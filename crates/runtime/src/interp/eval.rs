@@ -1492,6 +1492,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             return Err(r);
                         }
                         Op::Reraise => {
+                            f.unwind_pc = (pc - 1) as i32;
                             let e = popref!(f);
                             if arg != 0 {
                                 let lasti = popref!(f);
@@ -1740,7 +1741,9 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                 }
             }
         }
-        match find_handler(&code_obj, f.lasti) {
+        let lookup_pc = if f.unwind_pc >= 0 { f.unwind_pc as u32 } else { f.lasti };
+        f.unwind_pc = -1;
+        match find_handler(&code_obj, lookup_pc) {
             Some(h) => {
                 let depth = f.nlocalsplus + h.depth as usize;
                 while f.stack_top > depth {

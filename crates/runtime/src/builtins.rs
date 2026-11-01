@@ -716,6 +716,7 @@ pub fn init() -> PyResult<PyRef> {
         ("vars", FAST, b_vars, "vars([object]) -> dictionary\n\nWithout arguments, equivalent to locals().\nWith an argument, equivalent to object.__dict__."),
     ];
     add_methods_to_dict(&d, methods, Some(&m))?;
+    add_methods_to_dict(&d, more_builtins(), Some(&m))?;
     if let Some(f) = dict::get_item_rs(&d, "__import__") {
         IMPORT_FN.store(f.as_ptr(), Release);
     }
@@ -738,4 +739,82 @@ pub fn init() -> PyResult<PyRef> {
         set(n, type_obj(t))?;
     }
     Ok(m)
+}
+
+fn b_round(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
+    static P: Params = Params::new("round", &["number", "ndigits"], 0, 1);
+    let [n, nd] = args::parse::<2>(&P, args, kw)?;
+    let n = n.unwrap();
+    let f = match ab::lookup_special(n, name!("__round__"))? {
+        Some(f) => f,
+        None => raise!(TypeError, "type {} doesn't define __round__ method", tname(n)),
+    };
+    match nd.filter(|x| !x.is(none::none())) {
+        Some(d) => ab::call(&f, &[d]),
+        None => ab::call(&f, &[]),
+    }
+}
+fn radix_str(o: &PyObject, radix: u32, prefix: &str) -> PyResult {
+    let i = ab::index(o)?;
+    let neg = int::sign(&i) < 0;
+    let mag = int::int_methods_mag_string(&i, radix);
+    Ok(pystr::new_str(&format!("{}{}{}", if neg { "-" } else { "" }, prefix, mag)))
+}
+fn b_bin(_m: &PyObject, o: &PyObject) -> PyResult {
+    radix_str(o, 2, "0b")
+}
+fn b_oct(_m: &PyObject, o: &PyObject) -> PyResult {
+    radix_str(o, 8, "0o")
+}
+fn b_hex(_m: &PyObject, o: &PyObject) -> PyResult {
+    radix_str(o, 16, "0x")
+}
+fn b_aiter(_m: &PyObject, o: &PyObject) -> PyResult {
+    let am = o.ty().tp_as_async;
+    unsafe {
+        if !am.is_null() {
+            if let Some(f) = (*am).am_aiter {
+                let r = from_c(f(o.as_ptr()))?;
+                let ram = r.ty().tp_as_async;
+                if ram.is_null() || (*ram).am_anext.is_none() {
+                    raise!(TypeError, "aiter() returned not an async iterator of type '{}'", tname(&r));
+                }
+                return Ok(r);
+            }
+        }
+    }
+    raise!(TypeError, "'{}' object is not an async iterable", tname(o));
+}
+fn b_anext(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    args::check_pos("anext", args, 1, 2)?;
+    let o = args[0];
+    let am = o.ty().tp_as_async;
+    unsafe {
+        if am.is_null() || (*am).am_anext.is_none() {
+            raise!(TypeError, "'{}' object is not an async iterator", tname(o));
+        }
+        let aw = from_c((*am).am_anext.unwrap()(o.as_ptr()))?;
+        if args.len() == 1 {
+            return Ok(aw);
+        }
+        crate::types::asyncgen::anext_with_default(aw, args[1].to_ref())
+    }
+}
+fn b_breakpoint(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
+    match crate::modules::sys::get_sys_attr("breakpointhook") {
+        Some(h) => ab::call_kw(&h, args, kw),
+        None => raise!(RuntimeError, "lost sys.breakpointhook"),
+    }
+}
+
+pub fn more_builtins() -> *mut PyMethodDef {
+    crate::mdefs![
+        ("round", FASTKW, b_round, "round($module, /, number, ndigits=None)\n--\n\nRound a number to a given precision in decimal digits."),
+        ("bin", O, b_bin, "bin($module, number, /)\n--\n\nReturn the binary representation of an integer."),
+        ("oct", O, b_oct, "oct($module, number, /)\n--\n\nReturn the octal representation of an integer."),
+        ("hex", O, b_hex, "hex($module, number, /)\n--\n\nReturn the hexadecimal representation of an integer."),
+        ("aiter", O, b_aiter, "aiter($module, async_iterable, /)\n--\n\nReturn an AsyncIterator for an AsyncIterable object."),
+        ("anext", FAST, b_anext, "anext(aiterator[, default])\n\nReturn the next item from the async iterator."),
+        ("breakpoint", FASTKW, b_breakpoint, "breakpoint($module, /, *args, **kws)\n--\n\nCall sys.breakpointhook(*args, **kws)."),
+    ]
 }
