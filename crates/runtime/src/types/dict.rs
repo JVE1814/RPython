@@ -102,6 +102,16 @@ pub struct DictTable {
     pub version: u64,
 }
 
+static DICT_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A fresh, globally unique dict version stamp. Every mutation of a dict
+/// (insert, delete, value replacement, clear, resize) gives it a new stamp,
+/// so caches may key on `version(d)` alone.
+#[inline]
+pub fn next_version() -> u64 {
+    DICT_VERSION.fetch_add(1, Relaxed) + 1
+}
+
 #[inline]
 fn usable_for(size: usize) -> usize {
     (size << 1) / 3
@@ -117,7 +127,7 @@ fn size_for(min_usable: usize) -> usize {
 impl DictTable {
     pub fn new(cap: usize) -> DictTable {
         let size = size_for(cap);
-        DictTable { indices: vec![EMPTY; size], entries: Vec::with_capacity(cap.min(usable_for(size))), used: 0, version: 0 }
+        DictTable { indices: vec![EMPTY; size], entries: Vec::with_capacity(cap.min(usable_for(size))), used: 0, version: next_version() }
     }
     #[inline]
     fn mask(&self) -> usize {
@@ -153,7 +163,7 @@ impl DictTable {
             }
             self.indices[i] = idx as i32;
         }
-        self.version += 1;
+        self.version = next_version();
     }
     #[inline]
     fn insert_new(&mut self, h: isize, key: *mut PyObject, value: *mut PyObject) {
@@ -164,7 +174,7 @@ impl DictTable {
         self.indices[slot] = self.entries.len() as i32;
         self.entries.push(Entry { hash: h, key, value });
         self.used += 1;
-        self.version += 1;
+        self.version = next_version();
     }
     /// Find the index slot holding entry `ix` (which has hash `h`).
     fn slot_of(&self, ix: usize, h: isize) -> usize {
@@ -187,7 +197,7 @@ impl DictTable {
         self.entries[ix].key = std::ptr::null_mut();
         self.entries[ix].value = std::ptr::null_mut();
         self.used -= 1;
-        self.version += 1;
+        self.version = next_version();
         (e.key, e.value)
     }
     pub fn used(&self) -> usize {
@@ -487,6 +497,7 @@ pub fn set_item_hash(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) -
         Found::At(ix) => {
             let old = t.entries[ix].value;
             t.entries[ix].value = value.as_ptr();
+            t.version = next_version();
             drop(g);
             unsafe { decref(old) };
         }
@@ -589,7 +600,7 @@ pub fn clear(d: &PyObject) {
         return;
     }
     let mut fresh = DictTable::new(0);
-    fresh.version = t.version + 1;
+    fresh.version = next_version();
     let old = std::mem::replace(t, fresh);
     set_used(d, 0);
     drop(g);
@@ -718,7 +729,7 @@ pub fn merge_dict(d: &PyObject, other: &PyObject, overwrite: bool) -> PyResult<(
         let t = table(d);
         if t.used == 0 {
             if t.indices.len() < size_for(items.len()) {
-                *t = DictTable { version: t.version + 1, ..DictTable::new(items.len()) };
+                *t = DictTable { version: next_version(), ..DictTable::new(items.len()) };
             }
             for (k, v, h) in items {
                 t.insert_new(h, k.into_raw(), v.into_raw());
