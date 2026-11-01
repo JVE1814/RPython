@@ -197,8 +197,9 @@ class ShareableList:
     def _slot_format(self, item):
         fmt = self._types_mapping[type(item)]
         if isinstance(item, (str, bytes)):
-            raw = item.encode(_encoding) if isinstance(item, str) else item
-            capacity = self._alignment * (len(raw) // self._alignment + 1)
+            # sized by len(item) (characters for str), plus at least one
+            # spare byte, rounded up to the alignment
+            capacity = self._alignment * (len(item) // self._alignment + 1)
             fmt = fmt % (capacity,)
         return fmt
 
