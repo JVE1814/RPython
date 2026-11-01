@@ -1192,6 +1192,7 @@ fn setiter_len(o: &PyObject) -> PyResult {
     Ok(int::new_int(n.max(0) as i64))
 }
 fn setiter_reduce(o: &PyObject) -> PyResult {
+    let iter_fn = crate::builtins::builtin("iter")?;
     let it = unsafe { &*(o.as_ptr() as *mut SetIter) };
     let mut items = Vec::new();
     if !it.set.is_null() {
@@ -1206,7 +1207,6 @@ fn setiter_reduce(o: &PyObject) -> PyResult {
             items.push(x);
         }
     }
-    let iter_fn = crate::builtins::builtin("iter")?;
     Ok(tuple::new_tuple(vec![iter_fn, tuple::new_tuple(vec![list::new_list(items)])]))
 }
 

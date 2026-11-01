@@ -949,8 +949,8 @@ fn builtin_fn(name: &str) -> PyResult {
     crate::builtins::builtin(name)
 }
 fn listiter_reduce(o: &PyObject) -> PyResult {
-    let it = it_ref(o);
     let iter_fn = builtin_fn("iter")?;
+    let it = it_ref(o);
     if it.seq.is_null() {
         return Ok(tuple::new_tuple(vec![iter_fn, tuple::new_tuple(vec![new_list_empty()])]));
     }
@@ -961,12 +961,12 @@ fn listiter_reduce(o: &PyObject) -> PyResult {
     ]))
 }
 fn listreviter_reduce(o: &PyObject) -> PyResult {
+    // look the builtin up first: the lookup may run code that exhausts us
+    let rev = builtin_fn("reversed")?;
     let it = it_ref(o);
     if it.seq.is_null() {
-        let iter_fn = builtin_fn("iter")?;
-        return Ok(tuple::new_tuple(vec![iter_fn, tuple::new_tuple(vec![new_list_empty()])]));
+        return Ok(tuple::new_tuple(vec![rev, tuple::new_tuple(vec![new_list_empty()])]));
     }
-    let rev = builtin_fn("reversed")?;
     Ok(tuple::new_tuple(vec![
         rev,
         tuple::new_tuple(vec![unsafe { (*it.seq).to_ref() }]),
