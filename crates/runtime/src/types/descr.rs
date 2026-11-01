@@ -430,9 +430,37 @@ pub unsafe fn member_set(obj: *mut PyObject, m: *const PyMemberDef, v: Option<&P
                 raise!(TypeError, "can't delete numeric/char attribute");
             }
         };
+        // C-API member semantics: values must fit the "hard" range (C long / unsigned
+        // long for small types) else OverflowError; values outside the field's own range
+        // are truncated with a RuntimeWarning.
         macro_rules! int_member {
             ($t:ty) => {{
-                let x = ab::as_i128_index(v)?;
+                int_member!($t, i64::MIN as i128, i64::MAX as i128, true)
+            }};
+            ($t:ty, $hmin:expr, $hmax:expr, $index:expr) => {{
+                if !$index && !crate::types::int::is_int(v) {
+                    raise!(TypeError, "attribute value type must be int");
+                }
+                let x = match ab::as_i128_index(v) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        if exc_matches(crate::types::exceptions::OverflowError()) {
+                            clear_exc();
+                            raise!(OverflowError, "Python int too large to convert to C {}", stringify!($t));
+                        }
+                        return Err(e);
+                    }
+                };
+                if x < $hmin || x > $hmax {
+                    raise!(OverflowError, "Python int too large to convert to C {}", stringify!($t));
+                }
+                if x < <$t>::MIN as i128 || x > <$t>::MAX as i128 {
+                    crate::modules::warnings::warn(
+                        crate::types::exceptions::RuntimeWarning(),
+                        &format!("Truncation of value to {}", stringify!($t)),
+                        1,
+                    )?;
+                }
                 *(p as *mut $t) = x as $t;
             }};
         }
@@ -448,9 +476,10 @@ pub unsafe fn member_set(obj: *mut PyObject, m: *const PyMemberDef, v: Option<&P
             Py_T_SHORT => int_member!(i16),
             Py_T_USHORT => int_member!(u16),
             Py_T_INT => int_member!(i32),
-            Py_T_UINT => int_member!(u32),
-            Py_T_LONG | Py_T_LONGLONG | Py_T_PYSSIZET => int_member!(i64),
-            Py_T_ULONG | Py_T_ULONGLONG => int_member!(u64),
+            Py_T_UINT => int_member!(u32, i64::MIN as i128, u64::MAX as i128, true),
+            Py_T_LONG | Py_T_LONGLONG => int_member!(i64, i64::MIN as i128, i64::MAX as i128, true),
+            Py_T_PYSSIZET => int_member!(i64, i64::MIN as i128, i64::MAX as i128, false),
+            Py_T_ULONG | Py_T_ULONGLONG => int_member!(u64, i64::MIN as i128, u64::MAX as i128, true),
             Py_T_FLOAT => *(p as *mut f32) = ab::float_value(v)? as f32,
             Py_T_DOUBLE => *(p as *mut f64) = ab::float_value(v)?,
             Py_T_OBJECT | Py_T_OBJECT_EX => {

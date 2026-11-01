@@ -195,6 +195,13 @@ pub unsafe extern "C" fn PyFunction_GetAnnotations(o: *mut PyObject) -> *mut PyO
         if pyfunc(o).is_none() {
             return std::ptr::null_mut();
         }
+        let fo = crate::types::funcobject::func(&*o);
+        if !fo.func_annotations.is_null() {
+            return fo.func_annotations;
+        }
+        if fo.func_annotate.is_null() || none::is_none(&*fo.func_annotate) {
+            return none::none().as_ptr();
+        }
         match ab::getattr_str(&*o, "__annotations__") {
             Ok(a) => {
                 let p = a.as_ptr();
@@ -513,6 +520,10 @@ pub unsafe extern "C" fn PyFrame_GetLasti(f: *mut PyObject) -> c_int {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyFrame_GetVar(f: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
     unsafe {
+        if !pystr::is_str(&*name) {
+            let _ = type_error(&format!("name must be str, not {}", tname(&*name)));
+            return std::ptr::null_mut();
+        }
         let l = PyFrame_GetLocals(f);
         if l.is_null() {
             return l;
@@ -559,6 +570,8 @@ pub unsafe extern "C" fn PyFrame_New(_ts: *mut c_void, code: *mut PyObject, glob
         let fr = crate::interp::frame::Frame::new(&*code, None, &*globals, &bd, opt(locals));
         let p = Box::into_raw(fr);
         let fobj = frameobject::new_frame_object(&mut *p);
+        (*p).frame_obj = fobj;
+        incref(fobj); // the caller's reference (take_ownership drops the frame's self-reference)
         frameobject::take_ownership(fobj, Box::from_raw(p));
         fobj
     }

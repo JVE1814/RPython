@@ -25,6 +25,20 @@ pub unsafe extern "C" fn PyBytes_FromStringAndSize(s: *const c_char, n: Py_ssize
             let _ = system_error("Negative size passed to PyBytes_FromStringAndSize");
             return std::ptr::null_mut();
         }
+        const HEADER: usize = std::mem::offset_of!(PyBytesObject, ob_sval);
+        if n as usize >= isize::MAX as usize - HEADER - 1 {
+            let _ = overflow_error("byte string is too large");
+            return std::ptr::null_mut();
+        }
+        if n as usize > crate::tlab::MAX_SMALL {
+            // probe the system allocator first so huge requests raise MemoryError
+            let probe = libc::malloc(n as usize + HEADER + 1);
+            if probe.is_null() {
+                let _ = memory_error();
+                return std::ptr::null_mut();
+            }
+            libc::free(probe);
+        }
         let b = bytes::alloc_bytes(n as usize);
         if !s.is_null() && n > 0 {
             std::ptr::copy_nonoverlapping(s as *const u8, bytes::bytes_ptr(&b), n as usize);
@@ -306,6 +320,15 @@ pub unsafe extern "C" fn PyByteArray_FromStringAndSize(s: *const c_char, n: Py_s
             let _ = system_error("Negative size passed to PyByteArray_FromStringAndSize");
             return std::ptr::null_mut();
         }
+        if n as usize >= isize::MAX as usize - 64 {
+            let _ = overflow_error("byte string is too large");
+            return std::ptr::null_mut();
+        }
+        let mut v: Vec<u8> = Vec::new();
+        if v.try_reserve(n as usize).is_err() {
+            let _ = memory_error();
+            return std::ptr::null_mut();
+        }
         let data = if s.is_null() { vec![0u8; n as usize] } else { std::slice::from_raw_parts(s as *const u8, n as usize).to_vec() };
         ret(ab::call(type_obj(bytearray::bytearray_type()), &[&bytes::new_bytes(&data)]))
     }
@@ -340,8 +363,8 @@ pub unsafe extern "C" fn PyByteArray_AsString(o: *mut PyObject) -> *mut c_char {
 pub unsafe extern "C" fn PyByteArray_Concat(a: *mut PyObject, b: *mut PyObject) -> *mut PyObject {
     unsafe {
         ret((|| -> PyResult {
-            let da = crate::types::bytes::bytes_like_data(&*a);
-            let db = crate::types::bytes::bytes_like_data(&*b);
+            let da = contiguous_bytes(&*a);
+            let db = contiguous_bytes(&*b);
             match (da, db) {
                 (Some(mut x), Some(y)) => {
                     x.extend_from_slice(&y);
@@ -365,7 +388,13 @@ pub unsafe extern "C" fn PyByteArray_Resize(o: *mut PyObject, n: Py_ssize_t) -> 
             let s = slice::new_slice(&int::new_int(n as i64), none::none(), none::none());
             ab::setitem(b, &s, None)
         } else if n > old {
-            ab::call_method_str(b, "extend", &[&bytes::new_bytes(&vec![0u8; (n - old) as usize])]).map(|_| ())
+            let mut z: Vec<u8> = Vec::new();
+            if n as usize >= isize::MAX as usize - 64 || z.try_reserve((n - old) as usize).is_err() {
+                let _ = memory_error();
+                return -1;
+            }
+            z.resize((n - old) as usize, 0);
+            ab::call_method_str(b, "extend", &[&bytes::new_bytes(&z)]).map(|_| ())
         } else {
             Ok(())
         };
@@ -490,5 +519,29 @@ pub unsafe extern "C" fn PyBytesWriter_Format(w: *mut BytesWriter, fmt: *const c
             }
             Err(_) => -1,
         }
+    }
+}
+
+/// Data of a C-contiguous buffer exporter (None if `o` does not export one).
+pub(crate) unsafe fn contiguous_bytes(o: &PyObject) -> Option<Vec<u8>> {
+    unsafe {
+        if super::buffer::PyObject_CheckBuffer(o.as_ptr()) == 0 {
+            return None;
+        }
+        let mut view: Py_buffer = std::mem::zeroed();
+        if super::buffer::PyObject_GetBuffer(o.as_ptr(), &mut view, 0) < 0 {
+            clear_exc();
+            return None;
+        }
+        let ok = super::buffer::PyBuffer_IsContiguous(&view, b'C' as c_char) != 0;
+        let v = if !ok {
+            None
+        } else if view.buf.is_null() || view.len == 0 {
+            Some(Vec::new())
+        } else {
+            Some(std::slice::from_raw_parts(view.buf as *const u8, view.len as usize).to_vec())
+        };
+        super::buffer::PyBuffer_Release(&mut view);
+        v
     }
 }

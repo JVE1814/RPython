@@ -112,6 +112,15 @@ pub(crate) fn bad_internal() -> PyErr {
     system_error("bad argument to internal function")
 }
 
+/// CPython's null_error(): SystemError for a NULL object argument (unless an
+/// exception is already set); returns NULL for convenience.
+pub(crate) fn null_arg() -> *mut PyObject {
+    if !err_occurred() {
+        let _ = system_error("null argument to internal routine");
+    }
+    std::ptr::null_mut()
+}
+
 /// Raise SystemError if `p` is NULL; borrow it otherwise.
 #[inline]
 pub(crate) unsafe fn nn<'a>(p: *mut PyObject) -> PyResult<&'a PyObject> {

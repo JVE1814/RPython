@@ -403,7 +403,10 @@ pub unsafe extern "C" fn PyEval_GetLocals() -> *mut PyObject {
         }
         // borrowed snapshot cached on the frame object
         let fo = crate::interp::eval::frame_object(f);
-        match ab::getattr_str(&*fo, "f_locals") {
+        let snap = ab::getattr_str(&*fo, "f_locals").and_then(|l| {
+            if dict::is_dict(&l) { Ok(l) } else { ab::call(crate::types::typeobject::type_obj(dict::dict_type()), &[&l]) }
+        });
+        match snap {
             Ok(l) => {
                 let p = l.as_ptr();
                 let cache = &mut (*(fo as *mut crate::types::frameobject::PyFrameObject)).locals_snapshot;
@@ -447,12 +450,22 @@ pub unsafe extern "C" fn PyEval_GetFrameLocals() -> *mut PyObject {
 pub unsafe extern "C" fn PyEval_GetFuncName(f: *mut PyObject) -> *const c_char {
     unsafe {
         let o = &*f;
-        if crate::types::funcobject::is_function(o) || crate::types::cfunction::is_cfunction(o) {
-            if let Ok(n) = ab::getattr_str(o, "__name__") {
-                let p = super::unicode::PyUnicode_AsUTF8(n.as_ptr());
-                return p; // owned by the (immortal or function-held) name string
+        if crate::types::funcobject::is_method(o) {
+            return PyEval_GetFuncName(crate::types::funcobject::method_parts(o).0.as_ptr());
+        }
+        if crate::types::cfunction::is_cfunction(o) {
+            return (*(*(f as *mut PyCFunctionObject)).m_ml).ml_name;
+        }
+        if crate::types::funcobject::is_function(o) {
+            // the name string is owned by the function object
+            let n = crate::types::funcobject::func(o).func_name;
+            if !n.is_null() {
+                let p = super::unicode::PyUnicode_AsUTF8(n);
+                if !p.is_null() {
+                    return p;
+                }
+                clear_exc();
             }
-            clear_exc();
         }
         (*o.type_ptr()).tp_name
     }

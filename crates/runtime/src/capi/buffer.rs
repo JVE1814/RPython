@@ -392,15 +392,12 @@ fn memoryview_type() -> PyResult {
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyMemoryView_FromObject(o: *mut PyObject) -> *mut PyObject {
-    unsafe { ret(memoryview_type().and_then(|m| ab::call(&m, &[&*o]))) }
+    unsafe { ret(crate::types::memoryview::from_object(&*o)) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyMemoryView_FromMemory(mem: *mut c_char, size: Py_ssize_t, flags: c_int) -> *mut PyObject {
     unsafe {
-        let mut v: Py_buffer = std::mem::zeroed();
-        PyBuffer_FillInfo(&mut v, std::ptr::null_mut(), mem as *mut c_void, size, (flags == PYBUF_READ) as c_int, PYBUF_FORMAT | PYBUF_STRIDES);
-        let e = raw_exporter(&v);
-        ret(memoryview_type().and_then(|m| ab::call(&m, &[&e])))
+        ret(crate::types::memoryview::from_memory(mem as *mut u8, size, flags))
     }
 }
 #[unsafe(no_mangle)]
@@ -410,38 +407,13 @@ pub unsafe extern "C" fn PyMemoryView_FromBuffer(info: *const Py_buffer) -> *mut
             let _ = value_error("PyMemoryView_FromBuffer(): info->buf must not be NULL");
             return std::ptr::null_mut();
         }
-        let e = raw_exporter(&*info);
-        ret(memoryview_type().and_then(|m| ab::call(&m, &[&e])))
+        ret(crate::types::memoryview::from_buffer(&*info))
     }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyMemoryView_GetContiguous(o: *mut PyObject, buffertype: c_int, order: c_char) -> *mut PyObject {
     unsafe {
-        let mv = PyMemoryView_FromObject(o);
-        if mv.is_null() {
-            return mv;
-        }
-        let mv = PyRef::from_raw(mv);
-        if buffertype == PYBUF_WRITE {
-            let ro = ab::getattr_str(&mv, "readonly").and_then(|r| ab::is_true(&r)).unwrap_or(true);
-            if ro {
-                let _ = crate::err!(BufferError, "underlying buffer is not writable");
-                return std::ptr::null_mut();
-            }
-        }
-        let c = ab::getattr_str(&mv, if order as u8 == b'F' { "f_contiguous" } else { "c_contiguous" }).and_then(|r| ab::is_true(&r));
-        match c {
-            Ok(true) => mv.into_raw(),
-            Ok(false) => {
-                if buffertype == PYBUF_WRITE {
-                    let _ = crate::err!(BufferError, "writable contiguous buffer requested for a non-contiguous object.");
-                    return std::ptr::null_mut();
-                }
-                let o2 = ab::call_method_str(&mv, "tobytes", &[]);
-                ret(o2.and_then(|b| memoryview_type().and_then(|m| ab::call(&m, &[&b]))))
-            }
-            Err(_) => std::ptr::null_mut(),
-        }
+        ret(crate::types::memoryview::get_contiguous(&*o, buffertype, order as u8))
     }
 }
 

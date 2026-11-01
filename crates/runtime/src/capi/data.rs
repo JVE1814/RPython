@@ -36,8 +36,6 @@ macro_rules! placeholder_types {
     };
 }
 placeholder_types!(
-    (PyByteArrayIter_Type, "bytearray_iterator"),
-    (PyBytesIter_Type, "bytes_iterator"),
     (PyContextToken_Type, "_contextvars.Token"),
     (PyContextVar_Type, "_contextvars.ContextVar"),
     (PyContext_Type, "_contextvars.Context"),
@@ -52,7 +50,6 @@ placeholder_types!(
     (PyInstanceMethod_Type, "instancemethod"),
     (PyListRevIter_Type, "list_reverseiterator"),
     (PyLongRangeIter_Type, "longrange_iterator"),
-    (PyMemoryView_Type, "memoryview"),
     (PyODictItems_Type, "odict_items"),
     (PyODictIter_Type, "odict_iterator"),
     (PyODictKeys_Type, "odict_keys"),
