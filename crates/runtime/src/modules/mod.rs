@@ -82,6 +82,7 @@ pub mod _decimal;
 pub mod _bz2;
 pub mod pyexpat;
 pub mod _pickle;
+pub mod tty;
 pub mod array;
 pub mod _datetime;
 pub mod _csv;
@@ -112,6 +113,7 @@ pub fn register_all() {
     _decimal::register();
     crate::import::register_builtin("_expat_engine", pyexpat::init);
     crate::import::register_builtin("_pickle", _pickle::init_module);
+    tty::register();
     crate::import::register_builtin("array", array::init_module);
     crate::import::register_builtin("_datetime", _datetime::init_module);
     crate::import::register_builtin("_csv", _csv::init_module);
