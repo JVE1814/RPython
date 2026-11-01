@@ -37,6 +37,11 @@ pub mod sys_namespace;
 pub mod _thread;
 pub mod pymain;
 pub mod _imp;
+pub mod _queue;
+pub mod select;
+pub mod _posixsubprocess;
+pub mod gc_mod;
+pub mod faulthandler;
 pub mod text_util;
 pub mod _sre;
 

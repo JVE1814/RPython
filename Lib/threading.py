@@ -247,10 +247,10 @@ class Condition:
         return "<Condition(%s, %d)>" % (self._lock, len(self._waiters))
 
     def _release_save(self):
-        self._lock.release()           # No state to save
+        self._lock.release()
 
     def _acquire_restore(self, x):
-        self._lock.acquire()           # Ignore saved state
+        self._lock.acquire()
 
     def _is_owned(self):
         if self._lock.acquire(False):
@@ -471,7 +471,7 @@ class Barrier:
         self._action = action
         self._timeout = timeout
         self._parties = parties
-        self._state = 0  # 0 filling, 1 draining, -1 resetting, -2 broken
+        self._state = 0
         self._count = 0
 
     def __repr__(self):
@@ -487,7 +487,7 @@ class Barrier:
         if timeout is None:
             timeout = self._timeout
         with self._cond:
-            self._enter()  # wait while a previous cycle drains
+            self._enter()
             index = self._count
             self._count += 1
             try:
@@ -581,7 +581,7 @@ def _newname(name_template):
 
 
 _active_limbo_lock = RLock()
-_active = {}    # maps thread id to Thread object
+_active = {}
 _limbo = {}
 _dangling = WeakSet()
 
@@ -680,7 +680,7 @@ class Thread:
             with _active_limbo_lock:
                 del _limbo[self]
             raise
-        self._started.wait()  # Will set ident and native_id
+        self._started.wait()
 
     def run(self):
         """The thread's activity: calls the target with args/kwargs.
