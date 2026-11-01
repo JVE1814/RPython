@@ -1,6 +1,7 @@
 pub mod annotations;
 pub mod builtins_super;
 pub mod copyreg_support;
+pub mod _json;
 pub mod signal;
 pub mod suggestions;
 pub mod sys;
@@ -85,4 +86,5 @@ pub fn register_all() {
     sys_full::register_system_modules();
     text_util::register();
     crate::import::register_builtin("_typing", crate::types::typevar::make_typing_module);
+    crate::import::register_builtin("_json", _json::init_module);
 }
