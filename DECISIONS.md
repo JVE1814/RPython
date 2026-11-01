@@ -86,3 +86,14 @@ CPython's default static build. Benefit: initial-exec/local-exec TLS for the thr
 ## D14 — Baseline interpreters built
 /opt/baseline/py-default (3.15.2, PGO+LTO, GIL) and /opt/baseline/py-ft (3.15.2, PGO+LTO,
 free-threaded). Used only by the benchmark harness.
+- 2026-11-01: the bigint agent also ran `python3 --version` once (no code executed).
+- 2026-11-01: the sre agent also ran `python3 --version` once (no code executed). All four finished foundation agents did this by reflex; rule 2 now names it.
+
+## D15 — Use of the baseline CPython for measurement
+The baseline builds in /opt/baseline are used only as measurement references: benchmark
+timings, and the regression suite's own pass/fail/skip counts (to evaluate "no more failures
+or skips than CPython"). They never run as part of our interpreter, tooling or tests.
+
+## D16 — Test runner
+`tools/run_tests.sh PY OUTDIR [tests]` runs `PY -m test <module>` per module (from the spec's
+Lib/test package) with a timeout and records status + regrtest totals in results.tsv.
