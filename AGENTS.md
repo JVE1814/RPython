@@ -9,7 +9,8 @@ Hard rules (violating any of these invalidates the project):
    CPython repo except what is in `spec/`. Never read any other Python implementation's source
    (PyPy, RustPython, Jython, GraalPy, MicroPython, ...), including copies in `~/.cargo/registry`.
    Write everything from your own knowledge and from the tests/headers in `spec/`.
-2. NEVER run `python3`/`python` or any other Python interpreter, not even for tooling. Tooling is
+2. NEVER run `python3`/`python` or any other Python interpreter, not even for tooling, not even
+   `python3 --version` (two agents already did this by reflex — do not).  Tooling is
    bash or Rust. (Exception: `/opt/baseline/py-*` builds are used *only* by the benchmark harness.)
 3. NEVER edit anything under `spec/`. Never skip or special-case a test.
 4. Only touch the paths you were assigned. Shared files (Cargo.toml at the root, DECISIONS.md,
