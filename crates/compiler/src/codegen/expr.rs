@@ -291,7 +291,7 @@ impl<'a> Compiler<'a> {
                     return Ok(());
                 }
                 self.compile_expr(value)?;
-                self.set_loc(e.loc);
+                self.set_loc(attr_loc(e.loc, e, attr));
                 let m = self.mangle(attr);
                 self.emit_name(Op::LoadAttr, &m);
             }
@@ -705,17 +705,17 @@ impl<'a> Compiler<'a> {
                 // method call
                 if self.try_super_attr(func, value, attr, true)?.is_none() {
                     self.compile_expr(value)?;
-                    self.set_loc(func.loc);
+                    self.set_loc(attr_loc(func.loc, func, attr));
                     let m = self.mangle(attr);
                     self.emit_name(Op::LoadMethod, &m);
                 }
-                return self.compile_call_args(e, 0, args, keywords);
+                return self.compile_call_args(e, attr_loc(e.loc, func, attr), 0, args, keywords);
             }
         }
         self.compile_expr(func)?;
         self.set_loc(e.loc);
         self.emit(Op::PushNull, 0);
-        self.compile_call_args(e, 0, args, keywords)
+        self.compile_call_args(e, e.loc, 0, args, keywords)
     }
 
     fn validate_keywords(&self, keywords: &[Keyword]) -> R {
@@ -734,7 +734,7 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
-    fn compile_call_args(&mut self, e: &'a Expr, pushed: u32, args: &'a [Expr], keywords: &'a [Keyword]) -> R {
+    fn compile_call_args(&mut self, e: &'a Expr, cloc: Loc, pushed: u32, args: &'a [Expr], keywords: &'a [Keyword]) -> R {
         if has_starred(args) || keywords.iter().any(|k| k.arg.is_none()) {
             return self.compile_call_ex(e, pushed, args, keywords, false);
         }
@@ -743,14 +743,14 @@ impl<'a> Compiler<'a> {
         }
         let nargs = pushed + args.len() as u32;
         if keywords.is_empty() {
-            self.set_loc(e.loc);
+            self.set_loc(cloc);
             self.emit(Op::Call, nargs);
         } else {
             for k in keywords {
                 self.compile_expr(&k.value)?;
             }
             let names: Vec<Constant> = keywords.iter().map(|k| str_const(k.arg.as_ref().unwrap())).collect();
-            self.set_loc(e.loc);
+            self.set_loc(cloc);
             self.load_const(Constant::Tuple(names));
             self.emit(Op::CallKw, nargs + keywords.len() as u32);
         }
@@ -1334,4 +1334,25 @@ impl<'a> Compiler<'a> {
         }
         Ok(())
     }
+}
+
+/// CPython's update_start_location_to_match_attr: when an attribute access spans lines, the
+/// instruction location starts at the attribute name (for tracebacks and line events).
+pub(crate) fn attr_loc(mut loc: Loc, attr_expr: &Expr, attr: &str) -> Loc {
+    let a = attr_expr.loc;
+    if loc.lineno != a.end_lineno {
+        loc.lineno = a.end_lineno;
+        let len = attr.len() as i32;
+        if len <= a.end_col_offset {
+            loc.col_offset = a.end_col_offset - len;
+        } else {
+            loc.col_offset = -1;
+            loc.end_col_offset = -1;
+        }
+        loc.end_lineno = loc.lineno.max(loc.end_lineno);
+        if loc.lineno == loc.end_lineno {
+            loc.end_col_offset = loc.col_offset.max(loc.end_col_offset);
+        }
+    }
+    loc
 }
