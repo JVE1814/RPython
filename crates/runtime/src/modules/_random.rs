@@ -285,15 +285,6 @@ fn r_reduce(o: &PyObject) -> PyResult {
 unsafe extern "C" fn random_new(tp: *mut PyTypeObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
     unsafe {
         let r = (|| -> PyResult {
-            let a = tuple::tuple_items(&*args);
-            if tp == random_type() {
-                if !kw.is_null() && dict::dict_len(&*kw) > 0 {
-                    raise!(TypeError, "Random() takes no keyword arguments");
-                }
-            }
-            if a.len() > 1 {
-                raise!(TypeError, "Random() expected at most 1 argument, got {}", a.len());
-            }
             let alloc = (*tp).tp_alloc.unwrap_or(generic_alloc);
             let op = alloc(tp, 0);
             if op.is_null() {
@@ -303,7 +294,7 @@ unsafe extern "C" fn random_new(tp: *mut PyTypeObject, args: *mut PyObject, kw: 
             ro.mt = Box::into_raw(Box::new(Mt::new()));
             std::ptr::write(&mut ro.lock, std::sync::Mutex::new(()));
             let obj = PyRef::from_raw(op);
-            seed_obj(&mut *ro.mt, a.first().copied())?;
+
             Ok(obj)
         })();
         into_c(r)
@@ -323,8 +314,22 @@ unsafe extern "C" fn random_dealloc(o: *mut PyObject) {
     }
 }
 
-unsafe extern "C" fn random_init(_o: *mut PyObject, _a: *mut PyObject, _k: *mut PyObject) -> c_int {
-    0
+unsafe extern "C" fn random_init(o: *mut PyObject, args: *mut PyObject, kw: *mut PyObject) -> c_int {
+    unsafe {
+        let r = (|| -> PyResult<()> {
+            let o = &*o;
+            if o.is_type(random_type()) && !kw.is_null() && dict::dict_len(&*kw) > 0 {
+                raise!(TypeError, "Random() takes no keyword arguments");
+            }
+            let a = tuple::tuple_items(&*args);
+            if a.len() > 1 {
+                raise!(TypeError, "Random() requires 0 or 1 argument");
+            }
+            let _g = lock(o);
+            seed_obj(mt(o), a.first().copied())
+        })();
+        int_into_c(r)
+    }
 }
 
 static INIT: std::sync::Once = std::sync::Once::new();
