@@ -32,12 +32,14 @@ pub mod _operator;
 pub mod _functools;
 pub mod _abc;
 pub mod itertools;
-
-/// Register all builtin (Rust-implemented) modules with the import system.
-pub fn register_all() {
 pub mod builtins_numbers;
 pub mod math;
 pub mod numbers_registry;
+pub mod text_util;
+pub mod _sre;
+
+/// Register all builtin (Rust-implemented) modules with the import system.
+pub fn register_all() {
     crate::import::register_builtin("posix", posix::init);
     crate::import::register_builtin("errno", errno::init);
     crate::import::register_builtin("_stat", stat_mod::init);
@@ -47,3 +49,5 @@ pub mod numbers_registry;
     numbers_registry::register();
     crate::import::register_builtin("_warnings", _warnings::init_module);
     sys_full::register_system_modules();
+
+    text_util::register();
