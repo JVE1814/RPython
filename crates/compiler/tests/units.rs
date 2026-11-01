@@ -296,7 +296,7 @@ fn match_statement() {
 #[test]
 fn imports() {
     let c = comp("import a.b.c as d\nfrom . import e\nlazy import f\n");
-    let lazy = c.code.iter().map(|&w| decode(w)).filter(|(o, _)| *o == Op::ImportName).any(|(_, a)| a >> 23 == 1);
+    let lazy = c.code.iter().map(|&w| decode(w)).filter(|(o, _)| *o == Op::ImportName).any(|(_, a)| (a >> 23) & 1 == 1);
     assert!(lazy);
     assert!(has(&c, Op::ImportFrom));
 }

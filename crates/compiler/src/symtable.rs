@@ -436,7 +436,8 @@ impl Builder {
 
     fn record_directive(&mut self, name: &str, loc: Loc) {
         let m = self.mangle(name);
-        self.cur_mut().directives.insert(m, loc);
+        // errors point at the first global/nonlocal statement naming it
+        self.cur_mut().directives.entry(m).or_insert(loc);
     }
 
     fn enter_depth(&mut self) -> R {
@@ -879,7 +880,10 @@ impl Builder {
     /// Parameter annotations of a function: always creates the `__annotate__` block.
     fn visit_annotations(&mut self, s: &Stmt, a: &Arguments, returns: Option<&Expr>, fname: &str) -> R {
         let cur_kind = self.cur().kind;
-        let in_class = cur_kind == ScopeKind::Class;
+        // a generic method's annotations live inside its type-parameter block, which
+        // itself sees the class namespace
+        let in_class = cur_kind == ScopeKind::Class
+            || (cur_kind == ScopeKind::TypeParams && self.cur().can_see_class_scope);
         let future = self.flags & FUTURE_ANNOTATIONS != 0;
         self.enter_block("__annotate__", ScopeKind::Annotation, Some(key(s, TAG_ANN)), s.loc);
         self.cur_mut().function_name = Some(fname.to_string());
@@ -1486,6 +1490,13 @@ impl<'a> Analyzer<'a> {
             }
             if let Some(b) = bound {
                 newbound.extend(b.iter().cloned());
+            }
+            // a `global` declaration hides enclosing bindings of the name from
+            // nested scopes (they see the global)
+            for (name, flags) in &syms {
+                if flags & DEF_GLOBAL != 0 {
+                    newbound.remove(name);
+                }
             }
             newglobal.extend(global.iter().cloned());
         } else {

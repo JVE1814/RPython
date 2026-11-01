@@ -174,6 +174,10 @@ fn chain_context(ts: &ThreadState, e: &PyObject) {
     // break cycles: walk handled's context chain and cut a link to e
     unsafe {
         let mut o = handled;
+        // the chain may itself contain a cycle: a second pointer moving at half
+        // speed detects it (Floyd)
+        let mut slow = handled;
+        let mut step = false;
         loop {
             let ctx = exc::exc_context(&*o);
             match ctx {
@@ -184,6 +188,13 @@ fn chain_context(ts: &ThreadState, e: &PyObject) {
                         break;
                     }
                     o = c.as_ptr();
+                    if step {
+                        slow = exc::exc_context(&*slow).map_or(std::ptr::null_mut(), |s| s.as_ptr());
+                    }
+                    step = !step;
+                    if o == slow {
+                        break;
+                    }
                 }
             }
         }
@@ -304,12 +315,12 @@ pub(super) fn load_global(f: &Frame, nm: &PyObject) -> PyResult {
     let g = f.globals();
     if dict::is_dict_exact(g) {
         if let Some(v) = dict::get_item_str(g, nm) {
-            return Ok(v);
+            return lazy_check(g, nm, v);
         }
     } else {
         // dict subclass: go through __getitem__ (honours __missing__)
         match ab::getitem(g, nm) {
-            Ok(v) => return Ok(v),
+            Ok(v) => return lazy_check(g, nm, v),
             Err(e) => {
                 if !exc_matches(exc::KeyError()) {
                     return Err(e);
@@ -321,12 +332,12 @@ pub(super) fn load_global(f: &Frame, nm: &PyObject) -> PyResult {
     let b = f.builtins();
     if dict::is_dict_exact(b) {
         if let Some(v) = dict::get_item_str(b, nm) {
-            return Ok(v);
+            return lazy_check(b, nm, v);
         }
         return Err(name_error(f, nm));
     }
     match ab::getitem(b, nm) {
-        Ok(v) => Ok(v),
+        Ok(v) => lazy_check(b, nm, v),
         Err(e) => {
             if exc_matches(exc::KeyError()) {
                 clear_exc();
@@ -490,7 +501,7 @@ fn import_from(module: &PyObject, nm: &PyObject) -> PyResult {
         Some(n) if pystr::is_str(&n) => n,
         _ => {
             return Err(crate::import::import_error_with(
-                &format!("cannot import name '{}' from <unknown module name>", pystr::to_string_lossy(nm)),
+                &format!("cannot import name '{}' from '<unknown module name>' (unknown location)", pystr::to_string_lossy(nm)),
                 None,
                 None,
                 Some(nm),
@@ -657,9 +668,12 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
     // pending exception to raise immediately (generator.throw)
     let mut pending_err: bool = false;
     if let Some(t) = throw {
+        f.lasti = if pc > 0 { (pc - 1) as u32 } else { 0 };
+        if crate::modules::sys::tracing_active() {
+            crate::modules::sys_trace::fire_exc_event(ts, f, crate::modules::sys_trace::PY_THROW, &t)?;
+        }
         set_exc(t);
         pending_err = true;
-        f.lasti = if pc > 0 { (pc - 1) as u32 } else { 0 };
     }
 
     'outer: loop {
@@ -690,6 +704,12 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                     ext = 0;
                     if crate::modules::sys::tracing_active() {
                         crate::modules::sys::trace_instr(ts, f)?;
+                        if f.jump_to >= 0 {
+                            // the trace function assigned f_lineno
+                            pc = f.jump_to as usize;
+                            f.jump_to = -1;
+                            continue;
+                        }
                     }
                     match op {
                         Op::Nop | Op::Resume => {
@@ -816,6 +836,9 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             let mut v = None;
                             if !f.locals.is_null() {
                                 v = mapping_get(unsafe { &*f.locals }, nm)?;
+                                if let Some(x) = v {
+                                    v = Some(lazy_check(unsafe { &*f.locals }, nm, x)?);
+                                }
                             }
                             let v = match v {
                                 Some(v) => v,
@@ -880,7 +903,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             let mapping = popref!(f);
                             let nm = &cd.names[arg as usize];
                             let v = match mapping_get(&mapping, nm)? {
-                                Some(v) => v,
+                                Some(v) => lazy_check(&mapping, nm, v)?,
                                 None => load_global(f, nm)?,
                             };
                             push!(f, v.into_raw());
@@ -1183,6 +1206,9 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             }
                         }
                         Op::Jump => {
+                            if crate::modules::sys::tracing_active() {
+                                crate::modules::sys_trace::fire_branch(ts, f, crate::modules::sys_trace::JUMP, arg as usize)?;
+                            }
                             if (arg as usize) < pc {
                                 // backedge: safepoint poll + tiering counter
                                 cd.backedge_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1204,6 +1230,9 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             if !t {
                                 pc = arg as usize;
                             }
+                            if crate::modules::sys::tracing_active() {
+                                branch_event(ts, f, !t, pc)?;
+                            }
                         }
                         Op::PopJumpIfTrue => {
                             let v = popref!(f);
@@ -1211,17 +1240,26 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             if t {
                                 pc = arg as usize;
                             }
+                            if crate::modules::sys::tracing_active() {
+                                branch_event(ts, f, t, pc)?;
+                            }
                         }
                         Op::PopJumpIfNone => {
                             let v = popref!(f);
                             if v.is(none::none()) {
                                 pc = arg as usize;
                             }
+                            if crate::modules::sys::tracing_active() {
+                                branch_event(ts, f, v.is(none::none()), pc)?;
+                            }
                         }
                         Op::PopJumpIfNotNone => {
                             let v = popref!(f);
                             if !v.is(none::none()) {
                                 pc = arg as usize;
+                            }
+                            if crate::modules::sys::tracing_active() {
+                                branch_event(ts, f, !v.is(none::none()), pc)?;
                             }
                         }
                         Op::JumpIfFalseOrPop => {
@@ -1231,6 +1269,9 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             } else {
                                 unsafe { decref(pop!(f)) };
                             }
+                            if crate::modules::sys::tracing_active() {
+                                branch_event(ts, f, !t, pc)?;
+                            }
                         }
                         Op::JumpIfTrueOrPop => {
                             let t = ab::is_true(unsafe { &*top!(f) })?;
@@ -1238,6 +1279,9 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                                 pc = arg as usize;
                             } else {
                                 unsafe { decref(pop!(f)) };
+                            }
+                            if crate::modules::sys::tracing_active() {
+                                branch_event(ts, f, t, pc)?;
                             }
                         }
                         Op::GetIter => {
@@ -1252,6 +1296,9 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                                     unsafe { decref(pop!(f)) };
                                     pc = arg as usize;
                                 }
+                            }
+                            if crate::modules::sys::tracing_active() {
+                                for_iter_event(ts, f, pc == arg as usize, pc)?;
                             }
                         }
                         Op::GetAiter => {
@@ -1344,6 +1391,13 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             let base = f.stack_top - n - 2;
                             let callable = f.slots[base];
                             let self_or_null = f.slots[base + 1];
+                            let call_info = if crate::modules::sys::tracing_active() {
+                                let first = if n > 0 { Some(unsafe { &*f.slots[base + 2] }) } else { None };
+                                let so = if self_or_null.is_null() { None } else { Some(unsafe { &*self_or_null }) };
+                                crate::modules::sys_trace::before_call(ts, f, unsafe { &*callable }, so, first, true)?
+                            } else {
+                                None
+                            };
                             let r = unsafe {
                                 if self_or_null.is_null() {
                                     let args = f.slots.as_ptr().add(base + 2) as *const *mut PyObject;
@@ -1371,6 +1425,12 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                                 unsafe { xdecref(p) };
                             }
                             f.stack_top = base;
+                            if let Some(info) = call_info {
+                                if let Err(e) = crate::modules::sys_trace::after_call(ts, f, info, !r.is_null()) {
+                                    unsafe { xdecref(r) };
+                                    return Err(e);
+                                }
+                            }
                             if r.is_null() {
                                 return Err(PyErr);
                             }
@@ -1414,7 +1474,16 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                                 Some(k) => Some(k.clone()),
                                 None => None,
                             };
-                            let r = ab::call_with_kwargs_dict(&callable, &v, kwd.as_deref())?;
+                            let call_info = if crate::modules::sys::tracing_active() {
+                                crate::modules::sys_trace::before_call(ts, f, &callable, self_or_null.as_deref(), v.first().copied(), false)?
+                            } else {
+                                None
+                            };
+                            let r = ab::call_with_kwargs_dict(&callable, &v, kwd.as_deref());
+                            if let Some(info) = call_info {
+                                crate::modules::sys_trace::after_call(ts, f, info, r.is_ok())?;
+                            }
+                            let r = r?;
                             push!(f, r.into_raw());
                         }
                         Op::CallIntrinsic1 => {
@@ -1550,21 +1619,31 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             let (enter, exit) = match (enter, exit) {
                                 (Some(a), Some(b)) => (a, b),
                                 (en, ex) => {
-                                    let kind = if op == Op::BeforeWith { "" } else { "asynchronous " };
-                                    let missing = if en.is_none() {
-                                        if op == Op::BeforeWith { "__enter__" } else { "__aenter__" }
-                                    } else if op == Op::BeforeWith {
-                                        "__exit__"
+                                    let sync = op == Op::BeforeWith;
+                                    let kind = if sync { "" } else { "asynchronous " };
+                                    // a missing exit method is reported before a missing enter
+                                    let missing = if ex.is_none() {
+                                        if sync { "__exit__" } else { "__aexit__" }
+                                    } else if sync {
+                                        "__enter__"
                                     } else {
-                                        "__aexit__"
+                                        "__aenter__"
                                     };
-                                    let _ = ex;
+                                    let _ = en;
+                                    // suggest the other protocol when the object implements it
+                                    let (oe, ox, hint) = if sync {
+                                        (name!("__aenter__"), name!("__aexit__"), " but it supports the asynchronous context manager protocol. Did you mean to use 'async with'?")
+                                    } else {
+                                        (name!("__enter__"), name!("__exit__"), " but it supports the context manager protocol. Did you mean to use 'with'?")
+                                    };
+                                    let other = lookup(mgr.type_ptr(), oe).is_some() && lookup(mgr.type_ptr(), ox).is_some();
                                     raise!(
                                         TypeError,
-                                        "'{}' object does not support the {}context manager protocol (missed {} method)",
+                                        "'{}' object does not support the {}context manager protocol (missed {} method){}",
                                         tname(&mgr),
                                         kind,
-                                        missing
+                                        missing,
+                                        if other { hint } else { "" }
                                     );
                                 }
                             };
@@ -1603,12 +1682,35 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             let level = popref!(f);
                             let nm = &cd.names[(arg & 0x7fffff) as usize];
                             let locals = if f.locals.is_null() { none::none_ref() } else { unsafe { (*f.locals).to_ref() } };
-                            let m = crate::import::import_name_from_frame(f.globals(), &locals, nm, &fromlist, &level, f.builtins())?;
+                            let m = if arg >> 23 != 0 {
+                                let module_level = !f.locals.is_null() && f.locals == f.globals;
+                                if arg & (1 << 23) != 0 && !locals.is(f.globals()) {
+                                    // `lazy import` compiled by exec() inside a function or class body
+                                    raise!(SyntaxError, "lazy import is only allowed at module level");
+                                }
+                                crate::types::lazyimport::import_name(
+                                    f.globals(),
+                                    &locals,
+                                    nm,
+                                    &fromlist,
+                                    &level,
+                                    f.builtins(),
+                                    (arg >> 23) & 1 != 0,
+                                    (arg >> 24) & 1 != 0,
+                                    module_level,
+                                )?
+                            } else {
+                                crate::import::import_name_from_frame(f.globals(), &locals, nm, &fromlist, &level, f.builtins())?
+                            };
                             push!(f, m.into_raw());
                         }
                         Op::ImportFrom => {
                             let m = unsafe { &*top!(f) };
-                            let v = import_from(m, &cd.names[arg as usize])?;
+                            let v = if crate::types::lazyimport::is_lazy(m) {
+                                crate::types::lazyimport::import_from(m, &cd.names[arg as usize])?
+                            } else {
+                                import_from(m, &cd.names[arg as usize])?
+                            };
                             push!(f, v.into_raw());
                         }
                         Op::FormatSimple => {
@@ -1703,7 +1805,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
         }
         pending_err = false;
         // ---------------------------------------------------------- exception unwinding
-        let e = match take_exc() {
+        let mut e = match take_exc() {
             Some(e) => e,
             None => {
                 let _ = err!(SystemError, "error return without exception set");
@@ -1721,12 +1823,16 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
             add_traceback(f, &e);
             if crate::modules::sys::tracing_active() {
                 if crate::modules::sys::trace_exception(ts, f, &e).is_err() {
-                    // tracer raised: replace exception
-                    let e2 = take_exc().unwrap();
-                    set_exc(e2);
-                    f.clear_stack();
-                    return Err(PyErr);
+                    // the tracer raised: its exception replaces the original one and
+                    // unwinding continues (cleanup handlers must still run)
+                    e = take_exc().unwrap();
+                    add_traceback(f, &e);
                 }
+            }
+        } else if crate::modules::sys::tracing_active() {
+            if crate::modules::sys_trace::fire_exc_event(ts, f, crate::modules::sys_trace::RERAISE, &e).is_err() {
+                e = take_exc().unwrap();
+                add_traceback(f, &e);
             }
         }
         let lookup_pc = if f.unwind_pc >= 0 { f.unwind_pc as u32 } else { f.lasti };
@@ -1740,6 +1846,12 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                 }
                 if h.lasti {
                     push!(f, int::new_int(f.lasti as i64).into_raw());
+                }
+                if crate::modules::sys::tracing_active()
+                    && crate::modules::sys_trace::fire_exc_event(ts, f, crate::modules::sys_trace::EXCEPTION_HANDLED, &e).is_err()
+                {
+                    e = take_exc().unwrap();
+                    add_traceback(f, &e);
                 }
                 push!(f, e.into_raw());
                 pc = h.target as usize;
@@ -1962,4 +2074,38 @@ pub fn finish_send_loop(f: &mut Frame) {
     }
     f.next_instr = target;
     f.yield_from_send = -1;
+}
+
+/// A name lookup that finds a lazy import placeholder reifies it (PEP 810) and
+/// replaces the binding in the mapping it was found in.
+#[inline]
+pub(super) fn lazy_check(d: &PyObject, nm: &PyObject, v: PyRef) -> PyResult {
+    if crate::types::lazyimport::is_lazy(&v) {
+        return crate::types::lazyimport::reify_in_dict(d, nm, &v);
+    }
+    Ok(v)
+}
+
+/// Set the current thread's handled exception (NULL = none); returns the old one (owned).
+pub fn restore_handled_exception(v: *mut PyObject) -> *mut PyObject {
+    set_handled_exception(crate::threads::current(), v)
+}
+
+/// BRANCH_RIGHT (jump taken) or BRANCH_LEFT (fall through) to `dest`.
+#[cold]
+fn branch_event(ts: &ThreadState, f: &mut Frame, taken: bool, dest: usize) -> PyResult<()> {
+    use crate::modules::sys_trace as st;
+    st::fire_branch(ts, f, if taken { st::BRANCH_RIGHT } else { st::BRANCH_LEFT }, dest)
+}
+
+/// FOR_ITER: continuing the loop is the left branch, leaving it the right one; an
+/// exhausted generator reports STOP_ITERATION (no exception is raised for it).
+#[cold]
+fn for_iter_event(ts: &ThreadState, f: &mut Frame, exhausted: bool, dest: usize) -> PyResult<()> {
+    use crate::modules::sys_trace as st;
+    if exhausted && st::wants(st::STOP_ITERATION) {
+        let si = ab::call(type_obj(exc::StopIteration()), &[])?;
+        st::fire_exc_event(ts, f, st::STOP_ITERATION, &si)?;
+    }
+    st::fire_branch(ts, f, if exhausted { st::BRANCH_RIGHT } else { st::BRANCH_LEFT }, dest)
 }

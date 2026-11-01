@@ -17,6 +17,7 @@ pub mod compile;
 
 pub mod ffi;
 pub mod gc;
+pub mod gc_support;
 pub mod hash;
 pub mod import;
 pub mod import_spec;
@@ -39,6 +40,8 @@ pub struct Config {
     pub optimize: i32,
     /// Full interpreter configuration (sys.flags, -X/-W options, ...).
     pub sys: modules::sys_full::RtConfig,
+    /// sys.path fixed by an `<executable>._pth` file (no PYTHONPATH, no stdlib entry).
+    pub pth_paths: Option<Vec<String>>,
 }
 
 /// Initialise the runtime: types, builtins, sys.
@@ -64,18 +67,27 @@ pub fn initialize(cfg: &Config) -> PyResult<()> {
     let _ = sys;
     modules::signal::init_signals();
     // sys.path: script dir is added by the caller; then PYTHONPATH and the stdlib
-    let stdlib = modules::sys_full::stdlib_dir();
     let path = modules::sys::get_sys_attr("path").unwrap();
-    if !ignore_env {
+    if let Some(pp) = &cfg.pth_paths {
+        for p in pp {
+            types::list::append(&path, types::str::new_str(p));
+        }
+    } else if !ignore_env {
         if let Ok(pp) = std::env::var("PYTHONPATH") {
             for p in pp.split(':').filter(|p| !p.is_empty()) {
                 types::list::append(&path, types::str::new_str(p));
             }
         }
     }
-    types::list::append(&path, types::str::new_str(&stdlib));
+    if cfg.pth_paths.is_none() {
+        for entry in modules::sys_full::default_search_path() {
+            types::list::append(&path, types::str::new_str(&entry));
+        }
+    }
     modules::sys_full::post_init()?;
+    // real std streams (and builtins.open) must exist before site runs .pth files
     modules::sys::init_stdio();
+    modules::sys_full::import_site()?;
     Ok(())
 }
 

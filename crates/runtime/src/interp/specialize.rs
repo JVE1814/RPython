@@ -340,7 +340,10 @@ fn fill_load_attr(o: &PyObject, nm: &PyObject, method: bool) -> Option<Fill> {
             return None;
         }
         let dd = unsafe { &*d };
-        return dict::get_item_str(dd, nm).map(|v| (kind::MODULE, dict::version(dd), d as u64, v.as_ptr() as usize));
+        // lazy import placeholders must go through the module getattr (reification)
+        return dict::get_item_str(dd, nm)
+            .filter(|v| !crate::types::lazyimport::is_lazy(v))
+            .map(|v| (kind::MODULE, dict::version(dd), d as u64, v.as_ptr() as usize));
     }
     if o.is_type(type_type()) {
         // class attribute through a plain `type` metaclass

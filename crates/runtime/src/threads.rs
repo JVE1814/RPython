@@ -88,6 +88,8 @@ pub struct ThreadState {
     pub propagated_exc: Cell<(usize, usize)>,
     pub headroom: Cell<bool>,
     pub stack_low: Cell<usize>,
+    /// Native stack kept free below the soft limit (scaled to the thread's stack size).
+    pub stack_margin: Cell<usize>,
     /// True while an OS thread is attached to this state.
     pub alive: std::sync::atomic::AtomicBool,
     /// Pending asynchronous exception (PyThreadState_SetAsyncExc), owned.
@@ -156,6 +158,7 @@ pub fn new_thread_state() -> *mut ThreadState {
             propagated_exc: Cell::new((0, 0)),
             headroom: Cell::new(false),
             stack_low: Cell::new(compute_stack_low()),
+            stack_margin: Cell::new(compute_stack_margin()),
             alive: std::sync::atomic::AtomicBool::new(true),
             async_exc: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             trace_func: Cell::new(std::ptr::null_mut()),
@@ -333,12 +336,22 @@ impl ThreadState {
     /// Lowest usable native stack address (+ margin for raising RecursionError).
     #[inline]
     pub fn stack_soft_limit(&self) -> usize {
-        self.stack_low.get() + 256 * 1024
+        self.stack_low.get() + self.stack_margin.get()
     }
     #[inline]
     pub fn stack_hard_limit(&self) -> usize {
-        self.stack_low.get() + 64 * 1024
+        self.stack_low.get() + self.stack_margin.get() / 4
     }
+}
+
+/// Native stack reserved below the RecursionError limit: 256 KiB on ordinary
+/// stacks, a quarter of the stack for small thread stacks (threading.stack_size()).
+pub fn compute_stack_margin() -> usize {
+    let low = compute_stack_low();
+    let x = 0u8;
+    let here = &x as *const u8 as usize;
+    let size = here.saturating_sub(low);
+    if size == 0 { 256 * 1024 } else { (size / 4).clamp(16 * 1024, 256 * 1024) }
 }
 
 /// Determine the native stack bounds of the calling thread.

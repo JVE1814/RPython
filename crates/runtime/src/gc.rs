@@ -144,9 +144,13 @@ pub unsafe fn track(op: *mut PyObject) {
 }
 
 fn trigger_threshold() -> usize {
-    // young collection after THRESHOLD net new tracked objects
+    // young collection after THRESHOLD net new tracked objects; 0 disables
+    // automatic collection (gc.set_threshold(0))
     let _ = LAST_LIVE.load(Relaxed);
-    THRESHOLD.load(Relaxed)
+    match THRESHOLD.load(Relaxed) {
+        0 => usize::MAX,
+        t => t,
+    }
 }
 
 #[inline]
@@ -523,12 +527,14 @@ fn collect_gen(young_only: bool) -> usize {
     }
     let me = crate::threads::current_mut();
     let saved_exc = crate::errors::take_exc();
+    let t0 = std::time::Instant::now();
     let n = unsafe { collect_phases(me, young_only) };
     release_mature();
     if let Some(e) = saved_exc {
         crate::errors::set_exc(e);
     }
-    if let Some(n) = n {
+    if n.is_some() {
+        crate::gc_support::DURATION_NS.fetch_add((t0.elapsed().as_nanos() as usize).max(1), Relaxed);
         ALLOCS_SINCE.store(0, Relaxed);
         LAST_LIVE.store(TRACKED.load(Relaxed).max(0) as usize, Relaxed);
         if young_only {
@@ -562,6 +568,7 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
         mature_deferred();
         // ---- phase 1 (stopped): find the unreachable objects
         let objs = snapshot_gen(young_only);
+        crate::gc_support::CANDIDATES.fetch_add(objs.len(), Relaxed);
         let unreachable = find_unreachable(objs);
         promote_young();
         if unreachable.is_empty() {
@@ -618,8 +625,15 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
             late.finish();
             v
         };
-        // ---- phase 4 (running): break the cycles
-        let n = to_clear.len();
+        // ---- phase 4 (running): break the cycles (gc.DEBUG_SAVEALL keeps them)
+        let countable = crate::gc_support::countable(&to_clear);
+        let n = countable.len();
+        if crate::gc_support::save_all(&countable) {
+            drop(to_clear);
+            drop(garbage);
+            COLLECTED.fetch_add(n, Relaxed);
+            return Some(n);
+        }
         for g in &to_clear {
             let op = g.as_ptr();
             if !is_tracked(&*op) {

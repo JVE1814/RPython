@@ -449,18 +449,29 @@ fn co_lines(o: &PyObject) -> PyResult {
     let lst = crate::types::list::new_list(out);
     crate::abstract_::get_iter(&lst)
 }
+/// `-X no_debug_ranges` / PYTHONNODEBUGRANGES: code objects report no column ranges.
+pub fn no_debug_ranges() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let c = crate::modules::sys_full::config();
+        c.xoptions.iter().any(|x| x == "no_debug_ranges" || x.starts_with("no_debug_ranges="))
+            || (c.ignore_environment == 0 && std::env::var_os("PYTHONNODEBUGRANGES").is_some_and(|v| !v.is_empty()))
+    })
+}
+
 fn co_positions(o: &PyObject) -> PyResult {
     let d = code_data(o);
     let mut out: Vec<PyRef> = Vec::new();
     let opt = |x: u32, none_if_zero: bool| -> PyRef {
         if (none_if_zero && x == 0) || x == u32::MAX { none::none_ref() } else { int::new_int(x as i64) }
     };
+    let no_ranges = no_debug_ranges();
     for l in &d.locations {
         let item = tuple::new_tuple(vec![
             opt(l.lineno, true),
             opt(l.end_lineno, true),
-            if l.lineno == 0 { none::none_ref() } else { opt(l.col, false) },
-            if l.lineno == 0 { none::none_ref() } else { opt(l.end_col, false) },
+            if l.lineno == 0 || no_ranges { none::none_ref() } else { opt(l.col, false) },
+            if l.lineno == 0 || no_ranges { none::none_ref() } else { opt(l.end_col, false) },
         ]);
         // CPython yields one entry per code unit; ours are 4-byte instructions = 2 code units
         out.push(item.clone());

@@ -25,6 +25,9 @@ pub fn register() {
     reg("_hashlib", hashes::init_hashlib);
     reg("_hmac", hashes::init_hmac);
     reg("_bz2", crate::modules::_bz2::init_module);
+    reg("_lzma", crate::modules::_lzma::init_module);
+    reg("_zstd", crate::modules::_zstd::init_module);
+    reg("_uuid", crate::modules::_uuid::init_module);
 }
 
 /// Object layout: header + pointer to the boxed, mutex-protected Rust state.

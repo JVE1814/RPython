@@ -24,6 +24,8 @@ pub const GC_BIT_MANAGED: u8 = 0x40;
 pub const GC_BIT_LARGE: u8 = 0x20;
 pub const GC_BIT_TRACKED: u8 = 0x01;
 pub const GC_BIT_FINALIZED: u8 = 0x02;
+/// The managed __dict__ was replaced or deleted (no "inline values" any more).
+pub const GC_BIT_DICT_DETACHED: u8 = 0x10;
 
 #[inline]
 pub fn type_is_gc(tp: *const PyTypeObject) -> bool {
@@ -71,6 +73,9 @@ pub unsafe fn alloc_object(tp: *mut PyTypeObject, size: usize) -> *mut PyObject 
         let op = raw.add(pre) as *mut PyObject;
         init_header(op, tp);
         (*op).ob_gc_bits.store(bits | large, Relaxed);
+        if crate::modules::_tracemalloc::TRACING.load(Relaxed) {
+            crate::modules::_tracemalloc::track(op as *const u8, size + pre);
+        }
         op
     }
 }
@@ -122,6 +127,9 @@ pub unsafe fn free_object(op: *mut PyObject) {
         if bits & GC_BIT_TRACKED != 0 {
             crate::gc::untrack(op);
         }
+        if crate::modules::_tracemalloc::TRACING.load(Relaxed) {
+            crate::modules::_tracemalloc::untrack(op as *const u8);
+        }
         let start = alloc_start(op);
         if bits & GC_BIT_LARGE != 0 {
             libc::free(start as *mut libc::c_void);
@@ -132,6 +140,17 @@ pub unsafe fn free_object(op: *mut PyObject) {
 }
 
 pub unsafe fn realloc_object(op: *mut PyObject, new_size: usize) -> *mut PyObject {
+    unsafe {
+        let nop = realloc_object_impl(op, new_size);
+        if !nop.is_null() && crate::modules::_tracemalloc::TRACING.load(Relaxed) {
+            let total = new_size + preheader_size(nop);
+            crate::modules::_tracemalloc::retrack(op as *const u8, nop as *const u8, total);
+        }
+        nop
+    }
+}
+
+unsafe fn realloc_object_impl(op: *mut PyObject, new_size: usize) -> *mut PyObject {
     unsafe {
         let pre = preheader_size(op);
         let bits = (*op).ob_gc_bits.load(Relaxed);
