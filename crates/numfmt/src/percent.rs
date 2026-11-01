@@ -3,7 +3,7 @@
 //! argument fetching (tuple / mapping, `*` arguments, type checks).
 
 use crate::float_fmt::{double_to_string, DtoaFlags};
-use crate::NumFmtError;
+use crate::{try_reserve, NumFmtError};
 
 /// Conversion flags.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -269,9 +269,16 @@ impl PercentOpts {
 
 /// Write `sign + prefix + body` with width/flag handling for numeric
 /// conversions (CPython's `unicode_format_arg_output`).
-fn output_numeric(out: &mut String, sign: Option<char>, prefix: &str, body: &str, opts: &PercentOpts) {
+fn output_numeric(
+    out: &mut String,
+    sign: Option<char>,
+    prefix: &str,
+    body: &str,
+    opts: &PercentOpts,
+) -> Result<(), NumFmtError> {
     let len = sign.is_some() as usize + prefix.len() + body.chars().count();
     let pad = opts.width.map_or(0, |w| w.saturating_sub(len));
+    try_reserve(out, pad.saturating_add(body.len() + 4))?;
     if opts.flags.left {
         if let Some(s) = sign {
             out.push(s);
@@ -294,6 +301,7 @@ fn output_numeric(out: &mut String, sign: Option<char>, prefix: &str, body: &str
         out.push_str(prefix);
         out.push_str(body);
     }
+    Ok(())
 }
 
 fn sign_for(negative: bool, flags: &PercentFlags) -> Option<char> {
@@ -330,13 +338,18 @@ pub fn percent_format_float(out: &mut String, x: f64, conv: char, opts: &Percent
         Some(rest) => (true, rest),
         None => (false, buf.as_str()),
     };
-    output_numeric(out, sign_for(neg, &opts.flags), "", body, opts);
-    Ok(())
+    output_numeric(out, sign_for(neg, &opts.flags), "", body, opts)
 }
 
 /// Format an integer for `%d %i %u %o %x %X` given its sign and the digits
 /// of its magnitude in the conversion's radix (lowercase hex).
-pub fn percent_format_int(out: &mut String, negative: bool, digits: &str, conv: char, opts: &PercentOpts) {
+pub fn percent_format_int(
+    out: &mut String,
+    negative: bool,
+    digits: &str,
+    conv: char,
+    opts: &PercentOpts,
+) -> Result<(), NumFmtError> {
     let prefix = if opts.flags.alt {
         match conv {
             'o' => "0o",
@@ -349,14 +362,15 @@ pub fn percent_format_int(out: &mut String, negative: bool, digits: &str, conv: 
     };
     let ndig = digits.len();
     let zeros = opts.precision.map_or(0, |p| p.saturating_sub(ndig));
-    let mut body = String::with_capacity(ndig + zeros);
+    let mut body = String::new();
+    try_reserve(&mut body, zeros.saturating_add(ndig))?;
     body.extend(core::iter::repeat_n('0', zeros));
     if conv == 'X' {
         body.extend(digits.chars().map(|c| c.to_ascii_uppercase()));
     } else {
         body.push_str(digits);
     }
-    output_numeric(out, sign_for(negative, &opts.flags), prefix, &body, opts);
+    output_numeric(out, sign_for(negative, &opts.flags), prefix, &body, opts)
 }
 
 /// Layout for `%s %r %a %c` (and `%b` for bytes): number of code points to
@@ -375,14 +389,21 @@ pub fn percent_str_layout(len: usize, conv: char, opts: &PercentOpts) -> (usize,
 }
 
 /// Append a string argument for `%s %r %a %c`.
-pub fn percent_format_str(out: &mut String, s: &str, conv: char, opts: &PercentOpts) {
+pub fn percent_format_str(
+    out: &mut String,
+    s: &str,
+    conv: char,
+    opts: &PercentOpts,
+) -> Result<(), NumFmtError> {
     let (take, l, r) = percent_str_layout(s.chars().count(), conv, opts);
+    try_reserve(out, l.saturating_add(r).saturating_add(s.len()))?;
     out.extend(core::iter::repeat_n(' ', l));
     match s.char_indices().nth(take) {
         Some((i, _)) => out.push_str(&s[..i]),
         None => out.push_str(s),
     }
     out.extend(core::iter::repeat_n(' ', r));
+    Ok(())
 }
 
 /// Error for `%c` with an out-of-range int.

@@ -45,6 +45,7 @@ pub enum ErrorKind {
     ValueError,
     OverflowError,
     TypeError,
+    MemoryError,
 }
 
 /// Error with the exact CPython exception type and message.
@@ -64,6 +65,14 @@ impl NumFmtError {
     pub fn type_error(msg: impl Into<String>) -> Self {
         NumFmtError { kind: ErrorKind::TypeError, msg: msg.into() }
     }
+}
+
+/// Reserve room for `n` more bytes, mapping allocation failure (or a
+/// capacity overflow from an absurd width) to MemoryError like CPython.
+#[inline]
+pub(crate) fn try_reserve(out: &mut String, n: usize) -> Result<(), NumFmtError> {
+    out.try_reserve(n)
+        .map_err(|_| NumFmtError { kind: ErrorKind::MemoryError, msg: String::new() })
 }
 
 impl core::fmt::Display for NumFmtError {

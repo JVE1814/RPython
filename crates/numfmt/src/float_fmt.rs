@@ -2,7 +2,7 @@
 //! (the equivalent of CPython's `PyOS_double_to_string`) and float repr.
 
 use crate::dtoa::{self, Digits};
-use crate::{NumFmtError, PRECISION_MAX};
+use crate::{try_reserve, NumFmtError, PRECISION_MAX};
 
 /// Flags for [`double_to_string`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -166,6 +166,9 @@ pub fn double_to_string(
     };
     if precision > PRECISION_MAX {
         return Err(NumFmtError::value("precision too big"));
+    }
+    if precision > 64 {
+        try_reserve(out, precision + 400)?;
     }
     if x.is_nan() {
         if flags.sign {

@@ -119,7 +119,7 @@ fn pct(fmt: &str, args: &[Arg]) -> Result<String, NumFmtError> {
                     'x' | 'X' => 16,
                     _ => 10,
                 };
-                percent_format_int(&mut out, v < 0, &radix_digits(v.unsigned_abs(), radix), spec.conv, &opts);
+                percent_format_int(&mut out, v < 0, &radix_digits(v.unsigned_abs(), radix), spec.conv, &opts)?;
             }
             'e' | 'E' | 'f' | 'F' | 'g' | 'G' => {
                 let v = match arg {
@@ -135,7 +135,7 @@ fn pct(fmt: &str, args: &[Arg]) -> Result<String, NumFmtError> {
                     Arg::I(v) => v.to_string(),
                     Arg::F(f) => float_repr(*f),
                 };
-                percent_format_str(&mut out, &s, spec.conv, &opts);
+                percent_format_str(&mut out, &s, spec.conv, &opts)?;
             }
             _ => unreachable!(),
         }
@@ -1499,4 +1499,17 @@ fn strtod_halfway_cases() {
     }
     assert_eq!(parse_float("10.900000000000000012345678912345678912345").unwrap(), 10.9);
     assert_eq!(parse_float("999999999999999944488848768742172978818416595458984375e-54").unwrap(), 1.0);
+}
+
+#[test]
+fn huge_width_is_memory_error() {
+    let w = i64::MAX.to_string();
+    for spec in [format!("{}f", w), format!("0{}f", w), format!("{},.2f", w), format!("0{},.2f", w)] {
+        assert_eq!(format_float(2.34, &spec, "float").unwrap_err().kind, ErrorKind::MemoryError, "{}", spec);
+    }
+    assert_eq!(format_str("x", &format!("{}", w), "str").unwrap_err().kind, ErrorKind::MemoryError);
+    assert_eq!(format_i128(5, &format!("0{}", w), "int").unwrap_err().kind, ErrorKind::MemoryError);
+    assert_eq!(format_complex(1.0, 2.0, &format!("{}", w), "complex").unwrap_err().kind, ErrorKind::MemoryError);
+    assert_eq!(pct(&format!("%{}d", w), &[Arg::I(1)]).unwrap_err().kind, ErrorKind::MemoryError);
+    assert_eq!(pct(&format!("%{}s", w), &[Arg::S("a")]).unwrap_err().kind, ErrorKind::MemoryError);
 }

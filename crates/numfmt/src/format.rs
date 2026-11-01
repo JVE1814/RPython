@@ -2,7 +2,7 @@
 
 use crate::float_fmt::{double_to_string, DtoaFlags};
 use crate::spec::{unknown_presentation_type, Align, FormatSpec};
-use crate::NumFmtError;
+use crate::{try_reserve, NumFmtError};
 
 /// Numeric locale information used by the 'n' presentation type.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -232,7 +232,7 @@ fn render_number(
     width: Option<usize>,
     grouping: &Grouping,
     frac_sep: Option<char>,
-) -> usize {
+) -> Result<usize, NumFmtError> {
     let n_sign = p.sign.is_some() as usize;
     let n_prefix = p.prefix.len();
     let n_decimal = p.decimal.chars().count();
@@ -244,6 +244,9 @@ fn render_number(
         _ => 0,
     };
     let mut grouped = String::new();
+    if min_width > 0 {
+        try_reserve(&mut grouped, (min_width as usize).saturating_add(min_width as usize / 2))?;
+    }
     let n_grouped = if p.digits.is_empty() {
         0
     } else if grouping.sizes.is_empty() && min_width <= p.digits.len() as isize {
@@ -263,7 +266,7 @@ fn render_number(
         Align::Center => (n_pad / 2, 0, n_pad - n_pad / 2),
         Align::AfterSign => (0, n_pad, 0),
     };
-    out.reserve(total + n_pad);
+    try_reserve(out, (grouped.len() + non_digit * 4).saturating_add(n_pad.saturating_mul(fill.len_utf8())))?;
     push_fill(out, fill, lpad);
     if let Some(s) = p.sign {
         out.push(s);
@@ -275,7 +278,7 @@ fn render_number(
     push_frac_grouped(out, p.frac, frac_sep);
     out.push_str(p.rest);
     push_fill(out, fill, rpad);
-    total + n_pad
+    Ok(total + n_pad)
 }
 
 /// Split a formatted (unsigned) float string into digits / decimal / frac / rest.
@@ -420,7 +423,7 @@ pub fn format_float_spec(
         rest,
     };
     let g = number_grouping(spec, locale, is_n, false);
-    render_number(out, &parts, spec.fill, spec.align, spec.width, &g, spec.frac_grouping);
+    render_number(out, &parts, spec.fill, spec.align, spec.width, &g, spec.frac_grouping)?;
     Ok(())
 }
 
@@ -478,7 +481,7 @@ pub fn format_int(
         rest: "",
     };
     let g = number_grouping(spec, locale, is_n, four);
-    render_number(out, &parts, spec.fill, spec.align, spec.width, &g, None);
+    render_number(out, &parts, spec.fill, spec.align, spec.width, &g, None)?;
     Ok(())
 }
 
@@ -538,6 +541,7 @@ pub fn format_int_char(out: &mut String, code: Option<i64>, spec: &FormatSpec) -
     let (cp, layout) = int_char_layout(code, spec)?;
     let ch = char::from_u32(cp).unwrap_or('\u{FFFD}');
     let mut tmp = [0u8; 4];
+    try_reserve(out, (layout.lpad + layout.rpad).saturating_mul(layout.fill.len_utf8()).saturating_add(4))?;
     layout.apply(out, ch.encode_utf8(&mut tmp));
     Ok(())
 }
@@ -584,7 +588,8 @@ pub fn format_str(s: &str, spec: &str, type_name: &str) -> Result<String, NumFmt
     }
     let f = FormatSpec::parse_str(spec, type_name)?;
     let layout = str_layout(s.chars().count(), &f, type_name)?;
-    let mut out = String::with_capacity(s.len() + layout.lpad + layout.rpad);
+    let mut out = String::new();
+    try_reserve(&mut out, (layout.lpad + layout.rpad).saturating_mul(layout.fill.len_utf8()).saturating_add(s.len()))?;
     layout.apply(&mut out, s);
     Ok(out)
 }
@@ -675,13 +680,13 @@ pub fn format_complex_spec(
     if !skip_re {
         let (d, h, f, r) = split_number(&re_buf);
         let parts = NumParts { sign: resolve_sign(spec.sign, re_neg), prefix: "", digits: d, decimal: dec_of(h), frac: f, rest: r };
-        render_number(&mut body, &parts, ' ', Align::Left, None, &g, spec.frac_grouping);
+        render_number(&mut body, &parts, ' ', Align::Left, None, &g, spec.frac_grouping)?;
     }
     {
         let (d, h, f, r) = split_number(&im_buf);
         let im_sign = if skip_re { spec.sign } else { Some('+') };
         let parts = NumParts { sign: resolve_sign(im_sign, im_neg), prefix: "", digits: d, decimal: dec_of(h), frac: f, rest: r };
-        render_number(&mut body, &parts, ' ', Align::Left, None, &g, spec.frac_grouping);
+        render_number(&mut body, &parts, ' ', Align::Left, None, &g, spec.frac_grouping)?;
     }
     body.push('j');
     if add_parens {
@@ -689,6 +694,7 @@ pub fn format_complex_spec(
     }
     let n = body.chars().count();
     let (lpad, rpad) = calc_padding(n, spec.width, spec.align);
+    try_reserve(out, (lpad + rpad).saturating_mul(spec.fill.len_utf8()).saturating_add(body.len()))?;
     push_fill(out, spec.fill, lpad);
     out.push_str(&body);
     push_fill(out, spec.fill, rpad);
