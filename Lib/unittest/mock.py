@@ -29,6 +29,7 @@ __all__ = (
     'seal',
 )
 
+import annotationlib as _annotationlib
 import builtins
 import contextlib
 import inspect
@@ -237,13 +238,14 @@ def _get_signature_object(func, as_instance, eat_self):
         if isinstance(func, classmethod):
             eat_self = True
         func = func.__func__
-    elif not isinstance(func, FunctionTypes):
+    elif not isinstance(func, FunctionTypes + (MethodType, _partial)):
         try:
             func = func.__call__
         except AttributeError:
             return None
     try:
-        sig = inspect.signature(func)
+        sig = inspect.signature(
+            func, annotation_format=_annotationlib.Format.FORWARDREF)
     except (ValueError, TypeError):
         return None
     if eat_self:
@@ -738,6 +740,8 @@ def _delegated(name, doc=None):
     object holds the authoritative value instead.
     """
     slot = '_mock_' + name
+    # assignments must reach the property even on spec_set mocks
+    _allowed_names.add(name)
 
     def fget(self):
         delegate = self._mock_delegate
@@ -913,7 +917,8 @@ class NonCallableMock(Base):
         if delegate is not None:
             return delegate.return_value
         value = self._mock_return_value
-        if value is DEFAULT:
+        # a wrapping mock reports DEFAULT: calls go to the wrapped object
+        if value is DEFAULT and self._mock_wraps is None:
             value = self._get_child_mock(_new_parent=self, _new_name='()')
             self.return_value = value
         return value
@@ -983,11 +988,14 @@ class NonCallableMock(Base):
         if side_effect:
             self._mock_side_effect = None
 
-        for child in self._mock_children.values():
+        for name, child in self._mock_children.items():
             if isinstance(child, _SpecState) or child is _deleted:
                 continue
             child.reset_mock(visited, return_value=return_value,
                              side_effect=side_effect)
+            if return_value and name in _all_magics:
+                # magic methods fall back to their defaults, not to mocks
+                _set_return_value(self, child, name)
 
         current = self._mock_return_value
         if _is_instance_mock(current) and current is not self:
@@ -1042,8 +1050,7 @@ class NonCallableMock(Base):
                                          result.instance, result.parent,
                                          result.name)
             except InvalidSpecError:
-                owner = self._mock_name or self._spec_class or self
-                owner_name = getattr(owner, '__name__', owner)
+                owner_name = self._mock_name or self
                 raise InvalidSpecError(
                     f'Cannot autospec attr {result.name!r} from target '
                     f'{owner_name!r} as it has already been mocked out. '
@@ -1186,7 +1193,9 @@ class NonCallableMock(Base):
             bound = signature.bind(*args, **kwargs)
         except TypeError as exc:
             return exc.with_traceback(None)
-        return _Call((name, bound.args, bound.kwargs))
+        # the name becomes part of the arguments so that differently named
+        # calls never compare equal once normalised
+        return _Call(((name, bound.args, bound.kwargs), {}), two=True)
 
     def _calls_repr(self, prefix='Calls'):
         if not self.mock_calls:
@@ -1254,7 +1263,7 @@ class NonCallableMock(Base):
                               for e in expected]
                     problem = ('Error processing expected calls.\n'
                                'Errors: {}'.format(errors))
-                actual = self._calls_repr(prefix='  Actual').rstrip('.')
+                actual = f'\n  Actual: {safe_repr(self.mock_calls)}'
                 raise AssertionError(
                     f'{problem}\nExpected: {_CallList(calls)}{actual}'
                 ) from cause
@@ -1922,7 +1931,10 @@ def create_autospec(spec, spec_set=False, instance=False, _parent=None,
 
     _name = kwargs.pop('name', _name)
     new_name = _name if _parent is not None else ''
-    spec_kwargs.update(kwargs)
+    # dotted settings may reach into the autospecced return value or
+    # children, so they are applied once the whole structure exists
+    dotted_settings = {k: v for k, v in kwargs.items() if '.' in k}
+    spec_kwargs.update((k, v) for k, v in kwargs.items() if '.' not in k)
 
     if inspect.isdatadescriptor(spec):
         # the value type a descriptor produces is unknown
@@ -1993,8 +2005,8 @@ def create_autospec(spec, spec_set=False, instance=False, _parent=None,
         if isinstance(child, FunctionTypes):
             setattr(mock, entry, child)
 
-    if isinstance(mock, FunctionTypes):
-        return mock
+    if dotted_settings:
+        _extract_mock(mock).configure_mock(**dotted_settings)
     return mock
 
 
