@@ -51,6 +51,12 @@ pub mod _heapq;
 pub mod _bisect;
 pub mod devtools;
 pub mod marshal;
+pub mod pwd;
+pub mod resource;
+pub mod fcntl;
+pub mod termios;
+pub mod syslog;
+pub mod mmap;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
 pub fn register_all() {
