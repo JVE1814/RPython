@@ -377,6 +377,32 @@ pub fn import_name(
     let Some(hook) = hook else { raise!(ImportError, "__lazy_import__ not found") };
     let fl = normalize_fromlist(Some(fromlist))?;
     if hook.as_ptr() == LAZY_FN.load(std::sync::atomic::Ordering::Acquire) {
+        // `lazy import a.x` after `lazy import a.y`: keep the placeholder already bound
+        // to `a` (it imports a.y when used); a.x becomes a pending submodule of a
+        if fl.is(none::none()) && ab::as_i64(level)? == 0 && dict::is_dict(globals) {
+            let full = pystr::to_string_lossy(nm);
+            if let Some((top, _)) = full.split_once('.') {
+                if let Some(cur) = dict::get_item_str(globals, &pystr::new_str(top)) {
+                    let c = li(&cur);
+                    if is_lazy(&cur) && c.base.is_null() && !c.resolved.is_null() && opt_ref(c.fromlist).is_none_or(|f| f.is(none::none()) || !ab::is_true(&f).unwrap_or(true)) {
+                        let cr = pystr::to_string_lossy(unsafe { &*c.resolved });
+                        if cr.split('.').next() == Some(top) && call_filter(Some(globals), &full, &fl)? {
+                            let mut acc = String::new();
+                            for part in full.split('.') {
+                                if !acc.is_empty() {
+                                    acc.push('.');
+                                }
+                                acc.push_str(part);
+                                if !in_sys_modules(&acc) && !pending_module(&acc) {
+                                    track(&acc, true)?;
+                                }
+                            }
+                            return Ok(cur);
+                        }
+                    }
+                }
+            }
+        }
         return lazy_import_impl(nm, Some(globals), Some(locals), &fl, level);
     }
     ab::call(&hook, &[nm, globals, locals, &fl, level])

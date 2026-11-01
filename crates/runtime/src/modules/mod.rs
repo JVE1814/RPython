@@ -89,6 +89,7 @@ pub mod _datetime;
 pub fn register_all() {
     crate::import::register_builtin("_weakref", _weakref::init);
     crate::import::register_builtin("_testinternalcapi", testinternalcapi::init);
+    crate::import::register_builtin("_suggestions", suggestions::init_module);
     crate::import::register_builtin("_string", crate::types::str_methods::init_string_module);
     crate::import::register_builtin("posix", posix::init);
     crate::import::register_builtin("errno", errno::init);
