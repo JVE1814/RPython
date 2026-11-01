@@ -83,7 +83,7 @@ pub fn allocate(f: &Func) -> Alloc {
     let words = nv.div_ceil(64).max(1);
     let mut live_in = vec![vec![0u64; words]; nb];
     let mut live_out = vec![vec![0u64; words]; nb];
-    let succs: Vec<Vec<BlockId>> = f.blocks.iter().map(|b| b.term.succs()).collect();
+    let succs: Vec<Vec<BlockId>> = f.blocks.iter().map(|b| b.term.succs().into_iter().chain(b.tsuccs.iter().copied()).collect()).collect();
     let mut changed = true;
     while changed {
         changed = false;

@@ -233,6 +233,9 @@ pub enum SnapKind {
 pub struct Block {
     pub insts: Vec<Inst>,
     pub term: Term,
+    /// blocks a template instruction of this block jumps to by itself (control flow
+    /// not described by `term`; needed for liveness)
+    pub tsuccs: Vec<BlockId>,
     /// first bytecode instruction index of the block (u32::MAX for synthetic blocks)
     pub instr: u32,
 }

@@ -345,7 +345,7 @@ impl<'a> B<'a> {
         self.f.blocks[self.cur as usize].insts.push(i);
     }
     fn new_block(&mut self, instr: u32) -> BlockId {
-        self.f.blocks.push(Block { insts: Vec::new(), term: Term::None, instr });
+        self.f.blocks.push(Block { insts: Vec::new(), term: Term::None, instr, tsuccs: Vec::new() });
         self.f.blocks.len() as BlockId - 1
     }
     fn term(&mut self, t: Term) {
@@ -863,6 +863,9 @@ impl<'a> B<'a> {
             let nd = (d + jump).max(0) as usize;
             self.settle_after_template(&mut js, nd);
             self.edge_state(t, js);
+            // the template jumps there itself: record the edge for liveness
+            let tb = self.ir_block[t];
+            self.f.blocks[self.cur as usize].tsuccs.push(tb);
         }
         let nd = (d + fall).max(0) as usize;
         let mut st = std::mem::replace(&mut self.st, State { stack: vec![], locals: vec![], ptr: vec![], unb: vec![] });
@@ -2419,7 +2422,7 @@ fn build_once(u: &Unit, reps: &[Rep], assume: &mut Vec<Option<State>>) -> Result
     let mut f = Func { blocks: Vec::new(), classes: Vec::new(), snaps: Vec::new(), order: Vec::new(), entries: Vec::new() };
     let mut ir_block = vec![u32::MAX; nb];
     for &b in &cfg.order {
-        f.blocks.push(Block { insts: Vec::new(), term: Term::None, instr: cfg.blocks[b].first as u32 });
+        f.blocks.push(Block { insts: Vec::new(), term: Term::None, instr: cfg.blocks[b].first as u32, tsuccs: Vec::new() });
         ir_block[b] = f.blocks.len() as u32 - 1;
     }
     let mut homes = vec![u32::MAX; u.nlp];
