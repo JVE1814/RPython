@@ -205,7 +205,18 @@ fn get_doc(o: &PyObject) -> PyResult {
     }
 }
 fn get_textsig(o: &PyObject) -> PyResult {
-    match raw_doc(o).and_then(|d| crate::types::descr::text_signature(&cfunction_name(o), &d)) {
+    let (flags, slf) = unsafe { ((*(*fptr(o)).m_ml).ml_flags, (*fptr(o)).m_self) };
+    let first = if slf.is_null() || flags & METH_STATIC != 0 {
+        None
+    } else if crate::types::module::is_module(unsafe { &*slf }) {
+        Some("$module")
+    } else if flags & METH_CLASS != 0 {
+        Some("$type")
+    } else {
+        Some("$self")
+    };
+    let doc = raw_doc(o);
+    match crate::types::descr::method_text_signature(&cfunction_name(o), doc.as_deref(), flags, first) {
         Some(s) => Ok(pystr::new_str(&s)),
         None => Ok(none::none_ref()),
     }
