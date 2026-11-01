@@ -526,7 +526,7 @@ unsafe extern "C" fn m_repr_slot(o: *mut PyObject) -> *mut PyObject {
         let o = &*o;
         let r = (|| -> PyResult {
             let st = cc::lock::<HmacState>(o)?;
-            Ok(pystr::new_str(&format!("<{} HMAC object @ {:#x}>", st.name, o.as_ptr() as usize)))
+            Ok(pystr::new_str(&format!("<{} HMAC object @ {:#x}>", st.name.trim_start_matches("hmac-"), o.as_ptr() as usize)))
         })();
         into_c(r)
     }

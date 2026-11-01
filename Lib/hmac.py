@@ -57,6 +57,23 @@ def _is_xof(constructor):
     return isinstance(name, str) and name.lower().startswith("shake")
 
 
+def _usable_block_size(hash_obj, default):
+    """The hash's block size, or *default* (with a RuntimeWarning) when it
+    is missing or implausibly small."""
+    bs = getattr(hash_obj, 'block_size', None)
+    if bs is None:
+        import warnings
+        warnings.warn('No block_size attribute on given digest object; '
+                      f'Assuming {default}.', RuntimeWarning, 3)
+        return default
+    if bs < 16:
+        import warnings
+        warnings.warn(f'block_size of {bs} seems too small; '
+                      f'using our default of {default}.', RuntimeWarning, 3)
+        return default
+    return bs
+
+
 def _padded_key(key, blocksize, constructor):
     if len(key) > blocksize:
         key = constructor(key).digest()
@@ -125,18 +142,7 @@ class HMAC:
         outer = make()
         self.digest_size = inner.digest_size
 
-        bs = getattr(inner, 'block_size', None)
-        if bs is None:
-            import warnings
-            warnings.warn('No block_size attribute on given digest object; '
-                          f'Assuming {self.blocksize}.', RuntimeWarning, 2)
-            bs = self.blocksize
-        elif bs < 16:
-            import warnings
-            warnings.warn(f'block_size of {bs} seems too small; '
-                          f'using our default of {self.blocksize}.',
-                          RuntimeWarning, 2)
-            bs = self.blocksize
+        bs = _usable_block_size(inner, self.blocksize)
         self.block_size = bs
 
         padded = _padded_key(key, bs, make)
@@ -219,12 +225,15 @@ def digest(key, msg, digest):
 
 
 def _compute_digest_fallback(key, msg, digest):
+    if not isinstance(key, (bytes, bytearray)):
+        raise TypeError("key: expected bytes or bytearray, "
+                        f"but got {type(key).__name__!r}")
     make = _constructor_for(digest)
     if _is_xof(make):
         raise ValueError(f"unsupported hash type {digest}")
     inner = make()
     outer = make()
-    padded = _padded_key(key, getattr(inner, 'block_size', 64), make)
+    padded = _padded_key(key, _usable_block_size(inner, HMAC.blocksize), make)
     inner.update(padded.translate(trans_36))
     inner.update(msg)
     outer.update(padded.translate(trans_5C))
