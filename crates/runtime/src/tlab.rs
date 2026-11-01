@@ -9,7 +9,6 @@
 //!   refill from it, and only then carve fresh pages.
 //! * Blocks larger than the biggest class are served by the system allocator.
 
-use std::cell::RefCell;
 use std::sync::Mutex;
 
 pub const PAGE: usize = 64 * 1024;
@@ -63,35 +62,6 @@ struct Depot {
     segments: Vec<usize>,
 }
 
-static DEPOT: Mutex<Option<Depot>> = Mutex::new(None);
-
-const BATCH: usize = 64;
-const CACHE_LIMIT: usize = 256;
-
-struct Cache {
-    lists: [Vec<usize>; NCLASSES],
-}
-
-impl Drop for Cache {
-    fn drop(&mut self) {
-        let mut g = DEPOT.lock().unwrap();
-        let d = g.get_or_insert_with(new_depot);
-        for (c, l) in self.lists.iter_mut().enumerate() {
-            if !l.is_empty() {
-                d.batches[c].push(std::mem::take(l));
-            }
-        }
-    }
-}
-
-fn new_depot() -> Depot {
-    Depot { batches: (0..NCLASSES).map(|_| Vec::new()).collect(), seg_cur: 0, seg_end: 0, segments: Vec::new() }
-}
-
-thread_local! {
-    static CACHE: RefCell<Cache> = RefCell::new(Cache { lists: std::array::from_fn(|_| Vec::with_capacity(CACHE_LIMIT)) });
-}
-
 fn new_page(d: &mut Depot, class: usize) -> Vec<usize> {
     if d.seg_cur + PAGE > d.seg_end {
         unsafe {
@@ -132,51 +102,153 @@ fn new_page(d: &mut Depot, class: usize) -> Vec<usize> {
     v
 }
 
-#[cold]
-fn refill(class: usize, list: &mut Vec<usize>) {
-    let mut g = DEPOT.lock().unwrap();
-    let d = g.get_or_insert_with(new_depot);
-    if let Some(b) = d.batches[class].pop() {
-        list.extend(b);
-        return;
+static DEPOT: Mutex<Option<Depot>> = Mutex::new(None);
+
+const BATCH: usize = 64;
+const CACHE_LIMIT: usize = 256;
+
+fn new_depot() -> Depot {
+    Depot { batches: (0..NCLASSES).map(|_| Vec::new()).collect(), seg_cur: 0, seg_end: 0, segments: Vec::new() }
+}
+
+/// Per-thread cache: one intrusive free list per size class (the first word of a
+/// free block links to the next one). `#[thread_local]` gives direct fs-relative
+/// access without lazy-init checks; a separate guard returns the blocks to the depot
+/// when the thread exits.
+struct ThreadCache {
+    heads: [usize; NCLASSES],
+    counts: [u32; NCLASSES],
+    registered: bool,
+    dead: bool,
+}
+
+#[thread_local]
+static mut TC: ThreadCache = ThreadCache { heads: [0; NCLASSES], counts: [0; NCLASSES], registered: false, dead: false };
+
+struct ExitGuard;
+impl Drop for ExitGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let tc = &mut *(&raw mut TC);
+            tc.dead = true;
+            let mut g = DEPOT.lock().unwrap_or_else(|e| e.into_inner());
+            let d = g.get_or_insert_with(new_depot);
+            for c in 0..NCLASSES {
+                let mut v = Vec::with_capacity(tc.counts[c] as usize);
+                let mut p = tc.heads[c];
+                while p != 0 {
+                    v.push(p);
+                    p = *(p as *const usize);
+                }
+                tc.heads[c] = 0;
+                tc.counts[c] = 0;
+                if !v.is_empty() {
+                    d.batches[c].push(v);
+                }
+            }
+        }
     }
-    let blocks = new_page(d, class);
-    list.extend(blocks);
+}
+
+thread_local! {
+    static GUARD: ExitGuard = const { ExitGuard };
 }
 
 #[cold]
-fn spill(class: usize, list: &mut Vec<usize>) {
-    let keep = list.len() - BATCH;
-    let batch: Vec<usize> = list.drain(keep..).collect();
-    let mut g = DEPOT.lock().unwrap();
-    let d = g.get_or_insert_with(new_depot);
-    d.batches[class].push(batch);
+fn register(tc: &mut ThreadCache) {
+    tc.registered = true;
+    let _ = GUARD.try_with(|_| ());
+}
+
+#[cold]
+fn refill(class: usize, tc: &mut ThreadCache) {
+    if !tc.registered {
+        register(tc);
+    }
+    let blocks = {
+        let mut g = DEPOT.lock().unwrap_or_else(|e| e.into_inner());
+        let d = g.get_or_insert_with(new_depot);
+        match d.batches[class].pop() {
+            Some(b) => b,
+            None => new_page(d, class),
+        }
+    };
+    for p in blocks {
+        unsafe { *(p as *mut usize) = tc.heads[class] };
+        tc.heads[class] = p;
+        tc.counts[class] += 1;
+    }
+}
+
+#[cold]
+fn spill(class: usize, tc: &mut ThreadCache) {
+    let mut batch = Vec::with_capacity(BATCH);
+    for _ in 0..BATCH {
+        let p = tc.heads[class];
+        if p == 0 {
+            break;
+        }
+        tc.heads[class] = unsafe { *(p as *const usize) };
+        tc.counts[class] -= 1;
+        batch.push(p);
+    }
+    let mut g = DEPOT.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(new_depot).batches[class].push(batch);
+}
+
+#[inline(always)]
+unsafe fn zero_block(p: *mut u8, size: usize) {
+    unsafe {
+        // constant-size stores for the common small classes (avoids a memset call)
+        match size {
+            16 => std::ptr::write_bytes(p, 0, 16),
+            32 => std::ptr::write_bytes(p, 0, 32),
+            48 => std::ptr::write_bytes(p, 0, 48),
+            64 => std::ptr::write_bytes(p, 0, 64),
+            80 => std::ptr::write_bytes(p, 0, 80),
+            96 => std::ptr::write_bytes(p, 0, 96),
+            _ => std::ptr::write_bytes(p, 0, size),
+        }
+    }
 }
 
 /// Allocate a zeroed small block (size <= MAX_SMALL). Null on OOM.
 #[inline]
 pub fn alloc_small(size: usize) -> *mut u8 {
     let c = CLASS_OF[(size + 15) / 16] as usize;
-    let p = CACHE
-        .try_with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let list = &mut cache.lists[c];
-            if list.is_empty() {
-                refill(c, list);
+    unsafe {
+        let tc = &mut *(&raw mut TC);
+        let mut p = tc.heads[c];
+        if p == 0 {
+            if tc.dead {
+                return alloc_from_depot(c);
             }
-            list.pop().unwrap_or(0)
-        })
-        .unwrap_or_else(|_| {
-            // thread is exiting: take directly from the depot
-            let mut v = Vec::new();
-            refill(c, &mut v);
-            let p = v.pop().unwrap_or(0);
-            if !v.is_empty() {
-                let mut g = DEPOT.lock().unwrap();
-                g.get_or_insert_with(new_depot).batches[c].push(v);
+            refill(c, tc);
+            p = tc.heads[c];
+            if p == 0 {
+                return std::ptr::null_mut();
             }
-            p
-        });
+        }
+        tc.heads[c] = *(p as *const usize);
+        tc.counts[c] -= 1;
+        zero_block(p as *mut u8, CLASSES[c]);
+        p as *mut u8
+    }
+}
+
+#[cold]
+fn alloc_from_depot(c: usize) -> *mut u8 {
+    // thread is exiting: take directly from the depot
+    let mut g = DEPOT.lock().unwrap_or_else(|e| e.into_inner());
+    let d = g.get_or_insert_with(new_depot);
+    let mut v = match d.batches[c].pop() {
+        Some(b) => b,
+        None => new_page(d, c),
+    };
+    let p = v.pop().unwrap_or(0);
+    if !v.is_empty() {
+        d.batches[c].push(v);
+    }
     if p != 0 {
         unsafe { std::ptr::write_bytes(p as *mut u8, 0, CLASSES[c]) };
     }
@@ -202,18 +274,21 @@ pub fn small_size_of(p: *mut u8) -> usize {
 #[inline]
 pub fn free_small(p: *mut u8) {
     let c = small_class_of(p);
-    let ok = CACHE
-        .try_with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let list = &mut cache.lists[c];
-            list.push(p as usize);
-            if list.len() > CACHE_LIMIT {
-                spill(c, list);
-            }
-        })
-        .is_ok();
-    if !ok {
-        let mut g = DEPOT.lock().unwrap();
-        g.get_or_insert_with(new_depot).batches[c].push(vec![p as usize]);
+    unsafe {
+        let tc = &mut *(&raw mut TC);
+        if tc.dead {
+            let mut g = DEPOT.lock().unwrap_or_else(|e| e.into_inner());
+            g.get_or_insert_with(new_depot).batches[c].push(vec![p as usize]);
+            return;
+        }
+        if !tc.registered {
+            register(tc);
+        }
+        *(p as *mut usize) = tc.heads[c];
+        tc.heads[c] = p as usize;
+        tc.counts[c] += 1;
+        if tc.counts[c] as usize > CACHE_LIMIT {
+            spill(c, tc);
+        }
     }
 }

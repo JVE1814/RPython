@@ -100,6 +100,9 @@ pub unsafe fn untrack(op: *mut PyObject) {
         });
         o.ob_gc_bits.fetch_and(!GC_BIT_TRACKED, Relaxed);
         TRACKED.fetch_sub(1, Relaxed);
+        // allocations minus deallocations (like CPython gen0 counts): short-lived
+        // objects do not trigger collections
+        let _ = ALLOCS_SINCE.fetch_update(Relaxed, Relaxed, |v| v.checked_sub(1));
     }
 }
 
@@ -203,9 +206,26 @@ fn total_refcnt(o: &PyObject) -> isize {
     local as isize + (o.ob_ref_shared.load(Relaxed) >> REF_SHARED_SHIFT)
 }
 
+/// Multiplicative hash for object addresses (SipHash dominated collection time).
+#[derive(Default)]
+struct PtrHasher(u64);
+impl std::hash::Hasher for PtrHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        }
+    }
+    fn write_usize(&mut self, v: usize) {
+        self.0 = ((v as u64) >> 4).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
 struct Graph {
     objs: Vec<*mut PyObject>,
-    index: HashMap<usize, usize>,
+    index: HashMap<usize, usize, std::hash::BuildHasherDefault<PtrHasher>>,
     refs: Vec<isize>,
     reachable: Vec<bool>,
 }
