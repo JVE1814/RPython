@@ -45,24 +45,31 @@ pub fn merge_from_seq2(d: &PyObject, src: &PyObject, overwrite: bool) -> PyResul
         let (k, v) = if tuple::is_tuple_exact(&item) && tuple::tuple_len(&item) == 2 {
             (tuple::tuple_get(&item, 0).to_ref(), tuple::tuple_get(&item, 1).to_ref())
         } else {
-            let pair = match ab::get_iter(&item) {
-                Ok(pit) => {
-                    let mut v = Vec::with_capacity(2);
-                    while let Some(x) = ab::iter_next(&pit)? {
-                        v.push(x);
+            let pair = match (|| {
+                // PySequence_Fast(item, "object is not iterable") semantics
+                let pit = match ab::get_iter(&item) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        if exc_matches(exceptions::TypeError()) {
+                            clear_exc();
+                            return Err(err!(TypeError, "object is not iterable"));
+                        }
+                        return Err(e);
                     }
-                    v
+                };
+                let mut v = Vec::with_capacity(2);
+                while let Some(x) = ab::iter_next(&pit)? {
+                    v.push(x);
                 }
+                Ok::<_, PyErr>(v)
+            })() {
+                Ok(v) => v,
                 Err(e) => {
                     if exc_matches(exceptions::TypeError()) {
-                        let orig = take_exc();
-                        let _ = err!(TypeError, "cannot convert dictionary update sequence element #{} to a sequence", i);
-                        if let (Some(o), p) = (orig, current_exc_ptr()) {
-                            if !p.is_null() {
-                                exceptions::set_context_and_cause(unsafe { &*p }, Some(&o));
-                            }
-                        }
-                        return Err(PyErr);
+                        crate::modules::traceback_util::add_note_to_current(&format!(
+                            "Cannot convert dictionary update sequence element #{} to a sequence",
+                            i
+                        ));
                     }
                     return Err(e);
                 }
@@ -362,7 +369,7 @@ unsafe extern "C" fn dict_or(a: *mut PyObject, b: *mut PyObject) -> *mut PyObjec
     unsafe {
         let (a, b) = (&*a, &*b);
         let r = (|| -> PyResult {
-            if !dict::is_dict(a) || !dict::is_dict(b) {
+            if !dict::is_dict(a) || !dict::is_anydict(b) {
                 return Ok(ni());
             }
             let n = dict::copy(a)?;

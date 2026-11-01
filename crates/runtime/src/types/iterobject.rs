@@ -32,6 +32,9 @@ unsafe extern "C" fn seqiter_next(o: *mut PyObject) -> *mut PyObject {
         if it.seq.is_null() {
             return std::ptr::null_mut();
         }
+        if it.index == isize::MAX {
+            return into_c(Err(crate::err!(OverflowError, "iter index too large")));
+        }
         let seq = &*it.seq;
         let tp = seq.ty();
         let r = if !tp.tp_as_sequence.is_null() && (*tp.tp_as_sequence).sq_item.is_some() {
@@ -138,10 +141,12 @@ unsafe extern "C" fn calliter_next(o: *mut PyObject) -> *mut PyObject {
         match ab::call(&f, &[]) {
             Ok(v) => {
                 if it.sentinel.is_null() {
-                    return v.into_raw();
+                    // exhausted re-entrantly during the call
+                    drop(v);
+                    return std::ptr::null_mut();
                 }
                 let s = PyRef::from_borrowed(it.sentinel);
-                match ab::rich_compare_bool(&v, &s, Py_EQ) {
+                match ab::rich_compare_bool(&s, &v, Py_EQ) {
                     Ok(true) => {
                         let f = std::mem::replace(&mut it.func, std::ptr::null_mut());
                         let s = std::mem::replace(&mut it.sentinel, std::ptr::null_mut());

@@ -72,7 +72,7 @@ pub fn new_tuple(items: Vec<PyRef>) -> PyRef {
         for (i, it) in items.into_iter().enumerate() {
             *base.add(i) = it.into_raw();
         }
-        crate::gc::track(op);
+        track_if_needed(op);
         PyRef::from_raw(op)
     }
 }
@@ -98,8 +98,29 @@ pub unsafe fn new_tuple_from_ptrs(items: &[*mut PyObject]) -> PyRef {
             incref(it);
             *base.add(i) = it;
         }
-        crate::gc::track(op);
+        track_if_needed(op);
         PyRef::from_raw(op)
+    }
+}
+
+/// GC-track a freshly filled exact tuple only if one of its items may be part of
+/// a cycle (a tracked GC object); tuples of atomic values are never tracked.
+pub unsafe fn track_if_needed(op: *mut PyObject) {
+    unsafe {
+        if !(*op).is_type(tuple_type()) {
+            crate::gc::track(op);
+            return;
+        }
+        let n = var_size(&*op) as usize;
+        let base = item_ptr(op);
+        for i in 0..n {
+            let it = *base.add(i);
+            if !it.is_null() && crate::gc::is_tracked(&*it) {
+                crate::gc::track(op);
+                return;
+            }
+        }
+        crate::gc::untrack(op);
     }
 }
 
@@ -119,7 +140,7 @@ pub fn tuple_refill(t: &PyObject, items: Vec<PyRef>) {
             *base.add(i) = it.into_raw();
         }
         (*(t.as_ptr() as *mut PyTupleObject)).ob_hash = -1;
-        crate::gc::track(t.as_ptr());
+        track_if_needed(t.as_ptr());
     }
     for p in old {
         unsafe { xdecref(p) };
@@ -380,7 +401,7 @@ unsafe extern "C" fn tuple_repeat(a: *mut PyObject, n: Py_ssize_t) -> *mut PyObj
                 k += 1;
             }
         }
-        crate::gc::track(op);
+        track_if_needed(op);
         op
     }
 }

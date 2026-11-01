@@ -408,7 +408,9 @@ class WeakKeyDictionary(_DeferredRemovals, _collections_abc.MutableMapping):
             for key, value in dict.items():
                 data[ref(key, self._remove)] = value
         if kwargs:
-            self.update(kwargs)
+            # keyword names are strings, which cannot be weakly referenced
+            raise TypeError("Keyword arguments are not supported: "
+                            "cannot create weak reference to 'str' object")
 
     def __ior__(self, other):
         self.update(other)

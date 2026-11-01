@@ -100,6 +100,9 @@ pub struct DictTable {
     used: usize,
     /// Bumped on every change of the key structure (insert/delete/clear/resize).
     pub version: u64,
+    /// Identity of the index layout: renewed on resize/clear (lookups that ran
+    /// Python code restart only if this or the probed entry changed).
+    layout: u64,
 }
 
 /// A fresh, globally unique dict version stamp (the JIT's allocator). Every
@@ -125,7 +128,7 @@ fn size_for(min_usable: usize) -> usize {
 impl DictTable {
     pub fn new(cap: usize) -> DictTable {
         let size = size_for(cap);
-        DictTable { indices: vec![EMPTY; size], entries: Vec::with_capacity(cap.min(usable_for(size))), used: 0, version: next_version() }
+        DictTable { indices: vec![EMPTY; size], entries: Vec::with_capacity(cap.min(usable_for(size))), used: 0, version: next_version(), layout: next_version() }
     }
     #[inline]
     fn mask(&self) -> usize {
@@ -162,6 +165,7 @@ impl DictTable {
             self.indices[i] = idx as i32;
         }
         self.version = next_version();
+        self.layout = next_version();
     }
     #[inline]
     fn insert_new(&mut self, h: isize, key: *mut PyObject, value: *mut PyObject) {
@@ -357,7 +361,7 @@ pub fn find(d: &PyObject, key: &PyObject, hash: isize) -> PyResult<(ObGuard, Fou
                             return Ok((g, Found::At(ix as usize)));
                         }
                     } else {
-                        let version = t.version;
+                        let layout = t.layout;
                         let ek_owned = ek.to_ref();
                         drop(g);
                         let eq = rich_eq(&ek_owned, key);
@@ -365,7 +369,7 @@ pub fn find(d: &PyObject, key: &PyObject, hash: isize) -> PyResult<(ObGuard, Fou
                         let eq = eq?;
                         g = ob_lock(d);
                         let t2 = table(d);
-                        if t2.version != version || t2.entries.get(ix as usize).map(|x| x.key) != Some(e.key) {
+                        if t2.layout != layout || t2.entries.get(ix as usize).map(|x| x.key) != Some(e.key) {
                             drop(g);
                             continue 'restart;
                         }
