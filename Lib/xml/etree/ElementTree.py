@@ -44,6 +44,13 @@ def iselement(element):
     return hasattr(element, 'tag')
 
 
+# mappings accepted as the attrib argument
+try:
+    _ATTRIB_TYPES = (dict, frozendict)
+except NameError:
+    _ATTRIB_TYPES = (dict,)
+
+
 class Element:
     """An XML element: a tag, a dict of attributes, text, tail and a list
     of child elements."""
@@ -54,8 +61,8 @@ class Element:
     tail = None
 
     def __init__(self, tag, /, attrib={}, **extra):
-        if not isinstance(attrib, dict):
-            raise TypeError("attrib must be dict, not %s"
+        if not isinstance(attrib, _ATTRIB_TYPES):
+            raise TypeError("attrib must be dict or frozendict, not %s"
                             % (attrib.__class__.__name__,))
         self.tag = tag
         self.attrib = {**attrib, **extra}
@@ -124,6 +131,9 @@ class Element:
     def remove(self, subelement, /):
         """Remove the first occurrence of *subelement*; ValueError if it is
         not a child."""
+        if not isinstance(subelement, Element):
+            raise TypeError("remove() argument must be xml.etree.ElementTree.Element, not %s"
+                            % type(subelement).__name__)
         children = self._children
         for i, child in enumerate(children):
             if child is subelement or child == subelement:
@@ -538,6 +548,10 @@ def _serialize_html(write, elem, qnames, namespaces, **kwargs):
             for key, value in elem.items():
                 if isinstance(key, QName):
                     key = key.text
+                if value is None:
+                    # an attribute without a value (HTML only)
+                    write(" %s" % qnames[key])
+                    continue
                 if isinstance(value, QName):
                     value = qnames[value.text]
                 else:
@@ -727,14 +741,14 @@ def indent(tree, space="  ", level=0):
         except IndexError:
             child_indent = indentations[level] + space
             indentations.append(child_indent)
-        if not elem.text or not elem.text.strip():
+        if not elem.text or not elem.text.strip(" \t\r\n"):
             elem.text = child_indent
         for child in elem:
             if len(child):
                 walk(child, child_level)
-            if not child.tail or not child.tail.strip():
+            if not child.tail or not child.tail.strip(" \t\r\n"):
                 child.tail = child_indent
-        if not child.tail.strip():
+        if not child.tail.strip(" \t\r\n"):
             child.tail = indentations[level]
 
     walk(tree, 0)
@@ -760,33 +774,50 @@ def iterparse(source, events=None, parser=None):
     return _IterParseIterator(source, events, parser)
 
 
+class _IterParseState:
+    __slots__ = ('root',)
+
+    def __init__(self):
+        self.root = None
+
+
+def _iterparse_events(pull, source, owns_source, state):
+    # A free function, so the generator holds no reference to the iterator
+    # object: dropping the iterator finalizes it immediately.
+    try:
+        while True:
+            yield from pull.read_events()
+            data = source.read(16 * 1024)
+            if not data:
+                break
+            pull.feed(data)
+        root = pull._close_and_return_root()
+        yield from pull.read_events()
+        state.root = root
+    finally:
+        if owns_source:
+            source.close()
+
+
 class _IterParseIterator(collections.abc.Iterator):
 
     def __init__(self, source, events, parser):
-        self._owns_source = not hasattr(source, "read")
-        if self._owns_source:
-            source = open(source, "rb")
-        self._source = source
-        self._pull = XMLPullParser(events=events, _parser=parser)
+        self._owns_source = False
         self._closed = False
-        self.root = None
-        self._gen = self._run()
+        # validate the events before opening anything
+        pull = XMLPullParser(events=events, _parser=parser)
+        owns_source = not hasattr(source, "read")
+        if owns_source:
+            source = open(source, "rb")
+        self._owns_source = owns_source
+        self._source = source
+        self._pull = pull
+        self._state = _IterParseState()
+        self._gen = _iterparse_events(pull, source, owns_source, self._state)
 
-    def _run(self):
-        pull = self._pull
-        try:
-            while True:
-                yield from pull.read_events()
-                data = self._source.read(16 * 1024)
-                if not data:
-                    break
-                pull.feed(data)
-            root = pull._close_and_return_root()
-            yield from pull.read_events()
-            self.root = root
-        finally:
-            if self._owns_source:
-                self._source.close()
+    @property
+    def root(self):
+        return self._state.root
 
     def __next__(self):
         return next(self._gen)
@@ -1274,7 +1305,7 @@ class C14NWriterTarget:
         data = _join_text(self._data)
         del self._data[:]
         if self._strip_text and not self._preserve_space[-1]:
-            data = data.strip()
+            data = data.strip(" \t\r\n")
         if self._pending_start is not None:
             args, self._pending_start = self._pending_start, None
             qname_text = data if data and _looks_like_prefix_name(data) else None

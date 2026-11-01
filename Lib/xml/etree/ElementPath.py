@@ -42,9 +42,12 @@ def xpath_tokenizer(pattern, namespaces=None):
                 yield op, '{%s}%s' % (default_ns, name)
             else:
                 yield op, name
+        elif name[:2] == "{}" and name != "{}*":
+            # explicitly no namespace
+            yield op, name[2:]
         else:
             yield op, name
-        after_at = op == '@'
+        after_at = op == "@"
 
 
 def get_parent_map(context):
@@ -80,11 +83,10 @@ def _tag_matcher(tag):
 
 def _select_children(tag):
     if tag == '*':
+        # every child, comments and processing instructions included
         def select(context, result):
             for elem in result:
-                for child in elem:
-                    if isinstance(child.tag, str):
-                        yield child
+                yield from elem
         return select
     if _is_wildcard_tag(tag):
         match = _tag_matcher(tag)
@@ -209,7 +211,8 @@ def prepare_predicate(next, token):
         else:
             def select(context, result):
                 for elem in result:
-                    if elem.get(key) != value:
+                    v = elem.get(key)
+                    if v is not None and v != value:
                         yield elem
         return select
     if signature == '-' and not re.match(r'-?\d+$', values[0]):
