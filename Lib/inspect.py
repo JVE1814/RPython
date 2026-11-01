@@ -252,6 +252,7 @@ def isroutine(object):
             or ismethod(object)
             or ismethoddescriptor(object)
             or ismethodwrapper(object)
+            or isinstance(object, functools.partial)
             or isinstance(object, _DISPATCH_GETTERS))
 
 # Objects produced by functools.singledispatchmethod.__get__ act as methods.
@@ -1583,7 +1584,8 @@ def _signature_get_partial(wrapped_sig, partial, extra_args=()):
             value = bound.arguments[name]
             if value is hole:
                 # Left open by a Placeholder: still filled positionally.
-                new_params[name] = param.replace(kind=_POSITIONAL_ONLY)
+                new_params[name] = param.replace(kind=_POSITIONAL_ONLY,
+                                                 default=_empty)
                 continue
             if param.kind is _POSITIONAL_ONLY:
                 del new_params[name]
@@ -1628,7 +1630,7 @@ def _signature_is_builtin(obj):
     return (isbuiltin(obj) or
             ismethoddescriptor(obj) or
             isinstance(obj, _NonUserDefinedCallables) or
-            obj in (type, object))
+            obj is type or obj is object)
 
 
 def _signature_is_functionlike(obj):
@@ -1726,12 +1728,13 @@ class _DefaultEvaluator:
         module = sys.modules.get(module_name) if module_name else None
         self.namespace = module.__dict__ if module is not None else {}
 
+    # Named defaults must resolve to plain constants.
+    _CONSTANT_TYPES = (str, bytes, int, float, complex, bool, type(None))
+
     def lookup(self, dotted):
         head, *rest = dotted.split('.')
         if head in self.namespace:
             value = self.namespace[head]
-        elif dotted in sys.modules:
-            return sys.modules[dotted]
         elif head in sys.modules:
             value = sys.modules[head]
         elif hasattr(builtins, head):
@@ -1743,6 +1746,8 @@ class _DefaultEvaluator:
                 value = getattr(value, part)
             except AttributeError:
                 raise ValueError(dotted) from None
+        if not isinstance(value, self._CONSTANT_TYPES):
+            raise ValueError(dotted)
         return value
 
     def evaluate(self, node):
@@ -1972,7 +1977,11 @@ def _signature_from_callable(obj, *,
             first = tuple(wrapped_sig.parameters.values())[0]
             if first.kind is _VAR_POSITIONAL:
                 return sig
-            return sig.replace(parameters=(first,) + tuple(sig.parameters.values()))
+            rest = tuple(sig.parameters.values())
+            if rest and rest[0].kind is _POSITIONAL_ONLY:
+                # Placeholders made the following parameters positional-only.
+                first = first.replace(kind=_POSITIONAL_ONLY)
+            return sig.replace(parameters=(first,) + rest)
 
     if isfunction(obj) or _signature_is_functionlike(obj):
         return _signature_from_function(sigcls, obj,
@@ -2449,9 +2458,8 @@ class Signature:
                 value = kwargs.pop(param.name)
             except KeyError:
                 if not partial and param.default is _empty:
-                    kind = ' keyword-only' if param.kind == _KEYWORD_ONLY else ''
-                    raise TypeError('missing a required{} argument: {!r}'.format(
-                        kind, param.name)) from None
+                    raise TypeError('missing a required argument: {!r}'.format(
+                        param.name)) from None
             else:
                 arguments[param.name] = value
 
