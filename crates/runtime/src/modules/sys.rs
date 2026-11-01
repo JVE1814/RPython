@@ -152,6 +152,7 @@ pub fn create_sys_module(argv: &[String]) -> PyResult<PyRef> {
     dict::set_item_str(&d, "path_hooks", &list::new_list_empty())?;
     dict::set_item_str(&d, "path_importer_cache", &dict::new_dict())?;
     crate::modules::sys_full::populate(&d)?;
+    crate::types::asyncgen::populate_sys(&d, &m)?;
     Ok(m)
 }
 

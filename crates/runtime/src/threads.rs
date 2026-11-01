@@ -75,7 +75,7 @@ pub enum ThreadMode {
 #[repr(C)]
 pub struct ThreadState {
     pub c: CThreadState,
-    pub mode: Cell<ThreadMode>,
+    pub mode: ModeCell,
     /// Objects whose shared refcount went negative and need the owner to merge.
     pub merge_queue: Mutex<Vec<usize>>,
     /// Rust-side top interpreter frame (see interp::frame).
@@ -142,7 +142,7 @@ pub fn new_thread_state() -> *mut ThreadState {
         c.py_recursion_remaining = limit;
         let st = ThreadState {
             c,
-            mode: Cell::new(ThreadMode::InVm),
+            mode: ModeCell(std::sync::atomic::AtomicU8::new(ThreadMode::InVm as u8)),
             merge_queue: Mutex::new(Vec::new()),
             frame: Cell::new(std::ptr::null_mut()),
             recursion_depth: Cell::new(0),
@@ -379,5 +379,29 @@ pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
 impl ThreadState {
     pub fn alive(&self) -> bool {
         !self.exited.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+
+/// Thread mode readable from other threads (stop-the-world coordination).
+pub struct ModeCell(pub std::sync::atomic::AtomicU8);
+impl ModeCell {
+    #[inline]
+    pub fn get(&self) -> ThreadMode {
+        match self.0.load(std::sync::atomic::Ordering::Acquire) {
+            0 => ThreadMode::InVm,
+            1 => ThreadMode::InNative,
+            _ => ThreadMode::Blocked,
+        }
+    }
+    #[inline]
+    pub fn set(&self, m: ThreadMode) {
+        self.0.store(m as u8, std::sync::atomic::Ordering::Release)
+    }
+    #[inline]
+    pub fn replace(&self, m: ThreadMode) -> ThreadMode {
+        let old = self.get();
+        self.set(m);
+        old
     }
 }

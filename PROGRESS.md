@@ -1,33 +1,33 @@
 # PROGRESS
 
-## Status (2026-11-01, day 1)
-- Pinned CPython v3.15.2; spec extracted (`spec/`); baseline CPython 3.15.2 built twice
-  (PGO+LTO default and free-threaded) in /opt/baseline.
-- Finished foundation crates (each with its own test suite):
-  - `rpy-unicode`: UCD 17.0.0 + 3.2.0; all 6 test_unicodedata checksums reproduced.
-  - `rpy-numfmt`: float repr (Schubfach), correctly rounded formatting, format-spec mini
-    language, %-formatting, parsing, hex; formatfloat_testcases.txt passes.
-  - `rpy-bigint`: 30-bit-digit ints, Karatsuba/Toom-3/NTT, Burnikel-Ziegler, Montgomery,
-    subquadratic str<->int; pidigits(10000) ~1.1 s.
-  - `rpy-sre`: Python `re` engine; re_tests.py table + 106 ported test_re cases pass.
-  - `rpy-parser` (in progress): all spec files parse; all test_ast snippets match; 815/815
-    parser-level error messages; tokenize conformance 182/182.
-- `rpy-compiler`: in progress (symtable, codegen, folding).
-- `rpy-runtime`: first complete skeleton builds: C-layout objects with biased refcounting,
-  type system with full dunder<->slot bridge, descriptors, builtin types core slots,
-  exception hierarchy, interpreter loop (all opcodes of the contract), generators,
-  frames/tracebacks, Rust import system, builtins, sys bootstrap. Initialization runs.
+## Status (2026-11-01, day 1, evening)
+- Spec pinned (CPython v3.15.2). Baselines built: /opt/baseline/py-default (PGO+LTO),
+  /opt/baseline/py-ft (PGO+LTO, free-threaded).
+- Foundation crates done & tested: unicode (UCD 17), numfmt, bigint, sre; parser (all spec
+  files parse, all ast snippets/error messages match); compiler (compiles all 1269 parseable
+  spec test files; all constructs).
+- Runtime: first end-to-end Python execution (functions, classes, metaclasses, closures,
+  generators, exceptions, comprehensions, f-strings, match). Own small-object allocator
+  (TLAB-style), frame pool, stop-the-world cycle GC with safepoints.
+- 12 parallel workstreams running in worktrees: str, bytes, numbers, containers, osio,
+  functional, text, harness (unittest/traceback/...), system (sys/threads/importlib/...),
+  lang (except*/typing/async gens), capi (C API + extension loading + numpy), jit.
 
-## Regression suite pass rate
-Not yet runnable (waiting for the compiler).
+## Regression suite
+Reference (CPython 3.15.2 free-threaded, this machine, tools/run_tests.sh):
+434 modules: 416 PASS, 18 FAIL; tests run 50,649, failures 24, skipped 3,371.
+(tools/baseline_ft_results.tsv). Default-build reference: running.
+Ours: regrtest not runnable yet (needs harness/system/osio/functional stdlib merges).
 
-## Benchmarks
-Not yet measured.
+## Benchmarks (preliminary, noisy machine)
+| metric | ours | py-default | py-ft |
+|---|---|---|---|
+| startup `-c pass` | 6.6 ms (no site yet) | 13.6 ms | 19.4 ms |
+| fib(20) instructions (callgrind) | 42.4M (35.8M excl. startup) | 51.1M (11.5M excl. startup) | - |
+pyperformance: harness ready (tools/bench), ours blocked on stdlib (time/argparse).
 
 ## Next steps
-1. Hook up the compiler; run first scripts; fix the VM.
-2. Parallel workstreams (agents in worktrees): str methods; bytes/bytearray/memoryview;
-   numbers+math; containers/iterators/weakref; stdlib bootstrap (os/posix, io, functools,
-   collections, itertools, operator, re, types, warnings, traceback, unittest...);
-   sys/threading/time/signal; C API + extension loading; cycle GC; JIT.
-3. Test runner `tools/run_tests.sh` + pass-rate tracking.
+1. Merge workstreams as they complete; get regrtest running; first pass-rate measurement.
+2. Wave 2 stdlib (asyncio, pickle, json, datetime, decimal, socket/ssl, hashlib, zlib,
+   sqlite3, email/http/urllib/xml, multiprocessing, ctypes, csv, zipfile/tarfile...).
+3. Performance: inline caches, baseline JIT, optimizing JIT (jit workstream).
