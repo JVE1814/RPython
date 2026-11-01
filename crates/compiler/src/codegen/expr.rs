@@ -268,13 +268,14 @@ impl<'a> Compiler<'a> {
             ExprKind::FormattedValue { value, conversion, format_spec } => {
                 self.compile_formatted_value(value, *conversion, format_spec.as_deref())?
             }
-            ExprKind::Interpolation { .. } => {
-                return Err(self.error("Interpolation outside of a t-string", e.loc));
+            // nested replacement fields inside a t-string format spec format like f-strings
+            ExprKind::Interpolation { value, conversion, format_spec, .. } => {
+                self.compile_formatted_value(value, *conversion, format_spec.as_deref())?
             }
             ExprKind::JoinedStr { values } => {
                 if values.is_empty() {
                     self.load_const(Constant::Str(Vec::new()));
-                } else if values.len() == 1 && matches!(values[0].node, ExprKind::FormattedValue { .. }) {
+                } else if values.len() == 1 && matches!(values[0].node, ExprKind::FormattedValue { .. } | ExprKind::Interpolation { .. }) {
                     self.compile_expr(&values[0])?;
                 } else {
                     for v in values {

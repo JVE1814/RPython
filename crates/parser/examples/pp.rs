@@ -8,6 +8,8 @@ fn main() {
     let mut src: Option<Vec<u8>> = None;
     let mut tokens = false;
     let mut raw_tokens = false;
+    let mut type_comments = false;
+    let mut feature_version: Option<u32> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -21,6 +23,11 @@ fn main() {
                 };
             }
             "-k" => tokens = true,
+            "-T" => type_comments = true,
+            "-V" => {
+                i += 1;
+                feature_version = args[i].parse().ok();
+            }
             "-K" => raw_tokens = true,
             "-c" => {
                 i += 1;
@@ -44,7 +51,7 @@ fn main() {
         }
         return;
     }
-    let opts = ParseOptions { mode, ..Default::default() };
+    let opts = ParseOptions { mode, type_comments, feature_version, ..Default::default() };
     let out = parse_bytes(&src, &opts);
     for w in &out.warnings {
         println!("WARNING {:?}", w);

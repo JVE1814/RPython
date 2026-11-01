@@ -1626,7 +1626,11 @@ impl<'a> Analyzer<'a> {
                 }
             }
             let existing = self.scopes[sid].lookup(&s.name).map(|x| x.flags);
+            let implicit_class_cell = parent_kind == ScopeKind::Class
+                && scope == SymScope::Free
+                && matches!(s.name.as_str(), "__class__" | "__classdict__" | "__conditional_annotations__");
             match existing {
+                None if implicit_class_cell => {}
                 None => {
                     self.scopes[sid].set_symbol(&s.name, only_flags);
                     scopes.insert(s.name.clone(), scope);

@@ -11,6 +11,9 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 [[package]]
 name = "python"
 version = "0.1.0"
+dependencies = [
+ "rpy-runtime",
+]
 
 [[package]]
 name = "rpy-bigint"
@@ -19,6 +22,9 @@ version = "0.1.0"
 [[package]]
 name = "rpy-compiler"
 version = "0.1.0"
+dependencies = [
+ "rpy-parser",
+]
 
 [[package]]
 name = "rpy-numfmt"
@@ -27,6 +33,9 @@ version = "0.1.0"
 [[package]]
 name = "rpy-parser"
 version = "0.1.0"
+dependencies = [
+ "rpy-unicode",
+]
 
 [[package]]
 name = "rpy-runtime"
@@ -34,6 +43,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "rpy-bigint",
+ "rpy-compiler",
  "rpy-numfmt",
  "rpy-parser",
  "rpy-sre",

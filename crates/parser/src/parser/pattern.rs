@@ -8,6 +8,7 @@ impl<'a> Parser<'a> {
     pub(crate) fn match_stmt(&mut self) -> R<Stmt> {
         let start = self.p;
         let mt = self.advance(); // "match"
+        let _ = 0;
         let Some(subject) = self.subject_expr()? else {
             self.p = start;
             return Ok(None);
@@ -43,6 +44,9 @@ impl<'a> Parser<'a> {
                     break;
                 }
             }
+        }
+        if !cases.is_empty() {
+            self.check_version(10, "Pattern matching is")?;
         }
         if cases.is_empty() || self.eat(T::DEDENT).is_none() {
             self.p = start;

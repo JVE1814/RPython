@@ -654,3 +654,14 @@ pub(crate) fn byte_to_char_1based(line: &str, col: i32) -> i32 {
     let n = String::from_utf8_lossy(&b[..k.min(b.len())]).chars().count();
     (n + if k > b.len() { 1 } else { 0 }) as i32
 }
+
+impl<'a> Parser<'a> {
+    /// CHECK_VERSION: raise "<what> only supported in Python 3.<minor> and greater" when a
+    /// lower `feature_version` was requested.
+    pub(crate) fn check_version(&self, minor: u32, what: &str) -> Result<(), PErr> {
+        match self.opts.feature_version {
+            Some(v) if v < minor => Err(self.err_last(ErrorKind::Syntax, format!("{} only supported in Python 3.{} and greater", what, minor))),
+            _ => Ok(()),
+        }
+    }
+}

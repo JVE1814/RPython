@@ -201,6 +201,7 @@ impl<'a> Parser<'a> {
         if t.ty == T::NAME && !t.kw.is_hard() && self.peek_n(1).ty == T::COLONEQUAL {
             self.advance();
             self.advance();
+            self.check_version(8, "Assignment expressions are")?;
             match self.expression()? {
                 Some(v) => {
                     let target = self.mk_name(&t, ExprContext::Store);
@@ -464,6 +465,9 @@ impl<'a> Parser<'a> {
             }
             let m = self.p;
             self.advance();
+            if op == Operator::MatMult {
+                self.check_version(5, "The '@' operator is")?;
+            }
             let right = if prec == 6 {
                 self.factor()?
             } else {
@@ -553,6 +557,7 @@ impl<'a> Parser<'a> {
         let start = self.p;
         if self.at_kw(Kw::Await) {
             self.advance();
+            self.check_version(5, "Await expressions are")?;
             match self.primary()? {
                 Some(e) => return Ok(Some(Expr::new(ExprKind::Await { value: bx(e) }, self.loc(start)))),
                 None => {
@@ -1164,6 +1169,7 @@ impl<'a> Parser<'a> {
             let m = self.p;
             let is_async = if self.at_kw(Kw::Async) {
                 self.advance();
+                self.check_version(6, "Async comprehensions are")?;
                 1
             } else {
                 0
@@ -1434,6 +1440,9 @@ impl<'a> Parser<'a> {
 
     pub(crate) fn parse_number(&self, t: &Token) -> Result<Constant, PErr> {
         let s = self.text(t);
+        if s.contains('_') {
+            self.check_version(6, "Underscores in numeric literals are")?;
+        }
         parse_number_literal(s).map_err(|m| self.err_tok(m, t))
     }
 }

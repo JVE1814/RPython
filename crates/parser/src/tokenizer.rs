@@ -642,10 +642,9 @@ impl<'a> Lexer<'a> {
             }
             return Ok(Some(t));
         }
-        if self.blankline {
-            // A type comment on its own line is ignored by the parser.
-            return Ok(None);
-        }
+        // CPython: after a type comment the newline is a NEWLINE even on an otherwise blank line
+        self.blankline = false;
+        self.line_has_tokens = true;
         Ok(Some(Token { ty: TokenType::TYPE_COMMENT, kw: Kw::None, level: self.parens.len() as u16, start: p as u32, end: end as u32, lineno: slineno, col: self.col_of(p), end_lineno: slineno, end_col: self.col_of(end) }))
     }
 

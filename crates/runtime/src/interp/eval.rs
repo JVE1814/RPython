@@ -1136,6 +1136,9 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                         Op::SetAdd => {
                             let v = popref!(f);
                             let s = peek!(f, arg as usize);
+                            if !crate::types::set::is_set(unsafe { &*s }) {
+                                raise!(TypeError, "'{}' object is not a set", tname(unsafe { &*s }));
+                            }
                             crate::types::set::set_add(unsafe { &*s }, &v)?;
                         }
                         Op::MapAdd => {

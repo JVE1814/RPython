@@ -149,6 +149,7 @@ impl<'a> Parser<'a> {
                 }
             }
             let target = self.mk_name(&t, ExprContext::Store);
+            self.check_version(6, "Variable annotation syntax is")?;
             return Ok(Some(Stmt::new(StmtKind::AnnAssign { target: bx(target), annotation: bx(ann), value, simple: 1 }, self.loc(start))));
         }
         let first = if t.ty == T::NAME && t.kw == Kw::Yield { self.yield_expr()? } else { self.star_expressions()? };
@@ -185,6 +186,7 @@ impl<'a> Parser<'a> {
                     }
                 }
                 super::targets::set_ctx(&mut first, ExprContext::Store);
+                self.check_version(6, "Variable annotation syntax is")?;
                 Ok(Some(Stmt::new(StmtKind::AnnAssign { target: bx(first), annotation: bx(ann), value, simple: 0 }, self.loc(start))))
             }
             T::EQUAL => {
@@ -218,6 +220,9 @@ impl<'a> Parser<'a> {
                     return Ok(None);
                 }
                 let op = augassign_op(ty).unwrap();
+                if op == Operator::MatMult {
+                    self.check_version(5, "The '@' operator is")?;
+                }
                 self.advance();
                 let Some(rhs) = self.annotated_rhs()? else {
                     self.p = start;
@@ -390,6 +395,7 @@ impl<'a> Parser<'a> {
     fn type_alias(&mut self) -> R<Stmt> {
         let start = self.p;
         self.advance(); // "type"
+        self.check_version(12, "Type statement is")?;
         let n = self.advance();
         let name = self.mk_name(&n, ExprContext::Store);
         let mut type_params = Vec::new();
@@ -726,6 +732,9 @@ impl<'a> Parser<'a> {
     fn function_def(&mut self, decorator_list: Vec<Expr>) -> R<Stmt> {
         let start = self.p;
         let is_async = self.eat_kw(Kw::Async).is_some();
+        if is_async {
+            self.check_version(5, "Async functions are")?;
+        }
         let def_tok = self.advance(); // 'def'
         let _ = def_tok;
         let Some(n) = self.eat_name() else {
@@ -779,6 +788,9 @@ impl<'a> Parser<'a> {
             type_comment = Some(self.text(&tc).to_string());
             // the NEWLINE before INDENT remains for the block; we consumed the first NEWLINE.
         } else if self.at(T::TYPE_COMMENT) {
+            if self.peek_n(1).ty == T::NEWLINE && self.peek_n(2).ty == T::TYPE_COMMENT && self.peek_n(3).ty == T::NEWLINE && self.peek_n(4).ty == T::INDENT {
+                return Err(self.err_last(ErrorKind::Syntax, "Cannot have two type comments on def"));
+            }
             let tc = self.advance();
             type_comment = Some(self.text(&tc).to_string());
         }
@@ -935,6 +947,9 @@ impl<'a> Parser<'a> {
     fn for_stmt(&mut self) -> R<Stmt> {
         let start = self.p;
         let is_async = self.eat_kw(Kw::Async).is_some();
+        if is_async {
+            self.check_version(5, "Async for loops are")?;
+        }
         let ft = self.advance(); // 'for'
         let tstart = self.p;
         let Some(target) = self.star_targets()? else {
@@ -1072,6 +1087,9 @@ impl<'a> Parser<'a> {
             self.invalid_with_stmt()?;
         }
         let is_async = self.eat_kw(Kw::Async).is_some();
+        if is_async {
+            self.check_version(5, "Async with statements are")?;
+        }
         let wt = self.advance(); // 'with'
         let after_with = self.p;
         // parenthesized form: '(' ','.with_item+ ','? ')' ':'
@@ -1096,11 +1114,15 @@ impl<'a> Parser<'a> {
             }
             if ok && !items.is_empty() && self.eat(T::RPAR).is_some() && self.at(T::COLON) {
                 self.advance();
+                let mut type_comment = None;
+                if let Some(tc) = self.eat(T::TYPE_COMMENT) {
+                    type_comment = Some(self.text(&tc).to_string());
+                }
                 let Some(body) = self.block_after("'with' statement", wt.lineno as i32)? else {
                     self.p = start;
                     return Ok(None);
                 };
-                let w = With { items, body, type_comment: None };
+                let w = With { items, body, type_comment };
                 return Ok(Some(Stmt::new(if is_async { StmtKind::AsyncWith(w) } else { StmtKind::With(w) }, self.loc(start))));
             }
             self.p = after_with;
@@ -1166,6 +1188,9 @@ impl<'a> Parser<'a> {
                 }
             }
             star = Some(is_star);
+            if is_star {
+                self.check_version(11, "Exception groups are")?;
+            }
             let Some(h) = self.except_block(is_star)? else {
                 self.p = start;
                 return Ok(None);
@@ -1310,6 +1335,7 @@ impl<'a> Parser<'a> {
     pub(crate) fn type_params(&mut self) -> R<Vec<TypeParam>> {
         let start = self.p;
         let lb = self.advance(); // '['
+        self.check_version(12, "Type parameter lists are")?;
         if self.at(T::RSQB) {
             if self.invalid {
                 let rb = self.peek();

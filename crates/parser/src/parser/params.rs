@@ -87,6 +87,7 @@ impl<'a> Parser<'a> {
             let t = self.peek();
             match t.ty {
                 T::SLASH => {
+                    self.check_version(8, "Positional-only parameters are")?;
                     if seen_slash || seen_star || pos.is_empty() {
                         self.p = start;
                         return Ok(None);
