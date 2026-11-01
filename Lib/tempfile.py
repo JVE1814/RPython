@@ -560,7 +560,12 @@ else:
             return _io.open(fd, mode, buffering=buffering, newline=newline,
                             encoding=encoding, errors=errors)
         except BaseException:
-            _os.close(fd)
+            # io.open() may already have closed the descriptor (e.g. when
+            # the text layer fails after the raw file took ownership).
+            try:
+                _os.close(fd)
+            except OSError:
+                pass
             raise
 
 

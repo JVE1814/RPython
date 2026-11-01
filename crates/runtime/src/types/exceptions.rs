@@ -239,6 +239,30 @@ pub fn is_exception_class(o: &PyObject) -> bool {
     is_type(o) && unsafe { (*as_type(o)).tp_flags & Py_TPFLAGS_BASE_EXC_SUBCLASS != 0 }
 }
 
+/// When attribute lookup on *o* failed with an AttributeError that does not
+/// say which attribute (e.g. a `__getattr__` hook raising a bare
+/// AttributeError), record *name* and *o* on it, so that tracebacks can
+/// still suggest similar names.
+pub fn fill_attribute_error_context(o: &PyObject, name: &PyObject) {
+    let p = current_exc_ptr();
+    if p.is_null() {
+        return;
+    }
+    let exc = unsafe { &*p };
+    if !isinstance_exact_or_sub(exc, AttributeError()) {
+        return;
+    }
+    let e = unsafe { &mut *(p as *mut AttributeErrorExc) };
+    let unset = |f: *mut PyObject| f.is_null() || unsafe { (*f).is(none::none()) };
+    if !unset(e.name) {
+        return;
+    }
+    set_field(&mut e.name, Some(name));
+    if unset(e.obj) {
+        set_field(&mut e.obj, Some(o));
+    }
+}
+
 fn set_field(slot: &mut *mut PyObject, v: Option<&PyObject>) {
     let old = *slot;
     *slot = v.map_or(std::ptr::null_mut(), |v| v.to_ref().into_raw());
@@ -744,7 +768,9 @@ unsafe extern "C" fn keyerror_str(op: *mut PyObject) -> *mut PyObject {
 unsafe extern "C" fn importerror_str(op: *mut PyObject) -> *mut PyObject {
     unsafe {
         let e = &*(op as *mut ImportErrorExc);
-        if !e.msg.is_null() && !(*e.msg).is(none::none()) {
+        // only an exact str message is used as is (like CPython); anything
+        // else goes through BaseException.__str__
+        if !e.msg.is_null() && crate::types::str::is_str_exact(&*e.msg) {
             return (*e.msg).to_ref().into_raw();
         }
         base_str(op)

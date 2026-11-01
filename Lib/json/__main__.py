@@ -1,20 +1,14 @@
-"""Command-line tool to validate and pretty-print JSON
+"""``python -m json``: validate and pretty-print JSON (see json.tool)."""
+import os
+import sys
 
-Usage::
-
-    $ echo '{"json":"obj"}' | python -m json
-    {
-        "json": "obj"
-    }
-    $ echo '{ 1.2:3.4}' | python -m json
-    Expecting property name enclosed in double quotes: line 1 column 3 (char 2)
-
-"""
 import json.tool
-
 
 if __name__ == '__main__':
     try:
         json.tool.main()
     except BrokenPipeError as exc:
-        raise SystemExit(exc.errno)
+        # the reader went away; keep the interpreter's final flush quiet
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        sys.exit(exc.errno)
