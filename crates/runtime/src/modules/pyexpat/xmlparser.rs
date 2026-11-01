@@ -11,10 +11,9 @@ use crate::abstract_ as ab;
 use crate::errors::*;
 use crate::ffi::*;
 use crate::modules::compress_common::ExcCell;
-use crate::modules::fncommon::{self as fc, RObj, Trav};
+use crate::modules::fncommon::{self as fc, Trav};
 use crate::object::*;
 use crate::types::{bool_, dict, int, list, none, str as pystr, tuple};
-use crate::raise;
 use std::ffi::{CString, c_int, c_void};
 use std::sync::OnceLock;
 
@@ -92,6 +91,7 @@ pub struct Parser {
     foreign_dtd: bool,
     reparse_deferral: bool,
     ampl: Option<(u64, f64)>,
+    alloc: Option<(u64, f64)>,
     namespace_prefixes: bool,
     ordered_attributes: bool,
     specified_attributes: bool,
@@ -404,7 +404,8 @@ fn dispatch_other(o: &PyObject, ev: Ev, pos: &Pos) -> PyResult<()> {
                 call_handler(o, H_XML_DECL, &h, &[&opt_str(&version), &opt_str(&encoding), &int::new_int(standalone as i64)])?;
             }
         }
-        Ev::StartDoctype { name, sysid, pubid, internal } => {
+        Ev::StartDoctype(boxed) => {
+            let crate::modules::pyexpat::engine::StartDoctypeEv { name, sysid, pubid, internal } = *boxed;
             if let Some(h) = handler_flushed(o, H_START_DOCTYPE)? {
                 call_handler(
                     o,
@@ -425,7 +426,8 @@ fn dispatch_other(o: &PyObject, ev: Ev, pos: &Pos) -> PyResult<()> {
                 call_handler(o, H_ELEMENT_DECL, &h, &[&pystr::new_str(&name), &m])?;
             }
         }
-        Ev::AttlistDecl { elname, attname, atype, default, required } => {
+        Ev::AttlistDecl(boxed) => {
+            let crate::modules::pyexpat::engine::AttlistDeclEv { elname, attname, atype, default, required } = *boxed;
             if let Some(h) = handler_flushed(o, H_ATTLIST)? {
                 call_handler(
                     o,
@@ -441,7 +443,8 @@ fn dispatch_other(o: &PyObject, ev: Ev, pos: &Pos) -> PyResult<()> {
                 )?;
             }
         }
-        Ev::EntityDecl { name, is_pe, value, base, sysid, pubid, notation } => {
+        Ev::EntityDecl(boxed) => {
+            let crate::modules::pyexpat::engine::EntityDeclEv { name, is_pe, value, base, sysid, pubid, notation } = *boxed;
             if notation.is_some() && ps(o).handlers[H_UNPARSED].is_some() {
                 if let Some(h) = handler_flushed(o, H_UNPARSED)? {
                     call_handler(
@@ -470,7 +473,8 @@ fn dispatch_other(o: &PyObject, ev: Ev, pos: &Pos) -> PyResult<()> {
                 )?;
             }
         }
-        Ev::NotationDecl { name, base, sysid, pubid } => {
+        Ev::NotationDecl(boxed) => {
+            let crate::modules::pyexpat::engine::NotationDeclEv { name, base, sysid, pubid } = *boxed;
             if let Some(h) = handler_flushed(o, H_NOTATION)? {
                 call_handler(o, H_NOTATION, &h, &[&pystr::new_str(&name), &opt_str(&base), &opt_str(&sysid), &opt_str(&pubid)])?;
             }
@@ -520,7 +524,8 @@ fn dispatch_other(o: &PyObject, ev: Ev, pos: &Pos) -> PyResult<()> {
                 default_text(o, &format!("&{};", name))?;
             }
         }
-        Ev::ExternalEntityRef { context, base, sysid, pubid } => {
+        Ev::ExternalEntityRef(boxed) => {
+            let crate::modules::pyexpat::engine::ExternalEntityRefEv { context, base, sysid, pubid } = *boxed;
             if let Some(h) = handler_flushed(o, H_EXT_REF)? {
                 let r = call_handler(o, H_EXT_REF, &h, &[&opt_str(&context), &opt_str(&base), &opt_str(&sysid), &opt_str(&pubid)])?;
                 if !int::is_int(&r) {
@@ -567,6 +572,10 @@ fn configure(o: &PyObject) -> PyResult<&mut Engine> {
     if let Some((thr, mx)) = p.ampl {
         eng.ampl_threshold = thr;
         eng.ampl_max = mx;
+    }
+    if let Some((thr, mx)) = p.alloc {
+        eng.alloc_threshold = thr;
+        eng.alloc_max = mx;
     }
     Ok(eng)
 }
@@ -697,6 +706,7 @@ fn new_parser(
         foreign_dtd: false,
         reparse_deferral: true,
         ampl: None,
+        alloc: None,
         namespace_prefixes: false,
         ordered_attributes: false,
         specified_attributes: false,
@@ -789,6 +799,54 @@ fn check_root(o: &PyObject) -> PyResult<()> {
 }
 
 const DEFAULT_AMPL: (u64, f64) = (8 * 1024 * 1024, 100.0);
+const DEFAULT_ALLOC: (u64, f64) = (64 * 1024 * 1024, 100.0);
+
+/// Validated activation threshold argument.
+fn threshold_arg(threshold: &PyObject) -> PyResult<u64> {
+    if !int::is_int(threshold) {
+        raise!(TypeError, "threshold must be an integer");
+    }
+    let v = ab::as_i128_index(threshold)?;
+    if v < 0 {
+        raise!(ValueError, "threshold must be non-negative");
+    }
+    if v > u64::MAX as i128 {
+        raise!(OverflowError, "threshold is too large");
+    }
+    Ok((v as u64).min(i64::MAX as u64))
+}
+
+/// Validated maximum amplification argument (checked after the root
+/// parser check, like the threshold).
+fn factor_arg(o: &PyObject, factor: &PyObject) -> PyResult<f64> {
+    if bool_::is_bool(factor) || !(int::is_int(factor) || crate::types::float::is_float(factor)) {
+        raise!(TypeError, "max_factor must be a float");
+    }
+    let f = ab::float_value(factor)?;
+    check_root(o)?;
+    if !(f >= 1.0) {
+        let tp = expat_error()?;
+        let e = ab::call(crate::types::typeobject::type_obj(tp), &[&pystr::new_str("'max_factor' must be at least 1.0")])?;
+        set_exc(e);
+        return Err(PyErr);
+    }
+    Ok(f)
+}
+
+fn m_set_alloc_threshold(o: &PyObject, threshold: &PyObject) -> PyResult {
+    let v = threshold_arg(threshold)?;
+    check_root(o)?;
+    let cur = ps(o).alloc.unwrap_or(DEFAULT_ALLOC);
+    ps(o).alloc = Some((v, cur.1));
+    Ok(none::none_ref())
+}
+
+fn m_set_alloc_max(o: &PyObject, factor: &PyObject) -> PyResult {
+    let f = factor_arg(o, factor)?;
+    let cur = ps(o).alloc.unwrap_or(DEFAULT_ALLOC);
+    ps(o).alloc = Some((cur.0, f));
+    Ok(none::none_ref())
+}
 
 fn m_set_ampl_threshold(o: &PyObject, threshold: &PyObject) -> PyResult {
     if !int::is_int(threshold) {
@@ -860,7 +918,7 @@ unsafe extern "C" fn set_handler(s: *mut PyObject, v: *mut PyObject, closure: *m
 const F_BUFFER_TEXT: usize = 0;
 const F_NS_PREFIXES: usize = 1;
 const F_ORDERED: usize = 2;
-const F_SPECIFIED: usize = 3;
+
 
 unsafe extern "C" fn get_flag(s: *mut PyObject, closure: *mut c_void) -> *mut PyObject {
     unsafe {
@@ -1075,6 +1133,8 @@ fn init_type() -> PyResult<()> {
             ("SetReparseDeferralEnabled", O, m_set_reparse_deferral, "Enable/Disable reparse deferral; enabled by default with Expat >=2.6.0."),
             ("SetBillionLaughsAttackProtectionActivationThreshold", O, m_set_ampl_threshold, "Sets the number of output bytes needed to activate protection against billion laughs attacks."),
             ("SetBillionLaughsAttackProtectionMaximumAmplification", O, m_set_ampl_max, "Sets the maximum tolerated amplification factor for protection against billion laughs attacks."),
+            ("SetAllocTrackerActivationThreshold", O, m_set_alloc_threshold, "Sets the number of allocated bytes of dynamic memory needed to activate protection against disproportionate use of RAM."),
+            ("SetAllocTrackerMaximumAmplification", O, m_set_alloc_max, "Sets the maximum amplification factor between direct input and bytes of dynamic memory allocated."),
         ];
         let mut gs: Vec<PyGetSetDef> = Vec::new();
         for (i, n) in HANDLER_NAMES.iter().enumerate() {

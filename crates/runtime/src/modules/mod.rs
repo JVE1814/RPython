@@ -85,6 +85,7 @@ pub mod _lzma;
 pub mod _zstd;
 pub mod _uuid;
 pub mod pyexpat;
+pub mod _elementtree;
 pub mod _pickle;
 pub mod tty;
 pub mod array;
@@ -119,8 +120,8 @@ pub fn register_all() {
     crate::import::register_builtin("_json", _json::init_module);
     compress_common::register();
     _decimal::register();
-    crate::import::register_builtin("_expat_engine", pyexpat::init);
     crate::import::register_builtin("pyexpat", pyexpat::xmlparser::init);
+    crate::import::register_builtin("_elementtree", _elementtree::init);
     crate::import::register_builtin("_pickle", _pickle::init_module);
     tty::register();
     crate::import::register_builtin("array", array::init_module);

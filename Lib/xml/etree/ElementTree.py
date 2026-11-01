@@ -298,6 +298,11 @@ class ElementTree:
         try:
             if parser is None:
                 parser = XMLParser()
+                whole = getattr(parser, '_parse_whole', None)
+                if whole is not None:
+                    # the accelerated parser reads the file itself
+                    self._root = whole(source)
+                    return self._root
             while True:
                 data = source.read(65536)
                 if not data:
@@ -363,13 +368,26 @@ class ElementTree:
                      declared_encoding.lower() not in ("utf-8", "us-ascii"))):
                 write("<?xml version='1.0' encoding='%s'?>\n" % (
                     declared_encoding,))
-            if method == "text":
-                _serialize_text(write, self._root)
+            # Serializers produce many small pieces: hand them to the
+            # stream joined, in one write.
+            # (tostringlist() wants the individual pieces.)
+            pieces = []
+            if isinstance(file_or_filename, _ListDataStream):
+                collect = write
             else:
-                qnames, namespaces = _namespaces(self._root, default_namespace)
-                serialize = _serialize[method]
-                serialize(write, self._root, qnames, namespaces,
-                          short_empty_elements=short_empty_elements)
+                collect = pieces.append
+            try:
+                if method == "text":
+                    _serialize_text(collect, self._root)
+                else:
+                    qnames, namespaces = _namespaces(self._root,
+                                                     default_namespace)
+                    serialize = _serialize[method]
+                    serialize(collect, self._root, qnames, namespaces,
+                              short_empty_elements=short_empty_elements)
+            finally:
+                if pieces:
+                    write("".join(pieces))
 
     def write_c14n(self, file):
         return self.write(file, method="c14n")
