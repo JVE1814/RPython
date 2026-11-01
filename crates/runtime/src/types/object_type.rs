@@ -458,6 +458,7 @@ unsafe extern "C" fn type_dealloc(op: *mut PyObject) {
     unsafe {
         let tp = op as *mut PyTypeObject;
         crate::gc::untrack(op);
+        crate::interp::cache::unwatch_type_dict(tp); // jit
         crate::types::weakref::clear_weakrefs(op);
         if !(*tp).tp_bases.is_null() {
             for b in tuple::tuple_items(&*(*tp).tp_bases) {

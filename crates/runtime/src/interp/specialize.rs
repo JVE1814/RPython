@@ -455,6 +455,12 @@ fn fill_store_attr(o: &PyObject, nm: &PyObject, e: &Entry) {
 
 // ------------------------------------------------------------------ arithmetic
 
+/// Addresses of the (immortal) small int objects -5..=1025, for JIT code.
+pub fn small_int_table() -> *const usize {
+    static T: std::sync::OnceLock<Box<[usize]>> = std::sync::OnceLock::new();
+    T.get_or_init(|| (-5i64..=1025).map(|v| int::new_int(v).into_raw() as usize).collect()).as_ptr()
+}
+
 /// Value of an exact int with at most two 30-bit digits (|v| < 2**60).
 #[inline(always)]
 pub fn small_int_value(o: &PyObject) -> Option<i64> {
