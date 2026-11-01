@@ -355,6 +355,16 @@ class Future:
             yield self
         if self._fut_state == _PENDING:
             raise RuntimeError("await wasn't used with future")
+        if self._fut_state == _FINISHED and self._fut_exc is not None:
+            # raise without this frame keeping the future (and so the
+            # exception) alive through the traceback
+            self._fut_log_tb = False
+            exc, tb = self._fut_exc, self._fut_exc_tb
+            self = None
+            try:
+                raise exc.with_traceback(tb)
+            finally:
+                exc = tb = None
         return self.result()
 
     __iter__ = __await__
