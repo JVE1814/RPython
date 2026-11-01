@@ -1,5 +1,11 @@
 # PROGRESS
 
+## PAUSED (2026-11-01, ~21:00 UTC) at user request
+In-flight agents were asked to wrap up; their branches are merged into master as they report.
+To resume: read PLAN.md (workstream table, unassigned list), notes/*.md (per-workstream status and next
+steps), DECISIONS.md D19-D22; integration happens in the /home/user/core worktree (branch `core`), pushed
+to origin claude/rpython-dev. Latest full-suite run: run 4 (208/434 modules pass, 23,987 tests).
+
 ## Status (2026-11-01, day 1, night)
 - Spec pinned (CPython v3.15.2). Baselines built: /opt/baseline/py-default (PGO+LTO),
   /opt/baseline/py-ft (PGO+LTO, free-threaded).
