@@ -584,3 +584,24 @@ pub fn abs(a: IntRef) -> BigInt {
 pub fn neg(a: IntRef) -> BigInt {
     mk(!a.neg, a.mag.to_vec())
 }
+
+/// `round(a, -n)` for n >= 0: round to a multiple of 10^n, ties to even (Python semantics).
+pub fn round_neg_ndigits(a: IntRef, n: u64) -> BigInt {
+    if n == 0 || a.mag.is_empty() {
+        return a.to_owned();
+    }
+    // 10^n > 2|a| implies the result is 0 (|a| < 10^n / 2).
+    let abits = nat::bit_length(a.mag);
+    if (n as f64) * core::f64::consts::LOG2_10 > abits as f64 + 2.0 {
+        return BigInt::zero();
+    }
+    let p = pow_u64(BigInt::from_i64(10).as_ref(), n).expect("small power");
+    let (mut q, r) = divmod(a, p.as_ref()).expect("nonzero");
+    let r2 = nat::shl(&r.mag, 1);
+    let c = nat::cmp(&r2, &p.mag);
+    let q_odd = q.mag.first().is_some_and(|d| d & 1 == 1);
+    if c == Ordering::Greater || (c == Ordering::Equal && q_odd) {
+        q = add(q.as_ref(), BigInt::from_i64(1).as_ref());
+    }
+    mul(q.as_ref(), p.as_ref())
+}

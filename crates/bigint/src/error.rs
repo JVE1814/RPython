@@ -66,6 +66,12 @@ pub enum IntError {
     KNegative,
     /// ValueError "math domain error" (e.g. log of non-positive int).
     MathDomain,
+    /// OverflowError "factorial() argument should not exceed 9223372036854775807".
+    FactorialTooLarge,
+    /// OverflowError "k must not exceed 9223372036854775807" (math.perm).
+    PermKTooLarge,
+    /// OverflowError "min(n - k, k) must not exceed 9223372036854775807" (math.comb).
+    CombKTooLarge,
 }
 
 impl IntError {
@@ -75,7 +81,7 @@ impl IntError {
         match self {
             DivisionByZero | ModuloByZero | TrueDivisionByZero => ExcKind::ZeroDivisionError,
             TrueDivOverflow | FloatOverflow | TooManyDigits | FloatInfinity | IntTooBig
-            | NegativeToUnsigned | Overflow => ExcKind::OverflowError,
+            | NegativeToUnsigned | Overflow | FactorialTooLarge | PermKTooLarge | CombKTooLarge => ExcKind::OverflowError,
             MemoryError => ExcKind::MemoryError,
             NegativeShiftCount | PowModulusZero | NotInvertible | FloatNaN | InvalidLiteral { .. }
             | InvalidBase | StrToIntDigitLimit { .. } | IntToStrDigitLimit { .. }
@@ -120,6 +126,9 @@ impl IntError {
             NNegative => "n must be a non-negative integer".into(),
             KNegative => "k must be a non-negative integer".into(),
             MathDomain => "math domain error".into(),
+            FactorialTooLarge => "factorial() argument should not exceed 9223372036854775807".into(),
+            PermKTooLarge => "k must not exceed 9223372036854775807".into(),
+            CombKTooLarge => "min(n - k, k) must not exceed 9223372036854775807".into(),
         }
     }
 }

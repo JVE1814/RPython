@@ -269,7 +269,8 @@ pub fn factorial(n: IntRef) -> Result<BigInt, IntError> {
     }
     let v = match nat::to_u64(n.mag) {
         Some(v) if v <= (1u64 << 40) => v,
-        _ => return Err(IntError::MemoryError),
+        Some(v) if v <= i64::MAX as u64 => return Err(IntError::MemoryError),
+        _ => return Err(IntError::FactorialTooLarge),
     };
     Ok(BigInt::from_parts(false, factorial_mag(v)))
 }
@@ -318,7 +319,8 @@ pub fn perm(n: IntRef, k: IntRef) -> Result<BigInt, IntError> {
     }
     let kv = match nat::to_u64(k.mag) {
         Some(v) if v <= (1u64 << 40) => v,
-        _ => return Err(IntError::MemoryError),
+        Some(v) if v <= i64::MAX as u64 => return Err(IntError::MemoryError),
+        _ => return Err(IntError::PermKTooLarge),
     };
     if let Some(nv) = nat::to_u64(n.mag) {
         return Ok(BigInt::from_parts(false, range_product(nv - kv, nv)));
@@ -342,7 +344,8 @@ pub fn comb(n: IntRef, k: IntRef) -> Result<BigInt, IntError> {
     let kk: &[u32] = if nat::cmp(&nk, k.mag) == Ordering::Less { &nk } else { k.mag };
     let kv = match nat::to_u64(kk) {
         Some(v) if v <= (1u64 << 40) => v,
-        _ => return Err(IntError::MemoryError),
+        Some(v) if v <= i64::MAX as u64 => return Err(IntError::MemoryError),
+        _ => return Err(IntError::CombKTooLarge),
     };
     if kv == 0 {
         return Ok(BigInt::from_i64(1));
