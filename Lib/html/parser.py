@@ -20,6 +20,14 @@ _tagname_rest_re = re.compile(r'[^\t\n\f\r />]*')
 _attrname_rest_re = re.compile(r'[^\t\n\f\r />=]*')
 _unquoted_value_re = re.compile(r'[^\t\n\f\r >]*')
 _comment_close_re = re.compile(r'--!?>')
+# A run of complete attributes (and stray slashes) inside a tag; used to
+# skip over end-tag attributes quickly.  An attribute whose quoted value is
+# unterminated is not part of the run.
+_attr_run_re = re.compile(
+    r'(?:[\t\n\f\r ]*(?:/(?!>)|[^\t\n\f\r />=][^\t\n\f\r />=]*'
+    r'(?:[\t\n\f\r ]*=[\t\n\f\r ]*'
+    r'(?:"[^"]*"|\'[^\']*\'|[^\t\n\f\r >"\'][^\t\n\f\r >]*|(?=>))'
+    r'|(?![\t\n\f\r ]*=))))*')
 _text_special_re = re.compile(r'[&<]')
 _charref_re = re.compile(r'&#(?:[0-9]+|[xX][0-9a-fA-F]+)')
 _entityref_re = re.compile(r'&([a-zA-Z][a-zA-Z0-9]*)')
@@ -332,6 +340,8 @@ class HTMLParser(_markupbase.ParserBase):
         (index after '>', self_closing) or _INCOMPLETE."""
         raw = self.rawdata
         n = len(raw)
+        if attrs is None:
+            k = _attr_run_re.match(raw, k).end()
         while True:
             k = _ws_re.match(raw, k).end()
             if k >= n:
