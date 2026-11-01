@@ -397,17 +397,17 @@ pub fn init() -> PyResult {
     super::funcptr::init_types()?;
 
     let methods = rpy_runtime::mdefs![
-        ("sizeof", O, sizeof, "sizeof(C type) -> integer\nsizeof(C instance) -> integer\nReturn the size in bytes of a C instance"),
-        ("alignment", O, alignment, "alignment(C type) -> integer\nalignment(C instance) -> integer\nReturn the alignment requirements of a C instance"),
-        ("addressof", O, addressof, "addressof(C instance) -> integer\nReturn the address of the C instance internal buffer"),
-        ("byref", FAST, byref, "byref(C instance[, offset=0]) -> byref-object\nReturn a pointer lookalike to a C instance, only usable\nas function argument"),
-        ("resize", FAST, resize, "Resize the memory buffer of a ctypes instance"),
-        ("buffer_info", O, buffer_info, "Return buffer interface information"),
+        ("sizeof", O, sizeof),
+        ("alignment", O, alignment),
+        ("addressof", O, addressof),
+        ("byref", FAST, byref),
+        ("resize", FAST, resize),
+        ("buffer_info", O, buffer_info),
         ("get_errno", NOARGS, get_errno),
         ("set_errno", O, set_errno),
-        ("dlopen", FAST, py_dlopen, "dlopen(name, flag={RTLD_GLOBAL|RTLD_LOCAL}) open a shared library"),
-        ("dlclose", O, py_dlclose, "dlclose a library"),
-        ("dlsym", FAST, py_dlsym, "find symbol in shared library"),
+        ("dlopen", FAST, py_dlopen),
+        ("dlclose", O, py_dlclose),
+        ("dlsym", FAST, py_dlsym),
         ("call_function", FAST, call_function),
         ("call_cdeclfunction", FAST, call_cdeclfunction),
         ("PyObj_FromPtr", O, obj_from_ptr),
@@ -416,7 +416,7 @@ pub fn init() -> PyResult {
         ("_unpickle", FAST, unpickle),
         ("__getattr__", O, module_getattr),
     ];
-    let (m, d) = rpy_runtime::modules::fncommon::new_module("_ctypes", methods, Some("Create and manipulate C compatible data types in Python."))?;
+    let (m, d) = rpy_runtime::modules::fncommon::new_module("_ctypes", methods, None)?;
     unsafe {
         MODULE = m.clone().into_raw();
     }

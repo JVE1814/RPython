@@ -12,36 +12,9 @@ import sys
 
 if os.name == "nt":
 
-    def _get_build_version():
-        prefix = "MSC v."
-        i = sys.version.find(prefix)
-        if i == -1:
-            return 6
-        s, rest = sys.version[i + len(prefix):].split(" ", 1)
-        major = int(s[:-2]) - 6
-        if major >= 13:
-            major += 1
-        minor = int(s[2:3]) / 10.0
-        if major == 6:
-            minor = 0
-        if major >= 6:
-            return major + minor
-        return None
-
-    def find_msvcrt():
-        """Return the name of the VC runtime dll"""
-        version = _get_build_version()
-        if version is None or version > 13:
-            return None
-        clibname = "msvcr%d" % (version * 10) if version > 6 else "msvcrt"
-        import importlib.machinery
-        if "_d.pyd" in importlib.machinery.EXTENSION_SUFFIXES:
-            clibname += "d"
-        return clibname + ".dll"
-
     def find_library(name):
         if name in ("c", "m"):
-            return find_msvcrt()
+            return None  # the C runtime is not located by name on Windows
         for directory in os.environ["PATH"].split(os.pathsep):
             for candidate in (os.path.join(directory, name),
                               os.path.join(directory, name + ".dll")):
@@ -247,30 +220,3 @@ elif os.name == "posix":
                                  ctypes.byref(ctypes.py_object(libraries)))
             return libraries
 
-
-def test():
-    from ctypes import cdll
-    if os.name == "nt":
-        print(cdll.msvcrt)
-        print(cdll.load("msvcrt"))
-        print(find_library("msvcrt"))
-    if os.name == "posix":
-        print(find_library("m"))
-        print(find_library("c"))
-        print(find_library("bz2"))
-        if sys.platform == "darwin":
-            print(cdll.LoadLibrary("libm.dylib"))
-        else:
-            print(cdll.LoadLibrary("libm.so.6"))
-            print(cdll.LoadLibrary("libcrypt.so.1"))
-        print(find_library("crypt"))
-    try:
-        dllist
-    except NameError:
-        print("dllist() not available")
-    else:
-        print(dllist())
-
-
-if __name__ == "__main__":
-    test()

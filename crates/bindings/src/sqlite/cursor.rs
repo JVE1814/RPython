@@ -941,17 +941,16 @@ pub fn init_types() -> PyResult<()> {
         (*t).tp_init = Some(cur_init);
         (*t).tp_iter = Some(cur_iter);
         (*t).tp_iternext = Some(cur_iternext);
-        (*t).tp_doc = c"SQLite database cursor class.".as_ptr();
         (*t).tp_methods = rpy_runtime::mdefs![
-            ("execute", FAST, m_execute, "Executes an SQL statement."),
-            ("executemany", FAST, m_executemany, "Repeatedly executes an SQL statement."),
-            ("executescript", O, m_executescript, "Executes multiple SQL statements at once."),
-            ("fetchone", NOARGS, m_fetchone, "Fetches one row from the resultset."),
-            ("fetchmany", FASTKW, m_fetchmany, "Fetches several rows from the resultset."),
-            ("fetchall", NOARGS, m_fetchall, "Fetches all rows from the resultset."),
-            ("close", NOARGS, m_close, "Closes the cursor."),
-            ("setinputsizes", O, m_setinputsizes, "Required by DB-API. Does nothing in sqlite3."),
-            ("setoutputsize", FAST, m_setoutputsize, "Required by DB-API. Does nothing in sqlite3."),
+            ("execute", FAST, m_execute),
+            ("executemany", FAST, m_executemany),
+            ("executescript", O, m_executescript),
+            ("fetchone", NOARGS, m_fetchone),
+            ("fetchmany", FASTKW, m_fetchmany),
+            ("fetchall", NOARGS, m_fetchall),
+            ("close", NOARGS, m_close),
+            ("setinputsizes", O, m_setinputsizes),
+            ("setoutputsize", FAST, m_setoutputsize),
         ];
         (*t).tp_getset = rpy_runtime::getset_table![
             ("connection", g_connection),
@@ -975,7 +974,7 @@ pub fn init_types() -> PyResult<()> {
         ROW_AS_MAPPING.mp_subscript = Some(row_subscript);
         (*r).tp_as_sequence = &raw mut ROW_AS_SEQUENCE;
         (*r).tp_as_mapping = &raw mut ROW_AS_MAPPING;
-        (*r).tp_methods = rpy_runtime::mdefs![("keys", NOARGS, row_keys, "Returns the keys of the row.")];
+        (*r).tp_methods = rpy_runtime::mdefs![("keys", NOARGS, row_keys)];
         rpy_runtime::types::typeobject::type_ready(r)?;
     }
     Ok(())

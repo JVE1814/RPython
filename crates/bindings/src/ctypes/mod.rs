@@ -517,7 +517,7 @@ pub fn init_ctype_type() -> PyResult<()> {
     unsafe {
         let t = ctype_type();
         init_meta(t, c"_ctypes.CType_Type", rpy_runtime::types::typeobject::type_type());
-        (*t).tp_methods = rpy_runtime::mdefs![("__sizeof__", NOARGS, ctype_sizeof, "Return memory consumption of the type object.")];
+        (*t).tp_methods = rpy_runtime::mdefs![("__sizeof__", NOARGS, ctype_sizeof)];
         (*t).tp_getset = rpy_runtime::getset_table![("__pointer_type__", get_pointer_type, set_pointer_type)];
         rpy_runtime::types::typeobject::type_ready(t)?;
     }

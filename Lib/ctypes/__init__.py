@@ -1,4 +1,4 @@
-"""create and manipulate C data types in Python"""
+"""C-compatible data types and calls into shared libraries."""
 
 import os as _os
 import sys as _sys
@@ -31,10 +31,7 @@ def __getattr__(name):
 # --------------------------------------------------------------- buffers
 
 def create_string_buffer(init, size=None):
-    """create_string_buffer(aBytes) -> character array
-    create_string_buffer(anInteger) -> character array
-    create_string_buffer(aBytes, anInteger) -> character array
-    """
+    """Return a mutable c_char array, initialised from bytes or sized by an int."""
     if isinstance(init, bytes):
         if size is None:
             size = len(init) + 1
@@ -49,10 +46,7 @@ def create_string_buffer(init, size=None):
 
 
 def create_unicode_buffer(init, size=None):
-    """create_unicode_buffer(aString) -> character array
-    create_unicode_buffer(anInteger) -> character array
-    create_unicode_buffer(aString, anInteger) -> character array
-    """
+    """Return a mutable c_wchar array, initialised from str or sized by an int."""
     if isinstance(init, str):
         if size is None:
             if sizeof(c_wchar) == 2:
@@ -76,20 +70,9 @@ _c_functype_cache = {}
 
 
 def CFUNCTYPE(restype, *argtypes, **kw):
-    """CFUNCTYPE(restype, *argtypes,
-                 use_errno=False, use_last_error=False) -> function prototype.
-
-    restype: the result type
-    argtypes: a sequence specifying the argument types
-
-    The function prototype can be called in different ways to create a
-    callable object:
-
-    prototype(integer address) -> foreign function
-    prototype(callable) -> create and return a C callable function from callable
-    prototype(integer index, method name[, paramflags]) -> foreign function calling a COM method
-    prototype((ordinal number, dll object)[, paramflags]) -> foreign function exported by ordinal
-    prototype((function name, dll object)[, paramflags]) -> foreign function exported by name
+    """Return a C function pointer type (cdecl) with the given result and
+    argument types.  Instances wrap a function address, a (name, library)
+    pair, or a Python callable (a callback).
     """
     flags = _FUNCFLAG_CDECL
     if kw.pop("use_errno", False):
@@ -147,8 +130,7 @@ def _check_size(typ, typecode=None):
     actual = sizeof(typ)
     required = _struct.calcsize(typecode)
     if actual != required:
-        raise SystemError("sizeof(%s) wrong: %d instead of %d" %
-                          (typ, actual, required))
+        raise SystemError(f"{typ}: size {actual} does not match struct code size {required}")
 
 
 class py_object(_SimpleCData):
@@ -250,7 +232,7 @@ _check_size(c_char_p, "P")
 
 class c_void_p(_SimpleCData):
     _type_ = "P"
-c_voidp = c_void_p  # backwards compatibility (to a bug)
+c_voidp = c_void_p  # old alias
 _check_size(c_void_p)
 
 
@@ -348,11 +330,7 @@ _pointer_type_cache = _PointerTypeCache()
 
 
 def POINTER(cls):
-    """Create and return a new ctypes pointer type.
-
-    Pointer types are cached and reused internally,
-    so calling this function repeatedly is cheap.
-    """
+    """Return the pointer type for `cls` (created on first use)."""
     if cls is None:
         return c_void_p
     try:
@@ -373,12 +351,7 @@ def POINTER(cls):
 
 
 def pointer(obj):
-    """Create a new pointer instance, pointing to 'obj'.
-
-    The returned object is of the type POINTER(type(obj)). Note that if you
-    just want to pass a pointer to an object to a foreign function call, you
-    should use byref(obj) which is much faster.
-    """
+    """Return a POINTER(type(obj)) instance pointing at `obj`."""
     return POINTER(type(obj))(obj)
 
 
@@ -399,18 +372,8 @@ def _reset_cache():
 # --------------------------------------------------------------- shared libraries
 
 class CDLL:
-    """An instance of this class represents a loaded dll/shared
-    library, exporting functions using the standard C calling
-    convention (named 'cdecl' on Windows).
-
-    The exported functions can be accessed as attributes, or by
-    indexing with the function name.  Examples:
-
-    <obj>.qsort -> callable object
-    <obj>['qsort'] -> callable object
-
-    Calling the functions releases the Python GIL during the call and
-    reacquires it afterwards.
+    """A shared library loaded with dlopen(); its functions are available as
+    attributes or items and are called with the thread state released.
     """
     _func_flags_ = _FUNCFLAG_CDECL
     _func_restype_ = None  # set to c_int below
@@ -465,18 +428,14 @@ CDLL._func_restype_ = c_int
 
 
 class PyDLL(CDLL):
-    """This class represents the Python library itself.  It allows
-    accessing Python API functions.  The GIL is not released, and
-    Python exceptions are handled correctly.
-    """
+    """Like CDLL, but functions are called with the thread state held and
+    Python exceptions they set are propagated (for the Python C API)."""
     _func_flags_ = _FUNCFLAG_CDECL | _FUNCFLAG_PYTHONAPI
 
 
 if _os.name == "nt":
     class WinDLL(CDLL):
-        """This class represents a dll exporting functions using the
-        Windows stdcall calling convention.
-        """
+        """A DLL using the stdcall calling convention."""
         _func_flags_ = _FUNCFLAG_STDCALL
 
 
@@ -530,9 +489,7 @@ _string_at = PYFUNCTYPE(py_object, c_void_p, c_ssize_t)(_string_at_addr)
 
 
 def string_at(ptr, size=-1):
-    """string_at(ptr[, size]) -> string
-
-    Return the byte string at void *ptr."""
+    """Return `size` bytes (or up to the first NUL) at address `ptr`."""
     return _string_at(ptr, size)
 
 
@@ -540,9 +497,7 @@ _wstring_at = PYFUNCTYPE(py_object, c_void_p, c_ssize_t)(_wstring_at_addr)
 
 
 def wstring_at(ptr, size=-1):
-    """wstring_at(ptr[, size]) -> string
-
-    Return the wide-character string at void *ptr."""
+    """Return the wide character string at address `ptr`."""
     return _wstring_at(ptr, size)
 
 
@@ -550,9 +505,7 @@ _memoryview_at = PYFUNCTYPE(py_object, c_void_p, c_ssize_t, c_int)(_memoryview_a
 
 
 def memoryview_at(ptr, size, readonly=False):
-    """memoryview_at(ptr, size[, readonly]) -> memoryview
-
-    Return a memoryview representing the memory at void *ptr."""
+    """Return a memoryview of `size` bytes at address `ptr`."""
     return _memoryview_at(ptr, size, bool(readonly))
 
 

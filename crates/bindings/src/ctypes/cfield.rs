@@ -258,19 +258,18 @@ pub fn init_type() -> PyResult<()> {
         (*t).tp_descr_get = Some(cfield_descr_get);
         (*t).tp_descr_set = Some(cfield_descr_set);
         (*t).tp_repr = Some(cfield_repr);
-        (*t).tp_doc = c"Structure/Union member".as_ptr();
         let _ = cfield_get_method;
         (*t).tp_getset = rpy_runtime::getset_table![
-            ("name", g_name; "name of this field"),
-            ("type", g_type; "type of this field"),
-            ("offset", g_offset; "offset in bytes of this field (same as byte_offset)"),
-            ("byte_offset", g_offset; "offset in bytes of this field"),
-            ("byte_size", g_byte_size; "size of this field in bytes"),
-            ("size", g_size; "size in bytes of this field; for bit fields, the bit size and offset packed together"),
-            ("bit_size", g_bit_size; "size of this field in bits"),
-            ("bit_offset", g_bit_offset; "additional offset in bits (relative to byte_offset)"),
-            ("is_bitfield", g_is_bitfield; "true if this is a bitfield"),
-            ("is_anonymous", g_is_anonymous; "true if this field is anonymous"),
+            ("name", g_name),
+            ("type", g_type),
+            ("offset", g_offset),
+            ("byte_offset", g_offset),
+            ("byte_size", g_byte_size),
+            ("size", g_size),
+            ("bit_size", g_bit_size),
+            ("bit_offset", g_bit_offset),
+            ("is_bitfield", g_is_bitfield),
+            ("is_anonymous", g_is_anonymous),
         ];
         rpy_runtime::types::typeobject::type_ready(t)?;
     }

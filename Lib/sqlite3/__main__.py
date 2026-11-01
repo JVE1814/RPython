@@ -58,10 +58,10 @@ class SqliteInteractiveConsole(InteractiveConsole):
             if command == "version":
                 print(sqlite3.sqlite_version)
             elif command == "help":
-                print("Enter SQL code or one of the below commands, and press enter.\n\n"
-                      ".version    Print underlying SQLite library version\n"
-                      ".help       Print this help message\n"
-                      ".quit       Exit the CLI, equivalent to CTRL-D\n")
+                print("Type SQL statements terminated by ';', or a command:\n"
+                      "  .version  show the SQLite library version\n"
+                      "  .help     show this text\n"
+                      "  .quit     leave the shell (or send EOF)\n")
             elif command == "quit":
                 sys.exit(0)
             else:
@@ -82,17 +82,16 @@ def main(*args):
     )
     parser.add_argument(
         "filename", type=str, default=":memory:", nargs="?",
-        help=("SQLite database to open (defaults to ':memory:'). "
-              "A new database is created if the file does not previously exist."),
+        help="database file to open (default: an in-memory database); created if missing",
     )
     parser.add_argument(
         "sql", type=str, nargs="?",
-        help=("An SQL query to execute. Any returned rows are printed to stdout."),
+        help="SQL statement to run; its rows are printed and the program exits",
     )
     parser.add_argument(
         "-v", "--version", action="version",
         version=f"SQLite version {sqlite3.sqlite_version}",
-        help="Print underlying SQLite library version",
+        help="show the SQLite library version and exit",
     )
     args = parser.parse_args(*args)
 
@@ -103,10 +102,10 @@ def main(*args):
 
     eofkey = "CTRL-Z" if sys.platform == "win32" else "CTRL-D"
     banner = (
-        f"sqlite3 shell, running on SQLite version {sqlite3.sqlite_version}\n"
+        f"SQLite {sqlite3.sqlite_version} interactive shell\n"
         f"Connected to {db_name}\n\n"
-        "Each command will be run using execute() on the cursor.\n"
-        f'Type ".help" for more information; type ".quit" or {eofkey} to quit.'
+        "Statements run through Cursor.execute(); rows are printed.\n"
+        f'Enter ".help" for commands, ".quit" or {eofkey} to leave.'
     )
 
     theme = get_theme()

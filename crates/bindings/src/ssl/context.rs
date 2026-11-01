@@ -858,13 +858,14 @@ fn m_load_dh_params(o: &PyObject, path: &PyObject) -> PyResult {
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::ENOENT);
         return Err(rpy_runtime::types::exceptions::os_error_from_errno(errno, Some(path), None));
     }
-    let pkey = cr!(PEM_read_bio_Parameters(bio, std::ptr::null_mut()));
+    let dh = cr!(PEM_read_bio_DHparams(bio, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()));
     cr!(BIO_free(bio));
-    if pkey.is_null() {
+    if dh.is_null() {
         return Err(raise_from_queue(None, "failed to load DH parameters"));
     }
-    if sl!(SSL_CTX_set0_tmp_dh_pkey(ctx(o).ctx, pkey)) != 1 {
-        cr!(EVP_PKEY_free(pkey));
+    let r = sl!(SSL_CTX_ctrl(ctx(o).ctx, SSL_CTRL_SET_TMP_DH, 0, dh));
+    cr!(DH_free(dh));
+    if r != 1 {
         return Err(raise_from_queue(None, "failed to set DH parameters"));
     }
     Ok(none())

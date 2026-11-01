@@ -368,13 +368,13 @@ pub fn init_type() -> PyResult<()> {
         BLOB_AS_MAPPING.mp_ass_subscript = Some(blob_ass_subscript);
         (*t).tp_as_mapping = &raw mut BLOB_AS_MAPPING;
         (*t).tp_methods = rpy_runtime::mdefs![
-            ("read", FAST, m_read, "Read data at the current offset position."),
-            ("write", O, m_write, "Write data at the current offset."),
-            ("seek", FAST, m_seek, "Set the current access position to offset."),
-            ("tell", NOARGS, m_tell, "Return the current access position for the blob."),
-            ("close", NOARGS, m_close, "Close the blob."),
-            ("__enter__", NOARGS, m_enter, "Blob context manager enter."),
-            ("__exit__", FAST, m_exit, "Blob context manager exit."),
+            ("read", FAST, m_read),
+            ("write", O, m_write),
+            ("seek", FAST, m_seek),
+            ("tell", NOARGS, m_tell),
+            ("close", NOARGS, m_close),
+            ("__enter__", NOARGS, m_enter),
+            ("__exit__", FAST, m_exit),
         ];
         rpy_runtime::types::typeobject::type_ready(t)?;
     }

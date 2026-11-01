@@ -39,6 +39,8 @@ crate::dyn_lib!(LibCrypto, ["libcrypto.so.3", "libcrypto.so"], {
     fn PEM_read_bio_X509_AUX(b: P, x: *mut P, cb: P, u: P) -> P;
     fn PEM_write_bio_X509(b: P, x: P) -> c_int;
     fn PEM_read_bio_Parameters(b: P, x: *mut P) -> P;
+    fn PEM_read_bio_DHparams(b: P, x: *mut P, cb: P, u: P) -> P;
+    fn DH_free(d: P);
     fn EVP_PKEY_free(k: P);
     fn X509_get_subject_name(x: P) -> P;
     fn X509_get_issuer_name(x: P) -> P;

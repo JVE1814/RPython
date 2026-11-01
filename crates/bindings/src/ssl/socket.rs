@@ -718,6 +718,7 @@ pub unsafe extern "C" fn msg_cb(write_p: c_int, version: c_int, content_type: c_
             if let Some(cb) = ctx(&s.context).msg_callback.clone() {
                 let data = std::slice::from_raw_parts(buf as *const u8, len);
                 let msg_type = match content_type {
+                    20 => 0x101,
                     21 if data.len() >= 2 => data[1] as i64,
                     _ if !data.is_empty() => data[0] as i64,
                     _ => -1,

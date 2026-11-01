@@ -362,13 +362,13 @@ fn struct_init_impl(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> 
 pub fn init_types() -> PyResult<()> {
     unsafe {
         for (m, name, doc) in [
-            (struct_meta(), c"_ctypes.PyCStructType", c"metatype for the CData Objects"),
-            (union_meta(), c"_ctypes.UnionType", c"metatype for the CData Objects"),
+            (struct_meta(), c"_ctypes.PyCStructType", c"Metaclass of Structure and Union types."),
+            (union_meta(), c"_ctypes.UnionType", c"Metaclass of Structure and Union types."),
         ] {
             init_meta(m, name, ctype_type());
             (*m).tp_init = Some(struct_meta_init);
             (*m).tp_setattro = Some(struct_meta_setattro);
-            (*m).tp_methods = meta_methods(rpy_runtime::mdefs![("from_param", O, ct_from_param, "Convert a Python object into a function call parameter.")], vec![]);
+            (*m).tp_methods = meta_methods(rpy_runtime::mdefs![("from_param", O, ct_from_param)], vec![]);
             (*m).tp_doc = doc.as_ptr();
             set_meta_number(m);
             rpy_runtime::types::typeobject::type_ready(m)?;
@@ -376,7 +376,6 @@ pub fn init_types() -> PyResult<()> {
         for (t, name, meta) in [(struct_type(), c"_ctypes.Structure", struct_meta()), (union_type(), c"_ctypes.Union", union_meta())] {
             init_base_type(t, name, meta, std::mem::size_of::<CDataObject>());
             (*t).tp_init = Some(struct_init);
-            (*t).tp_doc = c"Structure base class".as_ptr();
             rpy_runtime::types::typeobject::type_ready(t)?;
         }
     }

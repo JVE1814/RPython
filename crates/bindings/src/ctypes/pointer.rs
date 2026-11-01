@@ -335,8 +335,7 @@ pub fn init_types() -> PyResult<()> {
             let t = rpy_runtime::mdefs![("set_type", O, pointer_set_type)];
             vec![std::ptr::read(t)]
         };
-        (*m).tp_methods = meta_methods(rpy_runtime::mdefs![("from_param", O, pointer_from_param, "Convert a Python object into a function call parameter.")], extra);
-        (*m).tp_doc = c"metatype for the Pointer Objects".as_ptr();
+        (*m).tp_methods = meta_methods(rpy_runtime::mdefs![("from_param", O, pointer_from_param)], extra);
         set_meta_number(m);
         rpy_runtime::types::typeobject::type_ready(m)?;
 
@@ -352,8 +351,7 @@ pub fn init_types() -> PyResult<()> {
         (*t).tp_as_sequence = &raw mut POINTER_AS_SEQUENCE;
         (*t).tp_as_mapping = &raw mut POINTER_AS_MAPPING;
         (*t).tp_as_number = &raw mut POINTER_AS_NUMBER;
-        (*t).tp_doc = c"XXX to be provided".as_ptr();
-        (*t).tp_getset = rpy_runtime::getset_table![("contents", contents_get, contents_set; "the object this pointer points to (read-write)")];
+        (*t).tp_getset = rpy_runtime::getset_table![("contents", contents_get, contents_set)];
         (*t).tp_methods = rpy_runtime::mdefs![("__class_getitem__", O, pointer_class_getitem; METH_CLASS)];
         rpy_runtime::types::typeobject::type_ready(t)?;
     }

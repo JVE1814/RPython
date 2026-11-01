@@ -987,8 +987,7 @@ pub fn init_types() -> PyResult<()> {
         let m = simple_meta();
         init_meta(m, c"_ctypes.PyCSimpleType", ctype_type());
         (*m).tp_init = Some(simple_meta_init);
-        (*m).tp_methods = meta_methods(rpy_runtime::mdefs![("from_param", O, simple_from_param, "Convert a Python object into a function call parameter.")], vec![]);
-        (*m).tp_doc = c"metatype for the PyCSimpleType Objects".as_ptr();
+        (*m).tp_methods = meta_methods(rpy_runtime::mdefs![("from_param", O, simple_from_param)], vec![]);
         set_meta_number(m);
         rpy_runtime::types::typeobject::type_ready(m)?;
 
@@ -998,9 +997,8 @@ pub fn init_types() -> PyResult<()> {
         (*t).tp_repr = Some(simple_repr);
         SIMPLE_AS_NUMBER.nb_bool = Some(simple_bool);
         (*t).tp_as_number = &raw mut SIMPLE_AS_NUMBER;
-        (*t).tp_doc = c"XXX to be provided".as_ptr();
         (*t).tp_methods = rpy_runtime::mdefs![("__ctypes_from_outparam__", NOARGS, simple_from_outparam)];
-        (*t).tp_getset = rpy_runtime::getset_table![("value", simple_value_get, simple_value_set; "current value")];
+        (*t).tp_getset = rpy_runtime::getset_table![("value", simple_value_get, simple_value_set)];
         rpy_runtime::types::typeobject::type_ready(t)?;
     }
     Ok(())

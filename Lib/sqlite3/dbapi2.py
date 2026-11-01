@@ -43,8 +43,8 @@ def _install_default_adapters():
 
     def _deprecated(kind):
         warnings.warn(
-            f"The default {kind} is deprecated as of Python 3.12; see the "
-            "sqlite3 documentation for suggested replacement recipes",
+            f"sqlite3's built-in {kind} is deprecated; register your own "
+            "adapters/converters instead (see the sqlite3 documentation)",
             DeprecationWarning, stacklevel=3)
 
     def date_to_text(value):

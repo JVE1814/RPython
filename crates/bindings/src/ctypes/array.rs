@@ -104,12 +104,12 @@ fn array_meta_init_impl(cls: &PyObject) -> PyResult<()> {
         let d = &*(*tp).tp_dict;
         if is_char {
             let gs = rpy_runtime::getset_table![
-                ("raw", char_array_get_raw, char_array_set_raw; "value"),
-                ("value", char_array_get_value, char_array_set_value; "string value"),
+                ("raw", char_array_get_raw, char_array_set_raw),
+                ("value", char_array_get_value, char_array_set_value),
             ];
             add_getsets(tp, d, gs)?;
         } else if is_wchar {
-            let gs = rpy_runtime::getset_table![("value", wchar_array_get_value, wchar_array_set_value; "string value")];
+            let gs = rpy_runtime::getset_table![("value", wchar_array_get_value, wchar_array_set_value)];
             add_getsets(tp, d, gs)?;
         }
         capi::PyType_Modified(tp);
@@ -426,8 +426,7 @@ pub fn init_types() -> PyResult<()> {
         let m = array_meta();
         init_meta(m, c"_ctypes.PyCArrayType", ctype_type());
         (*m).tp_init = Some(array_meta_init);
-        (*m).tp_methods = meta_methods(rpy_runtime::mdefs![("from_param", O, ct_from_param, "Convert a Python object into a function call parameter.")], vec![]);
-        (*m).tp_doc = c"metatype for the Array Objects".as_ptr();
+        (*m).tp_methods = meta_methods(rpy_runtime::mdefs![("from_param", O, ct_from_param)], vec![]);
         set_meta_number(m);
         rpy_runtime::types::typeobject::type_ready(m)?;
 
@@ -443,7 +442,6 @@ pub fn init_types() -> PyResult<()> {
         (*t).tp_as_sequence = &raw mut ARRAY_AS_SEQUENCE;
         (*t).tp_as_mapping = &raw mut ARRAY_AS_MAPPING;
         (*t).tp_flags |= Py_TPFLAGS_SEQUENCE;
-        (*t).tp_doc = c"Abstract base class for arrays.".as_ptr();
         (*t).tp_methods = rpy_runtime::mdefs![("__class_getitem__", O, array_class_getitem; METH_CLASS)];
         rpy_runtime::types::typeobject::type_ready(t)?;
     }

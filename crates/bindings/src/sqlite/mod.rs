@@ -358,12 +358,12 @@ pub fn init() -> PyResult {
         raise!(ImportError, "libsqlite3 could not be loaded: {}", e);
     }
     let methods = rpy_runtime::mdefs![
-        ("adapt", FAST, m_adapt, "Adapt given object to given protocol."),
-        ("register_adapter", FAST, m_register_adapter, "Register a function to adapt Python objects to SQLite values."),
-        ("register_converter", FAST, m_register_converter, "Register a function to convert SQLite values to Python objects."),
-        ("complete_statement", FASTKW, m_complete_statement, "Checks if a string contains a complete SQL statement."),
-        ("enable_callback_tracebacks", O, m_enable_callback_tracebacks, "Enable or disable callback functions throwing errors to stderr."),
-        ("connect", FASTKW, connection::module_connect, "Open a connection to the SQLite database file 'database'."),
+        ("adapt", FAST, m_adapt),
+        ("register_adapter", FAST, m_register_adapter),
+        ("register_converter", FAST, m_register_converter),
+        ("complete_statement", FASTKW, m_complete_statement),
+        ("enable_callback_tracebacks", O, m_enable_callback_tracebacks),
+        ("connect", FASTKW, connection::module_connect),
     ];
     let (m, d) = rpy_runtime::modules::fncommon::new_module("_sqlite3", methods, None)?;
     let exception = unsafe { PyRef::from_borrowed(rpy_runtime::types::exceptions::Exception() as *mut PyObject) };
@@ -397,7 +397,6 @@ pub fn init() -> PyResult {
         rpy_runtime::modules::fncommon::init_type(t, c"sqlite3.PrepareProtocol", std::mem::size_of::<PyObject>(), Py_TPFLAGS_BASETYPE);
         (*t).tp_new = Some(rpy_runtime::types::object_type::generic_new);
         (*t).tp_init = Some(pp_init);
-        (*t).tp_doc = c"PEP 246 style object adaption protocol type.".as_ptr();
         (*t).tp_dealloc = Some(pp_dealloc);
         rpy_runtime::types::typeobject::type_ready(t)?;
     }

@@ -802,30 +802,30 @@ pub fn init() -> PyResult {
         raise!(ImportError, "libssl could not be loaded: {}", e);
     }
     let methods = rpy_runtime::mdefs![
-        ("RAND_bytes", O, m_rand_bytes, "Generate n cryptographically strong pseudo-random bytes."),
-        ("RAND_status", NOARGS, m_rand_status, "Returns True if the OpenSSL PRNG has been seeded with enough data."),
-        ("RAND_add", FAST, m_rand_add, "Mix string into the OpenSSL PRNG state."),
-        ("txt2obj", FASTKW, m_txt2obj, "Lookup NID, short name, long name and OID of an ASN1_OBJECT."),
-        ("nid2obj", O, m_nid2obj, "Lookup NID, short name, long name and OID of an ASN1_OBJECT by NID."),
+        ("RAND_bytes", O, m_rand_bytes),
+        ("RAND_status", NOARGS, m_rand_status),
+        ("RAND_add", FAST, m_rand_add),
+        ("txt2obj", FASTKW, m_txt2obj),
+        ("nid2obj", O, m_nid2obj),
         ("_test_decode_cert", O, m_test_decode_cert),
-        ("get_default_verify_paths", NOARGS, m_get_default_verify_paths, "Return search paths and environment vars that are used by SSLContext's set_default_verify_paths()."),
+        ("get_default_verify_paths", NOARGS, m_get_default_verify_paths),
     ];
-    let (m, d) = fc::new_module("_ssl", methods, Some("Implementation module for SSL socket operations."))?;
+    let (m, d) = fc::new_module("_ssl", methods, None)?;
     // exceptions
     let oserror = unsafe { PyRef::from_borrowed(rpy_runtime::types::exceptions::OSError() as *mut PyObject) };
     let valueerror = unsafe { PyRef::from_borrowed(rpy_runtime::types::exceptions::ValueError() as *mut PyObject) };
-    let ssl_error = new_exc("ssl.SSLError", oserror, Some("An error occurred in the SSL implementation."))?;
+    let ssl_error = new_exc("ssl.SSLError", oserror, None)?;
     let one = |b: &PyRef| tuple::new_tuple(vec![b.clone()]);
     let cert_verify_error = new_exc(
         "ssl.SSLCertVerificationError",
         tuple::new_tuple(vec![ssl_error.clone(), valueerror]),
-        Some("A certificate could not be verified."),
+        None,
     )?;
-    let zero_return_error = new_exc("ssl.SSLZeroReturnError", one(&ssl_error), Some("SSL/TLS session closed cleanly."))?;
-    let want_read_error = new_exc("ssl.SSLWantReadError", one(&ssl_error), Some("Non-blocking SSL socket needs to read more data\nbefore the requested operation can be completed."))?;
-    let want_write_error = new_exc("ssl.SSLWantWriteError", one(&ssl_error), Some("Non-blocking SSL socket needs to write more data\nbefore the requested operation can be completed."))?;
-    let syscall_error = new_exc("ssl.SSLSyscallError", one(&ssl_error), Some("System error when attempting SSL operation."))?;
-    let eof_error = new_exc("ssl.SSLEOFError", one(&ssl_error), Some("SSL/TLS connection terminated abruptly."))?;
+    let zero_return_error = new_exc("ssl.SSLZeroReturnError", one(&ssl_error), None)?;
+    let want_read_error = new_exc("ssl.SSLWantReadError", one(&ssl_error), None)?;
+    let want_write_error = new_exc("ssl.SSLWantWriteError", one(&ssl_error), None)?;
+    let syscall_error = new_exc("ssl.SSLSyscallError", one(&ssl_error), None)?;
+    let eof_error = new_exc("ssl.SSLEOFError", one(&ssl_error), None)?;
     for (n, v) in [
         ("SSLError", &ssl_error),
         ("SSLCertVerificationError", &cert_verify_error),
@@ -856,13 +856,13 @@ pub fn init() -> PyResult {
         fc::init_robj_type::<MemBio>(t, c"_ssl.MemoryBIO", 0);
         (*t).tp_new = Some(membio_new);
         (*t).tp_methods = rpy_runtime::mdefs![
-            ("read", FAST, membio_read, "Read up to size bytes from the memory BIO."),
-            ("write", O, membio_write, "Writes the bytes b into the memory BIO."),
-            ("write_eof", NOARGS, membio_write_eof, "Write an EOF marker to the memory BIO."),
+            ("read", FAST, membio_read),
+            ("write", O, membio_write),
+            ("write_eof", NOARGS, membio_write_eof),
         ];
         (*t).tp_getset = rpy_runtime::getset_table![
-            ("pending", membio_pending; "The number of bytes pending in the memory BIO."),
-            ("eof", membio_eof; "Whether the memory BIO is at EOF."),
+            ("pending", membio_pending),
+            ("eof", membio_eof),
         ];
         rpy_runtime::types::typeobject::type_ready(t)?;
         dict::set_item_str(&d, "MemoryBIO", &rpy_runtime::types::typeobject::type_ref(t))?;
@@ -871,11 +871,11 @@ pub fn init() -> PyResult {
         fc::init_robj_type::<Session>(t, c"_ssl.SSLSession", Py_TPFLAGS_DISALLOW_INSTANTIATION);
         (*t).tp_richcompare = Some(sess_richcompare);
         (*t).tp_getset = rpy_runtime::getset_table![
-            ("id", sess_id; "Session ID."),
-            ("time", sess_time; "Session creation time (seconds since epoch)."),
-            ("timeout", sess_timeout; "Session timeout (delta in seconds)."),
-            ("ticket_lifetime_hint", sess_hint; "Ticket life time hint."),
-            ("has_ticket", sess_has_ticket; "Does the session contain a ticket?"),
+            ("id", sess_id),
+            ("time", sess_time),
+            ("timeout", sess_timeout),
+            ("ticket_lifetime_hint", sess_hint),
+            ("has_ticket", sess_has_ticket),
         ];
         rpy_runtime::types::typeobject::type_ready(t)?;
         dict::set_item_str(&d, "SSLSession", &rpy_runtime::types::typeobject::type_ref(t))?;

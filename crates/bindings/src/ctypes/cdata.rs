@@ -496,16 +496,15 @@ pub fn init_cdata_type() -> PyResult<()> {
         (*t).tp_as_buffer = &raw mut CDATA_BUFFER;
         (*t).tp_alloc = Some(rpy_runtime::types::typeobject::generic_alloc);
         (*t).tp_free = Some(rpy_runtime::types::typeobject::generic_free);
-        (*t).tp_doc = c"XXX to be provided".as_ptr();
         (*t).tp_methods = rpy_runtime::mdefs![
             ("__ctypes_from_outparam__", NOARGS, cdata_from_outparam),
             ("__reduce__", NOARGS, cdata_reduce),
             ("__setstate__", FAST, cdata_setstate),
         ];
         (*t).tp_getset = rpy_runtime::getset_table![
-            ("_b_base_", b_base_get; "the base object"),
-            ("_b_needsfree_", b_needsfree_get; "whether the object owns the memory or not"),
-            ("_objects", objects_get; "internal objects tree (NEVER CHANGE THIS OBJECT!)"),
+            ("_b_base_", b_base_get),
+            ("_b_needsfree_", b_needsfree_get),
+            ("_objects", objects_get),
         ];
         rpy_runtime::types::typeobject::type_ready(t)?;
     }
@@ -768,10 +767,10 @@ pub fn meta_methods(fp: *mut PyMethodDef, extra: Vec<PyMethodDef>) -> *mut PyMet
     let mut v: Vec<PyMethodDef> = Vec::new();
     unsafe {
         let base = rpy_runtime::mdefs![
-            ("from_address", O, ct_from_address, "C.from_address(integer) -> C instance\naccess a C instance at the specified address"),
-            ("from_buffer", FAST, ct_from_buffer, "C.from_buffer(object, offset=0) -> C instance\ncreate a C instance from a writeable buffer"),
-            ("from_buffer_copy", FAST, ct_from_buffer_copy, "C.from_buffer_copy(object, offset=0) -> C instance\ncreate a C instance from a readable buffer"),
-            ("in_dll", FAST, ct_in_dll, "C.in_dll(dll, name) -> C instance\naccess a C instance in a dll"),
+            ("from_address", O, ct_from_address),
+            ("from_buffer", FAST, ct_from_buffer),
+            ("from_buffer_copy", FAST, ct_from_buffer_copy),
+            ("in_dll", FAST, ct_in_dll),
         ];
         let mut p = base;
         while !(*p).ml_name.is_null() {

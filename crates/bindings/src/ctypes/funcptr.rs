@@ -1245,8 +1245,7 @@ pub fn init_types() -> PyResult<()> {
         let m = funcptr_meta();
         init_meta(m, c"_ctypes.PyCFuncPtrType", ctype_type());
         (*m).tp_init = Some(funcptr_meta_init);
-        (*m).tp_methods = meta_methods(rpy_runtime::mdefs![("from_param", O, ct_from_param, "Convert a Python object into a function call parameter.")], vec![]);
-        (*m).tp_doc = c"metatype for C function pointers".as_ptr();
+        (*m).tp_methods = meta_methods(rpy_runtime::mdefs![("from_param", O, ct_from_param)], vec![]);
         set_meta_number(m);
         rpy_runtime::types::typeobject::type_ready(m)?;
 
@@ -1260,11 +1259,10 @@ pub fn init_types() -> PyResult<()> {
         (*t).tp_repr = Some(funcptr_repr);
         FUNCPTR_AS_NUMBER.nb_bool = Some(funcptr_bool);
         (*t).tp_as_number = &raw mut FUNCPTR_AS_NUMBER;
-        (*t).tp_doc = c"Function Pointer".as_ptr();
         (*t).tp_getset = rpy_runtime::getset_table![
-            ("errcheck", fp_errcheck_get, fp_errcheck_set; "a function to check for errors"),
-            ("restype", fp_restype_get, fp_restype_set; "specify the result type"),
-            ("argtypes", fp_argtypes_get, fp_argtypes_set; "specify the argument types"),
+            ("errcheck", fp_errcheck_get, fp_errcheck_set),
+            ("restype", fp_restype_get, fp_restype_set),
+            ("argtypes", fp_argtypes_get, fp_argtypes_set),
         ];
         rpy_runtime::types::typeobject::type_ready(t)?;
 
