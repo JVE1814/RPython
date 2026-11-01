@@ -353,6 +353,10 @@ impl Builder {
         sc.private = self.private.clone();
         // a block nested in a comprehension iterable inherits the restriction on walrus
         sc.comp_iter_expr = self.scopes[prev].comp_iter_expr;
+        // blocks nested in a class type-param block only mangle the type parameter names
+        if kind != ScopeKind::Class {
+            sc.mangled_names = self.scopes[prev].mangled_names.clone();
+        }
         self.scopes.push(sc);
         self.scopes[prev].children.push(id);
         if let Some(k) = k {
@@ -390,14 +394,12 @@ impl Builder {
     }
 
     fn add_def_in(&mut self, name: &str, flag: u32, sid: ScopeId, loc: Loc) -> R {
-        let mangled = if sid == self.cur { self.mangle(name) } else { mangle(self.private.as_deref(), name) };
         if flag & DEF_TYPE_PARAM != 0 {
             if let Some(m) = &mut self.scopes[sid].mangled_names {
-                if mangled != name {
-                    m.insert(name.to_string());
-                }
+                m.insert(name.to_string());
             }
         }
+        let mangled = if sid == self.cur { self.mangle(name) } else { mangle(self.private.as_deref(), name) };
         let sc = &mut self.scopes[sid];
         let mut val = match sc.lookup(&mangled) {
             Some(s) => {
@@ -1248,7 +1250,10 @@ impl Builder {
         value: Option<&Expr>,
     ) -> R {
         let is_generator = kind == CompKind::Gen;
-        let outermost = &generators[0];
+        let outermost = match generators.first() {
+            Some(g) => g,
+            None => return Err(CompileError::other(crate::error::ErrorKind::ValueError, "comprehension with no generators")),
+        };
         self.cur_mut().comp_iter_expr += 1;
         let r = self.visit_expr(&outermost.iter);
         self.cur_mut().comp_iter_expr -= 1;

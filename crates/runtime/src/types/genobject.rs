@@ -697,6 +697,11 @@ fn cw_close(o: &PyObject) -> PyResult {
     unsafe { gen_close(&*(*(o.as_ptr() as *mut CoroWrapper)).coro) }
 }
 
+/// A generator created from code with CO_ITERABLE_COROUTINE (`@types.coroutine`).
+pub fn gen_is_iterable_coroutine(o: &PyObject) -> bool {
+    is_generator_exact(o) && crate::types::code::code(unsafe { &*g(o).code }).flags() & bc::co::ITERABLE_COROUTINE != 0
+}
+
 /// `await o` target: the iterator to drive.
 pub fn get_awaitable_iter(o: &PyObject) -> PyResult {
     if is_coroutine_exact(o) {
@@ -714,10 +719,8 @@ pub fn get_awaitable_iter(o: &PyObject) -> PyResult {
         if !am.is_null() {
             if let Some(f) = (*am).am_await {
                 let r = from_c(f(o.as_ptr()))?;
-                if is_coroutine_exact(&r) || (is_generator_exact(&r) && get_awaitable_iter(&r).is_ok()) {
-                    if is_coroutine_exact(&r) {
-                        raise!(TypeError, "__await__() returned a coroutine");
-                    }
+                if is_coroutine_exact(&r) || gen_is_iterable_coroutine(&r) {
+                    raise!(TypeError, "__await__() returned a coroutine");
                 }
                 if r.ty().tp_iternext.is_none() {
                     raise!(TypeError, "__await__() returned non-iterator of type '{}'", tname(&r));
