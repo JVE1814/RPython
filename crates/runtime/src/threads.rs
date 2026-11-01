@@ -174,7 +174,7 @@ pub fn new_thread_state() -> *mut ThreadState {
     }
 }
 
-static FREE_STATES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+pub(crate) static FREE_STATES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 static RECURSION_LIMIT: AtomicUsize = AtomicUsize::new(1000);
 /// pthread id of the main Python thread (0 = not yet known).
 pub static MAIN_THREAD_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

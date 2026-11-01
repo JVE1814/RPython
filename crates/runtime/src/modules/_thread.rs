@@ -291,8 +291,13 @@ fn my_ident() -> u64 {
     unsafe { libc::pthread_self() as u64 }
 }
 
-unsafe extern "C" fn rlock_new(tp: *mut PyTypeObject, _args: *mut PyObject, _kw: *mut PyObject) -> *mut PyObject {
+unsafe extern "C" fn rlock_new(tp: *mut PyTypeObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
     unsafe {
+        // Arguments are only accepted when a subclass defines its own __init__.
+        let has_args = (!args.is_null() && tuple::tuple_len(&*args) != 0) || (!kw.is_null() && dict::dict_len(&*kw) != 0);
+        if has_args && (tp == &raw mut RLOCK_TYPE || (*tp).tp_init == RLOCK_TYPE.tp_init) {
+            return into_c(Err(err!(TypeError, "RLock() takes no arguments")));
+        }
         let op = crate::alloc::alloc_object(tp, std::mem::size_of::<RLockObject>().max((*tp).tp_basicsize as usize));
         let r = op as *mut RLockObject;
         std::ptr::write(&raw mut (*r).lock, RawLock::new());
@@ -807,6 +812,9 @@ fn interrupt_main(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> P
         None => libc::SIGINT,
     };
     crate::modules::signal::set_interrupt(signum)?;
+    // Called from the main thread: the handler runs right away (before the
+    // caller's next statement), as it would after the call returns.
+    crate::modules::signal::check_signals()?;
     Ok(none::none_ref())
 }
 fn daemon_threads_allowed(_m: &PyObject) -> PyResult {

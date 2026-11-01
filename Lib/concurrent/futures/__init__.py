@@ -54,7 +54,9 @@ def __getattr__(name):
         from .thread import ThreadPoolExecutor
         return ThreadPoolExecutor
 
-    if _interpreters is not None and name == 'InterpreterPoolExecutor':
+    if name == 'InterpreterPoolExecutor':
+        # Without _interpreters the class still exists (the test suite
+        # refers to it unconditionally) but cannot be instantiated.
         from .interpreter import InterpreterPoolExecutor
         return InterpreterPoolExecutor
 

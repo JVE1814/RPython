@@ -25,6 +25,7 @@ pub mod methods;
 pub mod modules;
 pub mod object;
 pub mod threads;
+pub mod fork;
 pub mod tlab;
 pub mod types;
 

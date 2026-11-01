@@ -709,6 +709,7 @@ fn methods() -> *mut crate::ffi::PyMethodDef {
         ("getrandom", FASTKW, os_getrandom),
         ("register_at_fork", FASTKW, os_register_at_fork),
         ("fork", NOARGS, os_fork),
+        ("forkpty", NOARGS, os_forkpty),
         ("execv", FAST, os_execv),
         ("execve", FASTKW, os_execve),
         ("waitpid", FAST, os_waitpid),

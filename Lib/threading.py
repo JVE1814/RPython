@@ -112,19 +112,12 @@ def gettrace():
 Lock = _LockType
 
 
-def RLock(*args, **kwargs):
+def RLock():
     """Factory returning a new reentrant lock: the lock must be released by
     the thread that acquired it, as many times as it was acquired."""
-    if args or kwargs:
-        import warnings
-        warnings.warn(
-            'Passing arguments to RLock is deprecated and will be removed in 3.15',
-            DeprecationWarning,
-            stacklevel=2,
-        )
     if _CRLock is None:
-        return _PyRLock(*args, **kwargs)
-    return _CRLock(*args, **kwargs)
+        return _PyRLock()
+    return _CRLock()
 
 
 class _RLock:
@@ -256,6 +249,10 @@ class Condition:
     def __repr__(self):
         return "<Condition(%s, %d)>" % (self._lock, len(self._waiters))
 
+    def locked(self):
+        """True if the underlying lock is held."""
+        return self._lock.locked()
+
     def _release_save(self):
         self._lock.release()
 
@@ -274,6 +271,8 @@ class Condition:
         expires, then re-acquire the lock.  Returns False on timeout."""
         if not self._is_owned():
             raise RuntimeError("cannot wait on un-acquired lock")
+        if timeout is not None and timeout != timeout:
+            raise ValueError("Invalid value NaN (not a number)")
         waiter = _allocate_lock()
         waiter.acquire()
         self._waiters.append(waiter)
