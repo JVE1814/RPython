@@ -285,7 +285,5 @@ parsing) takes ~3 s in release mode.
 * Line-event behaviour could not be validated end to end (runtime tracing is stubbed); the
   shapes follow CPython's rules but `test_sys_settrace` details may differ.
 * No constant folding of subscripts or slices (there is no slice constant in the contract).
-* `optimize_ast(level 2)` strips docstrings of module/classes/functions reachable through
-  def/class nesting only (not defs inside if/for blocks).
 * Exact `co_consts` layouts checked by CPython-only tests (e.g. test_folding_type_param) are
   not reproduced.
