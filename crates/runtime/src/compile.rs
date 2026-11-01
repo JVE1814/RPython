@@ -26,7 +26,7 @@ impl Mode {
             _ => return None,
         })
     }
-    fn p(self) -> PMode {
+    pub fn p(self) -> PMode {
         match self {
             Mode::Exec => PMode::Exec,
             Mode::Eval => PMode::Eval,
@@ -34,7 +34,7 @@ impl Mode {
             Mode::FuncType => PMode::FuncType,
         }
     }
-    fn c(self) -> CMode {
+    pub fn c(self) -> CMode {
         match self {
             Mode::Exec => CMode::Exec,
             Mode::Eval => CMode::Eval,
@@ -111,12 +111,15 @@ fn source_line(src: &str, lineno: i32) -> Option<String> {
 }
 
 fn parse_error(e: &rpy_parser::SyntaxError, filename: &str) -> PyErr {
-    let class = match e.kind.class_name() {
-        "IndentationError" => crate::types::exceptions::IndentationError(),
-        "TabError" => crate::types::exceptions::TabError(),
-        "_IncompleteInputError" | "IncompleteInputError" => crate::types::exceptions::IncompleteInputError(),
-        _ if e.msg == "incomplete input" => crate::types::exceptions::IncompleteInputError(),
-        _ => crate::types::exceptions::SyntaxError(),
+    use rpy_parser::ErrorKind as K;
+    let class = match e.kind {
+        K::Indentation => crate::types::exceptions::IndentationError(),
+        K::Tab => crate::types::exceptions::TabError(),
+        K::IncompleteInput => crate::types::exceptions::IncompleteInputError(),
+        K::MemoryError => return err!(MemoryError, "{}", e.msg),
+        K::RecursionError => return err!(RecursionError, "{}", e.msg),
+        K::Syntax if e.msg == "incomplete input" => crate::types::exceptions::IncompleteInputError(),
+        K::Syntax => crate::types::exceptions::SyntaxError(),
     };
     raise_syntax_error(class, &e.msg, filename, e.lineno, e.offset, e.text.as_deref(), e.end_lineno, e.end_offset)
 }
@@ -138,7 +141,10 @@ fn compile_error(e: &rpy_compiler::CompileError, filename: &str, src: Option<&st
         match src.and_then(|s| source_line(s, line)) {
             Some(l) => {
                 let b = (col.max(0) as usize).min(l.len());
-                l[..b].chars().count() as i32 + 1
+                match l.get(..b) {
+                    Some(p) => p.chars().count() as i32 + 1,
+                    None => col + 1,
+                }
             }
             None => col + 1,
         }
@@ -156,25 +162,28 @@ fn compile_error(e: &rpy_compiler::CompileError, filename: &str, src: Option<&st
 }
 
 /// Emit a compile-time warning; if the filter turns it into an error, raise SyntaxError.
-fn emit_warning(category: &str, msg: &str, error_msg: &str, filename: &str, lineno: i32, offset: i32, text: Option<&str>) -> PyResult<()> {
+#[allow(clippy::too_many_arguments)]
+fn emit_warning_m(
+    category: &str,
+    msg: &str,
+    error_msg: &str,
+    filename: &str,
+    lineno: i32,
+    offset: i32,
+    text: Option<&str>,
+    module: Option<&PyObject>,
+) -> PyResult<()> {
     let cat = match category {
         "DeprecationWarning" => crate::types::exceptions::DeprecationWarning(),
         _ => crate::types::exceptions::SyntaxWarning(),
     };
-    let r = crate::modules::warnings::warn_explicit(cat, msg, filename, lineno);
+    let m = pystr::new_str(msg);
+    let f = pystr::new_str(filename);
+    let r = crate::modules::_warnings::warn_explicit(cat, &m, &f, lineno as i64, module, None);
     if r.is_err() {
         if exc_matches(cat) {
             clear_exc();
-            return Err(raise_syntax_error(
-                crate::types::exceptions::SyntaxError(),
-                error_msg,
-                filename,
-                lineno,
-                offset,
-                text,
-                None,
-                None,
-            ));
+            return Err(raise_syntax_error(crate::types::exceptions::SyntaxError(), error_msg, filename, lineno, offset, text, None, None));
         }
         return r;
     }
@@ -188,39 +197,109 @@ pub struct Compiled {
 
 /// Compile source text to a code object.
 pub fn compile_str(src: &str, filename: &str, mode: Mode, flags: u32, optimize: i32) -> PyResult<Compiled> {
-    let popts = parse_options(mode, flags, None);
-    let out = rpy_parser::parse(src, &popts);
-    for w in &out.warnings {
-        let cat = format!("{:?}", w.category);
-        emit_warning(&cat, &w.msg, &w.error_msg, filename, w.lineno, w.col_offset + 1, source_line(src, w.lineno).as_deref())?;
-    }
-    let module = match out.result {
-        Ok(m) => m,
-        Err(e) => return Err(parse_error(&e, filename)),
-    };
-    compile_ast(&module, filename, mode, flags, optimize, Some(src))
+    compile_source(Source::Str(src), &Opts::new(filename, mode, flags, optimize))
 }
 
 /// Compile source bytes (encoding detection, BOM).
 pub fn compile_bytes(src: &[u8], filename: &str, mode: Mode, flags: u32, optimize: i32) -> PyResult<Compiled> {
-    let popts = parse_options(mode, flags, None);
-    let out = rpy_parser::parse_bytes(src, &popts);
-    let text = String::from_utf8_lossy(src).into_owned();
-    for w in &out.warnings {
-        let cat = format!("{:?}", w.category);
-        emit_warning(&cat, &w.msg, &w.error_msg, filename, w.lineno, w.col_offset + 1, source_line(&text, w.lineno).as_deref())?;
-    }
-    let module = match out.result {
-        Ok(m) => m,
-        Err(e) => return Err(parse_error(&e, filename)),
-    };
-    compile_ast(&module, filename, mode, flags, optimize, Some(&text))
+    compile_source(Source::Bytes(src), &Opts::new(filename, mode, flags, optimize))
 }
 
 pub fn compile_ast(module: &rpy_parser::ast::Mod, filename: &str, mode: Mode, flags: u32, optimize: i32, src: Option<&str>) -> PyResult<Compiled> {
-    let mut copts = CompileOptions::new(filename, mode.c());
-    copts.flags = flags;
-    copts.optimize = if optimize < 0 { crate::modules::sys::optimize_flag() } else { optimize };
+    compile_mod(module, &Opts::new(filename, mode, flags, optimize), src)
+}
+
+/// Source text of a compile() call.
+#[derive(Clone, Copy)]
+pub enum Source<'a> {
+    /// Decoded text (encoding declarations are ignored, like PyCF_IGNORE_COOKIE).
+    Str(&'a str),
+    /// Raw bytes (BOM / PEP 263 cookie honoured).
+    Bytes(&'a [u8]),
+}
+
+/// Options of a compile()/ast.parse() call.
+#[derive(Clone, Copy)]
+pub struct Opts<'a> {
+    pub filename: &'a str,
+    pub mode: Mode,
+    pub flags: u32,
+    pub optimize: i32,
+    /// `_feature_version` minor version (only honoured with PyCF_ONLY_AST).
+    pub feature_version: Option<u32>,
+    /// `module=` argument of compile(): used to filter compile-time warnings.
+    pub module: Option<&'a PyObject>,
+}
+
+impl<'a> Opts<'a> {
+    pub fn new(filename: &'a str, mode: Mode, flags: u32, optimize: i32) -> Opts<'a> {
+        Opts { filename, mode, flags, optimize, feature_version: None, module: None }
+    }
+}
+
+fn decode_hook(enc: &str, data: &[u8]) -> Option<Result<String, String>> {
+    let b = crate::types::bytes::new_bytes(data);
+    match crate::modules::codecs_registry::decode(&b, enc, "strict") {
+        Ok(s) => Some(Ok(pystr::to_string_lossy(&s))),
+        Err(_) => {
+            if exc_matches(crate::types::exceptions::LookupError()) {
+                clear_exc();
+                return None;
+            }
+            let msg = take_exc().map(|e| crate::abstract_::str_string(&e).unwrap_or_default()).unwrap_or_default();
+            Some(Err(msg))
+        }
+    }
+}
+
+pub fn full_parse_options(o: &Opts) -> ParseOptions {
+    let mut p = parse_options(o.mode, o.flags, o.feature_version);
+    p.dont_imply_dedent = o.flags & rpy_compiler::cf::PYCF_DONT_IMPLY_DEDENT != 0;
+    p.filename = o.filename.to_string();
+    p.decode = Some(decode_hook);
+    let d = crate::modules::sys::int_max_str_digits();
+    p.int_max_str_digits = if d <= 0 { 0 } else { d as usize };
+    p
+}
+
+/// Decode `src` to text (BOM, PEP 263 cookie) or raise the decoding SyntaxError.
+pub fn decode_source(src: &[u8], filename: &str) -> PyResult<String> {
+    match rpy_parser::tokenizer::decode_source_with(src, Some(decode_hook), filename) {
+        Ok(s) => Ok(s),
+        Err(e) => Err(parse_error(&e, filename)),
+    }
+}
+
+/// Parse source to a Rust AST, emitting parser warnings. Returns the AST and the decoded text.
+pub fn parse_mod(src: Source, o: &Opts) -> PyResult<(rpy_parser::ast::Mod, String)> {
+    let text: std::borrow::Cow<str> = match src {
+        Source::Str(s) => std::borrow::Cow::Borrowed(s),
+        Source::Bytes(b) => std::borrow::Cow::Owned(decode_source(b, o.filename)?),
+    };
+    let popts = full_parse_options(o);
+    let out = rpy_parser::parse(&text, &popts);
+    for w in &out.warnings {
+        let cat = format!("{:?}", w.category);
+        emit_warning_m(&cat, &w.msg, &w.error_msg, o.filename, w.lineno, w.offset, source_line(&text, w.lineno).as_deref(), o.module)?;
+    }
+    match out.result {
+        Ok(m) => Ok((m, text.into_owned())),
+        Err(e) => Err(parse_error(&e, o.filename)),
+    }
+}
+
+/// Full pipeline: source -> code object.
+pub fn compile_source(src: Source, o: &Opts) -> PyResult<Compiled> {
+    let (module, text) = parse_mod(src, o)?;
+    compile_mod(&module, o, Some(&text))
+}
+
+/// Rust AST -> code object (warnings filtered with `o.module`).
+pub fn compile_mod(module: &rpy_parser::ast::Mod, o: &Opts, src: Option<&str>) -> PyResult<Compiled> {
+    let filename = o.filename;
+    let mut copts = CompileOptions::new(filename, o.mode.c());
+    copts.flags = o.flags;
+    copts.optimize = if o.optimize < 0 { crate::modules::sys::optimize_flag() } else { o.optimize };
     let out = match rpy_compiler::compile(module, &copts) {
         Ok(o) => o,
         Err(e) => return Err(compile_error(&e, filename, src)),
@@ -228,12 +307,30 @@ pub fn compile_ast(module: &rpy_parser::ast::Mod, filename: &str, mode: Mode, fl
     for w in &out.warnings {
         let cat = format!("{:?}", w.category);
         let text = src.and_then(|s| source_line(s, w.lineno));
-        emit_warning(&cat, &w.msg, &w.msg, filename, w.lineno, w.col_offset + 1, text.as_deref())?;
+        let off = match &text {
+            Some(l) => {
+                let b = (w.col_offset.max(0) as usize).min(l.len());
+                l.get(..b).map_or(w.col_offset + 1, |p| p.chars().count() as i32 + 1)
+            }
+            None => w.col_offset + 1,
+        };
+        emit_warning_m(&cat, &w.msg, &w.msg, filename, w.lineno, off, text.as_deref(), o.module)?;
     }
     let fname = pystr::intern_str(filename);
     let code = crate::types::code::new_code_from_unit(&out.code, Some(&fname))?;
     Ok(Compiled { code, future_flags: out.future_flags })
 }
 
-#[allow(dead_code)]
-fn _unused(_: &PyObject) {}
+/// AST-level optimization of `ast.parse(..., optimize=N)` / PyCF_OPTIMIZED_AST.
+pub fn optimize_mod(module: &mut rpy_parser::ast::Mod, o: &Opts) -> PyResult<()> {
+    let opt = if o.optimize < 0 { crate::modules::sys::optimize_flag() } else { o.optimize };
+    match rpy_compiler::optimize_ast(module, opt, o.flags) {
+        Ok(()) => Ok(()),
+        Err(e) => Err(compile_error(&e, o.filename, None)),
+    }
+}
+
+/// Map a compiler error (validation etc.) to a Python exception.
+pub fn raise_compile_error(e: &rpy_compiler::CompileError, filename: &str, src: Option<&str>) -> PyErr {
+    compile_error(e, filename, src)
+}
