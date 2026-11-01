@@ -50,3 +50,46 @@ def gens(n):
 for _ in range(150):
     r = (ranges(), lists(), tuples(), nested(30), gens(20))
 print(r)
+
+def subscr(n):
+    l = list(range(10))
+    t = tuple(range(10))
+    out = []
+    for i in range(-12, 12):
+        for c in (l, t):
+            try:
+                out.append(c[i])
+            except IndexError as e:
+                out.append(str(e))
+    out.append(l[2 ** 40 % 7])
+    try:
+        l[2 ** 40]
+    except IndexError as e:
+        out.append(str(e))
+    out.append(t[True])
+    f = [1.5, float('nan'), -0.0]
+    out.append([(a < b, a <= b, a == b, a != b, a > b, a >= b) for a in f for b in f])
+    return out
+
+for _ in range(120):
+    r = subscr(1)
+print(r)
+
+def fcmp(vals):
+    out = []
+    for a in vals:
+        for b in vals:
+            r = 0
+            if a < b: r |= 1
+            if a <= b: r |= 2
+            if a == b: r |= 4
+            if a != b: r |= 8
+            if a > b: r |= 16
+            if a >= b: r |= 32
+            if not (a < b): r |= 64
+            out.append(r)
+    return out
+
+for _ in range(120):
+    r = fcmp([1.5, float('nan'), -0.0, 0.0, float('inf'), 3, -2, 2 ** 70])
+print(r)

@@ -639,7 +639,7 @@ impl<'a> Gen<'a> {
                 self.helper_sp(&ins, d, addr!(h::h_unary), Some(which), None, d - 1);
                 self.a.bind(done);
             }
-            Op::BinarySubscr => self.helper_sp(&ins, d, addr!(h::h_binary_subscr), None, None, d - 2),
+            Op::BinarySubscr => self.binary_subscr(&ins, d),
             Op::StoreSubscr => self.helper_sp(&ins, d, addr!(h::h_store_subscr), None, None, d - 3),
             Op::DeleteSubscr => self.helper_sp(&ins, d, addr!(h::h_delete_subscr), None, None, d - 2),
             Op::BinarySlice => self.helper_sp(&ins, d, addr!(h::h_binary_slice), None, None, d - 3),
@@ -707,6 +707,53 @@ impl<'a> Gen<'a> {
             _ => self.deopt(ins.start, d),
         }
         Ok(())
+    }
+
+    /// BinarySubscr with inline list[int] / tuple[int] (compact int index).
+    fn binary_subscr(&mut self, ins: &Instr, d: i32) {
+        let (mc, mk) = (self.slot(d - 2), self.slot(d - 1));
+        let slow = self.a.label();
+        let done = self.a.label();
+        let not_list = self.a.label();
+        let got = self.a.label();
+        self.a.load(Rax, mc);
+        self.a.load(Rcx, mk);
+        self.compact_int(Rcx, Rsi, Rdx, slow);
+        for (tp, is_list) in [(crate::types::list::list_type() as i64, true), (crate::types::tuple::tuple_type() as i64, false)] {
+            if !is_list {
+                self.a.bind(not_list);
+            }
+            self.a.mov_ri(Rdx, tp);
+            self.a.cmp_rm(Rdx, M(Rax, OB_TYPE));
+            self.a.jcc(Cc::NE, if is_list { not_list } else { slow });
+            self.a.load(Rdx, M(Rax, LIST_SIZE));
+            let pos = self.a.label();
+            self.a.test_rr(Rsi, Rsi);
+            self.a.jcc(Cc::NS, pos);
+            self.a.add_rr(Rsi, Rdx);
+            self.a.bind(pos);
+            self.a.cmp_rr(Rsi, Rdx);
+            self.a.jcc(Cc::AE, slow);
+            if is_list {
+                self.a.load(Rdx, M(Rax, LIST_ITEMS));
+                self.a.load_idx(Rdi, Rdx, Rsi, 8, 0);
+                self.a.jmp(got);
+            } else {
+                self.a.load_idx(Rdi, Rax, Rsi, 8, TUPLE_ITEMS);
+            }
+        }
+        self.a.bind(got);
+        self.incref(Rdi);
+        self.a.mov_rr(R14, Rdi);
+        self.a.load(Rax, mc);
+        self.decref(Rax);
+        self.a.load(Rax, mk);
+        self.decref(Rax);
+        self.a.store(mc, R14);
+        self.a.jmp(done);
+        self.a.bind(slow);
+        self.helper_sp(ins, d, addr!(h::h_binary_subscr), None, None, d - 2);
+        self.a.bind(done);
     }
 
     // ------------------------------------------------------------ iteration
@@ -1114,12 +1161,55 @@ impl<'a> Gen<'a> {
         let (ma, mb) = (self.slot(d - 2), self.slot(d - 1));
         let slow = self.a.label();
         let decide = self.a.label();
+        let not_int = self.a.label();
+        let release = self.a.label();
         self.a.load(Rax, ma);
         self.a.load(Rcx, mb);
-        self.compact_int(Rax, Rdi, Rdx, slow);
+        self.compact_int(Rax, Rdi, Rdx, not_int);
         self.compact_int(Rcx, Rsi, Rdx, slow);
         self.a.cmp_rr(Rdi, Rsi);
         self.a.setcc(cc, R14);
+        self.a.jmp(release);
+        // float x float (IEEE semantics: comparisons with NaN are false, != is true)
+        self.a.bind(not_int);
+        self.a.mov_ri(Rdx, crate::types::float::float_type() as i64);
+        self.a.cmp_rm(Rdx, M(Rax, OB_TYPE));
+        self.a.jcc(Cc::NE, slow);
+        self.a.cmp_rm(Rdx, M(Rcx, OB_TYPE));
+        self.a.jcc(Cc::NE, slow);
+        self.a.movsd_load(XMM0, M(Rax, FVAL));
+        self.a.movsd_load(XMM1, M(Rcx, FVAL));
+        match cop {
+            Py_LT => {
+                self.a.ucomisd(XMM1, XMM0);
+                self.a.setcc(Cc::A, R14);
+            }
+            Py_LE => {
+                self.a.ucomisd(XMM1, XMM0);
+                self.a.setcc(Cc::AE, R14);
+            }
+            Py_GT => {
+                self.a.ucomisd(XMM0, XMM1);
+                self.a.setcc(Cc::A, R14);
+            }
+            Py_GE => {
+                self.a.ucomisd(XMM0, XMM1);
+                self.a.setcc(Cc::AE, R14);
+            }
+            Py_EQ => {
+                self.a.ucomisd(XMM0, XMM1);
+                self.a.setcc(Cc::E, R14);
+                self.a.setcc(Cc::NP, Rdx);
+                self.a.and_rr(R14, Rdx);
+            }
+            _ => {
+                self.a.ucomisd(XMM0, XMM1);
+                self.a.setcc(Cc::NE, R14);
+                self.a.setcc(Cc::P, Rdx);
+                self.a.or_rr(R14, Rdx);
+            }
+        }
+        self.a.bind(release);
         // operands: release (compact ints are mostly immortal small ints)
         self.a.load(Rax, ma);
         self.decref(Rax);
