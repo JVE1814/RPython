@@ -265,7 +265,7 @@ pub(crate) fn check_future(m: &Mod, inherited: u32) -> R<u32> {
     let mut done = false;
     for (i, s) in body.iter().enumerate() {
         match &s.node {
-            StmtKind::ImportFrom { module: Some(m), names, .. } if m == "__future__" => {
+            StmtKind::ImportFrom { module: Some(m), names, level: 0, .. } if m == "__future__" => {
                 if done {
                     return Err(CompileError::syntax("from __future__ imports must occur at the beginning of the file", s.loc));
                 }

@@ -919,6 +919,8 @@ impl<'w> Folder<'w> {
                     ExprKind::Constant { value, .. } => {
                         matches!(value, Constant::None | Constant::Bool(_) | Constant::Ellipsis)
                     }
+                    // a tuple display of constants is a literal too
+                    ExprKind::Tuple { elts, .. } => !elts.iter().all(|x| matches!(x.node, ExprKind::Constant { .. })),
                     _ => true,
                 }
             };

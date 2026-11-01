@@ -700,7 +700,9 @@ impl<'a> Parser<'a> {
             // (its NEWLINE is the implied, empty one) has no NEWLINE left for the rule.
             let ends_ok = self.at(TokenType::ENDMARKER) && {
                 let prev = self.toks[self.p.max(1) - 1];
-                prev.ty == TokenType::DEDENT || (prev.ty == TokenType::NEWLINE && prev.end > prev.start)
+                prev.ty == TokenType::DEDENT
+                    || (prev.ty == TokenType::NEWLINE
+                        && matches!(self.src.as_bytes().get(prev.start as usize), Some(b'\n' | b'\r')))
             };
             if self.eat(TokenType::NEWLINE).is_some() || ends_ok {
                 return Ok(Some(Mod::Interactive { body: vec![s] }));
