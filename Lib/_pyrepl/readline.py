@@ -68,7 +68,7 @@ DEFAULT_DELIMS = " \t\n`~!@#$%^&*()-=+[{]}\\|;:'\",<>/?"
 class ReadlineConfig:
     readline_completer: object | None = None
     completer_delims: frozenset = frozenset(DEFAULT_DELIMS)
-    module_completer: ModuleCompleter | None = None
+    module_completer: ModuleCompleter | None = field(default_factory=ModuleCompleter)
     colorize_completions: object | None = None
 
 

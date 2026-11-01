@@ -48,11 +48,17 @@ class BaseEventQueue:
             self.buf.extend(byte)
             if isinstance(node, dict):
                 self.keymap = node
+                self._partial_key = True
             else:
                 self.insert(Event("key", node, bytes(self.flush_buf())))
                 self.keymap = self.compiled_keymap
+                self._partial_key = False
             return
-        if self.keymap is not self.compiled_keymap:
+        partial = getattr(self, "_partial_key", False)
+        self._partial_key = False
+        if self.keymap is not self.compiled_keymap and not partial:
+            self.keymap = self.compiled_keymap
+        if partial:
             # an unfinished key sequence: what was buffered is plain text;
             # the new byte starts over from the top of the keymap
             self.keymap = self.compiled_keymap
