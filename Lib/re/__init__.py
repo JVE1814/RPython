@@ -187,7 +187,7 @@ def purge():
 
 # Characters that have a meaning somewhere in the pattern syntax: operators,
 # brackets, set operators, and '#' and whitespace (verbose mode).
-_escape_map = {c: '\\' + chr(c) for c in b'()[]{}?*+-|^$\\.&~# \t\n\r\v\f'}
+_escape_map = {ord(c): '\\' + c for c in '()[]{}?*+-|^$\\.&~# \t\n\r\v\f'}
 
 
 def escape(pattern):
