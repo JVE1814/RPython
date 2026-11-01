@@ -47,6 +47,9 @@ impl Buf {
                     let mut view: Py_buffer = std::mem::zeroed();
                     let flags = if writable { 1 } else { 0 };
                     if gb(o.as_ptr(), &mut view, flags) < 0 {
+                        if !writable {
+                            return Err(PyErr);
+                        }
                         clear_exc();
                         return Err(Self::type_err(o, writable));
                     }
@@ -69,6 +72,9 @@ impl Buf {
                         }
                         if !ok {
                             drop(b);
+                            if !writable {
+                                raise!(BufferError, "memoryview: underlying buffer is not C-contiguous");
+                            }
                             return Err(Self::type_err(o, writable));
                         }
                     }
