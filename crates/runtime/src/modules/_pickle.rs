@@ -2838,6 +2838,9 @@ impl<'a> U<'a> {
             op::GLOBAL => {
                 let m = self.line_body()?;
                 let n = self.line_body()?;
+                if m.is_empty() || n.is_empty() {
+                    return Err(truncated());
+                }
                 let ms = decode_utf8_strict(&m)?;
                 let ns = decode_utf8_strict(&n)?;
                 let v = self.find_class(&ms, &ns)?;
@@ -2855,6 +2858,9 @@ impl<'a> U<'a> {
             op::INST => {
                 let m = self.line_body()?;
                 let n = self.line_body()?;
+                if m.is_empty() || n.is_empty() {
+                    return Err(truncated());
+                }
                 let ms = decode_ascii_strict(&m)?;
                 let ns = decode_ascii_strict(&n)?;
                 let klass = self.find_class(&ms, &ns)?;

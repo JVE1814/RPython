@@ -682,7 +682,8 @@ unsafe fn add_methods(tp: *mut PyTypeObject) -> PyResult<()> {
             let descr = if (*m).ml_flags & METH_CLASS != 0 {
                 crate::types::descr::new_classmethod_descr(tp, m)
             } else if (*m).ml_flags & METH_STATIC != 0 {
-                let f = crate::types::cfunction::new_cfunction(m, None, None);
+                let owner = if is_heap_type(tp) { None } else { Some(type_ref(tp)) };
+                let f = crate::types::cfunction::new_cfunction(m, owner, None);
                 crate::types::funcobject::new_staticmethod(f)
             } else {
                 crate::types::descr::new_method_descr(tp, m)
