@@ -669,6 +669,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                         super::jit::Run::Return(v) => return Ok(Some(Exit::Return(v))),
                         super::jit::Run::Error => return Err(PyErr),
                         super::jit::Run::Deopt(npc) => pc = npc,
+                        super::jit::Run::Yield(v) => return Ok(Some(Exit::Yield(v))),
                     }
                 }
                 let mut ext: u32 = 0;

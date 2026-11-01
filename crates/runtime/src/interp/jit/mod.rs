@@ -97,6 +97,8 @@ pub enum Run {
     Error,
     /// continue interpreting at this pc
     Deopt(usize),
+    /// the generator frame yielded this value (frame suspended at f.next_instr)
+    Yield(PyRef),
 }
 
 #[inline]
@@ -157,6 +159,7 @@ fn run(ts: &ThreadState, f: &mut Frame, c: &Compiled, pc: usize) -> Run {
     match st {
         tier1::ST_RETURN => Run::Return(unsafe { PyRef::from_raw(out) }),
         tier1::ST_ERROR => Run::Error,
+        tier1::ST_YIELD => Run::Yield(unsafe { PyRef::from_raw(out) }),
         _ => Run::Deopt(f.next_instr as usize),
     }
 }

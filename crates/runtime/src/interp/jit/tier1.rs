@@ -33,6 +33,8 @@ use std::mem::offset_of;
 pub const ST_RETURN: u32 = 0;
 pub const ST_ERROR: u32 = 1;
 pub const ST_DEOPT: u32 = 2;
+pub const ST_YIELD: u32 = 3;
+const YIELD_FROM_SEND: i32 = offset_of!(Frame, yield_from_send) as i32;
 
 const LASTI: i32 = offset_of!(Frame, lasti) as i32;
 const NEXT_INSTR: i32 = offset_of!(Frame, next_instr) as i32;
@@ -422,6 +424,22 @@ impl<'a> Gen<'a> {
                 self.a.store(M(Rcx, 0), Rax);
                 self.a.store_i(M(Rbx, STACK_TOP), self.nlp + d - 1);
                 self.a.mov_ri(Rax, ST_RETURN as i64);
+                self.a.jmp(self.exit);
+            }
+            Op::YieldValue => {
+                // suspend: the interpreter resumes the generator at the next instruction
+                // (an entry point of this code) and pushes the sent value there
+                let next = self.an.instrs.get(i + 1).map_or(ins.pc + 1, |n| n.start);
+                let send = if i > 0 && self.an.instrs[i - 1].op == Op::Send { self.an.instrs[i - 1].pc as i32 } else { -1 };
+                let m = self.slot(d - 1);
+                self.a.load(Rax, m);
+                self.a.load(Rcx, M(Rsp, 0));
+                self.a.store(M(Rcx, 0), Rax);
+                self.a.store32_i(M(Rbx, LASTI), pc as i32);
+                self.a.store32_i(M(Rbx, NEXT_INSTR), next as i32);
+                self.a.store32_i(M(Rbx, YIELD_FROM_SEND), send);
+                self.a.store_i(M(Rbx, STACK_TOP), self.nlp + d - 1);
+                self.a.mov_ri(Rax, ST_YIELD as i64);
                 self.a.jmp(self.exit);
             }
             Op::Jump => {
