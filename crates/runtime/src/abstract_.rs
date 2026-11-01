@@ -1034,6 +1034,9 @@ pub fn getitem(o: &PyObject, key: &PyObject) -> PyResult {
         }
     }
     if is_type(o) {
+        if o.is(crate::types::typeobject::type_obj(crate::types::typeobject::type_type())) {
+            return crate::types::genericalias::new_generic_alias(o, key);
+        }
         // __class_getitem__
         if let Some(m) = getattr_opt(o, name!("__class_getitem__"))? {
             return call(&m, &[key]);

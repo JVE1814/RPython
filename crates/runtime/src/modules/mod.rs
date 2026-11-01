@@ -16,11 +16,6 @@ pub mod sys_trace_api;
 pub mod codecs_core;
 pub mod codecs_registry;
 pub mod reprlib_guard;
-
-/// Register all builtin (Rust-implemented) modules with the import system.
-pub fn register_all() {
-    numbers_registry::register();
-}
 pub mod builtins_numbers;
 pub mod math;
 pub mod numbers_registry;
@@ -28,3 +23,35 @@ pub mod cmath;
 pub mod _struct;
 pub mod binascii;
 pub mod _random;
+pub mod bufview;
+pub mod errno;
+pub mod posix;
+pub mod stat_mod;
+pub mod time;
+pub mod fncommon;
+pub mod functional;
+pub mod _operator;
+pub mod _functools;
+pub mod _abc;
+pub mod itertools;
+pub mod _warnings;
+pub mod sys_structseq;
+pub mod sys_namespace;
+pub mod _thread;
+pub mod pymain;
+pub mod text_util;
+pub mod _sre;
+
+/// Register all builtin (Rust-implemented) modules with the import system.
+pub fn register_all() {
+    numbers_registry::register();
+    crate::import::register_builtin("posix", posix::init);
+    crate::import::register_builtin("errno", errno::init);
+    crate::import::register_builtin("_stat", stat_mod::init);
+    crate::import::register_builtin("time", time::init);
+    functional::register();
+    crate::import::register_builtin("_warnings", _warnings::init_module);
+    sys_full::register_system_modules();
+    text_util::register();
+    crate::import::register_builtin("_typing", crate::types::typevar::make_typing_module);
+}

@@ -436,10 +436,6 @@ impl<'a> Compiler<'a> {
         CompileError::syntax(msg, loc)
     }
 
-    pub fn warn(&mut self, msg: impl Into<String>, loc: Loc) {
-        self.warnings.push(Warning::syntax(msg, loc));
-    }
-
     pub fn enter_depth(&mut self) -> R {
         self.depth += 1;
         if self.depth > self.opts.max_depth {
