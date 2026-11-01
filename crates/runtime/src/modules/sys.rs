@@ -133,6 +133,14 @@ pub fn init_bootstrap_types() {
 /// Replace the bootstrap writers by real io objects (TextIOWrapper over a buffered
 /// FileIO).  Keeps the bootstrap streams if `_io` cannot be set up.
 pub fn init_stdio() {
+    // builtins.open is io.open
+    match crate::import::import_absolute("_io").and_then(|io| crate::abstract_::getattr_str(&io, "open")) {
+        Ok(open) => {
+            let b = crate::types::module::module_dict(&crate::builtins::builtins_module());
+            let _ = dict::set_item_str(&b, "open", &open);
+        }
+        Err(_) => clear_exc(),
+    }
     if let Err(_) = init_stdio_impl() {
         if std::env::var_os("RPY_DEBUG_STDIO").is_some() {
             crate::print_exception_and_clear();
