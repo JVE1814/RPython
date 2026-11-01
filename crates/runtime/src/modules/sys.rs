@@ -114,38 +114,7 @@ pub fn write_stderr(s: &str) {
 
 /// sys.unraisablehook equivalent: print "msg: obj" and the current exception.
 pub fn write_unraisable_with_obj(msg: &str, obj: Option<&PyObject>) {
-    let e = take_exc();
-    if let Some(hook) = get_sys_attr("unraisablehook") {
-        if let Some(mk) = get_sys_attr("UnraisableHookArgs") {
-            let et = e.as_ref().map(|e| crate::types::typeobject::type_ref(e.type_ptr())).unwrap_or_else(none::none_ref);
-            let ev = e.clone().unwrap_or_else(none::none_ref);
-            let tb = e.as_ref().and_then(|e| crate::types::exceptions::exc_traceback(e)).unwrap_or_else(none::none_ref);
-            let m = pystr::new_str(msg);
-            let o = obj.map(|o| o.to_ref()).unwrap_or_else(none::none_ref);
-            let args = tuple::new_tuple(vec![et, ev, tb, m, o]);
-            if let Ok(a) = crate::abstract_::call(&mk, &[&args]) {
-                if crate::abstract_::call(&hook, &[&a]).is_ok() {
-                    return;
-                }
-            }
-            clear_exc();
-        }
-    }
-    let objs = match obj {
-        Some(o) => crate::abstract_::repr_string(o).unwrap_or_else(|_| {
-            clear_exc();
-            "<object repr() failed>".into()
-        }),
-        None => String::new(),
-    };
-    if objs.is_empty() {
-        write_stderr(&format!("{}\n", msg));
-    } else {
-        write_stderr(&format!("{}: {}\n", msg, objs));
-    }
-    if let Some(e) = e {
-        crate::modules::traceback_print::print_exception(&e);
-    }
+    crate::modules::sys_full::write_unraisable(Some(msg), obj)
 }
 
 pub fn init_bootstrap_types() {

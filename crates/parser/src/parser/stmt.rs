@@ -863,32 +863,36 @@ impl<'a> Parser<'a> {
         Ok(r)
     }
 
+    /// if_stmt / elif_stmt. Written iteratively so that long `elif` chains do not recurse
+    /// (the AST is still nested: each `elif` is an `If` in the previous `orelse`).
     fn if_stmt(&mut self) -> R<Stmt> {
         let start = self.p;
-        let it = self.advance(); // 'if' or 'elif'
-        let Some(test) = self.named_expression()? else {
-            self.p = start;
-            return Ok(None);
-        };
-        self.expect_colon_invalid()?;
-        if self.eat(T::COLON).is_none() {
-            self.p = start;
-            return Ok(None);
-        }
-        let what = if it.kw == Kw::If { "'if' statement" } else { "'elif' statement" };
-        let Some(body) = self.block_after(what, it.lineno as i32)? else {
-            self.p = start;
-            return Ok(None);
-        };
-        let orelse = if self.at_kw(Kw::Elif) {
-            match self.if_stmt()? {
-                Some(s) => vec![s],
-                None => {
-                    self.p = start;
-                    return Ok(None);
-                }
+        // (start index, test, body) for 'if' and each 'elif'
+        let mut parts: Vec<(usize, Expr, Vec<Stmt>)> = Vec::new();
+        loop {
+            let pstart = self.p;
+            let it = self.advance(); // 'if' or 'elif'
+            let Some(test) = self.named_expression()? else {
+                self.p = start;
+                return Ok(None);
+            };
+            self.expect_colon_invalid()?;
+            if self.eat(T::COLON).is_none() {
+                self.p = start;
+                return Ok(None);
             }
-        } else if self.at_kw(Kw::Else) {
+            let what = if it.kw == Kw::If { "'if' statement" } else { "'elif' statement" };
+            let Some(body) = self.block_after(what, it.lineno as i32)? else {
+                self.p = start;
+                return Ok(None);
+            };
+            parts.push((pstart, test, body));
+            self.check_chain(parts.len())?;
+            if !self.at_kw(Kw::Elif) {
+                break;
+            }
+        }
+        let mut orelse = if self.at_kw(Kw::Else) {
             match self.else_block()? {
                 Some(b) => {
                     if self.invalid && self.at_kw(Kw::Elif) {
@@ -905,7 +909,15 @@ impl<'a> Parser<'a> {
         } else {
             Vec::new()
         };
-        Ok(Some(Stmt::new(StmtKind::If { test: bx(test), body, orelse }, self.loc(start))))
+        // every If (including the nested elifs) ends where the whole statement ends
+        while let Some((pstart, test, body)) = parts.pop() {
+            let s = Stmt::new(StmtKind::If { test: bx(test), body, orelse }, self.loc(pstart));
+            if parts.is_empty() {
+                return Ok(Some(s));
+            }
+            orelse = vec![s];
+        }
+        unreachable!()
     }
 
     fn else_block(&mut self) -> R<Vec<Stmt>> {

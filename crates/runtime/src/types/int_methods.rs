@@ -125,11 +125,11 @@ binop!(int_sub, |x, y| small { Ok(new_int(x - y)) }, |p, q| big { Ok(from_big(op
 binop!(int_mul, |x, y| small { Ok(new_int_i128(x as i128 * y as i128)) }, |p, q| big { Ok(from_big(ops::mul(p, q))) });
 binop!(int_floordiv,
     |x, y| small {
-        if y == 0 { Err(zero_div("integer division or modulo by zero")) }
+        if y == 0 { Err(zero_div("division by zero")) }
         else { Ok(new_int(rpy_bigint::small::floordiv(x, y).unwrap())) }
     },
     |p, q| big {
-        if q.mag.is_empty() { Err(zero_div("integer division or modulo by zero")) }
+        if q.mag.is_empty() { Err(zero_div("division by zero")) }
         else { ops::floordiv(p, q).map(from_big).map_err(int_error) }
     });
 binop!(int_mod,
@@ -142,14 +142,14 @@ binop!(int_mod,
     });
 binop!(int_divmod,
     |x, y| small {
-        if y == 0 { Err(zero_div("integer division or modulo by zero")) }
+        if y == 0 { Err(zero_div("division by zero")) }
         else {
             let (d, m) = rpy_bigint::small::divmod(x, y).unwrap();
             Ok(tuple::new_tuple(vec![new_int(d), new_int(m)]))
         }
     },
     |p, q| big {
-        if q.mag.is_empty() { Err(zero_div("integer division or modulo by zero")) }
+        if q.mag.is_empty() { Err(zero_div("division by zero")) }
         else { ops::divmod(p, q).map(|(d, m)| tuple::new_tuple(vec![from_big(d), from_big(m)])).map_err(int_error) }
     });
 binop!(int_truediv,
@@ -218,10 +218,7 @@ unsafe extern "C" fn int_pow(a: *mut PyObject, b: *mut PyObject, m: *mut PyObjec
                 // float power
                 let x = to_f64(a)?;
                 let y = to_f64(b)?;
-                if x == 0.0 {
-                    raise!(ZeroDivisionError, "zero to a negative power");
-                }
-                return Ok(float::new_float(x.powf(y)));
+                return crate::types::float_math::float_pow(x, y);
             }
             if is_compact(a) && is_compact(b) {
                 if let Some(v) = rpy_bigint::small::pow(compact_value(a), compact_value(b) as u64) {
@@ -369,7 +366,7 @@ unsafe extern "C" fn int_new(tp: *mut PyTypeObject, args: *mut PyObject, kw: *mu
                 (None, Some(_)) => raise!(TypeError, "int() missing string argument"),
                 (Some(x), None) => number_long(x)?,
                 (Some(x), Some(b)) => {
-                    let b = ab::as_i64(b)?;
+                    let b = as_i64(&*ab::index(b)?).unwrap_or(-1);
                     if b != 0 && !(2..=36).contains(&b) {
                         raise!(ValueError, "int() base must be >= 2 and <= 36, or 0");
                     }

@@ -214,6 +214,59 @@ pub fn format_exception(e: &PyObject) -> String {
 }
 
 pub fn print_exception(e: &PyObject) {
+    // Like CPython, prefer `traceback._print_exception_bltin` (carets,
+    // suggestions, colours); fall back to the built-in printer when the
+    // traceback module is unavailable or fails.
+    if print_with_traceback_module(e) {
+        return;
+    }
     let s = format_exception(e);
     crate::modules::sys::write_stderr(&s);
+}
+
+thread_local! {
+    static IN_PY_PRINT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn print_with_traceback_module(e: &PyObject) -> bool {
+    if IN_PY_PRINT.with(|c| c.replace(true)) {
+        return false;
+    }
+    let r = print_with_traceback_module_inner(e);
+    IN_PY_PRINT.with(|c| c.set(false));
+    r
+}
+
+fn print_with_traceback_module_inner(e: &PyObject) -> bool {
+    let saved = crate::errors::take_exc();
+    let ok = (|| -> crate::errors::PyResult<bool> {
+        let tb = match crate::import::import_absolute("traceback") {
+            Ok(m) => m,
+            Err(_) => {
+                crate::errors::clear_exc();
+                return Ok(false);
+            }
+        };
+        let f = match ab::getattr_opt(&tb, &pystr::new_str("_print_exception_bltin"))? {
+            Some(f) if !f.is(none::none()) => f,
+            _ => return Ok(false),
+        };
+        ab::call(&f, &[e])?;
+        Ok(true)
+    })();
+    let r = match ok {
+        Ok(b) => b,
+        Err(_) => {
+            if let Some(err) = crate::errors::take_exc() {
+                crate::errors::set_exc(err);
+                crate::modules::sys::write_unraisable_with_obj("Exception ignored in the internal traceback machinery", None);
+            }
+            crate::errors::clear_exc();
+            false
+        }
+    };
+    if let Some(s) = saved {
+        crate::errors::set_exc(s);
+    }
+    r
 }

@@ -333,3 +333,13 @@ fn percent_format_folding() {
     let c = comp("x = '%s=%r' % (a, b)\n");
     assert!(has(&c, Op::FormatSimple) && has(&c, Op::BuildString));
 }
+
+#[test]
+fn unused_consts_removed() {
+    let c = comp("l = lambda: 'this is the only const'\n");
+    assert_eq!(find_code(&c, "<lambda>").unwrap().consts, vec![s("this is the only const")]);
+    let c = comp("def f():\n    'doc'\n    return 42\n");
+    assert_eq!(find_code(&c, "f").unwrap().consts, vec![s("doc"), Constant::Int(42)]);
+    let c = comp("def f():\n    if True:\n        return 'used'\n    else:\n        return 'unused'\n");
+    assert!(!find_code(&c, "f").unwrap().consts.contains(&s("unused")));
+}

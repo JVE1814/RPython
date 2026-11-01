@@ -623,6 +623,37 @@ pub(crate) fn assemble(mut ir: Ir, info: UnitInfo) -> Result<CodeUnit, CompileEr
         }
     }
 
+    // ---- drop unused constants (keep consts[0] when it is the docstring)
+    let consts = {
+        let mut used = vec![false; info.consts.len()];
+        if info.flags & co::HAS_DOCSTRING != 0 && !used.is_empty() {
+            used[0] = true;
+        }
+        for f in &flat {
+            if f.op == Op::LoadConst {
+                if let Some(u) = used.get_mut(f.arg as usize) {
+                    *u = true;
+                }
+            }
+        }
+        let mut remap = vec![u32::MAX; info.consts.len()];
+        let mut out = Vec::with_capacity(info.consts.len());
+        for (i, c) in info.consts.iter().enumerate() {
+            if used[i] {
+                remap[i] = out.len() as u32;
+                out.push(c.clone());
+            }
+        }
+        for f in flat.iter_mut() {
+            if f.op == Op::LoadConst {
+                if let Some(&r) = remap.get(f.arg as usize) {
+                    f.arg = r;
+                }
+            }
+        }
+        out
+    };
+
     // ---- compute instruction indices with ExtendedArg prefixes
     for (b, s) in &flat_block_start {
         block_start[*b as usize] = *s as u32; // provisional (flat index)
@@ -728,7 +759,7 @@ pub(crate) fn assemble(mut ir: Ir, info: UnitInfo) -> Result<CodeUnit, CompileEr
         stacksize: maxdepth as u32,
         code,
         locations,
-        consts: info.consts,
+        consts,
         names: info.names,
         localsplusnames: names,
         localspluskinds: kinds,

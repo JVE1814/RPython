@@ -54,11 +54,6 @@ pub fn format_float(v: f64, spec: &PyObject, tname: &str) -> PyResult {
 }
 
 pub fn format_str(o: &PyObject, spec: &PyObject) -> PyResult {
-    let s = spec_str(spec)?;
-    if s.is_empty() {
-        return Ok(crate::abstract_::str(o)?);
-    }
-    let text = pystr::to_string_lossy(o);
-    let r = rpy_numfmt::format_str(&text, &s, &crate::types::typeobject::tname(o)).map_err(numfmt_error)?;
-    Ok(pystr::new_str(&r))
+    let _ = spec_str(spec)?;
+    crate::types::str_methods::format_str_spec(o, spec)
 }
