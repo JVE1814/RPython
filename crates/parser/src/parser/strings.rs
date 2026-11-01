@@ -23,6 +23,13 @@ impl<'a> Parser<'a> {
     #[inline(never)]
     pub(crate) fn strings(&mut self) -> R<Expr> {
         let start = self.p;
+        // fast path: a single plain string literal
+        let t = self.peek();
+        if t.ty == T::STRING && !matches!(self.peek_n(1).ty, T::STRING | T::FSTRING_START | T::TSTRING_START) {
+            self.advance();
+            let (e, _) = self.string_constant(&t)?;
+            return Ok(Some(e));
+        }
         let mut pieces: Vec<Piece> = Vec::new();
         loop {
             let t = self.peek();
