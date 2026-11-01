@@ -146,7 +146,22 @@ pub fn audit(event: &str, args: &[&PyObject]) -> PyResult<()> {
 fn audit_tuple(event: &PyObject, args: &PyObject) -> PyResult<()> {
     let hooks: Vec<PyRef> = AUDIT_HOOKS.lock().unwrap().iter().map(|&p| unsafe { PyRef::from_borrowed(p as *mut PyObject) }).collect();
     for h in hooks {
-        ab::call(&h, &[event, args])?;
+        // hooks are not traced or profiled unless they opt in with __cantrace__
+        let suppress = crate::modules::sys::tracing_active()
+            && match ab::getattr_opt(&h, crate::name!("__cantrace__")) {
+                Ok(Some(v)) => !ab::is_true(&v)?,
+                Ok(None) => true,
+                Err(e) => return Err(e),
+            };
+        if suppress {
+            let ts = crate::threads::current();
+            ts.tracing_depth.set(ts.tracing_depth.get() + 1);
+            let r = ab::call(&h, &[event, args]);
+            ts.tracing_depth.set(ts.tracing_depth.get() - 1);
+            r?;
+        } else {
+            ab::call(&h, &[event, args])?;
+        }
     }
     Ok(())
 }
@@ -602,7 +617,9 @@ fn sys_getsizeof(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> Py
             if n < 0 {
                 raise!(ValueError, "__sizeof__() should return >= 0");
             }
-            let extra = if crate::alloc::type_is_gc(o.type_ptr()) { crate::alloc::GC_HEAD as i64 } else { 0 };
+            // like the free-threaded build: no GC header is reported (ours is internal),
+            // only the managed __dict__/__weakref__ pre-header
+            let extra = if unsafe { (*o.type_ptr()).tp_flags } & crate::ffi::Py_TPFLAGS_PREHEADER != 0 { crate::alloc::MANAGED as i64 } else { 0 };
             Ok(int::new_int(n + extra))
         }
         Ok(None) => match default {
@@ -799,11 +816,9 @@ pub fn dlopenflags() -> i32 {
 // lazy imports (PEP 810)
 pub fn lazy_imports_mode() -> String {
     match *LAZY_MODE.lock().unwrap() {
-        Some(0) => "none".into(),
         Some(1) => "all".into(),
         Some(_) => "normal".into(),
         None => match config().lazy_imports {
-            0 => "none".into(),
             1 => "all".into(),
             _ => "normal".into(),
         },
@@ -819,8 +834,7 @@ fn sys_set_lazy_imports(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>
     let v = match pystr::to_string_lossy(m).as_str() {
         "normal" => 2,
         "all" => 1,
-        "none" => 0,
-        _ => raise!(ValueError, "mode must be \"normal\", \"none\", or \"all\""),
+        _ => raise!(ValueError, "mode must be \"normal\" or \"all\""),
     };
     *LAZY_MODE.lock().unwrap() = Some(v);
     Ok(none::none_ref())
@@ -854,35 +868,229 @@ fn jit_false(_m: &PyObject) -> PyResult {
 }
 
 fn exe_path() -> String {
-    if let Ok(p) = std::env::var("RPYTHON_EXECUTABLE") {
-        return p;
-    }
-    std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
+    paths().executable.clone()
 }
 
-/// Installation prefix: <prefix>/bin/python3.15t -> <prefix>
-pub fn prefix() -> String {
-    if let Ok(p) = std::env::var("RPYTHON_PREFIX") {
-        return p;
+/// Interpreter location and prefixes (CPython's getpath, simplified; see
+/// pkgtools notes).  Computed once.
+pub struct PathConfig {
+    pub executable: String,
+    pub base_executable: String,
+    pub prefix: String,
+    pub exec_prefix: String,
+    pub base_prefix: String,
+    pub base_exec_prefix: String,
+    pub stdlib_dir: String,
+    /// `<base_prefix>/lib/python315t.zip` (listed in sys.path even if absent)
+    pub zip_path: String,
+    /// `<base_exec_prefix>/lib/python3.15t/lib-dynload`
+    pub platstdlib_dir: String,
+}
+
+static PATHS: OnceLock<PathConfig> = OnceLock::new();
+
+pub fn paths() -> &'static PathConfig {
+    PATHS.get_or_init(compute_paths)
+}
+
+/// Lexically normalise an absolute path ('.', '..', duplicate slashes).
+fn normalize_abs(p: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
     }
-    let exe = std::path::PathBuf::from(exe_path());
-    exe.parent().and_then(|b| b.parent()).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| "/usr/local".into())
+    format!("/{}", parts.join("/"))
+}
+
+fn path_str(p: &std::path::Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
+fn dirname(p: &str) -> String {
+    match p.rfind('/') {
+        Some(0) => "/".into(),
+        Some(i) => p[..i].into(),
+        None => String::new(),
+    }
+}
+
+fn basename(p: &str) -> &str {
+    p.rsplit('/').next().unwrap_or(p)
+}
+
+fn is_executable_file(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).unwrap_or(false)
+}
+
+/// sys.executable: argv[0] made absolute (symlinks are NOT resolved, so a
+/// venv's bin/python finds its pyvenv.cfg), or found on PATH.
+fn program_path(real_exe: &str) -> String {
+    let argv0 = config()
+        .orig_argv
+        .first()
+        .cloned()
+        .or_else(|| std::env::args_os().next().map(|a| a.to_string_lossy().into_owned()))
+        .unwrap_or_default();
+    if argv0.contains('/') {
+        if argv0.starts_with('/') {
+            return normalize_abs(&argv0);
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            return normalize_abs(&format!("{}/{}", path_str(&cwd), argv0));
+        }
+    } else if !argv0.is_empty() {
+        if let Some(path) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path) {
+                let cand = dir.join(&argv0);
+                if is_executable_file(&cand) {
+                    let s = path_str(&cand);
+                    if s.starts_with('/') {
+                        return normalize_abs(&s);
+                    }
+                    if let Ok(cwd) = std::env::current_dir() {
+                        return normalize_abs(&format!("{}/{}", path_str(&cwd), s));
+                    }
+                }
+            }
+        }
+    }
+    real_exe.to_string()
+}
+
+/// Read the `home` key of a pyvenv.cfg file (None if absent).
+fn pyvenv_home(cfg: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(cfg).ok()?;
+    for line in text.lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim().eq_ignore_ascii_case("home") {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+fn compute_paths() -> PathConfig {
+    let c = config();
+    let use_env = c.ignore_environment == 0;
+    let real_exe = std::env::current_exe().map(|p| path_str(&p)).unwrap_or_default();
+    let executable = match std::env::var("RPYTHON_EXECUTABLE") {
+        Ok(p) if !p.is_empty() => p,
+        _ => program_path(&real_exe),
+    };
+
+    // Virtual environment: pyvenv.cfg next to the executable or one level up.
+    let exe_dir = dirname(&executable);
+    let mut venv_prefix: Option<String> = None;
+    let mut home: Option<String> = None;
+    for dir in [exe_dir.clone(), dirname(&exe_dir)] {
+        if dir.is_empty() {
+            continue;
+        }
+        let cfg = std::path::Path::new(&dir).join("pyvenv.cfg");
+        if cfg.is_file() {
+            venv_prefix = Some(dir);
+            home = pyvenv_home(&cfg);
+            break;
+        }
+    }
+
+    let base_executable = match &home {
+        Some(h) => {
+            let name = basename(&executable).to_string();
+            let resolved_name = std::fs::canonicalize(&executable)
+                .ok()
+                .map(|p| basename(&path_str(&p)).to_string());
+            let mut cands = vec![format!("{}/{}", h, name)];
+            if let Some(r) = resolved_name {
+                cands.push(format!("{}/{}", h, r));
+            }
+            if let Some(found) = cands.iter().find(|p| std::path::Path::new(p).is_file()) {
+                found.clone()
+            } else if dirname(&real_exe) == *h {
+                real_exe.clone()
+            } else {
+                cands[0].clone()
+            }
+        }
+        None => executable.clone(),
+    };
+
+    // The base installation: <prefix>/bin/python3.15t -> <prefix>.
+    let pythonhome = if use_env { std::env::var("PYTHONHOME").ok().filter(|v| !v.is_empty()) } else { None };
+    let (base_prefix, base_exec_prefix) = if let Ok(p) = std::env::var("RPYTHON_PREFIX") {
+        (p.clone(), p)
+    } else if let Some(h) = pythonhome {
+        match h.split_once(':') {
+            Some((a, b)) => (a.to_string(), b.to_string()),
+            None => (h.clone(), h),
+        }
+    } else {
+        let anchor = std::fs::canonicalize(&base_executable)
+            .map(|p| path_str(&p))
+            .unwrap_or_else(|_| real_exe.clone());
+        let p = dirname(&dirname(&anchor));
+        let p = if p.is_empty() { "/usr/local".to_string() } else { p };
+        (p.clone(), p)
+    };
+    let (prefix, exec_prefix) = match &venv_prefix {
+        Some(v) => (v.clone(), v.clone()),
+        None => (base_prefix.clone(), base_exec_prefix.clone()),
+    };
+
+    let stdlib_dir = if let Some(d) = &c.stdlib_dir {
+        d.clone()
+    } else if let Ok(d) = std::env::var("RPYTHON_STDLIB") {
+        d
+    } else {
+        let p = format!("{}/lib/python3.15t", base_prefix);
+        if std::path::Path::new(&p).join("os.py").is_file() {
+            p
+        } else {
+            let dev = concat!(env!("CARGO_MANIFEST_DIR"), "/../../Lib");
+            std::fs::canonicalize(dev).map(|p| path_str(&p)).unwrap_or_else(|_| dev.to_string())
+        }
+    };
+    PathConfig {
+        zip_path: format!("{}/lib/python315t.zip", base_prefix),
+        platstdlib_dir: format!("{}/lib/python3.15t/lib-dynload", base_exec_prefix),
+        executable,
+        base_executable,
+        prefix,
+        exec_prefix,
+        base_prefix,
+        base_exec_prefix,
+        stdlib_dir,
+    }
+}
+
+/// Installation prefix (sys.prefix): the venv directory inside a virtual
+/// environment, else <prefix> of <prefix>/bin/python3.15t.
+pub fn prefix() -> String {
+    paths().prefix.clone()
 }
 
 /// The standard library directory.
 pub fn stdlib_dir() -> String {
-    if let Some(d) = &config().stdlib_dir {
-        return d.clone();
+    paths().stdlib_dir.clone()
+}
+
+/// The default module search path after PYTHONPATH: the stdlib zip, the
+/// stdlib directory and (if present) lib-dynload.
+pub fn default_search_path() -> Vec<String> {
+    let p = paths();
+    let mut v = vec![p.zip_path.clone(), p.stdlib_dir.clone()];
+    if std::path::Path::new(&p.platstdlib_dir).is_dir() {
+        v.push(p.platstdlib_dir.clone());
     }
-    if let Ok(d) = std::env::var("RPYTHON_STDLIB") {
-        return d;
-    }
-    let p = format!("{}/lib/python3.15t", prefix());
-    if std::path::Path::new(&p).join("os.py").is_file() {
-        return p;
-    }
-    let dev = concat!(env!("CARGO_MANIFEST_DIR"), "/../../Lib");
-    std::fs::canonicalize(dev).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| dev.to_string())
+    v
 }
 
 pub const STDLIB_MODULE_NAMES: &[&str] = &[
@@ -1009,6 +1217,15 @@ pub fn post_init() -> PyResult<()> {
         crate::modules::faulthandler::enable_at_startup();
     }
     crate::import::install_importlib(&stdlib_dir())?;
+    if config().tracemalloc > 0 {
+        crate::modules::_tracemalloc::start(config().tracemalloc as i64)?;
+    }
+    Ok(())
+}
+
+/// `import site` (unless -S).  Runs after the standard streams and
+/// builtins.open exist, as in CPython (site.venv() reads pyvenv.cfg).
+pub fn import_site() -> PyResult<()> {
     if config().no_site == 0 && std::path::Path::new(&stdlib_dir()).join("site.py").is_file() {
         if crate::import::import_absolute("site").is_err() {
             // CPython aborts start-up here; we report and continue so that a
@@ -1076,12 +1293,13 @@ pub fn populate(d: &PyObject) -> PyResult<()> {
     set("maxsize", &int::new_int(i64::MAX))?;
     set("maxunicode", &int::new_int(0x10ffff))?;
     set("abiflags", &s("t"))?;
+    let pc = paths();
     set("executable", &s(&exe_path()))?;
-    set("_base_executable", &s(&exe_path()))?;
-    let p = prefix();
-    for k in ["prefix", "base_prefix", "exec_prefix", "base_exec_prefix"] {
-        set(k, &s(&p))?;
-    }
+    set("_base_executable", &s(&pc.base_executable))?;
+    set("prefix", &s(&pc.prefix))?;
+    set("exec_prefix", &s(&pc.exec_prefix))?;
+    set("base_prefix", &s(&pc.base_prefix))?;
+    set("base_exec_prefix", &s(&pc.base_exec_prefix))?;
     set("platlibdir", &s(&std::env::var("PYTHONPLATLIBDIR").ok().filter(|_| c.ignore_environment == 0).unwrap_or_else(|| "lib".into())))?;
     set("_stdlib_dir", &s(&stdlib_dir()))?;
     set("pycache_prefix", &c.pycache_prefix.as_deref().map(s).unwrap_or_else(none::none_ref))?;
@@ -1247,5 +1465,20 @@ pub fn populate(d: &PyObject) -> PyResult<()> {
         }
     }
     crate::modules::sys_trace_api::install_monitoring(d)?;
+    crate::types::lazyimport::install_sys(d)?;
     Ok(())
+}
+
+/// PyImport_SetLazyImportsMode: true = "all", false = "normal".
+pub fn set_lazy_imports_all(all: bool) {
+    *LAZY_MODE.lock().unwrap() = Some(if all { 1 } else { 2 });
+}
+/// PyImport_SetLazyImportsFilter (None/NULL clears the filter).
+pub fn set_lazy_imports_filter_obj(f: Option<&PyObject>) {
+    let nv = match f {
+        Some(f) if !f.is(none::none()) => f.to_ref().into_raw(),
+        _ => std::ptr::null_mut(),
+    };
+    let old = LAZY_FILTER.swap(nv, AcqRel);
+    unsafe { xdecref(old) };
 }

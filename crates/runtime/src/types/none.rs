@@ -101,7 +101,7 @@ pub fn init_types() {
         t.tp_new = Some(none_new);
         (*(&raw mut NONE_NUMBER)).nb_bool = Some(none_bool);
         t.tp_as_number = &raw mut NONE_NUMBER;
-        t.tp_doc = c"The type of the None singleton.".as_ptr();
+        t.tp_doc = c"NoneType()\n--\n\nThe type of the None singleton.".as_ptr();
 
         let t = &mut *(&raw mut _PyNotImplemented_Type);
         t.tp_name = c"NotImplementedType".as_ptr();

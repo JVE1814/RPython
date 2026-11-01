@@ -91,7 +91,7 @@ pub unsafe extern "C" fn h_dict_replace(d: *mut PyObject, ix: u64, name: *mut Py
     unsafe {
         let g = dict::ob_lock(&*d);
         let t = dict::table(&*d);
-        match t.entries.get_mut(ix as usize) {
+        match t.entries_mut().get_mut(ix as usize) {
             Some(e) if e.key == name => {
                 let old = std::mem::replace(&mut e.value, v);
                 t.version = crate::interp::cache::next_dict_version();
@@ -394,11 +394,14 @@ pub unsafe extern "C" fn h_binary_subscr(sp: *mut *mut PyObject) -> u64 {
                 if i < 0 {
                     i += n;
                 }
-                if i < 0 || i >= n {
-                    let _ = err!(IndexError, "list index out of range");
-                    return Err(ERR);
+                // locked read (core-runtime): another thread may resize the list
+                match if i < 0 { None } else { list::get(&c, i as usize) } {
+                    Some(v) => v,
+                    None => {
+                        let _ = err!(IndexError, "list index out of range");
+                        return Err(ERR);
+                    }
                 }
-                list::list_items(&c)[i as usize].to_ref()
             } else if tuple::is_tuple_exact(&c) && int::is_int_exact(&k) && int::is_compact(&k) {
                 let mut i = int::compact_value(&k);
                 let n = tuple::tuple_len(&c) as i64;
@@ -639,11 +642,14 @@ pub unsafe extern "C" fn h_unpack_sequence(sp: *mut *mut PyObject, n: u64) -> u6
             return OK;
         }
         if list::is_list_exact(&seq) && list::list_len(&seq) == n {
-            let items = list::list_items(&seq);
-            for i in 0..n {
-                *base.add(n - 1 - i) = items[i].to_ref().into_raw();
+            // snapshot under the list lock (core-runtime: concurrent resizes)
+            let items = list::list_to_vec(&seq);
+            if items.len() == n {
+                for (i, it) in items.into_iter().enumerate() {
+                    *base.add(n - 1 - i) = it.into_raw();
+                }
+                return OK;
             }
-            return OK;
         }
         let mut items = Vec::with_capacity(n);
         if eval::unpack_sequence(&seq, n, &mut items).is_err() {

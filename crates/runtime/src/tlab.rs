@@ -355,3 +355,11 @@ pub fn owns(p: *const u8) -> bool {
     }
     SEGMENT_MAP[g / 64].load(std::sync::atomic::Ordering::Acquire) & (1 << (g % 64)) != 0
 }
+
+/// The allocator depot, held across fork() so that the child never inherits
+/// it locked by a thread that does not exist there (see crate::fork).
+pub struct DepotForkGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, Option<Depot>>);
+
+pub fn lock_depot_for_fork() -> DepotForkGuard {
+    DepotForkGuard(DEPOT.lock().unwrap_or_else(|e| e.into_inner()))
+}
