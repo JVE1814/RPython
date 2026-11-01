@@ -1,4 +1,4 @@
-"""Event loop and event loop policy."""
+"""Event loop interface, callback handles and the (deprecated) policies."""
 
 __all__ = (
     "_AbstractEventLoopPolicy",
@@ -28,61 +28,57 @@ import warnings
 from . import format_helpers
 
 
+# ---------------------------------------------------------------- handles
+
 class Handle:
-    """Object returned by callback registration methods."""
+    """A scheduled callback; returned by loop.call_soon() and friends."""
 
     __slots__ = ('_callback', '_args', '_cancelled', '_loop',
-                 '_source_traceback', '_repr', '__weakref__',
-                 '_context')
+                 '_source_traceback', '_repr', '__weakref__', '_context')
 
     def __init__(self, callback, args, loop, context=None):
-        if context is None:
-            context = contextvars.copy_context()
-        self._context = context
         self._loop = loop
         self._callback = callback
         self._args = args
         self._cancelled = False
         self._repr = None
-        if self._loop.get_debug():
-            self._source_traceback = format_helpers.extract_stack(
-                sys._getframe(1))
-        else:
-            self._source_traceback = None
+        self._context = (contextvars.copy_context() if context is None
+                         else context)
+        self._source_traceback = (
+            format_helpers.extract_stack(sys._getframe(1))
+            if loop.get_debug() else None)
 
     def _repr_info(self):
-        info = [self.__class__.__name__]
+        info = [type(self).__name__]
         if self._cancelled:
             info.append('cancelled')
         if self._callback is not None:
             info.append(format_helpers._format_callback_source(
-                self._callback, self._args,
-                debug=self._loop.get_debug()))
+                self._callback, self._args, debug=self._loop.get_debug()))
         if self._source_traceback:
-            frame = self._source_traceback[-1]
-            info.append(f'created at {frame[0]}:{frame[1]}')
+            last = self._source_traceback[-1]
+            info.append(f'created at {last[0]}:{last[1]}')
         return info
 
     def __repr__(self):
-        if self._repr is not None:
-            return self._repr
-        info = self._repr_info()
-        return '<{}>'.format(' '.join(info))
+        if self._repr is None:
+            return '<' + ' '.join(self._repr_info()) + '>'
+        return self._repr
 
     def get_context(self):
         return self._context
 
-    def cancel(self):
-        if not self._cancelled:
-            self._cancelled = True
-            if self._loop.get_debug():
-                # remember what was cancelled for later reprs
-                self._repr = repr(self)
-            self._callback = None
-            self._args = None
-
     def cancelled(self):
         return self._cancelled
+
+    def cancel(self):
+        if self._cancelled:
+            return
+        self._cancelled = True
+        if self._loop.get_debug():
+            # freeze the description before the callback is dropped
+            self._repr = repr(self)
+        self._callback = self._args = None
 
     def _run(self):
         try:
@@ -90,382 +86,169 @@ class Handle:
         except (SystemExit, KeyboardInterrupt):
             raise
         except BaseException as exc:
-            cb = format_helpers._format_callback_source(
-                self._callback, self._args,
-                debug=self._loop.get_debug())
-            msg = f'Exception in callback {cb}'
-            context = {
-                'message': msg,
-                'exception': exc,
-                'handle': self,
-            }
+            where = format_helpers._format_callback_source(
+                self._callback, self._args, debug=self._loop.get_debug())
+            report = {'message': f'Exception in callback {where}',
+                      'exception': exc, 'handle': self}
             if self._source_traceback:
-                context['source_traceback'] = self._source_traceback
-            self._loop.call_exception_handler(context)
-        self = None  # break reference cycles through the exception
+                report['source_traceback'] = self._source_traceback
+            self._loop.call_exception_handler(report)
+            del report, exc
+        self = None
 
 
 class TimerHandle(Handle):
-    """Object returned by timed callback registration methods."""
+    """A callback scheduled for a point in (loop) time."""
 
     __slots__ = ['_scheduled', '_when']
 
     def __init__(self, when, callback, args, loop, context=None):
         super().__init__(callback, args, loop, context)
         if self._source_traceback:
-            del self._source_traceback[-1]
+            # drop the frame of call_at()/call_later() itself
+            self._source_traceback.pop()
         self._when = when
         self._scheduled = False
 
     def _repr_info(self):
         info = super()._repr_info()
-        pos = 2 if self._cancelled else 1
-        info.insert(pos, f'when={self._when}')
+        info.insert(2 if self._cancelled else 1, f'when={self._when}')
         return info
+
+    def when(self):
+        """The scheduled time, in loop.time() units."""
+        return self._when
 
     def __hash__(self):
         return hash(self._when)
 
-    def __lt__(self, other):
-        if isinstance(other, TimerHandle):
-            return self._when < other._when
-        return NotImplemented
-
-    def __le__(self, other):
-        if isinstance(other, TimerHandle):
-            return self._when < other._when or self.__eq__(other)
-        return NotImplemented
-
-    def __gt__(self, other):
-        if isinstance(other, TimerHandle):
-            return self._when > other._when
-        return NotImplemented
-
-    def __ge__(self, other):
-        if isinstance(other, TimerHandle):
-            return self._when > other._when or self.__eq__(other)
-        return NotImplemented
+    def _same(self, other):
+        return (self._when, self._callback, self._args, self._cancelled) == \
+            (other._when, other._callback, other._args, other._cancelled)
 
     def __eq__(self, other):
-        if isinstance(other, TimerHandle):
-            return (self._when == other._when and
-                    self._callback == other._callback and
-                    self._args == other._args and
-                    self._cancelled == other._cancelled)
-        return NotImplemented
+        if not isinstance(other, TimerHandle):
+            return NotImplemented
+        return self._same(other)
+
+    def __lt__(self, other):
+        if not isinstance(other, TimerHandle):
+            return NotImplemented
+        return self._when < other._when
+
+    def __gt__(self, other):
+        if not isinstance(other, TimerHandle):
+            return NotImplemented
+        return self._when > other._when
+
+    def __le__(self, other):
+        if not isinstance(other, TimerHandle):
+            return NotImplemented
+        return self._when < other._when or self._same(other)
+
+    def __ge__(self, other):
+        if not isinstance(other, TimerHandle):
+            return NotImplemented
+        return self._when > other._when or self._same(other)
 
     def cancel(self):
         if not self._cancelled:
             self._loop._timer_handle_cancelled(self)
         super().cancel()
 
-    def when(self):
-        """Return the scheduled time (in loop.time() units) as a float."""
-        return self._when
+
+# ---------------------------------------------------------------- interfaces
+
+def _unimplemented(name):
+    def method(self, *args, **kwargs):
+        raise NotImplementedError
+    method.__name__ = name
+    return method
+
+
+def _unimplemented_async(name):
+    async def method(self, *args, **kwargs):
+        raise NotImplementedError
+    method.__name__ = name
+    return method
 
 
 class AbstractServer:
-    """Abstract server returned by create_server()."""
+    """Interface of the server objects returned by create_server()."""
 
-    def close(self):
-        """Stop serving.  Already accepted connections stay open."""
-        raise NotImplementedError
-
-    def close_clients(self):
-        """Close all active connections."""
-        raise NotImplementedError
-
-    def abort_clients(self):
-        """Close all active connections immediately."""
-        raise NotImplementedError
-
-    def get_loop(self):
-        """Get the event loop the Server object is attached to."""
-        raise NotImplementedError
-
-    def is_serving(self):
-        """Return True if the server is accepting connections."""
-        raise NotImplementedError
-
-    async def start_serving(self):
-        """Start accepting connections (idempotent)."""
-        raise NotImplementedError
-
-    async def serve_forever(self):
-        """Accept connections until cancelled."""
-        raise NotImplementedError
-
-    async def wait_closed(self):
-        """Wait until the server and its connections are closed."""
-        raise NotImplementedError
+    close = _unimplemented('close')
+    close_clients = _unimplemented('close_clients')
+    abort_clients = _unimplemented('abort_clients')
+    get_loop = _unimplemented('get_loop')
+    is_serving = _unimplemented('is_serving')
+    start_serving = _unimplemented_async('start_serving')
+    serve_forever = _unimplemented_async('serve_forever')
+    wait_closed = _unimplemented_async('wait_closed')
 
     async def __aenter__(self):
         return self
 
-    async def __aexit__(self, *exc):
+    async def __aexit__(self, *exc_info):
         self.close()
         await self.wait_closed()
 
 
+_LOOP_SYNC_METHODS = (
+    'run_forever', 'run_until_complete', 'stop', 'is_running', 'is_closed',
+    'close', '_timer_handle_cancelled', 'call_later', 'call_at', 'time',
+    'create_future', 'create_task', 'call_soon_threadsafe',
+    'run_in_executor', 'set_default_executor', 'add_reader',
+    'remove_reader', 'add_writer', 'remove_writer', 'add_signal_handler',
+    'remove_signal_handler', 'set_task_factory', 'get_task_factory',
+    'get_exception_handler', 'set_exception_handler',
+    'default_exception_handler', 'call_exception_handler', 'get_debug',
+    'set_debug',
+)
+
+_LOOP_ASYNC_METHODS = (
+    'shutdown_asyncgens', 'shutdown_default_executor', 'getaddrinfo',
+    'getnameinfo', 'create_connection', 'create_server', 'sendfile',
+    'start_tls', 'create_unix_connection', 'create_unix_server',
+    'connect_accepted_socket', 'create_datagram_endpoint',
+    'connect_read_pipe', 'connect_write_pipe', 'subprocess_shell',
+    'subprocess_exec', 'sock_recv', 'sock_recv_into', 'sock_recvfrom',
+    'sock_recvfrom_into', 'sock_sendall', 'sock_sendto', 'sock_connect',
+    'sock_accept', 'sock_sendfile',
+)
+
+
 class AbstractEventLoop:
-    """Abstract event loop."""
-
-    # running and stopping
-
-    def run_forever(self):
-        raise NotImplementedError
-
-    def run_until_complete(self, future):
-        raise NotImplementedError
-
-    def stop(self):
-        raise NotImplementedError
-
-    def is_running(self):
-        raise NotImplementedError
-
-    def is_closed(self):
-        raise NotImplementedError
-
-    def close(self):
-        raise NotImplementedError
-
-    async def shutdown_asyncgens(self):
-        raise NotImplementedError
-
-    async def shutdown_default_executor(self):
-        raise NotImplementedError
-
-    # scheduling
-
-    def _timer_handle_cancelled(self, handle):
-        raise NotImplementedError
+    """Interface of event loops; every method raises NotImplementedError
+    except call_soon(), which defaults to call_later(0, ...)."""
 
     def call_soon(self, callback, *args, context=None):
         return self.call_later(0, callback, *args, context=context)
 
-    def call_later(self, delay, callback, *args, context=None):
-        raise NotImplementedError
 
-    def call_at(self, when, callback, *args, context=None):
-        raise NotImplementedError
+for _name in _LOOP_SYNC_METHODS:
+    setattr(AbstractEventLoop, _name, _unimplemented(_name))
+for _name in _LOOP_ASYNC_METHODS:
+    setattr(AbstractEventLoop, _name, _unimplemented_async(_name))
+del _name
 
-    def time(self):
-        raise NotImplementedError
 
-    def create_future(self):
-        raise NotImplementedError
-
-    def create_task(self, coro, **kwargs):
-        raise NotImplementedError
-
-    # threads
-
-    def call_soon_threadsafe(self, callback, *args, context=None):
-        raise NotImplementedError
-
-    def run_in_executor(self, executor, func, *args):
-        raise NotImplementedError
-
-    def set_default_executor(self, executor):
-        raise NotImplementedError
-
-    # network I/O
-
-    async def getaddrinfo(self, host, port, *,
-                          family=0, type=0, proto=0, flags=0):
-        raise NotImplementedError
-
-    async def getnameinfo(self, sockaddr, flags=0):
-        raise NotImplementedError
-
-    async def create_connection(
-            self, protocol_factory, host=None, port=None,
-            *, ssl=None, family=0, proto=0,
-            flags=0, sock=None, local_addr=None,
-            server_hostname=None,
-            ssl_handshake_timeout=None,
-            ssl_shutdown_timeout=None,
-            happy_eyeballs_delay=None, interleave=None):
-        raise NotImplementedError
-
-    async def create_server(
-            self, protocol_factory, host=None, port=None,
-            *, family=socket.AF_UNSPEC,
-            flags=socket.AI_PASSIVE, sock=None, backlog=100,
-            ssl=None, reuse_address=None, reuse_port=None,
-            keep_alive=None,
-            ssl_handshake_timeout=None,
-            ssl_shutdown_timeout=None,
-            start_serving=True):
-        """Create a TCP server and return a Server object."""
-        raise NotImplementedError
-
-    async def sendfile(self, transport, file, offset=0, count=None,
-                       *, fallback=True):
-        raise NotImplementedError
-
-    async def start_tls(self, transport, protocol, sslcontext, *,
-                        server_side=False,
-                        server_hostname=None,
-                        ssl_handshake_timeout=None,
-                        ssl_shutdown_timeout=None):
-        raise NotImplementedError
-
-    async def create_unix_connection(
-            self, protocol_factory, path=None, *,
-            ssl=None, sock=None,
-            server_hostname=None,
-            ssl_handshake_timeout=None,
-            ssl_shutdown_timeout=None):
-        raise NotImplementedError
-
-    async def create_unix_server(
-            self, protocol_factory, path=None, *,
-            sock=None, backlog=100, ssl=None,
-            ssl_handshake_timeout=None,
-            ssl_shutdown_timeout=None,
-            start_serving=True):
-        raise NotImplementedError
-
-    async def connect_accepted_socket(
-            self, protocol_factory, sock,
-            *, ssl=None,
-            ssl_handshake_timeout=None,
-            ssl_shutdown_timeout=None):
-        raise NotImplementedError
-
-    async def create_datagram_endpoint(self, protocol_factory,
-                                       local_addr=None, remote_addr=None, *,
-                                       family=0, proto=0, flags=0,
-                                       reuse_address=None, reuse_port=None,
-                                       allow_broadcast=None, sock=None):
-        raise NotImplementedError
-
-    # pipes and subprocesses
-
-    async def connect_read_pipe(self, protocol_factory, pipe):
-        raise NotImplementedError
-
-    async def connect_write_pipe(self, protocol_factory, pipe):
-        raise NotImplementedError
-
-    async def subprocess_shell(self, protocol_factory, cmd, *,
-                               stdin=subprocess.PIPE,
-                               stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE,
-                               **kwargs):
-        raise NotImplementedError
-
-    async def subprocess_exec(self, protocol_factory, *args,
-                              stdin=subprocess.PIPE,
-                              stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE,
-                              **kwargs):
-        raise NotImplementedError
-
-    # ready-based callbacks
-
-    def add_reader(self, fd, callback, *args):
-        raise NotImplementedError
-
-    def remove_reader(self, fd):
-        raise NotImplementedError
-
-    def add_writer(self, fd, callback, *args):
-        raise NotImplementedError
-
-    def remove_writer(self, fd):
-        raise NotImplementedError
-
-    # completion-based socket operations
-
-    async def sock_recv(self, sock, nbytes):
-        raise NotImplementedError
-
-    async def sock_recv_into(self, sock, buf):
-        raise NotImplementedError
-
-    async def sock_recvfrom(self, sock, bufsize):
-        raise NotImplementedError
-
-    async def sock_recvfrom_into(self, sock, buf, nbytes=0):
-        raise NotImplementedError
-
-    async def sock_sendall(self, sock, data):
-        raise NotImplementedError
-
-    async def sock_sendto(self, sock, data, address):
-        raise NotImplementedError
-
-    async def sock_connect(self, sock, address):
-        raise NotImplementedError
-
-    async def sock_accept(self, sock):
-        raise NotImplementedError
-
-    async def sock_sendfile(self, sock, file, offset=0, count=None,
-                            *, fallback=None):
-        raise NotImplementedError
-
-    # signals
-
-    def add_signal_handler(self, sig, callback, *args):
-        raise NotImplementedError
-
-    def remove_signal_handler(self, sig):
-        raise NotImplementedError
-
-    # task factory
-
-    def set_task_factory(self, factory):
-        raise NotImplementedError
-
-    def get_task_factory(self):
-        raise NotImplementedError
-
-    # error handling
-
-    def get_exception_handler(self):
-        raise NotImplementedError
-
-    def set_exception_handler(self, handler):
-        raise NotImplementedError
-
-    def default_exception_handler(self, context):
-        raise NotImplementedError
-
-    def call_exception_handler(self, context):
-        raise NotImplementedError
-
-    # debug flag
-
-    def get_debug(self):
-        raise NotImplementedError
-
-    def set_debug(self, enabled):
-        raise NotImplementedError
-
+# ---------------------------------------------------------------- policies
 
 class _AbstractEventLoopPolicy:
-    """Abstract policy for accessing the event loop."""
+    """Interface of event loop policies (deprecated mechanism)."""
 
     def get_event_loop(self):
-        """Return the event loop of the current context."""
         raise NotImplementedError
 
     def set_event_loop(self, loop):
-        """Set the event loop of the current context."""
         raise NotImplementedError
 
     def new_event_loop(self):
-        """Create and return a new event loop object."""
         raise NotImplementedError
 
 
 class _BaseDefaultEventLoopPolicy(_AbstractEventLoopPolicy):
-    """Default policy: one event loop per thread, set explicitly with
-    set_event_loop(); get_event_loop() never creates a loop."""
+    """Keeps one "current" loop per thread; never creates loops implicitly."""
 
     _loop_factory = None
 
@@ -476,10 +259,11 @@ class _BaseDefaultEventLoopPolicy(_AbstractEventLoopPolicy):
         self._local = self._Local()
 
     def get_event_loop(self):
-        if self._local._loop is None:
+        loop = self._local._loop
+        if loop is None:
             raise RuntimeError('There is no current event loop in thread %r.'
                                % threading.current_thread().name)
-        return self._local._loop
+        return loop
 
     def set_event_loop(self, loop):
         if loop is not None and not isinstance(loop, AbstractEventLoop):
@@ -491,62 +275,51 @@ class _BaseDefaultEventLoopPolicy(_AbstractEventLoopPolicy):
         return self._loop_factory()
 
 
-# The global policy, created lazily.
 _event_loop_policy = None
-
-# Protects the lazy creation of the policy.
-_lock = threading.Lock()
+_policy_lock = threading.Lock()
 
 
-class _RunningLoop(threading.local):
-    loop_pid = (None, None)
+class _RunningLoopSlot(threading.local):
+    # (loop, pid): a loop inherited through fork() is not "running" in
+    # the child.
+    value = (None, None)
 
 
-_running_loop = _RunningLoop()
+_running_slot = _RunningLoopSlot()
+
+
+def _get_running_loop():
+    """The running loop of this thread, or None."""
+    loop, pid = _running_slot.value
+    if loop is not None and pid == os.getpid():
+        return loop
+    return None
+
+
+def _set_running_loop(loop):
+    """Declare *loop* as running in this thread (for loop implementations)."""
+    _running_slot.value = (loop, os.getpid())
 
 
 def get_running_loop():
-    """Return the running event loop; raise RuntimeError if there is none."""
+    """Return the running event loop; RuntimeError if there is none."""
     loop = _get_running_loop()
     if loop is None:
         raise RuntimeError('no running event loop')
     return loop
 
 
-def _get_running_loop():
-    """Return the running event loop or None (fast, no exception)."""
-    running_loop, pid = _running_loop.loop_pid
-    if running_loop is not None and pid == os.getpid():
-        return running_loop
-
-
-def _set_running_loop(loop):
-    """Set the running event loop (used by loop implementations only)."""
-    _running_loop.loop_pid = (loop, os.getpid())
-
-
-def _init_event_loop_policy():
-    global _event_loop_policy
-    with _lock:
-        if _event_loop_policy is None:
-            from . import _DefaultEventLoopPolicy
-            _event_loop_policy = _DefaultEventLoopPolicy()
-
-
 def _get_event_loop_policy():
-    """Get the current event loop policy."""
+    global _event_loop_policy
     if _event_loop_policy is None:
-        _init_event_loop_policy()
+        with _policy_lock:
+            if _event_loop_policy is None:
+                from . import _DefaultEventLoopPolicy
+                _event_loop_policy = _DefaultEventLoopPolicy()
     return _event_loop_policy
 
 
-def get_event_loop_policy():
-    warnings._deprecated('asyncio.get_event_loop_policy', remove=(3, 16))
-    return _get_event_loop_policy()
-
-
 def _set_event_loop_policy(policy):
-    """Set the current event loop policy (None restores the default)."""
     global _event_loop_policy
     if policy is not None and not isinstance(policy, _AbstractEventLoopPolicy):
         raise TypeError(f"policy must be an instance of AbstractEventLoopPolicy "
@@ -554,55 +327,60 @@ def _set_event_loop_policy(policy):
     _event_loop_policy = policy
 
 
+def get_event_loop_policy():
+    """Deprecated: return the global event loop policy."""
+    warnings._deprecated('asyncio.get_event_loop_policy', remove=(3, 16))
+    return _get_event_loop_policy()
+
+
 def set_event_loop_policy(policy):
+    """Deprecated: replace the global event loop policy (None = default)."""
     warnings._deprecated('asyncio.set_event_loop_policy', remove=(3, 16))
     _set_event_loop_policy(policy)
 
 
 def get_event_loop():
-    """Return the running loop, or the policy's current loop."""
-    current_loop = _get_running_loop()
-    if current_loop is not None:
-        return current_loop
+    """The running loop if any, else the current loop of the policy."""
+    loop = _get_running_loop()
+    if loop is not None:
+        return loop
     return _get_event_loop_policy().get_event_loop()
 
 
 def set_event_loop(loop):
-    """Equivalent to calling get_event_loop_policy().set_event_loop(loop)."""
+    """Make *loop* the current loop of this thread."""
     _get_event_loop_policy().set_event_loop(loop)
 
 
 def new_event_loop():
-    """Equivalent to calling get_event_loop_policy().new_event_loop()."""
+    """Create a new event loop (through the policy)."""
     return _get_event_loop_policy().new_event_loop()
 
 
-# Pure Python versions, kept for the tests.
 _py__get_running_loop = _get_running_loop
 _py__set_running_loop = _set_running_loop
 _py_get_running_loop = get_running_loop
 _py_get_event_loop = get_event_loop
 
-
 try:
-    # C versions from the accelerator module, when available.
-    from _asyncio import (_get_running_loop, _set_running_loop,
-                          get_running_loop, get_event_loop)
+    import _asyncio as _accel
 except ImportError:
     pass
 else:
-    _c__get_running_loop = _get_running_loop
-    _c__set_running_loop = _set_running_loop
-    _c_get_running_loop = get_running_loop
-    _c_get_event_loop = get_event_loop
+    _c__get_running_loop = _get_running_loop = _accel._get_running_loop
+    _c__set_running_loop = _set_running_loop = _accel._set_running_loop
+    _c_get_running_loop = get_running_loop = _accel.get_running_loop
+    _c_get_event_loop = get_event_loop = _accel.get_event_loop
+    del _accel
 
 
-if hasattr(os, 'fork'):
-    def on_fork():
-        # the child must not see the parent's loop or wakeup fd
-        if _event_loop_policy is not None:
-            _event_loop_policy._local = _BaseDefaultEventLoopPolicy._Local()
-        _set_running_loop(None)
-        signal.set_wakeup_fd(-1)
+def _reset_after_fork():
+    # The parent's loops are unusable in a forked child.
+    if _event_loop_policy is not None:
+        _event_loop_policy._local = _BaseDefaultEventLoopPolicy._Local()
+    _set_running_loop(None)
+    signal.set_wakeup_fd(-1)
 
-    os.register_at_fork(after_in_child=on_fork)
+
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(after_in_child=_reset_after_fork)

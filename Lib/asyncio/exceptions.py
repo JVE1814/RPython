@@ -1,59 +1,57 @@
-"""asyncio exceptions."""
-
+"""Exception classes of the asyncio package."""
 
 __all__ = ('BrokenBarrierError',
            'CancelledError', 'InvalidStateError', 'TimeoutError',
            'IncompleteReadError', 'LimitOverrunError',
            'SendfileNotAvailableError')
 
+# asyncio uses the builtin TimeoutError.
+TimeoutError = TimeoutError
+
 
 class CancelledError(BaseException):
-    """The Future or Task was cancelled."""
-
-
-TimeoutError = TimeoutError  # the builtin, re-exported
+    """Raised inside a task (or by a future) that was cancelled."""
 
 
 class InvalidStateError(Exception):
-    """The operation is not allowed in this state."""
+    """A future or task is not in the state the operation requires."""
 
 
 class SendfileNotAvailableError(RuntimeError):
-    """sendfile syscall is not available for the given socket or file type.
-
-    Raised when loop.sendfile() cannot use the native implementation.
-    """
+    """The native sendfile path cannot be used for this socket/file pair."""
 
 
 class IncompleteReadError(EOFError):
-    """EOF was reached before the expected number of bytes was read.
+    """The stream ended before the requested amount of data was read.
 
-    - partial: the bytes read before EOF
-    - expected: total number of expected bytes (or None if undefined)
+    Attributes: partial (bytes received) and expected (requested size or
+    None).
     """
+
     def __init__(self, partial, expected):
-        r_expected = 'undefined' if expected is None else repr(expected)
+        wanted = 'undefined' if expected is None else repr(expected)
         super().__init__(f'{len(partial)} bytes read on a total of '
-                         f'{r_expected} expected bytes')
+                         f'{wanted} expected bytes')
         self.partial = partial
         self.expected = expected
 
     def __reduce__(self):
-        return type(self), (self.partial, self.expected)
+        return (type(self), (self.partial, self.expected))
 
 
 class LimitOverrunError(Exception):
-    """The buffer limit was reached while looking for a separator.
+    """A separator was not found within the stream's buffer limit.
 
-    - consumed: total number of bytes to be consumed
+    Attribute consumed: number of bytes that would have to be consumed.
     """
+
     def __init__(self, message, consumed):
         super().__init__(message)
         self.consumed = consumed
 
     def __reduce__(self):
-        return type(self), (self.args[0], self.consumed)
+        return (type(self), (self.args[0], self.consumed))
 
 
 class BrokenBarrierError(RuntimeError):
-    """The Barrier is broken or was reset while a task was waiting."""
+    """A Barrier was broken or reset while tasks were waiting on it."""

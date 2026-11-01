@@ -8,3 +8,4 @@ pub mod huffman;
 pub mod inflate;
 pub mod deflate;
 pub mod hash;
+pub mod bzip2;

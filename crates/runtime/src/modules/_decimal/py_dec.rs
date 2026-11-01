@@ -292,7 +292,7 @@ fn tuple_to_dec(v: &PyObject) -> PyResult<Dec> {
     Ok(match kind {
         Kind::Inf => Dec::inf(neg),
         Kind::Finite => Dec::finite(neg, nat::from_digits(&digits), exp),
-        k => Dec { neg, kind: k, exp: 0, coef: nat::from_digits(&digits) },
+        k => Dec { neg, kind: k, exp: 0, coef: nat::from_digits(&digits).into() },
     })
 }
 
@@ -958,7 +958,7 @@ fn m_as_integer_ratio(o: &PyObject) -> PyResult {
     }
     // reduce c / 10^k by removing common factors of 2 and 5
     let k = (-(d.exp as i128)) as u64;
-    let mut c = d.coef.clone();
+    let mut c = d.coef.to_vec();
     let mut twos = 0u64;
     while twos < k && nat::rem_small(&c, 2) == 0 {
         // divide by the largest power of two available at once
@@ -1113,6 +1113,7 @@ fn m_format(o: &PyObject, a: &[&PyObject]) -> PyResult {
         if !dict::is_dict(a[1]) {
             raise!(TypeError, "optional argument must be a dict");
         }
+        locale_from_dict(a[1])?;
         Some(a[1])
     } else {
         None
@@ -1422,7 +1423,7 @@ pub fn init_types() -> PyResult<()> {
         let t = &mut *decimal_type();
         t.tp_name = c"decimal.Decimal".as_ptr();
         t.tp_basicsize = std::mem::size_of::<DecObj>() as isize;
-        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE;
+        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_IMMUTABLETYPE;
         t.tp_new = Some(dec_new);
         t.tp_dealloc = Some(dec_dealloc);
         t.tp_alloc = Some(generic_alloc);

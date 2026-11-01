@@ -283,12 +283,12 @@ const CONSTANTS: &[(&str, i64)] = &[
 
 pub fn init() -> PyResult {
     let methods = mdefs![
-        ("fcntl", FAST, fcntl_fcntl, "fcntl($module, fd, cmd, arg=0, /)\n--\n\nPerform the operation `cmd` on file descriptor fd.\n\nThe values used for `cmd` are operating system dependent, and are available\nas constants in the fcntl module, using the same names as used in\nthe relevant C header files.  The argument arg is optional, and\ndefaults to 0; it may be an integer, a bytes-like object or a string.\nIf arg is given as a string, the return value of fcntl is a string\nof that length, containing the resulting value put in the arg buffer by\nthe operating system.  The length of the arg string is not allowed\nto exceed 1024 bytes.  If the arg given is an integer or if none is\nspecified, the result value is an integer corresponding to the return\nvalue of the fcntl call in the C code."),
-        ("ioctl", FAST, fcntl_ioctl, "ioctl($module, fd, request, arg=0, mutate_flag=True, /)\n--\n\nPerform the operation `request` on file descriptor `fd`."),
-        ("flock", FAST, fcntl_flock, "flock($module, fd, operation, /)\n--\n\nPerform the lock operation `operation` on file descriptor `fd`.\n\nSee the Unix manual page for flock(2) for details (On some systems, this\nfunction is emulated using fcntl())."),
-        ("lockf", FAST, fcntl_lockf, "lockf($module, fd, cmd, len=0, start=0, whence=0, /)\n--\n\nA wrapper around the fcntl() locking calls."),
+        ("fcntl", FAST, fcntl_fcntl, "fcntl($module, fd, cmd, arg=0, /)\n--\n\nApply the fcntl() command cmd to the file descriptor.\n\narg may be an int (the result is the int returned by the call) or a\nbytes-like object or str, which is copied into a buffer passed to the call;\nthe possibly modified buffer is then returned as bytes."),
+        ("ioctl", FAST, fcntl_ioctl, "ioctl($module, fd, request, arg=0, mutate_flag=True, /)\n--\n\nApply the ioctl() request to the file descriptor.\n\narg may be an int or a buffer. A writable buffer is updated in place when\nmutate_flag is true (the int result is returned); otherwise a copy is passed\nand returned as bytes."),
+        ("flock", FAST, fcntl_flock, "flock($module, fd, operation, /)\n--\n\nApply the flock() operation (LOCK_SH, LOCK_EX, LOCK_UN, optionally | LOCK_NB)."),
+        ("lockf", FAST, fcntl_lockf, "lockf($module, fd, cmd, len=0, start=0, whence=0, /)\n--\n\nLock or unlock a byte range of the file using fcntl() record locks.\n\ncmd is LOCK_UN, LOCK_SH or LOCK_EX, optionally | LOCK_NB."),
     ];
-    let (m, d) = crate::modules::fncommon::new_module("fcntl", methods, Some("This module performs file control and I/O control on file\ndescriptors.  It is an interface to the fcntl() and ioctl() Unix\nroutines.  File descriptors can be obtained with the fileno() method of\na file or socket object."))?;
+    let (m, d) = crate::modules::fncommon::new_module("fcntl", methods, Some("The fcntl() and ioctl() system calls and file locking (flock, lockf).\n\nFile descriptors may be given as ints or as objects with a fileno() method."))?;
     for (n, v) in CONSTANTS {
         dict::set_item_str(&d, n, &int::new_int(*v))?;
     }

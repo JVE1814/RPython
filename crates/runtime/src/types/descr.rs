@@ -848,6 +848,9 @@ unsafe extern "C" fn tp_new_wrapper(slf: *mut PyObject, args: *mut PyObject, kw:
                 type_name(&*tp)
             )));
         }
+        if (*sub).tp_flags & Py_TPFLAGS_DISALLOW_INSTANTIATION != 0 || (*sub).tp_new.is_none() {
+            return into_c(Err(err!(TypeError, "cannot create '{}' instances", crate::types::typeobject::type_fqname(sub))));
+        }
         // Check that the most derived non-heap base of `sub` uses this tp_new.
         let mut staticbase = sub;
         while !staticbase.is_null() && (*staticbase).tp_new == Some(std::mem::transmute(crate::types::slots::Slot::TpNew.generic())) {
@@ -931,6 +934,8 @@ pub fn init_types() {
         t.tp_flags |= Py_TPFLAGS_HAVE_VECTORCALL | Py_TPFLAGS_METHOD_DESCRIPTOR;
 
         setup(classmethod_descr_type(), c"classmethod_descriptor", std::mem::size_of::<PyMethodDescrObject>());
+        // Unlike the other descriptors, classmethod descriptors cannot be pickled.
+        (*classmethod_descr_type()).tp_methods = std::ptr::null_mut();
         let t = &mut *classmethod_descr_type();
         t.tp_descr_get = Some(classmethod_descr_get);
         t.tp_call = Some(classmethod_descr_call);

@@ -1,64 +1,49 @@
+"""State constants and repr support shared by Future implementations."""
+
 __all__ = ()
 
 import reprlib
 
 from . import format_helpers
 
-# States of a Future.
 _PENDING = 'PENDING'
 _CANCELLED = 'CANCELLED'
 _FINISHED = 'FINISHED'
 
 
 def isfuture(obj):
-    """Check for a Future.
-
-    True for instances of asyncio.Future and for objects of classes that are
-    Future-compatible (they define _asyncio_future_blocking).
-    """
-    return (hasattr(obj.__class__, '_asyncio_future_blocking') and
-            obj._asyncio_future_blocking is not None)
+    """True for asyncio futures and Future-compatible objects (classes
+    defining _asyncio_future_blocking)."""
+    if not hasattr(type(obj), '_asyncio_future_blocking'):
+        return False
+    return obj._asyncio_future_blocking is not None
 
 
 def _format_callbacks(cb):
-    """Render the callbacks part of Future.__repr__()."""
-    size = len(cb)
-    if not size:
-        cb = ''
-
-    def format_cb(callback):
-        return format_helpers._format_callback_source(callback, ())
-
-    if size == 1:
-        cb = format_cb(cb[0][0])
-    elif size == 2:
-        cb = '{}, {}'.format(format_cb(cb[0][0]), format_cb(cb[1][0]))
-    elif size > 2:
-        cb = '{}, <{} more>, {}'.format(format_cb(cb[0][0]),
-                                        size - 2,
-                                        format_cb(cb[-1][0]))
-    return f'cb=[{cb}]'
+    # first, last and a count of the ones in between
+    names = [format_helpers._format_callback_source(entry[0], ())
+             for entry in (cb[:1] + cb[-1:] if len(cb) > 2 else cb)]
+    if len(cb) > 2:
+        names.insert(1, f'<{len(cb) - 2} more>')
+    return 'cb=[' + ', '.join(names) + ']'
 
 
 def _future_repr_info(future):
-    """Repr fragments shared by Future and Task."""
-    info = [future._state.lower()]
+    parts = [future._state.lower()]
     if future._state == _FINISHED:
         if future._exception is not None:
-            info.append(f'exception={future._exception!r}')
+            parts.append(f'exception={future._exception!r}')
         else:
-            # reprlib bounds the size of huge results
-            result = reprlib.repr(future._result)
-            info.append(f'result={result}')
+            parts.append(f'result={reprlib.repr(future._result)}')
     if future._callbacks:
-        info.append(_format_callbacks(future._callbacks))
+        parts.append(_format_callbacks(future._callbacks))
     if future._source_traceback:
-        frame = future._source_traceback[-1]
-        info.append(f'created at {frame[0]}:{frame[1]}')
-    return info
+        origin = future._source_traceback[-1]
+        parts.append(f'created at {origin[0]}:{origin[1]}')
+    return parts
 
 
 @reprlib.recursive_repr()
 def _future_repr(future):
-    info = ' '.join(_future_repr_info(future))
-    return f'<{future.__class__.__name__} {info}>'
+    return '<{} {}>'.format(type(future).__name__,
+                            ' '.join(_future_repr_info(future)))

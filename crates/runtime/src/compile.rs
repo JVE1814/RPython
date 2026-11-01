@@ -216,6 +216,8 @@ fn emit_warning_m(
     };
     let m = pystr::new_str(msg);
     let f = pystr::new_str(filename);
+    let derived = if module.is_none() { module_name_for_file(filename) } else { None };
+    let module = module.or(derived.as_deref());
     let r = crate::modules::_warnings::warn_explicit(cat, &m, &f, lineno as i64, module, None);
     if r.is_err() {
         if exc_matches(cat) {
@@ -389,6 +391,41 @@ pub fn optimize_mod(module: &mut rpy_parser::ast::Mod, o: &Opts) -> PyResult<()>
         Ok(()) => Ok(()),
         Err(e) => Err(compile_error(&e, o.filename, None)),
     }
+}
+
+/// Dotted module name of a source file found below one of the `sys.path`
+/// directories (used as the warnings `module` of compile-time warnings).
+fn module_name_for_file(filename: &str) -> Option<PyRef> {
+    let stem = filename.strip_suffix(".py")?;
+    let path = crate::modules::sys::get_sys_attr("path")?;
+    if !crate::types::list::is_list(&path) {
+        return None;
+    }
+    let mut best: Option<String> = None;
+    for entry in crate::types::list::list_to_vec(&path) {
+        if !pystr::is_str(&entry) {
+            continue;
+        }
+        let mut dir = pystr::to_string_lossy(&entry);
+        while dir.len() > 1 && dir.ends_with('/') {
+            dir.pop();
+        }
+        if dir.is_empty() {
+            continue;
+        }
+        let Some(rest) = stem.strip_prefix(dir.as_str()).and_then(|r| r.strip_prefix('/')) else { continue };
+        if rest.is_empty() || rest.split('/').any(|p| p.is_empty() || p.contains('.')) {
+            continue;
+        }
+        let mut dotted = rest.replace('/', ".");
+        if let Some(pkg) = dotted.strip_suffix(".__init__") {
+            dotted = pkg.to_string();
+        }
+        if best.as_ref().is_none_or(|b| dotted.len() < b.len()) {
+            best = Some(dotted);
+        }
+    }
+    best.map(|b| pystr::new_str(&b))
 }
 
 /// Map a compiler error (validation etc.) to a Python exception.

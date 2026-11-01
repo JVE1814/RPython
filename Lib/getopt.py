@@ -104,6 +104,10 @@ def gnu_getopt(args, shortopts, longopts=[]):
         if arg == '--':
             operands.extend(rest[1:])
             break
+        if in_order and operands and arg.startswith('-') and arg != '-':
+            # operands seen so far are reported in place, before this option
+            found.append((None, operands))
+            operands = []
         if arg.startswith('--'):
             found, rest = do_longs(found, arg[2:], longopts, rest[1:])
             continue
@@ -114,10 +118,7 @@ def gnu_getopt(args, shortopts, longopts=[]):
         if stop_at_operand:
             operands.extend(rest)
             break
-        if in_order:
-            found.append((None, [arg]))
-        else:
-            operands.append(arg)
+        operands.append(arg)
         rest = rest[1:]
     return found, operands
 

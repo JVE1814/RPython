@@ -209,11 +209,11 @@ fn zero_sum_sign(an: bool, bn: bool, ctx: &Ctx) -> bool {
 #[inline]
 fn sum_small(x: u128, xn: bool, y: u128, yn: bool, exp: i64, ctx: &Ctx) -> Dec {
     if xn == yn {
-        Dec::finite(xn, nat::from_u128(x + y), exp)
+        Dec::finite(xn, Coef::from_u128(x + y), exp)
     } else if x > y {
-        Dec::finite(xn, nat::from_u128(x - y), exp)
+        Dec::finite(xn, Coef::from_u128(x - y), exp)
     } else if y > x {
-        Dec::finite(yn, nat::from_u128(y - x), exp)
+        Dec::finite(yn, Coef::from_u128(y - x), exp)
     } else {
         Dec::finite(zero_sum_sign(xn, yn, ctx), vec![], exp)
     }
@@ -241,7 +241,7 @@ pub fn mul_exact(a: &Dec, b: &Dec) -> Dec {
     let exp = a.exp + b.exp;
     if a.coef.len() == 1 && b.coef.len() == 1 {
         let p = a.coef[0] as u128 * b.coef[0] as u128;
-        return Dec::finite(neg, nat::from_u128(p), exp);
+        return Dec::finite(neg, Coef::from_u128(p), exp);
     }
     Dec::finite(neg, nat::mul(&a.coef, &b.coef), exp)
 }
@@ -286,7 +286,7 @@ pub fn clamp_i64(v: i128) -> i64 {
 
 /// Quotient of coefficients with at least `prec` digits; exact results are
 /// brought as close as possible to the ideal exponent.
-pub fn div_coef(ca: &[u64], cb: &[u64], ideal: i128, prec: i64) -> (Vec<u64>, i128, Rest) {
+pub fn div_coef(ca: &[u64], cb: &[u64], ideal: i128, prec: i64) -> (Coef, i128, Rest) {
     let da = nat::digits(ca) as i128;
     let db = nat::digits(cb) as i128;
     let shift = prec as i128 + db - da;
@@ -310,7 +310,7 @@ pub fn div_coef(ca: &[u64], cb: &[u64], ideal: i128, prec: i64) -> (Vec<u64>, i1
                     Ordering::Greater => Rest::Gt,
                 }
             };
-            return (nat::from_u128(q), exp, rest);
+            return (Coef::from_u128(q), exp, rest);
         }
     }
     let (num, den) = if shift > 0 {
@@ -333,7 +333,7 @@ pub fn div_coef(ca: &[u64], cb: &[u64], ideal: i128, prec: i64) -> (Vec<u64>, i1
     } else {
         half_cmp(&r, &den)
     };
-    (q, exp, rest)
+    (q.into(), exp, rest)
 }
 
 /// Classify remainder r relative to divisor d.
@@ -789,7 +789,7 @@ pub fn reduce(a: &Dec, ctx: &mut Ctx) -> Dec {
     let tz = nat::trailing_zeros(&r.coef) as i128;
     let k = tz.min(emax_eff - r.exp as i128);
     if k > 0 {
-        r.coef = nat::shr_trunc(&r.coef, k as u64);
+        r.coef = nat::shr_trunc(&r.coef, k as u64).into();
         r.exp += k as i64;
     }
     r
