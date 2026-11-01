@@ -11,7 +11,9 @@ pub fn symtable(module: &ast::Mod, opts: &CompileOptions) -> Result<symtable::Sy
 pub fn optimize_ast(module: &mut ast::Mod, optimize: i32, flags: u32) -> Result<(), CompileError>;
 pub fn dis::disassemble(code: &CodeUnit) -> String;
 pub fn unparse::unparse_expr(e: &ast::Expr) -> String;   // ast.unparse-like, annotation style
-pub fn validate_ast(module: &ast::Mod) -> Result<(), CompileError>;  // ValueError for invalid positions
+pub fn validate_ast(module: &ast::Mod) -> Result<(), CompileError>;  // for compile(ast_obj): ValueError on
+    // invalid positions and malformed nodes (BoolOp < 2 values, empty bodies, ...). compile() itself
+    // never panics on malformed trees (returns ValueError) but does not check positions.
 
 pub struct CompileOptions { filename, mode: Mode /*Exec|Eval|Single|FuncType*/, optimize: i32,
                             flags: u32 /* PyCF_* | CO_FUTURE_* */, interactive: bool, max_depth: u32 }
@@ -262,3 +264,28 @@ parsing) takes ~3 s in release mode.
   `*.expected` outputs (comprehension scoping in module/class/function scope, control flow,
   annotations, match ...). All pass with the runtime at the time of writing.
 * `cargo run --example dis -- -c 'source'` (or a file) prints a disassembly.
+
+## Locations / tracing
+
+* Every instruction has a `Location`; artificial instructions inherit the previous location in
+  their block (and along fallthrough edges), except handler entry blocks and the prologue
+  (lineno 0 = "no location").
+* NOPs are kept only when they carry the sole instruction of a line (`pass`, `global`, constant
+  expression statements, the `while` header, `try` header, `return <const>` on its own line).
+* Small location-less exit blocks (`LoadConst None; ReturnValue`) reached by jumps are
+  duplicated per jumping predecessor with that predecessor's location (CPython's
+  duplicate_exits_without_lineno), so the implicit return after a loop reports the loop line.
+* Multi-line attribute chains/method calls: LoadAttr/LoadMethod/Call locations start at the
+  attribute name (CPython's update_start_location_to_match_attr).
+* Jump threading retargets jumps to location-less unconditional jumps.
+* Unused constants are dropped (consts[0] kept when it is the docstring).
+
+## Known gaps
+
+* Line-event behaviour could not be validated end to end (runtime tracing is stubbed); the
+  shapes follow CPython's rules but `test_sys_settrace` details may differ.
+* No constant folding of subscripts or slices (there is no slice constant in the contract).
+* `optimize_ast(level 2)` strips docstrings of module/classes/functions reachable through
+  def/class nesting only (not defs inside if/for blocks).
+* Exact `co_consts` layouts checked by CPython-only tests (e.g. test_folding_type_param) are
+  not reproduced.
