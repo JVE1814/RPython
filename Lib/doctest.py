@@ -61,6 +61,7 @@ __all__ = [
 
 import __future__
 import difflib
+import functools
 import inspect
 import linecache
 import os
@@ -354,8 +355,8 @@ class DocTest:
     def __lt__(self, other):
         if not isinstance(other, DocTest):
             return NotImplemented
-        mine = (self.name, self.filename, self.lineno is None, self.lineno or 0, id(self))
-        theirs = (other.name, other.filename, other.lineno is None, other.lineno or 0, id(other))
+        mine = (self.name, self.filename, -1 if self.lineno is None else self.lineno, id(self))
+        theirs = (other.name, other.filename, -1 if other.lineno is None else other.lineno, id(other))
         return mine < theirs
 
 
@@ -646,11 +647,40 @@ class DocTestFinder:
                 filename = filename[:-1]
         return self._parser.get_doctest(docstring, globs, name, filename, lineno)
 
+    @staticmethod
+    def _find_string_lineno(text, source_lines):
+        """Line (0-based) of the string literal `text` (e.g. a __test__
+        entry) in the source: the place where all its non-blank lines
+        appear consecutively."""
+        if not source_lines:
+            return None
+        wanted = [(offset, line.strip())
+                  for offset, line in enumerate(text.split('\n')) if line.strip()]
+        if not wanted:
+            return None
+        stripped = [line.strip() for line in source_lines]
+        first_offset, first_line = wanted[0]
+        for start, line in enumerate(stripped):
+            if not line.endswith(first_line):
+                continue
+            position = start
+            matched = True
+            for offset, expected in wanted[1:]:
+                position = start + (offset - first_offset)
+                if position >= len(stripped) or stripped[position] != expected:
+                    matched = False
+                    break
+            if matched:
+                return start - first_offset
+        return None
+
     _DOCSTRING_START = re.compile(r'(^|.*:)\s*\w*("|\')')
 
     def _find_lineno(self, obj, source_lines):
         """0-based line of the docstring of `obj` in its source, or None."""
         lineno = None
+        if isinstance(obj, str):
+            return self._find_string_lineno(obj, source_lines)
         docstring = getattr(obj, '__doc__', None)
 
         if inspect.ismodule(obj) and docstring is not None:
@@ -665,12 +695,17 @@ class DocTestFinder:
                     lineno = index
                     break
 
+        if isinstance(obj, functools.cached_property):
+            obj = obj.func
         if inspect.ismethod(obj):
             obj = obj.__func__
         if isinstance(obj, property):
             obj = obj.fget
-        if inspect.isfunction(obj) and getattr(obj, '__doc__', None):
-            obj = inspect.unwrap(obj)
+        if inspect.isroutine(obj) and getattr(obj, '__doc__', None):
+            try:
+                obj = inspect.unwrap(obj)
+            except ValueError:
+                pass
             try:
                 obj = obj.__code__
             except AttributeError:
@@ -697,7 +732,9 @@ class OutputChecker:
     """Compares actual with expected output under the option flags."""
 
     def _to_str(self, text):
-        return text if isinstance(text, str) else str(text)
+        # Non-ASCII characters compare equal to their backslash escapes.
+        text = text if isinstance(text, str) else str(text)
+        return text.encode("ascii", "backslashreplace").decode("ascii")
 
     def check_output(self, want, got, optionflags):
         """True if `got` is acceptable as the output `want`."""
@@ -1340,6 +1377,12 @@ def _with_doctest_frame(exc, test, example, tb_next):
         code = compile('\n' * (lineno - 1) + 'raise __exc__',
                        test.filename, 'exec').replace(co_name=test.name)
         try:
+            # no column information: the frame shows the example line only
+            import marshal
+            code = marshal._loads_without_positions(marshal.dumps(code))
+        except (ImportError, AttributeError):
+            pass
+        try:
             exec(code, {'__exc__': exc})
         except BaseException as raised:
             here = raised.__traceback__
@@ -1408,7 +1451,7 @@ class DocTestCase(unittest.TestCase):
                 if kind == 'skip':
                     self.skipTest('example skipped')
                 elif kind == 'fail':
-                    raise _with_doctest_frame(self.failureException(detail),
+                    raise _with_doctest_frame(self.failureException(detail.removesuffix("\n")),
                                               test, example, None)
                 else:
                     exc = detail[1]

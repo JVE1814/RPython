@@ -938,7 +938,15 @@ fn str_tuple(o: &PyObject) -> Option<Vec<String>> {
     Some(v)
 }
 
+thread_local! {
+    /// Set while `_loads_without_positions` runs.
+    static STRIP_COLUMNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn no_debug_ranges() -> bool {
+    if STRIP_COLUMNS.with(|c| c.get()) {
+        return true;
+    }
     // -X no_debug_ranges / PYTHONNODEBUGRANGES: drop column information on load.
     if std::env::var_os("PYTHONNODEBUGRANGES").map(|v| !v.is_empty()).unwrap_or(false) {
         return true;
@@ -1119,6 +1127,16 @@ fn m_loads(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult
     loads_slice(&view, allow)
 }
 
+/// Private helper (used by doctest): loads() with column information removed from
+/// code objects, as under -X no_debug_ranges.
+fn m_loads_without_positions(_m: &PyObject, data: &PyObject) -> PyResult {
+    let bytes_data = crate::buffer::with_buffer(data, |b| b.to_vec())?;
+    STRIP_COLUMNS.with(|c| c.set(true));
+    let r = loads_slice(&bytes_data, true);
+    STRIP_COLUMNS.with(|c| c.set(false));
+    r
+}
+
 fn m_load(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
     static P: Params = Params::new("load", &["file", "allow_code"], 1, 1).kwonly(1);
     let [file, allow] = crate::args::parse::<2>(&P, args, kw)?;
@@ -1141,6 +1159,7 @@ pub fn init() -> PyResult {
         ("dump", FASTKW, m_dump, "dump($module, value, file, version=version, /, *, allow_code=True)\n--\n\nSerialize value with the marshal format and write it to the binary file.\n\nversion selects the format version; allow_code=False rejects code objects.\nRaises ValueError for unsupported types (partial output may have been written)."),
         ("load", FASTKW, m_load, "load($module, file, /, *, allow_code=True)\n--\n\nRead and return one marshalled value from the binary file.\n\nThe file is left positioned just after the value. allow_code=False rejects\ncode objects. Raises EOFError, ValueError or TypeError for bad data."),
         ("dumps", FASTKW, m_dumps, "dumps($module, value, version=version, /, *, allow_code=True)\n--\n\nReturn value serialized with the marshal format as bytes.\n\nversion selects the format version; allow_code=False rejects code objects.\nRaises ValueError for unsupported types."),
+        ("_loads_without_positions", O, m_loads_without_positions, "Private: loads() dropping column positions of code objects."),
         ("loads", FASTKW, m_loads, "loads($module, bytes, /, *, allow_code=True)\n--\n\nDeserialize one marshalled value from a bytes-like object.\n\nTrailing bytes are ignored. allow_code=False rejects code objects.\nRaises EOFError, ValueError or TypeError for bad data."),
     ];
     let (m, d) = crate::modules::fncommon::new_module("marshal", methods, Some(MODULE_DOC))?;
