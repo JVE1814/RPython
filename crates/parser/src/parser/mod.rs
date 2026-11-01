@@ -46,6 +46,8 @@ pub struct ParseOptions {
     pub barry_as_flufl: bool,
     /// PyCF_ALLOW_INCOMPLETE_INPUT (codeop): report "incomplete input" when input ends early.
     pub allow_incomplete_input: bool,
+    /// PyCF_DONT_IMPLY_DEDENT ('single' mode): no implicit DEDENTs at a mid-line EOF.
+    pub dont_imply_dedent: bool,
     /// Unicode database hooks.
     pub hooks: UnicodeHooks,
     /// File name used in a few messages (e.g. "Non-UTF-8 code ... in file X").
@@ -63,6 +65,7 @@ impl Default for ParseOptions {
             feature_version: None,
             barry_as_flufl: false,
             allow_incomplete_input: false,
+            dont_imply_dedent: false,
             hooks: UnicodeHooks::default(),
             filename: "<string>".to_string(),
             decode: None,
@@ -118,6 +121,10 @@ pub(crate) struct Parser<'a> {
     pub(crate) toks: Vec<Token>,
     /// tokenizer error located at the last token (ERRORTOKEN)
     lex_err: Option<LexError>,
+    /// the tokenizer stopped at the end of the input (E_EOF/E_EOFS/E_EOLS)
+    lex_eof: bool,
+    /// index of the first token produced after the tokenizer read EOF
+    eof_start: usize,
     pub(crate) p: usize,
     /// number of tokens "fetched" (max index looked at + 1), as CPython's p->fill
     pub(crate) fill: usize,
@@ -132,6 +139,10 @@ pub(crate) struct Parser<'a> {
     /// lazy-import / misc state
     pub(crate) in_lambda: usize,
     pub(crate) no_genexp_arg: bool,
+    /// first pass: top-level statement start -> end token index
+    top_ok: std::collections::HashMap<usize, usize>,
+    /// furthest token index fetched by the first pass
+    first_fail: usize,
     /// Tokens that had a type comment consumed etc. (unused)
     pub(crate) type_ignores: Vec<TypeIgnore>,
 }
@@ -140,10 +151,19 @@ const MAX_DEPTH: usize = 3000;
 
 impl<'a> Parser<'a> {
     pub(crate) fn new(src: &'a str, opts: &'a ParseOptions) -> Parser<'a> {
-        let mut lx = Lexer::new(src, LexOptions { extra_tokens: false, type_comments: opts.type_comments, hooks: opts.hooks });
+        let lopts = LexOptions {
+            extra_tokens: false,
+            type_comments: opts.type_comments,
+            hooks: opts.hooks,
+            implicit_newline: opts.mode == Mode::Exec || opts.mode == Mode::FuncType,
+            single_input: opts.mode == Mode::Single,
+            dont_imply_dedent: opts.dont_imply_dedent,
+        };
+        let mut lx = Lexer::new(src, lopts);
         let mut toks = Vec::with_capacity(src.len() / 4 + 16);
         let mut lex_err = None;
         let mut type_ignores = Vec::new();
+        let mut eof_start: Option<usize> = None;
         loop {
             match lx.next_token() {
                 Ok(t) => {
@@ -153,6 +173,9 @@ impl<'a> Parser<'a> {
                     }
                     let end = t.ty == TokenType::ENDMARKER;
                     toks.push(t);
+                    if lx.reached_eof && eof_start.is_none() {
+                        eof_start = Some(toks.len() - 1);
+                    }
                     if end {
                         break;
                     }
@@ -170,10 +193,14 @@ impl<'a> Parser<'a> {
             }
         }
         let lex_warnings = std::mem::take(&mut lx.warnings);
+        let lex_eof = lx.eof_error;
+        let eof_start = eof_start.unwrap_or(toks.len() - 1);
         Parser {
             src,
             toks,
             lex_err,
+            lex_eof,
+            eof_start,
             p: 0,
             fill: 0,
             invalid: false,
@@ -185,6 +212,8 @@ impl<'a> Parser<'a> {
             fstring_depth: 0,
             in_lambda: 0,
             no_genexp_arg: false,
+            top_ok: std::collections::HashMap::new(),
+            first_fail: usize::MAX,
             type_ignores,
         }
     }
@@ -313,6 +342,7 @@ impl<'a> Parser<'a> {
     pub(crate) fn tok_loc(t: &Token) -> Loc {
         Loc { lineno: t.lineno as i32, col_offset: t.col, end_lineno: t.end_lineno as i32, end_col_offset: t.end_col }
     }
+    #[allow(dead_code)]
     pub(crate) fn span(a: Loc, b: Loc) -> Loc {
         Loc { lineno: a.lineno, col_offset: a.col_offset, end_lineno: b.end_lineno, end_col_offset: b.end_col_offset }
     }
@@ -397,9 +427,18 @@ impl<'a> Parser<'a> {
         // First pass.
         let r = self.start_rule();
         match r {
-            Ok(Some(m)) => return Ok(m),
+            Ok(Some(m)) => {
+                if self.opts.mode == Mode::Single && self.bad_single_statement() {
+                    return Err(*self.err_last(ErrorKind::Syntax, "multiple statements found while compiling a single statement"));
+                }
+                return Ok(m);
+            }
             Err(e) => return Err(*e),
             Ok(None) => {}
+        }
+        if self.opts.allow_incomplete_input && self.is_end_of_source() {
+            let t = self.toks[self.fill.max(1) - 1];
+            return Err(*self.error_at(ErrorKind::IncompleteInput, "incomplete input", t.lineno as i32, t.col.max(0), t.end_lineno as i32, t.end_col.max(0)));
         }
         // Tokenizer error reached?
         let err_idx = if self.lex_err.is_some() { Some(self.toks.len() - 1) } else { None };
@@ -408,11 +447,8 @@ impl<'a> Parser<'a> {
                 return Err(lex_error_to_syntax(self.src, self.lex_err.clone().unwrap()));
             }
         }
-        if self.opts.allow_incomplete_input && self.is_end_of_source() {
-            let t = self.toks[self.fill.max(1) - 1];
-            return Err(*self.error_at(ErrorKind::Syntax, "incomplete input", t.lineno as i32, t.col.max(0), t.end_lineno as i32, t.end_col.max(0)));
-        }
         let last_fill = self.fill;
+        self.first_fail = last_fill.saturating_sub(1);
         let last_token = self.toks[last_fill.max(1) - 1];
         // Second pass with invalid rules.
         self.p = 0;
@@ -490,11 +526,7 @@ impl<'a> Parser<'a> {
 
     fn is_end_of_source(&self) -> bool {
         // the parser reached the end of the input (ENDMARKER or EOF error token)
-        let last = self.toks.len() - 1;
-        if self.fill > last {
-            return true;
-        }
-        matches!(self.lex_err, Some(LexError::UnclosedParen(..)) | Some(LexError::Eof { .. })) && self.fill >= last
+        self.lex_eof && self.fill > self.eof_start
     }
 
     fn start_rule(&mut self) -> R<Mod> {
@@ -507,18 +539,42 @@ impl<'a> Parser<'a> {
     }
 
     fn file_rule(&mut self) -> R<Mod> {
-        let body = if self.at(TokenType::ENDMARKER) { Vec::new() } else {
-            match self.statements()? {
-                Some(b) => b,
-                None => return Ok(None),
+        // statements+ ENDMARKER, written out so that the second pass can skip the invalid_*
+        // rules for top-level statements that already parsed in the first pass and end
+        // before the first-pass failure point (a big speedup for errors late in large files).
+        let mut body = Vec::new();
+        loop {
+            if self.at(TokenType::ENDMARKER) {
+                break;
             }
-        };
+            let m = self.p;
+            let fast = self.invalid && self.top_ok.get(&m).map(|&e| e < self.first_fail).unwrap_or(false);
+            let save = self.invalid;
+            if fast {
+                self.invalid = false;
+            }
+            let r = self.statement();
+            self.invalid = save;
+            match r? {
+                Some(mut s) => {
+                    if !self.invalid {
+                        self.top_ok.insert(m, self.p);
+                    }
+                    body.append(&mut s);
+                }
+                None => {
+                    self.p = m;
+                    break;
+                }
+            }
+        }
         if !self.at(TokenType::ENDMARKER) {
             return Ok(None);
         }
         let type_ignores = std::mem::take(&mut self.type_ignores);
         Ok(Some(Mod::Module { body, type_ignores }))
     }
+
 
     fn eval_rule(&mut self) -> R<Mod> {
         let Some(e) = self.expressions()? else { return Ok(None) };
@@ -541,25 +597,14 @@ impl<'a> Parser<'a> {
         }
         let mark = self.p;
         if let Some(s) = self.compound_stmt()? {
+            // CPython's parser turns the ENDMARKER into the NEWLINE that ends the statement
             if self.eat(TokenType::NEWLINE).is_some() || self.at(TokenType::ENDMARKER) {
-                // CPython's single input requires the trailing NEWLINE; the tokenizer adds it.
-                if self.at(TokenType::ENDMARKER) || true {
-                    return Ok(Some(Mod::Interactive { body: vec![s] }));
-                }
+                return Ok(Some(Mod::Interactive { body: vec![s] }));
             }
-            // compound statement followed by something else
-            let _ = mark;
             return Ok(None);
         }
         self.p = mark;
         if let Some(v) = self.simple_stmts()? {
-            if !self.at(TokenType::ENDMARKER) {
-                // trailing NEWLINEs are fine
-                while self.eat(TokenType::NEWLINE).is_some() {}
-                if !self.at(TokenType::ENDMARKER) {
-                    return Ok(None);
-                }
-            }
             return Ok(Some(Mod::Interactive { body: v }));
         }
         Ok(None)
@@ -662,6 +707,30 @@ impl<'a> Parser<'a> {
         match self.opts.feature_version {
             Some(v) if v < minor => Err(self.err_last(ErrorKind::Syntax, format!("{} only supported in Python 3.{} and greater", what, minor))),
             _ => Ok(()),
+        }
+    }
+}
+
+impl<'a> Parser<'a> {
+    /// CPython's `bad_single_statement`: anything but whitespace and comments after the
+    /// last fetched token.
+    fn bad_single_statement(&self) -> bool {
+        let t = self.toks[self.fill.max(1) - 1];
+        let b = self.src.as_bytes();
+        let mut i = (t.end as usize).min(b.len());
+        loop {
+            while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | 0x0c | b'\r') {
+                i += 1;
+            }
+            if i >= b.len() {
+                return false;
+            }
+            if b[i] != b'#' {
+                return true;
+            }
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
         }
     }
 }

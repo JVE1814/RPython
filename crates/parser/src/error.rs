@@ -8,6 +8,9 @@ pub enum ErrorKind {
     Syntax,
     Indentation,
     Tab,
+    /// "incomplete input" with PyCF_ALLOW_INCOMPLETE_INPUT (CPython raises
+    /// `_IncompleteInputError`, a SyntaxError subclass).
+    IncompleteInput,
 }
 
 impl ErrorKind {
@@ -16,6 +19,7 @@ impl ErrorKind {
             ErrorKind::Syntax => "SyntaxError",
             ErrorKind::Indentation => "IndentationError",
             ErrorKind::Tab => "TabError",
+            ErrorKind::IncompleteInput => "_IncompleteInputError",
         }
     }
 }

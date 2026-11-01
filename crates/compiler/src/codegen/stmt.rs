@@ -365,8 +365,6 @@ impl<'a> Compiler<'a> {
         self.emit_jump(Op::ForIter, cleanup);
         self.compile_store(&f.target)?;
         self.compile_stmts(&f.body)?;
-        self.set_loc(f.iter.loc);
-        self.u().loc.lineno = s.loc.lineno as u32;
         self.u().loc = NO_LOC;
         self.emit_jump(Op::Jump, start);
         self.use_label(cleanup);
@@ -810,12 +808,10 @@ impl<'a> Compiler<'a> {
                     if let Some(dot) = a.name.find('.') {
                         let rest = &a.name[dot + 1..];
                         let parts: Vec<&str> = rest.split('.').collect();
-                        for (k, p) in parts.iter().enumerate() {
+                        for p in parts.iter() {
                             self.emit_name(Op::ImportFrom, p);
-                            if k + 1 < parts.len() || true {
-                                self.emit(Op::Swap, 2);
-                                self.emit(Op::PopTop, 0);
-                            }
+                            self.emit(Op::Swap, 2);
+                            self.emit(Op::PopTop, 0);
                         }
                     }
                     self.store_import_name(asname, a.loc)?;
@@ -1056,7 +1052,10 @@ impl<'a> Compiler<'a> {
                     }
                 }
             }
-            ExprKind::Attribute { value: obj, .. } => {
+            ExprKind::Attribute { value: obj, attr, .. } => {
+                if attr == "__debug__" {
+                    return Err(self.error("cannot assign to __debug__", target.loc));
+                }
                 if value.is_none() {
                     self.compile_expr(obj)?;
                     self.emit(Op::PopTop, 0);
