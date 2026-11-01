@@ -533,6 +533,12 @@ fn t(o: &PyObject) -> *mut PyTypeObject {
 }
 
 fn type_get_name(o: &PyObject) -> PyResult {
+    unsafe {
+        let tp = t(o);
+        if (*tp).tp_flags & Py_TPFLAGS_HEAPTYPE != 0 && !(*heap(tp)).ht_name.is_null() {
+            return Ok(PyRef::from_borrowed((*heap(tp)).ht_name));
+        }
+    }
     Ok(pystr::new_str(&type_name(unsafe { &*t(o) })))
 }
 fn check_set_special(o: &PyObject, v: Option<&PyObject>, attr: &str) -> PyResult<()> {
@@ -574,6 +580,12 @@ fn type_set_name(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     Ok(())
 }
 fn type_get_qualname(o: &PyObject) -> PyResult {
+    unsafe {
+        let tp = t(o);
+        if (*tp).tp_flags & Py_TPFLAGS_HEAPTYPE != 0 && !(*heap(tp)).ht_qualname.is_null() {
+            return Ok(PyRef::from_borrowed((*heap(tp)).ht_qualname));
+        }
+    }
     Ok(pystr::new_str(&type_qualname(unsafe { &*t(o) })))
 }
 fn type_set_qualname(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
@@ -1153,12 +1165,16 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
         (*h).ht_slots = if slots.is_some() { tuple::new_tuple(slot_names.clone()).into_raw() } else { std::ptr::null_mut() };
         if add_dict {
             (*tp).tp_flags |= Py_TPFLAGS_MANAGED_DICT;
+            if (*base).tp_itemsize == 0 {
+                (*tp).tp_flags |= Py_TPFLAGS_INLINE_VALUES;
+            }
         }
         if add_weak {
             (*tp).tp_flags |= Py_TPFLAGS_MANAGED_WEAKREF;
         }
         // inherit preheader flags from base
         (*tp).tp_flags |= (*base).tp_flags & Py_TPFLAGS_PREHEADER;
+        (*tp).tp_flags |= (*base).tp_flags & Py_TPFLAGS_INLINE_VALUES;
         (*tp).tp_basicsize = slotoffset as isize;
         (*tp).tp_itemsize = (*base).tp_itemsize;
         (*tp).tp_dealloc = Some(subtype_dealloc);
@@ -1239,6 +1255,9 @@ fn subtype_set_dict(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         match v {
             Some(v) if !dict::is_dict(v) => raise!(TypeError, "__dict__ must be set to a dictionary, not a '{}'", tname(v)),
             _ => {}
+        }
+        if crate::alloc::has_managed(o.as_ptr()) {
+            o.ob_gc_bits.fetch_or(crate::alloc::GC_BIT_DICT_DETACHED, std::sync::atomic::Ordering::Relaxed);
         }
         let old = *slot;
         *slot = v.map_or(std::ptr::null_mut(), |v| v.to_ref().into_raw());

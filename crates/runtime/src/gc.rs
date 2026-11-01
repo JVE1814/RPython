@@ -197,7 +197,12 @@ fn stop_the_world(me: *mut ThreadState) -> bool {
         return true;
     }
     RELEASE.store(false, Release);
-    for t in &others {
+    for t in         // keep garbage alive while we work on it
+        let garbage: Vec<PyRef> = unreachable.iter().map(|&o| PyRef::from_borrowed(o)).collect();
+        // 0. weakrefs with callbacks to garbage are cleared first (their callbacks run
+        //    unless the weakref itself is garbage), so finalizers cannot observe them
+        crate::types::weakref::clear_weakrefs_for_gc(&unreachable, true);
+thers {
         t.c.eval_breaker.fetch_or(crate::threads::EVAL_SAFEPOINT, Release);
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
@@ -393,9 +398,10 @@ unsafe fn collect_stopped() -> usize {
             garbage.clone()
         };
         let n = to_clear.len();
-        // 3. weak references to garbage are cleared (callbacks run) before tp_clear
-        for g in &to_clear {
-            crate::types::weakref::clear_weakrefs(g.as_ptr());
+        // 3. the remaining weak references to garbage are cleared before tp_clear
+        {
+            let ptrs: Vec<*mut PyObject> = to_clear.iter().map(|g| g.as_ptr()).collect();
+            crate::types::weakref::clear_weakrefs_for_gc(&ptrs, false);
         }
         // 4. break cycles
         for g in &to_clear {
