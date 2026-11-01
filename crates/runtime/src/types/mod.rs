@@ -44,6 +44,7 @@ pub mod float_math;
 pub mod float_methods;
 pub mod complex_methods;
 pub mod str_sub;
+pub mod str_methods;
 
 use crate::ffi::PyTypeObject;
 
@@ -151,6 +152,7 @@ pub mod lang_util;
 pub mod genericalias;
     bootstrap_builtins::ready()?;
     type_ready(frameobject_proxy::proxy_type())?;
+    str_methods::ready_types()?;
     Ok(())
 }
     lang_init()?;
