@@ -95,6 +95,8 @@ CODEC_MAP = {
 # Python codec names whose MIME name is spelled differently.
 _CODEC_TO_MIME = {
     'ascii': 'us-ascii',
+    'big5hkscs': 'big5-hkscs',
+    'hz': 'hz-gb-2312',
     'euc_jp': 'euc-jp',
     'euc_kr': 'euc-kr',
     'iso2022_jp': 'iso-2022-jp',

@@ -154,30 +154,14 @@ pub fn lookup(encoding: &str) -> PyResult {
     raise!(LookupError, "unknown encoding: {}", encoding)
 }
 
-/// `codecs.lookup(name)` for a str object, which may contain lone
-/// surrogates (such names are never cached and normally unknown).
+/// `codecs.lookup(name)` for a str object.  A name with lone surrogates has
+/// no UTF-8 form, so no codec can be registered under it: after the
+/// non-ASCII deprecation warning it is an unknown encoding.
 pub fn lookup_obj(name: &PyObject) -> PyResult {
     if let Some(s) = pystr::to_string_strict(name) {
         return lookup(&s);
     }
-    ensure_encodings_imported()?;
     tu::warn(exc::DeprecationWarning(), "Support for non-ascii encoding names will be removed in 3.17", 1)?;
-    let key: Vec<u32> = pystr::str_data(name)
-        .iter()
-        .map(|c| if c == b' ' as u32 { b'-' as u32 } else if c < 0x80 { (c as u8).to_ascii_lowercase() as u32 } else { c })
-        .collect();
-    let k = pystr::from_codepoints(&key);
-    let funcs = REGISTRY.lock().unwrap().search.clone();
-    for f in funcs {
-        let res = ab::call(&f, &[&k])?;
-        if none::is_none(&res) {
-            continue;
-        }
-        if !tuple::is_tuple(&res) || tuple::tuple_len(&res) != 4 {
-            raise!(TypeError, "codec search functions must return 4-tuples");
-        }
-        return Ok(res);
-    }
     raise!(LookupError, "unknown encoding: {}", pystr::to_string_lossy(name))
 }
 
