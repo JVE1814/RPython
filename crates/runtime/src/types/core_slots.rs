@@ -232,7 +232,9 @@ pub struct SeqIterObj {
     idx: usize,
     seq: *mut PyObject,
 }
+#[unsafe(export_name = "PyTupleIter_Type")]
 static mut TUPLE_ITER_TYPE: PyTypeObject = PyTypeObject::ZERO;
+#[unsafe(export_name = "PyListIter_Type")]
 static mut LIST_ITER_TYPE: PyTypeObject = PyTypeObject::ZERO;
 unsafe extern "C" fn tuple_iter(o: *mut PyObject) -> *mut PyObject {
     unsafe {

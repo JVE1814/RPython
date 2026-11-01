@@ -16,7 +16,6 @@ pub mod ceval;
 pub mod codecs;
 pub mod containers;
 pub mod data;
-pub mod descr;
 pub mod dict;
 pub mod errors;
 pub mod funcs;

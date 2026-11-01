@@ -235,6 +235,7 @@ pub unsafe fn run_initfunc(name: &str, f: unsafe extern "C" fn() -> *mut PyObjec
 /// Load (create) an extension from `path` for module `fullname` with `spec`.
 unsafe fn create_dynamic_impl(fullname: &str, path: &str, spec: &PyObject) -> PyResult<(PyRef, Option<*mut PyModuleDef>)> {
     unsafe {
+        capi::data::init();
         let short = fullname.rsplit('.').next().unwrap();
         // inittab entries take precedence (embedding)
         if let Some(f) = capi::import::find_inittab(fullname) {

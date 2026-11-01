@@ -18,8 +18,11 @@ pub struct DictView {
     ob_base: PyObject,
     dict: *mut PyObject,
 }
+#[unsafe(export_name = "PyDictKeys_Type")]
 pub static mut KEYS_TYPE: PyTypeObject = PyTypeObject::ZERO;
+#[unsafe(export_name = "PyDictValues_Type")]
 pub static mut VALUES_TYPE: PyTypeObject = PyTypeObject::ZERO;
+#[unsafe(export_name = "PyDictItems_Type")]
 pub static mut ITEMS_TYPE: PyTypeObject = PyTypeObject::ZERO;
 fn tp(k: Kind) -> *mut PyTypeObject {
     match k {

@@ -25,11 +25,17 @@ struct RState {
     refs: Vec<PyRef>,
 }
 
+#[unsafe(export_name = "PyEnum_Type")]
 static mut ENUMERATE_TYPE: PyTypeObject = PyTypeObject::ZERO;
+#[unsafe(export_name = "PyZip_Type")]
 static mut ZIP_TYPE: PyTypeObject = PyTypeObject::ZERO;
+#[unsafe(export_name = "PyMap_Type")]
 static mut MAP_TYPE: PyTypeObject = PyTypeObject::ZERO;
+#[unsafe(export_name = "PyFilter_Type")]
 static mut FILTER_TYPE: PyTypeObject = PyTypeObject::ZERO;
+#[unsafe(export_name = "PyReversed_Type")]
 static mut REVERSED_TYPE: PyTypeObject = PyTypeObject::ZERO;
+#[unsafe(export_name = "PyRangeIter_Type")]
 static mut RANGE_ITER_TYPE: PyTypeObject = PyTypeObject::ZERO;
 
 fn new_riter(tp: *mut PyTypeObject, refs: Vec<PyRef>, next: Box<dyn FnMut() -> PyResult<Option<PyRef>>>) -> PyResult {
