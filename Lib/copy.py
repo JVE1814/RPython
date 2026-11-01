@@ -10,43 +10,14 @@ Interface summary:
 
 For module specific errors, copy.Error is raised.
 
-The difference between shallow and deep copying is only relevant for
-compound objects (objects that contain other objects, like lists or
-class instances).
+A shallow copy constructs a new compound object and inserts references to
+the objects found in the original; a deep copy inserts copies of them,
+recursively, using a memo dictionary to handle shared and recursive
+structures.
 
-- A shallow copy constructs a new compound object and then (to the
-  extent possible) inserts *the same objects* into it that the
-  original contains.
-
-- A deep copy constructs a new compound object and then, recursively,
-  inserts *copies* into it of the objects found in the original.
-
-Two problems often exist with deep copy operations that don't exist
-with shallow copy operations:
-
- a) recursive objects (compound objects that, directly or indirectly,
-    contain a reference to themselves) may cause a recursive loop
-
- b) because deep copy copies *everything* it may copy too much, e.g.
-    administrative data structures that should be shared even between
-    copies
-
-Python's deep copy operation avoids these problems by:
-
- a) keeping a table of objects already copied during the current
-    copying pass
-
- b) letting user-defined classes override the copying operation or the
-    set of components copied
-
-This version does not copy types like module, class, function, method,
-nor stack trace, stack frame, nor file, socket, window, nor any
-similar types.
-
-Classes can use the same interfaces to control copying that they use
-to control pickling: they can define methods called __getinitargs__(),
-__getstate__() and __setstate__().  See the documentation for module
-"pickle" for information on these methods.
+Classes can customise copying with __copy__() / __deepcopy__(memo), or
+through the pickle protocol (__reduce_ex__, __reduce__, __getstate__,
+__setstate__, __getnewargs__ ...).
 """
 
 import types
@@ -56,7 +27,6 @@ from copyreg import dispatch_table
 
 class Error(Exception):
     pass
-
 error = Error   # backward compatibility
 
 __all__ = ["Error", "copy", "deepcopy", "replace"]
@@ -67,16 +37,15 @@ def copy(x):
 
     See the module's __doc__ string for more info.
     """
-
     cls = type(x)
 
-    if cls in _copy_atomic_types:
+    if cls in _copy_atomic:
         return x
     if cls in _copy_builtin_containers:
         return cls.copy(x)
 
     if issubclass(cls, type):
-        # treat it as a regular class:
+        # treat it as a regular class
         return x
 
     copier = getattr(cls, "__copy__", None)
@@ -87,41 +56,43 @@ def copy(x):
     if reductor is not None:
         rv = reductor(x)
     else:
-        reductor = getattr(x, "__reduce_ex__", None)
-        if reductor is not None:
-            rv = reductor(4)
-        else:
-            reductor = getattr(x, "__reduce__", None)
-            if reductor:
-                rv = reductor()
-            else:
-                raise Error("un(shallow)copyable object of type %s" % cls)
+        rv = _call_reduce(x)
 
     if isinstance(rv, str):
         return x
     return _reconstruct(x, None, *rv)
 
 
-_copy_atomic_types = frozenset({
-    types.NoneType, int, float, bool, complex, str, tuple,
-    bytes, frozenset, type, range, slice, property,
-    types.BuiltinFunctionType, types.EllipsisType,
-    types.NotImplementedType, types.FunctionType, types.CodeType,
-    weakref.ref, super,
-})
+def _call_reduce(x):
+    reductor = getattr(x, "__reduce_ex__", None)
+    if reductor is not None:
+        return reductor(4)
+    reductor = getattr(x, "__reduce__", None)
+    if reductor:
+        return reductor()
+    raise Error(f"un(deep)copyable object of type {type(x)}")
+
+
+_copy_atomic = {types.NoneType, int, float, bool, complex, str, tuple,
+                bytes, frozenset, type, range, slice, property,
+                types.BuiltinFunctionType, types.EllipsisType,
+                types.NotImplementedType, types.FunctionType, types.CodeType,
+                weakref.ref, super}
+_copy_builtin_containers = {list, dict, set, bytearray}
 try:
-    _copy_atomic_types |= {frozendict}
+    _copy_atomic.add(frozendict)
 except NameError:
     pass
-_copy_builtin_containers = frozenset({list, dict, set, bytearray})
 
 
-def deepcopy(x, memo=None, _nil=[]):
+_KEEP = object()   # marker: no memo entry
+
+
+def deepcopy(x, memo=None):
     """Deep copy operation on arbitrary Python objects.
 
     See the module's __doc__ string for more info.
     """
-
     cls = type(x)
 
     if cls in _atomic_types:
@@ -131,8 +102,8 @@ def deepcopy(x, memo=None, _nil=[]):
     if memo is None:
         memo = {}
     else:
-        y = memo.get(d, _nil)
-        if y is not _nil:
+        y = memo.get(d, _KEEP)
+        if y is not _KEEP:
             return y
 
     copier = _deepcopy_dispatch.get(cls)
@@ -140,7 +111,7 @@ def deepcopy(x, memo=None, _nil=[]):
         y = copier(x, memo)
     else:
         if issubclass(cls, type):
-            y = x  # atomic copy
+            y = x   # treat it as a regular class
         else:
             copier = getattr(x, "__deepcopy__", None)
             if copier is not None:
@@ -150,33 +121,23 @@ def deepcopy(x, memo=None, _nil=[]):
                 if reductor:
                     rv = reductor(x)
                 else:
-                    reductor = getattr(x, "__reduce_ex__", None)
-                    if reductor is not None:
-                        rv = reductor(4)
-                    else:
-                        reductor = getattr(x, "__reduce__", None)
-                        if reductor:
-                            rv = reductor()
-                        else:
-                            raise Error(
-                                "un(deep)copyable object of type %s" % cls)
+                    rv = _call_reduce(x)
                 if isinstance(rv, str):
                     y = x
                 else:
                     y = _reconstruct(x, memo, *rv)
 
-    # If is its own copy, don't memoize.
+    # If it is its own copy, don't memoize.
     if y is not x:
         memo[d] = y
         _keep_alive(x, memo)  # Make sure x lives at least as long as d
     return y
 
 
-_atomic_types = frozenset({
-    types.NoneType, types.EllipsisType, types.NotImplementedType,
-    int, float, bool, complex, bytes, str, types.CodeType, type, range,
-    types.BuiltinFunctionType, types.FunctionType, weakref.ref, property,
-})
+_atomic_types = {types.NoneType, types.EllipsisType, types.NotImplementedType,
+                 int, float, bool, complex, bytes, str, types.CodeType, type,
+                 range, types.BuiltinFunctionType, types.FunctionType,
+                 weakref.ref, property}
 
 _deepcopy_dispatch = d = {}
 
@@ -193,20 +154,16 @@ d[list] = _deepcopy_list
 
 def _deepcopy_tuple(x, memo, deepcopy=deepcopy):
     y = [deepcopy(a, memo) for a in x]
-    # We're not going to put the tuple in the memo, but it's still important
-    # we check for it, in case the tuple contains recursive mutable
-    # structures.
+    # A recursive tuple may already have been copied through one of its
+    # elements; use that copy.
     try:
         return memo[id(x)]
     except KeyError:
         pass
     for k, j in zip(x, y):
         if k is not j:
-            y = tuple(y)
-            break
-    else:
-        y = x
-    return y
+            return tuple(y)
+    return x
 d[tuple] = _deepcopy_tuple
 
 
@@ -220,22 +177,16 @@ d[dict] = _deepcopy_dict
 
 
 try:
-    _frozendict = frozendict
+    def _deepcopy_frozendict(x, memo, deepcopy=deepcopy):
+        y = frozendict({deepcopy(k, memo): deepcopy(v, memo)
+                        for k, v in x.items()})
+        for (k1, v1), (k2, v2) in zip(x.items(), y.items()):
+            if k1 is not k2 or v1 is not v2:
+                return y
+        return x
+    d[frozendict] = _deepcopy_frozendict
 except NameError:
     pass
-else:
-    def _deepcopy_frozendict(x, memo, deepcopy=deepcopy):
-        y = [(deepcopy(key, memo), deepcopy(value, memo))
-             for key, value in x.items()]
-        # Like tuples, frozendicts are not memoized before their items are
-        # copied: a recursive reference must be resolved through the memo.
-        try:
-            return memo[id(x)]
-        except KeyError:
-            pass
-        return type(x)(y)
-    d[_frozendict] = _deepcopy_frozendict
-    del _frozendict
 
 
 def _deepcopy_method(x, memo):  # Copy instance methods
@@ -248,17 +199,13 @@ del d
 def _keep_alive(x, memo):
     """Keeps a reference to the object x in the memo.
 
-    Because we remember objects by their id, we have
-    to assure that possibly temporary objects are kept
-    alive by referencing them.
-    We store a reference at the id of the memo, which should
-    normally not be used unless someone tries to deepcopy
-    the memo itself...
+    The memo maps id() of copied objects to their copies; the originals must
+    stay alive while the memo is in use or their ids could be reused.  They
+    are kept in a list stored in the memo under the memo's own id.
     """
     try:
         memo[id(memo)].append(x)
     except KeyError:
-        # aha, this is the first one :-)
         memo[id(memo)] = [x]
 
 
@@ -291,17 +238,14 @@ def _reconstruct(x, memo, func, args,
     if listiter is not None:
         if deep:
             for item in listiter:
-                item = deepcopy(item, memo)
-                y.append(item)
+                y.append(deepcopy(item, memo))
         else:
             for item in listiter:
                 y.append(item)
     if dictiter is not None:
         if deep:
             for key, value in dictiter:
-                key = deepcopy(key, memo)
-                value = deepcopy(value, memo)
-                y[key] = value
+                y[deepcopy(key, memo)] = deepcopy(value, memo)
         else:
             for key, value in dictiter:
                 y[key] = value
