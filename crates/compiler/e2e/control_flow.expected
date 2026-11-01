@@ -1,0 +1,25 @@
+control_flow.py:19: SyntaxWarning: 'return' in a 'finally' block
+['v', 'k']
+[[6], 0, 5]
+False [1, 2, 0]
+['a', 'b']
+2
+[('inner', 1), ('outer', 1), ('inner', 2), ('outer', 2)]
+[10, 'ok', 'zde', 5, 'ok']
+1
+gen cleanup
+closed
+UnboundLocalError
+e unbound after except
+11
+{'flag': 1}
+tagged
+{'x': 3}
+['base', 'base']
+3
+6 6
+[2, 4] ((1,), {'b': 2})
+True
+1 2 3
+ValueError
+assert msg here
