@@ -936,20 +936,9 @@ fn unicode_error_init(o: &PyObject, args: &PyObject) -> PyResult<()> {
 fn uerr(o: &PyObject) -> &mut UnicodeErrorExc {
     unsafe { &mut *(o.as_ptr() as *mut UnicodeErrorExc) }
 }
+/// The attributes hold the raw values (only the C API getters clamp them).
 fn ue_get_start(o: &PyObject) -> PyResult {
-    let e = uerr(o);
-    let len = if e.object.is_null() { 0 } else { ab::length(unsafe { &*e.object })? as isize };
-    let mut s = e.start;
-    if s < 0 {
-        s = 0;
-    }
-    if s >= len && len > 0 {
-        s = len - 1;
-    }
-    if len == 0 {
-        s = 0;
-    }
-    Ok(int::new_int(s as i64))
+    Ok(int::new_int(uerr(o).start as i64))
 }
 fn ue_set_start(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     match v {
@@ -959,16 +948,7 @@ fn ue_set_start(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     Ok(())
 }
 fn ue_get_end(o: &PyObject) -> PyResult {
-    let e = uerr(o);
-    let len = if e.object.is_null() { 0 } else { ab::length(unsafe { &*e.object })? as isize };
-    let mut s = e.end;
-    if s < 1 {
-        s = 1;
-    }
-    if s > len {
-        s = len;
-    }
-    Ok(int::new_int(s as i64))
+    Ok(int::new_int(uerr(o).end as i64))
 }
 fn ue_set_end(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     match v {

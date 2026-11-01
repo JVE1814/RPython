@@ -435,9 +435,24 @@ pub fn is_2004_addition(c1: u8, c2: u8) -> bool {
     JISX0213_2004_ADDED.contains(&code)
 }
 
+/// 2-93-27 is U+9B1C since JIS X 0213:2004 and U+9B1D in the :2000 edition.
+const X0213_2_93_27: u16 = 0xFDBB;
+
 #[inline]
-pub fn jisx0213_2_get(c1: u8, c2: u8) -> Option<u32> {
+pub fn jisx0213_2_get(c1: u8, c2: u8, y2000: bool) -> Option<u32> {
+    if y2000 && (c1 as u16) << 8 | c2 as u16 == X0213_2_93_27 {
+        return Some(0x9B1D);
+    }
     JISX0213_2.get(c1, c2)
+}
+
+/// Plane-2 code of `c`.
+pub fn jisx0213_2_encode(c: u32, y2000: bool) -> Option<u16> {
+    match c {
+        0x9B1D if y2000 => Some(X0213_2_93_27),
+        0x9B1C if y2000 => None,
+        _ => jisx0213_2_rev().get(c),
+    }
 }
 
 lazy_rev!(jisx0208_rev, {
@@ -492,7 +507,7 @@ pub fn jisx0213_encode(inp: &[u32], pos: usize, flush: bool, y2000: bool, pairs_
         }
         return X0213::None;
     }
-    if let Some(code) = jisx0213_2_rev().get(c) {
+    if let Some(code) = jisx0213_2_encode(c, y2000) {
         return X0213::Found(2, code, 1);
     }
     X0213::None
@@ -761,7 +776,7 @@ impl MbCodec for EucJis2004 {
                 }
                 0x8F => {
                     need(inp, *pos, 3)?;
-                    match jisx0213_2_get(inp[*pos + 1], inp[*pos + 2]) {
+                    match jisx0213_2_get(inp[*pos + 1], inp[*pos + 2], self.y2000) {
                         Some(u) => push_value(out, u),
                         None => return Err(Fail::Illegal(1)),
                     }
@@ -841,7 +856,7 @@ impl MbCodec for ShiftJis2004 {
             need(inp, *pos, 2)?;
             let c2 = inp[*pos + 1];
             let u = if c >= 0xF0 {
-                sjis_plane2_to_euc(c, c2).and_then(|(r, k)| jisx0213_2_get(r, k))
+                sjis_plane2_to_euc(c, c2).and_then(|(r, k)| jisx0213_2_get(r, k, self.y2000))
             } else {
                 sjis_to_euc(c, c2).and_then(|(r, k)| jisx0213_1_get(r, k, self.y2000))
             };

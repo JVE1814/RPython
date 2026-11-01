@@ -1823,6 +1823,8 @@ pub fn detect_encoding(src: &[u8]) -> Result<DetectedEncoding, SyntaxError> {
             if bom && norm != "utf-8" {
                 let mut e = SyntaxError::simple(format!("encoding problem: {} with BOM", enc));
                 e.lineno = idx as i32 + 1;
+                let text = String::from_utf8_lossy(line);
+                e.text = Some(text.trim_end_matches(|c| c == '\n' || c == '\r').to_string());
                 return Err(e);
             }
             return Ok(DetectedEncoding { encoding: norm, bom, lines_consumed: consumed, from_cookie: true });
@@ -1910,7 +1912,7 @@ pub fn decode_source_with(src: &[u8], hook: Option<DecodeHook>, filename: &str) 
     let enc = canonical(&det.encoding);
     let codec_error = |what: &str, off: usize, reason: &str| -> SyntaxError {
         let (lineno, offset, text) = bad_byte_location(data, off);
-        let mut e = SyntaxError::simple(format!("(unicode error) '{}' codec can't decode byte 0x{:02x} in position {}: {}", what, data[off], off, reason));
+        let mut e = SyntaxError::simple(format!("'{}' codec can't decode byte 0x{:02x} in position {}: {}", what, data[off], off, reason));
         e.lineno = lineno;
         e.offset = offset;
         e.end_lineno = Some(lineno);
@@ -1926,7 +1928,7 @@ pub fn decode_source_with(src: &[u8], hook: Option<DecodeHook>, filename: &str) 
                 let (lineno, offset, text) = bad_byte_location(data, off);
                 let mut err = if det.from_cookie || det.bom {
                     let reason = if e.error_len().is_none() { "unexpected end of data" } else if data[off] >= 0xC2 && data[off] <= 0xF4 { "invalid continuation byte" } else { "invalid start byte" };
-                    SyntaxError::simple(format!("(unicode error) 'utf-8' codec can't decode byte 0x{:02x} in position {}: {}", data[off], off, reason))
+                    SyntaxError::simple(format!("'utf-8' codec can't decode byte 0x{:02x} in position {}: {}", data[off], off, reason))
                 } else {
                     SyntaxError::simple(format!(
                         "Non-UTF-8 code starting with '\\x{:02x}' in file {} on line {}, but no encoding declared; see https://peps.python.org/pep-0263/ for details",
@@ -1985,7 +1987,7 @@ pub fn decode_source_with(src: &[u8], hook: Option<DecodeHook>, filename: &str) 
         }
         _ => match hook.and_then(|h| h(&det.encoding, data)) {
             Some(Ok(s)) => Ok(s),
-            Some(Err(m)) => Err(SyntaxError::simple(format!("(unicode error) {}", m))),
+            Some(Err(m)) => Err(SyntaxError::simple(m)),
             None => {
                 let mut e = SyntaxError::simple(format!("unknown encoding: {}", det.encoding));
                 e.lineno = if det.lines_consumed > 0 { det.lines_consumed as i32 } else { 1 };

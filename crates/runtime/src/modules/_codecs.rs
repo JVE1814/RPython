@@ -310,6 +310,7 @@ fn h_encode(kind: Eh, encoding: &str, d: StrData, start: usize, end: usize) -> R
             Ok((Rep::Str(v), end))
         }
         Eh::NameReplace => {
+            tu::ensure_unicodedata();
             let mut v = Vec::new();
             for i in start..end {
                 let c = d.get(i);
@@ -459,10 +460,15 @@ fn wrong_exc(e: &PyObject) -> PyErr {
     err!(TypeError, "don't know how to handle {} in error callback", tu::trunc_chars(&tname(e), 200))
 }
 
-fn exc_range(e: &PyObject) -> PyResult<(usize, usize)> {
+/// `exc.start` / `exc.end` clamped to the object like the C API getters do:
+/// start into [0, len-1], end into [min(1, len), len].
+fn exc_range(e: &PyObject, len: usize) -> PyResult<(usize, usize)> {
+    let len = len as isize;
     let s = ab::index_as_ssize(&*ab::getattr_str(e, "start")?, None)?;
     let en = ab::index_as_ssize(&*ab::getattr_str(e, "end")?, None)?;
-    Ok((s.max(0) as usize, en.max(0) as usize))
+    let s = if s < 0 { 0 } else if s >= len { (len - 1).max(0) } else { s };
+    let en = en.max(1.min(len)).min(len);
+    Ok((s as usize, en as usize))
 }
 
 fn exc_str_object(e: &PyObject) -> PyResult {
@@ -516,7 +522,7 @@ fn run_builtin_handler(kind: Eh, e: &PyObject) -> PyResult {
                 return Err(reraise(e));
             }
             let obj = exc_str_object(e)?;
-            let (s, en) = exc_range(e)?;
+            let (s, en) = exc_range(e, pystr::str_len(&obj))?;
             let enc = if kind == Eh::SurrogatePass { exc_encoding(e)? } else { String::new() };
             match h_encode(kind, &enc, pystr::str_data(&obj), s, en) {
                 Ok((r, p)) => Ok(result_pair(rep_obj(r), p)),
@@ -526,7 +532,7 @@ fn run_builtin_handler(kind: Eh, e: &PyObject) -> PyResult {
         }
         ErrKind::Decode => {
             let obj = exc_bytes_object(e)?;
-            let (s, en) = exc_range(e)?;
+            let (s, en) = exc_range(e, bytes::bytes_data(&obj).len())?;
             let enc = if kind == Eh::SurrogatePass { exc_encoding(e)? } else { String::new() };
             match h_decode(kind, &enc, bytes::bytes_data(&obj), s, en) {
                 Ok((v, p)) => Ok(result_pair(pystr::from_codepoints(&v), p)),
@@ -536,7 +542,7 @@ fn run_builtin_handler(kind: Eh, e: &PyObject) -> PyResult {
         }
         ErrKind::Translate => {
             let obj = exc_str_object(e)?;
-            let (s, en) = exc_range(e)?;
+            let (s, en) = exc_range(e, pystr::str_len(&obj))?;
             match h_translate(kind, pystr::str_data(&obj), s, en) {
                 Ok((v, p)) => Ok(result_pair(pystr::from_codepoints(&v), p)),
                 Err(HFail::Raise) => Err(reraise(e)),
@@ -935,6 +941,12 @@ pub fn decode_text(data: &[u8], obj: Option<&PyObject>, encoding: &str, errors: 
     decode_with(data, obj, &info, encoding, errors)
 }
 
+/// Decoding of source code declared with a PEP 263 cookie (text encodings only).
+pub fn decode_text_for_source(data: &[u8], encoding: &str) -> PyResult {
+    let info = lookup_text_codec(encoding, "codecs.open()")?;
+    decode_with(data, None, &info, encoding, "strict")
+}
+
 /// `bytes.decode` with an encoding name that contains lone surrogates.
 pub fn decode_text_obj(data: &[u8], obj: Option<&PyObject>, name: &PyObject, errors: &str) -> PyResult {
     let encoding = pystr::to_string_lossy(name);
@@ -1248,7 +1260,9 @@ fn final_decode(
     let final_ = bool_arg(fi, false)?;
     let mut ctx = DecCtx::new(encname, data.as_slice(), &errors);
     let (s, n) = f(&mut ctx, final_)?;
-    Ok(pair(s, n))
+    // A final decode reports the whole (original) input as consumed, even if
+    // an error handler replaced the input.
+    Ok(pair(s, if final_ { data.as_slice().len() } else { n }))
 }
 
 fn m_utf_8_decode(_m: &PyObject, a: &[&PyObject]) -> PyResult {
@@ -1328,7 +1342,7 @@ fn escape_decode_common(fname: &str, args: &[&PyObject], raw: bool) -> PyResult 
     let mut ctx = DecCtx::new(if raw { "rawunicodeescape" } else { "unicodeescape" }, data.as_slice(), &errors);
     let (s, n, first) = ci::decode_unicode_escape(&mut ctx, final_, raw)?;
     ci::invalid_escape_warning(first)?;
-    Ok(pair(s, n))
+    Ok(pair(s, if final_ { data.as_slice().len() } else { n }))
 }
 fn m_unicode_escape_decode(_m: &PyObject, a: &[&PyObject]) -> PyResult {
     escape_decode_common("unicode_escape_decode", a, false)

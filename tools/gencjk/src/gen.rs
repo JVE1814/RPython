@@ -97,7 +97,15 @@ impl Sets {
             jisx0212: crate::to_map(&euc_jp, 3, |c| c >> 16 == 0x8F).into_iter().map(|(k, v)| (k & 0xFFFF, v)).collect(),
             cp932: two(&cp932, |_| true),
             jisx0213_1: x0213_1,
-            jisx0213_2: crate::to_map(&x0213, 3, |c| c >> 16 == 0x8F).into_iter().map(|(k, v)| (k & 0xFFFF, v)).collect(),
+            jisx0213_2: {
+                // The x0213.org :2000 table leaves 2-93-27 out (its mapping changed
+                // in :2004); take the :2004 value from glibc.
+                let mut p2: Map = crate::to_map(&x0213, 3, |c| c >> 16 == 0x8F).into_iter().map(|(k, v)| (k & 0xFFFF, v)).collect();
+                for (k, v) in crate::to_map(&g0213, 3, |c| c >> 16 == 0x8F) {
+                    p2.entry(k & 0xFFFF).or_insert(v);
+                }
+                p2
+            },
             jisx0213_2004_add: add,
             ksx1001: two(&euc_kr, |_| true),
             cp949: two(&cp949, |_| true),

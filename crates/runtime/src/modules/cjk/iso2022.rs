@@ -5,7 +5,7 @@
 //! designated to G0..G3 (the final byte of the designation, | 0x80 for
 //! two-byte sets), byte 4 holds flags (`SHIFTED`: G1 is invoked by SO).
 
-use super::dbcs::{self, is_2004_addition, jisx0213_1_rev, jisx0213_2_rev};
+use super::dbcs::{self, is_2004_addition, jisx0213_1_rev};
 use super::table::push_value;
 use super::{CodecDef, Fail, MbCodec, St, R};
 
@@ -30,7 +30,7 @@ enum Cs {
     Gb2312,
     /// JIS X 0213 plane 1: (2000 edition?, combining pairs only?)
     X0213P1(bool, bool),
-    X0213P2,
+    X0213P2(bool),
     /// Single-shifted G2 sets: decoded specially, never used for encoding.
     Iso8859,
 }
@@ -59,7 +59,8 @@ const X0213_2000_PAIRS: Dsg = dbcs(b'O', Cs::X0213P1(true, true));
 const X0213_2000_1: Dsg = dbcs(b'O', Cs::X0213P1(true, false));
 const X0213_2004_PAIRS: Dsg = dbcs(b'Q', Cs::X0213P1(false, true));
 const X0213_2004_1: Dsg = dbcs(b'Q', Cs::X0213P1(false, false));
-const X0213_2: Dsg = dbcs(b'P', Cs::X0213P2);
+const X0213_2000_2: Dsg = dbcs(b'P', Cs::X0213P2(true));
+const X0213_2004_2: Dsg = dbcs(b'P', Cs::X0213P2(false));
 const ISO8859_1: Dsg = Dsg { mark: b'A', plane: 2, width: 1, cs: Cs::Iso8859 };
 const ISO8859_7: Dsg = Dsg { mark: b'F', plane: 2, width: 1, cs: Cs::Iso8859 };
 
@@ -101,7 +102,7 @@ fn decode_char(cs: Cs, b: &[u8]) -> Option<u32> {
         Cs::Ksx1001 => two().and_then(|(x, y)| dbcs::ksx1001_decode(x, y)),
         Cs::Gb2312 => two().and_then(|(x, y)| dbcs::gb2312_decode(x, y)),
         Cs::X0213P1(y2000, _) => two().and_then(|(x, y)| dbcs::jisx0213_1_decode(x, y, y2000)),
-        Cs::X0213P2 => two().and_then(|(x, y)| dbcs::jisx0213_2_get(x, y)),
+        Cs::X0213P2(y2000) => two().and_then(|(x, y)| dbcs::jisx0213_2_get(x, y, y2000)),
         Cs::Iso8859 => None,
     }
 }
@@ -151,7 +152,7 @@ fn encode_char(cs: Cs, inp: &[u32], pos: usize, flush: bool) -> Enc {
                 _ => Enc::None,
             }
         }
-        Cs::X0213P2 => one(jisx0213_2_rev().get(c)),
+        Cs::X0213P2(y2000) => one(dbcs::jisx0213_2_encode(c, y2000)),
         Cs::Iso8859 => Enc::None,
     }
 }
@@ -438,8 +439,8 @@ pub static CODECS: &[CodecDef] = &[
     },
     CodecDef {
         name: "iso2022_jp_2004",
-        imp: &Iso2022 { flags: JP_FLAGS, dsgs: &[X0213_2004_PAIRS, JISX0208, X0213_2004_1, X0213_2, X0213_2000_1] },
+        imp: &Iso2022 { flags: JP_FLAGS, dsgs: &[X0213_2004_PAIRS, JISX0208, X0213_2004_1, X0213_2004_2, X0213_2000_1] },
     },
-    CodecDef { name: "iso2022_jp_3", imp: &Iso2022 { flags: JP_FLAGS, dsgs: &[X0213_2000_PAIRS, JISX0208, X0213_2000_1, X0213_2] } },
+    CodecDef { name: "iso2022_jp_3", imp: &Iso2022 { flags: JP_FLAGS, dsgs: &[X0213_2000_PAIRS, JISX0208, X0213_2000_1, X0213_2000_2] } },
     CodecDef { name: "iso2022_jp_ext", imp: &Iso2022 { flags: JP_FLAGS, dsgs: &[JISX0208, JISX0212, JISX0201_R, JISX0201_K, JISX0208_1978] } },
 ];

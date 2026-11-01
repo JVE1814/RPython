@@ -94,6 +94,17 @@ pub fn encode_utf8(ctx: &mut EncCtx) -> PyResult<Vec<u8>> {
         while j < n && is_surrogate(d.get(j)) {
             j += 1;
         }
+        if ctx.eh == crate::modules::_codecs::Eh::SurrogateEscape {
+            // Escaped bytes are written directly; the handler only sees the
+            // rest of the run, starting at the first non-escape surrogate.
+            while i < j && (0xDC80..=0xDCFF).contains(&d.get(i)) {
+                out.push((d.get(i) - 0xDC00) as u8);
+                i += 1;
+            }
+            if i == j {
+                continue;
+            }
+        }
         let (rep, np) = ctx.handle(i, j, "surrogates not allowed")?;
         put_rep(ctx, rep, &mut out, i, j, "surrogates not allowed", 1, |c, o| {
             if c < 0x80 {
@@ -444,6 +455,11 @@ fn utf8_scan(data: &[u8], mut i: usize, final_: bool, out: &mut StrBuf) -> Step 
             }
             let b1 = data[i + 1];
             if !(lo..=hi).contains(&b1) {
+                // A truncated surrogate (ED A0..BF) at the end of incremental
+                // input waits for its last byte (surrogatepass may accept it).
+                if !final_ && c == 0xED && i + 2 == n && (0xA0..=0xBF).contains(&b1) {
+                    return Step::Done(i);
+                }
                 return Step::Error(i, i + 1, "invalid continuation byte");
             }
             if i + 2 >= n {
@@ -923,6 +939,7 @@ pub fn decode_unicode_escape(ctx: &mut DecCtx, final_: bool, raw: bool) -> PyRes
                             if i > ns {
                                 let name = &d[ns..i];
                                 i += 1;
+                                tu::ensure_unicodedata();
                                 let found = std::str::from_utf8(name).ok().and_then(rpy_unicode::lookup_name);
                                 if let Some(ch) = found {
                                     out.push(ch);

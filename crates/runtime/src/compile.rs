@@ -85,7 +85,17 @@ fn nfkc(s: &str) -> String {
     let out = rpy_unicode::normalize(rpy_unicode::Form::NFKC, &cps);
     out.into_iter().filter_map(char::from_u32).collect()
 }
+thread_local! {
+    /// Set when a `\N{...}` escape could not be resolved because the
+    /// `unicodedata` module cannot be imported.
+    static NO_UNICODEDATA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn lookup_name(s: &str) -> Option<u32> {
+    if !crate::modules::text_util::ensure_unicodedata() {
+        NO_UNICODEDATA.with(|c| c.set(true));
+        return None;
+    }
     rpy_unicode::lookup_name(s)
 }
 fn xid_start(c: char) -> bool {
@@ -276,18 +286,20 @@ impl<'a> Opts<'a> {
     }
 }
 
+/// Source decoding through the codec registry: `None` for an unknown
+/// encoding, an error message for a non-text codec or a decoding error.
 fn decode_hook(enc: &str, data: &[u8]) -> Option<Result<String, String>> {
-    let b = crate::types::bytes::new_bytes(data);
-    match crate::modules::codecs_registry::decode(&b, enc, "strict") {
-        Ok(s) => Some(Ok(pystr::to_string_lossy(&s))),
-        Err(_) => {
-            if exc_matches(crate::types::exceptions::LookupError()) {
-                clear_exc();
-                return None;
-            }
-            let msg = take_exc().map(|e| crate::abstract_::str_string(&e).unwrap_or_default()).unwrap_or_default();
-            Some(Err(msg))
+    let msg = |e: Option<PyRef>| e.map(|e| crate::abstract_::str_string(&e).unwrap_or_default()).unwrap_or_default();
+    if crate::modules::_codecs::lookup(enc).is_err() {
+        if exc_matches(crate::types::exceptions::LookupError()) {
+            clear_exc();
+            return None;
         }
+        return Some(Err(msg(take_exc())));
+    }
+    match crate::modules::_codecs::decode_text_for_source(data, enc) {
+        Ok(s) => Some(Ok(pystr::to_string_lossy(&s))),
+        Err(_) => Some(Err(msg(take_exc()))),
     }
 }
 
@@ -317,8 +329,16 @@ pub fn parse_mod(src: Source, o: &Opts) -> PyResult<(rpy_parser::ast::Mod, Strin
     };
     let popts = full_parse_options(o);
     PY_NFKC.with(|c| c.set(true));
-    let out = rpy_parser::parse(&text, &popts);
+    NO_UNICODEDATA.with(|c| c.set(false));
+    let mut out = rpy_parser::parse(&text, &popts);
     PY_NFKC.with(|c| c.set(false));
+    if NO_UNICODEDATA.with(|c| c.replace(false)) {
+        if let Err(e) = &mut out.result {
+            if e.msg.contains("unknown Unicode character name") {
+                e.msg = "(unicode error) \\N escapes not supported (can't load unicodedata module)".to_string();
+            }
+        }
+    }
     if let Some(e) = NFKC_ERROR.with(|c| c.borrow_mut().take()) {
         set_exc(e);
         return Err(PyErr);
