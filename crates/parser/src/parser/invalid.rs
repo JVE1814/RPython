@@ -101,6 +101,13 @@ impl<'a> Parser<'a> {
                         return Err(self.err_range("expected 'else' after 'if' expression", a.loc, b.loc));
                     }
                     if self.eat_kw(Kw::Else).is_some() {
+                        let st = self.peek();
+                        if st.ty == T::STAR {
+                            return Err(self.err_tok("cannot unpack only part of a conditional expression", &st));
+                        }
+                        if st.ty == T::DOUBLESTAR {
+                            return Err(self.err_tok("cannot use dict unpacking on only part of a conditional expression", &st));
+                        }
                         let m = self.p;
                         let ok = self.expression_without_invalid()?.is_some();
                         self.p = m;

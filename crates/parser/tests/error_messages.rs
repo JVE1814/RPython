@@ -165,7 +165,7 @@ fn check(e: &Expect, st: &mut Stats) {
                 return;
             }
             let mut problems = Vec::new();
-            if let Some(m) = &e.exact_msg {
+            if let Some(m) = e.exact_msg.as_ref().filter(|m| m.as_str() != "..." && !shown.contains("IGNORE_EXCEPTION_DETAIL")) {
                 let alt_ok = m.starts_with("invalid syntax. Did you mean '") && err.msg.starts_with("invalid syntax");
                 if &err.msg != m && !alt_ok {
                     problems.push(format!("msg {:?} != {:?}", err.msg, m));
@@ -421,6 +421,78 @@ fn error_messages() {
                     cases.push(x);
                 }
             }
+        });
+    }
+
+    // ---- doctests in other modules (only SyntaxError expectations and parse-OK examples)
+    for file in ["test_unpack_ex.py", "test_genexps.py", "test_setcomps.py", "test_listcomps.py", "test_extcall.py", "test_generators.py", "test_unpack.py"] {
+        let (_, m) = parse_file(file);
+        let mut docs = Vec::new();
+        if let Mod::Module { body, .. } = &m {
+            for s in body {
+                let v = match &s.node {
+                    StmtKind::Assign { value, .. } => value,
+                    StmtKind::Expr { value } => value,
+                    _ => continue,
+                };
+                if let Some(d) = const_str(v) {
+                    if d.contains(">>>") {
+                        docs.push(d);
+                    }
+                }
+            }
+        }
+        for d in docs {
+            for (src, exc) in doctests(&d) {
+                let mut e = Expect { origin: format!("{}-doctest", file), src: src.into_bytes(), mode: Some(Mode::Single), ..Default::default() };
+                match exc {
+                    None => e.ok = true,
+                    Some((cls, msg)) => {
+                        let Some(k) = err_kind(&cls) else { continue };
+                        e.kind = Some(k);
+                        e.exact_msg = Some(msg);
+                    }
+                }
+                cases.push(e);
+            }
+        }
+    }
+
+    // ---- generic: assertRaises(SyntaxError, eval|exec|compile, "src"[, ..., mode])
+    let all_files = ["test_grammar.py", "test_string_literals.py", "test_fstring.py", "test_tstring.py", "test_compile.py", "test_ast/test_ast.py", "test_patma.py", "test_type_params.py", "test_positional_only_arg.py", "test_named_expressions.py", "test_syntax.py", "test_exceptions.py", "test_builtin.py", "test_keywordonlyarg.py", "test_decorators.py", "test_with.py", "test_coroutines.py", "test_exception_variations.py", "test_except_star.py", "test_type_aliases.py", "test_lazy_import/__init__.py"];
+    for file in all_files {
+        let (_, m) = parse_file(file);
+        walk_mod(&m, &mut |e, _| {
+            let a = call_args(e);
+            let name = call_name(e);
+            let (re, rest) = match name {
+                Some("assertRaises") if a.len() >= 3 => (None, &a[1..]),
+                Some("assertRaisesRegex") if a.len() >= 4 => (const_str(&a[1]), &a[2..]),
+                _ => return,
+            };
+            if !matches!(&a[0].node, ExprKind::Name { id, .. } if id == "SyntaxError" || id == "IndentationError" || id == "TabError") {
+                return;
+            }
+            let fname = match &rest[0].node {
+                ExprKind::Name { id, .. } => id.as_str(),
+                _ => return,
+            };
+            let Some(src) = rest.get(1).and_then(const_bytes) else { return };
+            let mode = match fname {
+                "eval" => Mode::Eval,
+                "exec" => Mode::Exec,
+                "compile" => match rest.get(3).and_then(const_str).as_deref() {
+                    Some("eval") => Mode::Eval,
+                    Some("single") => Mode::Single,
+                    Some("exec") => Mode::Exec,
+                    _ => return,
+                },
+                _ => return,
+            };
+            if fname == "compile" && rest.len() > 4 {
+                return; // flags argument: not modelled
+            }
+            cases.push(Expect { origin: format!("{}-assertRaises", file), src, mode: Some(mode), regex: re, ..Default::default() });
         });
     }
 

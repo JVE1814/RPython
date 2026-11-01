@@ -133,7 +133,12 @@ impl<'a> Parser<'a> {
         if self.at(T::STAR) {
             self.advance();
             match self.bitwise_or()? {
-                Some(v) => return Ok(Some(Expr::new(ExprKind::Starred { value: bx(v), ctx: ExprContext::Load }, self.loc(start)))),
+                Some(v) => {
+                    if self.invalid && self.at_kw(Kw::If) {
+                        self.invalid_starred_conditional(start)?;
+                    }
+                    return Ok(Some(Expr::new(ExprKind::Starred { value: bx(v), ctx: ExprContext::Load }, self.loc(start))));
+                }
                 None => {
                     self.p = start;
                     return Ok(None);
@@ -141,6 +146,52 @@ impl<'a> Parser<'a> {
             }
         }
         self.named_expression()
+    }
+
+    /// `'*' expression` where the expression is a conditional: "invalid starred expression..."
+    /// (also for '**'). `start` is the index of the star token.
+    pub(crate) fn invalid_starred_conditional(&mut self, start: usize) -> Result<(), PErr> {
+        let m = self.p;
+        self.p = start;
+        let st = self.advance();
+        let save = self.invalid;
+        self.invalid = false;
+        let e = self.expression()?;
+        self.invalid = save;
+        if let Some(e) = e {
+            if matches!(e.node, ExprKind::IfExp { .. }) {
+                let msg = if st.ty == T::STAR {
+                    "invalid starred expression. Did you forget to wrap the conditional expression in parentheses?"
+                } else {
+                    "invalid double starred expression. Did you forget to wrap the conditional expression in parentheses?"
+                };
+                return Err(self.err_range(msg, Self::tok_loc(&st), e.loc));
+            }
+        }
+        self.p = m;
+        Ok(())
+    }
+
+    /// In the second pass: `**` at a position where only a dict display allows it.
+    /// `what` describes the context ("list comprehension", "generator expression", ...).
+    fn invalid_double_star_elt(&mut self, ctx: &str) -> Result<(), PErr> {
+        let start = self.p;
+        if !self.at(T::DOUBLESTAR) {
+            return Ok(());
+        }
+        let st = self.advance();
+        let save = self.invalid;
+        self.invalid = false;
+        let v = self.bitwise_or()?;
+        self.invalid = save;
+        if let Some(v) = v {
+            if self.at_comprehension_start() {
+                return Err(self.err_range(format!("cannot use dict unpacking in {}", ctx), Self::tok_loc(&st), v.loc));
+            }
+            return Err(self.err_tok("cannot use dict unpacking here", &st));
+        }
+        self.p = start;
+        Ok(())
     }
 
     /// assignment_expression: NAME ':=' ~ expression
@@ -847,6 +898,8 @@ impl<'a> Parser<'a> {
         let first = if self.at(T::STAR) { self.star_named_expression()? } else { self.group_element()? };
         let Some(first) = first else {
             if self.invalid {
+                self.p = first_start;
+                self.invalid_double_star_elt("generator expression")?;
                 self.p = start;
                 self.invalid_group()?;
             }
@@ -934,6 +987,10 @@ impl<'a> Parser<'a> {
             return Ok(Some(Expr::new(ExprKind::List { elts: Vec::new(), ctx: ExprContext::Load }, self.loc(start))));
         }
         let Some(first) = self.star_named_expression()? else {
+            if self.invalid {
+                self.p = start + 1;
+                self.invalid_double_star_elt("list comprehension")?;
+            }
             self.p = start;
             return Ok(None);
         };
@@ -984,11 +1041,19 @@ impl<'a> Parser<'a> {
         if self.at(T::DOUBLESTAR) {
             // dict with **, or PEP 798 dict comprehension {**d for ...}
             let m = self.p;
-            self.advance();
+            let st = self.advance();
             let Some(v) = self.bitwise_or()? else {
                 self.p = start;
                 return Ok(None);
             };
+            if self.invalid {
+                if self.at_kw(Kw::If) {
+                    self.invalid_starred_conditional(m)?;
+                }
+                if self.at(T::COLON) {
+                    return Err(self.err_range("cannot use dict unpacking in a dictionary key", Self::tok_loc(&st), v.loc));
+                }
+            }
             if self.at_comprehension_start() {
                 let Some(generators) = self.for_if_clauses()? else {
                     self.p = start;
@@ -997,10 +1062,12 @@ impl<'a> Parser<'a> {
                 if self.eat(T::RBRACE).is_some() {
                     return Ok(Some(Expr::new(ExprKind::DictComp { key: bx(v), value: None, generators }, self.loc(start))));
                 }
+                if self.invalid && self.at(T::COLON) {
+                    return Err(self.err_tok("cannot use dict unpacking here", &st));
+                }
                 self.p = start;
                 return Ok(None);
             }
-            let _ = m;
             return self.dict_rest(start, None, v);
         }
         if self.at(T::STAR) {
@@ -1008,6 +1075,9 @@ impl<'a> Parser<'a> {
                 self.p = start;
                 return Ok(None);
             };
+            if self.invalid && self.at(T::COLON) {
+                return Err(self.err_loc("cannot use a starred expression in a dictionary key", first.loc));
+            }
             return self.set_rest(start, first);
         }
         let t = self.peek();
@@ -1026,6 +1096,16 @@ impl<'a> Parser<'a> {
             self.advance();
             let Some(v) = self.expression()? else {
                 if self.invalid {
+                    if self.at(T::DOUBLESTAR) {
+                        let st = self.advance();
+                        let save = self.invalid;
+                        self.invalid = false;
+                        let e = self.bitwise_or()?;
+                        self.invalid = save;
+                        if let Some(e) = e {
+                            return Err(self.err_range("cannot use dict unpacking in a dictionary value", Self::tok_loc(&st), e.loc));
+                        }
+                    }
                     self.p = start;
                     self.invalid_double_starred_kvpairs()?;
                 }
@@ -1256,9 +1336,21 @@ impl<'a> Parser<'a> {
                     }
                     return Ok(None);
                 }
+                if first && allow_genexp && self.at_comprehension_start() {
+                    // PEP 798: f(*x for x in y)
+                    let Some(generators) = self.for_if_clauses()? else { return Ok(None) };
+                    if self.at(T::RPAR) {
+                        let rp = self.peek();
+                        let l = self.start_pos(lpar);
+                        let loc = Loc { lineno: l.0, col_offset: l.1, end_lineno: rp.end_lineno as i32, end_col_offset: rp.end_col };
+                        args.push(Expr::new(ExprKind::GeneratorExp { elt: bx(e), generators }, loc));
+                        return Ok(Some((args, keywords)));
+                    }
+                    return Ok(None);
+                }
                 args.push(e);
             } else if t.ty == T::DOUBLESTAR {
-                self.advance();
+                let st = self.advance();
                 let Some(v) = self.expression()? else {
                     self.p = istart;
                     if self.invalid {
@@ -1269,6 +1361,12 @@ impl<'a> Parser<'a> {
                 };
                 if self.invalid && self.at(T::EQUAL) {
                     return Err(self.err_range("cannot assign to keyword argument unpacking", self.loc(istart), self.loc(istart)));
+                }
+                if self.at_comprehension_start() {
+                    if self.invalid {
+                        return Err(self.err_range("cannot use dict unpacking in generator expression", Self::tok_loc(&st), v.loc));
+                    }
+                    return Ok(None);
                 }
                 keywords.push(Keyword { arg: None, value: v, loc: self.loc(istart) });
             } else if t.ty == T::NAME && !t.kw.is_hard() && self.peek_n(1).ty == T::EQUAL {
