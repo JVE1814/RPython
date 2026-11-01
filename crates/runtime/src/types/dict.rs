@@ -289,6 +289,7 @@ pub fn set_item_hash(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) -
         unsafe { incref(value.as_ptr()) };
         t.entries[ix].value = value.as_ptr();
         t.version = crate::interp::cache::next_dict_version(); // jit: caches key on any mutation
+        crate::interp::cache::on_dict_write(d);
         unsafe { decref(old) };
         return Ok(());
     }
@@ -305,6 +306,7 @@ pub fn set_item_hash(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) -
     t.entries.push(Entry { hash: h, key: key.as_ptr(), value: value.as_ptr() });
     t.used += 1;
     t.version = crate::interp::cache::next_dict_version();
+    crate::interp::cache::on_dict_write(d);
     set_used(d, t.used);
     Ok(())
 }
@@ -352,6 +354,7 @@ pub fn remove_at(d: &PyObject, ix: usize, h: isize) -> (*mut PyObject, *mut PyOb
     t.entries[ix].value = std::ptr::null_mut();
     t.used -= 1;
     t.version = crate::interp::cache::next_dict_version();
+    crate::interp::cache::on_dict_write(d);
     set_used(d, t.used);
     // Trim trailing holes so popitem/ordering stays cheap.
     while let Some(last) = t.entries.last() {
@@ -369,6 +372,7 @@ pub fn clear(d: &PyObject) {
     let t = table(d);
     let old = std::mem::replace(t, DictTable::new(0));
     t.version = crate::interp::cache::next_dict_version();
+    crate::interp::cache::on_dict_write(d);
     set_used(d, 0);
     for e in old.entries.iter() {
         if !e.key.is_null() {

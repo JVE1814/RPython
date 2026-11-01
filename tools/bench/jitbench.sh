@@ -13,6 +13,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 PY="$1"; OUT="$2"; shift 2
+case "$PY" in /*) ;; */*) PY="$PWD/$PY";; esac
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BENCHDIR="${PYPERF_BENCHMARKS:-/opt/bench/dl/pyperformance-1.14.0/pyperformance/data-files/benchmarks}"
 if [ $# -eq 0 ]; then set -- $(cd "$BENCHDIR" && ls -d bm_* | sed 's/^bm_//'); fi

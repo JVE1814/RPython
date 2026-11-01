@@ -94,6 +94,7 @@ pub unsafe extern "C" fn h_dict_replace(d: *mut PyObject, ix: u64, name: *mut Py
             Some(e) if e.key == name => {
                 let old = std::mem::replace(&mut e.value, v);
                 t.version = crate::interp::cache::next_dict_version();
+                crate::interp::cache::on_dict_write(&*d);
                 decref(old);
                 0
             }
