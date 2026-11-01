@@ -64,5 +64,8 @@ Finished also: decimal (662/663 test_decimal), devtools.
 Running (wave 6): pkgtools (importlib.resources/metadata, venv, ensurepip+pip, zipapp, pydoc, tracemalloc), intl
 (CJK codecs, _multibytecodec, codec-name rules), markup2 (_elementtree, pyexpat perf, imaplib, xmlrpc, rule-9 review).
 Finished also: data, markup (XML engine from scratch, email 1803/1814), cleanroom-ut, cleanroom-sys, cleanroom-lang.
+Running (wave 7): jit2 (tier-2 optimizing JIT, deopt, tier-1 gaps), perf-runtime (inline attribute shapes,
+call path, memory, safe reclamation D6, multi-core scaling, startup).
+Finished also: jit (tier-0 caches, tier-1 baseline JIT, generational GC, startup 135M->45M).
 Unassigned: _testclinic re-implemented by us (spec lacks
 internal headers / generated clinic files); no-GIL thread-safety audit; startup time (jit owns perf).
