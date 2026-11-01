@@ -106,9 +106,7 @@ impl RawLock {
                 wait = Some(wait.map_or(cap, |w| w.min(cap)));
                 MAIN_WAIT_ADDR.store(&self.state as *const AtomicU32 as *mut AtomicU32, Release);
             }
-            let prev = ts.mode.replace(crate::threads::ThreadMode::Blocked);
-            futex_wait(&self.state, 2, wait);
-            ts.mode.set(prev);
+            crate::threads::blocking(|| futex_wait(&self.state, 2, wait));
             if main {
                 MAIN_WAIT_ADDR.store(std::ptr::null_mut(), Release);
             }
@@ -145,9 +143,7 @@ fn wait_interruptible<T>(m: &Mutex<T>, cv: &Condvar, mut done: impl FnMut(&T) ->
             }
             wait = wait.min(Duration::from_millis(20));
         }
-        let prev = ts.mode.replace(crate::threads::ThreadMode::Blocked);
-        g = cv.wait_timeout(g, wait).unwrap().0;
-        ts.mode.set(prev);
+        g = crate::threads::blocking(|| cv.wait_timeout(g, wait).unwrap().0);
     }
 }
 
@@ -230,7 +226,7 @@ unsafe extern "C" fn lock_new(tp: *mut PyTypeObject, args: *mut PyObject, kw: *m
 
 unsafe extern "C" fn lock_dealloc(op: *mut PyObject) {
     unsafe {
-        crate::types::weakref::clear_weakrefs_if_any(op);
+        crate::types::weakref::clear_weakrefs(op);
         crate::alloc::free_object(op);
     }
 }
@@ -307,7 +303,7 @@ unsafe extern "C" fn rlock_new(tp: *mut PyTypeObject, _args: *mut PyObject, _kw:
 }
 unsafe extern "C" fn rlock_dealloc(op: *mut PyObject) {
     unsafe {
-        crate::types::weakref::clear_weakrefs_if_any(op);
+        crate::types::weakref::clear_weakrefs(op);
         let tp = (*op).type_ptr();
         crate::types::typeobject::generic_free_and_type_decref(op, tp);
     }
@@ -503,7 +499,7 @@ unsafe extern "C" fn handle_new(_tp: *mut PyTypeObject, args: *mut PyObject, kw:
 }
 unsafe extern "C" fn handle_dealloc(op: *mut PyObject) {
     unsafe {
-        crate::types::weakref::clear_weakrefs_if_any(op);
+        crate::types::weakref::clear_weakrefs(op);
         drop(Arc::from_raw((*(op as *mut HandleObject)).inner));
         crate::alloc::free_object(op);
     }
@@ -537,11 +533,11 @@ fn handle_join(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRes
     if h.ident.load(Relaxed) == my_ident() {
         raise!(RuntimeError, "Cannot join current thread");
     }
-    let gen = h.generation.load(Relaxed);
+    let fgen = h.generation.load(Relaxed);
     wait_interruptible(
         &h.state,
         &h.cv,
-        |s| *s == HState::Done || (gen != FORK_GENERATION.load(Relaxed)),
+        |s| *s == HState::Done || (fgen != FORK_GENERATION.load(Relaxed)),
         timeout,
     )?;
     Ok(none::none_ref())
@@ -560,6 +556,7 @@ fn handle_set_done(o: &PyObject) -> PyResult {
 
 // ===================================================================== starting threads
 
+#[derive(Clone, Copy)]
 struct SendPtr(*mut PyObject);
 unsafe impl Send for SendPtr {}
 
@@ -640,10 +637,12 @@ fn spawn_thread(func: PyRef, args: PyRef, kwargs: Option<PyRef>, handle: Arc<Han
         Ok(jh) => {
             drop(jh); // detach
             let (m, cv) = &*started;
-            let mut g = m.lock().unwrap();
-            while !*g {
-                g = cv.wait(g).unwrap();
-            }
+            crate::threads::blocking(|| {
+                let mut g = m.lock().unwrap();
+                while !*g {
+                    g = cv.wait(g).unwrap();
+                }
+            });
             Ok(handle.ident.load(Acquire))
         }
         Err(_) => {
@@ -737,8 +736,8 @@ fn thread_shutdown(_m: &PyObject) -> PyResult {
         };
         match next {
             Some(h) => {
-                let gen = h.generation.load(Relaxed);
-                wait_interruptible(&h.state, &h.cv, |s| *s == HState::Done || gen != FORK_GENERATION.load(Relaxed), None)?;
+                let fgen = h.generation.load(Relaxed);
+                wait_interruptible(&h.state, &h.cv, |s| *s == HState::Done || fgen != FORK_GENERATION.load(Relaxed), None)?;
                 let mut nd = NON_DAEMON.lock().unwrap();
                 let me = Arc::as_ptr(&h) as usize;
                 if let Some(i) = nd.iter().position(|&p| p == me) {
@@ -945,7 +944,7 @@ unsafe extern "C" fn local_new(tp: *mut PyTypeObject, args: *mut PyObject, kw: *
 unsafe extern "C" fn local_dealloc(op: *mut PyObject) {
     unsafe {
         crate::gc::untrack(op);
-        crate::types::weakref::clear_weakrefs_if_any(op);
+        crate::types::weakref::clear_weakrefs(op);
         let l = op as *mut LocalObject;
         if let Some(m) = LIVE_LOCALS.lock().unwrap().as_mut() {
             m.remove(&(*l).id);

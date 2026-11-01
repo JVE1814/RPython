@@ -992,6 +992,53 @@ pub fn make_version_info() -> PyResult {
     Ok(ss::new_instance(tp, vec![int::new_int(3), int::new_int(15), int::new_int(2), pystr::new_str("final"), int::new_int(0)]))
 }
 
+/// Register the builtin modules implemented by the system workstream.
+pub fn register_system_modules() {
+    crate::import::register_builtin("_thread", crate::modules::_thread::init_module);
+    crate::import::register_builtin("_signal", crate::modules::signal::init_module);
+}
+
+/// Late initialisation (after sys and builtins exist).
+pub fn post_init() -> PyResult<()> {
+    Ok(())
+}
+
+fn call_module_func(module: &str, func: &str) {
+    if let Some(m) = crate::import::get_loaded_module(module) {
+        let r = ab::getattr_str(&m, func).and_then(|f| ab::call(&f, &[]));
+        if r.is_err() {
+            if exc_matches(crate::types::exceptions::KeyboardInterrupt()) {
+                clear_exc();
+            } else {
+                write_unraisable(Some(&format!("Exception ignored on calling {}.{}", module, func)), None);
+            }
+        }
+    }
+}
+
+/// Flush a standard stream; returns false on failure (exception reported).
+fn flush_std(name: &str) -> bool {
+    if let Some(s) = crate::modules::sys::get_sys_attr(name) {
+        if !s.is(none::none()) {
+            if ab::call_method_str(&s, "flush", &[]).is_err() {
+                write_unraisable(Some(&format!("Exception ignored on flushing sys.{}", name)), None);
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Interpreter shutdown. Returns false if flushing sys.stdout failed (exit status 120).
+pub fn finalize() -> bool {
+    call_module_func("threading", "_shutdown");
+    call_module_func("atexit", "_run_exitfuncs");
+    FINALIZING.store(true, Release);
+    let ok = flush_std("stdout");
+    flush_std("stderr");
+    ok
+}
+
 pub fn populate(d: &PyObject) -> PyResult<()> {
     let c = config();
     let s = |v: &str| pystr::new_str(v);

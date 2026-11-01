@@ -9,3 +9,4 @@ path = "src/main.rs"
 
 [dependencies]
 rpy-runtime = { path = "../runtime" }
+libc = "0.2"

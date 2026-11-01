@@ -94,6 +94,8 @@ pub struct ThreadState {
     pub profile_func: Cell<*mut PyObject>,
     /// Re-entrancy guard while a trace/profile function runs.
     pub tracing_depth: Cell<i32>,
+    /// Set when the OS thread has finished (its state may linger in ALL_THREADS).
+    pub exited: std::sync::atomic::AtomicBool,
 }
 
 unsafe impl Sync for ThreadState {}
@@ -153,6 +155,7 @@ pub fn new_thread_state() -> *mut ThreadState {
             trace_func: Cell::new(std::ptr::null_mut()),
             profile_func: Cell::new(std::ptr::null_mut()),
             tracing_depth: Cell::new(0),
+            exited: std::sync::atomic::AtomicBool::new(false),
         };
         // Reuse the memory of a dead thread state (pointers to thread states stay valid).
         let recycled = FREE_STATES.lock().unwrap().pop();
@@ -228,6 +231,7 @@ pub fn thread_exit() {
         }
         process_merge_queue(ts);
         ts.alive.store(false, Release);
+        ts.exited.store(true, Release);
         {
             let mut all = ALL_THREADS.lock().unwrap();
             all.retain(|&t| t != p as usize);
@@ -269,6 +273,7 @@ pub const EVAL_MERGE_REFCOUNTS: usize = 1 << 0;
 pub const EVAL_SAFEPOINT: usize = 1 << 1;
 pub const EVAL_SIGNALS: usize = 1 << 2;
 pub const EVAL_ASYNC_EXC: usize = 1 << 3;
+pub const EVAL_GC: usize = 1 << 4;
 
 /// Process pending merges for the current thread.
 pub fn process_merge_queue(ts: &ThreadState) {
@@ -338,4 +343,41 @@ pub fn current_mut() -> *mut ThreadState {
         return current() as *const ThreadState as *mut ThreadState;
     }
     p
+}
+
+/// In a forked child only the calling thread survives: retire all other states.
+/// (Called from a pthread_atfork child handler; must not block.)
+pub fn after_fork_child() {
+    let me = current_ptr() as usize;
+    if let Ok(mut all) = ALL_THREADS.try_lock() {
+        for &t in all.iter() {
+            if t != me {
+                let ts = unsafe { &*(t as *const ThreadState) };
+                ts.alive.store(false, Relaxed);
+                ts.exited.store(true, Relaxed);
+            }
+        }
+        all.retain(|&t| t == me);
+    }
+    crate::modules::signal::after_fork_child();
+}
+
+/// Run `f` (a blocking native operation) with the thread in `Blocked` mode so that
+/// stop-the-world operations do not wait for it; polls the safepoint on return.
+#[inline]
+pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
+    let ts = current();
+    let prev = ts.mode.replace(ThreadMode::Blocked);
+    let r = f();
+    ts.mode.set(prev);
+    if prev == ThreadMode::InVm && ts.c.eval_breaker.load(Acquire) & EVAL_SAFEPOINT != 0 {
+        crate::gc::safepoint_poll(ts);
+    }
+    r
+}
+
+impl ThreadState {
+    pub fn alive(&self) -> bool {
+        !self.exited.load(std::sync::atomic::Ordering::Acquire)
+    }
 }

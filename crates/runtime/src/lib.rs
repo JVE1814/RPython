@@ -22,22 +22,33 @@ pub mod methods;
 pub mod modules;
 pub mod object;
 pub mod threads;
+pub mod tlab;
 pub mod types;
 
 use errors::*;
 use object::PyRef;
 
+#[derive(Default)]
 pub struct Config {
     pub argv: Vec<String>,
     pub hash_seed: Option<u32>,
     pub optimize: i32,
+    /// Full interpreter configuration (sys.flags, -X/-W options, ...).
+    pub sys: modules::sys_full::RtConfig,
 }
 
 /// Initialise the runtime: types, builtins, sys.
 pub fn initialize(cfg: &Config) -> PyResult<()> {
+    let mut rc = cfg.sys.clone();
+    rc.optimize = rc.optimize.max(cfg.optimize);
+    let ignore_env = rc.ignore_environment != 0;
+    modules::sys::INT_MAX_STR_DIGITS.store(rc.int_max_str_digits, std::sync::atomic::Ordering::Relaxed);
+    modules::sys::BYTES_WARNING.store(rc.bytes_warning, std::sync::atomic::Ordering::Relaxed);
+    modules::sys::OPTIMIZE.store(rc.optimize, std::sync::atomic::Ordering::Relaxed);
+    modules::sys_full::set_config(rc);
     hash::init_hash_secret(cfg.hash_seed);
-    modules::sys::OPTIMIZE.store(cfg.optimize, std::sync::atomic::Ordering::Relaxed);
     let _ = threads::current();
+    threads::set_main_thread();
     types::int::init_small_ints();
     types::init_all()?;
     modules::register_all();
@@ -47,20 +58,25 @@ pub fn initialize(cfg: &Config) -> PyResult<()> {
     let md = modules::sys::modules_dict();
     types::dict::set_item_str(&md, "builtins", &builtins::builtins_module())?;
     let _ = sys;
-    // sys.path: script dir is added by the caller; then the stdlib
-    let prefix = modules::sys_full::prefix();
-    let stdlib = std::env::var("RPYTHON_STDLIB").unwrap_or_else(|_| {
-        let p = format!("{}/lib/python3.15t", prefix);
-        if std::path::Path::new(&p).is_dir() { p } else { concat!(env!("CARGO_MANIFEST_DIR"), "/../../Lib").to_string() }
-    });
+    modules::signal::init_signals();
+    // sys.path: script dir is added by the caller; then PYTHONPATH and the stdlib
+    let stdlib = modules::sys_full::stdlib_dir();
     let path = modules::sys::get_sys_attr("path").unwrap();
-    if let Ok(pp) = std::env::var("PYTHONPATH") {
-        for p in pp.split(':').filter(|p| !p.is_empty()) {
-            types::list::append(&path, types::str::new_str(p));
+    if !ignore_env {
+        if let Ok(pp) = std::env::var("PYTHONPATH") {
+            for p in pp.split(':').filter(|p| !p.is_empty()) {
+                types::list::append(&path, types::str::new_str(p));
+            }
         }
     }
     types::list::append(&path, types::str::new_str(&stdlib));
+    modules::sys_full::post_init()?;
     Ok(())
+}
+
+/// Interpreter shutdown: wait for non-daemon threads, run atexit handlers, flush streams.
+pub fn finalize() -> bool {
+    modules::sys_full::finalize()
 }
 
 /// Print an uncaught exception via sys.excepthook (or the built-in printer).
