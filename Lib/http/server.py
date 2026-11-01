@@ -7,7 +7,15 @@ SimpleHTTPRequestHandler serves files and directory listings from a
 directory.  ``python -m http.server`` runs a file server.
 """
 
-__version__ = '0.6'
+_VERSION = '0.6'
+
+
+def __getattr__(name):
+    if name == '__version__':
+        import warnings
+        warnings._deprecated('__version__', remove=(3, 20))
+        return _VERSION
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
 
 __all__ = [
     'HTTPServer', 'ThreadingHTTPServer',
@@ -129,7 +137,7 @@ class BaseHTTPRequestHandler(socketserver.StreamRequestHandler):
     """
 
     sys_version = 'Python/' + sys.version.split()[0]
-    server_version = 'BaseHTTP/' + __version__
+    server_version = 'BaseHTTP/' + _VERSION
 
     error_message_format = DEFAULT_ERROR_MESSAGE
     error_content_type = DEFAULT_ERROR_CONTENT_TYPE
@@ -210,6 +218,11 @@ class BaseHTTPRequestHandler(socketserver.StreamRequestHandler):
         # when it is reused in a URL (e.g. in a Location header).
         if self.path.startswith('//'):
             self.path = '/' + self.path.lstrip('/')
+
+        if len(words) == 2:
+            # HTTP/0.9 requests have no headers
+            self.headers = self.MessageClass()
+            return True
 
         try:
             self.headers = http.client.parse_headers(self.rfile,
@@ -478,7 +491,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     by default): files as they are, directories as an HTML listing (or
     their index.html)."""
 
-    server_version = 'SimpleHTTP/' + __version__
+    server_version = 'SimpleHTTP/' + _VERSION
     index_pages = ('index.html', 'index.htm')
     extensions_map = _encodings_map_default = {
         '.gz': 'application/gzip',
