@@ -1,0 +1,1961 @@
+//! The tier-0 bytecode interpreter loop.
+
+use super::frame::{Frame, FrameState};
+use crate::abstract_ as ab;
+use crate::errors::*;
+use crate::ffi::*;
+use crate::object::*;
+use crate::threads::ThreadState;
+use crate::types::exceptions as exc;
+use crate::types::typeobject::*;
+use crate::types::{bool_, dict, float, funcobject, int, list, none, str as pystr, tuple};
+use crate::{name, raise};
+use rpy_compiler::bytecode::{self as bc, BinOp, Intrinsic1, Intrinsic2, Op};
+
+pub enum Exit {
+    Return(PyRef),
+    Yield(PyRef),
+}
+
+macro_rules! push {
+    ($f:expr, $v:expr) => {{
+        let __v: *mut PyObject = $v;
+        $f.slots[$f.stack_top] = __v;
+        $f.stack_top += 1;
+    }};
+}
+macro_rules! pop {
+    ($f:expr) => {{
+        $f.stack_top -= 1;
+        std::mem::replace(&mut $f.slots[$f.stack_top], std::ptr::null_mut())
+    }};
+}
+macro_rules! top {
+    ($f:expr) => {
+        $f.slots[$f.stack_top - 1]
+    };
+}
+macro_rules! peek {
+    ($f:expr, $n:expr) => {
+        $f.slots[$f.stack_top - $n]
+    };
+}
+/// Pop into an owned PyRef (must not be NULL).
+macro_rules! popref {
+    ($f:expr) => {
+        unsafe { PyRef::from_raw(pop!($f)) }
+    };
+}
+macro_rules! popopt {
+    ($f:expr) => {
+        unsafe { PyRef::from_raw_opt(pop!($f)) }
+    };
+}
+
+fn binop_slot(op: BinOp) -> (ab::NbSlot, bool) {
+    use ab::NbSlot::*;
+    match op {
+        BinOp::Add => (Add, false),
+        BinOp::And => (And, false),
+        BinOp::FloorDivide => (FloorDiv, false),
+        BinOp::Lshift => (Lshift, false),
+        BinOp::MatrixMultiply => (MatMul, false),
+        BinOp::Multiply => (Mul, false),
+        BinOp::Remainder => (Mod, false),
+        BinOp::Or => (Or, false),
+        BinOp::Power => (Pow, false),
+        BinOp::Rshift => (Rshift, false),
+        BinOp::Subtract => (Sub, false),
+        BinOp::TrueDivide => (TrueDiv, false),
+        BinOp::Xor => (Xor, false),
+        BinOp::InplaceAdd => (Add, true),
+        BinOp::InplaceAnd => (And, true),
+        BinOp::InplaceFloorDivide => (FloorDiv, true),
+        BinOp::InplaceLshift => (Lshift, true),
+        BinOp::InplaceMatrixMultiply => (MatMul, true),
+        BinOp::InplaceMultiply => (Mul, true),
+        BinOp::InplaceRemainder => (Mod, true),
+        BinOp::InplaceOr => (Or, true),
+        BinOp::InplacePower => (Pow, true),
+        BinOp::InplaceRshift => (Rshift, true),
+        BinOp::InplaceSubtract => (Sub, true),
+        BinOp::InplaceTrueDivide => (TrueDiv, true),
+        BinOp::InplaceXor => (Xor, true),
+    }
+}
+
+const BINOPS: [BinOp; 26] = [
+    BinOp::Add,
+    BinOp::And,
+    BinOp::FloorDivide,
+    BinOp::Lshift,
+    BinOp::MatrixMultiply,
+    BinOp::Multiply,
+    BinOp::Remainder,
+    BinOp::Or,
+    BinOp::Power,
+    BinOp::Rshift,
+    BinOp::Subtract,
+    BinOp::TrueDivide,
+    BinOp::Xor,
+    BinOp::InplaceAdd,
+    BinOp::InplaceAnd,
+    BinOp::InplaceFloorDivide,
+    BinOp::InplaceLshift,
+    BinOp::InplaceMatrixMultiply,
+    BinOp::InplaceMultiply,
+    BinOp::InplaceRemainder,
+    BinOp::InplaceOr,
+    BinOp::InplacePower,
+    BinOp::InplaceRshift,
+    BinOp::InplaceSubtract,
+    BinOp::InplaceTrueDivide,
+    BinOp::InplaceXor,
+];
+
+/// Fast paths for common binary operations on exact builtin types.
+#[inline(always)]
+fn binary_fast(op: BinOp, a: &PyObject, b: &PyObject) -> Option<PyRef> {
+    if int::is_int_exact(a) && int::is_int_exact(b) && int::is_compact(a) && int::is_compact(b) {
+        let x = int::compact_value(a);
+        let y = int::compact_value(b);
+        let r = match op {
+            BinOp::Add | BinOp::InplaceAdd => x + y,
+            BinOp::Subtract | BinOp::InplaceSubtract => x - y,
+            BinOp::Multiply | BinOp::InplaceMultiply => x * y,
+            BinOp::And | BinOp::InplaceAnd => x & y,
+            BinOp::Or | BinOp::InplaceOr => x | y,
+            BinOp::Xor | BinOp::InplaceXor => x ^ y,
+            BinOp::FloorDivide | BinOp::InplaceFloorDivide if y != 0 => x.div_euclid(y) - if y < 0 && x.rem_euclid(y) != 0 { 1 } else { 0 },
+            BinOp::Remainder | BinOp::InplaceRemainder if y != 0 => {
+                let r = x % y;
+                if r != 0 && ((r < 0) != (y < 0)) { r + y } else { r }
+            }
+            _ => return None,
+        };
+        return Some(int::new_int(r));
+    }
+    if float::is_float_exact(a) && float::is_float_exact(b) {
+        let x = float::float_value(a);
+        let y = float::float_value(b);
+        let r = match op {
+            BinOp::Add | BinOp::InplaceAdd => x + y,
+            BinOp::Subtract | BinOp::InplaceSubtract => x - y,
+            BinOp::Multiply | BinOp::InplaceMultiply => x * y,
+            BinOp::TrueDivide | BinOp::InplaceTrueDivide if y != 0.0 => x / y,
+            _ => return None,
+        };
+        return Some(float::new_float(r));
+    }
+    if pystr::is_str_exact(a) && pystr::is_str_exact(b) && matches!(op, BinOp::Add | BinOp::InplaceAdd) {
+        return Some(pystr::concat(a, b));
+    }
+    None
+}
+
+pub fn binary_op(op: BinOp, a: &PyObject, b: &PyObject) -> PyResult {
+    if let Some(r) = binary_fast(op, a, b) {
+        return Ok(r);
+    }
+    let (slot, inplace) = binop_slot(op);
+    if inplace { ab::inplace_op(a, b, slot) } else { ab::binary_op(a, b, slot) }
+}
+
+/// Find the exception handler for instruction `i` (first matching entry).
+fn find_handler(code: &PyObject, i: u32) -> Option<bc::ExceptionEntry> {
+    let d = crate::types::code::code_data(code);
+    for e in d.exception_table.iter() {
+        if e.start <= i && i < e.end {
+            return Some(*e);
+        }
+    }
+    None
+}
+
+/// Exception currently being handled (sys.exception()).
+pub fn handled_exception(ts: &ThreadState) -> *mut PyObject {
+    unsafe {
+        let mut item = ts.c.exc_info;
+        while !item.is_null() {
+            let v = (*item).exc_value;
+            if !v.is_null() && !(*v).is(none::none()) {
+                return v;
+            }
+            item = (*item).previous_item;
+        }
+        std::ptr::null_mut()
+    }
+}
+
+fn set_handled_exception(ts: &ThreadState, v: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        let item = ts.c.exc_info;
+        let old = (*item).exc_value;
+        (*item).exc_value = v;
+        old
+    }
+}
+
+/// Attach __context__ = currently handled exception (avoiding cycles).
+fn chain_context(ts: &ThreadState, e: &PyObject) {
+    let handled = handled_exception(ts);
+    if handled.is_null() || handled == e.as_ptr() {
+        return;
+    }
+    if exc::exc_context(e).is_some() {
+        return;
+    }
+    // break cycles: walk handled's context chain and cut a link to e
+    unsafe {
+        let mut o = handled;
+        loop {
+            let ctx = exc::exc_context(&*o);
+            match ctx {
+                None => break,
+                Some(c) => {
+                    if c.as_ptr() == e.as_ptr() {
+                        exc::set_context_and_cause(&*o, None);
+                        break;
+                    }
+                    o = c.as_ptr();
+                }
+            }
+        }
+        exc::set_context_and_cause(e, Some(&*handled));
+    }
+}
+
+/// Make sure the frame has a PyFrameObject and return it (borrowed).
+pub fn frame_object(f: &mut Frame) -> *mut PyObject {
+    if f.frame_obj.is_null() {
+        f.frame_obj = crate::types::frameobject::new_frame_object(f);
+    }
+    f.frame_obj
+}
+
+fn add_traceback(f: &mut Frame, e: &PyObject) {
+    let fo = frame_object(f);
+    let prev = exc::exc_traceback(e);
+    let lineno = f.lineno();
+    let tb = crate::types::traceback::new_traceback(prev.as_deref(), unsafe { &*fo }, f.lasti as i32, lineno);
+    exc::set_exc_traceback(e, Some(&tb));
+}
+
+fn normalize_raise(v: &PyObject) -> PyResult {
+    if exc::is_exception_class(v) {
+        let inst = ab::call(v, &[])?;
+        if !exc::is_exception_instance(&inst) {
+            raise!(
+                TypeError,
+                "calling {} should have returned an instance of BaseException, not {}",
+                ab::repr_string(v)?,
+                tname(&inst)
+            );
+        }
+        return Ok(inst);
+    }
+    if exc::is_exception_instance(v) {
+        return Ok(v.to_ref());
+    }
+    raise!(TypeError, "exceptions must derive from BaseException");
+}
+
+fn do_raise(ts: &ThreadState, e: Option<&PyObject>, cause: Option<&PyObject>) -> PyErr {
+    let e = match e {
+        None => {
+            let h = handled_exception(ts);
+            if h.is_null() {
+                return err!(RuntimeError, "No active exception to reraise");
+            }
+            set_exc(unsafe { PyRef::from_borrowed(h) });
+            return PyErr;
+        }
+        Some(e) => e,
+    };
+    let inst = match normalize_raise(e) {
+        Ok(i) => i,
+        Err(x) => return x,
+    };
+    if let Some(c) = cause {
+        let c = if c.is(none::none()) {
+            None
+        } else if exc::is_exception_class(c) {
+            match ab::call(c, &[]) {
+                Ok(ci) => {
+                    if !exc::is_exception_instance(&ci) {
+                        return err!(
+                            TypeError,
+                            "calling {} should have returned an instance of BaseException, not {}",
+                            ab::repr_string(c).unwrap_or_default(),
+                            tname(&ci)
+                        );
+                    }
+                    Some(ci)
+                }
+                Err(x) => return x,
+            }
+        } else if exc::is_exception_instance(c) {
+            Some(c.to_ref())
+        } else {
+            return err!(TypeError, "exception causes must derive from BaseException");
+        };
+        exc::set_exc_cause(&inst, c.as_deref());
+    }
+    set_exc(inst);
+    PyErr
+}
+
+fn name_error(f: &Frame, nm: &PyObject) -> PyErr {
+    let s = pystr::to_string_lossy(nm);
+    let _ = f;
+    exc::name_error_with(exc::NameError(), &format!("name '{}' is not defined", s), nm)
+}
+
+fn unbound_local(f: &Frame, idx: usize) -> PyErr {
+    let d = crate::types::code::code_data(f.code());
+    let nm = &d.localsplusnames[idx];
+    let kind = d.localspluskinds[idx];
+    if kind & bc::fast::FREE != 0 {
+        return exc::name_error_with(
+            exc::NameError(),
+            &format!(
+                "cannot access free variable '{}' where it is not associated with a value in enclosing scope",
+                pystr::to_string_lossy(nm)
+            ),
+            nm,
+        );
+    }
+    exc::name_error_with(
+        exc::UnboundLocalError(),
+        &format!("cannot access local variable '{}' where it is not associated with a value", pystr::to_string_lossy(nm)),
+        nm,
+    )
+}
+
+/// Look up a global name: globals then builtins.
+#[inline]
+fn load_global(f: &Frame, nm: &PyObject) -> PyResult {
+    let g = f.globals();
+    if dict::is_dict_exact(g) {
+        if let Some(v) = dict::get_item_str(g, nm) {
+            return Ok(v);
+        }
+    } else if let Some(v) = dict::get_item(g, nm)? {
+        return Ok(v);
+    }
+    let b = f.builtins();
+    if dict::is_dict_exact(b) {
+        if let Some(v) = dict::get_item_str(b, nm) {
+            return Ok(v);
+        }
+        return Err(name_error(f, nm));
+    }
+    match ab::getitem(b, nm) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            if exc_matches(exc::KeyError()) {
+                clear_exc();
+                return Err(name_error(f, nm));
+            }
+            Err(e)
+        }
+    }
+}
+
+fn mapping_get(m: &PyObject, key: &PyObject) -> PyResult<Option<PyRef>> {
+    if dict::is_dict_exact(m) {
+        return dict::get_item(m, key);
+    }
+    match ab::getitem(m, key) {
+        Ok(v) => Ok(Some(v)),
+        Err(e) => {
+            if exc_matches(exc::KeyError()) {
+                clear_exc();
+                Ok(None)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+fn load_method(o: &PyObject, nm: &PyObject) -> PyResult<(PyRef, Option<PyRef>)> {
+    let tp = o.ty();
+    if tp.tp_getattro.map(|f| f as usize) == Some(object_generic_getattro as usize) {
+        if let Some(d) = lookup(o.type_ptr(), nm) {
+            if d.ty().tp_flags & Py_TPFLAGS_METHOD_DESCRIPTOR != 0 {
+                // instance dict may shadow
+                let shadow = match instance_dict_existing(o) {
+                    Some(id) => dict::get_item(&id, nm)?,
+                    None => None,
+                };
+                match shadow {
+                    Some(v) => return Ok((v, None)),
+                    None => return Ok((d, Some(o.to_ref()))),
+                }
+            }
+        }
+    }
+    Ok((ab::getattr(o, nm)?, None))
+}
+
+fn unpack_sequence(seq: &PyObject, n: usize, out: &mut Vec<PyRef>) -> PyResult<()> {
+    if tuple::is_tuple_exact(seq) || list::is_list_exact(seq) {
+        let items: Vec<PyRef> = if tuple::is_tuple_exact(seq) { tuple::tuple_to_vec(seq) } else { list::list_to_vec(seq) };
+        if items.len() != n {
+            if items.len() < n {
+                raise!(ValueError, "not enough values to unpack (expected {}, got {})", n, items.len());
+            }
+            raise!(ValueError, "too many values to unpack (expected {}, got {})", n, items.len());
+        }
+        *out = items;
+        return Ok(());
+    }
+    let it = match ab::get_iter(seq) {
+        Ok(it) => it,
+        Err(e) => {
+            if exc_matches(exc::TypeError()) && seq.ty().tp_iter.is_none() {
+                clear_exc();
+                raise!(TypeError, "cannot unpack non-iterable {} object", tname(seq));
+            }
+            return Err(e);
+        }
+    };
+    for i in 0..n {
+        match ab::iter_next(&it)? {
+            Some(v) => out.push(v),
+            None => raise!(ValueError, "not enough values to unpack (expected {}, got {})", n, i),
+        }
+    }
+    if ab::iter_next(&it)?.is_some() {
+        if let Ok(len) = ab::length(seq) {
+            raise!(ValueError, "too many values to unpack (expected {}, got {})", n, len);
+        }
+        clear_exc();
+        raise!(ValueError, "too many values to unpack (expected {})", n);
+    }
+    Ok(())
+}
+
+fn unpack_ex(seq: &PyObject, before: usize, after: usize) -> PyResult<Vec<PyRef>> {
+    let it = match ab::get_iter(seq) {
+        Ok(it) => it,
+        Err(e) => {
+            if exc_matches(exc::TypeError()) && seq.ty().tp_iter.is_none() {
+                clear_exc();
+                raise!(TypeError, "cannot unpack non-iterable {} object", tname(seq));
+            }
+            return Err(e);
+        }
+    };
+    let mut out = Vec::with_capacity(before + after + 1);
+    for i in 0..before {
+        match ab::iter_next(&it)? {
+            Some(v) => out.push(v),
+            None => raise!(ValueError, "not enough values to unpack (expected at least {}, got {})", before + after, i),
+        }
+    }
+    let rest = ab::collect_iterable(&it)?;
+    if rest.len() < after {
+        raise!(
+            ValueError,
+            "not enough values to unpack (expected at least {}, got {})",
+            before + after,
+            before + rest.len()
+        );
+    }
+    let split = rest.len() - after;
+    let mut rest = rest;
+    let tail: Vec<PyRef> = rest.split_off(split);
+    out.push(list::new_list(rest));
+    out.extend(tail);
+    Ok(out)
+}
+
+fn check_exc_match_type(t: &PyObject, star: bool) -> PyResult<()> {
+    let ok = |c: &PyObject| -> bool { exc::is_exception_class(c) };
+    if tuple::is_tuple(t) {
+        for c in tuple::tuple_items(t) {
+            if !ok(c) {
+                raise!(TypeError, "catching classes that do not inherit from BaseException is not allowed");
+            }
+            if star && is_subtype(as_type(c), exc::BaseExceptionGroup()) {
+                raise!(TypeError, "catching ExceptionGroup with except* is not allowed. Use except instead.");
+            }
+        }
+    } else {
+        if !ok(t) {
+            raise!(TypeError, "catching classes that do not inherit from BaseException is not allowed");
+        }
+        if star && is_subtype(as_type(t), exc::BaseExceptionGroup()) {
+            raise!(TypeError, "catching ExceptionGroup with except* is not allowed. Use except instead.");
+        }
+    }
+    Ok(())
+}
+
+pub fn exception_matches(e: &PyObject, t: &PyObject) -> PyResult<bool> {
+    if tuple::is_tuple(t) {
+        for c in tuple::tuple_items(t) {
+            if exception_matches(e, c)? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    Ok(is_subtype(e.type_ptr(), as_type(t)))
+}
+
+fn import_from(module: &PyObject, nm: &PyObject) -> PyResult {
+    if let Some(v) = ab::getattr_opt(module, nm)? {
+        return Ok(v);
+    }
+    // fall back to sys.modules[f"{module.__name__}.{name}"] (circular imports)
+    let pkgname = match ab::getattr_opt(module, name!("__name__"))? {
+        Some(n) if pystr::is_str(&n) => n,
+        _ => {
+            return Err(crate::import::import_error_with(
+                &format!("cannot import name '{}' from <unknown module name>", pystr::to_string_lossy(nm)),
+                None,
+                None,
+                Some(nm),
+            ));
+        }
+    };
+    let full = pystr::new_str(&format!("{}.{}", pystr::to_string_lossy(&pkgname), pystr::to_string_lossy(nm)));
+    if let Some(m) = dict::get_item(&crate::modules::sys::modules_dict(), &full)? {
+        return Ok(m);
+    }
+    crate::import::cannot_import_name(module, &pkgname, nm)
+}
+
+fn format_value(v: &PyObject, spec: Option<&PyObject>) -> PyResult {
+    match spec {
+        None => {
+            if pystr::is_str_exact(v) {
+                return Ok(v.to_ref());
+            }
+            let empty = pystr::new_str("");
+            ab::format(v, &empty)
+        }
+        Some(s) => ab::format(v, s),
+    }
+}
+
+fn call_intrinsic1(ts: &ThreadState, f: &mut Frame, which: u32, v: PyRef) -> PyResult {
+    let which: Intrinsic1 = unsafe { std::mem::transmute(which as u8) };
+    match which {
+        Intrinsic1::Print => {
+            let hook = crate::modules::sys::get_sys_attr("displayhook")
+                .ok_or_else(|| err!(RuntimeError, "lost sys.displayhook"))?;
+            ab::call(&hook, &[&v])
+        }
+        Intrinsic1::ImportStar => {
+            let locals = if f.locals.is_null() {
+                raise!(SystemError, "no locals found during 'import *'");
+            } else {
+                unsafe { &*f.locals }
+            };
+            crate::import::import_all_from(locals, &v)?;
+            Ok(none::none_ref())
+        }
+        Intrinsic1::StopIterationError => {
+            // v is the exception being raised out of a generator
+            let flags = crate::types::code::code(f.code()).flags();
+            let r = if exc::is_exception_instance(&v) && is_subtype(v.type_ptr(), exc::StopIteration()) {
+                let msg = if flags & bc::co::ASYNC_GENERATOR != 0 {
+                    "async generator raised StopIteration"
+                } else if flags & bc::co::COROUTINE != 0 {
+                    "coroutine raised StopIteration"
+                } else {
+                    "generator raised StopIteration"
+                };
+                Some(msg)
+            } else if flags & bc::co::ASYNC_GENERATOR != 0 && is_subtype(v.type_ptr(), exc::StopAsyncIteration()) {
+                Some("async generator raised StopAsyncIteration")
+            } else {
+                None
+            };
+            match r {
+                Some(msg) => {
+                    let new = exc::make_exception(exc::RuntimeError(), &[pystr::new_str(msg)])?;
+                    exc::set_exc_cause(&new, Some(&v));
+                    exc::set_context_and_cause(&new, Some(&v));
+                    let _ = ts;
+                    Ok(new)
+                }
+                None => Ok(v),
+            }
+        }
+        Intrinsic1::UnaryPositive => ab::positive(&v),
+        Intrinsic1::ListToTuple => Ok(tuple::new_tuple(list::list_to_vec(&v))),
+        Intrinsic1::TypeVar => crate::types::typevar::make_typevar(&v, None, None, false),
+        Intrinsic1::ParamSpec => crate::types::typevar::make_paramspec(&v),
+        Intrinsic1::TypeVarTuple => crate::types::typevar::make_typevartuple(&v),
+        Intrinsic1::SubscriptGeneric => crate::types::typevar::subscript_generic(&v),
+        Intrinsic1::TypeAlias => crate::types::typevar::make_typealias(&v),
+        Intrinsic1::AsyncGenWrap => crate::types::asyncgen::wrap_value(v),
+    }
+}
+
+fn call_intrinsic2(f: &mut Frame, which: u32, a: PyRef, b: PyRef) -> PyResult {
+    let which: Intrinsic2 = unsafe { std::mem::transmute(which as u8) };
+    let _ = f;
+    match which {
+        Intrinsic2::PrepReraiseStar => crate::types::exceptiongroup::prep_reraise_star(&a, &b),
+        Intrinsic2::TypeVarWithBound => crate::types::typevar::make_typevar(&a, Some(&b), None, false),
+        Intrinsic2::TypeVarWithConstraints => crate::types::typevar::make_typevar(&a, None, Some(&b), false),
+        Intrinsic2::SetFunctionTypeParams => {
+            let fo = funcobject::func(&a);
+            let old = fo.func_typeparams;
+            fo.func_typeparams = b.clone().into_raw();
+            unsafe { xdecref(old) };
+            Ok(a)
+        }
+        Intrinsic2::SetTypeparamDefault => crate::types::typevar::set_default(&a, &b),
+    }
+}
+
+fn get_awaitable(o: &PyObject, where_: u32) -> PyResult {
+    match crate::types::genobject::get_awaitable_iter(o) {
+        Ok(r) => {
+            if crate::types::genobject::is_coroutine_exact(&r) && crate::types::genobject::coro_is_running_await(&r) {
+                raise!(RuntimeError, "coroutine is being awaited already");
+            }
+            Ok(r)
+        }
+        Err(e) => {
+            if exc_matches(exc::TypeError()) {
+                let msg = match where_ {
+                    1 => Some(format!(
+                        "'async with' received an object from __aenter__ that does not implement __await__: {}",
+                        tname(o)
+                    )),
+                    2 => Some(format!(
+                        "'async with' received an object from __aexit__ that does not implement __await__: {}",
+                        tname(o)
+                    )),
+                    _ => None,
+                };
+                if let Some(m) = msg {
+                    clear_exc();
+                    return Err(err!(TypeError, "{}", m));
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Run (or resume) a frame. `throw`: an exception to raise at the resume point.
+pub fn eval_frame(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult<Exit> {
+    let prev = ts.frame.get();
+    f.prev = prev;
+    ts.frame.set(f as *mut Frame);
+    f.state = FrameState::Executing;
+    let r = eval_inner(ts, f, throw);
+    ts.frame.set(prev);
+    f.prev = std::ptr::null_mut();
+    match &r {
+        Ok(Exit::Yield(_)) => f.state = FrameState::Suspended,
+        _ => f.state = FrameState::Completed,
+    }
+    r
+}
+
+fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult<Exit> {
+    let code_obj: PyRef = f.code().to_ref();
+    let cd = crate::types::code::code_data(&code_obj);
+    let code: &[u32] = &cd.code;
+    let mut pc: usize = f.next_instr as usize;
+    f.yield_from_send = -1;
+    let tracing = crate::modules::sys::tracing_active();
+    if tracing && f.state != FrameState::Suspended {
+        crate::modules::sys::trace_call(ts, f)?;
+    }
+
+    // pending exception to raise immediately (generator.throw)
+    let mut pending_err: bool = false;
+    if let Some(t) = throw {
+        set_exc(t);
+        pending_err = true;
+        f.lasti = if pc > 0 { (pc - 1) as u32 } else { 0 };
+    }
+
+    'outer: loop {
+        if !pending_err {
+            // ---------------------------------------------------------- dispatch loop
+            let result: PyResult<Option<Exit>> = (|| -> PyResult<Option<Exit>> {
+                let mut ext: u32 = 0;
+                loop {
+                    let w = unsafe { *code.get_unchecked(pc) };
+                    let op = Op::from_u8((w & 0xff) as u8);
+                    let arg = (w >> 8) | ext;
+                    f.lasti = pc as u32;
+                    pc += 1;
+                    if op == Op::ExtendedArg {
+                        ext = arg << 24;
+                        continue;
+                    }
+                    ext = 0;
+                    if tracing {
+                        crate::modules::sys::trace_instr(ts, f)?;
+                    }
+                    match op {
+                        Op::Nop | Op::Resume => {
+                            let eb = ts.c.eval_breaker.load(std::sync::atomic::Ordering::Relaxed);
+                            if eb != 0 {
+                                handle_eval_breaker(ts)?;
+                            }
+                        }
+                        Op::PopTop => unsafe { xdecref(pop!(f)) },
+                        Op::PushNull => push!(f, std::ptr::null_mut()),
+                        Op::Copy => {
+                            let v = peek!(f, arg as usize);
+                            unsafe { xincref(v) };
+                            push!(f, v);
+                        }
+                        Op::Swap => {
+                            let n = arg as usize;
+                            let t = f.stack_top;
+                            f.slots.swap(t - 1, t - n);
+                        }
+                        Op::LoadConst => {
+                            let v = cd.consts[arg as usize].clone();
+                            push!(f, v.into_raw());
+                        }
+                        Op::LoadFast => {
+                            let v = f.slots[arg as usize];
+                            if v.is_null() {
+                                return Err(unbound_local(f, arg as usize));
+                            }
+                            unsafe { incref(v) };
+                            push!(f, v);
+                        }
+                        Op::LoadFastCheck => {
+                            let v = f.slots[arg as usize];
+                            if v.is_null() {
+                                return Err(unbound_local(f, arg as usize));
+                            }
+                            unsafe { incref(v) };
+                            push!(f, v);
+                        }
+                        Op::LoadFastAndClear => {
+                            let v = std::mem::replace(&mut f.slots[arg as usize], std::ptr::null_mut());
+                            push!(f, v);
+                        }
+                        Op::StoreFast => {
+                            let v = pop!(f);
+                            let old = std::mem::replace(&mut f.slots[arg as usize], v);
+                            unsafe { xdecref(old) };
+                        }
+                        Op::DeleteFast => {
+                            let old = std::mem::replace(&mut f.slots[arg as usize], std::ptr::null_mut());
+                            if old.is_null() {
+                                return Err(unbound_local(f, arg as usize));
+                            }
+                            unsafe { decref(old) };
+                        }
+                        Op::MakeCell => {
+                            let i = arg as usize;
+                            let v = std::mem::replace(&mut f.slots[i], std::ptr::null_mut());
+                            let cell = funcobject::new_cell(unsafe { PyRef::from_raw_opt(v) });
+                            f.slots[i] = cell.into_raw();
+                        }
+                        Op::CopyFreeVars => {
+                            let n = arg as usize;
+                            let func = f.func;
+                            if func.is_null() {
+                                return Err(system_error("CopyFreeVars without function"));
+                            }
+                            let clos = funcobject::func(unsafe { &*func }).func_closure;
+                            if clos.is_null() {
+                                return Err(system_error("missing closure"));
+                            }
+                            let items = tuple::tuple_items(unsafe { &*clos });
+                            let base = f.nlocalsplus - n;
+                            for i in 0..n {
+                                let c = items[i].to_ref().into_raw();
+                                let old = std::mem::replace(&mut f.slots[base + i], c);
+                                unsafe { xdecref(old) };
+                            }
+                        }
+                        Op::LoadDeref => {
+                            let cell = f.slots[arg as usize];
+                            let v = if cell.is_null() { None } else { funcobject::cell_get(unsafe { &*cell }) };
+                            match v {
+                                Some(v) => push!(f, v.into_raw()),
+                                None => return Err(unbound_local(f, arg as usize)),
+                            }
+                        }
+                        Op::StoreDeref => {
+                            let v = popref!(f);
+                            let cell = f.slots[arg as usize];
+                            funcobject::cell_set(unsafe { &*cell }, Some(v));
+                        }
+                        Op::DeleteDeref => {
+                            let cell = f.slots[arg as usize];
+                            if funcobject::cell_get(unsafe { &*cell }).is_none() {
+                                return Err(unbound_local(f, arg as usize));
+                            }
+                            funcobject::cell_set(unsafe { &*cell }, None);
+                        }
+                        Op::LoadFromDictOrDeref => {
+                            let mapping = popref!(f);
+                            let nm = &cd.localsplusnames[arg as usize];
+                            match mapping_get(&mapping, nm)? {
+                                Some(v) => push!(f, v.into_raw()),
+                                None => {
+                                    let cell = f.slots[arg as usize];
+                                    match funcobject::cell_get(unsafe { &*cell }) {
+                                        Some(v) => push!(f, v.into_raw()),
+                                        None => return Err(unbound_local(f, arg as usize)),
+                                    }
+                                }
+                            }
+                        }
+                        Op::LoadLocals => {
+                            if f.locals.is_null() {
+                                raise!(SystemError, "no locals found");
+                            }
+                            let l = unsafe { (*f.locals).to_ref() };
+                            push!(f, l.into_raw());
+                        }
+                        Op::LoadName => {
+                            let nm = &cd.names[arg as usize];
+                            let mut v = None;
+                            if !f.locals.is_null() {
+                                v = mapping_get(unsafe { &*f.locals }, nm)?;
+                            }
+                            let v = match v {
+                                Some(v) => v,
+                                None => load_global(f, nm)?,
+                            };
+                            push!(f, v.into_raw());
+                        }
+                        Op::StoreName => {
+                            let v = popref!(f);
+                            let nm = &cd.names[arg as usize];
+                            if f.locals.is_null() {
+                                raise!(SystemError, "no locals found when storing {}", pystr::to_string_lossy(nm));
+                            }
+                            let l = unsafe { &*f.locals };
+                            if dict::is_dict_exact(l) {
+                                dict::set_item(l, nm, &v)?;
+                            } else {
+                                ab::setitem(l, nm, Some(&v))?;
+                            }
+                        }
+                        Op::DeleteName => {
+                            let nm = &cd.names[arg as usize];
+                            if f.locals.is_null() {
+                                raise!(SystemError, "no locals when deleting {}", pystr::to_string_lossy(nm));
+                            }
+                            let l = unsafe { &*f.locals };
+                            let ok = if dict::is_dict_exact(l) {
+                                dict::del_item(l, nm)?
+                            } else {
+                                match ab::setitem(l, nm, None) {
+                                    Ok(()) => true,
+                                    Err(e) => {
+                                        if exc_matches(exc::KeyError()) {
+                                            clear_exc();
+                                            false
+                                        } else {
+                                            return Err(e);
+                                        }
+                                    }
+                                }
+                            };
+                            if !ok {
+                                return Err(name_error(f, nm));
+                            }
+                        }
+                        Op::LoadGlobal => {
+                            let nm = &cd.names[arg as usize];
+                            let v = load_global(f, nm)?;
+                            push!(f, v.into_raw());
+                        }
+                        Op::StoreGlobal => {
+                            let v = popref!(f);
+                            dict::set_item(f.globals(), &cd.names[arg as usize], &v)?;
+                        }
+                        Op::DeleteGlobal => {
+                            let nm = &cd.names[arg as usize];
+                            if !dict::del_item(f.globals(), nm)? {
+                                return Err(name_error(f, nm));
+                            }
+                        }
+                        Op::LoadFromDictOrGlobals => {
+                            let mapping = popref!(f);
+                            let nm = &cd.names[arg as usize];
+                            let v = match mapping_get(&mapping, nm)? {
+                                Some(v) => v,
+                                None => load_global(f, nm)?,
+                            };
+                            push!(f, v.into_raw());
+                        }
+                        Op::LoadAttr => {
+                            let o = popref!(f);
+                            let v = ab::getattr(&o, &cd.names[arg as usize])?;
+                            push!(f, v.into_raw());
+                        }
+                        Op::LoadMethod => {
+                            let o = popref!(f);
+                            let (m, s) = load_method(&o, &cd.names[arg as usize])?;
+                            push!(f, m.into_raw());
+                            push!(f, s.map_or(std::ptr::null_mut(), |s| s.into_raw()));
+                        }
+                        Op::StoreAttr => {
+                            let o = popref!(f);
+                            let v = popref!(f);
+                            ab::setattr(&o, &cd.names[arg as usize], &v)?;
+                        }
+                        Op::DeleteAttr => {
+                            let o = popref!(f);
+                            ab::delattr(&o, &cd.names[arg as usize])?;
+                        }
+                        Op::LoadSuperAttr => {
+                            let slf = popref!(f);
+                            let cls = popref!(f);
+                            let gsuper = popref!(f);
+                            let nm = &cd.names[(arg >> 2) as usize];
+                            let is_method = arg & 1 != 0;
+                            let sup = if gsuper.is(type_obj(crate::types::super_::super_type())) {
+                                crate::types::super_::new_super(&cls, &slf)?
+                            } else {
+                                let two = arg & 2 != 0;
+                                if two { ab::call(&gsuper, &[&cls, &slf])? } else { ab::call(&gsuper, &[])? }
+                            };
+                            if is_method {
+                                let v = ab::getattr(&sup, nm)?;
+                                push!(f, v.into_raw());
+                                push!(f, std::ptr::null_mut());
+                            } else {
+                                let v = ab::getattr(&sup, nm)?;
+                                push!(f, v.into_raw());
+                            }
+                        }
+                        Op::BinaryOp => {
+                            let b = popref!(f);
+                            let a = popref!(f);
+                            let r = binary_op(BINOPS[arg as usize], &a, &b)?;
+                            push!(f, r.into_raw());
+                        }
+                        Op::UnaryNegative => {
+                            let a = popref!(f);
+                            let r = if int::is_int_exact(&a) && int::is_compact(&a) {
+                                int::new_int(-int::compact_value(&a))
+                            } else {
+                                ab::negative(&a)?
+                            };
+                            push!(f, r.into_raw());
+                        }
+                        Op::UnaryPositive => {
+                            let a = popref!(f);
+                            push!(f, ab::positive(&a)?.into_raw());
+                        }
+                        Op::UnaryInvert => {
+                            let a = popref!(f);
+                            push!(f, ab::invert(&a)?.into_raw());
+                        }
+                        Op::UnaryNot => {
+                            let a = popref!(f);
+                            let t = ab::is_true(&a)?;
+                            push!(f, bool_::new_bool(!t).into_raw());
+                        }
+                        Op::ToBool => {
+                            let a = popref!(f);
+                            let t = ab::is_true(&a)?;
+                            push!(f, bool_::new_bool(t).into_raw());
+                        }
+                        Op::CompareOp => {
+                            let b = popref!(f);
+                            let a = popref!(f);
+                            let cop = (arg & 15) as std::ffi::c_int;
+                            let r = if int::is_int_exact(&a) && int::is_int_exact(&b) && int::is_compact(&a) && int::is_compact(&b) {
+                                let (x, y) = (int::compact_value(&a), int::compact_value(&b));
+                                bool_::new_bool(match cop {
+                                    Py_LT => x < y,
+                                    Py_LE => x <= y,
+                                    Py_EQ => x == y,
+                                    Py_NE => x != y,
+                                    Py_GT => x > y,
+                                    _ => x >= y,
+                                })
+                            } else {
+                                let r = ab::rich_compare(&a, &b, cop)?;
+                                if arg & 16 != 0 && !bool_::is_bool(&r) { bool_::new_bool(ab::is_true(&r)?) } else { r }
+                            };
+                            push!(f, r.into_raw());
+                        }
+                        Op::IsOp => {
+                            let b = popref!(f);
+                            let a = popref!(f);
+                            push!(f, bool_::new_bool(a.is(&b) != (arg == 1)).into_raw());
+                        }
+                        Op::ContainsOp => {
+                            let b = popref!(f);
+                            let a = popref!(f);
+                            let r = ab::contains(&b, &a)?;
+                            push!(f, bool_::new_bool(r != (arg == 1)).into_raw());
+                        }
+                        Op::BinarySubscr => {
+                            let k = popref!(f);
+                            let c = popref!(f);
+                            let r = if list::is_list_exact(&c) && int::is_int_exact(&k) && int::is_compact(&k) {
+                                let mut i = int::compact_value(&k);
+                                let n = list::list_len(&c) as i64;
+                                if i < 0 {
+                                    i += n;
+                                }
+                                if i < 0 || i >= n {
+                                    raise!(IndexError, "list index out of range");
+                                }
+                                list::list_items(&c)[i as usize].to_ref()
+                            } else if tuple::is_tuple_exact(&c) && int::is_int_exact(&k) && int::is_compact(&k) {
+                                let mut i = int::compact_value(&k);
+                                let n = tuple::tuple_len(&c) as i64;
+                                if i < 0 {
+                                    i += n;
+                                }
+                                if i < 0 || i >= n {
+                                    raise!(IndexError, "tuple index out of range");
+                                }
+                                tuple::tuple_get(&c, i as usize).to_ref()
+                            } else if dict::is_dict_exact(&c) {
+                                match dict::get_item(&c, &k)? {
+                                    Some(v) => v,
+                                    None => {
+                                        crate::types::dict_methods::raise_key_error(&k);
+                                        return Err(PyErr);
+                                    }
+                                }
+                            } else {
+                                ab::getitem(&c, &k)?
+                            };
+                            push!(f, r.into_raw());
+                        }
+                        Op::StoreSubscr => {
+                            let k = popref!(f);
+                            let c = popref!(f);
+                            let v = popref!(f);
+                            if dict::is_dict_exact(&c) {
+                                dict::set_item(&c, &k, &v)?;
+                            } else {
+                                ab::setitem(&c, &k, Some(&v))?;
+                            }
+                        }
+                        Op::DeleteSubscr => {
+                            let k = popref!(f);
+                            let c = popref!(f);
+                            ab::setitem(&c, &k, None)?;
+                        }
+                        Op::BinarySlice => {
+                            let stop = popref!(f);
+                            let start = popref!(f);
+                            let c = popref!(f);
+                            let s = crate::types::slice::new_slice(&start, &stop, none::none());
+                            push!(f, ab::getitem(&c, &s)?.into_raw());
+                        }
+                        Op::StoreSlice => {
+                            let stop = popref!(f);
+                            let start = popref!(f);
+                            let c = popref!(f);
+                            let v = popref!(f);
+                            let s = crate::types::slice::new_slice(&start, &stop, none::none());
+                            ab::setitem(&c, &s, Some(&v))?;
+                        }
+                        Op::BuildSlice => {
+                            let step = if arg == 3 { Some(popref!(f)) } else { None };
+                            let stop = popref!(f);
+                            let start = popref!(f);
+                            let s = crate::types::slice::new_slice(&start, &stop, step.as_deref().unwrap_or(none::none()));
+                            push!(f, s.into_raw());
+                        }
+                        Op::BuildTuple => {
+                            let n = arg as usize;
+                            let base = f.stack_top - n;
+                            let items: Vec<PyRef> = (0..n)
+                                .map(|i| unsafe { PyRef::from_raw(std::mem::replace(&mut f.slots[base + i], std::ptr::null_mut())) })
+                                .collect();
+                            f.stack_top = base;
+                            push!(f, tuple::new_tuple(items).into_raw());
+                        }
+                        Op::BuildList => {
+                            let n = arg as usize;
+                            let base = f.stack_top - n;
+                            let items: Vec<PyRef> = (0..n)
+                                .map(|i| unsafe { PyRef::from_raw(std::mem::replace(&mut f.slots[base + i], std::ptr::null_mut())) })
+                                .collect();
+                            f.stack_top = base;
+                            push!(f, list::new_list(items).into_raw());
+                        }
+                        Op::BuildSet => {
+                            let n = arg as usize;
+                            let base = f.stack_top - n;
+                            let items: Vec<PyRef> = (0..n)
+                                .map(|i| unsafe { PyRef::from_raw(std::mem::replace(&mut f.slots[base + i], std::ptr::null_mut())) })
+                                .collect();
+                            f.stack_top = base;
+                            let s = crate::types::set::new_set_from_vec(items)?;
+                            push!(f, s.into_raw());
+                        }
+                        Op::BuildMap => {
+                            let n = arg as usize;
+                            let base = f.stack_top - 2 * n;
+                            let d = dict::new_dict_presized(n);
+                            let mut res = Ok(());
+                            for i in 0..n {
+                                let k = unsafe { PyRef::from_raw(std::mem::replace(&mut f.slots[base + 2 * i], std::ptr::null_mut())) };
+                                let v = unsafe { PyRef::from_raw(std::mem::replace(&mut f.slots[base + 2 * i + 1], std::ptr::null_mut())) };
+                                if res.is_ok() {
+                                    res = dict::set_item(&d, &k, &v);
+                                }
+                            }
+                            f.stack_top = base;
+                            res?;
+                            push!(f, d.into_raw());
+                        }
+                        Op::BuildString => {
+                            let n = arg as usize;
+                            let base = f.stack_top - n;
+                            let mut sb = pystr::StrBuilder::new();
+                            for i in 0..n {
+                                let s = unsafe { PyRef::from_raw(std::mem::replace(&mut f.slots[base + i], std::ptr::null_mut())) };
+                                sb.push_obj(&s);
+                            }
+                            f.stack_top = base;
+                            push!(f, sb.finish().into_raw());
+                        }
+                        Op::ListAppend => {
+                            let v = popref!(f);
+                            let l = peek!(f, arg as usize);
+                            list::append(unsafe { &*l }, v);
+                        }
+                        Op::SetAdd => {
+                            let v = popref!(f);
+                            let s = peek!(f, arg as usize);
+                            crate::types::set::set_add(unsafe { &*s }, &v)?;
+                        }
+                        Op::MapAdd => {
+                            let v = popref!(f);
+                            let k = popref!(f);
+                            let d = peek!(f, arg as usize);
+                            dict::set_item(unsafe { &*d }, &k, &v)?;
+                        }
+                        Op::ListExtend => {
+                            let it = popref!(f);
+                            let l = peek!(f, arg as usize);
+                            match ab::collect_iterable(&it) {
+                                Ok(v) => {
+                                    for x in v {
+                                        list::append(unsafe { &*l }, x);
+                                    }
+                                }
+                                Err(e) => {
+                                    if exc_matches(exc::TypeError()) && it.ty().tp_iter.is_none() && !is_sequence_like(&it) {
+                                        clear_exc();
+                                        raise!(TypeError, "Value after * must be an iterable, not {}", tname(&it));
+                                    }
+                                    return Err(e);
+                                }
+                            }
+                        }
+                        Op::SetUpdate => {
+                            let it = popref!(f);
+                            let s = peek!(f, arg as usize);
+                            crate::types::set::set_update(unsafe { &*s }, &it)?;
+                        }
+                        Op::DictUpdate => {
+                            let o = popref!(f);
+                            let d = peek!(f, arg as usize);
+                            if let Err(e) = crate::types::dict_methods::dict_update_from(unsafe { &*d }, &o) {
+                                if exc_matches(exc::AttributeError()) {
+                                    clear_exc();
+                                    raise!(TypeError, "'{}' object is not a mapping", tname(&o));
+                                }
+                                return Err(e);
+                            }
+                        }
+                        Op::DictMerge => {
+                            let o = popref!(f);
+                            let d = peek!(f, arg as usize);
+                            let func = peek!(f, arg as usize + 2);
+                            crate::types::dict_methods::dict_merge_kwargs(unsafe { &*d }, &o, func)?;
+                        }
+                        Op::UnpackSequence => {
+                            let seq = popref!(f);
+                            let n = arg as usize;
+                            let mut items = Vec::with_capacity(n);
+                            unpack_sequence(&seq, n, &mut items)?;
+                            for v in items.into_iter().rev() {
+                                push!(f, v.into_raw());
+                            }
+                        }
+                        Op::UnpackEx => {
+                            let seq = popref!(f);
+                            let before = (arg & 0xff) as usize;
+                            let after = (arg >> 8) as usize;
+                            let items = unpack_ex(&seq, before, after)?;
+                            for v in items.into_iter().rev() {
+                                push!(f, v.into_raw());
+                            }
+                        }
+                        Op::Jump => {
+                            if (arg as usize) < pc {
+                                // backedge: safepoint poll + tiering counter
+                                cd.backedge_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let eb = ts.c.eval_breaker.load(std::sync::atomic::Ordering::Relaxed);
+                                if eb != 0 {
+                                    handle_eval_breaker(ts)?;
+                                }
+                            }
+                            pc = arg as usize;
+                        }
+                        Op::PopJumpIfFalse => {
+                            let v = popref!(f);
+                            let t = if v.is(bool_::false_obj()) { false } else if v.is(bool_::true_obj()) { true } else { ab::is_true(&v)? };
+                            if !t {
+                                pc = arg as usize;
+                            }
+                        }
+                        Op::PopJumpIfTrue => {
+                            let v = popref!(f);
+                            let t = if v.is(bool_::true_obj()) { true } else if v.is(bool_::false_obj()) { false } else { ab::is_true(&v)? };
+                            if t {
+                                pc = arg as usize;
+                            }
+                        }
+                        Op::PopJumpIfNone => {
+                            let v = popref!(f);
+                            if v.is(none::none()) {
+                                pc = arg as usize;
+                            }
+                        }
+                        Op::PopJumpIfNotNone => {
+                            let v = popref!(f);
+                            if !v.is(none::none()) {
+                                pc = arg as usize;
+                            }
+                        }
+                        Op::JumpIfFalseOrPop => {
+                            let t = ab::is_true(unsafe { &*top!(f) })?;
+                            if !t {
+                                pc = arg as usize;
+                            } else {
+                                unsafe { decref(pop!(f)) };
+                            }
+                        }
+                        Op::JumpIfTrueOrPop => {
+                            let t = ab::is_true(unsafe { &*top!(f) })?;
+                            if t {
+                                pc = arg as usize;
+                            } else {
+                                unsafe { decref(pop!(f)) };
+                            }
+                        }
+                        Op::GetIter => {
+                            let o = popref!(f);
+                            push!(f, ab::get_iter(&o)?.into_raw());
+                        }
+                        Op::ForIter => {
+                            let it = unsafe { &*top!(f) };
+                            match ab::iter_next(it)? {
+                                Some(v) => push!(f, v.into_raw()),
+                                None => {
+                                    unsafe { decref(pop!(f)) };
+                                    pc = arg as usize;
+                                }
+                            }
+                        }
+                        Op::GetAiter => {
+                            let o = popref!(f);
+                            let r = crate::types::genobject::get_aiter(&o)?;
+                            push!(f, r.into_raw());
+                        }
+                        Op::GetAnext => {
+                            let aiter = unsafe { &*top!(f) };
+                            let r = crate::types::genobject::get_anext_awaitable(aiter)?;
+                            push!(f, r.into_raw());
+                        }
+                        Op::EndAsyncFor => {
+                            let e = popref!(f);
+                            let aiter = popref!(f);
+                            drop(aiter);
+                            if is_subtype(e.type_ptr(), exc::StopAsyncIteration()) {
+                                // done
+                            } else {
+                                set_exc(e);
+                                return Err(PyErr);
+                            }
+                        }
+                        Op::GetAwaitable => {
+                            let o = popref!(f);
+                            push!(f, get_awaitable(&o, arg)?.into_raw());
+                        }
+                        Op::GetYieldFromIter => {
+                            let o = popref!(f);
+                            let r = if crate::types::genobject::is_coroutine_exact(&o) {
+                                let flags = crate::types::code::code(f.code()).flags();
+                                if flags & (bc::co::COROUTINE | bc::co::ITERABLE_COROUTINE) == 0 {
+                                    raise!(TypeError, "cannot 'yield from' a coroutine object in a non-coroutine generator");
+                                }
+                                o
+                            } else if crate::types::genobject::is_generator_exact(&o) {
+                                o
+                            } else {
+                                ab::get_iter(&o)?
+                            };
+                            push!(f, r.into_raw());
+                        }
+                        Op::Send => {
+                            let v = popref!(f);
+                            let recv = unsafe { &*top!(f) };
+                            match crate::types::genobject::send_to(recv, &v)? {
+                                crate::types::genobject::SendResult::Yield(r) => push!(f, r.into_raw()),
+                                crate::types::genobject::SendResult::Return(r) => {
+                                    unsafe { decref(pop!(f)) };
+                                    push!(f, r.into_raw());
+                                    pc = arg as usize;
+                                }
+                            }
+                        }
+                        Op::YieldValue => {
+                            let v = popref!(f);
+                            f.next_instr = pc as u32;
+                            f.yield_from_send = -1;
+                            if pc >= 2 {
+                                let (pop, _) = bc::decode(code[pc - 2]);
+                                if pop == Op::Send {
+                                    f.yield_from_send = (pc - 2) as i32;
+                                }
+                            }
+                            return Ok(Some(Exit::Yield(v)));
+                        }
+                        Op::CleanupThrow => {
+                            let e = popref!(f);
+                            let _last = popopt!(f);
+                            let _sub = popopt!(f);
+                            if is_subtype(e.type_ptr(), exc::StopIteration()) {
+                                let val = exc::stop_iteration_value(&e);
+                                push!(f, none::none_ref().into_raw());
+                                push!(f, val.into_raw());
+                            } else {
+                                set_exc(e);
+                                return Err(PyErr);
+                            }
+                        }
+                        Op::ReturnValue => {
+                            let v = popref!(f);
+                            return Ok(Some(Exit::Return(v)));
+                        }
+                        Op::Call | Op::CallKw => {
+                            let (n, kwnames) = if op == Op::CallKw {
+                                (arg as usize, Some(popref!(f)))
+                            } else {
+                                (arg as usize, None)
+                            };
+                            let base = f.stack_top - n - 2;
+                            let callable = f.slots[base];
+                            let self_or_null = f.slots[base + 1];
+                            let r = unsafe {
+                                if self_or_null.is_null() {
+                                    let args = f.slots.as_ptr().add(base + 2) as *const *mut PyObject;
+                                    let nkw = kwnames.as_ref().map_or(0, |k| tuple::tuple_len(k));
+                                    ab::vectorcall_raw(
+                                        &*callable,
+                                        args,
+                                        (n - nkw) | PY_VECTORCALL_ARGUMENTS_OFFSET,
+                                        kwnames.as_ref().map_or(std::ptr::null_mut(), |k| k.as_ptr()),
+                                    )
+                                } else {
+                                    let args = f.slots.as_ptr().add(base + 1) as *const *mut PyObject;
+                                    let nkw = kwnames.as_ref().map_or(0, |k| tuple::tuple_len(k));
+                                    ab::vectorcall_raw(
+                                        &*callable,
+                                        args,
+                                        n + 1 - nkw,
+                                        kwnames.as_ref().map_or(std::ptr::null_mut(), |k| k.as_ptr()),
+                                    )
+                                }
+                            };
+                            // pop args, self, callable
+                            for i in (base..f.stack_top).rev() {
+                                let p = std::mem::replace(&mut f.slots[i], std::ptr::null_mut());
+                                unsafe { xdecref(p) };
+                            }
+                            f.stack_top = base;
+                            if r.is_null() {
+                                return Err(PyErr);
+                            }
+                            push!(f, r);
+                        }
+                        Op::CallFunctionEx => {
+                            let kw = popopt!(f);
+                            let args = popref!(f);
+                            let self_or_null = popopt!(f);
+                            let callable = popref!(f);
+                            let args = if tuple::is_tuple_exact(&args) {
+                                args
+                            } else {
+                                match ab::sequence_tuple(&args) {
+                                    Ok(t) => t,
+                                    Err(e) => {
+                                        if exc_matches(exc::TypeError()) && args.ty().tp_iter.is_none() && !is_sequence_like(&args) {
+                                            clear_exc();
+                                            raise!(
+                                                TypeError,
+                                                "{} argument after * must be an iterable, not {}",
+                                                func_desc(&callable),
+                                                tname(&args)
+                                            );
+                                        }
+                                        return Err(e);
+                                    }
+                                }
+                            };
+                            let mut v: Vec<&PyObject> = Vec::with_capacity(tuple::tuple_len(&args) + 1);
+                            if let Some(s) = &self_or_null {
+                                v.push(s);
+                            }
+                            v.extend(tuple::tuple_items(&args).iter().copied());
+                            let kwd = match &kw {
+                                Some(k) if !dict::is_dict(k) => {
+                                    let d = dict::new_dict();
+                                    crate::types::dict_methods::dict_merge_kwargs(&d, k, callable.as_ptr())?;
+                                    Some(d)
+                                }
+                                Some(k) => Some(k.clone()),
+                                None => None,
+                            };
+                            let r = ab::call_with_kwargs_dict(&callable, &v, kwd.as_deref())?;
+                            push!(f, r.into_raw());
+                        }
+                        Op::CallIntrinsic1 => {
+                            let v = popref!(f);
+                            let r = call_intrinsic1(ts, f, arg, v)?;
+                            push!(f, r.into_raw());
+                        }
+                        Op::CallIntrinsic2 => {
+                            let b = popref!(f);
+                            let a = popref!(f);
+                            let r = call_intrinsic2(f, arg, a, b)?;
+                            push!(f, r.into_raw());
+                        }
+                        Op::MakeFunction => {
+                            let code = popref!(f);
+                            let func = funcobject::new_function(&code, f.globals(), None)?;
+                            push!(f, func.into_raw());
+                        }
+                        Op::SetFunctionAttribute => {
+                            let func = popref!(f);
+                            let attr = popref!(f);
+                            let fo = funcobject::func(&func);
+                            let slot = match arg {
+                                bc::make_fn::DEFAULTS => &mut fo.func_defaults,
+                                bc::make_fn::KWDEFAULTS => &mut fo.func_kwdefaults,
+                                bc::make_fn::ANNOTATIONS => &mut fo.func_annotations,
+                                bc::make_fn::CLOSURE => &mut fo.func_closure,
+                                bc::make_fn::ANNOTATE => &mut fo.func_annotate,
+                                _ => raise!(SystemError, "bad SetFunctionAttribute flag"),
+                            };
+                            let old = std::mem::replace(slot, attr.into_raw());
+                            unsafe { xdecref(old) };
+                            push!(f, func.into_raw());
+                        }
+                        Op::LoadBuildClass => {
+                            let b = f.builtins();
+                            let bc_ = if dict::is_dict(b) { dict::get_item_str(b, name!("__build_class__")) } else { ab::getitem(b, name!("__build_class__")).ok() };
+                            match bc_ {
+                                Some(v) => push!(f, v.into_raw()),
+                                None => raise!(NameError, "__build_class__ not found"),
+                            }
+                        }
+                        Op::RaiseVarargs => {
+                            let (e, cause) = match arg {
+                                0 => (None, None),
+                                1 => (Some(popref!(f)), None),
+                                _ => {
+                                    let c = popref!(f);
+                                    (Some(popref!(f)), Some(c))
+                                }
+                            };
+                            let r = do_raise(ts, e.as_deref(), cause.as_deref());
+                            if arg == 0 {
+                                // re-raise: keep the existing traceback, don't add this frame twice
+                                return Err(r);
+                            }
+                            return Err(r);
+                        }
+                        Op::Reraise => {
+                            let e = popref!(f);
+                            if arg != 0 {
+                                let lasti = popref!(f);
+                                if let Some(l) = int::as_i64(&lasti) {
+                                    f.lasti = l as u32;
+                                }
+                            }
+                            set_exc(e);
+                            return Err(ReraiseMarker::mark(ts));
+                        }
+                        Op::PushExcInfo => {
+                            let e = pop!(f);
+                            unsafe { incref(e) };
+                            let prev = set_handled_exception(ts, e);
+                            push!(f, if prev.is_null() { none::none_ref().into_raw() } else { prev });
+                            push!(f, e);
+                        }
+                        Op::PopExcept => {
+                            let prev = pop!(f);
+                            let prevv = if !prev.is_null() && unsafe { (*prev).is(none::none()) } {
+                                unsafe { decref(prev) };
+                                std::ptr::null_mut()
+                            } else {
+                                prev
+                            };
+                            let old = set_handled_exception(ts, prevv);
+                            unsafe { xdecref(old) };
+                        }
+                        Op::CheckExcMatch => {
+                            let t = popref!(f);
+                            let e = unsafe { &*top!(f) };
+                            check_exc_match_type(&t, false)?;
+                            let r = exception_matches(e, &t)?;
+                            push!(f, bool_::new_bool(r).into_raw());
+                        }
+                        Op::CheckEgMatch => {
+                            let t = popref!(f);
+                            let e = popref!(f);
+                            check_exc_match_type(&t, true)?;
+                            let (rest, matched) = crate::types::exceptiongroup::eg_match(&e, &t)?;
+                            if !matched.is(none::none()) {
+                                // the matched group becomes the handled exception
+                                let prev = set_handled_exception(ts, matched.clone().into_raw());
+                                unsafe { xdecref(prev) };
+                            }
+                            push!(f, rest.into_raw());
+                            push!(f, matched.into_raw());
+                        }
+                        Op::WithExceptStart => {
+                            let val = peek!(f, 1);
+                            let exit_self = peek!(f, 4);
+                            let exit_func = peek!(f, 5);
+                            let v = unsafe { &*val };
+                            let tp = type_ref(v.type_ptr());
+                            let tb = exc::exc_traceback(v).unwrap_or_else(none::none_ref);
+                            let r = if exit_self.is_null() {
+                                ab::call(unsafe { &*exit_func }, &[&tp, v, &tb])?
+                            } else {
+                                ab::call(unsafe { &*exit_func }, &[unsafe { &*exit_self }, &tp, v, &tb])?
+                            };
+                            push!(f, r.into_raw());
+                        }
+                        Op::BeforeWith | Op::BeforeAsyncWith => {
+                            let mgr = popref!(f);
+                            let (enter_n, exit_n) = if op == Op::BeforeWith {
+                                (name!("__enter__"), name!("__exit__"))
+                            } else {
+                                (name!("__aenter__"), name!("__aexit__"))
+                            };
+                            let enter = lookup(mgr.type_ptr(), enter_n);
+                            let exit = lookup(mgr.type_ptr(), exit_n);
+                            let (enter, exit) = match (enter, exit) {
+                                (Some(a), Some(b)) => (a, b),
+                                (en, ex) => {
+                                    let kind = if op == Op::BeforeWith { "" } else { "asynchronous " };
+                                    let missing = if en.is_none() {
+                                        if op == Op::BeforeWith { "__enter__" } else { "__aenter__" }
+                                    } else if op == Op::BeforeWith {
+                                        "__exit__"
+                                    } else {
+                                        "__aexit__"
+                                    };
+                                    let _ = ex;
+                                    raise!(
+                                        TypeError,
+                                        "'{}' object does not support the {}context manager protocol (missed {} method)",
+                                        tname(&mgr),
+                                        kind,
+                                        missing
+                                    );
+                                }
+                            };
+                            // push exit as (func, self) pair
+                            if exit.ty().tp_flags & Py_TPFLAGS_METHOD_DESCRIPTOR != 0 {
+                                push!(f, exit.into_raw());
+                                push!(f, mgr.clone().into_raw());
+                            } else {
+                                let bound = match exit.ty().tp_descr_get {
+                                    Some(g) => unsafe { from_c(g(exit.as_ptr(), mgr.as_ptr(), mgr.type_ptr() as *mut PyObject))? },
+                                    None => exit,
+                                };
+                                push!(f, bound.into_raw());
+                                push!(f, std::ptr::null_mut());
+                            }
+                            let r = ab::call_unbound(&enter, &mgr, &[])?;
+                            if op == Op::BeforeAsyncWith {
+                                let aw = get_awaitable(&r, 1)?;
+                                push!(f, aw.into_raw());
+                            } else {
+                                push!(f, r.into_raw());
+                            }
+                        }
+                        Op::SetupAnnotations => {
+                            if f.locals.is_null() {
+                                raise!(SystemError, "no locals found when setting up annotations");
+                            }
+                            let l = unsafe { &*f.locals };
+                            if mapping_get(l, name!("__annotations__"))?.is_none() {
+                                let d = dict::new_dict();
+                                ab::setitem(l, name!("__annotations__"), Some(&d))?;
+                            }
+                        }
+                        Op::ImportName => {
+                            let fromlist = popref!(f);
+                            let level = popref!(f);
+                            let nm = &cd.names[(arg & 0x7fffff) as usize];
+                            let locals = if f.locals.is_null() { none::none_ref() } else { unsafe { (*f.locals).to_ref() } };
+                            let m = crate::import::import_name_from_frame(f.globals(), &locals, nm, &fromlist, &level, f.builtins())?;
+                            push!(f, m.into_raw());
+                        }
+                        Op::ImportFrom => {
+                            let m = unsafe { &*top!(f) };
+                            let v = import_from(m, &cd.names[arg as usize])?;
+                            push!(f, v.into_raw());
+                        }
+                        Op::FormatSimple => {
+                            let v = popref!(f);
+                            push!(f, format_value(&v, None)?.into_raw());
+                        }
+                        Op::FormatWithSpec => {
+                            let spec = popref!(f);
+                            let v = popref!(f);
+                            push!(f, format_value(&v, Some(&spec))?.into_raw());
+                        }
+                        Op::ConvertValue => {
+                            let v = popref!(f);
+                            let r = match arg {
+                                1 => ab::str(&v)?,
+                                2 => ab::repr(&v)?,
+                                3 => ab::ascii(&v)?,
+                                _ => raise!(SystemError, "bad conversion"),
+                            };
+                            push!(f, r.into_raw());
+                        }
+                        Op::BuildTemplate => {
+                            let interps = popref!(f);
+                            let strings = popref!(f);
+                            let t = crate::types::templatelib::new_template(&strings, &interps)?;
+                            push!(f, t.into_raw());
+                        }
+                        Op::BuildInterpolation => {
+                            let spec = if arg & 1 != 0 { Some(popref!(f)) } else { None };
+                            let s = popref!(f);
+                            let v = popref!(f);
+                            let conv = arg >> 2;
+                            let r = crate::types::templatelib::new_interpolation(&v, &s, conv, spec.as_deref())?;
+                            push!(f, r.into_raw());
+                        }
+                        Op::MatchClass => {
+                            let names = popref!(f);
+                            let cls = popref!(f);
+                            let subject = popref!(f);
+                            let r = crate::interp::eval::match_class(&subject, &cls, arg as usize, &names)?;
+                            push!(f, r.into_raw());
+                        }
+                        Op::MatchMapping => {
+                            let s = unsafe { &*top!(f) };
+                            let r = s.ty().tp_flags & Py_TPFLAGS_MAPPING != 0;
+                            push!(f, bool_::new_bool(r).into_raw());
+                        }
+                        Op::MatchSequence => {
+                            let s = unsafe { &*top!(f) };
+                            let r = s.ty().tp_flags & Py_TPFLAGS_SEQUENCE != 0;
+                            push!(f, bool_::new_bool(r).into_raw());
+                        }
+                        Op::MatchKeys => {
+                            let keys = unsafe { &*top!(f) };
+                            let subject = unsafe { &*peek!(f, 2) };
+                            let r = match_keys(subject, keys)?;
+                            push!(f, r.into_raw());
+                        }
+                        Op::GetLen => {
+                            let o = unsafe { &*top!(f) };
+                            let n = ab::length(o)?;
+                            push!(f, int::new_int(n as i64).into_raw());
+                        }
+                        Op::LoadCommonConstant => {
+                            let v = match arg {
+                                0 => type_ref(exc::AssertionError()),
+                                1 => type_ref(exc::NotImplementedError()),
+                                2 => type_ref(tuple::tuple_type()),
+                                3 => crate::builtins::builtin("all")?,
+                                _ => crate::builtins::builtin("any")?,
+                            };
+                            push!(f, v.into_raw());
+                        }
+                        Op::ExtendedArg => unreachable!(),
+                        Op::Unused1 | Op::Unused2 | Op::Unused3 => raise!(SystemError, "unknown opcode {}", op as u8),
+                    }
+                }
+            })();
+            match result {
+                Ok(Some(exit)) => {
+                    if tracing {
+                        crate::modules::sys::trace_exit(ts, f, &exit)?;
+                    }
+                    if let Exit::Return(_) = exit {
+                        f.clear_stack();
+                    }
+                    return Ok(exit);
+                }
+                Ok(None) => unreachable!(),
+                Err(_) => {}
+            }
+        }
+        pending_err = false;
+        // ---------------------------------------------------------- exception unwinding
+        let e = match take_exc() {
+            Some(e) => e,
+            None => {
+                let _ = err!(SystemError, "error return without exception set");
+                take_exc().unwrap()
+            }
+        };
+        let reraise = ReraiseMarker::take(ts);
+        if !reraise {
+            chain_context(ts, &e);
+            add_traceback(f, &e);
+            if tracing {
+                if crate::modules::sys::trace_exception(ts, f, &e).is_err() {
+                    // tracer raised: replace exception
+                    let e2 = take_exc().unwrap();
+                    set_exc(e2);
+                    f.clear_stack();
+                    return Err(PyErr);
+                }
+            }
+        }
+        match find_handler(&code_obj, f.lasti) {
+            Some(h) => {
+                let depth = f.nlocalsplus + h.depth as usize;
+                while f.stack_top > depth {
+                    let p = pop!(f);
+                    unsafe { xdecref(p) };
+                }
+                if h.lasti {
+                    push!(f, int::new_int(f.lasti as i64).into_raw());
+                }
+                push!(f, e.into_raw());
+                pc = h.target as usize;
+                continue 'outer;
+            }
+            None => {
+                f.clear_stack();
+                set_exc(e);
+                if tracing {
+                    let _ = crate::modules::sys::trace_unwind(ts, f);
+                }
+                return Err(PyErr);
+            }
+        }
+    }
+}
+
+/// Distinguishes a bare re-raise (no new traceback entry) from a fresh raise.
+pub struct ReraiseMarker;
+impl ReraiseMarker {
+    fn mark(ts: &ThreadState) -> PyErr {
+        ts.reraise_flag.set(true);
+        PyErr
+    }
+    fn take(ts: &ThreadState) -> bool {
+        ts.reraise_flag.replace(false)
+    }
+}
+
+fn is_sequence_like(o: &PyObject) -> bool {
+    let sq = o.ty().tp_as_sequence;
+    !sq.is_null() && unsafe { (*sq).sq_item.is_some() }
+}
+
+fn func_desc(o: &PyObject) -> String {
+    if funcobject::is_function(o) {
+        let q = funcobject::func(o).func_qualname;
+        return format!("{}()", pystr::to_string_lossy(unsafe { &*q }));
+    }
+    if crate::types::cfunction::is_cfunction(o) {
+        return format!("{}()", crate::types::cfunction::cfunction_name(o));
+    }
+    format!("{} object", tname(o))
+}
+
+pub fn handle_eval_breaker(ts: &ThreadState) -> PyResult<()> {
+    let eb = ts.c.eval_breaker.load(std::sync::atomic::Ordering::Acquire);
+    if eb & crate::threads::EVAL_MERGE_REFCOUNTS != 0 {
+        crate::threads::process_merge_queue(ts);
+    }
+    if eb & crate::threads::EVAL_SAFEPOINT != 0 {
+        crate::gc::safepoint_poll(ts);
+    }
+    if eb & crate::threads::EVAL_SIGNALS != 0 {
+        crate::modules::signal::run_pending_handlers(ts)?;
+    }
+    if eb & crate::threads::EVAL_ASYNC_EXC != 0 {
+        crate::modules::thread::raise_async_exc(ts)?;
+    }
+    Ok(())
+}
+
+pub fn match_class(subject: &PyObject, cls: &PyObject, nargs: usize, names: &PyObject) -> PyResult {
+    if !is_type(cls) {
+        raise!(TypeError, "called match pattern must be a class");
+    }
+    if !ab::isinstance(subject, cls)? {
+        return Ok(none::none_ref());
+    }
+    let mut out: Vec<PyRef> = Vec::new();
+    let mut seen: Vec<PyRef> = Vec::new();
+    let match_self = |cls: &PyObject| -> bool {
+        let t = as_type(cls);
+        [
+            bool_::bool_type(),
+            crate::types::bytearray::bytearray_type(),
+            crate::types::bytes::bytes_type(),
+            dict::dict_type(),
+            float::float_type(),
+            crate::types::set::frozenset_type(),
+            int::int_type(),
+            list::list_type(),
+            crate::types::set::set_type(),
+            pystr::str_type(),
+            tuple::tuple_type(),
+        ]
+        .iter()
+        .any(|&b| is_subtype(t, b))
+    };
+    if nargs > 0 {
+        let match_args = ab::getattr_opt(cls, name!("__match_args__"))?;
+        match match_args {
+            Some(ma) => {
+                if !tuple::is_tuple(&ma) {
+                    raise!(TypeError, "{}.__match_args__ must be a tuple (got {})", type_name(unsafe { &*as_type(cls) }), tname(&ma));
+                }
+                let ml = tuple::tuple_len(&ma);
+                if nargs > ml {
+                    raise!(
+                        TypeError,
+                        "{}() accepts {} positional sub-pattern{} ({} given)",
+                        type_name(unsafe { &*as_type(cls) }),
+                        ml,
+                        if ml == 1 { "" } else { "s" },
+                        nargs
+                    );
+                }
+                for i in 0..nargs {
+                    let nm = tuple::tuple_get(&ma, i);
+                    if !pystr::is_str(nm) {
+                        raise!(TypeError, "__match_args__ elements must be strings (got {})", tname(nm));
+                    }
+                    if seen.iter().any(|s| pystr::str_eq(s, nm)) {
+                        raise!(
+                            TypeError,
+                            "{}() got multiple sub-patterns for attribute '{}'",
+                            type_name(unsafe { &*as_type(cls) }),
+                            pystr::to_string_lossy(nm)
+                        );
+                    }
+                    seen.push(nm.to_ref());
+                    match ab::getattr_opt(subject, nm)? {
+                        Some(v) => out.push(v),
+                        None => return Ok(none::none_ref()),
+                    }
+                }
+            }
+            None => {
+                if match_self(cls) {
+                    if nargs > 1 {
+                        raise!(
+                            TypeError,
+                            "{}() accepts 1 positional sub-pattern ({} given)",
+                            type_name(unsafe { &*as_type(cls) }),
+                            nargs
+                        );
+                    }
+                    out.push(subject.to_ref());
+                } else {
+                    raise!(
+                        TypeError,
+                        "{}() accepts 0 positional sub-patterns ({} given)",
+                        type_name(unsafe { &*as_type(cls) }),
+                        nargs
+                    );
+                }
+            }
+        }
+    }
+    for nm in tuple::tuple_items(names) {
+        if seen.iter().any(|s| pystr::str_eq(s, nm)) {
+            raise!(
+                TypeError,
+                "{}() got multiple sub-patterns for attribute '{}'",
+                type_name(unsafe { &*as_type(cls) }),
+                pystr::to_string_lossy(nm)
+            );
+        }
+        seen.push(nm.to_ref());
+        match ab::getattr_opt(subject, nm)? {
+            Some(v) => out.push(v),
+            None => return Ok(none::none_ref()),
+        }
+    }
+    Ok(tuple::new_tuple(out))
+}
+
+fn match_keys(subject: &PyObject, keys: &PyObject) -> PyResult {
+    let n = tuple::tuple_len(keys);
+    if n == 0 {
+        return Ok(tuple::empty_tuple());
+    }
+    let get = ab::getattr(subject, name!("get"))?;
+    let dummy = crate::types::object_type::sentinel();
+    let mut out = Vec::with_capacity(n);
+    let mut seen: Vec<PyRef> = Vec::new();
+    for k in tuple::tuple_items(keys) {
+        for s in &seen {
+            if ab::rich_eq(s, k)? {
+                raise!(ValueError, "mapping pattern checks duplicate key ({})", ab::repr_string(k)?);
+            }
+        }
+        seen.push(k.to_ref());
+        let v = ab::call(&get, &[k, &dummy])?;
+        if v.is(&dummy) {
+            return Ok(none::none_ref());
+        }
+        out.push(v);
+    }
+    Ok(tuple::new_tuple(out))
+}
+
+/// Is a suspended frame inside a yield-from / await send loop?
+pub fn is_in_send_loop(f: &Frame) -> bool {
+    f.yield_from_send >= 0
+}
+
+/// The delegated-to iterator finished during throw(): pop the receiver and
+/// arrange to resume at the Send instruction's exit target.
+pub fn finish_send_loop(f: &mut Frame) {
+    if f.yield_from_send < 0 {
+        return;
+    }
+    let d = crate::types::code::code_data(f.code());
+    let (_, target) = bc::decode(d.code[f.yield_from_send as usize]);
+    if f.stack_top > f.nlocalsplus {
+        f.stack_top -= 1;
+        let p = std::mem::replace(&mut f.slots[f.stack_top], std::ptr::null_mut());
+        unsafe { xdecref(p) };
+    }
+    f.next_instr = target;
+    f.yield_from_send = -1;
+}

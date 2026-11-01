@@ -1,0 +1,178 @@
+//! rpy-runtime: the interpreter core (CPython 3.15 compatible object model and C ABI).
+#![allow(clippy::missing_safety_doc, clippy::new_without_default, static_mut_refs)]
+#![allow(unused_unsafe)]
+
+#[macro_use]
+pub mod errors;
+pub mod abstract_;
+pub mod alloc;
+pub mod args;
+pub mod buffer;
+pub mod builtins;
+pub mod capi_ext;
+pub mod compile;
+
+pub mod ffi;
+pub mod gc;
+pub mod hash;
+pub mod import;
+pub mod import_spec;
+pub mod interp;
+pub mod methods;
+pub mod modules;
+pub mod object;
+pub mod threads;
+pub mod types;
+
+use errors::*;
+use object::PyRef;
+
+pub struct Config {
+    pub argv: Vec<String>,
+    pub hash_seed: Option<u32>,
+    pub optimize: i32,
+}
+
+/// Initialise the runtime: types, builtins, sys.
+pub fn initialize(cfg: &Config) -> PyResult<()> {
+    hash::init_hash_secret(cfg.hash_seed);
+    modules::sys::OPTIMIZE.store(cfg.optimize, std::sync::atomic::Ordering::Relaxed);
+    let _ = threads::current();
+    types::int::init_small_ints();
+    types::init_all()?;
+    modules::sys::init_bootstrap_types();
+    let _b = builtins::init()?;
+    let sys = modules::sys::create_sys_module(&cfg.argv)?;
+    let md = modules::sys::modules_dict();
+    types::dict::set_item_str(&md, "builtins", &builtins::builtins_module())?;
+    let _ = sys;
+    // sys.path: script dir is added by the caller; then the stdlib
+    let prefix = modules::sys_full::prefix();
+    let stdlib = std::env::var("RPYTHON_STDLIB").unwrap_or_else(|_| format!("{}/lib/python3.15t", prefix));
+    let path = modules::sys::get_sys_attr("path").unwrap();
+    if let Ok(pp) = std::env::var("PYTHONPATH") {
+        for p in pp.split(':').filter(|p| !p.is_empty()) {
+            types::list::append(&path, types::str::new_str(p));
+        }
+    }
+    types::list::append(&path, types::str::new_str(&stdlib));
+    Ok(())
+}
+
+/// Print an uncaught exception via sys.excepthook (or the built-in printer).
+pub fn print_exception_and_clear() {
+    let e = match take_exc() {
+        Some(e) => e,
+        None => return,
+    };
+    if let Some(hook) = modules::sys::get_sys_attr("excepthook") {
+        let t = types::typeobject::type_ref(e.type_ptr());
+        let tb = types::exceptions::exc_traceback(&e).unwrap_or_else(types::none::none_ref);
+        if abstract_::call(&hook, &[&t, &e, &tb]).is_ok() {
+            return;
+        }
+        clear_exc();
+    }
+    modules::traceback_print::print_exception(&e);
+}
+
+/// Handle SystemExit: returns the process exit code.
+pub fn handle_system_exit(e: &PyRef) -> i32 {
+    let code = unsafe { &*(e.as_ptr() as *const types::exceptions::SystemExitExc) }.code;
+    if code.is_null() || unsafe { &*code }.is(types::none::none()) {
+        return 0;
+    }
+    let c = unsafe { &*code };
+    if types::int::is_int(c) {
+        return types::int::as_i64(c).unwrap_or(1) as i32;
+    }
+    let s = abstract_::str_string(c).unwrap_or_default();
+    modules::sys::write_stderr(&format!("{}\n", s));
+    1
+}
+
+/// Run a script file as __main__; returns the exit code.
+pub fn run_file(path: &str) -> i32 {
+    let r = (|| -> PyResult<()> {
+        let src = match std::fs::read(path) {
+            Ok(s) => s,
+            Err(e) => {
+                modules::sys::write_stderr(&format!(
+                    "{}: can't open file {:?}: [Errno {}] {}\n",
+                    std::env::args().next().unwrap_or_default(),
+                    path,
+                    e.raw_os_error().unwrap_or(0),
+                    e
+                ));
+                return Err(PyErr);
+            }
+        };
+        let main = types::module::new_module("__main__")?;
+        let d = types::module::module_dict(&main);
+        types::dict::set_item_str(&d, "__file__", &types::str::new_str(path))?;
+        types::dict::set_item_str(&d, "__builtins__", &builtins::builtins_module())?;
+        types::dict::set_item_str(&modules::sys::modules_dict(), "__main__", &main)?;
+        let code = compile::compile_bytes(&src, path, compile::Mode::Exec, 0, -1)?;
+        interp::eval_code(&code.code, &d, Some(&d))?;
+        Ok(())
+    })();
+    match r {
+        Ok(()) => 0,
+        Err(_) => {
+            if !err_occurred() {
+                return 2;
+            }
+            if exc_matches(types::exceptions::SystemExit()) {
+                let e = take_exc().unwrap();
+                return handle_system_exit(&e);
+            }
+            print_exception_and_clear();
+            1
+        }
+    }
+}
+
+/// Run a string of code (-c).
+pub fn run_string(src: &str) -> i32 {
+    let r = (|| -> PyResult<()> {
+        let main = types::module::new_module("__main__")?;
+        let d = types::module::module_dict(&main);
+        types::dict::set_item_str(&d, "__builtins__", &builtins::builtins_module())?;
+        types::dict::set_item_str(&modules::sys::modules_dict(), "__main__", &main)?;
+        let code = compile::compile_str(src, "<string>", compile::Mode::Exec, 0, -1)?;
+        interp::eval_code(&code.code, &d, Some(&d))?;
+        Ok(())
+    })();
+    match r {
+        Ok(()) => 0,
+        Err(_) => {
+            if exc_matches(types::exceptions::SystemExit()) {
+                let e = take_exc().unwrap();
+                return handle_system_exit(&e);
+            }
+            print_exception_and_clear();
+            1
+        }
+    }
+}
+
+/// Run module as script (-m).
+pub fn run_module(name: &str) -> i32 {
+    let r = (|| -> PyResult<()> {
+        let runpy = import::import_absolute("runpy")?;
+        let f = abstract_::getattr_str(&runpy, "_run_module_as_main")?;
+        abstract_::call(&f, &[&types::str::new_str(name)])?;
+        Ok(())
+    })();
+    match r {
+        Ok(()) => 0,
+        Err(_) => {
+            if exc_matches(types::exceptions::SystemExit()) {
+                let e = take_exc().unwrap();
+                return handle_system_exit(&e);
+            }
+            print_exception_and_clear();
+            1
+        }
+    }
+}

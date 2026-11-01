@@ -1,0 +1,16 @@
+[package]
+name = "rpy-runtime"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+libc = "0.2"
+rpy-bigint = { path = "../bigint" }
+rpy-numfmt = { path = "../numfmt" }
+rpy-parser = { path = "../parser" }
+rpy-unicode = { path = "../unicode" }
+rpy-sre = { path = "../sre" }
+rpy-compiler = { path = "../compiler" }

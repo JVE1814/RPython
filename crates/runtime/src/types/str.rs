@@ -1,0 +1,598 @@
+//! `str` core: PEP 393 compact representation (layout forced by the ABI's inline
+//! accessors), creation, views, hashing, interning. String *methods* live in
+//! `str_methods.rs`.
+
+use crate::alloc;
+use crate::errors::*;
+use crate::ffi::*;
+use crate::object::*;
+use std::sync::atomic::Ordering::*;
+
+pub const KIND_1: u32 = 1;
+pub const KIND_2: u32 = 2;
+pub const KIND_4: u32 = 4;
+
+const STATE_COMPACT: u32 = 1 << 11;
+const STATE_ASCII: u32 = 1 << 12;
+const STATE_STATIC: u32 = 1 << 13;
+
+#[unsafe(no_mangle)]
+pub static mut PyUnicode_Type: PyTypeObject = PyTypeObject::ZERO;
+
+#[inline(always)]
+pub fn str_type() -> *mut PyTypeObject {
+    &raw mut PyUnicode_Type
+}
+
+#[inline(always)]
+pub fn is_str(o: &PyObject) -> bool {
+    o.is_type(str_type()) || o.ty().tp_flags & Py_TPFLAGS_UNICODE_SUBCLASS != 0
+}
+#[inline(always)]
+pub fn is_str_exact(o: &PyObject) -> bool {
+    o.is_type(str_type())
+}
+
+#[derive(Clone, Copy)]
+pub enum StrData<'a> {
+    L1(&'a [u8]),
+    U2(&'a [u16]),
+    U4(&'a [u32]),
+}
+
+impl<'a> StrData<'a> {
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        match self {
+            StrData::L1(s) => s.len(),
+            StrData::U2(s) => s.len(),
+            StrData::U4(s) => s.len(),
+        }
+    }
+    #[inline(always)]
+    pub fn get(&self, i: usize) -> u32 {
+        match self {
+            StrData::L1(s) => s[i] as u32,
+            StrData::U2(s) => s[i] as u32,
+            StrData::U4(s) => s[i],
+        }
+    }
+    pub fn iter(&self) -> impl Iterator<Item = u32> + 'a {
+        let d = *self;
+        (0..d.len()).map(move |i| d.get(i))
+    }
+    pub fn kind(&self) -> u32 {
+        match self {
+            StrData::L1(_) => 1,
+            StrData::U2(_) => 2,
+            StrData::U4(_) => 4,
+        }
+    }
+    pub fn as_bytes(&self) -> &'a [u8] {
+        unsafe {
+            match self {
+                StrData::L1(s) => s,
+                StrData::U2(s) => std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 2),
+                StrData::U4(s) => std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 4),
+            }
+        }
+    }
+    pub fn to_vec(&self) -> Vec<u32> {
+        self.iter().collect()
+    }
+}
+
+#[inline(always)]
+fn ascii_obj(o: &PyObject) -> &PyASCIIObject {
+    unsafe { o.cast::<PyASCIIObject>() }
+}
+
+#[inline(always)]
+pub fn str_len(o: &PyObject) -> usize {
+    ascii_obj(o).length as usize
+}
+
+#[inline(always)]
+pub fn str_kind(o: &PyObject) -> u32 {
+    (ascii_obj(o).state >> 8) & 7
+}
+
+#[inline(always)]
+pub fn str_is_ascii(o: &PyObject) -> bool {
+    ascii_obj(o).state & STATE_ASCII != 0
+}
+
+#[inline(always)]
+pub fn str_data_ptr(o: &PyObject) -> *mut u8 {
+    let st = ascii_obj(o).state;
+    let p = o.as_ptr() as *mut u8;
+    unsafe {
+        if st & STATE_COMPACT != 0 {
+            if st & STATE_ASCII != 0 {
+                p.add(std::mem::size_of::<PyASCIIObject>())
+            } else {
+                p.add(std::mem::size_of::<PyCompactUnicodeObject>())
+            }
+        } else {
+            (*(o.as_ptr() as *mut PyUnicodeObject)).data as *mut u8
+        }
+    }
+}
+
+#[inline(always)]
+pub fn str_data(o: &PyObject) -> StrData<'_> {
+    let len = str_len(o);
+    let p = str_data_ptr(o);
+    unsafe {
+        match str_kind(o) {
+            KIND_1 => StrData::L1(std::slice::from_raw_parts(p, len)),
+            KIND_2 => StrData::U2(std::slice::from_raw_parts(p as *const u16, len)),
+            _ => StrData::U4(std::slice::from_raw_parts(p as *const u32, len)),
+        }
+    }
+}
+
+/// Fast path: the string as `&str` if it is pure ASCII.
+#[inline(always)]
+pub fn ascii_str(o: &PyObject) -> Option<&str> {
+    if str_is_ascii(o) {
+        let len = str_len(o);
+        unsafe { Some(std::str::from_utf8_unchecked(std::slice::from_raw_parts(str_data_ptr(o), len))) }
+    } else {
+        None
+    }
+}
+
+/// Allocate an uninitialised compact string of `len` chars with the given maximum char.
+pub fn alloc_str(len: usize, maxchar: u32) -> PyRef {
+    let (kind, ascii) = if maxchar < 0x80 {
+        (1u32, true)
+    } else if maxchar < 0x100 {
+        (1, false)
+    } else if maxchar < 0x10000 {
+        (2, false)
+    } else {
+        (4, false)
+    };
+    let header = if ascii { std::mem::size_of::<PyASCIIObject>() } else { std::mem::size_of::<PyCompactUnicodeObject>() };
+    let size = header + (len + 1) * kind as usize;
+    unsafe {
+        let op = alloc::alloc_object(str_type(), size);
+        if op.is_null() {
+            panic!("out of memory allocating str");
+        }
+        let a = &mut *(op as *mut PyASCIIObject);
+        a.length = len as isize;
+        a.hash = -1;
+        a.state = (kind << 8) | STATE_COMPACT | if ascii { STATE_ASCII } else { 0 };
+        if !ascii {
+            let c = &mut *(op as *mut PyCompactUnicodeObject);
+            c.utf8_length = 0;
+            c.utf8 = std::ptr::null_mut();
+        }
+        PyRef::from_raw(op)
+    }
+}
+
+#[inline]
+fn empty_str() -> PyRef {
+    static EMPTY: std::sync::atomic::AtomicPtr<PyObject> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+    let p = EMPTY.load(Acquire);
+    if !p.is_null() {
+        return unsafe { PyRef::from_borrowed(p) };
+    }
+    let s = alloc_str(0, 0);
+    unsafe { make_immortal(s.as_ptr()) };
+    match EMPTY.compare_exchange(std::ptr::null_mut(), s.as_ptr(), AcqRel, Acquire) {
+        Ok(_) => s,
+        Err(other) => unsafe { PyRef::from_borrowed(other) },
+    }
+}
+
+/// Single-character Latin-1 strings are cached (immortal).
+pub fn latin1_char(c: u8) -> PyRef {
+    static CACHE: [std::sync::atomic::AtomicPtr<PyObject>; 256] =
+        [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; 256];
+    let p = CACHE[c as usize].load(Acquire);
+    if !p.is_null() {
+        return unsafe { PyRef::from_borrowed(p) };
+    }
+    let s = alloc_str(1, c as u32);
+    unsafe {
+        *str_data_ptr(&s) = c;
+        make_immortal(s.as_ptr());
+    }
+    match CACHE[c as usize].compare_exchange(std::ptr::null_mut(), s.as_ptr(), AcqRel, Acquire) {
+        Ok(_) => s,
+        Err(other) => unsafe { PyRef::from_borrowed(other) },
+    }
+}
+
+/// Create a str from Rust UTF-8.
+pub fn new_str(s: &str) -> PyRef {
+    let b = s.as_bytes();
+    if b.is_empty() {
+        return empty_str();
+    }
+    if b.is_ascii() {
+        if b.len() == 1 {
+            return latin1_char(b[0]);
+        }
+        let r = alloc_str(b.len(), 0x7f);
+        unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), str_data_ptr(&r), b.len()) };
+        return r;
+    }
+    let mut maxc = 0u32;
+    let mut n = 0usize;
+    for c in s.chars() {
+        maxc = maxc.max(c as u32);
+        n += 1;
+    }
+    let r = alloc_str(n, maxc);
+    let p = str_data_ptr(&r);
+    unsafe {
+        match str_kind(&r) {
+            KIND_1 => {
+                for (i, c) in s.chars().enumerate() {
+                    *p.add(i) = c as u8;
+                }
+            }
+            KIND_2 => {
+                let p = p as *mut u16;
+                for (i, c) in s.chars().enumerate() {
+                    *p.add(i) = c as u16;
+                }
+            }
+            _ => {
+                let p = p as *mut u32;
+                for (i, c) in s.chars().enumerate() {
+                    *p.add(i) = c as u32;
+                }
+            }
+        }
+    }
+    r
+}
+
+/// Create a str from code points (may include lone surrogates).
+pub fn from_codepoints(cps: &[u32]) -> PyRef {
+    let maxc = cps.iter().copied().max().unwrap_or(0);
+    from_codepoints_max(cps, maxc)
+}
+
+pub fn from_codepoints_max(cps: &[u32], maxc: u32) -> PyRef {
+    if cps.is_empty() {
+        return empty_str();
+    }
+    if cps.len() == 1 && maxc < 256 {
+        return latin1_char(cps[0] as u8);
+    }
+    let r = alloc_str(cps.len(), maxc);
+    let p = str_data_ptr(&r);
+    unsafe {
+        match str_kind(&r) {
+            KIND_1 => {
+                for (i, &c) in cps.iter().enumerate() {
+                    *p.add(i) = c as u8;
+                }
+            }
+            KIND_2 => {
+                let p = p as *mut u16;
+                for (i, &c) in cps.iter().enumerate() {
+                    *p.add(i) = c as u16;
+                }
+            }
+            _ => {
+                std::ptr::copy_nonoverlapping(cps.as_ptr(), p as *mut u32, cps.len());
+            }
+        }
+    }
+    r
+}
+
+pub fn from_latin1(b: &[u8]) -> PyRef {
+    if b.is_empty() {
+        return empty_str();
+    }
+    if b.len() == 1 {
+        return latin1_char(b[0]);
+    }
+    let maxc = if b.is_ascii() { 0x7f } else { 0xff };
+    let r = alloc_str(b.len(), maxc);
+    unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), str_data_ptr(&r), b.len()) };
+    r
+}
+
+pub fn from_ucs2(u: &[u16]) -> PyRef {
+    let maxc = u.iter().copied().max().unwrap_or(0) as u32;
+    if maxc < 256 {
+        let v: Vec<u8> = u.iter().map(|&c| c as u8).collect();
+        return from_latin1(&v);
+    }
+    let r = alloc_str(u.len(), maxc);
+    unsafe { std::ptr::copy_nonoverlapping(u.as_ptr(), str_data_ptr(&r) as *mut u16, u.len()) };
+    r
+}
+
+/// Create from a StrData (copies, canonicalising the kind).
+pub fn from_data(d: StrData) -> PyRef {
+    match d {
+        StrData::L1(b) => from_latin1(b),
+        StrData::U2(u) => from_ucs2(u),
+        StrData::U4(u) => from_codepoints(u),
+    }
+}
+
+/// Convert to a Rust String; lone surrogates become U+FFFD.
+pub fn to_string_lossy(o: &PyObject) -> String {
+    if let Some(s) = ascii_str(o) {
+        return s.to_owned();
+    }
+    str_data(o).iter().map(|c| char::from_u32(c).unwrap_or('\u{fffd}')).collect()
+}
+
+/// Convert to a Rust String; None if it contains lone surrogates.
+pub fn to_string_strict(o: &PyObject) -> Option<String> {
+    if let Some(s) = ascii_str(o) {
+        return Some(s.to_owned());
+    }
+    let mut out = String::with_capacity(str_len(o));
+    for c in str_data(o).iter() {
+        out.push(char::from_u32(c)?);
+    }
+    Some(out)
+}
+
+/// UTF-8 view, cached in the object (PyUnicode_AsUTF8 semantics). Errors on surrogates.
+pub fn as_utf8(o: &PyObject) -> PyResult<&str> {
+    if let Some(s) = ascii_str(o) {
+        return Ok(s);
+    }
+    unsafe {
+        let c = &*(o.as_ptr() as *const PyCompactUnicodeObject);
+        let cached = std::ptr::read_volatile(&c.utf8);
+        if !cached.is_null() {
+            let len = c.utf8_length as usize;
+            return Ok(std::str::from_utf8_unchecked(std::slice::from_raw_parts(cached as *const u8, len)));
+        }
+        let s = match to_string_strict(o) {
+            Some(s) => s,
+            None => {
+                let pos = str_data(o).iter().position(|c| (0xd800..0xe000).contains(&c)).unwrap_or(0);
+                return Err(crate::types::exceptions::unicode_encode_error(
+                    "utf-8",
+                    o,
+                    pos,
+                    pos + 1,
+                    "surrogates not allowed",
+                ));
+            }
+        };
+        let len = s.len();
+        let buf = alloc::raw_malloc(len + 1);
+        std::ptr::copy_nonoverlapping(s.as_ptr(), buf, len);
+        *buf.add(len) = 0;
+        let cm = o.as_ptr() as *mut PyCompactUnicodeObject;
+        let slot = std::sync::atomic::AtomicPtr::<std::ffi::c_char>::from_ptr(&raw mut (*cm).utf8);
+        match slot.compare_exchange(std::ptr::null_mut(), buf as *mut _, AcqRel, Acquire) {
+            Ok(_) => {
+                (*cm).utf8_length = len as isize;
+                Ok(std::str::from_utf8_unchecked(std::slice::from_raw_parts(buf, len)))
+            }
+            Err(_) => {
+                alloc::raw_free(buf);
+                as_utf8(o)
+            }
+        }
+    }
+}
+
+#[inline]
+pub fn str_hash(o: &PyObject) -> isize {
+    let a = ascii_obj(o);
+    let h = unsafe { std::ptr::read_volatile(&a.hash) };
+    if h != -1 {
+        return h;
+    }
+    let h = crate::hash::hash_bytes(str_data(o).as_bytes());
+    unsafe {
+        let hp = &raw mut (*(o.as_ptr() as *mut PyASCIIObject)).hash;
+        std::sync::atomic::AtomicIsize::from_ptr(hp).store(h, Relaxed);
+    }
+    h
+}
+
+#[inline]
+pub fn str_eq(a: &PyObject, b: &PyObject) -> bool {
+    if a.is(b) {
+        return true;
+    }
+    let la = str_len(a);
+    if la != str_len(b) || str_kind(a) != str_kind(b) {
+        return false;
+    }
+    let k = str_kind(a) as usize;
+    unsafe {
+        std::slice::from_raw_parts(str_data_ptr(a), la * k) == std::slice::from_raw_parts(str_data_ptr(b), la * k)
+    }
+}
+
+pub fn str_eq_ascii(a: &PyObject, s: &str) -> bool {
+    match ascii_str(a) {
+        Some(x) => x == s,
+        None => false,
+    }
+}
+
+pub fn str_cmp(a: &PyObject, b: &PyObject) -> std::cmp::Ordering {
+    let da = str_data(a);
+    let db = str_data(b);
+    if let (StrData::L1(x), StrData::L1(y)) = (da, db) {
+        return x.cmp(y);
+    }
+    let n = da.len().min(db.len());
+    for i in 0..n {
+        let (x, y) = (da.get(i), db.get(i));
+        if x != y {
+            return x.cmp(&y);
+        }
+    }
+    da.len().cmp(&db.len())
+}
+
+/// Concatenate two strings.
+pub fn concat(a: &PyObject, b: &PyObject) -> PyRef {
+    let la = str_len(a);
+    let lb = str_len(b);
+    if la == 0 {
+        return b.to_ref();
+    }
+    if lb == 0 {
+        return a.to_ref();
+    }
+    let maxc = max_char(a).max(max_char(b));
+    let r = alloc_str(la + lb, maxc);
+    let k = str_kind(&r);
+    write_into(&r, 0, str_data(a), k);
+    write_into(&r, la, str_data(b), k);
+    r
+}
+
+/// Maximum code point bound for the representation (cheap, not exact).
+pub fn max_char(o: &PyObject) -> u32 {
+    if str_is_ascii(o) {
+        0x7f
+    } else {
+        match str_kind(o) {
+            KIND_1 => 0xff,
+            KIND_2 => 0xffff,
+            _ => 0x10ffff,
+        }
+    }
+}
+
+/// Copy `src` into string `dst` (fresh, unshared) at char offset `at`.
+pub fn write_into(dst: &PyObject, at: usize, src: StrData, dkind: u32) {
+    let p = str_data_ptr(dst);
+    unsafe {
+        match (dkind, src) {
+            (KIND_1, StrData::L1(s)) => std::ptr::copy_nonoverlapping(s.as_ptr(), p.add(at), s.len()),
+            (KIND_2, StrData::U2(s)) => std::ptr::copy_nonoverlapping(s.as_ptr(), (p as *mut u16).add(at), s.len()),
+            (KIND_4, StrData::U4(s)) => std::ptr::copy_nonoverlapping(s.as_ptr(), (p as *mut u32).add(at), s.len()),
+            (KIND_2, s) => {
+                let d = (p as *mut u16).add(at);
+                for i in 0..s.len() {
+                    *d.add(i) = s.get(i) as u16;
+                }
+            }
+            (KIND_4, s) => {
+                let d = (p as *mut u32).add(at);
+                for i in 0..s.len() {
+                    *d.add(i) = s.get(i);
+                }
+            }
+            (_, s) => {
+                let d = p.add(at);
+                for i in 0..s.len() {
+                    *d.add(i) = s.get(i) as u8;
+                }
+            }
+        }
+    }
+}
+
+/// Builder for strings of unknown final width.
+pub struct StrBuilder {
+    pub buf: Vec<u32>,
+    pub maxc: u32,
+}
+impl StrBuilder {
+    pub fn new() -> Self {
+        StrBuilder { buf: Vec::new(), maxc: 0 }
+    }
+    pub fn with_capacity(n: usize) -> Self {
+        StrBuilder { buf: Vec::with_capacity(n), maxc: 0 }
+    }
+    #[inline]
+    pub fn push(&mut self, c: u32) {
+        self.maxc = self.maxc.max(c);
+        self.buf.push(c);
+    }
+    pub fn push_str(&mut self, s: &str) {
+        for c in s.chars() {
+            self.push(c as u32);
+        }
+    }
+    pub fn push_data(&mut self, d: StrData) {
+        for c in d.iter() {
+            self.push(c);
+        }
+    }
+    pub fn push_obj(&mut self, o: &PyObject) {
+        self.maxc = self.maxc.max(max_char(o).min(0x10ffff));
+        self.buf.extend(str_data(o).iter());
+    }
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+    pub fn finish(self) -> PyRef {
+        let real_max = if self.maxc >= 0x80 { self.buf.iter().copied().max().unwrap_or(0) } else { self.maxc };
+        from_codepoints_max(&self.buf, real_max)
+    }
+}
+
+// ---------------- interning ----------------
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+struct InternTable {
+    map: HashMap<Vec<u32>, usize>,
+}
+static INTERNED: Mutex<Option<InternTable>> = Mutex::new(None);
+
+/// Intern a str object; returns the canonical (immortal) instance.
+pub fn intern(s: PyRef) -> PyRef {
+    if !is_str_exact(&s) {
+        return s;
+    }
+    if ascii_obj(&s).state & 0xff != 0 {
+        return s;
+    }
+    let key: Vec<u32> = str_data(&s).to_vec();
+    let mut g = INTERNED.lock().unwrap();
+    let t = g.get_or_insert_with(|| InternTable { map: HashMap::new() });
+    if let Some(&p) = t.map.get(&key) {
+        return unsafe { PyRef::from_borrowed(p as *mut PyObject) };
+    }
+    unsafe {
+        str_hash(&s);
+        make_immortal(s.as_ptr());
+        (*(s.as_ptr() as *mut PyASCIIObject)).state |= 2; // SSTATE_INTERNED_IMMORTAL
+    }
+    t.map.insert(key, s.as_ptr() as usize);
+    s
+}
+
+pub fn intern_str(s: &str) -> PyRef {
+    intern(new_str(s))
+}
+
+pub fn is_interned(o: &PyObject) -> bool {
+    ascii_obj(o).state & 0xff != 0
+}
+
+/// `name!("__init__")` → `&'static PyObject` interned string, cached per call site.
+#[macro_export]
+macro_rules! name {
+    ($s:expr) => {{
+        static CELL: std::sync::atomic::AtomicPtr<$crate::ffi::PyObject> =
+            std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+        let mut p = CELL.load(std::sync::atomic::Ordering::Acquire);
+        if p.is_null() {
+            p = $crate::types::str::intern_str($s).into_raw();
+            CELL.store(p, std::sync::atomic::Ordering::Release);
+        }
+        unsafe { &*p }
+    }};
+}

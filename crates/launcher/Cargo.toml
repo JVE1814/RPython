@@ -1,0 +1,11 @@
+[package]
+name = "python"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "python3"
+path = "src/main.rs"
+
+[dependencies]
+rpy-runtime = { path = "../runtime" }
