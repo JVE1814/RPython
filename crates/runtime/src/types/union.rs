@@ -42,6 +42,7 @@ fn is_unionable(o: &PyObject) -> bool {
         || crate::types::genericalias::is_generic_alias(o)
         || is_union(o)
         || crate::types::typevar::is_typealias(o)
+        || crate::types::sentinel::is_sentinel(o)
 }
 
 /// Accumulates union members (flattening nested unions, de-duplicating).
@@ -330,7 +331,7 @@ pub fn init_types() {
 }
 
 pub fn ready() -> PyResult<()> {
-    type_ready(union_type())?;
+    lu::ready_type(union_type())?;
     let _ = name!("__args__");
     Ok(())
 }

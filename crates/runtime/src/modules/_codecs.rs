@@ -108,6 +108,15 @@ pub fn normalize_encoding(name: &str) -> String {
     out
 }
 
+/// Registry key of an encoding name: ASCII letters lower-cased and spaces
+/// replaced by hyphens (non-ASCII names are deprecated).
+pub fn registry_key(name: &str) -> PyResult<String> {
+    if !name.is_ascii() {
+        tu::warn(exc::DeprecationWarning(), "Support for non-ascii encoding names will be removed in 3.17", 1)?;
+    }
+    Ok(name.chars().map(|c| if c == ' ' { '-' } else { c.to_ascii_lowercase() }).collect())
+}
+
 fn ensure_encodings_imported() -> PyResult<()> {
     let empty = REGISTRY.lock().unwrap().search.is_empty();
     if empty && crate::import::get_loaded_module("encodings").is_none() {
@@ -122,7 +131,7 @@ pub fn lookup(encoding: &str) -> PyResult {
         raise!(ValueError, "embedded null character");
     }
     ensure_encodings_imported()?;
-    let key = normalize_encoding(encoding);
+    let key = registry_key(encoding)?;
     let (funcs, cached) = {
         let r = REGISTRY.lock().unwrap();
         (r.search.clone(), r.cache.get(&key).cloned())
@@ -1011,7 +1020,7 @@ fn m_lookup(_m: &PyObject, e: &PyObject) -> PyResult {
 
 fn m_forget_codec(_m: &PyObject, e: &PyObject) -> PyResult {
     let e = str_arg(e, "_forget_codec", 1)?;
-    let key = normalize_encoding(pystr::as_utf8(e)?);
+    let key = registry_key(pystr::as_utf8(e)?)?;
     REGISTRY.lock().unwrap().cache.remove(&key);
     Ok(none::none_ref())
 }

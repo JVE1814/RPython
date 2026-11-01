@@ -997,11 +997,31 @@ pub fn register_system_modules() {
     crate::import::register_builtin("_thread", crate::modules::_thread::init_module);
     crate::import::register_builtin("_signal", crate::modules::signal::init_module);
     crate::import::register_builtin("_imp", crate::modules::_imp::init_module);
+    crate::import::register_builtin("_queue", crate::modules::_queue::init_module);
+    crate::import::register_builtin("select", crate::modules::select::init_module);
+    crate::import::register_builtin("gc", crate::modules::gc_mod::init_module);
+    crate::import::register_builtin("faulthandler", crate::modules::faulthandler::init_module);
 }
 
 /// Late initialisation (after sys and builtins exist).
 pub fn post_init() -> PyResult<()> {
+    if config().faulthandler {
+        crate::modules::faulthandler::enable_at_startup();
+    }
     crate::import::install_importlib(&stdlib_dir())?;
+    if config().no_site == 0 && std::path::Path::new(&stdlib_dir()).join("site.py").is_file() {
+        if crate::import::import_absolute("site").is_err() {
+            // CPython aborts start-up here; we report and continue so that a
+            // partially available stdlib remains usable.
+            let e = take_exc();
+            if config().verbose > 0 {
+                crate::modules::sys::write_stderr("Error in site import:\n");
+                if let Some(e) = e {
+                    crate::modules::traceback_print::print_exception(&e);
+                }
+            }
+        }
+    }
     Ok(())
 }
 

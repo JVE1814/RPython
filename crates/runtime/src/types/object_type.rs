@@ -170,7 +170,24 @@ fn compatible_for_assignment(old: *mut PyTypeObject, new: *mut PyTypeObject) -> 
         if (*old).tp_dictoffset != (*new).tp_dictoffset {
             return false;
         }
-        solid_base(o) == solid_base(n) || o == n
+        solid_base(o) == solid_base(n) || o == n || same_slots_added(o, n)
+    }
+}
+
+/// Two heap types adding the same __slots__ to the same base have the same layout.
+fn same_slots_added(a: *mut PyTypeObject, b: *mut PyTypeObject) -> bool {
+    unsafe {
+        if !is_heap_type(a) || !is_heap_type(b) || (*a).tp_base != (*b).tp_base || (*a).tp_basicsize != (*b).tp_basicsize {
+            return false;
+        }
+        let (sa, sb) = ((*heap(a)).ht_slots, (*heap(b)).ht_slots);
+        if sa.is_null() || sb.is_null() {
+            return sa.is_null() && sb.is_null();
+        }
+        ab::rich_eq(&*sa, &*sb).unwrap_or_else(|_| {
+            crate::errors::clear_exc();
+            false
+        })
     }
 }
 
@@ -418,7 +435,7 @@ unsafe extern "C" fn type_setattro(op: *mut PyObject, nm: *mut PyObject, v: *mut
                 TypeError,
                 "cannot set '{}' attribute of immutable type '{}'",
                 pystr::to_string_lossy(&*nm),
-                type_name(&*tp)
+                std::ffi::CStr::from_ptr((*tp).tp_name).to_string_lossy()
             );
             return -1;
         }
@@ -1097,6 +1114,8 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
                     (*tp).tp_doc = Box::leak(v.into_boxed_slice()).as_ptr() as *const _;
                 }
             }
+            // a `__doc__` slot provides the member descriptor instead
+            None if slot_names.iter().any(|s| pystr::str_eq_ascii(s, "__doc__")) => {}
             None => dict::set_item(&dict, name!("__doc__"), none::none())?,
         }
         // special methods that are implicitly static/class methods

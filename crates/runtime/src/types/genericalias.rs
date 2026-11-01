@@ -576,8 +576,8 @@ unsafe extern "C" fn self_iter(o: *mut PyObject) -> *mut PyObject {
 }
 
 pub fn ready() -> PyResult<()> {
-    type_ready(ga_type())?;
-    type_ready(&raw mut GA_ITER_TYPE)?;
+    lu::ready_type(ga_type())?;
+    lu::ready_type(&raw mut GA_ITER_TYPE)?;
     Ok(())
 }
 
@@ -589,6 +589,31 @@ fn class_getitem(cls: &PyObject, arg: &PyObject) -> PyResult {
 pub fn add_class_getitem(tp: *mut PyTypeObject) {
     let ml = crate::mdefs![("__class_getitem__", O, class_getitem, "See PEP 585"; METH_CLASS)];
     lu::add_classmethod(tp, ml);
+}
+
+/// `__class_getitem__` for builtin types defined by other parts of the runtime, found by
+/// name once the builtins namespace is complete (and for the type of `type.__dict__`).
+pub fn register_late_class_getitems(builtins: &PyObject) {
+    for n in ["enumerate", "memoryview", "frozendict", "reversed"] {
+        if n == "reversed" {
+            continue; // not generic in CPython
+        }
+        if let Some(t) = crate::types::dict::get_item_rs(builtins, n) {
+            if is_type(&t) && crate::types::dict::get_item_rs(type_dict(as_type(&t)), "__class_getitem__").is_none() {
+                add_class_getitem(as_type(&t));
+            }
+        }
+    }
+    // mappingproxy
+    let tdict = unsafe { (*crate::types::typeobject::type_type()).tp_dict };
+    if !tdict.is_null() {
+        if let Ok(mp) = ab::getattr(type_obj(crate::types::typeobject::type_type()), name!("__dict__")) {
+            let t = mp.type_ptr();
+            if t != crate::types::dict::dict_type() && crate::types::dict::get_item_rs(type_dict(t), "__class_getitem__").is_none() {
+                add_class_getitem(t);
+            }
+        }
+    }
 }
 
 /// `__class_getitem__` for the core builtin types (called once everything is ready).
