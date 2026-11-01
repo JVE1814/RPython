@@ -85,6 +85,7 @@ pub mod _pickle;
 pub mod tty;
 pub mod array;
 pub mod _datetime;
+pub mod _tracemalloc;
 pub mod _csv;
 pub mod _multiprocessing;
 
@@ -117,6 +118,7 @@ pub fn register_all() {
     tty::register();
     crate::import::register_builtin("array", array::init_module);
     crate::import::register_builtin("_datetime", _datetime::init_module);
+    crate::import::register_builtin("_tracemalloc", _tracemalloc::init_module);
     crate::import::register_builtin("_csv", _csv::init_module);
     crate::import::register_builtin("_multiprocessing", _multiprocessing::init);
 }
