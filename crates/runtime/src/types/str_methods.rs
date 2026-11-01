@@ -888,7 +888,7 @@ fn m_zfill(o: &PyObject, wo: &PyObject) -> PyResult {
     let r = pad(o, fillw, 0, '0' as u32)?;
     // move a leading sign to the front
     let d = sd(&r);
-    if d.get(fillw) == '+' as u32 || d.get(fillw) == '-' as u32 {
+    if n > 0 && (d.get(fillw) == '+' as u32 || d.get(fillw) == '-' as u32) {
         let sign = d.get(fillw);
         let mut dm = dst_mut(&r);
         fill(&mut dm, 0, 1, sign);
@@ -1025,14 +1025,18 @@ fn m_rstrip(o: &PyObject, args: &[&PyObject]) -> PyResult {
 }
 
 fn m_removeprefix(o: &PyObject, p: &PyObject) -> PyResult {
-    arg_must_be_str("removeprefix", "", p).map_err(|_| err!(TypeError, "removeprefix() argument must be str, not {}", tname(p)))?;
+    if !pystr::is_str(p) {
+        raise!(TypeError, "removeprefix() argument must be str, not {}", tname(p));
+    }
     if tailmatch(o, p, None, None, false) {
         return Ok(substring(o, slen(p), slen(o)));
     }
     Ok(writer::exact(o))
 }
 fn m_removesuffix(o: &PyObject, p: &PyObject) -> PyResult {
-    arg_must_be_str("removesuffix", "", p).map_err(|_| err!(TypeError, "removesuffix() argument must be str, not {}", tname(p)))?;
+    if !pystr::is_str(p) {
+        raise!(TypeError, "removesuffix() argument must be str, not {}", tname(p));
+    }
     if slen(p) > 0 && tailmatch(o, p, None, None, true) {
         return Ok(substring(o, 0, slen(o) - slen(p)));
     }
@@ -1317,7 +1321,7 @@ pub fn replace(o: &PyObject, old: &PyObject, new: &PyObject, count: usize) -> Py
     let n = slen(o);
     let m = slen(old);
     let nl = slen(new);
-    if count == 0 || (m == 0 && false) {
+    if count == 0 || pystr::str_eq(old, new) {
         return Ok(writer::exact(o));
     }
     if m == 0 {
@@ -1812,6 +1816,11 @@ pub fn init_types() {
 pub fn ready_types() -> PyResult<()> {
     crate::types::typeobject::type_ready(&raw mut STR_ASCII_ITER_TYPE)?;
     crate::types::typeobject::type_ready(&raw mut STR_ITER_TYPE)?;
+    unsafe {
+        // not instantiable from Python (Py_TPFLAGS_DISALLOW_INSTANTIATION)
+        (*(&raw mut STR_ASCII_ITER_TYPE)).tp_new = None;
+        (*(&raw mut STR_ITER_TYPE)).tp_new = None;
+    }
     Ok(())
 }
 
