@@ -369,7 +369,7 @@ unsafe extern "C" fn dict_or(a: *mut PyObject, b: *mut PyObject) -> *mut PyObjec
     unsafe {
         let (a, b) = (&*a, &*b);
         let r = (|| -> PyResult {
-            if !dict::is_dict(a) || !dict::is_dict(b) {
+            if !dict::is_dict(a) || !dict::is_anydict(b) {
                 return Ok(ni());
             }
             let n = dict::copy(a)?;
