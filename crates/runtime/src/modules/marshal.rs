@@ -924,6 +924,32 @@ fn u32s(b: &[u8]) -> Vec<u32> {
     b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
 }
 
+/// Number of items if `o` is a tuple of str, else None.
+fn str_count(o: &PyObject) -> Option<usize> {
+    if !tuple::is_tuple(o) {
+        return None;
+    }
+    let items = tuple::tuple_items(o);
+    if items.iter().all(|it| pystr::is_str(it)) { Some(items.len()) } else { None }
+}
+
+/// `no_debug_ranges` is fixed at startup (-X / environment): look it up once.
+fn no_debug_ranges_cached() -> bool {
+    static V: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+    match V.load(std::sync::atomic::Ordering::Relaxed) {
+        2 => {
+            let v = no_debug_ranges();
+            // sys may not be fully set up yet during bootstrap: only memoise once it is
+            if crate::modules::sys::get_sys_attr("_xoptions").is_some() {
+                V.store(v as u8, std::sync::atomic::Ordering::Relaxed);
+            }
+            v
+        }
+        x => x != 0,
+    }
+}
+
+#[allow(dead_code)]
 fn str_tuple(o: &PyObject) -> Option<Vec<String>> {
     if !tuple::is_tuple(o) {
         return None;
@@ -973,17 +999,17 @@ fn build_code(p: CodeParts) -> PyResult<PyRef> {
     if words.iter().any(|w| (w & 0xff) as usize >= bc::NUM_OPS) {
         return Err(invalid());
     }
-    let names = str_tuple(p.names).ok_or_else(invalid)?;
-    let lpnames = str_tuple(p.lpnames).ok_or_else(invalid)?;
+    let names = str_count(p.names).ok_or_else(invalid)?;
+    let lpnames = str_count(p.lpnames).ok_or_else(invalid)?;
     let kinds = bytes::bytes_data(p.lpkinds).to_vec();
-    if kinds.len() != lpnames.len() {
+    if kinds.len() != lpnames {
         return Err(invalid());
     }
     let lt = bytes::bytes_data(p.linetable);
     if lt.len() != words.len() * 16 {
         return Err(invalid());
     }
-    let strip_cols = no_debug_ranges();
+    let strip_cols = no_debug_ranges_cached();
     let locations: Vec<Location> = u32s(lt)
         .chunks_exact(4)
         .map(|c| {
@@ -1006,42 +1032,35 @@ fn build_code(p: CodeParts) -> PyResult<PyRef> {
     if exception_table.iter().any(|e| e.start > e.end || e.end > n || e.target >= n.max(1)) {
         return Err(invalid());
     }
-    let cu = CodeUnit {
-        name: pystr::to_string_lossy(p.name),
-        qualname: pystr::to_string_lossy(p.qualname),
-        filename: pystr::to_string_lossy(p.filename),
-        firstlineno: p.firstlineno as u32,
+    let _ = (names, lpnames);
+    // Build directly from the unmarshalled objects (constants keep their identity,
+    // names are interned in place: no round trip through Rust strings).
+    let intern_all = |t: &PyObject| -> Vec<PyRef> {
+        tuple::tuple_items(t)
+            .iter()
+            .map(|n| if pystr::is_str_exact(n) { pystr::intern(n.to_ref()) } else { pystr::intern_str(&pystr::to_string_lossy(n)) })
+            .collect()
+    };
+    let consts = if tuple::is_tuple_exact(p.consts) { p.consts.to_ref() } else { ab::sequence_tuple(p.consts)? };
+    let intern1 = |s: &PyObject| if pystr::is_str_exact(s) { pystr::intern(s.to_ref()) } else { pystr::intern_str(&pystr::to_string_lossy(s)) };
+    code_mod::new_code_from_parts(code_mod::CodeParts {
         argcount: p.argcount as u32,
         posonlyargcount: p.posonly as u32,
         kwonlyargcount: p.kwonly as u32,
         flags: p.flags as u32,
         stacksize: p.stacksize as u32,
+        firstlineno: p.firstlineno as u32,
         code: words,
         locations,
-        consts: Vec::new(),
-        names,
-        localsplusnames: lpnames,
-        localspluskinds: kinds,
         exception_table,
-    };
-    let filename = p.filename.to_ref();
-    let r = code_mod::new_code_from_unit(&cu, Some(&filename))?;
-    // Install the original objects (constants, names) so that identity is preserved.
-    unsafe {
-        let rc = &mut *(r.as_ptr() as *mut PyCodeObject);
-        let rd = &mut *rc.data;
-        let consts = if tuple::is_tuple_exact(p.consts) { p.consts.to_ref() } else { ab::sequence_tuple(p.consts)? };
-        rd.consts = tuple::tuple_to_vec(&consts);
-        let old = rc.co_consts;
-        rc.co_consts = consts.into_raw();
-        xdecref(old);
-        let interned_names: Vec<PyRef> = tuple::tuple_items(p.names).iter().map(|n| pystr::intern(n.to_ref())).collect();
-        rd.names = interned_names.clone();
-        let old = rc.co_names;
-        rc.co_names = tuple::new_tuple(interned_names).into_raw();
-        xdecref(old);
-    }
-    Ok(r)
+        kinds,
+        filename: p.filename.to_ref(),
+        consts: tuple::tuple_to_vec(&consts),
+        names: intern_all(p.names),
+        localsplusnames: intern_all(p.lpnames),
+        name: intern1(p.name),
+        qualname: intern1(p.qualname),
+    })
 }
 
 /// PyMarshal_ReadObjectFromString equivalent.

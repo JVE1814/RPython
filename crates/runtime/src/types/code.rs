@@ -156,54 +156,99 @@ pub fn new_code_from_unit(cu: &CodeUnit, filename: Option<&PyRef>) -> PyResult {
     }
     let names: Vec<PyRef> = cu.names.iter().map(|n| pystr::intern_str(n)).collect();
     let lpn: Vec<PyRef> = cu.localsplusnames.iter().map(|n| pystr::intern_str(n)).collect();
-    let co_name = pystr::intern_str(&cu.name);
-    let co_qualname = pystr::intern_str(&cu.qualname);
-    let kinds = cu.localspluskinds.clone();
+    let parts = CodeParts {
+        argcount: cu.argcount,
+        posonlyargcount: cu.posonlyargcount,
+        kwonlyargcount: cu.kwonlyargcount,
+        flags: cu.flags,
+        stacksize: cu.stacksize,
+        firstlineno: cu.firstlineno,
+        code: cu.code.clone(),
+        locations: cu.locations.clone(),
+        exception_table: cu.exception_table.clone(),
+        kinds: cu.localspluskinds.clone(),
+        filename,
+        consts,
+        names,
+        localsplusnames: lpn,
+        name: pystr::intern_str(&cu.name),
+        qualname: pystr::intern_str(&cu.qualname),
+    };
+    new_code_from_parts(parts)
+}
+
+/// Everything a code object is made of, with the object-valued parts already built
+/// (used by the compiler path above and by marshal, which reads objects directly).
+pub struct CodeParts {
+    pub argcount: u32,
+    pub posonlyargcount: u32,
+    pub kwonlyargcount: u32,
+    pub flags: u32,
+    pub stacksize: u32,
+    pub firstlineno: u32,
+    pub code: Vec<u32>,
+    pub locations: Vec<Location>,
+    pub exception_table: Vec<ExceptionEntry>,
+    pub kinds: Vec<u8>,
+    pub filename: PyRef,
+    pub consts: Vec<PyRef>,
+    /// interned names
+    pub names: Vec<PyRef>,
+    pub localsplusnames: Vec<PyRef>,
+    pub name: PyRef,
+    pub qualname: PyRef,
+}
+
+pub fn new_code_from_parts(p: CodeParts) -> PyResult {
+    let kinds = p.kinds;
     let nlocals = kinds.iter().filter(|&&k| k & bc::fast::LOCAL != 0).count();
     let ncell = kinds.iter().filter(|&&k| k & bc::fast::CELL != 0).count();
     let nfree = kinds.iter().filter(|&&k| k & bc::fast::FREE != 0).count();
     let cell_slots: Vec<u32> =
         kinds.iter().enumerate().filter(|(_, k)| **k & bc::fast::CELL != 0).map(|(i, _)| i as u32).collect();
+    let exctable = encode_exception_table(&p.exception_table);
+    let linetable = encode_locations(&p.locations);
+    let ninstr = p.code.len();
     let data = Box::new(CodeData {
-        code: cu.code.clone(),
-        locations: cu.locations.clone(),
-        exception_table: cu.exception_table.clone(),
-        consts: consts.clone(),
-        names: names.clone(),
-        localsplusnames: lpn.clone(),
+        code: p.code,
+        locations: p.locations,
+        exception_table: p.exception_table,
+        consts: p.consts.clone(),
+        names: p.names.clone(),
+        localsplusnames: p.localsplusnames.clone(),
         localspluskinds: kinds.clone(),
-        co_name: co_name.clone(),
-        co_qualname: co_qualname.clone(),
-        filename: filename.clone(),
+        co_name: p.name.clone(),
+        co_qualname: p.qualname.clone(),
+        filename: p.filename.clone(),
         cell_slots,
         invocation_count: std::sync::atomic::AtomicU32::new(0),
         backedge_count: std::sync::atomic::AtomicU32::new(0),
-        caches: crate::interp::cache::CodeCaches::new(cu.code.len()),
+        caches: crate::interp::cache::CodeCaches::new(ninstr),
     });
     unsafe {
         let op = crate::alloc::alloc_object(code_type(), std::mem::size_of::<PyCodeObject>());
         let c = &mut *(op as *mut PyCodeObject);
-        c.co_consts = tuple::new_tuple(consts).into_raw();
-        c.co_names = tuple::new_tuple(names).into_raw();
-        c.co_exceptiontable = bytes::new_bytes(&encode_exception_table(&cu.exception_table)).into_raw();
-        c.co_flags = cu.flags as c_int;
-        c.co_argcount = cu.argcount as c_int;
-        c.co_posonlyargcount = cu.posonlyargcount as c_int;
-        c.co_kwonlyargcount = cu.kwonlyargcount as c_int;
-        c.co_stacksize = cu.stacksize as c_int;
-        c.co_firstlineno = cu.firstlineno as c_int;
+        c.co_consts = tuple::new_tuple(p.consts).into_raw();
+        c.co_names = tuple::new_tuple(p.names).into_raw();
+        c.co_exceptiontable = bytes::new_bytes(&exctable).into_raw();
+        c.co_flags = p.flags as c_int;
+        c.co_argcount = p.argcount as c_int;
+        c.co_posonlyargcount = p.posonlyargcount as c_int;
+        c.co_kwonlyargcount = p.kwonlyargcount as c_int;
+        c.co_stacksize = p.stacksize as c_int;
+        c.co_firstlineno = p.firstlineno as c_int;
         c.co_nlocalsplus = kinds.len() as c_int;
-        c.co_framesize = (kinds.len() + cu.stacksize as usize) as c_int;
+        c.co_framesize = (kinds.len() + p.stacksize as usize) as c_int;
         c.co_nlocals = nlocals as c_int;
         c.co_ncellvars = ncell as c_int;
         c.co_nfreevars = nfree as c_int;
         c.co_version = 1;
-        c.co_localsplusnames = tuple::new_tuple(lpn).into_raw();
+        c.co_localsplusnames = tuple::new_tuple(p.localsplusnames).into_raw();
         c.co_localspluskinds = bytes::new_bytes(&kinds).into_raw();
-        c.co_filename = filename.into_raw();
-        c.co_name = co_name.into_raw();
-        c.co_qualname = co_qualname.into_raw();
-        c.co_linetable = bytes::new_bytes(&encode_linetable(cu)).into_raw();
+        c.co_filename = p.filename.into_raw();
+        c.co_name = p.name.into_raw();
+        c.co_qualname = p.qualname.into_raw();
+        c.co_linetable = bytes::new_bytes(&linetable).into_raw();
         c.data = Box::into_raw(data);
         Ok(PyRef::from_raw(op))
     }
@@ -220,9 +265,9 @@ fn encode_exception_table(t: &[ExceptionEntry]) -> Vec<u8> {
 }
 
 /// Our own linetable encoding: per instruction (lineno, end_lineno, col, end_col) as u32 LE.
-fn encode_linetable(cu: &CodeUnit) -> Vec<u8> {
-    let mut v = Vec::with_capacity(cu.locations.len() * 16);
-    for l in &cu.locations {
+fn encode_locations(locs: &[Location]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(locs.len() * 16);
+    for l in locs {
         for x in [l.lineno, l.end_lineno, l.col, l.end_col] {
             v.extend_from_slice(&x.to_le_bytes());
         }
