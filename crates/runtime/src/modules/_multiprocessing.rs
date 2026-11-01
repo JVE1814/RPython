@@ -34,6 +34,9 @@ struct SemLock {
     kind: i32,
     /// Owned str or None.
     name: *mut PyObject,
+    /// Whether this object opened the semaphore (and must sem_close it);
+    /// a SemLock rebuilt from a raw inherited handle only borrows it.
+    owns_handle: bool,
 }
 
 static mut SEMLOCK_TYPE: PyTypeObject = PyTypeObject::ZERO;
@@ -58,7 +61,7 @@ fn is_mine(s: &SemLock) -> bool {
     s.count.load(Acquire) > 0 && s.last_tid.load(Acquire) == me()
 }
 
-unsafe fn alloc(tp: *mut PyTypeObject, handle: *mut libc::sem_t, kind: i32, maxvalue: i32, name: Option<PyRef>) -> PyResult {
+unsafe fn alloc(tp: *mut PyTypeObject, handle: *mut libc::sem_t, kind: i32, maxvalue: i32, name: Option<PyRef>, owns_handle: bool) -> PyResult {
     unsafe {
         let op = ((*tp).tp_alloc.unwrap())(tp, 0);
         if op.is_null() {
@@ -70,6 +73,7 @@ unsafe fn alloc(tp: *mut PyTypeObject, handle: *mut libc::sem_t, kind: i32, maxv
         std::ptr::write(&raw mut (*s).count, AtomicI32::new(0));
         (*s).kind = kind;
         (*s).maxvalue = maxvalue;
+        (*s).owns_handle = owns_handle;
         (*s).name = match name {
             Some(n) => n.into_raw(),
             None => std::ptr::null_mut(),
@@ -118,13 +122,13 @@ fn semlock_new_impl(tp: *mut PyTypeObject, a: &fc::VcArgs) -> PyResult {
         unsafe { libc::sem_close(handle) };
         return Err(os_err(e));
     }
-    unsafe { alloc(tp, handle, kind, maxvalue, if unlink { None } else { Some(name.to_ref()) }) }
+    unsafe { alloc(tp, handle, kind, maxvalue, if unlink { None } else { Some(name.to_ref()) }, true) }
 }
 
 unsafe extern "C" fn semlock_dealloc(op: *mut PyObject) {
     unsafe {
         let s = op as *mut SemLock;
-        if !(*s).handle.is_null() && (*s).handle != libc::SEM_FAILED {
+        if (*s).owns_handle && !(*s).handle.is_null() && (*s).handle != libc::SEM_FAILED {
             libc::sem_close((*s).handle);
         }
         crate::object::xdecref((*s).name);
@@ -319,7 +323,8 @@ fn semlock_rebuild(cls: &PyObject, args: &[&PyObject]) -> PyResult {
         }
         Some(name.to_ref())
     };
-    unsafe { alloc(cls.as_ptr() as *mut PyTypeObject, handle, kind, maxvalue, keep_name) }
+    let owns = keep_name.is_some();
+    unsafe { alloc(cls.as_ptr() as *mut PyTypeObject, handle, kind, maxvalue, keep_name, owns) }
 }
 
 fn get_handle(o: &PyObject) -> PyResult {
