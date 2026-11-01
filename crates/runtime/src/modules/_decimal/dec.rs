@@ -105,37 +105,145 @@ pub enum Kind {
     SNaN,
 }
 
+/// Coefficient storage: up to two base-10^19 limbs inline (values below 10^38),
+/// larger values on the heap.  Derefs to the trimmed limb slice.
+#[derive(Clone)]
+pub enum Coef {
+    Small(u8, [u64; 2]),
+    Big(Vec<u64>),
+}
+
+impl Coef {
+    #[inline]
+    pub const fn zero() -> Coef {
+        Coef::Small(0, [0, 0])
+    }
+    #[inline]
+    pub fn from_u128(v: u128) -> Coef {
+        if v < nat::BASE as u128 {
+            if v == 0 { Coef::zero() } else { Coef::Small(1, [v as u64, 0]) }
+        } else if (v >> 64) < nat::BASE as u128 {
+            let (hi, lo) = nat::div_base(v);
+            if hi < nat::BASE {
+                return Coef::Small(2, [lo, hi]);
+            }
+            Coef::Big(nat::from_u128(v))
+        } else {
+            Coef::Big(nat::from_u128(v))
+        }
+    }
+    #[inline]
+    pub fn from_u64(v: u64) -> Coef {
+        Coef::from_u128(v as u128)
+    }
+    /// Value if it fits in two limbs.
+    #[inline]
+    pub fn small(&self) -> Option<u128> {
+        match self {
+            Coef::Small(0, _) => Some(0),
+            Coef::Small(1, d) => Some(d[0] as u128),
+            Coef::Small(_, d) => Some(d[0] as u128 + d[1] as u128 * nat::BASE as u128),
+            Coef::Big(_) => None,
+        }
+    }
+    pub fn to_vec(&self) -> Vec<u64> {
+        (**self).to_vec()
+    }
+    pub fn incr(&mut self) {
+        if let Some(v) = self.small() {
+            *self = Coef::from_u128(v + 1);
+            return;
+        }
+        let mut v = self.to_vec();
+        nat::incr(&mut v);
+        *self = Coef::from(v);
+    }
+}
+
+impl From<Vec<u64>> for Coef {
+    #[inline]
+    fn from(mut v: Vec<u64>) -> Coef {
+        nat::trim(&mut v);
+        match v.len() {
+            0 => Coef::zero(),
+            1 => Coef::Small(1, [v[0], 0]),
+            2 => Coef::Small(2, [v[0], v[1]]),
+            _ => Coef::Big(v),
+        }
+    }
+}
+
+impl From<&[u64]> for Coef {
+    fn from(v: &[u64]) -> Coef {
+        match v.len() {
+            0 => Coef::zero(),
+            1 => Coef::Small(1, [v[0], 0]),
+            2 => Coef::Small(2, [v[0], v[1]]),
+            _ => Coef::Big(v.to_vec()),
+        }
+    }
+}
+
+impl std::ops::Deref for Coef {
+    type Target = [u64];
+    #[inline]
+    fn deref(&self) -> &[u64] {
+        match self {
+            Coef::Small(n, d) => &d[..*n as usize],
+            Coef::Big(v) => v,
+        }
+    }
+}
+
+impl PartialEq for Coef {
+    fn eq(&self, o: &Coef) -> bool {
+        **self == **o
+    }
+}
+
+impl PartialEq<[u64]> for Coef {
+    fn eq(&self, o: &[u64]) -> bool {
+        **self == *o
+    }
+}
+
+impl std::fmt::Debug for Coef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", nat::to_string(self))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Dec {
     pub neg: bool,
     pub kind: Kind,
     pub exp: i64,
     /// Coefficient (for NaNs: the payload); empty = 0.
-    pub coef: Vec<u64>,
+    pub coef: Coef,
 }
 
 impl Dec {
     #[inline]
-    pub fn finite(neg: bool, coef: Vec<u64>, exp: i64) -> Dec {
-        Dec { neg, kind: Kind::Finite, exp, coef }
+    pub fn finite(neg: bool, coef: impl Into<Coef>, exp: i64) -> Dec {
+        Dec { neg, kind: Kind::Finite, exp, coef: coef.into() }
     }
     pub fn from_u64(neg: bool, c: u64, exp: i64) -> Dec {
-        Dec::finite(neg, nat::from_u64(c), exp)
+        Dec::finite(neg, Coef::from_u64(c), exp)
     }
     pub fn from_i64(v: i64) -> Dec {
         Dec::from_u64(v < 0, v.unsigned_abs(), 0)
     }
     pub fn zero() -> Dec {
-        Dec::finite(false, vec![], 0)
+        Dec::finite(false, Coef::zero(), 0)
     }
     pub fn one() -> Dec {
         Dec::from_u64(false, 1, 0)
     }
     pub fn inf(neg: bool) -> Dec {
-        Dec { neg, kind: Kind::Inf, exp: 0, coef: vec![] }
+        Dec { neg, kind: Kind::Inf, exp: 0, coef: Coef::zero() }
     }
     pub fn nan() -> Dec {
-        Dec { neg: false, kind: Kind::NaN, exp: 0, coef: vec![] }
+        Dec { neg: false, kind: Kind::NaN, exp: 0, coef: Coef::zero() }
     }
     #[inline]
     pub fn is_nan(&self) -> bool {
@@ -294,7 +402,11 @@ pub fn finalize(mut d: Dec, ctx: &mut Ctx, rest: Rest) -> Dec {
         }
         return d;
     }
-    let nd = nat::digits(&d.coef) as i128;
+    let small = d.coef.small();
+    let nd = match small {
+        Some(v) => if v == 0 { 0 } else { nat::u128_digits(v) as i128 },
+        None => nat::digits(&d.coef) as i128,
+    };
     let mut exp = d.exp as i128;
     let adj = exp + nd.max(1) - 1;
     let subnormal = adj < emin;
@@ -306,58 +418,98 @@ pub fn finalize(mut d: Dec, ctx: &mut Ctx, rest: Rest) -> Dec {
         target = etiny;
     }
     let mut rest = rest;
-    let mut rounded = false;
-    if target > exp {
-        let shift = target - exp;
-        let shift = if shift > u64::MAX as i128 / 2 { u64::MAX / 2 } else { shift as u64 };
-        let (q, r) = shift_round(&d.coef, shift, rest);
-        d.coef = q;
-        rest = r;
-        exp = target;
-        rounded = true;
-    }
-    if rest != Rest::Zero {
-        rounded = true;
-        let last = if d.coef.is_empty() { 0 } else { d.coef[0] % 10 };
-        if round_up(ctx.round, d.neg, last, rest) {
-            nat::incr(&mut d.coef);
-            if nat::digits(&d.coef) as i128 > prec {
-                d.coef = nat::shr_trunc(&d.coef, 1);
-                exp += 1;
+    let rounded = target > exp || rest != Rest::Zero;
+    match small {
+        Some(v) => {
+            // everything fits in u128: round with plain integer arithmetic
+            let mut q = v;
+            if target > exp {
+                let shift = target - exp;
+                let removed = if shift > 38 {
+                    q = 0;
+                    if v == 0 { Rest::Zero } else { Rest::Lt }
+                } else {
+                    let p = 10u128.pow(shift as u32);
+                    let r = v % p;
+                    q = v / p;
+                    let h = p / 2;
+                    if r == 0 {
+                        Rest::Zero
+                    } else if r < h {
+                        Rest::Lt
+                    } else if r == h {
+                        Rest::Half
+                    } else {
+                        Rest::Gt
+                    }
+                };
+                rest = combine_rest(removed, rest);
+                exp = target;
+            }
+            if rest != Rest::Zero && round_up(ctx.round, d.neg, (q % 10) as u64, rest) {
+                q += 1;
+                if prec <= 38 && q == 10u128.pow(prec as u32) {
+                    q /= 10;
+                    exp += 1;
+                }
+            }
+            d.coef = Coef::from_u128(q);
+        }
+        None => {
+            if target > exp {
+                let shift = target - exp;
+                let shift = if shift > u64::MAX as i128 / 2 { u64::MAX / 2 } else { shift as u64 };
+                let (q, r) = shift_round(&d.coef, shift, rest);
+                d.coef = Coef::from(q);
+                rest = r;
+                exp = target;
+            }
+            if rest != Rest::Zero {
+                let last = if d.coef.is_empty() { 0 } else { d.coef[0] % 10 };
+                if round_up(ctx.round, d.neg, last, rest) {
+                    d.coef.incr();
+                    if nat::digits(&d.coef) as i128 > prec {
+                        d.coef = Coef::from(nat::shr_trunc(&d.coef, 1));
+                        exp += 1;
+                    }
+                }
             }
         }
     }
+    let mut st = 0;
     if rounded {
-        ctx.status |= ROUNDED;
+        st |= ROUNDED;
     }
     if rest != Rest::Zero {
-        ctx.status |= INEXACT;
+        st |= INEXACT;
     }
     if subnormal {
-        ctx.status |= SUBNORMAL;
+        st |= SUBNORMAL;
         if rest != Rest::Zero {
-            ctx.status |= UNDERFLOW;
+            st |= UNDERFLOW;
             if d.coef.is_empty() {
-                ctx.status |= CLAMPED;
+                st |= CLAMPED;
             }
         }
     }
-    // overflow
+    ctx.status |= st;
     if !d.coef.is_empty() {
-        let adj = exp + nat::digits(&d.coef) as i128 - 1;
-        if adj > emax {
+        let digits = match d.coef.small() {
+            Some(v) => nat::u128_digits(v) as i128,
+            None => nat::digits(&d.coef) as i128,
+        };
+        if exp + digits - 1 > emax {
             return overflow_result(d.neg, ctx);
         }
         if ctx.clamp {
             let etop = emax - prec + 1;
             if exp > etop {
-                d.coef = nat::shl(&d.coef, (exp - etop) as u64);
+                d.coef = Coef::from(nat::shl(&d.coef, (exp - etop) as u64));
                 exp = etop;
                 ctx.status |= CLAMPED;
             }
         }
     } else {
-        // rounded to zero
         let emax_eff = if ctx.clamp { emax - prec + 1 } else { emax };
         if exp > emax_eff {
             exp = emax_eff;
@@ -372,12 +524,13 @@ pub fn finalize(mut d: Dec, ctx: &mut Ctx, rest: Rest) -> Dec {
     d
 }
 
+
 /// Truncate a NaN payload to fit the context.
 pub fn fix_nan(mut d: Dec, ctx: &Ctx) -> Dec {
     if d.is_nan() && !d.coef.is_empty() {
         let maxlen = (ctx.prec - ctx.clamp as i64).max(0) as u64;
         if nat::digits(&d.coef) > maxlen {
-            d.coef = nat::low_digits(&d.coef, maxlen);
+            d.coef = nat::low_digits(&d.coef, maxlen).into();
         }
     }
     d
@@ -413,7 +566,7 @@ pub fn parse(s: &[u8]) -> Option<Dec> {
         if !payload.iter().all(|c| c.is_ascii_digit()) {
             return None;
         }
-        return Some(Dec { neg, kind, exp: 0, coef: nat::from_digits(payload) });
+        return Some(Dec { neg, kind, exp: 0, coef: nat::from_digits(payload).into() });
     }
     // finite number
     let mut digits: Vec<u8> = Vec::with_capacity(rest.len());

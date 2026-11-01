@@ -1,6 +1,13 @@
-"""JSON token scanner
+"""Value dispatch for the JSON decoder.
+
+make_scanner(context) returns a callable ``scan(string, idx)`` that decodes
+the single JSON value starting at ``string[idx]`` and returns
+``(value, end)``.  When no value starts there it raises
+``StopIteration(idx)``.  The context (normally a JSONDecoder) supplies the
+container and string parsers, the hooks and the key memo.
 """
 import re
+
 try:
     from _json import make_scanner as c_make_scanner
 except ImportError:
@@ -8,70 +15,71 @@ except ImportError:
 
 __all__ = ['make_scanner']
 
-NUMBER_RE = re.compile(
-    r'(-?(?:0|[1-9][0-9]*))(\.[0-9]+)?([eE][-+]?[0-9]+)?',
-    (re.VERBOSE | re.MULTILINE | re.DOTALL))
+# integer part, optional fraction, optional exponent (ASCII digits only)
+NUMBER_RE = re.compile(r'(-?(?:0|[1-9][0-9]*))(\.[0-9]+)?([eE][-+]?[0-9]+)?')
+
+# literal words and the value (or parse_constant argument) they stand for
+_WORDS = (('null', None), ('true', True), ('false', False))
+_SPECIAL_FLOATS = ('NaN', 'Infinity', '-Infinity')
+
+
+class _PyScanner:
+    """Pure-Python scanner bound to one decoder context."""
+
+    def __init__(self, context):
+        self.parse_object = context.parse_object
+        self.parse_array = context.parse_array
+        self.parse_string = context.parse_string
+        self.strict = context.strict
+        self.object_hook = context.object_hook
+        self.object_pairs_hook = context.object_pairs_hook
+        self.array_hook = getattr(context, 'array_hook', None)
+        self.parse_float = context.parse_float
+        self.parse_int = context.parse_int
+        self.parse_constant = context.parse_constant
+        self.memo = context.memo
+
+    def __call__(self, string, idx):
+        # the key memo only lives for one top-level value
+        try:
+            return self.value_at(string, idx)
+        finally:
+            self.memo.clear()
+
+    def value_at(self, s, idx):
+        if idx < 0 or idx >= len(s):
+            raise StopIteration(idx)
+        lead = s[idx]
+        if lead == '"':
+            return self.parse_string(s, idx + 1, self.strict)
+        if lead == '{':
+            return self.parse_object((s, idx + 1), self.strict,
+                                     self.value_at, self.object_hook,
+                                     self.object_pairs_hook, self.memo)
+        if lead == '[':
+            return self.parse_array((s, idx + 1), self.value_at,
+                                    self.array_hook)
+        for word, value in _WORDS:
+            if s.startswith(word, idx):
+                return value, idx + len(word)
+        number = NUMBER_RE.match(s, idx)
+        if number is not None:
+            whole, fraction, exponent = number.groups()
+            if fraction or exponent:
+                value = self.parse_float(whole + (fraction or '') +
+                                         (exponent or ''))
+            else:
+                value = self.parse_int(whole)
+            return value, number.end()
+        for word in _SPECIAL_FLOATS:
+            if s.startswith(word, idx):
+                return self.parse_constant(word), idx + len(word)
+        raise StopIteration(idx)
+
 
 def py_make_scanner(context):
-    parse_object = context.parse_object
-    parse_array = context.parse_array
-    parse_string = context.parse_string
-    match_number = NUMBER_RE.match
-    strict = context.strict
-    parse_float = context.parse_float
-    parse_int = context.parse_int
-    parse_constant = context.parse_constant
-    object_hook = context.object_hook
-    object_pairs_hook = context.object_pairs_hook
-    array_hook = getattr(context, 'array_hook', None)
-    memo = context.memo
+    """Return a pure-Python scanner for *context* (see module docstring)."""
+    return _PyScanner(context)
 
-    def _scan_once(string, idx):
-        try:
-            nextchar = string[idx]
-        except IndexError:
-            raise StopIteration(idx) from None
-
-        if nextchar == '"':
-            return parse_string(string, idx + 1, strict)
-        elif nextchar == '{':
-            return parse_object((string, idx + 1), strict,
-                _scan_once, object_hook, object_pairs_hook, memo)
-        elif nextchar == '[':
-            res, end = parse_array((string, idx + 1), _scan_once)
-            if array_hook is not None:
-                res = array_hook(res)
-            return res, end
-        elif nextchar == 'n' and string[idx:idx + 4] == 'null':
-            return None, idx + 4
-        elif nextchar == 't' and string[idx:idx + 4] == 'true':
-            return True, idx + 4
-        elif nextchar == 'f' and string[idx:idx + 5] == 'false':
-            return False, idx + 5
-
-        m = match_number(string, idx)
-        if m is not None:
-            integer, frac, exp = m.groups()
-            if frac or exp:
-                res = parse_float(integer + (frac or '') + (exp or ''))
-            else:
-                res = parse_int(integer)
-            return res, m.end()
-        elif nextchar == 'N' and string[idx:idx + 3] == 'NaN':
-            return parse_constant('NaN'), idx + 3
-        elif nextchar == 'I' and string[idx:idx + 8] == 'Infinity':
-            return parse_constant('Infinity'), idx + 8
-        elif nextchar == '-' and string[idx:idx + 9] == '-Infinity':
-            return parse_constant('-Infinity'), idx + 9
-        else:
-            raise StopIteration(idx)
-
-    def scan_once(string, idx):
-        try:
-            return _scan_once(string, idx)
-        finally:
-            memo.clear()
-
-    return scan_once
 
 make_scanner = c_make_scanner or py_make_scanner

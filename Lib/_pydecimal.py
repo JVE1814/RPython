@@ -33,7 +33,7 @@ __libmpdec_version__ = '2.5.1'
 
 import math as _math
 import numbers as _numbers
-import sys
+import sys as _sys
 
 try:
     from collections import namedtuple as _namedtuple
@@ -57,7 +57,7 @@ _ROUNDINGS = (ROUND_UP, ROUND_DOWN, ROUND_CEILING, ROUND_FLOOR,
 HAVE_THREADS = True
 HAVE_CONTEXTVAR = True
 
-if sys.maxsize == 2**63 - 1:
+if _sys.maxsize == 2**63 - 1:
     MAX_PREC = 999999999999999999
     MAX_EMAX = 999999999999999999
     MIN_EMIN = -999999999999999999
@@ -946,7 +946,8 @@ def _op_minus(a, env):
         return _inf(a._sign ^ 1)
     sign = a._sign ^ 1
     if a._int == 0:
-        sign = 1 if env.rnd == ROUND_FLOOR else 0
+        # 0 - a: only +0 - (+0) under ROUND_FLOOR gives -0
+        sign = 1 if (env.rnd == ROUND_FLOOR and not a._sign) else 0
     return _finalize(sign, a._int, a._exp, env)
 
 def _op_abs(a, env):
@@ -1901,7 +1902,7 @@ def _from_tuple(v):
         raise ValueError("string argument in the third position must be 'F', 'n' or 'N'")
     if not isinstance(exp, int):
         raise ValueError('exponent must be an integer')
-    if not -sys.maxsize - 1 <= exp <= sys.maxsize:
+    if not -_sys.maxsize - 1 <= exp <= _sys.maxsize:
         raise OverflowError('exponent must be an integer')
     return _mk(sign, coef, exp)
 
@@ -1993,8 +1994,8 @@ def _rounding_arg(rounding, context):
         raise TypeError('invalid rounding mode')
     return rounding
 
-_HASH_MODULUS = sys.hash_info.modulus
-_HASH_INF = sys.hash_info.inf
+_HASH_MODULUS = _sys.hash_info.modulus
+_HASH_INF = _sys.hash_info.inf
 
 
 class Decimal(object):
@@ -2666,11 +2667,11 @@ class Context(object):
         self.clamp = pick(clamp, 'clamp', 0)
         if flags is None:
             flags = []
-        self.flags = flags
+        self.flags = _signal_dict_from(flags)
         if traps is None:
             traps = dict(base.traps) if base is not None else \
                 [InvalidOperation, DivisionByZero, Overflow]
-        self.traps = traps
+        self.traps = _signal_dict_from(traps)
 
     def __setattr__(self, name, value):
         if name == 'prec':
@@ -2688,6 +2689,8 @@ class Context(object):
                 raise TypeError('rounding must be one of the ROUND_* string constants')
             value = _ROUNDINGS[_ROUNDINGS.index(value)]
         elif name in ('flags', 'traps'):
+            if not isinstance(value, dict):
+                raise TypeError('%s must be a signal dict' % name)
             value = _signal_dict_from(value)
         object.__setattr__(self, name, value)
 
@@ -3104,6 +3107,8 @@ def localcontext(ctx=None, **kwargs):
     for key, value in kwargs.items():
         if key not in _CTX_ATTRS:
             raise TypeError("'%s' is an invalid keyword argument for this function" % key)
+        if key in ('flags', 'traps') and isinstance(value, list):
+            value = _signal_dict_from(value)
         setattr(local, key, value)
     return _ContextManager(local)
 
