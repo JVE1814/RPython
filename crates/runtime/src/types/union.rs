@@ -330,7 +330,7 @@ pub fn init_types() {
 }
 
 pub fn ready() -> PyResult<()> {
-    type_ready(union_type())?;
+    lu::ready_type(union_type())?;
     let _ = name!("__args__");
     Ok(())
 }

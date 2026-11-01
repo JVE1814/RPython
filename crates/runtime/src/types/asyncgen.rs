@@ -669,8 +669,14 @@ pub fn init_types() -> PyResult<()> {
         t.tp_doc = c"asyncgen_hooks\n\nA named tuple of the form (firstiter, finalizer).".as_ptr();
         t.tp_getset = crate::getset_table![("firstiter", hooks_firstiter), ("finalizer", hooks_finalizer)];
 
-        for t in [wrapped_type(), &raw mut ASEND_TYPE, &raw mut ATHROW_TYPE, &raw mut HOOKS_TYPE] {
-            type_ready(t)?;
+        for t in [
+            wrapped_type(),
+            &raw mut ASEND_TYPE,
+            &raw mut ATHROW_TYPE,
+            &raw mut HOOKS_TYPE,
+            &raw mut gobj::CORO_WRAPPER_TYPE,
+        ] {
+            lu::ready_type(t)?;
         }
         type_dict_set(&raw mut HOOKS_TYPE, "n_fields", &int::new_int(2));
         type_dict_set(&raw mut HOOKS_TYPE, "n_sequence_fields", &int::new_int(2));

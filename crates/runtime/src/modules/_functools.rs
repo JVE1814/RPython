@@ -823,6 +823,7 @@ unsafe extern "C" fn lru_descr_get(o: *mut PyObject, obj: *mut PyObject, _tp: *m
     }
 }
 
+#[allow(dead_code)]
 fn lru_get_wrapped(o: &PyObject) -> PyResult {
     Ok(unsafe { (*lobj(o).func).to_ref() })
 }
@@ -961,7 +962,6 @@ fn init_types() -> PyResult<()> {
         ];
         (*t).tp_getset = crate::getset_table![
             ("__dict__", fc::get_dict_attr, fc::set_dict_attr),
-            ("__wrapped__", lru_get_wrapped),
         ];
         for t in [placeholder_type(), partial_type(), keyobject_type(), lru_type()] {
             crate::types::typeobject::type_ready(t)?;
