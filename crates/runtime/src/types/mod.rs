@@ -145,4 +145,5 @@ pub fn init_all() -> crate::errors::PyResult<()> {
     Ok(())
 }
 pub mod complex_pow;
+pub mod namespace;
 pub mod bootstrap_builtins;

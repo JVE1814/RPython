@@ -864,6 +864,16 @@ fn tuplegetter_reduce(o: &PyObject) -> PyResult {
     ))
 }
 
+unsafe extern "C" fn tuplegetter_repr(o: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        into_c((|| -> PyResult {
+            let g = &*(o as *mut TupleGetter);
+            let doc = if g.doc.is_null() { "None".to_string() } else { ab::repr_string(&*g.doc)? };
+            Ok(pystr::new_str(&format!("{}({}, {})", fc::repr_type_name(&*o), g.index, doc)))
+        })())
+    }
+}
+
 fn tuplegetter_get_doc(o: &PyObject) -> PyResult {
     let g = unsafe { &*(o.as_ptr() as *mut TupleGetter) };
     Ok(if g.doc.is_null() { fc::none() } else { unsafe { (*g.doc).to_ref() } })
@@ -1007,6 +1017,7 @@ fn init_types() -> PyResult<()> {
         (*t).tp_new = Some(tuplegetter_new);
         (*t).tp_descr_get = Some(tuplegetter_get);
         (*t).tp_descr_set = Some(tuplegetter_set);
+        (*t).tp_repr = Some(tuplegetter_repr);
         (*t).tp_dealloc = Some(tuplegetter_dealloc);
         (*t).tp_traverse = Some(tuplegetter_traverse);
         (*t).tp_methods = mdefs![("__reduce__", NOARGS, tuplegetter_reduce)];
