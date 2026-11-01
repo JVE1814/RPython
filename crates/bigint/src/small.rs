@@ -98,7 +98,7 @@ pub fn lshift(a: i64, n: u64) -> Option<i64> {
     if a == 0 {
         return Some(0);
     }
-    if n >= 63 {
+    if n >= 64 {
         return None;
     }
     let r = a << n;

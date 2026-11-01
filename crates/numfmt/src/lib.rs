@@ -73,4 +73,3 @@ impl core::fmt::Display for NumFmtError {
 
 impl std::error::Error for NumFmtError {}
 
-pub type Result<T> = core::result::Result<T, NumFmtError>;
