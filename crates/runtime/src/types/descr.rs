@@ -385,7 +385,7 @@ pub unsafe fn member_get(obj: *mut PyObject, m: *const PyMemberDef) -> PyResult 
                     raise!(
                         AttributeError,
                         "'{}' object has no attribute '{}'",
-                        type_name(&*tp),
+                        crate::types::typeobject::type_fqname(tp),
                         CStr::from_ptr((*m).name).to_string_lossy()
                     );
                 }

@@ -306,7 +306,7 @@ class ArgResolver:
             return value, shown
         if name == 'IMPORT_NAME':
             value, shown = self._name(arg & ((1 << 23) - 1))
-            if arg >> 23 and shown:
+            if (arg >> 23) & 1 and shown:
                 shown += " + lazy"
             return value, shown
         return self._name(arg)

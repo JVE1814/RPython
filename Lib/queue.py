@@ -237,9 +237,9 @@ class _PySimpleQueue:
     def get(self, block=True, timeout=None):
         '''Remove and return an item, waiting if needed (forever, or at
         most *timeout* seconds; raises Empty).'''
-        if timeout is not None and timeout < 0:
+        if block and timeout is not None and timeout < 0:
             raise ValueError("'timeout' must be a non-negative number")
-        if not self._count.acquire(block, timeout):
+        if not self._count.acquire(block, timeout if block else None):
             raise Empty
         return self._queue.popleft()
 

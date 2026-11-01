@@ -1,0 +1,15 @@
+[package]
+name = "rpy-bindings"
+version = "0.1.0"
+edition = "2024"
+
+# Bindings to the system C libraries CPython itself binds (DECISIONS D20):
+# libffi (_ctypes), libsqlite3 (_sqlite3), OpenSSL 3 (_ssl). All libraries are
+# dlopen'ed at runtime, so the build needs no -dev packages.
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+libc = "0.2"
+rpy-runtime = { path = "../runtime" }

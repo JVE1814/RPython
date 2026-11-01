@@ -82,7 +82,7 @@ fn dict_get_hinted(d: *mut PyObject, nm: &PyObject, hint: u64, e: &Entry) -> Opt
             });
         }
         let t = dict::table(d);
-        if let Some(en) = t.entries.get(hint as usize) {
+        if let Some(en) = t.entries().get(hint as usize) {
             if en.key == nm.as_ptr() {
                 return Some(en.value);
             }
@@ -92,7 +92,7 @@ fn dict_get_hinted(d: *mut PyObject, nm: &PyObject, hint: u64, e: &Entry) -> Opt
         }
         match dict::lookup_index(d, nm, pystr::str_hash(nm)) {
             Ok(Some(ix)) => {
-                let v = dict::table(d).entries[ix].value;
+                let v = dict::table(d).entries()[ix].value;
                 e.set_hint(ix as u64);
                 Some(v)
             }
@@ -340,7 +340,10 @@ fn fill_load_attr(o: &PyObject, nm: &PyObject, method: bool) -> Option<Fill> {
             return None;
         }
         let dd = unsafe { &*d };
-        return dict::get_item_str(dd, nm).map(|v| (kind::MODULE, dict::version(dd), d as u64, v.as_ptr() as usize));
+        // lazy import placeholders must go through the module getattr (reification)
+        return dict::get_item_str(dd, nm)
+            .filter(|v| !crate::types::lazyimport::is_lazy(v))
+            .map(|v| (kind::MODULE, dict::version(dd), d as u64, v.as_ptr() as usize));
     }
     if o.is_type(type_type()) {
         // class attribute through a plain `type` metaclass
