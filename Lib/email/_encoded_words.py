@@ -144,7 +144,7 @@ def encode(string, charset='utf-8', encoding=None, lang=''):
     charset, surrogate escapes in *string* become the original bytes.
     """
     if charset == 'unknown-8bit':
-        raw = string.encode('ascii', 'surrogateescape')
+        raw = string.encode('utf-8', 'surrogateescape')
     else:
         raw = string.encode(charset)
     if encoding is None:

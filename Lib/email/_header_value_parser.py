@@ -230,6 +230,9 @@ class Comment(WhiteSpaceTokenList):
     def comments(self):
         return [self.content]
 
+    def startswith_fws(self):
+        return False
+
 
 class AddressList(TokenList):
     token_type = 'address-list'
@@ -1223,8 +1226,36 @@ def get_phrase(value):
             token, value = get_cfws(value)
             phrase.defects.append(errors.ObsoleteHeaderDefect(
                 "comment found without atom"))
+        _join_adjacent_ews(phrase, token)
         phrase.append(token)
     return phrase, value
+
+
+def _first_non_cfws(token):
+    for t in token:
+        if t.token_type != 'cfws':
+            return t
+    return None
+
+
+def _join_adjacent_ews(phrase, token):
+    # RFC 2047 6.2: linear white space between two adjacent encoded words
+    # is not part of the text.
+    if not phrase or not isinstance(token, TokenList):
+        return
+    previous = phrase[-1]
+    if not isinstance(previous, TokenList) or len(previous) < 2:
+        return
+    first = _first_non_cfws(token)
+    if first is None or first.token_type != 'encoded-word':
+        return
+    gap = previous[-1]
+    if (gap.token_type != 'cfws' or previous[-2].token_type != 'encoded-word'
+            or gap.comments):
+        return
+    if _first_non_cfws(token) is not token[0]:
+        return
+    previous[-1] = EWWhiteSpaceTerminal(str(gap), 'fws')
 
 
 def get_local_part(value):
@@ -1244,6 +1275,9 @@ def get_local_part(value):
             token = TokenList()
     if value and (value[0] == '\\' or value[0] not in PHRASE_ENDS):
         obs, value = get_obs_local_part(str(token) + value)
+        if all(t.token_type == 'cfws' for t in obs):
+            raise errors.HeaderParseError(
+                "expected local-part but found only CFWS")
         if obs.token_type == 'invalid-obs-local-part':
             local_part.defects.append(errors.InvalidHeaderDefect(
                 "local-part is not dot-atom, quoted-string, or obs-local-part"))
@@ -1725,11 +1759,9 @@ def get_address_list(value):
                 alist.defects.append(errors.InvalidHeaderDefect(
                     "invalid address in address-list"))
         if value and value[0] != ',':
-            # trailing junk: the mailbox becomes invalid
-            mailbox = alist[-1][0]
-            mailbox.token_type = 'invalid-mailbox'
+            # trailing junk becomes an invalid address of its own
             token, value = get_invalid_mailbox(value, ',')
-            mailbox.extend(token)
+            alist.append(Address([token]))
             alist.defects.append(errors.InvalidHeaderDefect(
                 "invalid address in address-list"))
         if value:
@@ -2353,6 +2385,25 @@ def _refold_parse_tree(parse_tree, *, policy):
     return _Refolder(policy).run(parse_tree)
 
 
+def _new_line(lines, text):
+    # Start a new output line, reusing the last one if stealing its
+    # trailing blank left it empty.
+    if len(lines) > 1 and lines[-1] == '':
+        lines[-1] = text
+    else:
+        lines.append(text)
+
+
+def _has_special_ew(part):
+    # An encoded word whose decoded text contains specials must stay
+    # encoded even if it would fit as is.
+    if part.token_type == 'encoded-word':
+        return not SPECIALSNL.isdisjoint(str(part))
+    if isinstance(part, TokenList):
+        return any(_has_special_ew(x) for x in part)
+    return False
+
+
 _ADDRESS_PARTS = frozenset(('addr-spec', 'local-part', 'domain'))
 
 
@@ -2396,7 +2447,7 @@ class _Refolder:
                 if part.token_type in ('ptext', 'vtext'):
                     want_encoding = not SPECIALSNL.isdisjoint(text)
                 else:
-                    want_encoding = not NLSET.isdisjoint(text)
+                    want_encoding = not NLSET.isdisjoint(text) or _has_special_ew(part)
             try:
                 text.encode(self.encoding)
                 charset = self.encoding
@@ -2432,7 +2483,7 @@ class _Refolder:
                 else:
                     carry = _steal_trailing_WSP_if_exists(lines)
                     if carry or text[:1] in WSP:
-                        lines.append(carry + text)
+                        _new_line(lines, carry + text)
                     else:
                         lines[-1] += text
                 continue
@@ -2480,7 +2531,7 @@ class _Refolder:
             if part.syntactic_break and len(text) + 1 <= maxlen:
                 carry = _steal_trailing_WSP_if_exists(lines)
                 if carry or part.startswith_fws():
-                    lines.append(carry + text)
+                    _new_line(lines, carry + text)
                     line = lines[-1]
                     self.leading_whitespace = line[:len(line) - len(line.lstrip(' \t'))]
                     self.last_ew = None
@@ -2511,7 +2562,7 @@ class _Refolder:
             # Unsplittable: put it on a line of its own if possible.
             carry = _steal_trailing_WSP_if_exists(lines)
             if carry or part.startswith_fws():
-                lines.append(carry + text)
+                _new_line(lines, carry + text)
             else:
                 lines[-1] += text
         return self.policy.linesep.join(lines) + self.policy.linesep
