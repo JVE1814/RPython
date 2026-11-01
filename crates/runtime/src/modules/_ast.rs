@@ -193,6 +193,29 @@ _ABSTRACT = set()
 def _is_abstract(cls):
     return cls is AST or cls in _ABSTRACT
 
+class _FallbackAlias:
+    # used only while the runtime lacks types.GenericAlias / types.UnionType
+    def __init__(self, origin, args):
+        self.__origin__ = origin
+        self.__args__ = args
+    def __eq__(self, other):
+        return (getattr(other, "__origin__", None) is self.__origin__
+                and getattr(other, "__args__", None) == self.__args__)
+    def __hash__(self):
+        return hash((self.__origin__, self.__args__))
+
+def _list_of(t):
+    try:
+        return list[t]
+    except TypeError:
+        return _FallbackAlias(list, (t,))
+
+def _optional(t):
+    try:
+        return t | None
+    except TypeError:
+        return _FallbackAlias(None, (t, type(None)))
+
 _BUILTIN_TYPES = {'identifier': str, 'string': str, 'int': int, 'constant': object}
 
 def _build(table, ns):
@@ -227,13 +250,13 @@ def _build(table, ns):
             if kind == 0:
                 ft = t
             elif kind == 1:
-                ft = t | None
+                ft = _optional(t)
                 if fname not in cls.__dict__:
                     setattr(cls, fname, None)
             elif kind == 2:
-                ft = list[t]
+                ft = _list_of(t)
             else:
-                ft = list[t | None]
+                ft = _list_of(_optional(t))
             ftypes[fname] = ft
         cls._field_types = ftypes
         cls.__annotations__ = dict(ftypes)
@@ -341,7 +364,7 @@ pub fn init_module() -> PyResult {
     ] {
         dict::set_item_str(&d, k, &int::new_int(v as i64))?;
     }
-    for k in ["_build", "_tpname", "_plural", "_BUILTIN_TYPES"] {
+    for k in ["_build"] {
         let _ = dict::del_item(&d, &pystr::new_str(k));
     }
     let _ = STATE.set(State { classes, singletons, module: m.clone().into_raw() as usize });

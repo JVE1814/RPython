@@ -534,6 +534,11 @@ pub fn add_operators(tp: *mut PyTypeObject) -> PyResult<()> {
         if dict::get_item_str(d, &nm).is_some() {
             continue;
         }
+        // A generic slot function only dispatches to a dunder found on the
+        // MRO; wrapping it would shadow that dunder and recurse forever.
+        if f == sd.slot.generic() {
+            continue;
+        }
         if sd.slot == Slot::TpHash && f == hash_not_implemented as *mut c_void {
             dict::set_item(d, &nm, none::none())?;
             continue;
