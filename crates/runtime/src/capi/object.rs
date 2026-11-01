@@ -695,12 +695,34 @@ pub unsafe extern "C" fn PyUnstable_Object_EnableDeferredRefcount(_o: *mut PyObj
     0
 }
 #[unsafe(no_mangle)]
+/// Owned by this thread with exactly one reference. CPython 3.14+ pushes locals onto the value
+/// stack without a new reference, so `x.resize(...)` on a local `x` sees refcount 1 there. Our
+/// interpreter's LoadFast takes a reference, so for a caller that is a Python frame, stack
+/// copies of a local of that same frame are not counted (at most one per local slot holding
+/// the object); references from anything else still count.
 pub unsafe extern "C" fn PyUnstable_Object_IsUniquelyReferenced(o: *mut PyObject) -> c_int {
     unsafe {
+        use std::sync::atomic::Ordering::Relaxed;
         let ob = &*o;
-        (ob.ob_tid.load(std::sync::atomic::Ordering::Relaxed) == thread_id()
-            && ob.ob_ref_local.load(std::sync::atomic::Ordering::Relaxed) == 1
-            && ob.ob_ref_shared.load(std::sync::atomic::Ordering::Relaxed) == 0) as c_int
+        if ob.ob_tid.load(Relaxed) != thread_id() || ob.ob_ref_shared.load(Relaxed) != 0 {
+            return 0;
+        }
+        let local = ob.ob_ref_local.load(Relaxed) as usize;
+        if local == 1 {
+            return 1;
+        }
+        if local == 0 || local > 64 {
+            return 0;
+        }
+        let f = crate::interp::current_frame_ptr();
+        if f.is_null() {
+            return 0;
+        }
+        let f = &*f;
+        let n = f.nlocalsplus.min(f.slots.len());
+        let in_locals = f.slots[..n].iter().filter(|&&p| p == o).count();
+        let on_stack = f.slots[n..].iter().filter(|&&p| p == o).count();
+        (local - in_locals.min(on_stack) == 1) as c_int
     }
 }
 #[unsafe(no_mangle)]
@@ -709,7 +731,12 @@ pub unsafe extern "C" fn PyUnstable_Object_IsUniquelyReferenced(o: *mut PyObject
 /// result). An object that only C code holds, e.g. a Cython temporary passed to
 /// PyNumber_Add, is not a stack temporary.
 pub unsafe extern "C" fn PyUnstable_Object_IsUniqueReferencedTemporary(o: *mut PyObject) -> c_int {
-    unsafe { (PyUnstable_Object_IsUniquelyReferenced(o) != 0 && crate::interp::eval::is_stack_temporary(o)) as c_int }
+    unsafe {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ob = &*o;
+        let sole = ob.ob_tid.load(Relaxed) == thread_id() && ob.ob_ref_local.load(Relaxed) == 1 && ob.ob_ref_shared.load(Relaxed) == 0;
+        (sole && crate::interp::eval::is_stack_temporary(o)) as c_int
+    }
 }
 
 #[allow(dead_code)]
