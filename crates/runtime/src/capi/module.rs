@@ -317,7 +317,9 @@ pub unsafe extern "C" fn PyModule_FromDefAndSpec2(def: *mut PyModuleDef, spec: *
             }
             let m = match create {
                 Some(c) => {
-                    let r = c(spec, def);
+                    // PEP 793: a create slot of a slot-defined module receives no def
+                    let from_slots = FROM_SLOTS.with(|c| c.replace(false));
+                    let r = c(spec, if from_slots { std::ptr::null_mut() } else { def });
                     let r = from_c(r)?;
                     if tmod::is_module(&r) {
                         if md(r.as_ptr()).md_def.is_null() {
@@ -448,7 +450,9 @@ pub unsafe extern "C" fn PyModule_FromSlotsAndSpec(slots: *const super::typeobj:
         }
         mslots.push(PyModuleDef_Slot { slot: 0, value: std::ptr::null_mut() });
         (*def).m_slots = Box::leak(mslots.into_boxed_slice()).as_mut_ptr();
+        FROM_SLOTS.with(|c| c.set(true));
         let m = PyModule_FromDefAndSpec2(def, spec, 1013);
+        FROM_SLOTS.with(|c| c.set(false));
         if !m.is_null() && tmod::is_module(&*m) {
             md(m).md_token = token;
         }
@@ -459,4 +463,9 @@ pub unsafe extern "C" fn PyModule_FromSlotsAndSpec(slots: *const super::typeobj:
 #[allow(dead_code)]
 fn _unused() -> PyRef {
     none::none_ref()
+}
+
+thread_local! {
+    /// Set while PyModule_FromSlotsAndSpec builds its module from a synthesized def.
+    static FROM_SLOTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }

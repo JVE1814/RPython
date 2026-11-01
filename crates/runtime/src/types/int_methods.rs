@@ -50,7 +50,7 @@ pub fn to_decimal_string(o: &PyObject) -> PyResult<String> {
             Ok(s) => return Ok(s),
             Err(IntError::IntToStrDigitLimit { limit }) => raise!(
                 ValueError,
-                "Exceeds the limit ({}) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit",
+                "Exceeds the limit ({} digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit",
                 limit
             ),
             Err(e) => return Err(int_error(e)),
@@ -305,7 +305,7 @@ pub fn parse_int_obj(s: &PyObject, base: i64) -> PyResult {
         }
         Err(IntError::StrToIntDigitLimit { digits, limit }) => raise!(
             ValueError,
-            "Exceeds the limit ({}) for integer string conversion: value has {} digits; use sys.set_int_max_str_digits() to increase the limit",
+            "Exceeds the limit ({} digits) for integer string conversion: value has {} digits; use sys.set_int_max_str_digits() to increase the limit",
             limit,
             digits
         ),

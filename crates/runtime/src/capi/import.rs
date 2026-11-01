@@ -326,33 +326,27 @@ pub unsafe extern "C" fn PyImport_CreateModuleFromInitfunc(spec: *mut PyObject, 
 
 // ---------------------------------------------------------------- lazy imports (PEP 810)
 
-static LAZY_MODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-static LAZY_FILTER: std::sync::atomic::AtomicPtr<PyObject> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyImport_GetLazyImportsMode() -> c_int {
-    LAZY_MODE.load(std::sync::atomic::Ordering::Relaxed)
+    (crate::modules::sys_full::lazy_imports_mode() == "all") as c_int
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyImport_SetLazyImportsMode(mode: c_int) -> c_int {
-    LAZY_MODE.store(mode, std::sync::atomic::Ordering::Relaxed);
+    crate::modules::sys_full::set_lazy_imports_all(mode == 1);
     0
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyImport_GetLazyImportsFilter() -> *mut PyObject {
-    unsafe {
-        let p = LAZY_FILTER.load(std::sync::atomic::Ordering::Acquire);
-        if p.is_null() {
-            return none::none_ref().into_raw();
-        }
-        (*p).to_ref().into_raw()
-    }
+    crate::modules::sys_full::lazy_imports_filter().unwrap_or_else(none::none_ref).into_raw()
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyImport_SetLazyImportsFilter(f: *mut PyObject) -> c_int {
     unsafe {
-        let new = if f.is_null() || none::is_none(&*f) { std::ptr::null_mut() } else { (*f).to_ref().into_raw() };
-        let old = LAZY_FILTER.swap(new, std::sync::atomic::Ordering::AcqRel);
-        xdecref(old);
+        if !f.is_null() && !none::is_none(&*f) && !crate::abstract_::is_callable(&*f) {
+            let _ = crate::err!(ValueError, "filter provided but is not callable");
+            return -1;
+        }
+        crate::modules::sys_full::set_lazy_imports_filter_obj(if f.is_null() { None } else { Some(&*f) });
         0
     }
 }

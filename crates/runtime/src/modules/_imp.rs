@@ -251,7 +251,10 @@ fn imp_rpy_read_file(_m: &PyObject, p: &PyObject) -> PyResult {
     Ok(bytes::new_bytes(&data))
 }
 
-pub const MAGIC: u32 = 3999 | ((b'\r' as u32) << 16) | ((b'\n' as u32) << 24);
+/// pyc magic: 3690..3699 (the top of the 3.15 range, 2900+50*15, unlikely to collide
+/// with CPython's own) selected by a hash of the compiler sources (stale caches written
+/// by an older compiler are never reused), then "\r\n".
+pub const MAGIC: u32 = (3690 + rpy_compiler::BYTECODE_HASH % 10) | ((b'\r' as u32) << 16) | ((b'\n' as u32) << 24);
 
 pub fn init_module() -> PyResult {
     let m = crate::types::module::new_module("_imp")?;

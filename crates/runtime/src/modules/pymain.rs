@@ -89,6 +89,23 @@ fn abspath(p: &str) -> String {
     }
 }
 
+/// A ZIP archive (possibly with data prepended, e.g. a launcher stub) has its
+/// end-of-central-directory record within the last 64 KiB + 22 bytes.
+fn looks_like_zip(path: &str) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    let Ok(len) = f.seek(SeekFrom::End(0)) else { return false };
+    let start = len.saturating_sub(65535 + 22);
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return false;
+    }
+    let mut tail = Vec::new();
+    if f.read_to_end(&mut tail).is_err() {
+        return false;
+    }
+    tail.windows(4).any(|w| w == b"PK\x05\x06")
+}
+
 fn insert_path0(p: &str) {
     if let Some(path) = crate::modules::sys::get_sys_attr("path") {
         list::insert(&path, 0, pystr::new_str(p));
@@ -99,11 +116,11 @@ fn run_script(path: &str, opts: &MainOptions) -> Outcome {
     let meta = std::fs::metadata(path);
     // a directory or zip file with __main__.py: run it as a module
     let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-    let is_zip = !is_dir && std::fs::read(path).map(|b| b.starts_with(b"PK")).unwrap_or(false);
+    let is_zip = !is_dir && looks_like_zip(path);
     if is_dir || is_zip {
-        if !opts.safe_path {
-            insert_path0(path);
-        }
+        // The directory or archive is where __main__ comes from, so it is
+        // put on sys.path even in safe-path / isolated mode.
+        insert_path0(path);
         let r = (|| -> PyResult<()> {
             main_module()?;
             let runpy = crate::import::import_absolute("runpy")?;

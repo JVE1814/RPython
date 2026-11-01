@@ -6,6 +6,7 @@
 //! event tuples `(kind, line, column, byte_index, *payload)`.
 
 pub mod engine;
+pub mod xmlparser;
 
 use crate::errors::*;
 use crate::ffi::*;

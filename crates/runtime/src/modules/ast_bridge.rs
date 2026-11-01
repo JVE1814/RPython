@@ -120,7 +120,11 @@ pub fn builtin_compile(args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
     if !dont_inherit {
         flags |= inherited_future_flags();
     }
-    let mode_s = if pystr::is_str(mode.unwrap()) { pystr::to_string_lossy(mode.unwrap()) } else { String::new() };
+    let mode = mode.unwrap();
+    if !pystr::is_str(mode) {
+        raise!(TypeError, "compile() argument 'mode' must be str, not {}", crate::types::typeobject::tname(mode));
+    }
+    let mode_s = pystr::to_string_lossy(mode);
     let mode = match Mode::from_str(&mode_s) {
         Some(Mode::FuncType) if flags & cf::PYCF_ONLY_AST == 0 => {
             raise!(ValueError, "compile() mode 'func_type' requires flag PyCF_ONLY_AST")
