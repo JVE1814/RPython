@@ -1,0 +1,68 @@
+# DECISIONS
+
+Every design call made during the project, newest at the bottom. No human is in the loop.
+
+## D1 — Pinned target: CPython v3.15.2 (project start 2026-11-01)
+`git ls-remote` showed v3.15.2 (commit 5e58eaad, 2026-10-25) as the newest final release.
+
+## D2 — Spec extraction
+`spec/` holds exactly: `Lib/test/` (the regression suite), `Include/` minus `Include/internal/`
+(internal headers are not the public ABI contract), `Modules/_test*` (C test helpers), `LICENSE`.
+Everything else from the clone was deleted from the spec tree. `_testinternalcapi` needs
+internal headers and is therefore out of scope by construction.
+
+## D3 — Baseline CPython
+A separate full clone lives in `/opt/baseline/cpython-src` *only* to build baseline interpreters
+(never read). Builds: `default` (PGO+LTO, GIL) and `ft` (PGO+LTO, `--disable-gil`). Each metric is
+compared against whichever baseline is better for that metric. The system `python3` (3.13) is
+never used by the project, not even for tooling scripts; tooling is bash or Rust.
+
+## D4 — Object model is the CPython free-threaded C layout (forced by the ABI)
+Unmodified cp315t wheels use inline header functions that read/write `ob_tid`, `ob_ref_local`,
+`ob_ref_shared`, `ob_type`, tuple/list `ob_item`, `PyFloatObject.ob_fval`, PEP 393 string
+fields, compact `PyLongObject.lv_tag`, and `PyTypeObject` slots directly. Therefore every
+runtime object is a raw heap object with exactly that layout, reference counting uses the
+biased refcount protocol the headers implement, and builtin types are exported
+`PyTypeObject` statics. No proxy layer (cpyext-style) — zero-cost C interop.
+
+## D5 — Memory management: refcount + HotSpot-style safepoint cycle collector
+Refcounting is forced (C code calls Py_DECREF and expects deallocation). Objects cannot move
+(C holds raw pointers), so no copying/compacting collector. Cycle collection is a stop-the-world
+trial-deletion collector, but the *thread coordination* is HotSpot's: mutator threads have
+states (in_vm / in_native / blocked), poll a safepoint word at backedges and calls, and threads
+in native or blocked state count as safe. Deferred reclamation (e.g. old list item arrays read
+lock-free by racing readers) is freed at the next global safepoint/handshake, as HotSpot
+handshakes do, instead of CPython's QSBR.
+
+## D6 — Memory model: JMM-like
+Racy Python programs must never crash or observe torn pointers. Container mutations take the
+per-object `ob_mutex` (ABI-provided field); reads of list/dict are lock-free optimistic reads
+validated against a version, with stale storage kept alive until the next safepoint.
+Volatile-like semantics for module/global dict writes (release/acquire).
+
+## D7 — Execution: tiered like HotSpot
+Tier 0: bytecode interpreter with invocation + backedge counters and per-bytecode type
+profiles (HotSpot MDO analogue). Tier 1: baseline template JIT. Tier 2: optimizing JIT with
+type speculation guarded by uncommon traps that deoptimize back to the interpreter, rebuilding
+interpreter frames from recorded frame states. The bytecode format is our own (not CPython's).
+
+## D8 — Language of implementation
+Runtime, compiler, builtin types and all accelerator/"C" modules are Rust. The goal says
+"everything else in Rust, stdlib included". The interpretation adopted: every module is written
+from scratch by us; modules whose observable contract is *Python source* (tests call
+`inspect.getsource` on them, monkeypatch module globals, check `__file__.endswith('.py')`,
+subclass pure-Python classes) are written by us in Python and shipped in `Lib/`; everything
+else is Rust. No line of CPython's Lib/*.py or Modules/*.c is read or copied.
+
+## D9 — Dependencies
+Only general-purpose Rust crates that contain no Python implementation code may be used
+(e.g. `libc`). Big-int arithmetic, regex engine (sre), float formatting, JIT backend, hashing
+are written in-repo.
+
+## D10 — Shared library layout
+The runtime is a cdylib `libpython3.15t.so` exporting the C API with `#[no_mangle]`; `python3`
+is a small launcher linked against it. This guarantees every C-API symbol is exported to
+extension modules (Rust executables do not reliably export dependency symbols).
+Install layout mirrors CPython's: `bin/python3.15t`, `lib/python3.15t/`, `include/python3.15t/`.
+The interpreter identifies as CPython 3.15.2 free-threaded (`sys.implementation.name ==
+'cpython'`, abiflags `t`) because pip must select cp315t wheels.
