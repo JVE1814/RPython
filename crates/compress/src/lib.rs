@@ -9,3 +9,4 @@ pub mod inflate;
 pub mod deflate;
 pub mod hash;
 pub mod bzip2;
+pub mod lzma;
