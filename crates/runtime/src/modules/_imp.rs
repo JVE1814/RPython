@@ -119,42 +119,139 @@ fn imp_exec_builtin(_m: &PyObject, _module: &PyObject) -> PyResult {
     Ok(int::new_int(0))
 }
 
-// ------------------------------------------------------------------ frozen (none)
+// ------------------------------------------------------------------ frozen modules
+// (tables and policy in crate::frozen)
 
 fn imp_is_frozen(_m: &PyObject, n: &PyObject) -> PyResult {
-    name_arg(n)?;
-    Ok(bool_::new_bool(false))
+    let n = name_arg(n)?;
+    Ok(bool_::new_bool(crate::frozen::lookup(&n, false).is_some()))
 }
 fn imp_find_frozen(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
     static P: crate::args::Params = crate::args::Params::new("find_frozen", &["name", "withdata"], 1, 1).kwonly(1);
-    let [n, _w] = crate::args::parse::<2>(&P, args, kw)?;
-    name_arg(n.unwrap())?;
-    Ok(none::none_ref())
+    let [n, w] = crate::args::parse::<2>(&P, args, kw)?;
+    let n = name_arg(n.unwrap())?;
+    let Some(e) = crate::frozen::lookup(&n, false) else {
+        return Ok(none::none_ref());
+    };
+    let data = match w {
+        Some(w) if ab::is_true(w)? => crate::types::memoryview::from_object(&bytes::new_bytes(e.src))?,
+        _ => none::none_ref(),
+    };
+    let orig = e.orig.map_or_else(none::none_ref, pystr::new_str);
+    Ok(tuple::new_tuple(vec![data, bool_::new_bool(e.is_package), orig]))
 }
 fn no_frozen(n: &PyObject) -> PyErr {
     let s = ab::repr_string(n).unwrap_or_default();
     crate::import::import_error_with(&format!("No such frozen object named {}", s), Some(n), None, None)
 }
+/// Compile a frozen module's source (cached next to its stdlib file when there
+/// is one, like the importlib bootstrap modules).
+pub fn frozen_code(e: &crate::frozen::Entry) -> PyResult {
+    let display = format!("<frozen {}>", e.orig.filter(|o| !o.starts_with('<')).unwrap_or(e.name()));
+    let file = crate::frozen::stdlib_file(e).unwrap_or_default();
+    crate::import::bootstrap_code(e.src, &file, &display)
+}
 fn imp_get_frozen_object(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     crate::args::check_pos("get_frozen_object", args, 1, 2)?;
-    name_arg(args[0])?;
-    Err(no_frozen(args[0]))
+    let n = name_arg(args[0])?;
+    match args.get(1).filter(|d| !d.is(none::none())) {
+        Some(d) => {
+            // caller-supplied data (as returned by find_frozen(withdata=True))
+            let buf = crate::buffer::BufferView::simple(d)?.to_vec();
+            let display = format!("<frozen {}>", n);
+            let r = std::str::from_utf8(&buf)
+                .ok()
+                .map(|_| crate::compile::compile_bytes(&buf, &display, crate::compile::Mode::Exec, 0, 0));
+            match r {
+                Some(Ok(c)) => Ok(c.code),
+                _ => {
+                    clear_exc();
+                    Err(crate::import::import_error_with(
+                        &format!("Frozen object named {} is invalid", ab::repr_string(args[0]).unwrap_or_default()),
+                        Some(args[0]),
+                        None,
+                        None,
+                    ))
+                }
+            }
+        }
+        None => match crate::frozen::lookup(&n, false) {
+            Some(e) => frozen_code(e),
+            None => Err(no_frozen(args[0])),
+        },
+    }
 }
 fn imp_init_frozen(_m: &PyObject, n: &PyObject) -> PyResult {
-    name_arg(n)?;
-    Ok(none::none_ref())
+    let name = name_arg(n)?;
+    match import_frozen(&name, false)? {
+        Some(m) => Ok(m),
+        None => Ok(none::none_ref()),
+    }
+}
+
+/// Execute a frozen module into `sys.modules[name]` (PyImport_ImportFrozenModule,
+/// `_imp.init_frozen`). Ok(None) if there is no such frozen module.
+pub fn import_frozen(name: &str, any: bool) -> PyResult<Option<PyRef>> {
+    let Some(e) = crate::frozen::lookup(name, any) else {
+        return Ok(None);
+    };
+    let code = frozen_code(e)?;
+    let modules = crate::modules::sys::modules_dict();
+    let existing = dict::get_item_rs(&modules, name).filter(|m| crate::types::module::is_module(m));
+    let created = existing.is_none();
+    let m = match existing {
+        Some(m) => m,
+        None => {
+            let m = crate::types::module::new_module(name)?;
+            dict::set_item_str(&modules, name, &m)?;
+            m
+        }
+    };
+    let d = crate::types::module::module_dict(&m);
+    let r = (|| -> PyResult<()> {
+        if dict::get_item_rs(&d, "__builtins__").is_none() {
+            dict::set_item_str(&d, "__builtins__", &crate::builtins::builtins_module())?;
+        }
+        if e.is_package && dict::get_item_rs(&d, "__path__").is_none() {
+            dict::set_item_str(&d, "__path__", &list::new_list(vec![]))?;
+        }
+        crate::interp::eval_code(&code, &d, Some(&d))?;
+        Ok(())
+    })();
+    if r.is_err() {
+        if created {
+            let e = take_exc();
+            let _ = dict::del_item(&modules, &pystr::new_str(name));
+            clear_exc();
+            if let Some(e) = e {
+                set_exc(e);
+            }
+        }
+        return Err(PyErr);
+    }
+    // give it the spec FrozenImporter would have produced
+    let has_spec = matches!(dict::get_item_rs(&d, "__spec__"), Some(s) if !s.is(none::none()));
+    if !has_spec {
+        if let Some(o) = e.orig {
+            dict::set_item_str(&d, "__origname__", &pystr::new_str(o))?;
+        }
+        crate::import::give_frozen_spec(&m);
+    }
+    Ok(Some(crate::import::get_loaded_module(name).unwrap_or(m)))
 }
 fn imp_is_frozen_package(_m: &PyObject, n: &PyObject) -> PyResult {
-    name_arg(n)?;
-    Err(no_frozen(n))
+    let name = name_arg(n)?;
+    match crate::frozen::lookup(&name, false) {
+        Some(e) => Ok(bool_::new_bool(e.is_package)),
+        None => Err(no_frozen(n)),
+    }
 }
 fn imp_frozen_module_names(_m: &PyObject) -> PyResult {
-    Ok(tuple::empty_tuple())
+    Ok(list::new_list(crate::frozen::names().into_iter().map(pystr::new_str).collect()))
 }
-static FROZEN_OVERRIDE: AtomicI32 = AtomicI32::new(0);
 fn imp_override_frozen(_m: &PyObject, v: &PyObject) -> PyResult {
     let n = ab::as_i64(v)? as i32;
-    FROZEN_OVERRIDE.store(n, Relaxed);
+    crate::frozen::set_override(n);
     Ok(none::none_ref())
 }
 static MULTI_INTERP_OVERRIDE: AtomicI32 = AtomicI32::new(-1);

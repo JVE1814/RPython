@@ -18,6 +18,7 @@ pub mod compile;
 pub mod ffi;
 pub mod gc;
 pub mod gc_support;
+pub mod frozen;
 pub mod hash;
 pub mod import;
 pub mod import_spec;

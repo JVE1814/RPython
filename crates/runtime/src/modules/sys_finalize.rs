@@ -29,15 +29,13 @@ pub fn finalize() -> bool {
     if FINALIZED.swap(true, AcqRel) {
         return true;
     }
-    super::sys_full::call_module_func("threading", "_shutdown");
+    wait_for_thread_shutdown();
     super::sys_full::call_module_func("atexit", "_run_exitfuncs");
     crate::capi::lifecycle::run_interp_atexit();
     super::sys_full::FINALIZING.store(true, Release);
     crate::gc::park_other_threads();
     let ok = super::sys_full::flush_std("stdout");
     super::sys_full::flush_std("stderr");
-    collect();
-    crate::gc_support::dump_shutdown_stats();
     finalize_modules();
     collect();
     super::sys_full::flush_std("stdout");
@@ -45,6 +43,18 @@ pub fn finalize() -> bool {
     clear_exc();
     crate::capi::lifecycle::run_process_atexit();
     ok
+}
+
+/// threading._shutdown() joins the non-daemon threads; an error there (also a
+/// KeyboardInterrupt that ends the wait) is reported, then shutdown continues.
+fn wait_for_thread_shutdown() {
+    let Some(m) = crate::import::get_loaded_module("threading") else {
+        return;
+    };
+    let r = crate::abstract_::getattr_str(&m, "_shutdown").and_then(|f| crate::abstract_::call(&f, &[]));
+    if r.is_err() {
+        super::sys_full::write_unraisable(Some("Exception ignored on threading shutdown"), None);
+    }
 }
 
 fn collect() {
@@ -105,7 +115,11 @@ fn finalize_modules() {
             }
         }
     }
+    // One collection serves two purposes: cycles that were garbage already and
+    // modules that nobody but sys.modules held go away, with their finalizers
+    // running against intact module globals.
     collect();
+    crate::gc_support::dump_shutdown_stats();
 
     // clear what is still alive, newest first
     for w in tracked.iter().rev() {

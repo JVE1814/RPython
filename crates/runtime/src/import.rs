@@ -88,7 +88,7 @@ static EXTERNAL_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::At
 /// (`__pycache__/<stem>.rpython-boot`, marshal format) keyed on the source size and
 /// mtime and on the interpreter executable's size and mtime (a rebuilt compiler
 /// invalidates it). Any problem with the cache falls back to compiling.
-fn bootstrap_code(src: &[u8], file: &str, display: &str) -> PyResult {
+pub(crate) fn bootstrap_code(src: &[u8], file: &str, display: &str) -> PyResult {
     fn stamp(p: &std::path::Path) -> Option<(u64, u128)> {
         let m = std::fs::metadata(p).ok()?;
         let t = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
@@ -145,6 +145,11 @@ fn exec_bootstrap_module(name: &str, file: &str, display: &str) -> PyResult {
     let m = module::new_module(name)?;
     let d = module::module_dict(&m);
     dict::set_item_str(&d, "__builtins__", &crate::builtins::builtins_module())?;
+    // these count as frozen modules: FrozenImporter._fix_up_module reads (and
+    // removes) the original name when it gives them their spec
+    if let Some(orig) = display.strip_prefix("<frozen ").and_then(|s| s.strip_suffix('>')) {
+        dict::set_item_str(&d, "__origname__", &pystr::new_str(orig))?;
+    }
     dict::set_item_str(&crate::modules::sys::modules_dict(), name, &m)?;
     let r = (|| -> PyResult<()> {
         let code = bootstrap_code(&src, file, display)?;
@@ -195,8 +200,32 @@ pub fn install_importlib(stdlib: &str) -> PyResult<()> {
         return Ok(());
     }
     EXTERNAL_INSTALLED.store(true, std::sync::atomic::Ordering::Release);
+    if let Some(ext) = get_loaded_module("_frozen_importlib_external") {
+        give_frozen_spec(&ext);
+    }
     install_zipimport_hook();
     Ok(())
+}
+
+/// Give a module executed from frozen code the spec FrozenImporter would have
+/// produced (origin "frozen", loader_state with origname/filename). The module's
+/// `__origname__` (if any) names the original module. Best effort.
+pub fn give_frozen_spec(m: &PyObject) {
+    let Some(bs) = bootstrap() else { return };
+    let d = module::module_dict(m);
+    if matches!(dict::get_item_rs(&d, "__spec__"), Some(s) if !s.is(none::none())) {
+        return;
+    }
+    let r = (|| -> PyResult<()> {
+        let fi = ab::getattr_str(&bs, "FrozenImporter")?;
+        let spec = ab::call(&*ab::getattr_str(&bs, "_spec_from_module")?, &[m, &fi])?;
+        ab::call(&*ab::getattr_str(&bs, "_init_module_attrs")?, &[&spec, m])?;
+        ab::call(&*ab::getattr_str(&fi, "_fix_up_module")?, &[m])?;
+        Ok(())
+    })();
+    if r.is_err() {
+        clear_exc();
+    }
 }
 
 /// Put `zipimport.zipimporter` first in sys.path_hooks (as CPython does at startup);
