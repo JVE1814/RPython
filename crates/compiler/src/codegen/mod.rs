@@ -70,6 +70,8 @@ pub(crate) struct CompSlot {
 pub(crate) struct CompCtx {
     pub scope: ScopeId,
     pub slots: HashMap<String, CompSlot>,
+    /// the inlined comprehension protects its saved locals with a SETUP_FINALLY block
+    pub has_setup: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -265,7 +267,7 @@ pub(crate) fn check_future(m: &Mod, inherited: u32) -> R<u32> {
     let mut done = false;
     for (i, s) in body.iter().enumerate() {
         match &s.node {
-            StmtKind::ImportFrom { module: Some(m), names, .. } if m == "__future__" => {
+            StmtKind::ImportFrom { module: Some(m), names, level: 0, .. } if m == "__future__" => {
                 if done {
                     return Err(CompileError::syntax("from __future__ imports must occur at the beginning of the file", s.loc));
                 }
@@ -434,6 +436,17 @@ impl<'a> Compiler<'a> {
 
     pub fn error(&self, msg: impl Into<String>, loc: Loc) -> CompileError {
         CompileError::syntax(msg, loc)
+    }
+
+    /// Static block nesting limit (CPython's CO_MAXBLOCKS): `extra` is the number of blocks
+    /// the caller is about to add on top of the ones already open.
+    pub fn check_block_limit(&self, limit: usize, loc: Loc) -> R {
+        let u = self.ur();
+        let open = u.fblocks.len() + u.comps.iter().filter(|c| c.has_setup).count();
+        if open >= limit {
+            return Err(self.error("too many statically nested blocks", loc));
+        }
+        Ok(())
     }
 
     pub fn enter_depth(&mut self) -> R {
@@ -1002,7 +1015,7 @@ impl<'a> Compiler<'a> {
                 self.emit_name(Op::StoreName, "__conditional_annotations__");
             }
         }
-        if docstring_allowed && !self.interactive {
+        if docstring_allowed && !(self.interactive && is_module) {
             if let Some(doc) = get_docstring(body) {
                 start = 1;
                 if self.optimize < 2 {
@@ -1091,7 +1104,14 @@ impl<'a> Compiler<'a> {
         }
         self.emit(Op::ReturnValue, 0);
         let code = self.exit_scope()?;
-        self.make_closure(code, 0)
+        self.make_format_function(code)
+    }
+
+    /// Push a function for an annotate/lazy-evaluation code object; its single
+    /// positional-only parameter `format` defaults to 1 (VALUE).
+    fn make_format_function(&mut self, code: CodeUnit) -> R {
+        self.load_const(Constant::Tuple(vec![Constant::Int(1)]));
+        self.make_closure(code, make_fn::DEFAULTS)
     }
 
     fn mangle_in_parent(&self, name: &str) -> String {
@@ -1267,7 +1287,7 @@ impl<'a> Compiler<'a> {
         self.emit(Op::BuildMap, anns.len() as u32);
         self.emit(Op::ReturnValue, 0);
         let code = self.exit_scope()?;
-        self.make_closure(code, 0)?;
+        self.make_format_function(code)?;
         Ok(true)
     }
 
@@ -1381,11 +1401,8 @@ impl<'a> Compiler<'a> {
             None
         };
         self.compile_expr(body)?;
-        if is_gen && self.st.scopes[self.ur().scope].generator {
-            // generator lambdas return None
-            self.emit(Op::PopTop, 0);
-            self.load_none();
-        }
+        // (a generator lambda returns its body's value, like any generator's return)
+        let _ = is_gen;
         self.emit(Op::ReturnValue, 0);
         if let Some(h) = handler {
             self.pop_block();
@@ -1464,7 +1481,7 @@ impl<'a> Compiler<'a> {
         }
         self.emit(Op::ReturnValue, 0);
         let code = self.exit_scope()?;
-        self.make_closure(code, 0)
+        self.make_format_function(code)
     }
 
     pub fn compile_type_alias(&mut self, s: &'a Stmt, name: &'a Expr, tps: &'a [ast::TypeParam], value: &'a Expr) -> R {

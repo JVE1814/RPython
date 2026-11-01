@@ -187,3 +187,13 @@ duplicate keys), "'elif' ..." is parser-level (done). Also "invalid syntax. Did 
   (CPython raises RecursionError for these in ast2obj/the compiler). Brackets: 200 (tokenizer).
   Consumers must still guard their own recursion over the AST.
 * Encodings beyond the native list need `ParseOptions.decode`.
+
+## Changes by the ast workstream (current owner)
+
+* `ErrorKind::ValueError`: a non-ASCII identifier that NFKC-normalizes to `True`/`False`/`None`
+  ("identifier field can't represent 'True' constant").
+* f-string format specs: adjacent literal pieces (e.g. the debug text of a nested `{y=}`) are
+  merged into one Constant.
+* `[*A: (int, str)]` / `[**P: (a, b)]`: "cannot use constraints with ..." (tuple bound).
+* 'single' mode: a one-line compound statement ending at a mid-line EOF (`def f(): pass`) is
+  rejected like CPython (the implied NEWLINE is used up by the body).

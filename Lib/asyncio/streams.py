@@ -162,6 +162,9 @@ class StreamReaderProtocol(FlowControlMixin, protocols.Protocol):
     def _replace_transport(self, transport):
         self._transport = transport
         self._over_ssl = transport.get_extra_info('sslcontext') is not None
+        reader = self._stream_reader
+        if reader is not None:
+            reader._transport = transport
 
     def connection_made(self, transport):
         if self._reject_connection:
@@ -181,7 +184,20 @@ class StreamReaderProtocol(FlowControlMixin, protocols.Protocol):
         if self._client_connected_cb is None:
             return
         writer = StreamWriter(transport, self, reader, self._loop)
-        outcome = self._client_connected_cb(reader, writer)
+        try:
+            outcome = self._client_connected_cb(reader, writer)
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except BaseException as exc:
+            # a plain callback failing is reported like a failing coroutine
+            self._loop.call_exception_handler({
+                'message': 'Unhandled exception in client_connected_cb',
+                'exception': exc,
+                'transport': transport,
+            })
+            transport.close()
+            self._strong_reader = None
+            return
         if coroutines.iscoroutine(outcome):
             def on_handler_done(task):
                 if task.cancelled():
@@ -481,7 +497,7 @@ class StreamReader:
         scanned = 0   # bytes known not to contain the end of a match
         while True:
             buf = self._buffer
-            match_end = None
+            match_end = match_start = None
             for sep in separators:
                 start = max(0, scanned - len(sep) + 1)
                 pos = buf.find(sep, start)
@@ -489,11 +505,13 @@ class StreamReader:
                     end = pos + len(sep)
                     if match_end is None or end < match_end:
                         match_end = end
+                        match_start = pos
             if match_end is not None:
-                if match_end > self._limit:
+                if match_start > self._limit:
+                    # "consumed" is where the separator starts
                     raise exceptions.LimitOverrunError(
-                        'Separator is found, but chunk is longer than limit',
-                        match_end)
+                        "Separator is found, but chunk is longer than limit",
+                        match_start)
                 return self._consume(match_end)
 
             scanned = max(0, len(buf) + 1 - longest)

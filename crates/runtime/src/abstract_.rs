@@ -247,6 +247,12 @@ pub fn call_with_kwargs_dict(callable: &PyObject, args: &[&PyObject], kw: Option
             let mut names = Vec::with_capacity(items.len());
             for (key, _) in items.iter() {
                 if !pystr::is_str(key) {
+                    // non-str keys: only tp_call (which receives the dict itself) can
+                    // decide; Python functions reject them there
+                    if callable.ty().tp_call.is_some() && callable.ty().tp_call != Some(vectorcall_call) {
+                        let t = tuple::new_tuple(args.iter().map(|a| a.to_ref()).collect());
+                        return call_tp_call(callable, &t, Some(k));
+                    }
                     raise!(TypeError, "keywords must be strings");
                 }
                 names.push(key.clone());
@@ -1238,12 +1244,24 @@ fn abstract_issubclass(derived: &PyObject, cls: &PyObject) -> PyResult<bool> {
             d = tuple::tuple_get(&bases, 0).to_ref();
             continue;
         }
+        let ts = crate::threads::current();
+        crate::interp::enter_recursive_call(ts, " in __subclasscheck__")?;
+        let mut found = Ok(false);
         for b in tuple::tuple_items(&bases) {
-            if abstract_issubclass(b, cls)? {
-                return Ok(true);
+            match abstract_issubclass(b, cls) {
+                Ok(true) => {
+                    found = Ok(true);
+                    break;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    found = Err(e);
+                    break;
+                }
             }
         }
-        return Ok(false);
+        crate::interp::leave_recursive_call(ts);
+        return found;
     }
 }
 
@@ -1276,12 +1294,21 @@ pub fn isinstance(inst: &PyObject, cls: &PyObject) -> PyResult<bool> {
         return recursive_isinstance(inst, cls);
     }
     if tuple::is_tuple(cls) {
+        // nested tuples recurse: guard the native stack
+        let ts = crate::threads::current();
+        crate::interp::enter_recursive_call(ts, " in __instancecheck__")?;
+        let mut r = Ok(false);
         for c in tuple::tuple_items(cls) {
-            if isinstance(inst, c)? {
-                return Ok(true);
+            match isinstance(inst, c) {
+                Ok(false) => {}
+                other => {
+                    r = other;
+                    break;
+                }
             }
         }
-        return Ok(false);
+        crate::interp::leave_recursive_call(ts);
+        return r;
     }
     if let Some(chk) = lookup_special(cls, name!("__instancecheck__"))? {
         let ts = crate::threads::current();
@@ -1314,12 +1341,21 @@ pub fn issubclass(derived: &PyObject, cls: &PyObject) -> PyResult<bool> {
         return recursive_issubclass(derived, cls);
     }
     if tuple::is_tuple(cls) {
+        // nested tuples recurse: guard the native stack
+        let ts = crate::threads::current();
+        crate::interp::enter_recursive_call(ts, " in __instancecheck__")?;
+        let mut r = Ok(false);
         for c in tuple::tuple_items(cls) {
-            if issubclass(derived, c)? {
-                return Ok(true);
+            match issubclass(derived, c) {
+                Ok(false) => {}
+                other => {
+                    r = other;
+                    break;
+                }
             }
         }
-        return Ok(false);
+        crate::interp::leave_recursive_call(ts);
+        return r;
     }
     if let Some(chk) = lookup_special(cls, name!("__subclasscheck__"))? {
         let ts = crate::threads::current();

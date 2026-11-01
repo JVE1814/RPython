@@ -11,7 +11,8 @@
 #   _testcapi/bytes.c      (pycore_bytesobject.h: private _PyBytesWriter API)
 #   _testcapi/immortal.c   (pycore_long.h immortality bits)
 #   _testcapi/monitoring.c (pycore_instruments.h)
-# Not buildable at all: _testinternalcapi (internal headers), _testmultiphase, _testclinic,
+# _testmultiphase uses tools/capi_shim/clinic/_testmultiphase.c.h (hand-written wrappers).
+# Not buildable at all: _testinternalcapi (internal headers; a Rust builtin instead), _testclinic,
 # _testclinic_limited (their generated Modules/clinic/*.c.h files are not in the spec).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -46,10 +47,10 @@ sources() { # module name -> list of sources
   done
 } > "$INC/_testcapi_excluded.c"
 
-ALL="_testcapi _testlimitedcapi _testbuffer _testsinglephase _testimportmultiple"
+ALL="_testcapi _testlimitedcapi _testbuffer _testsinglephase _testimportmultiple _testmultiphase"
 
 if [ "${1:-}" = "--check" ]; then
-  for mod in $ALL _testmultiphase _testclinic _testclinic_limited; do
+  for mod in $ALL _testclinic _testclinic_limited; do
     for src in $(sources "$mod"); do
       err=$("$CC" -fsyntax-only -w $CFLAGS "$src" 2>&1 | grep -m3 'error')
       [ -n "$err" ] && printf '%s:\n%s\n' "${src#$ROOT/}" "$err"

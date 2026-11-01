@@ -219,6 +219,7 @@ fn emit_warning_m(
     offset: i32,
     text: Option<&str>,
     module: Option<&PyObject>,
+    end: (Option<i32>, Option<i32>),
 ) -> PyResult<()> {
     let cat = match category {
         "DeprecationWarning" => crate::types::exceptions::DeprecationWarning(),
@@ -232,7 +233,7 @@ fn emit_warning_m(
     if r.is_err() {
         if exc_matches(cat) {
             clear_exc();
-            return Err(raise_syntax_error(crate::types::exceptions::SyntaxError(), error_msg, filename, lineno, offset, text, None, None));
+            return Err(raise_syntax_error(crate::types::exceptions::SyntaxError(), error_msg, filename, lineno, offset, text, end.0, end.1));
         }
         return r;
     }
@@ -345,7 +346,7 @@ pub fn parse_mod(src: Source, o: &Opts) -> PyResult<(rpy_parser::ast::Mod, Strin
     }
     for w in &out.warnings {
         let cat = format!("{:?}", w.category);
-        emit_warning_m(&cat, &w.msg, &w.error_msg, o.filename, w.lineno, w.offset, source_line(&text, w.lineno).as_deref(), o.module)?;
+        emit_warning_m(&cat, &w.msg, &w.error_msg, o.filename, w.lineno, w.offset, source_line(&text, w.lineno).as_deref(), o.module, (Some(w.end_lineno), Some(w.end_offset)))?;
     }
     match out.result {
         Ok(m) => Ok((m, text.into_owned())),
@@ -397,7 +398,15 @@ pub fn compile_mod(module: &rpy_parser::ast::Mod, o: &Opts, src: Option<&str>) -
             }
             None => w.col_offset + 1,
         };
-        emit_warning_m(&cat, &w.msg, &w.msg, filename, w.lineno, off, text.as_deref(), o.module)?;
+        let end_text = src.and_then(|s| source_line(s, w.end_lineno));
+        let end_off = match &end_text {
+            Some(l) => {
+                let b = (w.end_col_offset.max(0) as usize).min(l.len());
+                l.get(..b).map_or(w.end_col_offset + 1, |p| p.chars().count() as i32 + 1)
+            }
+            None => w.end_col_offset + 1,
+        };
+        emit_warning_m(&cat, &w.msg, &w.msg, filename, w.lineno, off, text.as_deref(), o.module, (Some(w.end_lineno), Some(end_off)))?;
     }
     let fname = pystr::intern_str(filename);
     let code = crate::types::code::new_code_from_unit(&out.code, Some(&fname))?;

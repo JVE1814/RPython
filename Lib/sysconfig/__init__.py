@@ -167,14 +167,9 @@ else:
 _sys_home = getattr(sys, '_home', None)
 
 
-def is_python_build(check_home=None):
+def is_python_build():
     """True when running from a build tree rather than an installation.
     This interpreter is never considered a CPython source build."""
-    if check_home is not None:
-        import warnings
-        warnings.warn("The check_home argument of sysconfig.is_python_build is "
-                      "deprecated and its value is ignored.",
-                      DeprecationWarning, stacklevel=2)
     return False
 
 _PYTHON_BUILD = is_python_build()
@@ -261,7 +256,14 @@ def get_makefile_filename():
         config_dir_name = 'config'
     if hasattr(sys.implementation, '_multiarch'):
         config_dir_name += f'-{sys.implementation._multiarch}'
-    return os.path.join(get_path('stdlib'), config_dir_name, 'Makefile')
+    makefile = os.path.join(get_path('stdlib'), config_dir_name, 'Makefile')
+    stdlib_dir = getattr(sys, '_stdlib_dir', None)
+    if not os.path.isfile(makefile) and stdlib_dir:
+        # Development layout: the standard library is not below the prefix.
+        candidate = os.path.join(stdlib_dir, config_dir_name, 'Makefile')
+        if os.path.isfile(candidate):
+            return candidate
+    return makefile
 
 
 def _get_sysconfigdata_name():
@@ -310,27 +312,28 @@ def parse_config_h(fp, vars=None):
     if vars is None:
         vars = {}
     import re
-    define_rx = re.compile("#define ([A-Z][A-Za-z0-9_]+) (.*)\n")
-    undef_rx = re.compile("/[*] #undef ([A-Z][A-Za-z0-9_]+) [*]/\n")
+    # Macro names: an upper-case ASCII letter followed by at least one more
+    # name character, or the _Py_ prefix.
+    name = r'(_Py_[A-Za-z0-9_]+|[A-Z][A-Za-z0-9_]+)'
+    define_rx = re.compile(r'#define ' + name + r'[ \t]+(\S.*?)\s*\Z', re.ASCII)
+    undef_rx = re.compile(r'/[*] #undef ' + name + r' [*]/\s*\Z', re.ASCII)
 
-    while True:
-        line = fp.readline()
-        if not line:
-            break
+    for line in fp:
         m = define_rx.match(line)
         if m:
             n, v = m.group(1, 2)
-            try:
-                if n in _ALWAYS_STR:
-                    raise ValueError
-                v = int(v)
-            except ValueError:
-                pass
+            if len(v) >= 2 and v[0] == v[-1] == '"':
+                v = v[1:-1]
+            elif n not in _ALWAYS_STR:
+                try:
+                    v = int(v)
+                except ValueError:
+                    pass
             vars[n] = v
-        else:
-            m = undef_rx.match(line)
-            if m:
-                vars[m.group(1)] = 0
+            continue
+        m = undef_rx.match(line)
+        if m:
+            vars[m.group(1)] = 0
     return vars
 
 
@@ -410,11 +413,11 @@ def _init_config_vars():
     except AttributeError:
         _CONFIG_VARS['py_version_nodot_plat'] = ''
 
-    _CONFIG_VARS['BINDIR'] = os.path.dirname(_safe_realpath(sys.executable)) if sys.executable else _CONFIG_VARS.get('BINDIR', '')
-    _CONFIG_VARS['LIBDEST'] = sys._stdlib_dir if getattr(sys, '_stdlib_dir', None) else _CONFIG_VARS.get('LIBDEST', '')
-    _CONFIG_VARS['BINLIBDEST'] = _CONFIG_VARS['LIBDEST']
-    _CONFIG_VARS['INCLUDEPY'] = os.path.join(prefix, 'include', f'python{_PY_VERSION_SHORT}{abiflags}')
-    _CONFIG_VARS['LIBDIR'] = os.path.join(prefix, sys.platlibdir)
+    # BINDIR, LIBDEST, INCLUDEPY, LIBDIR, ... keep their build-time values
+    # (from _sysconfigdata), as in CPython; installation paths that follow
+    # the actual location come from the install schemes (get_path()).
+    if os.name != 'posix':
+        _CONFIG_VARS['BINDIR'] = os.path.dirname(_safe_realpath(sys.executable)) if sys.executable else ''
 
     if os.name == 'nt':
         _CONFIG_VARS['VERSION'] = _PY_VERSION_SHORT_NO_DOT
@@ -474,13 +477,9 @@ def get_platform():
     """Return a string identifying the platform the interpreter was built
     for, e.g. 'linux-x86_64'."""
     if os.name == 'nt':
-        if 'amd64' in sys.version.lower():
-            return 'win-amd64'
-        if '(arm)' in sys.version.lower():
-            return 'win-arm32'
-        if '(arm64)' in sys.version.lower():
-            return 'win-arm64'
-        return sys.platform
+        import _sysconfig
+        platform = getattr(_sysconfig, 'get_platform', lambda: None)()
+        return platform or sys.platform
 
     if os.name != "posix" or not hasattr(os, 'uname'):
         return sys.platform
@@ -500,7 +499,7 @@ def get_platform():
             release = get_config_var("ANDROID_API_LEVEL")
             machine = {
                 "x86_64": "x86_64", "i686": "x86", "aarch64": "arm64_v8a",
-                "armv7l": "armeabi_v7a",
+                "armv7l": "armeabi_v7a", "armv8l": "armeabi_v7a", "arm": "armeabi_v7a",
             }[machine]
         else:
             return  f"{osname}-{machine}"
@@ -546,6 +545,13 @@ def expand_makefile_vars(s, vars):
     """Expand Makefile-style variables ("${foo}" / "$(foo)") in *s* using
     *vars* (unknown names become empty strings)."""
     import re
+    import warnings
+    warnings.warn(
+        'sysconfig.expand_makefile_vars is deprecated and will be removed in '
+        'Python 3.16. Use sysconfig.get_paths(vars=...) instead.',
+        DeprecationWarning,
+        stacklevel=2,
+    )
 
     _findvar1_rx = r"\$\(([A-Za-z][A-Za-z0-9_]*)\)"
     _findvar2_rx = r"\${([A-Za-z][A-Za-z0-9_]*)}"

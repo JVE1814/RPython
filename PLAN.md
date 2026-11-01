@@ -74,6 +74,11 @@ Running (wave 9): tty2 (_pyrepl, _tkinter+tkinter, login_tty, locking), numpy (C
 suite passes; other cp315t wheels), docsig (__text_signature__ for all builtins).
 Finished also: tty (dbm/readline/curses), pkgtools (importlib.resources/metadata, ensurepip+pip 26.2.2, venv,
 zipapp, tracemalloc, sysconfig, pydoc). MILESTONE: pip installs numpy-2.5.4 cp315t wheel; import numpy works.
+Running: core-runtime2 (finalization, except*, frozen modules, settrace/monitoring remainder, core test failures,
+traceback hints).
+Finished also: ast (test_ast 217/220, unparse/tokenize/symtable/codeop/grammar all pass), compress2 (lzma/zstd from
+scratch, tarfile 779/781, zipimport, uuid), core-runtime (monitoring/setprofile, lazy imports PEP 810, gc policy,
+_testinternalcapi, _testmultiphase, many slot/type fixes).
 Unassigned: _testclinic re-implemented by us (spec lacks
 internal headers / generated clinic files); subinterpreters (_interpreters/_interpqueues/_interpchannels,
 concurrent.interpreters, InterpreterPoolExecutor — CPython has them); no-GIL thread-safety audit; startup time (jit owns perf).
