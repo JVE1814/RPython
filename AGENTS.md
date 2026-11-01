@@ -23,3 +23,7 @@ Hard rules (violating any of these invalidates the project):
 7. External crates: only general-purpose ones without Python-implementation code, and only when
    the assignment allows it. Default: no dependencies.
 8. Your final message must summarise: public API, what is done, what is missing, known bugs.
+9. Never reproduce CPython's (or any other Python implementation's) source text from memory —
+   not code, not comments, not docstrings. Match the behaviour and the names the tests use; write
+   the structure, code and comments yourself. No CPython issue-number comments ("gh-NNNN").
+   If you notice you are recalling CPython's text, stop and design it differently. (D19)
