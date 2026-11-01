@@ -1,0 +1,5 @@
+{'x': <class '__main__.Outer.Nested'>, 'return': <class 'int'>}
+{'x': <class '__main__.Outer.Nested'>}
+{'x': <class 'int'>, 'y': <class 'str'>}
+NIE ok
+{'x': 'closure'}

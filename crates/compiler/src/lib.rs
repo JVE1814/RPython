@@ -16,6 +16,7 @@ pub mod dis;
 pub mod fold;
 pub mod symtable;
 pub mod unparse;
+pub mod validate;
 
 pub use error::{CompileError, ErrorKind, Warning, WarningCategory};
 
@@ -127,4 +128,10 @@ pub fn symtable(module: &ast::Mod, opts: &CompileOptions) -> Result<symtable::Sy
 /// and folding of constant expressions in match patterns.
 pub fn optimize_ast(module: &mut ast::Mod, optimize: i32, flags: u32) -> Result<(), CompileError> {
     fold::optimize_ast(module, optimize, flags)
+}
+
+/// Position validation for hand-built ASTs (CPython's `_PyAST_Validate` position rules); call
+/// before [`compile`] when compiling an `ast` object from Python. Errors are ValueErrors.
+pub fn validate_ast(module: &ast::Mod) -> Result<(), CompileError> {
+    validate::validate_positions(module)
 }
