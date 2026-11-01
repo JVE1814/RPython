@@ -591,6 +591,12 @@ pub fn type_ready(tp: *mut PyTypeObject) -> PyResult<()> {
         add_getsets(tp)?;
         // MRO
         mro_internal(tp)?;
+        // operator wrappers for the type's own slots (before inheritance, as in
+        // CPython: inherited slots must not get wrappers of their own, or a heap
+        // type `class C(Mixin, bytearray)` would expose object's slots as C's)
+        if is_heap_type(tp) {
+            crate::types::slots::add_operators(tp)?;
+        }
         // inheritance
         if !base.is_null() {
             inherit_special(tp, base);
@@ -599,8 +605,9 @@ pub fn type_ready(tp: *mut PyTypeObject) -> PyResult<()> {
         for b in tuple::tuple_items(&*mro).iter().skip(1) {
             inherit_slots(tp, as_type(b));
         }
-        // operator wrappers for slots (after inheritance so only own slots get wrappers)
-        crate::types::slots::add_operators(tp)?;
+        if !is_heap_type(tp) {
+            crate::types::slots::add_operators(tp)?;
+        }
         // __hash__ = None if __eq__ overridden without __hash__
         let d = &*(*tp).tp_dict;
         if dict::get_item_str(d, name!("__hash__")).is_none() {

@@ -116,12 +116,12 @@ pub unsafe fn fill_info(view: *mut Py_buffer, obj: *mut PyObject, buf: *mut c_vo
 
 /// RAII owner of an acquired buffer.
 pub struct BufferView {
-    pub view: Py_buffer,
+    pub view: Box<Py_buffer>, // boxed: exporters may store pointers into the view itself
 }
 
 impl BufferView {
     pub fn get(o: &PyObject, flags: c_int) -> PyResult<BufferView> {
-        let mut b = BufferView { view: empty_view() };
+        let mut b = BufferView { view: Box::new(empty_view()) };
         get_buffer(o, &mut b.view, flags)?;
         Ok(b)
     }
@@ -152,7 +152,7 @@ impl BufferView {
 
 impl Drop for BufferView {
     fn drop(&mut self) {
-        unsafe { release_buffer(&mut self.view) }
+        unsafe { release_buffer(&mut *self.view) }
     }
 }
 

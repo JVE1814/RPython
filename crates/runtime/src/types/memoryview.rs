@@ -1342,13 +1342,10 @@ fn ass_sub_impl(o: &PyObject, key: &PyObject, value: Option<&PyObject>) -> PyRes
             raise!(NotImplementedError, "sub-views are not implemented");
         }
         let i = ab::index_as_ssize(key, Some(crate::types::exceptions::IndexError()))?;
+        let p = unsafe { ptr_from_index(&mv(o).view, i, 0)? };
         pack_single(value, f, &fname, &mut tmp)?;
         check_released(o)?;
-        let v = &mv(o).view;
-        unsafe {
-            let p = ptr_from_index(v, i, 0)?;
-            std::ptr::copy_nonoverlapping(tmp.as_ptr(), p, f.size());
-        }
+        unsafe { std::ptr::copy_nonoverlapping(tmp.as_ptr(), p, f.size()) };
         return Ok(());
     }
     if slice::is_slice(key) && v.ndim == 1 {
@@ -1381,13 +1378,10 @@ fn ass_sub_impl(o: &PyObject, key: &PyObject, value: Option<&PyObject>) -> PyRes
             raise!(NotImplementedError, "sub-views are not implemented");
         }
         let idx = tuple_indices(v, key)?;
+        let p = unsafe { ptr_from_indices(&mv(o).view, &idx)? };
         pack_single(value, f, &fname, &mut tmp)?;
         check_released(o)?;
-        let v = &mv(o).view;
-        unsafe {
-            let p = ptr_from_indices(v, &idx)?;
-            std::ptr::copy_nonoverlapping(tmp.as_ptr(), p, f.size());
-        }
+        unsafe { std::ptr::copy_nonoverlapping(tmp.as_ptr(), p, f.size()) };
         return Ok(());
     }
     if slice::is_slice(key) || is_multislice(key) {
