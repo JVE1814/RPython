@@ -47,7 +47,7 @@ _slot = _LoopSlot()
 
 
 def _get_running_loop():
-    """Return the running event loop or None (meant for loops and policies)."""
+    """The loop running in this thread, or None."""
     loop = _slot.loop
     if loop is not None and _slot.pid == _os.getpid():
         return loop
@@ -55,13 +55,13 @@ def _get_running_loop():
 
 
 def _set_running_loop(loop, /):
-    """Set the running event loop (meant for event loop implementations)."""
+    """Declare the loop running in this thread (used by loop implementations)."""
     _slot.loop = loop
     _slot.pid = _os.getpid()
 
 
 def get_running_loop():
-    """Return the running event loop.  Raise a RuntimeError if there is none."""
+    """The loop running in this thread; RuntimeError when none is running."""
     loop = _get_running_loop()
     if loop is None:
         raise RuntimeError('no running event loop')
@@ -69,7 +69,7 @@ def get_running_loop():
 
 
 def get_event_loop():
-    """Return the running loop, or the current loop of the event loop policy."""
+    """The running loop if there is one, else the policy's current loop."""
     loop = _get_running_loop()
     if loop is not None:
         return loop
@@ -94,18 +94,11 @@ def _loop_of(fut):
 # Future
 
 class Future:
-    """This class is *almost* compatible with concurrent.futures.Future.
+    """The result of an asynchronous operation, completed by set_result(),
+    set_exception() or cancel().
 
-    Differences:
-
-    - result() and exception() do not take a timeout argument and
-      raise an exception when the future isn't done yet.
-
-    - Callbacks registered with add_done_callback() are always called
-      via the event loop's call_soon_threadsafe().
-
-    - This class is not compatible with the wait() and as_completed()
-      methods in the concurrent.futures package.
+    Done callbacks always run through the loop, never synchronously, and
+    result()/exception() never block.
     """
 
     __slots__ = ('_fut_loop', '_fut_state', '_fut_result', '_fut_exc',
@@ -115,6 +108,9 @@ class Future:
                  '__dict__')
 
     def __init__(self, *, loop=None):
+        if getattr(self, "_fut_loop", None) is not None:
+            raise RuntimeError(f"{type(self).__name__} object is already "
+                               f"initialized")
         if loop is None:
             loop = get_event_loop()
         self._fut_loop = loop
@@ -161,7 +157,7 @@ class Future:
             'future': self,
         }
         if self._fut_source_tb:
-            context['source_traceback'] = self._fut_source_tb
+            context["source_traceback"] = self._fut_source_tb
         self._fut_loop.call_exception_handler(context)
 
     # -- attributes with C semantics
@@ -235,21 +231,19 @@ class Future:
     # -- public API
 
     def get_loop(self):
-        """Return the event loop the Future is bound to."""
+        """The loop this future belongs to."""
         return self._check_init()
 
     def done(self):
-        """Return True if the future is done (finished or cancelled)."""
-        self._check_init()
-        return self._fut_state != _PENDING
+        """Whether a result, an exception or a cancellation was recorded."""
+        return getattr(self, "_fut_state", _PENDING) != _PENDING
 
     def cancelled(self):
-        """Return True if the future was cancelled."""
-        self._check_init()
-        return self._fut_state == _CANCELLED
+        """Whether the future ended by cancellation."""
+        return getattr(self, "_fut_state", _PENDING) == _CANCELLED
 
     def _make_cancelled_error(self):
-        """Create the CancelledError to raise if the Future is cancelled."""
+        """The CancelledError describing this cancellation."""
         exc = self._fut_cancelled_exc
         if exc is not None:
             self._fut_cancelled_exc = None
@@ -259,9 +253,8 @@ class Future:
         return _exceptions.CancelledError(self._fut_cancel_msg)
 
     def result(self):
-        """Return the result this future represents."""
-        self._check_init()
-        state = self._fut_state
+        """The result; re-raises a stored exception or the cancellation."""
+        state = getattr(self, "_fut_state", _PENDING)
         if state == _CANCELLED:
             raise self._make_cancelled_error()
         if state != _FINISHED:
@@ -272,9 +265,8 @@ class Future:
         return self._fut_result
 
     def exception(self):
-        """Return the exception that was set on this future."""
-        self._check_init()
-        state = self._fut_state
+        """The stored exception (None after a normal result)."""
+        state = getattr(self, "_fut_state", _PENDING)
         if state == _CANCELLED:
             raise self._make_cancelled_error()
         if state != _FINISHED:
@@ -283,7 +275,7 @@ class Future:
         return self._fut_exc
 
     def add_done_callback(self, fn, /, *, context=None):
-        """Add a callback to be run when the future becomes done."""
+        """Schedule fn(self) on the loop once the future is done."""
         loop = self._check_init()
         if self._fut_state != _PENDING:
             loop.call_soon(fn, self, context=context)
@@ -293,7 +285,7 @@ class Future:
         self._fut_callbacks.append((fn, context))
 
     def remove_done_callback(self, fn, /):
-        """Remove all instances of a callback from the "call when done" list."""
+        """Drop every registration of fn; return how many were dropped."""
         self._check_init()
         callbacks = self._fut_callbacks
         kept = [entry for entry in callbacks if entry[0] != fn]
@@ -313,7 +305,7 @@ class Future:
             loop.call_soon(fn, self, context=context)
 
     def cancel(self, msg=None):
-        """Cancel the future and schedule callbacks."""
+        """Cancel a pending future; False if it was already done."""
         self._check_init()
         self._fut_log_tb = False
         if self._fut_state != _PENDING:
@@ -324,7 +316,7 @@ class Future:
         return True
 
     def set_result(self, result, /):
-        """Mark the future done and set its result."""
+        """Finish the future with a result."""
         self._check_init()
         if self._fut_state != _PENDING:
             raise _exceptions.InvalidStateError(
@@ -334,7 +326,7 @@ class Future:
         self._schedule_callbacks()
 
     def set_exception(self, exception, /):
-        """Mark the future done and set an exception."""
+        """Finish the future with an exception."""
         self._check_init()
         if self._fut_state != _PENDING:
             raise _exceptions.InvalidStateError(
@@ -392,27 +384,27 @@ _current_tasks = {}
 
 
 def _register_task(task):
-    """Register a new task in asyncio as executed by loop."""
+    """Add a task to the registry of known tasks."""
     _scheduled_tasks.add(task)
 
 
 def _register_eager_task(task):
-    """Register a new task in asyncio as executed by loop."""
+    """Add a task to the registry of known tasks."""
     _eager_tasks.add(task)
 
 
 def _unregister_task(task):
-    """Unregister a task."""
+    """Remove a task from the registry."""
     _scheduled_tasks.discard(task)
 
 
 def _unregister_eager_task(task):
-    """Unregister a task."""
+    """Remove a task from the registry."""
     _eager_tasks.discard(task)
 
 
 def _enter_task(loop, task):
-    """Enter into task execution or resume suspended task."""
+    """Record that task starts running a step on loop."""
     current = _current_tasks.get(loop)
     if current is not None:
         raise RuntimeError(f'Cannot enter into task {task!r} while another '
@@ -421,7 +413,7 @@ def _enter_task(loop, task):
 
 
 def _leave_task(loop, task):
-    """Leave task execution or suspend a task."""
+    """Record that task stops running a step on loop."""
     current = _current_tasks.get(loop)
     if current is not task:
         raise RuntimeError(f'Leaving task {task!r} does not match the '
@@ -430,8 +422,8 @@ def _leave_task(loop, task):
 
 
 def _swap_current_task(loop, task):
-    """Temporarily swap in the supplied task and return the original one
-    (or None)."""
+    """Make task the running task of loop (None: no task) and return
+    the previous one."""
     previous = _current_tasks.get(loop)
     if task is None:
         _current_tasks.pop(loop, None)
@@ -441,14 +433,14 @@ def _swap_current_task(loop, task):
 
 
 def current_task(loop=None):
-    """Return a currently executed task."""
+    """The task running on loop (default: the running loop), or None."""
     if loop is None:
         loop = get_running_loop()
     return _current_tasks.get(loop)
 
 
 def all_tasks(loop=None):
-    """Return a set of all tasks for the loop."""
+    """The unfinished tasks of loop (default: the running loop)."""
     if loop is None:
         loop = get_running_loop()
     for attempt in range(1000):
@@ -470,7 +462,7 @@ _task_counter = _itertools.count(1)
 
 
 class Task(Future):
-    """A coroutine wrapped in a Future."""
+    """A future that drives a coroutine on its loop."""
 
     __slots__ = ('_task_coro', '_task_context', '_task_name',
                  '_task_fut_waiter', '_task_must_cancel',
@@ -484,6 +476,10 @@ class Task(Future):
         if not coroutines.iscoroutine(coro):
             self._task_log_destroy_pending = False
             raise TypeError(f'a coroutine was expected, got {coro!r}')
+        if context is not None and not isinstance(context, _contextvars.Context):
+            self._task_log_destroy_pending = False
+            raise TypeError(f'context must be a contextvars.Context, not '
+                            f'{type(context).__name__}')
         if self._fut_source_tb:
             del self._fut_source_tb[-1]
         self._task_must_cancel = False
@@ -517,7 +513,7 @@ class Task(Future):
             context = {'task': self,
                        'message': 'Task was destroyed but it is pending!'}
             if self._fut_source_tb:
-                context['source_traceback'] = self._fut_source_tb
+                context["source_traceback"] = self._fut_source_tb
             self._fut_loop.call_exception_handler(context)
         Future.__del__(self)
 
@@ -579,17 +575,17 @@ class Task(Future):
         raise RuntimeError('Task does not support set_exception operation')
 
     def get_stack(self, *, limit=None):
-        """Return the list of stack frames for this task's coroutine."""
+        """Frames of the suspended coroutine (or of the final traceback)."""
         from asyncio import base_tasks
         return base_tasks._task_get_stack(self, limit)
 
     def print_stack(self, *, limit=None, file=None):
-        """Print the stack or traceback for this task's coroutine."""
+        """Print get_stack() in traceback format."""
         from asyncio import base_tasks
         return base_tasks._task_print_stack(self, limit, file)
 
     def cancel(self, msg=None):
-        """Request that this task cancel itself."""
+        """Ask the task to cancel; it sees CancelledError at its next await."""
         self._check_init()
         self._fut_log_tb = False
         if self._fut_state != _PENDING:
@@ -603,11 +599,11 @@ class Task(Future):
         return True
 
     def cancelling(self):
-        """Return the count of the task's cancellation requests."""
+        """Number of pending cancellation requests."""
         return self._task_num_cancels
 
     def uncancel(self):
-        """Decrement the task's count of cancellation requests."""
+        """Withdraw one cancellation request; return the remaining number."""
         if self._task_num_cancels > 0:
             self._task_num_cancels -= 1
             if self._task_num_cancels == 0:
@@ -650,6 +646,7 @@ class Task(Future):
             self._task_step_run_and_handle(exc)
         finally:
             _leave_task(loop, self)
+            self = None   # no reference cycle through tracebacks
 
     def _task_schedule(self, exc=None):
         if exc is None:
@@ -682,6 +679,8 @@ class Task(Future):
             Future.set_exception(self, failure)
         else:
             self._task_handle_yield(result)
+        finally:
+            self = None   # no reference cycle through tracebacks
 
     def _task_handle_yield(self, result):
         blocking = getattr(result, '_asyncio_future_blocking', None)
@@ -731,8 +730,37 @@ class Task(Future):
             self._task_step_cb(exc)
         else:
             self._task_step_cb()
+        self = None
 
 
+class _builtin_function:
+    # Module-level functions behave like builtins: unlike Python functions
+    # they do not bind as methods when stored on a class.
+
+    def __init__(self, func):
+        self._func = func
+        self.__name__ = func.__name__
+        self.__qualname__ = func.__name__
+        self.__doc__ = func.__doc__
+        self.__module__ = '_asyncio'
+        self.__wrapped__ = func
+
+    def __call__(self, /, *args, **kwargs):
+        return self._func(*args, **kwargs)
+
+    def __repr__(self):
+        return f'<built-in function {self.__name__}>'
+
+
+for _name in ('_get_running_loop', '_set_running_loop', 'get_running_loop',
+              'get_event_loop', 'future_add_to_awaited_by',
+              'future_discard_from_awaited_by', '_register_task',
+              '_register_eager_task', '_unregister_task',
+              '_unregister_eager_task', '_enter_task', '_leave_task',
+              '_swap_current_task', 'current_task', 'all_tasks'):
+    globals()[_name] = _builtin_function(globals()[_name])
+del _name
+Future.__module__ = Task.__module__ = '_asyncio'
 "#;
 
 pub fn init_module() -> PyResult {
