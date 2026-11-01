@@ -172,7 +172,21 @@ def _bootstrap(*, root=None, upgrade=False, user=False,
         if sys.implementation.cache_tag is None:
             args.append("--no-compile")
 
-        return _run_pip([*args, "pip"], [os.fsdecode(local_wheel)])
+        return _run_pip([*args, "pip"], [_importable_location(local_wheel, tmpdir)])
+
+
+def _importable_location(wheel, tmpdir):
+    """Return a sys.path entry from which pip can be imported: the wheel
+    itself, or (when zipimport is unavailable) an unpacked copy of it."""
+    try:
+        import zipimport  # noqa: F401
+    except ImportError:
+        import zipfile
+        unpacked = os.path.join(tmpdir, 'pip-unpacked')
+        with zipfile.ZipFile(wheel) as zf:
+            zf.extractall(unpacked)
+        return unpacked
+    return os.fsdecode(wheel)
 
 
 def _uninstall_helper(*, verbosity=0):

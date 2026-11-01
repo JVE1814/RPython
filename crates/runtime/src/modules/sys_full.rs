@@ -1203,6 +1203,12 @@ pub fn post_init() -> PyResult<()> {
         crate::modules::faulthandler::enable_at_startup();
     }
     crate::import::install_importlib(&stdlib_dir())?;
+    Ok(())
+}
+
+/// `import site` (unless -S).  Runs after the standard streams and
+/// builtins.open exist, as in CPython (site.venv() reads pyvenv.cfg).
+pub fn import_site() -> PyResult<()> {
     if config().no_site == 0 && std::path::Path::new(&stdlib_dir()).join("site.py").is_file() {
         if crate::import::import_absolute("site").is_err() {
             // CPython aborts start-up here; we report and continue so that a

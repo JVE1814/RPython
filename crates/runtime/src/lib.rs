@@ -76,6 +76,7 @@ pub fn initialize(cfg: &Config) -> PyResult<()> {
     }
     modules::sys_full::post_init()?;
     modules::sys::init_stdio();
+    modules::sys_full::import_site()?;
     Ok(())
 }
 
