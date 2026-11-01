@@ -18,5 +18,9 @@ pub mod codecs_registry;
 pub mod reprlib_guard;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
-pub fn register_all() {}
+pub fn register_all() {
+    numbers_registry::register();
+}
 pub mod builtins_numbers;
+pub mod math;
+pub mod numbers_registry;
