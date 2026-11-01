@@ -23,6 +23,7 @@ use super::analysis::{Analysis, Instr};
 use super::helpers as h;
 use super::x64::*;
 use crate::ffi::*;
+use crate::interp::cache::prof;
 use crate::interp::frame::Frame;
 use crate::object::*;
 use crate::threads::{CThreadState, ThreadState};
@@ -48,7 +49,7 @@ const LV_TAG: i32 = offset_of!(PyLongObject, lv_tag) as i32;
 const LV_DIGIT: i32 = offset_of!(PyLongObject, ob_digit) as i32;
 const FVAL: i32 = offset_of!(PyFloatObject, ob_fval) as i32;
 
-type Stub = Box<dyn FnOnce(&mut Asm, Label, i32)>;
+pub(crate) type Stub = Box<dyn FnOnce(&mut Asm, Label, i32)>;
 
 const TP_TAG: i32 = offset_of!(PyTypeObject, tp_version_tag) as i32;
 const GC_BITS: i32 = offset_of!(PyObject, ob_gc_bits) as i32;
@@ -64,14 +65,18 @@ const E_B: i32 = offset_of!(crate::interp::cache::Entry, b) as i32;
 const E_C: i32 = offset_of!(crate::interp::cache::Entry, c) as i32;
 const E_KIND: i32 = offset_of!(crate::interp::cache::Entry, kind) as i32;
 
-const LIST_SIZE: i32 = offset_of!(PyVarObject, ob_size) as i32;
+const FUNC_CODE: i32 = offset_of!(crate::types::funcobject::PyFunctionObject, func_code) as i32;
+const CODE_DATA: i32 = offset_of!(crate::types::code::PyCodeObject, data) as i32;
+const CD_FAST_ENTRY: i32 = (offset_of!(CodeData, caches) + offset_of!(crate::interp::cache::CodeCaches, fast_entry)) as i32;
+
+const LIST_SIZE: i32 =offset_of!(PyVarObject, ob_size) as i32;
 const LIST_ITEMS: i32 = offset_of!(PyListObject, ob_item) as i32;
 const TUPLE_ITEMS: i32 = offset_of!(PyTupleObject, ob_item) as i32;
 
 /// The range/list/tuple iterator structs are private to their modules; the inline
 /// ForIter paths assume (index or start, seq or step, len) at offsets 32/40/48.
 /// Verify that once on real objects and fall back to the helper otherwise.
-fn iter_layout_ok() -> bool {
+pub(crate) fn iter_layout_ok() -> bool {
     static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OK.get_or_init(|| unsafe {
         let rd = |o: &PyObject, off: usize| *((o.as_ptr() as *const u8).add(off) as *const i64);
@@ -136,19 +141,21 @@ pub struct Output {
     pub entries: Vec<u32>,
 }
 
-struct Gen<'a> {
-    a: Asm,
-    nlp: i32,
-    an: &'a Analysis,
-    cd: &'a CodeData,
-    tables: &'a crate::interp::cache::Tables,
-    ilabel: Vec<Label>,
-    exit: Label,
+pub(crate) struct Gen<'a> {
+    pub(crate) a: Asm,
+    pub(crate) nlp: i32,
+    pub(crate) an: &'a Analysis,
+    pub(crate) cd: &'a CodeData,
+    pub(crate) tables: &'a crate::interp::cache::Tables,
+    pub(crate) ilabel: Vec<Label>,
+    pub(crate) exit: Label,
     stubs: Vec<Stub>,
-    rt_box_int: Label,
-    rt_box_float: Label,
-    rt_free_num: Label,
+    pub(crate) rt_box_int: Label,
+    pub(crate) rt_box_float: Label,
+    pub(crate) rt_free_num: Label,
     flags: u32,
+    /// do not fuse CompareOp with a following branch (embedded in tier 2)
+    pub(crate) no_fuse: bool,
 }
 
 fn fnaddr<T>(f: T) -> usize
@@ -186,7 +193,9 @@ impl<'a> Gen<'a> {
     /// Out-of-line error exit with the given remaining stack depth.
     fn error_label(&mut self, pc: u32, depth: i32) -> Label {
         let l = self.a.label();
-        self.stubs.push(Box::new(move |a: &mut Asm, exit, nlp| {
+        // the exit current at creation (tier 2 redirects it per embedded instruction)
+        let exit = self.exit;
+        self.stubs.push(Box::new(move |a: &mut Asm, _exit, nlp| {
             a.bind(l);
             a.store32_i(M(Rbx, LASTI), pc as i32);
             a.store_i(M(Rbx, STACK_TOP), nlp + depth);
@@ -302,6 +311,32 @@ impl<'a> Gen<'a> {
         self.check(ins.pc, err_depth);
     }
 
+    fn prof_addr(&self, pc: u32) -> i64 {
+        &self.tables.profile[pc as usize] as *const _ as i64
+    }
+    /// Record type-profile bits for the instruction at `pc` (fast paths). Clobbers r11.
+    fn prof(&mut self, pc: u32, bits: u16) {
+        let p = self.prof_addr(pc);
+        self.a.mov_ri(R11, p);
+        self.a.or16_mi(M(R11, 0), bits);
+    }
+    /// Record the types of the stack operands at depths `da` and `db` (slow paths;
+    /// clobbers caller-saved registers).
+    fn prof_slow(&mut self, pc: u32, da: i32, db: Option<i32>) {
+        let p = self.prof_addr(pc);
+        self.a.mov_ri(Rdi, p);
+        let m = self.slot(da);
+        self.a.load(Rsi, m);
+        match db {
+            Some(db) => {
+                let m = self.slot(db);
+                self.a.load(Rdx, m);
+            }
+            None => self.a.mov_ri(Rdx, 0),
+        }
+        self.call(addr!(h::h_prof));
+    }
+
     /// Load compact-int value of the object in `obj` into `out` or jump to `slow`.
     /// Clobbers `tmp`.
     fn compact_int(&mut self, obj: R, out: R, tmp: R, slow: Label) {
@@ -321,7 +356,7 @@ impl<'a> Gen<'a> {
         self.a.bind(pos);
     }
 
-    fn emit(&mut self, i: usize) -> Result<(), String> {
+    pub(crate) fn emit(&mut self, i: usize) -> Result<(), String> {
         let ins = self.an.instrs[i];
         let d = self.an.depth[i];
         let pc = ins.pc;
@@ -455,6 +490,27 @@ impl<'a> Gen<'a> {
                 let t = self.an.index_of[arg as usize] as usize;
                 if arg <= ins.start {
                     self.poll(pc, d);
+                    if !self.no_fuse && super::opt::enabled() {
+                        // tier-2 backedge countdown; on expiry compile and continue
+                        // in the tier-2 OSR entry of this loop header if one exists
+                        let stub = self.a.label();
+                        let back = self.a.label();
+                        let cnt = &self.cd.caches.t2_backedge as *const _ as i64;
+                        self.a.mov_ri(R11, cnt);
+                        self.a.sub32_mi(M(R11, 0), 1);
+                        self.a.jcc(Cc::L, stub);
+                        self.a.bind(back);
+                        self.stubs.push(Box::new(move |a: &mut Asm, _exit, _nlp| {
+                            a.bind(stub);
+                            a.store32_i(M(Rbx, LASTI), pc as i32);
+                            a.mov_rr(Rdi, Rbx);
+                            a.mov_ri(Rsi, arg as i64);
+                            a.call_abs(addr!(super::opt::h_backedge));
+                            a.test_rr(Rax, Rax);
+                            a.jcc(Cc::E, back);
+                            a.jmp_r(Rax);
+                        }));
+                    }
                 }
                 let l = self.ilabel[t];
                 self.a.jmp(l);
@@ -575,13 +631,15 @@ impl<'a> Gen<'a> {
             Op::BinaryOp => self.binary_op(&ins, d)?,
             Op::CompareOp => {
                 let next = self.an.instrs.get(i + 1).copied();
-                let fuse = arg & 16 != 0
+                let fuse = !self.no_fuse
+                    && arg & 16 != 0
                     && matches!(next.map(|n| n.op), Some(Op::PopJumpIfFalse | Op::PopJumpIfTrue))
                     && !self.an.is_target[i + 1];
                 if fuse {
                     self.compare_jump(&ins, &next.unwrap(), d)?;
                     return Ok(());
                 }
+                self.prof_slow(pc, d - 2, Some(d - 1));
                 self.helper_sp(&ins, d, addr!(h::h_compare), Some(arg as i64), None, d - 2);
             }
             Op::IsOp => {
@@ -634,7 +692,10 @@ impl<'a> Gen<'a> {
                 self.a.bind(done);
             }
             Op::BinarySubscr => self.binary_subscr(&ins, d),
-            Op::StoreSubscr => self.helper_sp(&ins, d, addr!(h::h_store_subscr), None, None, d - 3),
+            Op::StoreSubscr => {
+                self.prof_slow(pc, d - 2, Some(d - 1));
+                self.helper_sp(&ins, d, addr!(h::h_store_subscr), None, None, d - 3)
+            }
             Op::DeleteSubscr => self.helper_sp(&ins, d, addr!(h::h_delete_subscr), None, None, d - 2),
             Op::BinarySlice => self.helper_sp(&ins, d, addr!(h::h_binary_slice), None, None, d - 3),
             Op::StoreSlice => self.helper_sp(&ins, d, addr!(h::h_store_slice), None, None, d - 4),
@@ -656,11 +717,38 @@ impl<'a> Gen<'a> {
                 self.helper_sp(&ins, d, addr!(h::h_container_op), Some(which), Some(arg as i64), d - 1);
             }
             Op::MapAdd => self.helper_sp(&ins, d, addr!(h::h_container_op), Some(2), Some(arg as i64), d - 2),
-            Op::UnpackSequence => self.helper_sp(&ins, d, addr!(h::h_unpack_sequence), Some(arg as i64), None, d - 1),
+            Op::UnpackSequence => {
+                self.prof_slow(pc, d - 1, None);
+                self.helper_sp(&ins, d, addr!(h::h_unpack_sequence), Some(arg as i64), None, d - 1)
+            }
             Op::UnpackEx => self.helper_sp(&ins, d, addr!(h::h_unpack_ex), Some(arg as i64), None, d - 1),
             Op::GetIter => self.helper_sp(&ins, d, addr!(h::h_get_iter), None, None, d - 1),
             Op::ForIter => self.for_iter(&ins, d),
-            Op::Call => self.helper_sp(&ins, d, addr!(h::h_call), Some(arg as i64), Some(0), d - arg as i32 - 2),
+            Op::Call => {
+                // Python function with a fast entry: direct call (args moved into the
+                // callee frame); anything else: generic call helper
+                let base = d - arg as i32 - 2;
+                let generic = self.a.label();
+                let done = self.a.label();
+                let m = self.slot(base);
+                self.a.load(Rax, m);
+                self.a.mov_ri(Rcx, crate::types::funcobject::function_type() as i64);
+                self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
+                self.a.jcc(Cc::NE, generic);
+                self.a.load(Rcx, M(Rax, FUNC_CODE));
+                self.a.load(Rcx, M(Rcx, CODE_DATA));
+                self.a.cmp_mi(M(Rcx, CD_FAST_ENTRY), 0);
+                self.a.jcc(Cc::E, generic);
+                self.set_lasti(pc);
+                self.lea_sp(Rdi, base);
+                self.a.mov_ri(Rsi, arg as i64);
+                self.call(addr!(super::h_call_py));
+                self.check(pc, base);
+                self.a.jmp(done);
+                self.a.bind(generic);
+                self.helper_sp(&ins, d, addr!(h::h_call), Some(arg as i64), Some(0), base);
+                self.a.bind(done);
+            }
             Op::CallKw => self.helper_sp(&ins, d, addr!(h::h_call), Some(arg as i64), Some(1), d - arg as i32 - 3),
             Op::CallFunctionEx => self.helper_sp(&ins, d, addr!(h::h_call_ex), None, None, d - 4),
             Op::CallIntrinsic1 => {
@@ -731,9 +819,11 @@ impl<'a> Gen<'a> {
             if is_list {
                 self.a.load(Rdx, M(Rax, LIST_ITEMS));
                 self.a.load_idx(Rdi, Rdx, Rsi, 8, 0);
+                self.prof(ins.pc, (prof::LIST as u16) | (prof::INT as u16) << 8);
                 self.a.jmp(got);
             } else {
                 self.a.load_idx(Rdi, Rax, Rsi, 8, TUPLE_ITEMS);
+                self.prof(ins.pc, (prof::TUPLE as u16) | (prof::INT as u16) << 8);
             }
         }
         self.a.bind(got);
@@ -746,6 +836,7 @@ impl<'a> Gen<'a> {
         self.a.store(mc, R14);
         self.a.jmp(done);
         self.a.bind(slow);
+        self.prof_slow(ins.pc, d - 2, Some(d - 1));
         self.helper_sp(ins, d, addr!(h::h_binary_subscr), None, None, d - 2);
         self.a.bind(done);
     }
@@ -778,6 +869,7 @@ impl<'a> Gen<'a> {
             self.a.store(M(Rax, 32), Rdx);
             self.a.call_label(self.rt_box_int);
             self.a.store(out, Rax);
+            self.prof(ins.pc, prof::IT_RANGE as u16);
             self.a.jmp(pushed);
             // list iterator: index at 32, seq at 40; list size at 32, items at 40
             self.a.bind(not_range);
@@ -797,6 +889,7 @@ impl<'a> Gen<'a> {
             self.a.add_mi(M(Rax, 32), 1);
             self.incref(Rsi);
             self.a.store(out, Rsi);
+            self.prof(ins.pc, prof::IT_LIST as u16);
             self.a.jmp(pushed);
             // tuple iterator: index at 32, seq at 40; tuple size at 32, items inline
             self.a.bind(not_list);
@@ -813,9 +906,15 @@ impl<'a> Gen<'a> {
             self.a.add_mi(M(Rax, 32), 1);
             self.incref(Rsi);
             self.a.store(out, Rsi);
+            self.prof(ins.pc, prof::IT_TUPLE as u16);
             self.a.jmp(pushed);
         }
         self.a.bind(generic);
+        let p = self.prof_addr(ins.pc);
+        self.a.mov_ri(Rdi, p);
+        let m = self.slot(d - 1);
+        self.a.load(Rsi, m);
+        self.call(addr!(h::h_prof_iter));
         self.set_lasti(ins.pc);
         self.lea_sp(Rdi, d);
         self.call(addr!(h::h_for_iter));
@@ -1085,6 +1184,7 @@ impl<'a> Gen<'a> {
             Add | InplaceAdd | Subtract | InplaceSubtract | Multiply | InplaceMultiply | TrueDivide | InplaceTrueDivide
         );
         if !int_ok && !float_ok {
+            self.prof_slow(ins.pc, d - 2, Some(d - 1));
             self.helper_sp(ins, d, addr!(h::h_binary_op), Some(ins.arg as i64), None, d - 2);
             return Ok(());
         }
@@ -1098,6 +1198,7 @@ impl<'a> Gen<'a> {
         if int_ok {
             self.compact_int(Rax, Rdi, Rdx, not_int);
             self.compact_int(Rcx, Rsi, Rdx, not_int);
+            self.prof(ins.pc, (prof::INT as u16) | (prof::INT as u16) << 8);
             match op {
                 Add | InplaceAdd => self.a.add_rr(Rdi, Rsi),
                 Subtract | InplaceSubtract => self.a.sub_rr(Rdi, Rsi),
@@ -1116,16 +1217,18 @@ impl<'a> Gen<'a> {
             let ft = crate::types::float::float_type() as i64;
             let both_int = self.a.label();
             self.a.mov_ri(R8, 0);
-            for (obj, x) in [(Rax, XMM0), (Rcx, XMM1)] {
+            for (obj, x, sh) in [(Rax, XMM0, 0), (Rcx, XMM1, 8)] {
                 let is_float = self.a.label();
                 let next = self.a.label();
                 self.a.mov_ri(Rdx, ft);
                 self.a.cmp_rm(Rdx, M(obj, OB_TYPE));
                 self.a.jcc(Cc::E, is_float);
                 self.compact_int(obj, Rdi, Rdx, slow);
+                self.prof(ins.pc, (prof::INT as u16) << sh);
                 self.a.cvtsi2sd(x, Rdi);
                 self.a.jmp(next);
                 self.a.bind(is_float);
+                self.prof(ins.pc, (prof::FLOAT as u16) << sh);
                 self.a.movsd_load(x, M(obj, FVAL));
                 self.a.mov_ri(R8, 1);
                 self.a.bind(next);
@@ -1164,6 +1267,7 @@ impl<'a> Gen<'a> {
         self.a.store(ma, R14);
         self.a.jmp(done);
         self.a.bind(slow);
+        self.prof_slow(ins.pc, d - 2, Some(d - 1));
         self.helper_sp(ins, d, addr!(h::h_binary_op), Some(ins.arg as i64), None, d - 2);
         self.a.bind(done);
         Ok(())
@@ -1191,6 +1295,7 @@ impl<'a> Gen<'a> {
         self.a.load(Rcx, mb);
         self.compact_int(Rax, Rdi, Rdx, not_int);
         self.compact_int(Rcx, Rsi, Rdx, slow);
+        self.prof(ins.pc, (prof::INT as u16) | (prof::INT as u16) << 8);
         self.a.cmp_rr(Rdi, Rsi);
         self.a.setcc(cc, R14);
         self.a.jmp(release);
@@ -1203,6 +1308,7 @@ impl<'a> Gen<'a> {
         self.a.jcc(Cc::NE, slow);
         self.a.movsd_load(XMM0, M(Rax, FVAL));
         self.a.movsd_load(XMM1, M(Rcx, FVAL));
+        self.prof(ins.pc, (prof::FLOAT as u16) | (prof::FLOAT as u16) << 8);
         match cop {
             Py_LT => {
                 self.a.ucomisd(XMM1, XMM0);
@@ -1246,6 +1352,7 @@ impl<'a> Gen<'a> {
         self.a.jmp(fall);
         // slow path: helper returns 0/1/2
         self.a.bind(slow);
+        self.prof_slow(ins.pc, d - 2, Some(d - 1));
         self.set_lasti(ins.pc);
         self.lea_sp(Rdi, d);
         self.a.mov_ri(Rsi, ins.arg as i64);
@@ -1373,6 +1480,44 @@ fn emit_routines(a: &mut Asm, box_int: Label, box_float: Label, free_num: Label)
     }
 }
 
+impl<'a> Gen<'a> {
+    /// A template generator whose instruction labels / exit belong to another code
+    /// generator (tier 2 emits tier-1 templates for the instructions it does not
+    /// specialise). `exit`: label of the code that leaves the compiled code with the
+    /// status in eax (the tier-1 epilogue contract).
+    pub(crate) fn new_embedded(a: Asm, an: &'a Analysis, cd: &'a CodeData, nlp: usize, flags: u32, tables: &'a crate::interp::cache::Tables, ilabel: Vec<Label>, exit: Label) -> Gen<'a> {
+        let mut a = a;
+        let (rt_box_int, rt_box_float, rt_free_num) = (a.label(), a.label(), a.label());
+        Gen { a, nlp: nlp as i32, an, cd, tables, ilabel, exit, stubs: Vec::new(), rt_box_int, rt_box_float, rt_free_num, flags, no_fuse: true }
+    }
+    /// Emit the out-of-line stubs and shared routines; resolve labels.
+    pub(crate) fn finish(mut self) -> Result<Asm, String> {
+        let nlp = self.nlp;
+        let exit = self.exit;
+        while let Some(s) = self.stubs.pop() {
+            s(&mut self.a, exit, nlp);
+        }
+        emit_routines(&mut self.a, self.rt_box_int, self.rt_box_float, self.rt_free_num);
+        self.a.resolve()?;
+        Ok(self.a)
+    }
+    /// Emit the inline incref / decref / xdecref sequences (r11 clobbered; decref's
+    /// slow path clobbers caller-saved registers).
+    pub(crate) fn emit_incref(&mut self, r: R) {
+        self.incref(r)
+    }
+    pub(crate) fn emit_decref(&mut self, r: R) {
+        self.decref(r)
+    }
+    pub(crate) fn emit_xdecref(&mut self, r: R) {
+        self.xdecref(r)
+    }
+    /// Push an out-of-line stub (emitted by `finish`).
+    pub(crate) fn add_stub(&mut self, s: Stub) {
+        self.stubs.push(s)
+    }
+}
+
 /// Compile a code object. Err: not compilable (stays in the interpreter).
 pub fn compile(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crate::interp::cache::Tables) -> Result<Output, String> {
     let an = super::analysis::analyze(&cd.code, &cd.exception_table)?;
@@ -1380,7 +1525,7 @@ pub fn compile(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crate::in
     let ilabel: Vec<Label> = (0..an.instrs.len()).map(|_| a.label()).collect();
     let exit = a.label();
     let (rt_box_int, rt_box_float, rt_free_num) = (a.label(), a.label(), a.label());
-    let mut g = Gen { a, nlp: nlocalsplus as i32, an: &an, cd, tables, ilabel, exit, stubs: Vec::new(), rt_box_int, rt_box_float, rt_free_num, flags };
+    let mut g = Gen { a, nlp: nlocalsplus as i32, an: &an, cd, tables, ilabel, exit, stubs: Vec::new(), rt_box_int, rt_box_float, rt_free_num, flags, no_fuse: false };
 
     // prologue
     g.a.push(Rbp);

@@ -45,7 +45,7 @@ pub fn leave_recursive_call(ts: &ThreadState) {
 }
 
 #[inline(always)]
-fn stack_pointer() -> usize {
+pub(crate) fn stack_pointer() -> usize {
     let x = 0u8;
     &x as *const u8 as usize
 }
