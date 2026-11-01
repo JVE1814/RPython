@@ -102,6 +102,23 @@ tests are matched.  `ftplib` was written by markup (theirs is in master); mine w
   a failing synchronous `client_connected_cb` is reported and closes the transport,
   `TaskGroup.cancel()`.
 
+## Full test_asyncio (-j8, with parallel's concurrent/multiprocessing copies)
+27/35 files OK, 2 Windows-only skipped.  Remaining failures: test_base_events
+(`ssl_server_hostname_default` needs ssl), test_context (decimal not contextvar-based),
+test_futures2 (doubled traceback frames, runtime), test_unix_events (fork/multiprocessing
+manager tests from the parallel WIP: NameError in forked thread, ForkAwareLocal).
+env_changed in test_events/test_streams: the helper HTTP server thread of
+test_asyncio/utils.py reports "Invalid file descriptor: -1" (serve_forever on a closed
+server socket) — not investigated.
+
+## Next steps
+- Investigate the `Invalid file descriptor: -1` thread exception (socketserver /
+  selectors interaction when the server is closed while serving).
+- Rerun test_asyncio/test_unix_events once concurrent.futures and multiprocessing are in
+  master; test ssl paths (sslproto, start_tls, HTTPS, FTP_TLS) once `_ssl` lands.
+- `_remote_debugging` for test_tools / `asyncio ps|pstree`.
+- Move `_asyncio` hot paths to Rust.
+
 ## Missing / TODO
 - asyncio `windows_events`/`windows_utils` (Windows only).
 - Perf: `_asyncio` in Rust.
