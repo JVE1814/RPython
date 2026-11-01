@@ -32,6 +32,9 @@ unsafe extern "C" fn seqiter_next(o: *mut PyObject) -> *mut PyObject {
         if it.seq.is_null() {
             return std::ptr::null_mut();
         }
+        if it.index == isize::MAX {
+            return into_c(Err(crate::err!(OverflowError, "iter index too large")));
+        }
         let seq = &*it.seq;
         let tp = seq.ty();
         let r = if !tp.tp_as_sequence.is_null() && (*tp.tp_as_sequence).sq_item.is_some() {

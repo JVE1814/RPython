@@ -546,7 +546,7 @@ pub fn slice_items(items: &[&PyObject], start: isize, step: isize, n: isize) -> 
     let mut i = start;
     for _ in 0..n {
         v.push(items[i as usize].to_ref());
-        i += step;
+        i = i.wrapping_add(step);
     }
     v
 }
@@ -595,34 +595,42 @@ unsafe extern "C" fn list_subscript(o: *mut PyObject, k: *mut PyObject) -> *mut 
 /// Slice assignment / deletion (`v` None = delete).
 pub fn ass_slice(o: &PyObject, k: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     let (mut start, mut stop, step) = slice::unpack(k)?;
+    // Convert the value first: doing so may run code that mutates the list.
+    let collected: Option<Vec<PyRef>> = match v {
+        None => None,
+        Some(v) => Some(if v.is(o) || is_list_exact(v) || tuple::is_tuple_exact(v) {
+            if tuple::is_tuple_exact(v) { tuple::tuple_to_vec(v) } else { list_to_vec(v) }
+        } else {
+            let it = match ab::get_iter(v) {
+                Ok(it) => it,
+                Err(e) => {
+                    if exc_matches(exceptions::TypeError()) {
+                        clear_exc();
+                        if step == 1 {
+                            raise!(TypeError, "can only assign an iterable");
+                        }
+                        raise!(TypeError, "must assign iterable to extended slice");
+                    }
+                    return Err(e);
+                }
+            };
+            let mut out = Vec::new();
+            while let Some(x) = ab::iter_next(&it)? {
+                out.push(x);
+            }
+            out
+        }),
+    };
     let len = list_len(o) as isize;
     let n = slice::adjust_indices(len, &mut start, &mut stop, step);
     if step == 1 {
-        let items: Vec<PyRef> = match v {
-            None => Vec::new(),
-            Some(v) => {
-                if v.is(o) || is_list_exact(v) || tuple::is_tuple_exact(v) {
-                    if tuple::is_tuple_exact(v) { tuple::tuple_to_vec(v) } else { list_to_vec(v) }
-                } else {
-                    match ab::collect_iterable(v) {
-                        Ok(x) => x,
-                        Err(e) => {
-                            if exc_matches(exceptions::TypeError()) && ab::get_iter(v).is_err() {
-                                clear_exc();
-                                raise!(TypeError, "can only assign an iterable");
-                            }
-                            return Err(e);
-                        }
-                    }
-                }
-            }
-        };
+        let items = collected.unwrap_or_default();
         let stop = stop.max(start);
         splice(o, start as usize, stop as usize, items);
         return Ok(());
     }
     // extended slice
-    match v {
+    match collected {
         None => {
             if n <= 0 {
                 return Ok(());
@@ -637,13 +645,13 @@ pub fn ass_slice(o: &PyObject, k: &PyObject, v: Option<&PyObject>) -> PyResult<(
                 }
                 let ast = st.abs() as usize;
                 let mut rem = Vec::with_capacity(n as usize);
-                let mut keep = Vec::with_capacity(cur.len() - n as usize);
+                let mut keep = Vec::with_capacity(cur.len().saturating_sub(n as usize));
                 let mut next_del = s as usize;
                 let mut left = n;
                 for (i, p) in cur.drain(..).enumerate() {
                     if left > 0 && i == next_del {
                         rem.push(unsafe { PyRef::from_raw(p) });
-                        next_del += ast;
+                        next_del = next_del.wrapping_add(ast);
                         left -= 1;
                     } else {
                         keep.push(p);
@@ -655,21 +663,7 @@ pub fn ass_slice(o: &PyObject, k: &PyObject, v: Option<&PyObject>) -> PyResult<(
             drop(removed);
             Ok(())
         }
-        Some(v) => {
-            let seq: Vec<PyRef> = if v.is(o) || is_list_exact(v) || tuple::is_tuple_exact(v) {
-                if tuple::is_tuple_exact(v) { tuple::tuple_to_vec(v) } else { list_to_vec(v) }
-            } else {
-                match ab::collect_iterable(v) {
-                    Ok(x) => x,
-                    Err(e) => {
-                        if exc_matches(exceptions::TypeError()) {
-                            clear_exc();
-                            raise!(TypeError, "must assign iterable to extended slice");
-                        }
-                        return Err(e);
-                    }
-                }
-            };
+        Some(seq) => {
             if seq.len() as isize != n {
                 raise!(ValueError, "attempt to assign sequence of size {} to extended slice of size {}", seq.len(), n);
             }
@@ -687,7 +681,7 @@ pub fn ass_slice(o: &PyObject, k: &PyObject, v: Option<&PyObject>) -> PyResult<(
                         let slot = (*l).ob_item.add(i as usize);
                         old.push(*slot);
                         *slot = it.into_raw();
-                        i += step;
+                        i = i.wrapping_add(step);
                     }
                 }
             }
@@ -748,7 +742,10 @@ pub fn seq_richcompare(a: &dyn Fn(usize) -> Option<PyRef>, alen: &dyn Fn() -> us
             _ => break,
         };
         if !x.is(&y) && !ab::rich_compare_bool(&x, &y, Py_EQ)? {
-            // first differing item
+            // first differing item -- unless the comparison shrank a sequence
+            if i >= alen() || i >= blen() {
+                break;
+            }
             if op == Py_EQ {
                 return Ok(false);
             }
@@ -857,7 +854,10 @@ unsafe extern "C" fn list_inplace_repeat(a: *mut PyObject, n: Py_ssize_t) -> *mu
 unsafe extern "C" fn list_init(o: *mut PyObject, args: *mut PyObject, kw: *mut PyObject) -> c_int {
     unsafe {
         let r = (|| -> PyResult<()> {
-            if !kw.is_null() && crate::types::dict::dict_len(&*kw) > 0 && (*o).is_type(list_type()) {
+            if !kw.is_null()
+                && crate::types::dict::dict_len(&*kw) > 0
+                && ((*o).is_type(list_type()) || (*(*o).type_ptr()).tp_new == (*list_type()).tp_new)
+            {
                 raise!(TypeError, "list() takes no keyword arguments");
             }
             let a = tuple::tuple_items(&*args);
@@ -869,6 +869,12 @@ unsafe extern "C" fn list_init(o: *mut PyObject, args: *mut PyObject, kw: *mut P
                 clear(o);
             }
             if let Some(x) = a.first() {
+                // preallocate exactly: sys.getsizeof(list(x)) is observable
+                match ab::length_hint(x, 0) {
+                    Ok(n) if n > 0 && n < (1 << 28) => reserve(o, n),
+                    Ok(_) => {}
+                    Err(_) => clear_exc(),
+                }
                 extend(o, x)?;
             }
             Ok(())

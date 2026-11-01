@@ -129,12 +129,12 @@ unsafe extern "C" fn range_new(_tp: *mut PyTypeObject, args: *mut PyObject, kw: 
             }
             let a = tuple::tuple_items(&*args);
             let (start, stop, step) = match a.len() {
-                1 => (int::new_int(0), ab::index(a[0])?, int::new_int(1)),
-                2 => (ab::index(a[0])?, ab::index(a[1])?, int::new_int(1)),
+                1 => (int::new_int(0), exact_index(a[0])?, int::new_int(1)),
+                2 => (exact_index(a[0])?, exact_index(a[1])?, int::new_int(1)),
                 3 => {
-                    let s = ab::index(a[0])?;
-                    let e = ab::index(a[1])?;
-                    let st = ab::index(a[2])?;
+                    let s = exact_index(a[0])?;
+                    let e = exact_index(a[1])?;
+                    let st = exact_index(a[2])?;
                     if int::sign(&st) == 0 {
                         raise!(ValueError, "range() arg 3 must not be zero");
                     }
@@ -637,3 +637,12 @@ pub fn ready() -> PyResult<()> {
 
 #[allow(dead_code)]
 fn _unused(_: *mut c_void) {}
+
+/// PyNumber_Index: an exact int (subclass instances such as bools are copied).
+fn exact_index(o: &PyObject) -> PyResult {
+    let i = ab::index(o)?;
+    if int::is_int_exact(&i) {
+        return Ok(i);
+    }
+    Ok(crate::types::int_methods::exact_copy(&i))
+}
