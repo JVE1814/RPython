@@ -605,3 +605,32 @@ pub fn round_neg_ndigits(a: IntRef, n: u64) -> BigInt {
     }
     mul(q.as_ref(), p.as_ref())
 }
+
+/// `a << n` into `out` (len >= a.len() + n/30 + 1). Returns (negative, normalized length).
+pub fn lshift_into(out: &mut [u32], a: IntRef, n: u64) -> (bool, usize) {
+    let len = nat::shl_into(out, a.mag, n);
+    (a.neg && len > 0, len)
+}
+
+/// Arithmetic `a >> n` into `out` (len >= a.len() - n/30 + 1, at least 1).
+/// Returns (negative, normalized length).
+pub fn rshift_into(out: &mut [u32], a: IntRef, n: u64) -> (bool, usize) {
+    let dshift = n / SHIFT as u64;
+    if dshift >= a.mag.len() as u64 {
+        if a.neg {
+            out[0] = 1;
+            return (true, 1);
+        }
+        return (false, 0);
+    }
+    let src = &a.mag[dshift as usize..];
+    let lost = nat::shr_bits_to(out, src, (n % SHIFT as u64) as u32);
+    let mut len = nat::trimmed_len(&out[..src.len()]);
+    if a.neg && (lost != 0 || a.mag[..dshift as usize].iter().any(|&d| d != 0)) {
+        out[src.len()] = 0;
+        let c = nat::add_digit_assign(&mut out[..src.len() + 1], 1);
+        debug_assert_eq!(c, 0);
+        len = nat::trimmed_len(&out[..src.len() + 1]);
+    }
+    (a.neg && len > 0, len)
+}

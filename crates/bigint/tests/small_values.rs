@@ -264,3 +264,37 @@ fn true_division_small() {
     assert!(b(0).truediv(&b(-3)).unwrap().is_sign_negative());
     assert!(b(0).truediv(&b(3)).unwrap().is_sign_positive());
 }
+
+#[test]
+fn into_variants() {
+    let mut r = Rng::new(10);
+    for _ in 0..20000 {
+        let x = r.i128() >> 2;
+        let y = r.i128() >> 2;
+        let (bx, by) = (b(x), b(y));
+        let mut out = vec![0u32; 12];
+        let (n, l) = ops::add_into(&mut out, bx.as_ref(), by.as_ref());
+        assert_eq!(BigInt::from_parts(n, out[..l].to_vec()), b(x + y));
+        let (n, l) = ops::sub_into(&mut out, bx.as_ref(), by.as_ref());
+        assert_eq!(BigInt::from_parts(n, out[..l].to_vec()), b(x - y));
+        let xs = x >> 64;
+        let ys = y >> 64;
+        let (n, l) = ops::mul_into(&mut out, b(xs).as_ref(), b(ys).as_ref());
+        assert_eq!(BigInt::from_parts(n, out[..l].to_vec()), b(xs * ys));
+        let s = r.below(130);
+        let mut out = vec![0u32; 12];
+        let (n, l) = ops::rshift_into(&mut out, bx.as_ref(), s);
+        assert_eq!(BigInt::from_parts(n, out[..l].to_vec()), b(x >> s.min(127)), "{x} >> {s}");
+        let s2 = r.below(60);
+        let mut out = vec![0u32; 12];
+        let (n, l) = ops::lshift_into(&mut out, b(xs).as_ref(), s2);
+        assert_eq!(BigInt::from_parts(n, out[..l].to_vec()), b(xs << s2));
+        if y != 0 {
+            let mut q = vec![0u32; 8];
+            let mut m = vec![0u32; 8];
+            let (qn, ql, rn, rl) = ops::divmod_into(&mut q, &mut m, bx.as_ref(), by.as_ref()).unwrap();
+            assert_eq!(BigInt::from_parts(qn, q[..ql].to_vec()), bx.floordiv(&by).unwrap());
+            assert_eq!(BigInt::from_parts(rn, m[..rl].to_vec()), bx.modulo(&by).unwrap());
+        }
+    }
+}
