@@ -1097,6 +1097,8 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
                     (*tp).tp_doc = Box::leak(v.into_boxed_slice()).as_ptr() as *const _;
                 }
             }
+            // a `__doc__` slot provides the member descriptor instead
+            None if slot_names.iter().any(|s| pystr::str_eq_ascii(s, "__doc__")) => {}
             None => dict::set_item(&dict, name!("__doc__"), none::none())?,
         }
         // special methods that are implicitly static/class methods

@@ -540,7 +540,7 @@ pub fn add_operators(tp: *mut PyTypeObject) -> PyResult<()> {
         }
         // only add if this type defines the slot itself (not identical to its base's)
         let base = unsafe { (*tp).tp_base };
-        if !base.is_null() && sd.slot.get(base) == f && !is_heap_type(tp) {
+        if !base.is_null() && sd.slot.get(base) == f {
             // inherited: the base's dict already exposes it
             if crate::types::typeobject::lookup(base, &nm).is_some() {
                 continue;
