@@ -638,7 +638,10 @@ class DocTestFinder:
                 docstring = ''
         if self._exclude_empty and not docstring:
             return None
-        lineno = self._find_lineno(obj, source_lines)
+        if isinstance(obj, str):
+            lineno = self._find_string_lineno(obj, source_lines, name.rpartition(".")[2])
+        else:
+            lineno = self._find_lineno(obj, source_lines)
         if module is None:
             filename = None
         else:
@@ -648,7 +651,7 @@ class DocTestFinder:
         return self._parser.get_doctest(docstring, globs, name, filename, lineno)
 
     @staticmethod
-    def _find_string_lineno(text, source_lines):
+    def _find_string_lineno(text, source_lines, key=None):
         """Line (0-based) of the string literal `text` (e.g. a __test__
         entry) in the source: the place where all its non-blank lines
         appear consecutively."""
@@ -659,6 +662,7 @@ class DocTestFinder:
         if not wanted:
             return None
         stripped = [line.strip() for line in source_lines]
+        candidates = []
         first_offset, first_line = wanted[0]
         for start, line in enumerate(stripped):
             if not line.endswith(first_line):
@@ -671,8 +675,16 @@ class DocTestFinder:
                     matched = False
                     break
             if matched:
-                return start - first_offset
-        return None
+                candidates.append(start - first_offset)
+        if not candidates:
+            return None
+        if key:
+            # prefer the literal that follows its __test__ key
+            for lineno in candidates:
+                if 0 <= lineno < len(source_lines) and (
+                        repr(key) in source_lines[lineno] or f'"{key}"' in source_lines[lineno]):
+                    return lineno
+        return candidates[0]
 
     _DOCSTRING_START = re.compile(r'(^|.*:)\s*\w*("|\')')
 
@@ -793,7 +805,7 @@ class OutputChecker:
                 engine = difflib.Differ(charjunk=difflib.IS_CHARACTER_JUNK)
                 diff = list(engine.compare(want_lines, got_lines))
                 kind = 'ndiff with -expected +actual'
-            body = ''.join(line.rstrip() + '\n' for line in diff)
+            body = ''.join(line if line.endswith('\n') else line + '\n' for line in diff)
             return f'Differences ({kind}):\n' + _indent(body)
 
         if want and got:
@@ -892,12 +904,12 @@ class DocTestRunner:
                 else:
                     self.optionflags &= ~flag
 
+            tries += 1
             if self.optionflags & SKIP:
                 skips += 1
                 self._example_skipped(test, index, example)
                 continue
 
-            tries += 1
             if not quiet:
                 self.report_start(out, test, example)
 
@@ -911,13 +923,10 @@ class DocTestRunner:
             except KeyboardInterrupt:
                 raise
             except BaseException as exc:
-                if isinstance(exc, SyntaxError) or exc.__traceback__ is None:
-                    tb = exc.__traceback__
-                else:
-                    # drop this frame (the exec() call) from the traceback
-                    tb = exc.__traceback__.tb_next
-                    if isinstance(exc, SyntaxError) is False and tb is None:
-                        tb = exc.__traceback__
+                # drop this frame (the compile()/exec() call) from the traceback
+                tb = exc.__traceback__
+                if tb is not None:
+                    tb = tb.tb_next
                 exc_info = (type(exc), exc, tb)
                 self.debugger.set_continue()
 
@@ -966,12 +975,14 @@ class DocTestRunner:
                 if not quiet:
                     self.report_failure(out, test, example, got)
                 failures += 1
-                self._example_failed(test, index, example, got)
+                if not quiet:
+                    self._example_failed(test, index, example, got)
             else:
                 if not quiet:
                     self.report_unexpected_exception(out, test, example, exc_info)
                 failures += 1
-                self._example_raised(test, index, example, exc_info)
+                if not quiet:
+                    self._example_raised(test, index, example, exc_info)
 
             if failures and self.optionflags & FAIL_FAST:
                 break
@@ -1351,6 +1362,11 @@ class _CollectingRunner(DocTestRunner):
         self.outcomes.append(('fail', index, example, message))
 
     def _example_raised(self, test, index, example, exc_info):
+        # keep the example sources available for formatting the traceback later
+        for number, ex in enumerate(test.examples):
+            name = "<doctest %s[%d]>" % (test.name, number)
+            lines = ex.source.splitlines(keepends=True)
+            linecache.cache[name] = (len(ex.source), None, lines, name)
         self.outcomes.append(('error', index, example, exc_info))
 
     def report_start(self, out, test, example):
