@@ -28,7 +28,7 @@ __all__ = ['get_ident', 'active_count', 'Condition', 'current_thread',
            'Event', 'Lock', 'RLock', 'Semaphore', 'BoundedSemaphore', 'Thread',
            'Barrier', 'BrokenBarrierError', 'Timer', 'ThreadError',
            'ExceptHookArgs', 'setprofile', 'settrace', 'local', 'stack_size',
-           'excepthook', 'get_native_id', 'getprofile', 'gettrace',
+           'excepthook', 'getprofile', 'gettrace',
            'setprofile_all_threads', 'settrace_all_threads']
 
 _start_joinable_thread = _thread.start_joinable_thread

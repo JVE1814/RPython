@@ -450,11 +450,16 @@ impl HandleInner {
     }
     fn effective_state(&self) -> HState {
         let s = *self.state.lock().unwrap();
-        if s == HState::Running && self.generation.load(Relaxed) != FORK_GENERATION.load(Relaxed) && self.ident.load(Relaxed) != my_ident() {
+        if s == HState::Running && self.lost_by_fork(self.generation.load(Relaxed)) {
             // the OS thread does not exist in this (forked) process
             return HState::Done;
         }
         s
+    }
+    /// True if this handle's thread did not survive a fork() since the
+    /// handle was created (only the forking thread survives).
+    fn lost_by_fork(&self, created_generation: u64) -> bool {
+        created_generation != FORK_GENERATION.load(Relaxed) && self.ident.load(Relaxed) != FORK_SURVIVOR.load(Relaxed)
     }
     fn set_done(&self) {
         *self.state.lock().unwrap() = HState::Done;
@@ -463,6 +468,8 @@ impl HandleInner {
 }
 
 static FORK_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Ident of the thread that called fork() most recently (in a forked child).
+static FORK_SURVIVOR: AtomicU64 = AtomicU64::new(0);
 static NON_DAEMON: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 static THREAD_COUNT: AtomicUsize = AtomicUsize::new(0);
 static STACK_SIZE: AtomicUsize = AtomicUsize::new(0);
@@ -542,7 +549,7 @@ fn handle_join(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRes
     wait_interruptible(
         &h.state,
         &h.cv,
-        |s| *s == HState::Done || (fgen != FORK_GENERATION.load(Relaxed)),
+        |s| *s == HState::Done || h.lost_by_fork(fgen),
         timeout,
     )?;
     Ok(none::none_ref())
@@ -742,7 +749,7 @@ fn thread_shutdown(_m: &PyObject) -> PyResult {
         match next {
             Some(h) => {
                 let fgen = h.generation.load(Relaxed);
-                wait_interruptible(&h.state, &h.cv, |s| *s == HState::Done || fgen != FORK_GENERATION.load(Relaxed), None)?;
+                wait_interruptible(&h.state, &h.cv, |s| *s == HState::Done || h.lost_by_fork(fgen), None)?;
                 let mut nd = NON_DAEMON.lock().unwrap();
                 let me = Arc::as_ptr(&h) as usize;
                 if let Some(i) = nd.iter().position(|&p| p == me) {
@@ -1165,6 +1172,7 @@ fn thread_excepthook(_m: &PyObject, a: &PyObject) -> PyResult {
 
 extern "C" fn atfork_child() {
     FORK_GENERATION.fetch_add(1, Relaxed);
+    FORK_SURVIVOR.store(my_ident(), Relaxed);
     let me = my_ident();
     crate::threads::MAIN_THREAD_ID.store(me, Release);
     let ts = crate::threads::current_ptr();
