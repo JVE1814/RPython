@@ -48,10 +48,15 @@ pub struct ParseOptions {
     pub allow_incomplete_input: bool,
     /// PyCF_DONT_IMPLY_DEDENT ('single' mode): no implicit DEDENTs at a mid-line EOF.
     pub dont_imply_dedent: bool,
-    /// Stack budget for the recursive descent (bytes); deeper nesting raises
-    /// MemoryError("... too complex ..."). Default 1 MiB (about 700 nested lambdas or
-    /// 1300 unary operators); raise it when parsing on a thread with a big stack.
+    /// Stack the parser may use on the caller's thread (bytes, default 256 KiB). Deeper
+    /// recursion continues on scoped helper threads with 16 MiB stacks (if `grow_stack`),
+    /// otherwise raises MemoryError("... too complex ..."). Nesting is in any case limited
+    /// to 6000 levels, like CPython's parser.
     pub max_stack_bytes: usize,
+    /// Allow helper threads for very deep nesting (default true).
+    pub grow_stack: bool,
+    /// `sys.get_int_max_str_digits()` for decimal int literals (0 = unlimited; default 4300).
+    pub int_max_str_digits: usize,
     /// Unicode database hooks.
     pub hooks: UnicodeHooks,
     /// File name used in a few messages (e.g. "Non-UTF-8 code ... in file X").
@@ -70,7 +75,9 @@ impl Default for ParseOptions {
             barry_as_flufl: false,
             allow_incomplete_input: false,
             dont_imply_dedent: false,
-            max_stack_bytes: 1 << 20,
+            max_stack_bytes: 256 << 10,
+            grow_stack: true,
+            int_max_str_digits: 4300,
             hooks: UnicodeHooks::default(),
             filename: "<string>".to_string(),
             decode: None,
@@ -149,6 +156,8 @@ pub(crate) struct Parser<'a> {
     /// furthest token index fetched by the first pass
     first_fail: usize,
     stack_base: usize,
+    /// number of helper-thread stack segments currently in use
+    segment: usize,
     /// Tokens that had a type comment consumed etc. (unused)
     pub(crate) type_ignores: Vec<TypeIgnore>,
 }
@@ -158,6 +167,8 @@ pub(crate) struct Parser<'a> {
 const MAX_DEPTH: usize = 6000;
 /// Maximum length of iteratively parsed chains that produce nested ASTs.
 const MAX_CHAIN: usize = 5000;
+/// Stack size of the helper threads used to continue very deep recursions.
+const STACK_SEGMENT: usize = 16 << 20;
 
 impl<'a> Parser<'a> {
     pub(crate) fn new(src: &'a str, opts: &'a ParseOptions) -> Parser<'a> {
@@ -225,6 +236,7 @@ impl<'a> Parser<'a> {
             top_ok: std::collections::HashMap::new(),
             first_fail: usize::MAX,
             stack_base: 0,
+            segment: 0,
             type_ignores,
         }
     }
@@ -361,6 +373,8 @@ impl<'a> Parser<'a> {
     // ------------------------------------------------------------------ errors
 
     /// Build a SyntaxError at known byte positions (0-based columns), CPython style.
+    #[cold]
+    #[inline(never)]
     pub(crate) fn error_at(&self, kind: ErrorKind, msg: impl Into<String>, lineno: i32, col: i32, end_lineno: i32, end_col: i32) -> PErr {
         Box::new(make_error_cpython(self.src, kind, msg.into(), lineno, col, end_lineno, end_col))
     }
@@ -374,6 +388,8 @@ impl<'a> Parser<'a> {
         self.err_loc(msg, Self::tok_loc(t))
     }
     /// RAISE_SYNTAX_ERROR: location of the last fetched token.
+    #[cold]
+    #[inline(never)]
     pub(crate) fn err_last(&self, kind: ErrorKind, msg: impl Into<String>) -> PErr {
         let i = self.fill.max(1) - 1;
         let t = self.toks[i];
@@ -405,10 +421,55 @@ impl<'a> Parser<'a> {
 
     pub(crate) fn enter(&mut self) -> Result<(), PErr> {
         self.depth += 1;
-        if self.depth > MAX_DEPTH || (self.depth & 7 == 0 && self.stack_used() > self.opts.max_stack_bytes) {
-            return Err(Box::new(SyntaxError { kind: ErrorKind::MemoryError, ..SyntaxError::simple("Parser stack overflowed - Python source too complex to parse") }));
+        if self.depth > MAX_DEPTH {
+            return Err(Self::too_complex());
         }
         Ok(())
+    }
+
+    #[cold]
+    fn too_complex() -> PErr {
+        Box::new(SyntaxError { kind: ErrorKind::MemoryError, ..SyntaxError::simple("Parser stack overflowed - Python source too complex to parse") })
+    }
+
+    /// Run a recursive step with depth accounting. When the stack used on the current stack
+    /// segment exceeds the budget, the step continues on a scoped helper thread with a fresh
+    /// `STACK_SEGMENT` stack, so deep (but legal) nesting never overflows the caller's stack.
+    #[inline]
+    pub(crate) fn recurse<T: Send>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, PErr> + Send) -> Result<T, PErr> {
+        self.enter()?;
+        let limit = if self.segment > 0 { STACK_SEGMENT - STACK_SEGMENT / 4 } else { self.opts.max_stack_bytes };
+        let r = if self.depth & 3 == 0 && self.stack_used() > limit { self.on_new_stack(f) } else { f(self) };
+        self.leave();
+        r
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn on_new_stack<T: Send>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, PErr> + Send) -> Result<T, PErr> {
+        if !self.opts.grow_stack {
+            return Err(Self::too_complex());
+        }
+        let saved_base = self.stack_base;
+        self.segment += 1;
+        let r = std::thread::scope(|s| {
+            let h = std::thread::Builder::new().name("rpy-parser-stack".into()).stack_size(STACK_SEGMENT).spawn_scoped(s, || {
+                let here = 0u8;
+                self.stack_base = &here as *const u8 as usize;
+                f(self)
+            });
+            match h {
+                Ok(h) => Some(h.join()),
+                Err(_) => None,
+            }
+        });
+        self.segment -= 1;
+        self.stack_base = saved_base;
+        match r {
+            Some(Ok(v)) => v,
+            Some(Err(panic)) => std::panic::resume_unwind(panic),
+            None => Err(Self::too_complex()),
+        }
     }
 
     #[inline(never)]
@@ -731,6 +792,8 @@ pub(crate) fn byte_to_char_1based(line: &str, col: i32) -> i32 {
 impl<'a> Parser<'a> {
     /// CHECK_VERSION: raise "<what> only supported in Python 3.<minor> and greater" when a
     /// lower `feature_version` was requested.
+    #[cold]
+    #[inline(never)]
     pub(crate) fn check_version(&self, minor: u32, what: &str) -> Result<(), PErr> {
         match self.opts.feature_version {
             Some(v) if v < minor => Err(self.err_last(ErrorKind::Syntax, format!("{} only supported in Python 3.{} and greater", what, minor))),
