@@ -1001,6 +1001,13 @@ impl<'w> Folder<'w> {
                         }
                     }
                 }
+                if replace.is_none() && *op == Operator::Mod {
+                    if let (Some(Constant::Str(fmt)), ExprKind::Tuple { elts, ctx: ExprContext::Load }) = (as_const(left), &right.node) {
+                        if elts.len() <= MAX_COLLECTION_SIZE && !elts.iter().any(|x| matches!(x.node, ExprKind::Starred { .. })) {
+                            replace = optimize_format(fmt, elts, loc);
+                        }
+                    }
+                }
             }
             ExprKind::UnaryOp { op, operand } => {
                 self.fold_expr(operand)?;
@@ -1120,4 +1127,105 @@ impl<'w> Folder<'w> {
         }
         Ok(())
     }
+}
+
+/// `'%s %r' % (a, b)` -> `f'{a!s} {b!r}'` (CPython's optimize_format): only %s/%r/%a with
+/// optional flags `-`, width and precision; any other unit leaves the expression unchanged.
+fn optimize_format(fmt: &PyStr, elts: &[Expr], loc: Loc) -> Option<Expr> {
+    let f: Vec<u32> = fmt.code_points().collect();
+    let pct = '%' as u32;
+    let n = f.len();
+    let mut pos = 0;
+    let mut cnt = 0;
+    let mut seq: Vec<Expr> = Vec::new();
+    loop {
+        // literal part (%% -> %)
+        let mut lit = PyStr::new();
+        while pos < n {
+            if f[pos] == pct {
+                if pos + 1 < n && f[pos + 1] == pct {
+                    lit.push_code_point(pct);
+                    pos += 2;
+                    continue;
+                }
+                break;
+            }
+            lit.push_code_point(f[pos]);
+            pos += 1;
+        }
+        if !lit.is_empty() {
+            seq.push(mk_const(Constant::Str(lit), loc));
+        }
+        if pos >= n {
+            break;
+        }
+        if cnt >= elts.len() {
+            return None;
+        }
+        pos += 1; // '%'
+        let next = |pos: &mut usize| -> Option<u32> {
+            if *pos >= n {
+                return None;
+            }
+            *pos += 1;
+            Some(f[*pos - 1])
+        };
+        let mut ljust = false;
+        let mut ch;
+        loop {
+            ch = next(&mut pos)?;
+            match char::from_u32(ch) {
+                Some('-') => ljust = true,
+                Some('+') | Some(' ') | Some('#') | Some('0') => {}
+                _ => break,
+            }
+        }
+        let mut width: i64 = -1;
+        if (('0' as u32)..=('9' as u32)).contains(&ch) {
+            width = 0;
+            while (('0' as u32)..=('9' as u32)).contains(&ch) {
+                width = width * 10 + (ch - '0' as u32) as i64;
+                if width > i32::MAX as i64 / 10 {
+                    return None;
+                }
+                ch = next(&mut pos)?;
+            }
+        }
+        let mut prec: i64 = -1;
+        if ch == '.' as u32 {
+            ch = next(&mut pos)?;
+            prec = 0;
+            while (('0' as u32)..=('9' as u32)).contains(&ch) {
+                prec = prec * 10 + (ch - '0' as u32) as i64;
+                if prec > i32::MAX as i64 / 10 {
+                    return None;
+                }
+                ch = next(&mut pos)?;
+            }
+        }
+        let conv = match char::from_u32(ch) {
+            Some(c @ ('s' | 'r' | 'a')) => c as i32,
+            _ => return None,
+        };
+        let mut spec = String::new();
+        if !ljust && width > 0 {
+            spec.push('>');
+        }
+        if width >= 0 {
+            spec.push_str(&width.to_string());
+        }
+        if prec >= 0 {
+            spec.push('.');
+            spec.push_str(&prec.to_string());
+        }
+        let arg = elts[cnt].clone();
+        cnt += 1;
+        let aloc = arg.loc;
+        let format_spec = if spec.is_empty() { None } else { Some(Box::new(mk_const(Constant::Str(PyStr::from(spec)), aloc))) };
+        seq.push(Expr::new(ExprKind::FormattedValue { value: Box::new(arg), conversion: conv, format_spec }, aloc));
+    }
+    if cnt < elts.len() {
+        return None;
+    }
+    Some(Expr::new(ExprKind::JoinedStr { values: seq }, loc))
 }

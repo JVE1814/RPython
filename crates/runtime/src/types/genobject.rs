@@ -66,7 +66,7 @@ pub fn is_asyncgen(o: &PyObject) -> bool {
 fn is_any_gen(o: &PyObject) -> bool {
     is_generator_exact(o) || is_coroutine_exact(o) || is_asyncgen(o)
 }
-fn g(o: &PyObject) -> &mut GenObject {
+pub fn g(o: &PyObject) -> &mut GenObject {
     unsafe { &mut *(o.as_ptr() as *mut GenObject) }
 }
 
@@ -88,6 +88,10 @@ pub fn new_generator_for(frame: Box<Frame>, func: &PyObject, flags: u32) -> PyRe
         let fp = Box::into_raw(frame);
         (*fp).generator = op;
         gn.frame = fp;
+        if tp == coro_type() {
+            // coroutines keep their origin (sys.set_coroutine_origin_tracking_depth) here
+            gn.finalizer = crate::types::asyncgen::compute_cr_origin().map_or(std::ptr::null_mut(), |o| o.into_raw());
+        }
         crate::gc::track(op);
         Ok(PyRef::from_raw(op))
     }
@@ -115,7 +119,7 @@ pub fn gen_send_ex(o: &PyObject, arg: Option<&PyObject>, throw: Option<PyRef>, c
         let msg = if is_coroutine_exact(o) {
             "coroutine already executing"
         } else if is_asyncgen(o) {
-            "anext(): asynchronous generator is already running"
+            "async generator already executing"
         } else {
             "generator already executing"
         };
@@ -270,7 +274,7 @@ unsafe extern "C" fn gen_iternext(o: *mut PyObject) -> *mut PyObject {
 }
 
 /// Delegate target of a suspended yield from / await, if any.
-fn yieldfrom(o: &PyObject) -> Option<PyRef> {
+pub fn yieldfrom(o: &PyObject) -> Option<PyRef> {
     let gn = g(o);
     if gn.frame.is_null() {
         return None;
@@ -296,7 +300,7 @@ fn yieldfrom(o: &PyObject) -> Option<PyRef> {
     None
 }
 
-fn gen_throw_impl(o: &PyObject, typ: &PyObject, val: Option<&PyObject>, tb: Option<&PyObject>, close_on_genexit: bool) -> PyResult {
+pub fn gen_throw_impl(o: &PyObject, typ: &PyObject, val: Option<&PyObject>, tb: Option<&PyObject>, close_on_genexit: bool) -> PyResult {
     // delegate to sub-iterator first
     if let Some(yf) = yieldfrom(o) {
         if typ.is(type_obj(exc::GeneratorExit())) && close_on_genexit {
@@ -469,6 +473,17 @@ unsafe extern "C" fn gen_finalize(o: *mut PyObject) {
     unsafe {
         let oo = &*o;
         let gn = g(oo);
+        if is_asyncgen(oo) && !gn.frame.is_null() && !gn.finalizer.is_null() && !gn.closed {
+            let saved = take_exc();
+            let f = PyRef::from_borrowed(gn.finalizer);
+            if ab::call(&f, &[oo]).is_err() {
+                crate::modules::sys::write_unraisable_with_obj("Exception ignored while finalizing generator", Some(oo));
+            }
+            if let Some(s) = saved {
+                set_exc(s);
+            }
+            return;
+        }
         if gn.frame.is_null() || (*gn.frame).state == FrameState::Created {
             if is_coroutine_exact(oo) && !gn.frame.is_null() {
                 let saved = take_exc();
@@ -602,7 +617,7 @@ fn set_qualname(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         _ => raise!(TypeError, "__qualname__ must be set to a string object"),
     }
 }
-fn get_frame(o: &PyObject) -> PyResult {
+pub fn get_frame(o: &PyObject) -> PyResult {
     let gn = g(o);
     if gn.frame.is_null() {
         return Ok(none::none_ref());
@@ -613,7 +628,7 @@ fn get_frame(o: &PyObject) -> PyResult {
 fn get_running(o: &PyObject) -> PyResult {
     Ok(crate::types::bool_::new_bool(g(o).running))
 }
-fn get_suspended(o: &PyObject) -> PyResult {
+pub fn get_suspended(o: &PyObject) -> PyResult {
     let gn = g(o);
     Ok(crate::types::bool_::new_bool(!gn.frame.is_null() && unsafe { (*gn.frame).state == FrameState::Suspended }))
 }
@@ -628,6 +643,11 @@ fn gen_sizeof(_o: &PyObject) -> PyResult {
 }
 fn gen_close_m(o: &PyObject) -> PyResult {
     gen_close(o)
+}
+
+fn get_cr_origin(o: &PyObject) -> PyResult {
+    let p = g(o).finalizer;
+    Ok(if p.is_null() { none::none_ref() } else { unsafe { PyRef::from_borrowed(p) } })
 }
 
 pub fn coro_is_running_await(o: &PyObject) -> bool {
@@ -798,6 +818,7 @@ pub fn init_types() {
             ("cr_suspended", get_suspended),
             ("cr_code", get_code),
             ("cr_await", get_yieldfrom),
+            ("cr_origin", get_cr_origin),
         ];
         crate::types::asyncgen::setup_asyncgen_type(asyncgen_type());
 
