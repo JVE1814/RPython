@@ -275,8 +275,8 @@ class HTMLParser(_markupbase.ParserBase):
                 self._emit_cdata(raw[i:n])
                 return self.updatepos(i, n)
             j = m.start()
-            k = self._scan_tag_body(m.end(), None)
-            if k == _INCOMPLETE:
+            result = self._scan_tag_body(m.end(), None)
+            if result == _INCOMPLETE:
                 if not end:
                     self._waiting = True
                     return _INCOMPLETE
@@ -288,7 +288,7 @@ class HTMLParser(_markupbase.ParserBase):
             elem = self.cdata_elem
             self.clear_cdata_mode()
             self.handle_endtag(elem)
-            return self.updatepos(j, k)
+            return self.updatepos(j, result[0])
 
     def _emit_cdata(self, text):
         if not text:
@@ -473,9 +473,9 @@ class HTMLParser(_markupbase.ParserBase):
                 if not end:
                     self._waiting = True
                     return _INCOMPLETE
-                self.unknown_decl(raw[j:])
+                self.unknown_decl(raw[j + 1:])
                 return n
-            self.unknown_decl(raw[j:k])
+            self.unknown_decl(raw[j + 1:k])
             return k + 3
         if not end and len(rest) < 9 and (
                 '--'.startswith(rest)
