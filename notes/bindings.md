@@ -29,7 +29,7 @@
   `_swappedbytes_`, `_anonymous_` handled in Rust after the layout.
 * Calls: libffi `ffi_prep_cif`/`ffi_prep_cif_var` (variadic when more args than argtypes),
   `ffi_call` with the thread state detached (PyEval_SaveThread) unless FUNCFLAG_PYTHONAPI;
-  callbacks are libffi closures; the trampoline attaches with PyGILState_Ensure. errno swapping
+  callbacks are libffi closures; the trampoline attaches through `gil.rs`. errno swapping
   for use_errno. paramflags (in/out/lcid), errcheck, `_check_retval_`, ArgumentError wrapping.
 * `string_at`/`wstring_at`/`memoryview_at`/`cast` are Rust `extern "C"` functions exported as
   addresses (`_string_at_addr` ...) and wrapped with PYFUNCTYPE in Lib/ctypes, like the
@@ -64,7 +64,7 @@ All test_ctypes modules pass except:
 * 3.12+ transaction semantics: `autocommit` (True/False/LEGACY_TRANSACTION_CONTROL) and legacy
   `isolation_level` implicit BEGIN before DML; statement LRU cache (`cached_statements`).
 * Callbacks (functions, aggregates, window functions, collations, authorizer, progress, trace)
-  run with PyGILState_Ensure; errors are reported through `sys.unraisablehook` only when
+  re-attach through `gil.rs`; errors are reported through `sys.unraisablehook` only when
   `enable_callback_tracebacks(True)`. Hook contexts replaced during a call are kept alive
   ("retired") until the connection dies.
 * blocking SQLite calls (prepare/step/open/backup/blob I/O) detach the thread state.
@@ -94,13 +94,23 @@ All test_ctypes modules pass except:
   the hostname/IP mismatch texts).
 * Socket I/O uses the socket's fd (SSL_set_fd); timeouts and non-blocking mode follow the
   Python socket's `gettimeout()` with poll(), the thread state is released around OpenSSL
-  calls and waits. SNI/keylog/msg callbacks re-attach with PyGILState_Ensure.
+  calls and waits. SNI/keylog/msg/password callbacks re-attach through `gil.rs`.
+* `SSLSession` objects hold a copy (SSL_SESSION_dup) of the connection's session, and
+  setting a session installs a copy: OpenSSL marks a connection's session non-resumable when
+  the connection is freed without close_notify, which would otherwise break resumption after
+  `with sock:` blocks.
+* An `_SSLSocket` remembers an SSLEOFError and raises it again for later I/O.
 * Lib/ssl.py is written from the documented API (enums via `_convert_`, SSLContext
   properties, SSLSocket on socket.socket, SSLObject, create_default_context,
   `_create_unverified_context`, DER/PEM helpers, cert_time_to_seconds, get_server_certificate).
-* Verified by hand: TLS 1.3 handshakes over MemoryBIO pairs and over socketpair() with a
-  server thread, verification errors, PEM/DH error attributes. test_ssl itself cannot be
-  loaded yet: it imports `http.client`/`urllib.request`, which master does not have.
+* test_ssl cannot be loaded on master yet: it imports `http.client`/`urllib.request`
+  (web workstream). With local stub modules for those (debug build, unittest): 222 tests,
+  failures=1, errors=3, skipped=22. Remaining: test_distrusted_spki (3.15's built-in list of
+  distrusted public keys is not known to us), test_timeout_connect_ex (needs urllib.error),
+  test_https_client_non_tls_response_ignored and test_socketserver (need the real
+  http.server/http.client). Once in a while a run aborted inside the runtime's
+  `gc::untrack` (misaligned gc list pointer while a server thread dropped a bound builtin
+  method) — looks like a free-threaded GC list race in the runtime, not reproducible on rerun.
 * Not implemented: TLS-PSK callbacks (HAS_PSK False, the setters raise NotImplementedError),
   NPN (deprecated anyway), Windows certificate stores, kTLS, `_ssl.enum_*` (Windows).
 
@@ -110,3 +120,7 @@ All test_ctypes modules pass except:
 * B2: system libraries are dlopen'ed (no link-time dependency); missing libraries make the
   module import fail with ImportError, like a CPython build without the extension.
 * B3: `_hashlib` stays the compress workstream's own implementation (not switched to libcrypto).
+* B4 (`gil.rs`): callbacks invoked by C libraries while our thread is detached re-attach the
+  *same* thread state that `save()` detached (PyEval_RestoreThread) instead of
+  PyGILState_Ensure; on runtime-created threads PyGILState_Ensure made a second thread state,
+  which crashed the JIT. Threads unknown to the runtime still use PyGILState_Ensure.
