@@ -422,7 +422,7 @@ pub fn init_types() -> PyResult<()> {
             return Ok(());
         }
         let size = std::mem::size_of::<IoHeader>();
-        setup_type(iobase_type(), c"_io._IOBase", size, std::ptr::null_mut(), "The abstract base class for all I/O classes.");
+        setup_type(iobase_type(), c"_io._IOBase", size, std::ptr::null_mut(), "_IOBase()\n--\n\nRoot of the I/O class hierarchy; most operations raise UnsupportedOperation.");
         let t = &mut *iobase_type();
         t.tp_new = Some(header_new);
         t.tp_dealloc = Some(header_dealloc);
@@ -431,58 +431,58 @@ pub fn init_types() -> PyResult<()> {
         t.tp_iter = Some(iob_iter);
         t.tp_iternext = Some(iob_iternext);
         t.tp_methods = crate::mdefs![
-            ("seek", FAST, iob_seek),
+            ("seek", FAST, iob_seek, "seek($self, offset, whence=os.SEEK_SET, /)\n--\n\nChange the stream position (unsupported in the base class)."),
             ("tell", NOARGS, iob_tell),
-            ("truncate", FAST, iob_truncate),
+            ("truncate", FAST, iob_truncate, "truncate($self, size=None, /)\n--\n\nResize the stream (unsupported in the base class)."),
             ("flush", NOARGS, iob_flush),
             ("close", NOARGS, iob_close),
             ("seekable", NOARGS, iob_false),
             ("readable", NOARGS, iob_false),
             ("writable", NOARGS, iob_false),
-            ("_checkClosed", FAST, iob_check_closed),
-            ("_checkSeekable", FAST, iob_check_seekable),
-            ("_checkReadable", FAST, iob_check_readable),
-            ("_checkWritable", FAST, iob_check_writable),
+            ("_checkClosed", FAST, iob_check_closed, "_checkClosed($self, msg=None, /)\n--\n\n"),
+            ("_checkSeekable", FAST, iob_check_seekable, "_checkSeekable($self, msg=None, /)\n--\n\n"),
+            ("_checkReadable", FAST, iob_check_readable, "_checkReadable($self, msg=None, /)\n--\n\n"),
+            ("_checkWritable", FAST, iob_check_writable, "_checkWritable($self, msg=None, /)\n--\n\n"),
             ("fileno", NOARGS, iob_fileno),
             ("isatty", NOARGS, iob_isatty),
             ("__enter__", NOARGS, iob_enter),
-            ("__exit__", FAST, iob_exit),
-            ("readline", FAST, iob_readline),
-            ("readlines", FAST, iob_readlines),
+            ("__exit__", FAST, iob_exit, "__exit__($self, /, *args)\n--\n\nClose the stream when leaving a with block."),
+            ("readline", FAST, iob_readline, "readline($self, size=-1, /)\n--\n\nRead and return one line, or at most size bytes/characters of it."),
+            ("readlines", FAST, iob_readlines, "readlines($self, hint=-1, /)\n--\n\nReturn a list of lines, stopping once hint bytes/characters were read."),
             ("writelines", O, iob_writelines),
         ];
         t.tp_getset = crate::getset_table![("__dict__", iob_get_dict), ("closed", iob_get_closed)];
         crate::types::typeobject::type_ready(iobase_type())?;
 
-        setup_type(rawiobase_type(), c"_io._RawIOBase", size, iobase_type(), "Base class for raw binary I/O.");
+        setup_type(rawiobase_type(), c"_io._RawIOBase", size, iobase_type(), "_RawIOBase()\n--\n\nBase class for unbuffered binary streams.");
         let t = &mut *rawiobase_type();
         t.tp_methods = crate::mdefs![
-            ("read", FAST, raw_read),
+            ("read", FAST, raw_read, "read($self, size=-1, /)\n--\n\nRead up to size bytes via readinto(); -1 reads to EOF."),
             ("readall", NOARGS, raw_readall),
-            ("readinto", FAST, not_implemented),
-            ("write", FAST, not_implemented),
+            ("readinto", FAST, not_implemented, "readinto($self, buffer, /)\n--\n\nAbstract: read into a buffer."),
+            ("write", FAST, not_implemented, "write($self, b, /)\n--\n\nAbstract: write the given bytes."),
         ];
         crate::types::typeobject::type_ready(rawiobase_type())?;
 
-        setup_type(bufferediobase_type(), c"_io._BufferedIOBase", size, iobase_type(), "Base class for buffered IO objects.");
+        setup_type(bufferediobase_type(), c"_io._BufferedIOBase", size, iobase_type(), "_BufferedIOBase()\n--\n\nBase class for buffered binary streams.");
         let t = &mut *bufferediobase_type();
         t.tp_methods = crate::mdefs![
             ("detach", NOARGS, bio_detach),
-            ("read", FAST, bio_read),
-            ("read1", FAST, bio_read1),
+            ("read", FAST, bio_read, "read($self, size=-1, /)\n--\n\nRead up to size bytes (unsupported in the base class)."),
+            ("read1", FAST, bio_read1, "read1($self, size=-1, /)\n--\n\nRead up to size bytes with at most one raw read (unsupported here)."),
             ("readinto", O, bio_readinto),
             ("readinto1", O, bio_readinto1),
-            ("write", FAST, bio_write),
+            ("write", FAST, bio_write, "write($self, b, /)\n--\n\nWrite the given bytes (unsupported in the base class)."),
         ];
         crate::types::typeobject::type_ready(bufferediobase_type())?;
 
-        setup_type(textiobase_type(), c"_io._TextIOBase", size, iobase_type(), "Base class for text I/O.");
+        setup_type(textiobase_type(), c"_io._TextIOBase", size, iobase_type(), "_TextIOBase()\n--\n\nBase class for text streams.");
         let t = &mut *textiobase_type();
         t.tp_methods = crate::mdefs![
             ("detach", NOARGS, bio_detach),
-            ("read", FAST, tio_read),
-            ("readline", FAST, tio_readline),
-            ("write", FAST, tio_write),
+            ("read", FAST, tio_read, "read($self, size=-1, /)\n--\n\nRead up to size characters (unsupported in the base class)."),
+            ("readline", FAST, tio_readline, "readline($self, size=-1, /)\n--\n\nRead one line (unsupported in the base class)."),
+            ("write", FAST, tio_write, "write($self, s, /)\n--\n\nWrite a string (unsupported in the base class)."),
         ];
         t.tp_getset = crate::getset_table![("encoding", tio_none), ("newlines", tio_none), ("errors", tio_none)];
         crate::types::typeobject::type_ready(textiobase_type())?;

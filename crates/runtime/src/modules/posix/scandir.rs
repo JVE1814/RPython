@@ -361,7 +361,7 @@ pub fn init_types() -> PyResult<()> {
         t.tp_methods = crate::mdefs![
             ("close", NOARGS, iter_close),
             ("__enter__", NOARGS, iter_enter),
-            ("__exit__", FAST, iter_exit),
+            ("__exit__", FAST, iter_exit, "__exit__($self, /, *args)\n--\n\nClose the iterator when leaving a with block."),
             ("__reduce__", NOARGS, iter_reduce),
         ];
         crate::types::typeobject::type_ready(&raw mut SCANDIR_ITER_TYPE)?;
@@ -375,9 +375,9 @@ pub fn init_types() -> PyResult<()> {
         t.tp_getattro = Some(crate::types::typeobject::object_generic_getattro);
         t.tp_getset = crate::getset_table![("name", get_name; "the entry's base filename, relative to scandir() \"path\" argument"), ("path", get_path; "the entry's full path name; equivalent to os.path.join(scandir_path, entry.name)")];
         t.tp_methods = crate::mdefs![
-            ("stat", FASTKW, entry_stat),
-            ("is_dir", FASTKW, entry_is_dir),
-            ("is_file", FASTKW, entry_is_file),
+            ("stat", FASTKW, entry_stat, "stat($self, /, *, follow_symlinks=True)\n--\n\nReturn the stat_result of the entry, cached after the first call."),
+            ("is_dir", FASTKW, entry_is_dir, "is_dir($self, /, *, follow_symlinks=True)\n--\n\nReturn True if the entry is a directory."),
+            ("is_file", FASTKW, entry_is_file, "is_file($self, /, *, follow_symlinks=True)\n--\n\nReturn True if the entry is a regular file."),
             ("is_symlink", NOARGS, entry_is_symlink),
             ("is_junction", NOARGS, entry_is_junction),
             ("inode", NOARGS, entry_inode),

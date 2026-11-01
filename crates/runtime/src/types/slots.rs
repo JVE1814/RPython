@@ -571,7 +571,12 @@ pub fn add_operators(tp: *mut PyTypeObject) -> PyResult<()> {
     }
     // __new__ as a builtin staticmethod-like function
     unsafe {
-        if (*tp).tp_new.is_some() && dict::get_item_str(d, name!("__new__")).is_none() {
+        // Types that cannot be instantiated get no __new__ of their own (they
+        // show object.__new__ through the MRO, as in CPython).
+        if (*tp).tp_new.is_some()
+            && (*tp).tp_flags & crate::ffi::Py_TPFLAGS_DISALLOW_INSTANTIATION == 0
+            && dict::get_item_str(d, name!("__new__")).is_none()
+        {
             let base = (*tp).tp_base;
             if base.is_null() || (*base).tp_new != (*tp).tp_new || tp == object_type() {
                 let f = crate::types::descr::new_tp_new_wrapper(tp);

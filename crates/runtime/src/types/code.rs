@@ -640,8 +640,8 @@ pub fn init_types() {
         t.tp_methods = crate::mdefs![
             ("co_lines", NOARGS, co_lines),
             ("co_positions", NOARGS, co_positions),
-            ("replace", FASTKW, code_replace),
-            ("__replace__", FASTKW, code_replace),
+            ("replace", FASTKW, code_replace, "replace($self, /, *, co_argcount=-1, co_posonlyargcount=-1, co_kwonlyargcount=-1,\n        co_nlocals=-1, co_stacksize=-1, co_flags=-1, co_firstlineno=-1,\n        co_code=None, co_consts=None, co_names=None, co_varnames=None,\n        co_freevars=None, co_cellvars=None, co_filename=None, co_name=None,\n        co_qualname=None, co_linetable=None, co_exceptiontable=None)\n--\n\nReturn a copy of the code object with the given fields replaced."),
+            ("__replace__", FASTKW, code_replace, "__replace__($self, /, **changes)\n--\n\nReturn a copy of the code object with the given fields replaced."),
             ("__sizeof__", NOARGS, code_sizeof),
         ];
     }

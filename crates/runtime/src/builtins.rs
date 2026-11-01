@@ -805,7 +805,7 @@ pub fn more_builtins() -> *mut PyMethodDef {
         ("oct", O, b_oct, "oct($module, number, /)\n--\n\nReturn the octal representation of an integer."),
         ("hex", O, b_hex, "hex($module, number, /)\n--\n\nReturn the hexadecimal representation of an integer."),
         ("aiter", O, b_aiter, "aiter($module, async_iterable, /)\n--\n\nReturn an AsyncIterator for an AsyncIterable object."),
-        ("anext", FAST, b_anext, "anext(aiterator[, default])\n\nReturn the next item from the async iterator."),
+        ("anext", FAST, b_anext, "anext($module, aiterator, default=<unrepresentable>, /)\n--\n\nAwaitable returning the next item of an async iterator.\n\nWhen the iterator is exhausted, default is returned if given;\notherwise StopAsyncIteration is raised."),
         ("breakpoint", FASTKW, b_breakpoint, "breakpoint($module, /, *args, **kws)\n--\n\nCall sys.breakpointhook(*args, **kws)."),
     ]
 }

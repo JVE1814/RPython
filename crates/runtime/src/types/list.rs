@@ -1070,7 +1070,7 @@ pub fn init_types() {
         t.tp_alloc = Some(generic_alloc);
         t.tp_free = Some(generic_free);
         t.tp_getattro = Some(object_generic_getattro);
-        t.tp_doc = c"Built-in mutable sequence.\n\nIf no argument is given, the constructor creates a new empty list.\nThe argument must be an iterable if specified.".as_ptr();
+        t.tp_doc = c"list(iterable=(), /)\n--\n\nBuilt-in mutable sequence.\n\nWith no argument an empty list is created; otherwise the list holds\nthe items of the given iterable.".as_ptr();
         let s = &mut *(&raw mut LIST_SEQ);
         s.sq_length = Some(list_len_slot);
         s.sq_concat = Some(list_concat);

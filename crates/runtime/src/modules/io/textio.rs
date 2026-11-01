@@ -1605,10 +1605,10 @@ pub fn init_types() -> PyResult<()> {
         t.tp_iternext = Some(t_iternext);
         t.tp_methods = crate::mdefs![
             ("detach", NOARGS, t_detach),
-            ("reconfigure", FASTKW, t_reconfigure),
+            ("reconfigure", FASTKW, t_reconfigure, "reconfigure($self, /, *, encoding=None, errors=None, newline=None,\n            line_buffering=None, write_through=None)\n--\n\nChange the stream's text settings; omitted arguments keep their value."),
             ("write", O, t_write),
-            ("read", FAST, t_read),
-            ("readline", FAST, t_readline),
+            ("read", FAST, t_read, "read($self, size=-1, /)\n--\n\nRead up to size characters; a negative size reads to EOF."),
+            ("readline", FAST, t_readline, "readline($self, size=-1, /)\n--\n\nRead one line, or at most size characters of it."),
             ("flush", NOARGS, t_flush),
             ("close", NOARGS, t_close),
             ("fileno", NOARGS, t_fileno),
@@ -1616,9 +1616,9 @@ pub fn init_types() -> PyResult<()> {
             ("readable", NOARGS, t_readable),
             ("writable", NOARGS, t_writable),
             ("isatty", NOARGS, t_isatty),
-            ("seek", FAST, t_seek),
+            ("seek", FAST, t_seek, "seek($self, cookie, whence=os.SEEK_SET, /)\n--\n\nMove to a position given by an opaque cookie from tell()."),
             ("tell", NOARGS, t_tell),
-            ("truncate", FAST, t_truncate),
+            ("truncate", FAST, t_truncate, "truncate($self, pos=None, /)\n--\n\nFlush and resize the underlying stream."),
             ("__getstate__", NOARGS, t_getstate),
         ];
         t.tp_getset = crate::getset_table![
@@ -1650,7 +1650,7 @@ pub fn init_types() -> PyResult<()> {
         t.tp_setattro = Some(crate::types::typeobject::object_generic_setattro);
         t.tp_doc = c"IncrementalNewlineDecoder(decoder, translate, errors='strict')\n--\n\nCodec used when reading a file in universal newlines mode.\n\nIt wraps another incremental decoder, translating \\r\\n and \\r into \\n.\nIt also records the types of newlines encountered.  When used with\ntranslate=False, it ensures that the newline sequence is returned in\none piece. When used with decoder=None, it expects unicode strings as\ndecode input and translates newlines without first invoking an external\ndecoder.".as_ptr();
         t.tp_methods = crate::mdefs![
-            ("decode", FASTKW, nld_decode),
+            ("decode", FASTKW, nld_decode, "decode($self, /, input, final=False)\n--\n\nDecode input and translate its newlines."),
             ("getstate", NOARGS, nld_getstate),
             ("setstate", O, nld_setstate),
             ("reset", NOARGS, nld_reset),

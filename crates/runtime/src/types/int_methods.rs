@@ -580,7 +580,7 @@ pub fn init_types() {
         t.tp_basicsize = std::mem::offset_of!(PyLongObject, ob_digit) as isize;
         t.tp_itemsize = 4;
         t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_LONG_SUBCLASS;
-        t.tp_doc = c"int([x]) -> integer\nint(x, base=10) -> integer\n\nConvert a number or string to an integer, or return 0 if no arguments\nare given.  If x is a number, return x.__int__().  For floating-point\nnumbers, this truncates towards zero.".as_ptr();
+        t.tp_doc = c"int([x]) -> integer\nint(x, base=10) -> integer\n\nConvert a number or a string to an integer; with no argument return 0.\n\nNumbers are converted with their __int__() method (floats are truncated\ntoward zero).  A str, bytes or bytearray x is parsed as an integer literal\nin the given base (2 to 36, default 10); base 0 reads the base from the\nliteral's prefix, as in Python source:\n\n>>> int('0x1f', base=0)\n31".as_ptr();
         t.tp_repr = Some(int_repr);
         t.tp_hash = Some(int_hash_slot);
         t.tp_richcompare = Some(int_richcompare);
@@ -590,17 +590,17 @@ pub fn init_types() {
         t.tp_alloc = Some(generic_alloc);
         t.tp_free = Some(generic_free);
         t.tp_methods = crate::mdefs![
-            ("bit_length", NOARGS, int_bit_length, "bit_length($self, /)\n--\n\nNumber of bits necessary to represent self in binary."),
-            ("bit_count", NOARGS, int_bit_count, "bit_count($self, /)\n--\n\nNumber of ones in the binary representation of the absolute value of self."),
+            ("bit_length", NOARGS, int_bit_length, "bit_length($self, /)\n--\n\nReturn how many bits are needed to write abs(self) in binary.\n\n>>> bin(100)\n'0b1100100'\n>>> (100).bit_length()\n7"),
+            ("bit_count", NOARGS, int_bit_count, "bit_count($self, /)\n--\n\nReturn how many 1 bits there are in abs(self) written in binary.\n\n>>> bin(22)\n'0b10110'\n>>> (22).bit_count()\n3"),
             ("conjugate", NOARGS, int_conjugate, "Returns self, the complex conjugate of any int."),
             ("is_integer", NOARGS, int_is_integer, "Returns True. Exists for duck type compatibility with float.is_integer."),
-            ("as_integer_ratio", NOARGS, int_as_integer_ratio, "Return a pair of integers, whose ratio is equal to the original int."),
+            ("as_integer_ratio", NOARGS, int_as_integer_ratio, "as_integer_ratio($self, /)\n--\n\nReturn the pair (self, 1): an exact fraction with a positive denominator.\n\n>>> (7).as_integer_ratio()\n(7, 1)\n>>> (-3).as_integer_ratio()\n(-3, 1)\n>>> (0).as_integer_ratio()\n(0, 1)"),
             ("to_bytes", FASTKW, int_to_bytes, "to_bytes($self, /, length=1, byteorder='big', *, signed=False)\n--\n\nReturn an array of bytes representing an integer."),
             ("from_bytes", FASTKW, int_from_bytes, "from_bytes($type, /, bytes, byteorder='big', *, signed=False)\n--\n\nReturn the integer represented by the given array of bytes."; METH_CLASS),
             ("__trunc__", NOARGS, int_trunc, "Truncating an Integral returns itself."),
             ("__floor__", NOARGS, int_trunc, "Flooring an Integral returns itself."),
             ("__ceil__", NOARGS, int_trunc, "Ceiling of an Integral returns itself."),
-            ("__round__", FAST, int_round, "Rounding an Integral returns itself.\n\nRounding with an ndigits argument also returns an integer."),
+            ("__round__", FAST, int_round, "__round__($self, ndigits=None, /)\n--\n\nRound to the given number of decimal digits; the result is always an int."),
             ("__getnewargs__", NOARGS, int_getnewargs),
             ("__format__", O, int_format, "__format__($self, format_spec, /)\n--\n\nConvert to a string according to format_spec."),
             ("__sizeof__", NOARGS, int_sizeof, "Returns size in memory, in bytes."),

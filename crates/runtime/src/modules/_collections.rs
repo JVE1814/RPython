@@ -1004,7 +1004,7 @@ fn init_types() -> PyResult<()> {
         (*t).tp_as_number = leak(nb);
         (*t).tp_doc = c"defaultdict(default_factory=None, /, [...]) --> dict with default factory\n\nThe default factory is called without arguments to produce\na new value when a key is not present, in __getitem__ only.\nA defaultdict compares equal to a dict with the same items.\nAll remaining arguments are treated the same as if they were\npassed to the dict constructor, including keyword arguments.\n".as_ptr();
         (*t).tp_methods = mdefs![
-            ("__missing__", O, defdict_missing, "__missing__(key) # Called by __getitem__ for missing key; pseudo-code:\n  if self.default_factory is None: raise KeyError((key,))\n  self[key] = value = self.default_factory()\n  return value\n"),
+            ("__missing__", O, defdict_missing, "__missing__($self, key, /)\n--\n\nCalled by __getitem__ for a missing key.\n\nWithout a default_factory raise KeyError(key); otherwise store and\nreturn default_factory()."),
             ("copy", NOARGS, defdict_copy, "D.copy() -> a shallow copy of D."),
             ("__copy__", NOARGS, defdict_copy, "D.copy() -> a shallow copy of D."),
             ("__reduce__", NOARGS, defdict_reduce, "Return state information for pickling."),

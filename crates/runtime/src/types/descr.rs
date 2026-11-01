@@ -69,6 +69,46 @@ pub fn text_signature(name: &str, doc: &str) -> Option<String> {
     Some(sig.replace("($self, ", "($self, ").to_string())
 }
 
+/// Signature implied by the calling convention when the doc has none:
+/// METH_NOARGS takes nothing but the bound object, METH_O exactly one
+/// positional argument.  `first` names the implicit leading parameter
+/// ("$self", "$type", "$module"), or None when there is none.
+pub fn flags_text_signature(flags: i32, first: Option<&str>) -> Option<String> {
+    let base = flags & !(METH_CLASS | METH_STATIC | METH_COEXIST);
+    let rest = if base == METH_NOARGS {
+        ""
+    } else if base == METH_O {
+        "object"
+    } else {
+        return None;
+    };
+    Some(match (first, rest) {
+        (Some(f), "") => format!("({f}, /)"),
+        (Some(f), r) => format!("({f}, {r}, /)"),
+        (None, "") => "()".to_string(),
+        (None, r) => format!("({r}, /)"),
+    })
+}
+
+/// `__text_signature__` for a PyMethodDef-backed callable: the one in the doc,
+/// else the one implied by the flags.
+pub fn method_text_signature(name: &str, doc: Option<&str>, flags: i32, first: Option<&str>) -> Option<String> {
+    match doc {
+        Some(d) => {
+            if let Some(s) = text_signature(name, d) {
+                return Some(s);
+            }
+            // A doc that starts with something signature-shaped but is not a valid
+            // signature block is left alone (no implied signature either).
+            if d.starts_with(name) && d[name.len()..].starts_with('(') {
+                return None;
+            }
+        }
+        None => {}
+    }
+    flags_text_signature(flags, first)
+}
+
 fn find_sig_end(doc: &str) -> Option<usize> {
     let p = doc.find(")\n--\n\n")?;
     let head = &doc[..p];
@@ -763,6 +803,21 @@ fn descr_get_doc(o: &PyObject) -> PyResult {
 }
 
 fn descr_get_text_signature(o: &PyObject) -> PyResult {
+    if o.is_type(method_descr_type()) || o.is_type(classmethod_descr_type()) {
+        let flags = unsafe { (*(*(o.as_ptr() as *mut PyMethodDescrObject)).d_method).ml_flags };
+        let first = if flags & METH_STATIC != 0 {
+            None
+        } else if flags & METH_CLASS != 0 {
+            Some("$type")
+        } else {
+            Some("$self")
+        };
+        let doc = descr_doc_raw(o);
+        return Ok(match method_text_signature(&descr_name(o), doc.as_deref(), flags, first) {
+            Some(s) => pystr::new_str(&s),
+            None => none::none_ref(),
+        });
+    }
     match descr_doc_raw(o) {
         Some(d) => match text_signature(&descr_name(o), &d) {
             Some(s) => Ok(pystr::new_str(&s)),
@@ -818,7 +873,7 @@ static mut TP_NEW_DEF: PyMethodDef = PyMethodDef {
     ml_name: c"__new__".as_ptr(),
     ml_meth: std::ptr::null(),
     ml_flags: METH_VARARGS | METH_KEYWORDS,
-    ml_doc: c"Create and return a new object.  See help(type) for accurate signature.".as_ptr(),
+    ml_doc: c"__new__($type, *args, **kwargs)\n--\n\nCreate a new instance of the type (help(type) shows its real parameters).".as_ptr(),
 };
 
 unsafe extern "C" fn tp_new_wrapper(slf: *mut PyObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {

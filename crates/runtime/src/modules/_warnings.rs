@@ -636,8 +636,8 @@ pub fn init_module() -> PyResult {
     let m = crate::types::module::new_module("_warnings")?;
     let d = crate::types::module::module_dict(&m);
     let methods = crate::mdefs![
-        ("warn", FASTKW, py_warn, "Issue a warning, or maybe ignore it or raise an exception."),
-        ("warn_explicit", FASTKW, py_warn_explicit, "Issue a warning, or maybe ignore it or raise an exception."),
+        ("warn", FASTKW, py_warn, "warn($module, /, message, category=None, stacklevel=1, source=None, *,\n     skip_file_prefixes=())\n--\n\nIssue a warning: show it, ignore it or raise it, as the filters decide."),
+        ("warn_explicit", FASTKW, py_warn_explicit, "warn_explicit($module, /, message, category, filename, lineno,\n              module=<unrepresentable>, registry=None,\n              module_globals=None, source=None)\n--\n\nIssue a warning with an explicitly given location."),
         ("_filters_mutated_lock_held", NOARGS, py_filters_mutated),
         ("_acquire_lock", NOARGS, py_acquire_lock),
         ("_release_lock", NOARGS, py_release_lock),

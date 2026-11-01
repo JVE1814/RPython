@@ -113,7 +113,7 @@ pub fn init_types() {
         (*(&raw mut NI_NUMBER)).nb_bool = Some(ni_bool);
         t.tp_as_number = &raw mut NI_NUMBER;
         t.tp_methods = crate::mdefs![("__reduce__", NOARGS, ni_reduce)];
-        t.tp_doc = c"The type of the NotImplemented singleton.".as_ptr();
+        t.tp_doc = c"NotImplementedType()\n--\n\nThe type of the NotImplemented singleton.".as_ptr();
 
         let t = &mut *(&raw mut PyEllipsis_Type);
         t.tp_name = c"ellipsis".as_ptr();
@@ -123,7 +123,7 @@ pub fn init_types() {
         t.tp_repr = Some(ell_repr);
         t.tp_new = Some(ell_new);
         t.tp_methods = crate::mdefs![("__reduce__", NOARGS, ell_reduce)];
-        t.tp_doc = c"The type of the Ellipsis singleton.".as_ptr();
+        t.tp_doc = c"ellipsis()\n--\n\nThe type of the Ellipsis singleton.".as_ptr();
 
         for (o, tp) in [
             (&raw mut _Py_NoneStruct, &raw mut _PyNone_Type),

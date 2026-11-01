@@ -934,7 +934,7 @@ pub fn init_module() -> PyResult {
             let t = &mut *reader_type();
             t.tp_name = c"_csv.reader".as_ptr();
             t.tp_basicsize = std::mem::size_of::<ReaderObj>() as isize;
-            t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_IMMUTABLETYPE;
+            t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_IMMUTABLETYPE | Py_TPFLAGS_DISALLOW_INSTANTIATION;
             t.tp_new = Some(no_new);
             t.tp_dealloc = Some(reader_dealloc);
             t.tp_iter = Some(iter_self);
@@ -947,7 +947,7 @@ pub fn init_module() -> PyResult {
             let t = &mut *writer_type();
             t.tp_name = c"_csv.writer".as_ptr();
             t.tp_basicsize = std::mem::size_of::<WriterObj>() as isize;
-            t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_IMMUTABLETYPE;
+            t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_IMMUTABLETYPE | Py_TPFLAGS_DISALLOW_INSTANTIATION;
             t.tp_new = Some(no_new);
             t.tp_dealloc = Some(writer_dealloc);
             t.tp_getattro = Some(object_generic_getattro);
@@ -998,8 +998,8 @@ pub fn init_module() -> PyResult {
             ("register_dialect", FASTKW, m_register_dialect, "register_dialect(name, dialect=None, **options)\n--\n\nRegister a dialect under *name*."),
             ("unregister_dialect", O, m_unregister_dialect, "unregister_dialect(name, /)\n--\n\nForget the dialect registered under *name*."),
             ("get_dialect", O, m_get_dialect, "get_dialect(name, /)\n--\n\nReturn the dialect registered under *name*."),
-            ("list_dialects", NOARGS, m_list_dialects, "list_dialects(/)\n--\n\nNames of all registered dialects."),
-            ("field_size_limit", FASTKW, m_field_size_limit, "field_size_limit(new_limit=<unchanged>)\n--\n\nReturn the maximum field size accepted by readers, optionally setting a\nnew one."),
+            ("list_dialects", NOARGS, m_list_dialects, "list_dialects($module, /)\n--\n\nNames of all registered dialects."),
+            ("field_size_limit", FASTKW, m_field_size_limit, "field_size_limit($module, /, new_limit=<unrepresentable>)\n--\n\nReturn the maximum field size accepted by readers, optionally setting a\nnew one."),
         ],
         Some(&m),
     )?;

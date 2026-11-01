@@ -589,6 +589,32 @@ fn run_in(ns: &PyObject, src: &str, filename: &str) -> PyResult<()> {
 
 static NS: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
 
+const DATETIME_TEXT_SIGNATURES: &str = r#"
+def _with_text_signature(cls, name, sig):
+    attr = cls.__dict__[name]
+    wrapped = isinstance(attr, classmethod)
+    fn = attr.__func__ if wrapped else attr
+    new = type(fn)(fn.__code__, fn.__globals__, fn.__name__, fn.__defaults__, fn.__closure__)
+    new.__kwdefaults__ = fn.__kwdefaults__
+    new.__qualname__ = fn.__qualname__
+    new.__doc__ = fn.__doc__
+    new.__module__ = fn.__module__
+    new.__text_signature__ = sig
+    _set_class_attr(cls, name, classmethod(new) if wrapped else new)
+_with_text_signature(date, 'replace',
+    '($self, /, year=unchanged, month=unchanged, day=unchanged)')
+_with_text_signature(time, 'replace',
+    '($self, /, hour=unchanged, minute=unchanged, second=unchanged,\n'
+    '        microsecond=unchanged, tzinfo=unchanged, *, fold=unchanged)')
+_with_text_signature(datetime, 'replace',
+    '($self, /, year=unchanged, month=unchanged, day=unchanged,\n'
+    '        hour=unchanged, minute=unchanged, second=unchanged,\n'
+    '        microsecond=unchanged, tzinfo=unchanged, *, fold=unchanged)')
+_with_text_signature(datetime, 'combine',
+    '($type, /, date, time, tzinfo=<unrepresentable>)')
+del _with_text_signature
+"#;
+
 fn build_namespace() -> PyResult<()> {
     let ns = dict::new_dict();
     dict::set_item_str(&ns, "__name__", &pystr::new_str("datetime"))?;
@@ -617,6 +643,11 @@ fn build_namespace() -> PyResult<()> {
         mdefs![("_set_class_attr", FAST, m_set_class_attr, "Store a class attribute on a datetime type.")],
         None,
     )?;
+    // The copied pure methods whose defaults mean "keep the current value"
+    // advertise that through a text signature inspect cannot evaluate, as the
+    // C implementation does.  They get private copies so that aliases such as
+    // __replace__ keep their ordinary signature.
+    run_in(&ns, DATETIME_TEXT_SIGNATURES, "<_datetime signatures>")?;
     for (slot, name) in [
         (&H_DELTA, "_timedelta_fields"),
         (&H_DATE, "_date_new_args"),
@@ -859,13 +890,19 @@ fn init_types() -> PyResult<()> {
         (*date_type()).tp_methods = mdefs![
             ("isocalendar", NOARGS, m_isocalendar, "isocalendar($self, /)\n--\n\nThe ISO 8601 (year, week, weekday) of this date as a named tuple."),
         ];
+        (*timezone_type()).tp_doc = c"timezone(offset, name=<unrepresentable>)\n--\n\nA tzinfo with a fixed offset from UTC.".as_ptr();
+        (*delta_type()).tp_doc = c"timedelta(days=0, seconds=0, microseconds=0, milliseconds=0, minutes=0, hours=0, weeks=0)\n--\n\nA duration: the difference between two dates or datetimes.".as_ptr();
+        (*date_type()).tp_doc = c"date(year, month, day)\n--\n\nA calendar date in the proleptic Gregorian calendar.".as_ptr();
+        (*time_type()).tp_doc = c"time(hour=0, minute=0, second=0, microsecond=0, tzinfo=None, *, fold=0)\n--\n\nA time of day, optionally aware of a time zone.".as_ptr();
+        (*datetime_type()).tp_doc = c"datetime(year, month, day, hour=0, minute=0, second=0, microsecond=0, tzinfo=None, *, fold=0)\n--\n\nA date together with a time of day.".as_ptr();
+        // tzinfo gets a __new__ of its own (no signature, like CPython's).
         setup_type(
             tzinfo_type(),
             c"datetime.tzinfo",
             std::mem::size_of::<PyObject>(),
             std::ptr::null_mut(),
             true,
-            Some(crate::types::object_type::object_new),
+            Some(crate::types::object_type::generic_new),
             plain_dealloc,
             std::ptr::null_mut(),
         )?;

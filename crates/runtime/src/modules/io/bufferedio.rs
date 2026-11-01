@@ -1194,20 +1194,20 @@ pub fn init_types() -> PyResult<()> {
                 ("isatty", NOARGS, b_isatty),
                 ("_dealloc_warn", O, b_dealloc_warn),
                 ("tell", NOARGS, b_tell),
-                ("seek", FAST, b_seek),
-                ("truncate", FAST, b_truncate),
+                ("seek", FAST, b_seek, "seek($self, target, whence=0, /)\n--\n\nMove the stream position and return the new absolute position."),
+                ("truncate", FAST, b_truncate, "truncate($self, pos=None, /)\n--\n\nFlush, then resize the raw stream to pos (default: the current position)."),
                 ("__sizeof__", NOARGS, b_sizeof),
                 ("__getstate__", NOARGS, b_getstate),
             ];
             let reading = crate::mdefs![
-                ("read", FAST, b_read),
-                ("peek", FAST, b_peek),
-                ("read1", FAST, b_read1),
-                ("readinto", O, b_readinto),
-                ("readinto1", O, b_readinto1),
-                ("readline", FAST, b_readline),
+                ("read", FAST, b_read, "read($self, size=-1, /)\n--\n\nRead up to size bytes; a negative size reads until EOF."),
+                ("peek", FAST, b_peek, "peek($self, size=0, /)\n--\n\nReturn buffered bytes without advancing the position."),
+                ("read1", FAST, b_read1, "read1($self, size=-1, /)\n--\n\nRead up to size bytes with at most one raw read."),
+                ("readinto", O, b_readinto, "readinto($self, buffer, /)\n--\n\nRead bytes into a writable buffer; return the count."),
+                ("readinto1", O, b_readinto1, "readinto1($self, buffer, /)\n--\n\nLike readinto() but with at most one raw read."),
+                ("readline", FAST, b_readline, "readline($self, size=-1, /)\n--\n\nRead one line, or at most size bytes of it."),
             ];
-            let writing = crate::mdefs![("write", O, b_write)];
+            let writing = crate::mdefs![("write", O, b_write, "write($self, buffer, /)\n--\n\nBuffer the bytes for writing and return their count.")];
             let mut push = |tbl: *mut PyMethodDef| {
                 let mut m = tbl;
                 while !(*m).ml_name.is_null() {
@@ -1251,10 +1251,10 @@ pub fn init_types() -> PyResult<()> {
             ("read", FAST, p_read),
             ("peek", FAST, p_peek),
             ("read1", FAST, p_read1),
-            ("readinto", O, p_readinto),
-            ("readinto1", O, p_readinto1),
-            ("readline", FAST, p_readline),
-            ("write", O, p_write),
+            ("readinto", O, p_readinto, "readinto(buffer)\n\nRead into a buffer from the reader side."),
+            ("readinto1", O, p_readinto1, "readinto1(buffer)\n\nRead into a buffer from the reader side, with at most one raw read."),
+            ("readline", FAST, p_readline, "readline($self, size=-1, /)\n--\n\nRead one line from the reader side."),
+            ("write", O, p_write, "write(buffer)\n\nWrite through the writer side."),
             ("flush", NOARGS, p_flush),
             ("readable", NOARGS, p_readable),
             ("writable", NOARGS, p_writable),

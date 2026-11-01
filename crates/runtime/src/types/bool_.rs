@@ -116,7 +116,7 @@ pub fn init_types() {
         n.nb_invert = Some(bool_invert);
         n.nb_bool = Some(bool_nb_bool);
         t.tp_as_number = n;
-        t.tp_doc = c"Returns True when the argument is true, False otherwise.\nThe builtins True and False are the only two instances of the class bool.\nThe class bool is a subclass of the class int, and cannot be subclassed.".as_ptr();
+        t.tp_doc = c"bool(object=False, /)\n--\n\nConvert a value to True or False using its truth value.\nTrue and False are the only instances of bool, a subclass of int that\ncannot itself be subclassed.".as_ptr();
         for (o, v) in [(&raw mut _Py_FalseStruct, 0u32), (&raw mut _Py_TrueStruct, 1u32)] {
             let p = o as *mut PyObject;
             (*p).ob_type.store(bool_type(), std::sync::atomic::Ordering::Relaxed);

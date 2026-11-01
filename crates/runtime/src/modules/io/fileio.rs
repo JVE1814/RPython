@@ -674,13 +674,13 @@ pub fn init_types() -> PyResult<()> {
         t.tp_clear = Some(fileio_clear);
         t.tp_repr = Some(fileio_repr);
         t.tp_methods = crate::mdefs![
-            ("read", FAST, fio_read),
+            ("read", FAST, fio_read, "read($self, size=-1, /)\n--\n\nRead at most size bytes with one system call; -1 reads to EOF."),
             ("readall", NOARGS, fio_readall),
             ("readinto", O, fio_readinto),
             ("write", O, fio_write),
-            ("seek", FAST, fio_seek),
+            ("seek", FAST, fio_seek, "seek($self, pos, whence=0, /)\n--\n\nMove to a new file position and return it."),
             ("tell", NOARGS, fio_tell),
-            ("truncate", FAST, fio_truncate),
+            ("truncate", FAST, fio_truncate, "truncate($self, size=None, /)\n--\n\nResize the file to size bytes (default: the current position)."),
             ("close", NOARGS, fio_close),
             ("seekable", NOARGS, fio_seekable),
             ("readable", NOARGS, fio_readable),

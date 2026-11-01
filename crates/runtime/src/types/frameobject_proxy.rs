@@ -422,6 +422,7 @@ pub fn init_types() {
     unsafe {
         let t = &mut *proxy_type();
         t.tp_name = c"FrameLocalsProxy".as_ptr();
+        t.tp_doc = c"FrameLocalsProxy(frame)\n--\n\nWrite-through mapping view of the local variables of a frame.".as_ptr();
         t.tp_basicsize = std::mem::size_of::<ProxyObject>() as isize;
         t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC | Py_TPFLAGS_MAPPING;
         t.tp_dealloc = Some(proxy_dealloc);

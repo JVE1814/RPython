@@ -237,9 +237,9 @@ pub fn setup_asyncgen_type(tp: *mut PyTypeObject) {
         (*(&raw mut AG_ASYNC)).am_anext = Some(agen_anext);
         t.tp_as_async = &raw mut AG_ASYNC;
         t.tp_methods = crate::mdefs![
-            ("asend", O, agen_asend, "asend(v) -> send 'v' in generator."),
+            ("asend", O, agen_asend, "asend($self, value, /)\n--\n\nSend a value into the asynchronous generator; return an awaitable."),
             ("athrow", FAST, agen_athrow, "athrow(value)\nathrow(type[,value[,tb]])\n\nraise exception in generator.\nthe (type, val, tb) signature is deprecated, \nand may be removed in a future version of Python."),
-            ("aclose", NOARGS, agen_aclose, "aclose() -> raise GeneratorExit inside generator."),
+            ("aclose", NOARGS, agen_aclose, "aclose($self, /)\n--\n\nReturn an awaitable that raises GeneratorExit inside the generator."),
             ("__sizeof__", NOARGS, ag_sizeof),
             ("__class_getitem__", O, class_getitem, "See PEP 585"; METH_CLASS),
         ];
@@ -617,10 +617,10 @@ pub fn compute_cr_origin() -> Option<PyRef> {
 /// Add the asyncgen / coroutine-origin functions to the sys module dict.
 pub fn populate_sys(d: &PyObject, sysm: &PyObject) -> PyResult<()> {
     let m = crate::mdefs![
-        ("get_asyncgen_hooks", NOARGS, sys_get_asyncgen_hooks, "Return the installed asynchronous generators hooks.\n\nThis returns a namedtuple of the form (firstiter, finalizer)."),
+        ("get_asyncgen_hooks", NOARGS, sys_get_asyncgen_hooks, "get_asyncgen_hooks($module, /)\n--\n\nReturn the installed async generator hooks as (firstiter, finalizer)."),
         ("set_asyncgen_hooks", FASTKW, sys_set_asyncgen_hooks, "set_asyncgen_hooks([firstiter] [, finalizer])\n\nSet a finalizer for async generators objects."),
-        ("set_coroutine_origin_tracking_depth", FASTKW, sys_set_coro_depth, "Enable or disable origin tracking for coroutine objects in this thread."),
-        ("get_coroutine_origin_tracking_depth", NOARGS, sys_get_coro_depth, "Check status of origin tracking for coroutine objects in this thread."),
+        ("set_coroutine_origin_tracking_depth", FASTKW, sys_set_coro_depth, "set_coroutine_origin_tracking_depth($module, /, depth)\n--\n\nRecord this many frames of creation context for new coroutines\n(0 disables the tracking)."),
+        ("get_coroutine_origin_tracking_depth", NOARGS, sys_get_coro_depth, "get_coroutine_origin_tracking_depth($module, /)\n--\n\nReturn the depth set by set_coroutine_origin_tracking_depth()."),
     ];
     crate::builtins::add_methods_to_dict(d, m, Some(sysm))
 }

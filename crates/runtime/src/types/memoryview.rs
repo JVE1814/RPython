@@ -2045,7 +2045,7 @@ pub fn init_types() {
         t.tp_methods = crate::mdefs![
             ("release", NOARGS, m_release, "release($self, /)\n--\n\nRelease the underlying buffer exposed by the memoryview object."),
             ("tobytes", FASTKW, m_tobytes, "tobytes($self, /, order='C')\n--\n\nReturn the data in the buffer as a byte string."),
-            ("hex", FASTKW, m_hex, "hex($self, /, sep=<unrepresentable>, bytes_per_sep=1)\n--\n\nReturn the data in the buffer as a str of hexadecimal numbers."),
+            ("hex", FASTKW, m_hex, "hex($self, /, sep=<unrepresentable>, bytes_per_sep=1)\n--\n\nReturn the viewed bytes as a string of two hexadecimal digits per byte.\n\nsep and bytes_per_sep group the output as in bytes.hex().\n\n>>> view = memoryview(b'\\xab\\xcd\\xef')\n>>> view.hex()\n'abcdef'\n>>> view.hex(':')\n'ab:cd:ef'\n>>> view.hex(':', 2)\n'ab:cdef'\n>>> view.hex(':', -2)\n'abcd:ef'"),
             ("tolist", NOARGS, m_tolist, "tolist($self, /)\n--\n\nReturn the data in the buffer as a list of elements."),
             ("cast", FASTKW, m_cast, "cast($self, /, format, shape=<unrepresentable>)\n--\n\nCast a memoryview to a new format or shape."),
             ("toreadonly", NOARGS, m_toreadonly, "toreadonly($self, /)\n--\n\nReturn a readonly version of the memoryview."),

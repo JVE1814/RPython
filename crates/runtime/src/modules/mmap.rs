@@ -820,16 +820,16 @@ fn init_types() -> PyResult<()> {
         (*t).tp_doc = c"mmap(fileno, length, flags=MAP_SHARED, prot=PROT_WRITE|PROT_READ,\n     access=ACCESS_DEFAULT, offset=0, *, trackfd=True)\n\nMemory-map length bytes of the file open as fileno, starting at offset\n(a multiple of ALLOCATIONGRANULARITY). A length of 0 maps the rest of the\nfile. fileno -1 creates an anonymous mapping. Use either access\n(ACCESS_READ, ACCESS_WRITE, ACCESS_COPY) or flags and prot. The object\nsupports slicing, file-like reading and writing and the buffer protocol.".as_ptr();
         (*t).tp_methods = mdefs![
             ("close", NOARGS, m_close),
-            ("find", FAST, m_find),
-            ("rfind", FAST, m_rfind),
-            ("flush", FASTKW, m_flush),
-            ("madvise", FAST, m_madvise),
-            ("move", FAST, m_move),
-            ("read", FAST, m_read),
+            ("find", FAST, m_find, "find($self, sub, start=None, end=None, /)\n--\n\nReturn the lowest index where sub is found in [start:end], or -1."),
+            ("rfind", FAST, m_rfind, "rfind($self, sub, start=None, end=None, /)\n--\n\nReturn the highest index where sub is found in [start:end], or -1."),
+            ("flush", FASTKW, m_flush, "flush($self, offset=0, size=None, /)\n--\n\nWrite changes in the given range back to the file."),
+            ("madvise", FAST, m_madvise, "madvise($self, option, start=0, length=None, /)\n--\n\nGive the kernel advice about the use of a memory range."),
+            ("move", FAST, m_move, "move($self, dest, src, count, /)\n--\n\nCopy count bytes from offset src to offset dest."),
+            ("read", FAST, m_read, "read($self, n=None, /)\n--\n\nRead up to n bytes from the current position (all remaining if None)."),
             ("read_byte", NOARGS, m_read_byte),
             ("readline", NOARGS, m_readline),
-            ("resize", FAST, m_resize),
-            ("seek", FAST, m_seek),
+            ("resize", FAST, m_resize, "resize($self, newsize, /)\n--\n\nChange the size of the mapping (and of the underlying file)."),
+            ("seek", FAST, m_seek, "seek($self, pos, whence=0, /)\n--\n\nChange the current position."),
             ("seekable", NOARGS, m_seekable),
             ("set_name", O, m_set_name),
             ("size", NOARGS, m_size),
@@ -837,7 +837,7 @@ fn init_types() -> PyResult<()> {
             ("write", O, m_write),
             ("write_byte", O, m_write_byte),
             ("__enter__", NOARGS, m_enter),
-            ("__exit__", FAST, m_exit),
+            ("__exit__", FAST, m_exit, "__exit__($self, /, *args)\n--\n\nClose the mapping when leaving a with block."),
             ("__sizeof__", NOARGS, m_sizeof),
         ];
         (*t).tp_getset = crate::getset_table![("closed", m_closed)];
