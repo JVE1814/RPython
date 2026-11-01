@@ -14,3 +14,5 @@ mod ops;
 mod transc;
 #[path = "dectest.rs"]
 mod dectest;
+#[path = "format.rs"]
+mod format;
