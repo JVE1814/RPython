@@ -14,6 +14,9 @@ pub const BASE: u32 = 1 << SHIFT;
 /// Mask for one digit.
 pub const MASK: u32 = BASE - 1;
 
+/// Minimum length for the SIMD kernels.
+pub const KERN_MIN: usize = 12;
+
 /// Strip high zero digits.
 #[inline]
 pub fn trim(a: &[u32]) -> &[u32] {
@@ -184,8 +187,20 @@ pub fn low_u64(a: &[u32]) -> u64 {
 #[inline]
 pub fn add_to(out: &mut [u32], a: &[u32], b: &[u32]) -> u32 {
     debug_assert!(a.len() >= b.len() && out.len() >= a.len());
-    let mut carry = 0u32;
     let n = b.len();
+    if n >= KERN_MIN {
+        let mut carry = crate::kern::add_n(out, &a[..n], b);
+        let mut i = n;
+        while carry != 0 && i < a.len() {
+            let s = a[i] + carry;
+            out[i] = s & MASK;
+            carry = s >> SHIFT;
+            i += 1;
+        }
+        out[i..a.len()].copy_from_slice(&a[i..]);
+        return carry;
+    }
+    let mut carry = 0u32;
     for i in 0..n {
         let s = a[i] + b[i] + carry;
         out[i] = s & MASK;
@@ -238,8 +253,20 @@ pub fn add_digit_assign(acc: &mut [u32], d: u32) -> u32 {
 #[inline]
 pub fn sub_to(out: &mut [u32], a: &[u32], b: &[u32]) -> u32 {
     debug_assert!(a.len() >= b.len() && out.len() >= a.len());
-    let mut borrow = 0u32;
     let n = b.len();
+    if n >= KERN_MIN {
+        let mut borrow = crate::kern::sub_n(out, &a[..n], b);
+        let mut i = n;
+        while borrow != 0 && i < a.len() {
+            let d = a[i].wrapping_sub(borrow);
+            out[i] = d & MASK;
+            borrow = d >> 31;
+            i += 1;
+        }
+        out[i..a.len()].copy_from_slice(&a[i..]);
+        return borrow;
+    }
+    let mut borrow = 0u32;
     for i in 0..n {
         let d = a[i].wrapping_sub(b[i]).wrapping_sub(borrow);
         out[i] = d & MASK;
@@ -379,6 +406,9 @@ pub fn rsub_in_place(v: &mut Vec<u32>, b: &[u32]) {
 /// general < 2^34). `d` may be up to 2^32-1.
 #[inline]
 pub fn mul_digit_to(out: &mut [u32], a: &[u32], d: u32, carry_in: u64) -> u64 {
+    if carry_in == 0 && d <= MASK && a.len() >= KERN_MIN {
+        return crate::kern::mul1(out, a, d);
+    }
     let mut carry = carry_in;
     let d = d as u64;
     for i in 0..a.len() {
@@ -392,28 +422,35 @@ pub fn mul_digit_to(out: &mut [u32], a: &[u32], d: u32, carry_in: u64) -> u64 {
 /// `acc[..a.len()] += a * d`; returns the carry to add at `acc[a.len()]` (< 2^31 for d < 2^30).
 #[inline]
 pub fn mul_digit_add(acc: &mut [u32], a: &[u32], d: u32) -> u32 {
-    let mut carry = 0u64;
+    debug_assert!(d <= MASK);
     let d = d as u64;
-    for i in 0..a.len() {
-        let t = acc[i] as u64 + a[i] as u64 * d + carry;
-        acc[i] = (t as u32) & MASK;
+    let mut carry: u32 = 0;
+    let mut hi_prev: u32 = 0;
+    for (x, &y) in acc.iter_mut().zip(a.iter()) {
+        let p = y as u64 * d;
+        let t = *x + ((p as u32) & MASK) + hi_prev + carry;
+        *x = t & MASK;
         carry = t >> SHIFT;
+        hi_prev = (p >> SHIFT) as u32;
     }
-    carry as u32
+    hi_prev + carry
 }
 
 /// `acc[..a.len()] -= a * d`; returns the amount to subtract at `acc[a.len()]`.
 #[inline]
 pub fn mul_digit_sub(acc: &mut [u32], a: &[u32], d: u32) -> u32 {
-    // Signed accumulation: t in (-2^61, 2^31)
-    let mut carry: i64 = 0;
-    let d = d as i64;
-    for i in 0..a.len() {
-        let t = acc[i] as i64 - a[i] as i64 * d + carry;
-        acc[i] = (t as u32) & MASK;
-        carry = t >> SHIFT; // arithmetic shift: floor
+    debug_assert!(d <= BASE);
+    let d = d as u64;
+    let mut borrow: i64 = 0;
+    let mut hi_prev: i64 = 0;
+    for (x, &y) in acc.iter_mut().zip(a.iter()) {
+        let p = y as u64 * d;
+        let t = *x as i64 - (p & MASK as u64) as i64 - hi_prev - borrow;
+        *x = (t as u32) & MASK;
+        borrow = -(t >> SHIFT);
+        hi_prev = (p >> SHIFT) as i64;
     }
-    (-carry) as u32
+    (hi_prev + borrow) as u32
 }
 
 /// `a * d` for a u32 multiplier.
@@ -511,13 +548,17 @@ pub fn shl_bits_to(out: &mut [u32], a: &[u32], bits: u32) -> u32 {
         out[..a.len()].copy_from_slice(a);
         return 0;
     }
-    let mut carry = 0u32;
-    for i in 0..a.len() {
-        let x = a[i];
-        out[i] = ((x << bits) & MASK) | carry;
-        carry = x >> (SHIFT - bits);
+    let n = a.len();
+    if n == 0 {
+        return 0;
     }
-    carry
+    let out = &mut out[..n];
+    out[0] = (a[0] << bits) & MASK;
+    let rb = SHIFT - bits;
+    for ((o, &x1), &x0) in out[1..].iter_mut().zip(&a[1..]).zip(&a[..n - 1]) {
+        *o = ((x1 << bits) & MASK) | (x0 >> rb);
+    }
+    a[n - 1] >> rb
 }
 
 /// `out[..a.len()] = a >> bits` for `bits < 30`, with `hi` supplying bits from above.
@@ -529,14 +570,18 @@ pub fn shr_bits_to(out: &mut [u32], a: &[u32], bits: u32) -> u32 {
         out[..a.len()].copy_from_slice(a);
         return 0;
     }
-    let mut carry = 0u32;
-    let mask = (1u32 << bits) - 1;
-    for i in (0..a.len()).rev() {
-        let x = a[i];
-        out[i] = (x >> bits) | (carry << (SHIFT - bits));
-        carry = x & mask;
+    let n = a.len();
+    if n == 0 {
+        return 0;
     }
-    carry
+    let out = &mut out[..n];
+    let mask = (1u32 << bits) - 1;
+    let lb = SHIFT - bits;
+    for ((o, &x0), &x1) in out[..n - 1].iter_mut().zip(&a[..n - 1]).zip(&a[1..]) {
+        *o = (x0 >> bits) | ((x1 & mask) << lb);
+    }
+    out[n - 1] = a[n - 1] >> bits;
+    a[0] & mask
 }
 
 /// `a << n` (normalized).

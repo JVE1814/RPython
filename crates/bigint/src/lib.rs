@@ -21,6 +21,7 @@ pub mod math;
 pub mod modpow;
 pub mod mul;
 pub mod nat;
+mod kern;
 mod ntt;
 pub mod ops;
 pub mod radix;

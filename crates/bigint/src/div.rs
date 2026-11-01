@@ -75,6 +75,11 @@ pub fn divrem(a: &[u32], b: &[u32]) -> (Vec<u32>, Vec<u32>) {
         let (q, r) = nat::divrem_u32(a, b[0]);
         return (q, if r == 0 { Vec::new() } else { vec![r] });
     }
+    if b.len() >= 3 && a.len() <= b.len() + 1 {
+        if let Some(res) = divrem_small_quotient(a, b) {
+            return res;
+        }
+    }
     let qlen = a.len() - b.len() + 1;
     if b.len() >= NEWTON_THRESHOLD && qlen >= NEWTON_THRESHOLD {
         return divrem_large(a, b);
@@ -86,6 +91,36 @@ pub fn divrem(a: &[u32], b: &[u32]) -> (Vec<u32>, Vec<u32>) {
     let r = knuth_divrem(&mut q, a, b);
     nat::normalize(&mut q);
     (q, r)
+}
+
+/// Division with a quotient below 2^30 (`a.len() <= b.len() + 1`, `b.len() >= 3`, `a >= b`):
+/// estimate the quotient from the top bits, then one fused multiply-subtract pass and rare
+/// corrections. Returns None if the quotient estimate does not fit one digit.
+pub fn divrem_small_quotient(a: &[u32], b: &[u32]) -> Option<(Vec<u32>, Vec<u32>)> {
+    let n = b.len();
+    let lb = nat::bit_length(b);
+    let shift = lb.saturating_sub(64);
+    let bt = nat::extract_bits(b, shift, 64) as u128;
+    let at = (nat::extract_bits(a, shift + 64, 64) as u128) << 64 | nat::extract_bits(a, shift, 64) as u128;
+    let qe = at / bt;
+    if qe > (MASK as u128) - 4 {
+        return None;
+    }
+    let mut q = qe as u32;
+    let mut r = vec![0u32; n];
+    let amount = crate::kern::submul1(&mut r, &a[..n], b, q);
+    let mut top: i64 = if a.len() > n { a[n] as i64 } else { 0 } - amount as i64;
+    while top < 0 {
+        top += nat::add_assign(&mut r, b) as i64;
+        q -= 1;
+    }
+    while top > 0 || nat::cmp_same_len(&r, b) != Ordering::Less {
+        top -= nat::sub_assign(&mut r, b) as i64;
+        q += 1;
+    }
+    nat::normalize(&mut r);
+    let qv = if q == 0 { Vec::new() } else { vec![q] };
+    Some((qv, r))
 }
 
 /// Division where the quotient is much shorter than the divisor: estimate the quotient from
