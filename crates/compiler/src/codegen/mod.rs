@@ -1002,7 +1002,7 @@ impl<'a> Compiler<'a> {
                 self.emit_name(Op::StoreName, "__conditional_annotations__");
             }
         }
-        if docstring_allowed && !self.interactive {
+        if docstring_allowed && !(self.interactive && is_module) {
             if let Some(doc) = get_docstring(body) {
                 start = 1;
                 if self.optimize < 2 {

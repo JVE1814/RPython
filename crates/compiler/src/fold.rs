@@ -572,8 +572,22 @@ impl<'w> Folder<'w> {
     }
 
     fn fold_body(&mut self, body: &mut [Stmt]) -> R {
+        // A leading expression that only *folds* to a string (`"a" + "b"`) must not
+        // become a docstring: keep it unfolded.
+        let lead_was_str = match body.first().map(|s| &s.node) {
+            Some(StmtKind::Expr { value }) => matches!(value.node, ExprKind::Constant { value: Constant::Str(_), .. }),
+            _ => true,
+        };
+        let original = if lead_was_str { None } else { body.first().cloned() };
         for s in body.iter_mut() {
             self.fold_stmt(s)?;
+        }
+        if let (Some(orig), Some(first)) = (original, body.first_mut()) {
+            if let StmtKind::Expr { value } = &first.node {
+                if matches!(value.node, ExprKind::Constant { value: Constant::Str(_), .. }) {
+                    *first = orig;
+                }
+            }
         }
         Ok(())
     }

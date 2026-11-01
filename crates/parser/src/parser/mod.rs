@@ -696,7 +696,13 @@ impl<'a> Parser<'a> {
         let mark = self.p;
         if let Some(s) = self.compound_stmt()? {
             // CPython's parser turns the ENDMARKER into the NEWLINE that ends the statement
-            if self.eat(TokenType::NEWLINE).is_some() || self.at(TokenType::ENDMARKER) {
+            // ... but only once: a one-line compound statement that ends at a mid-line EOF
+            // (its NEWLINE is the implied, empty one) has no NEWLINE left for the rule.
+            let ends_ok = self.at(TokenType::ENDMARKER) && {
+                let prev = self.toks[self.p.max(1) - 1];
+                prev.ty == TokenType::DEDENT || (prev.ty == TokenType::NEWLINE && prev.end > prev.start)
+            };
+            if self.eat(TokenType::NEWLINE).is_some() || ends_ok {
                 return Ok(Some(Mod::Interactive { body: vec![s] }));
             }
             return Ok(None);

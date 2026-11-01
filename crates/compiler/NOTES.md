@@ -287,3 +287,14 @@ parsing) takes ~3 s in release mode.
 * No constant folding of subscripts or slices (there is no slice constant in the contract).
 * Exact `co_consts` layouts checked by CPython-only tests (e.g. test_folding_type_param) are
   not reproduced.
+
+## Changes by the ast workstream (current owner)
+
+* `validate_ast` is the full `_PyAST_Validate` (contexts, structure, patterns, identifiers,
+  positions); see validate.rs.
+* `__annotate__` and lazily evaluated type-param/alias functions get `__defaults__ == (1,)`
+  (signature `(format=1, /)`).
+* Annotations of a generic method defined in a class can see the class namespace
+  (`can_see_class_scope` propagates from the type-parameter block).
+* A leading expression statement that only folds to a string is not a docstring.
+* Class docstrings are kept in 'single' (interactive) mode.
