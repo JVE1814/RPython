@@ -95,7 +95,7 @@ pub unsafe fn setup_ptr_type(tp: *mut PyTypeObject, name: &str, size: usize, fla
         let t = &mut *tp;
         t.tp_name = crate::methods::cstr_static(name);
         t.tp_basicsize = size as isize;
-        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC | flags;
+        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC | Py_TPFLAGS_IMMUTABLETYPE | flags;
         t.tp_dealloc = Some(ptrs_dealloc);
         t.tp_traverse = Some(ptrs_traverse);
         t.tp_clear = Some(ptrs_clear);
@@ -104,6 +104,16 @@ pub unsafe fn setup_ptr_type(tp: *mut PyTypeObject, name: &str, size: usize, fla
         t.tp_alloc = Some(generic_alloc);
         t.tp_free = Some(generic_free);
     }
+}
+
+/// type_ready, marking types without tp_new as not instantiable from Python.
+pub fn ready_type(tp: *mut PyTypeObject) -> PyResult<()> {
+    unsafe {
+        if (*tp).tp_new.is_none() {
+            (*tp).tp_flags |= Py_TPFLAGS_DISALLOW_INSTANTIATION;
+        }
+    }
+    type_ready(tp)
 }
 
 /// Allocate an instance of `tp` (via tp_alloc).

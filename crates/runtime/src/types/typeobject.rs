@@ -602,6 +602,9 @@ pub fn type_ready(tp: *mut PyTypeObject) -> PyResult<()> {
         for b in tuple::tuple_items(&*mro).iter().skip(1) {
             inherit_slots(tp, as_type(b));
         }
+        if (*tp).tp_flags & Py_TPFLAGS_DISALLOW_INSTANTIATION != 0 {
+            (*tp).tp_new = None;
+        }
         // __hash__ = None if __eq__ overridden without __hash__
         let d = &*(*tp).tp_dict;
         if dict::get_item_str(d, name!("__hash__")).is_none() {

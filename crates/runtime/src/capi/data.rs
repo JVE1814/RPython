@@ -36,20 +36,7 @@ macro_rules! placeholder_types {
     };
 }
 placeholder_types!(
-    (PyContextToken_Type, "_contextvars.Token"),
-    (PyContextVar_Type, "_contextvars.ContextVar"),
-    (PyContext_Type, "_contextvars.Context"),
-    (PyDictIterItem_Type, "dict_itemiterator"),
-    (PyDictIterKey_Type, "dict_keyiterator"),
-    (PyDictIterValue_Type, "dict_valueiterator"),
-    (PyDictProxy_Type, "mappingproxy"),
-    (PyDictRevIterItem_Type, "dict_reverseitemiterator"),
-    (PyDictRevIterKey_Type, "dict_reversekeyiterator"),
-    (PyDictRevIterValue_Type, "dict_reversevalueiterator"),
-    (PyFrozenDict_Type, "frozendict"),
     (PyInstanceMethod_Type, "instancemethod"),
-    (PyListRevIter_Type, "list_reverseiterator"),
-    (PyLongRangeIter_Type, "longrange_iterator"),
     (PyODictItems_Type, "odict_items"),
     (PyODictIter_Type, "odict_iterator"),
     (PyODictKeys_Type, "odict_keys"),
@@ -57,11 +44,7 @@ placeholder_types!(
     (PyODict_Type, "collections.OrderedDict"),
     (PyPickleBuffer_Type, "pickle.PickleBuffer"),
     (PySentinel_Type, "sentinel"),
-    (PySetIter_Type, "set_iterator"),
     (PyStdPrinter_Type, "stderrprinter"),
-    (_PyWeakref_CallableProxyType, "weakref.CallableProxyType"),
-    (_PyWeakref_ProxyType, "weakref.ProxyType"),
-    (_PyWeakref_RefType, "weakref.ReferenceType"),
 );
 
 /// Called before the first extension module is loaded.

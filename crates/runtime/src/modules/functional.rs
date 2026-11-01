@@ -10,4 +10,6 @@ pub fn register() {
     register_builtin("_types", super::_types::init_module);
     register_builtin("_heapq", super::_heapq::init_module);
     register_builtin("_bisect", super::_bisect::init_module);
+    register_builtin("atexit", super::atexit::init_module);
+    register_builtin("_contextvars", super::_contextvars::init_module);
 }

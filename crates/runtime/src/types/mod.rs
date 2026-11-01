@@ -1,4 +1,3 @@
-pub mod bootstrap_builtins;
 pub mod complex_pow;
 pub mod namespace;
 pub mod genericalias;
@@ -79,7 +78,7 @@ pub fn builtin_types() -> Vec<(&'static str, *mut PyTypeObject)> {
         ("super", super_::super_type()),
     ]
     .into_iter()
-    .chain(bootstrap_builtins::types())
+    .chain(containers_reg::builtin_types())
     .collect()
 }
 
@@ -104,10 +103,8 @@ pub fn init_all() -> crate::errors::PyResult<()> {
     frameobject::init_types();
     traceback::init_types();
     genobject::init_types();
-    iterobject::init_types();
     super_::init_types();
-    dictview::init_types();
-    bootstrap_builtins::init_types();
+    containers_reg::init_types();
     frameobject_proxy::init_types();
     use typeobject::type_ready;
     type_ready(typeobject::object_type())?;
@@ -155,8 +152,7 @@ pub fn init_all() -> crate::errors::PyResult<()> {
         type_ready(t)?;
     }
     exceptions::ready_all()?;
-    dictview::ready()?;
-    bootstrap_builtins::ready()?;
+    containers_reg::ready()?;
     type_ready(frameobject_proxy::proxy_type())?;
     bytes_methods::ready()?;
     bytearray::ready()?;
@@ -178,3 +174,9 @@ fn lang_init() -> crate::errors::PyResult<()> {
     genericalias::register_builtin_class_getitems();
     Ok(())
 }
+pub mod containers_reg;
+pub mod range;
+pub mod enumerate;
+pub mod builtin_iters;
+pub mod property;
+pub mod frozendict;
