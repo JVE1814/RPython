@@ -25,7 +25,7 @@ pub struct ParseOptions {
     decode: Option<tokenizer::DecodeHook> /*codec fallback for parse_bytes*/,
 }
 
-pub struct SyntaxError { kind: ErrorKind /*Syntax|Indentation|Tab|IncompleteInput*/, msg,
+pub struct SyntaxError { kind: ErrorKind /*Syntax|Indentation|Tab|IncompleteInput|MemoryError|RecursionError*/, msg,
     lineno, col_offset /*0-based UTF-8 byte*/, end_lineno: Option, end_col_offset: Option,
     offset /*1-based chars = SyntaxError.offset*/, end_offset: Option, text: Option<String> }
 pub struct Warning { category /*SyntaxWarning|DeprecationWarning*/, msg,
@@ -170,6 +170,12 @@ duplicate keys), "'elif' ..." is parser-level (done). Also "invalid syntax. Did 
   positional-only parameters (8), match (10), except* (11), type parameters/`type` (12).
   Other version-dependent behaviour (e.g. PEP 701 f-string rules for < 3.12) is not emulated.
 * The tokenize-module stream is produced from the full source (no incremental readline).
-* Recursion: nesting is limited by `MAX_DEPTH` (3000 parser levels) and 200 brackets in the
-  tokenizer; deeply nested non-bracket expressions report "too many nested parentheses".
+* Recursion/stack safety: the recursive descent is bounded by a stack budget
+  (`ParseOptions.max_stack_bytes`, default 1 MiB, checked against the real stack pointer) and
+  6000 levels, raising `ErrorKind::MemoryError` "Parser stack overflowed - Python source too
+  complex to parse" (CPython: MemoryError). Constructs parsed iteratively but producing deep
+  ASTs (trailer chains `a()()()...`, binary-operator chains, `elif` chains) are limited to 5000
+  and raise `ErrorKind::RecursionError` "maximum recursion depth exceeded during compilation"
+  (CPython raises RecursionError for these in ast2obj/the compiler). Brackets: 200 (tokenizer).
+  Consumers must still guard their own recursion over the AST.
 * Encodings beyond the native list need `ParseOptions.decode`.
