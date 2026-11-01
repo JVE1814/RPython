@@ -25,6 +25,19 @@
 - Lib/compression/ package: `_common/_streams.py` (BaseStream, DecompressReader,
   BUFFER_SIZE), re-export modules gzip/zlib/bz2/lzma; `Lib/_compression.py` alias kept.
 
+## Status (spec tests, run with local stubs for missing array/py_compile/unittest.mock)
+- test_zlib 88 run, 1 failure (descr.rs tp_new_wrapper, see below)
+- test_gzip: all pass except test_fileobj_mode (io mode) and test_issue44439 (array stub)
+- test_bz2 102 run, only test_issue44439 (array stub) fails
+- test_hmac: only the 2 check_disallow_instantiation failures (descr.rs)
+- test_base64, test_binascii, test_secrets: pass
+- test_hashlib needs http.client; test_zipfile needs pathlib (not in master yet) — untested
+  beyond manual scripts.
+
+## Not done yet
+- _lzma / lzma.py (LZMA/LZMA2/XZ codec), _zstd / compression.zstd, tarfile, zipimport,
+  uuid.  zipfile: ZIP_LZMA/ZIP_ZSTANDARD members need those modules.
+
 ## Issues found in other areas (not fixed here)
 - `types/descr.rs` tp_new_wrapper: for types with tp_new == NULL (DISALLOW_INSTANTIATION),
   `T.__new__(T)` must raise "cannot create 'mod.T' instances" before the "is not safe" check
