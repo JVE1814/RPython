@@ -693,8 +693,9 @@ _QUOTED_PARAM_WARNING = 'Basic Auth Realm was unquoted'
 
 
 def _parse_challenges(header):
-    """Yield (scheme, params) for the challenges in an authentication
+    """Return [(scheme, params)] for the challenges in an authentication
     header value (several challenges may share one header)."""
+    challenges = []
     current = None
     for item in parse_http_list(header):
         word, space, rest = item.partition(' ')
@@ -702,7 +703,7 @@ def _parse_challenges(header):
             # a new challenge: "<scheme> [param or token]"
             current = (word, {})
             rest = rest.strip()
-            yield current
+            challenges.append(current)
             item = rest
             if not item:
                 continue
@@ -711,6 +712,7 @@ def _parse_challenges(header):
         name, eq, value = item.partition('=')
         if eq:
             current[1][name.strip().lower()] = value.strip()
+    return challenges
 
 
 class AbstractBasicAuthHandler:
@@ -1221,8 +1223,8 @@ class FTPHandler(BaseHandler):
         else:
             passwd = None
         host = unquote(host)
-        user = unquote(user or '')
-        passwd = unquote(passwd or '')
+        user = user or ""
+        passwd = passwd or ""
 
         try:
             host = socket.gethostbyname(host)
