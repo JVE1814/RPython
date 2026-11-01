@@ -1410,8 +1410,8 @@ impl<'a> Compiler<'a> {
                 ast::TypeParamKind::ParamSpec { name, .. } => (name, Intrinsic1::ParamSpec),
                 ast::TypeParamKind::TypeVarTuple { name, .. } => (name, Intrinsic1::TypeVarTuple),
             };
-            let m = self.mangle(name);
-            self.load_const(str_const(&m));
+            // the TypeVar keeps its source name (only the binding is mangled)
+            self.load_const(str_const(name));
             let mut done = false;
             if let ast::TypeParamKind::TypeVar { bound: Some(b), .. } = &tp.node {
                 let constraints = matches!(b.node, ExprKind::Tuple { .. });

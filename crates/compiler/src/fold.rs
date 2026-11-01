@@ -69,7 +69,8 @@ fn strip_docstring(body: &mut Vec<Stmt>) {
     if let Some(first) = body.first() {
         if let StmtKind::Expr { value } = &first.node {
             if let ExprKind::Constant { value: Constant::Str(_), .. } = value.node {
-                let loc = first.loc;
+                let l = first.loc;
+                let loc = Loc::new(l.lineno, l.col_offset, l.lineno, l.col_offset + 4);
                 if body.len() == 1 {
                     body[0] = Stmt::new(StmtKind::Pass, loc);
                 } else {
@@ -81,7 +82,34 @@ fn strip_docstring(body: &mut Vec<Stmt>) {
 }
 
 fn strip_docstrings_stmt(s: &mut Stmt) {
+    let nested = |b: &mut Vec<Stmt>| {
+        for x in b.iter_mut() {
+            strip_docstrings_stmt(x);
+        }
+    };
     match &mut s.node {
+        StmtKind::For(f) | StmtKind::AsyncFor(f) => {
+            nested(&mut f.body);
+            nested(&mut f.orelse);
+        }
+        StmtKind::While { body, orelse, .. } | StmtKind::If { body, orelse, .. } => {
+            nested(body);
+            nested(orelse);
+        }
+        StmtKind::With(w) | StmtKind::AsyncWith(w) => nested(&mut w.body),
+        StmtKind::Try(t) | StmtKind::TryStar(t) => {
+            nested(&mut t.body);
+            for h in t.handlers.iter_mut() {
+                nested(&mut h.body);
+            }
+            nested(&mut t.orelse);
+            nested(&mut t.finalbody);
+        }
+        StmtKind::Match { cases, .. } => {
+            for c in cases.iter_mut() {
+                nested(&mut c.body);
+            }
+        }
         StmtKind::FunctionDef(f) | StmtKind::AsyncFunctionDef(f) => {
             strip_docstring(&mut f.body);
             for x in f.body.iter_mut() {

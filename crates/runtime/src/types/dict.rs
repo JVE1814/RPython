@@ -102,14 +102,12 @@ pub struct DictTable {
     pub version: u64,
 }
 
-static DICT_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-/// A fresh, globally unique dict version stamp. Every mutation of a dict
-/// (insert, delete, value replacement, clear, resize) gives it a new stamp,
-/// so caches may key on `version(d)` alone.
+/// A fresh, globally unique dict version stamp (the JIT's allocator). Every
+/// mutation of a dict (insert, delete, value replacement, clear, resize) gives it
+/// a new stamp, so caches may key on `version(d)` alone.
 #[inline]
 pub fn next_version() -> u64 {
-    DICT_VERSION.fetch_add(1, Relaxed) + 1
+    crate::interp::cache::next_dict_version()
 }
 
 #[inline]

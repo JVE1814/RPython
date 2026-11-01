@@ -83,9 +83,7 @@ impl<'a> Parser<'a> {
                 self.p = start;
                 return Ok(None);
             }
-            self.enter()?;
-            let r = self.star_target();
-            self.leave();
+            let r = self.recurse(|p| p.star_target());
             return match r? {
                 Some(inner) => Ok(Some(Expr::new(ExprKind::Starred { value: bx(inner), ctx: ExprContext::Store }, self.loc(start)))),
                 None => {

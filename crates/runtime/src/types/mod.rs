@@ -1,11 +1,13 @@
+pub mod complex_pow;
+pub mod namespace;
 pub mod genericalias;
 pub mod lang_util;
 pub mod structseq;
-pub mod complex_pow;
 pub mod asyncgen;
 pub mod bool_;
 pub mod bytearray;
 pub mod bytes;
+pub mod bytes_methods;
 pub mod cfunction;
 pub mod code;
 pub mod complex;
@@ -64,6 +66,7 @@ pub fn builtin_types() -> Vec<(&'static str, *mut PyTypeObject)> {
         ("str", str::str_type()),
         ("bytes", bytes::bytes_type()),
         ("bytearray", bytearray::bytearray_type()),
+        ("memoryview", memoryview::memoryview_type()),
         ("tuple", tuple::tuple_type()),
         ("list", list::list_type()),
         ("dict", dict::dict_type()),
@@ -91,6 +94,9 @@ pub fn init_all() -> crate::errors::PyResult<()> {
     float_methods::init_types();
     complex_methods::init_types();
     core_slots::init_types();
+    bytes_methods::init_types();
+    bytearray::init_types();
+    memoryview::init_types();
     exceptions::init_types();
     code::init_types();
     module::init_types();
@@ -148,6 +154,9 @@ pub fn init_all() -> crate::errors::PyResult<()> {
     exceptions::ready_all()?;
     containers_reg::ready()?;
     type_ready(frameobject_proxy::proxy_type())?;
+    bytes_methods::ready()?;
+    bytearray::ready()?;
+    memoryview::ready()?;
     str_methods::ready_types()?;
     lang_init()?;
     Ok(())

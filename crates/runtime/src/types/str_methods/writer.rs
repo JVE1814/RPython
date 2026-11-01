@@ -186,6 +186,8 @@ impl Writer {
                 unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), pystr::str_data_ptr(&r), v.len()) };
                 r
             }
+            Buf::U2(v) if kind_for(self.maxc) < 2 => new_from_units(&v),
+            Buf::U4(v) if kind_for(self.maxc) < 4 => new_from_units(&v),
             Buf::U2(v) => {
                 let r = pystr::alloc_str(v.len(), 0xffff);
                 unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), pystr::str_data_ptr(&r) as *mut u16, v.len()) };
@@ -248,17 +250,7 @@ pub fn try_alloc(len: usize, maxc: u32) -> crate::errors::PyResult<PyRef> {
     if len > (isize::MAX as usize) / k - 64 {
         return Err(crate::errors::memory_error());
     }
-    // probe the allocator first for very large requests
-    if len * k > (1usize << 32) {
-        unsafe {
-            let p = libc::malloc(len * k + 128);
-            if p.is_null() {
-                return Err(crate::errors::memory_error());
-            }
-            libc::free(p);
-        }
-    }
-    Ok(pystr::alloc_str(len, maxc))
+    pystr::try_alloc_str(len, maxc).ok_or_else(crate::errors::memory_error)
 }
 
 /// Mutable typed view of a freshly allocated string's data.
