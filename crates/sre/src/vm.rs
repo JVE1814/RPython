@@ -392,6 +392,15 @@ impl<'a, T: CodeUnit> Vm<'a, T> {
                         }
                         true
                     }
+                    Inst::SplitS(a, b, si) => {
+                        if pos < end && prog.sets[si as usize].contains(self.ch(pos), self.prov) {
+                            self.push(F_CHOICE, b, pos, 0, 0);
+                            pc = a as usize;
+                        } else {
+                            pc = b as usize;
+                        }
+                        true
+                    }
                     Inst::Jmp(t) => {
                         pc = t as usize;
                         true

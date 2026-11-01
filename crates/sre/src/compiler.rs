@@ -56,6 +56,8 @@ pub(crate) enum Inst {
     Split(u32, u32),
     /// Split whose first alternative needs the current char to be `.2`.
     SplitG(u32, u32, u32),
+    /// Split whose first alternative needs the current char to be in set `.2`.
+    SplitS(u32, u32, u32),
     Jmp(u32),
     GroupRef(u32, RefMode),
     /// (group, else-pc)
@@ -238,7 +240,7 @@ pub(crate) struct Program {
     /// Whole pattern is a single literal string without groups.
     pub pure_literal: bool,
     /// Possible (first, second) character pairs of any match (empty = unknown).
-    pub pairs: Vec<(FirstSet, FirstSet)>,
+    pub pairs: Vec<Vec<FirstSet>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -886,6 +888,10 @@ impl<'a> Compiler<'a> {
                 let g = match self.prog.insts.get(a as usize) {
                     Some(Inst::Char(c)) => *c,
                     Some(Inst::Lit(s, _)) => self.prog.lits[*s as usize],
+                    Some(Inst::Set(i)) => {
+                        self.prog.insts[pc] = Inst::SplitS(a, b, *i);
+                        continue;
+                    }
                     _ => continue,
                 };
                 self.prog.insts[pc] = Inst::SplitG(a, b, g);
@@ -907,7 +913,7 @@ impl<'a> Compiler<'a> {
     }
 
     /// Possible (first, second) character pairs for a sequence.
-    fn pairs(&self, seq: &mut Vec<&Node>, flags: u32) -> Option<Vec<(FirstSet, FirstSet)>> {
+    fn pairs(&self, seq: &mut Vec<&Node>, flags: u32) -> Option<Vec<Vec<FirstSet>>> {
         let first = *seq.first()?;
         match first {
             Node::Subpattern { add: 0, del: 0, body, .. } => {
@@ -928,17 +934,29 @@ impl<'a> Compiler<'a> {
                 Some(out)
             }
             _ => {
-                let s0 = self.single_set(first, flags)?;
-                let second = *seq.get(1)?;
-                let (s1, _, nullable) = self.first_node(second, flags);
-                if nullable {
+                let mut grams = Vec::new();
+                for n in seq.iter() {
+                    if grams.len() == 8 {
+                        break;
+                    }
+                    match self.single_set(n, flags) {
+                        Some(s) => grams.push(s),
+                        None => {
+                            let (s, _, nullable) = self.first_node(n, flags);
+                            if !nullable {
+                                grams.push(s.unwrap_or_else(Self::full_set));
+                            }
+                            break;
+                        }
+                    }
+                }
+                while grams.last().is_some_and(|s| s.high && s.bits == [u64::MAX; 4]) {
+                    grams.pop();
+                }
+                if grams.len() < 2 {
                     return None;
                 }
-                let s1 = s1.unwrap_or_else(Self::full_set);
-                if s0.high && s1.high && s0.bits == [u64::MAX; 4] {
-                    return None;
-                }
-                Some(vec![(s0, s1)])
+                Some(vec![grams])
             }
         }
     }

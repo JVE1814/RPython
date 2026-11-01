@@ -118,10 +118,11 @@ pub(crate) fn exec<T: CodeUnit>(
     if !prog.pairs.is_empty() {
         let pairs = &prog.pairs[..];
         let mut i = pos;
-        while i <= last && i + 1 < end {
-            let c0: u32 = s[i].into();
-            let c1: u32 = s[i + 1].into();
-            if pairs.iter().any(|(a, b)| a.test(c0) && b.test(c1)) {
+        while i <= last {
+            let ok = pairs.iter().any(|g| {
+                i + g.len() <= end && g.iter().enumerate().all(|(j, set)| set.test(s[i + j].into()))
+            });
+            if ok {
                 if let Some(e) = vm.run(0, i) {
                     return Some(build(&vm, i, e, groups));
                 }

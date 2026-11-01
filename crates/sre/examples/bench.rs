@@ -36,12 +36,16 @@ fn sub<T: CodeUnit>(p: &Pattern, repl: &[T], s: &[T]) -> Vec<T> {
 }
 
 fn time<F: FnMut() -> usize>(name: &str, iters: usize, mut f: F) {
-    let t = Instant::now();
     let mut acc = 0;
-    for _ in 0..iters {
-        acc += f();
+    let mut dt = f64::MAX;
+    // best of 5 rounds
+    for _ in 0..5 {
+        let t = Instant::now();
+        for _ in 0..iters {
+            acc += f();
+        }
+        dt = dt.min(t.elapsed().as_secs_f64() / iters as f64);
     }
-    let dt = t.elapsed().as_secs_f64() / iters as f64;
     println!("{name:<44} {:>10.3} ms/iter  (checksum {acc})", dt * 1e3);
 }
 
