@@ -6,7 +6,6 @@ non-seekable streams with the "r|*" / "w|*" modes) and extraction filters
 that defend against hostile archives.
 """
 
-version = "0.9.0"
 
 import io
 import os
@@ -89,6 +88,26 @@ if os.name == "nt":
 else:
     ENCODING = sys.getfilesystemencoding()
 
+# File type bits shown by TarFile.list() for each member type.
+_TYPE_MODE_BITS = {
+    REGTYPE: stat.S_IFREG,
+    AREGTYPE: stat.S_IFREG,
+    DIRTYPE: stat.S_IFDIR,
+    SYMTYPE: stat.S_IFLNK,
+    FIFOTYPE: stat.S_IFIFO,
+    CHRTYPE: stat.S_IFCHR,
+    BLKTYPE: stat.S_IFBLK,
+}
+
+
+def __getattr__(name):
+    if name == "version":
+        import warnings
+        warnings._deprecated("version", remove=(3, 20))
+        return "0.9.0"
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 # Largest chunk read at once for GNU long names and pax headers, whose
 # claimed size comes from the (untrusted) archive.
 _EXTHEADER_READ_CHUNK = 1 << 20
@@ -119,10 +138,10 @@ def nti(s):
         if s[0] == 0o377:
             value -= 256 ** (len(s) - 1)
         return value
-    text = nts(s, "ascii", "strict").strip(" \0")
     try:
+        text = nts(s, "ascii", "strict").strip(" \0")
         return int(text or "0", 8)
-    except ValueError:
+    except (ValueError, UnicodeDecodeError):
         raise InvalidHeaderError("invalid header") from None
 
 
@@ -712,6 +731,7 @@ class TarInfo(object):
         sparse='Sparse member information.',
         _sparse_structs=None,
         _link_target=None,
+        _raw_type=None,
     )
 
     def __init__(self, name=""):
@@ -732,6 +752,7 @@ class TarInfo(object):
         self.offset_data = 0
         self.sparse = None
         self.pax_headers = {}
+        self._raw_type = None
 
     @property
     def tarfile(self):
@@ -858,17 +879,14 @@ class TarInfo(object):
         # Numbers that do not fit in their octal fields go to pax.
         for name, digits in (("uid", 8), ("gid", 8), ("size", 12),
                              ("mtime", 12)):
-            needs_pax = False
             value = info[name]
-            if not 0 <= value < 8 ** (digits - 1) or isinstance(value, float):
-                needs_pax = True
-            if needs_pax:
-                if name in pax:
-                    # an explicit pax value wins
-                    info[name] = 0
-                    continue
+            fits = 0 <= value < 8 ** (digits - 1)
+            if fits and not isinstance(value, float):
+                continue
+            if name not in pax:
                 pax[name] = str(value)
-                info[name] = 0
+            # The ustar field gets the nearest representable value.
+            info[name] = round(value) if fits else 0
         if pax:
             out = self._pax_block(pax, XHDTYPE, encoding)
         else:
@@ -1002,7 +1020,11 @@ class TarInfo(object):
         obj.devminor = nti(buf[337:345])
         prefix = nts(buf[345:500], encoding, errors)
 
+        if obj.size < 0:
+            raise InvalidHeaderError("invalid header")
+
         # Old V7 archives mark directories with a trailing slash only.
+        obj._raw_type = obj.type
         if obj.type == AREGTYPE and obj.name.endswith("/"):
             obj.type = DIRTYPE
 
@@ -1087,10 +1109,9 @@ class TarInfo(object):
         nxt.offset = self.offset
         if self.type == GNUTYPE_LONGNAME:
             nxt.name = nts(buf, tarfile.encoding, tarfile.errors)
+            nxt._recheck_v7_dir()
         elif self.type == GNUTYPE_LONGLINK:
             nxt.linkname = nts(buf, tarfile.encoding, tarfile.errors)
-        if nxt.isdir():
-            nxt.name = nxt.name.removesuffix("/")
         return nxt
 
     def _finish_old_sparse(self, tarfile):
@@ -1115,7 +1136,7 @@ class TarInfo(object):
         self.size = origsize
         return self
 
-    _PAX_RECORD = re.compile(br"(\d+) ")
+    _PAX_RECORD = re.compile(br"(\d{1,20}) ")
 
     def _finish_pax(self, tarfile):
         buf = self._read_ext_data(tarfile)
@@ -1125,7 +1146,7 @@ class TarInfo(object):
             pax_headers = tarfile.pax_headers.copy()
 
         # The character set of the values; BINARY means "as in the archive".
-        encoding = None
+        encoding = "utf-8"
         match = re.search(br"\d+ hdrcharset=([^\n]+)\n", buf)
         if match is not None:
             charset = match.group(1).decode("utf-8")
@@ -1171,22 +1192,29 @@ class TarInfo(object):
         nxt = self._next_header(tarfile)
 
         if self.type in (XHDTYPE, SOLARIS_XHDTYPE):
+            data_start = nxt.offset_data
+            nxt._merge_pax(pax_headers, tarfile.encoding, tarfile.errors)
+            nxt.offset = self.offset
+            # Size of the data actually stored in the archive.
+            stored_size = nxt.size
             if sparse_map:
                 pax_headers["GNU.sparse.map"] = ",".join(map(str, sparse_map))
             if "GNU.sparse.map" in pax_headers:
                 self._pax_sparse_v01(nxt, pax_headers)
-            elif "GNU.sparse.size" in pax_headers:
-                self._pax_sparse_v00(nxt, pax_headers)
             elif (pax_headers.get("GNU.sparse.major") == "1"
                   and pax_headers.get("GNU.sparse.minor") == "0"):
                 self._pax_sparse_v10(nxt, pax_headers, tarfile)
-            nxt._merge_pax(pax_headers, tarfile.encoding, tarfile.errors)
-            nxt.offset = self.offset
-            if "size" in pax_headers:
-                offset = nxt.offset_data
-                if nxt.isreg() or nxt.type not in SUPPORTED_TYPES:
-                    offset += _padded(nxt.size)
-                tarfile.offset = offset
+            elif "GNU.sparse.size" in pax_headers:
+                self._pax_sparse_v00(nxt, pax_headers)
+            if nxt.sparse is not None:
+                real = pax_headers.get("GNU.sparse.realsize",
+                                       pax_headers.get("GNU.sparse.size"))
+                if real is not None:
+                    nxt.size = int(real)
+            if nxt.isreg() or nxt.type not in SUPPORTED_TYPES:
+                tarfile.offset = data_start + _padded(stored_size)
+            else:
+                tarfile.offset = data_start
         return nxt
 
     def _pax_sparse_v00(self, nxt, pax_headers):
@@ -1228,21 +1256,27 @@ class TarInfo(object):
     def _merge_pax(self, pax_headers, encoding, errors):
         for key, value in pax_headers.items():
             if key == "GNU.sparse.name":
-                setattr(self, "path", value)
-            elif key == "GNU.sparse.size":
-                setattr(self, "size", int(value))
-            elif key == "GNU.sparse.realsize":
-                setattr(self, "size", int(value))
-            elif key in PAX_FIELDS:
-                if key in PAX_NUMBER_FIELDS:
-                    try:
-                        value = PAX_NUMBER_FIELDS[key](value)
-                    except ValueError:
-                        value = 0
-                if key == "path":
-                    value = value.rstrip("/")
-                setattr(self, key, value)
+                key = "path"
+            elif key not in PAX_FIELDS:
+                continue
+            if key in PAX_NUMBER_FIELDS:
+                try:
+                    value = PAX_NUMBER_FIELDS[key](value)
+                except ValueError:
+                    value = 0
+            setattr(self, key, value)
+            if key == "path":
+                self._recheck_v7_dir()
         self.pax_headers = pax_headers.copy()
+
+    def _recheck_v7_dir(self):
+        """Old-style members are directories when their name ends with a
+        slash; re-evaluate after the name was replaced by an extended
+        header, then drop the trailing slash of directories."""
+        if self._raw_type == AREGTYPE:
+            self.type = DIRTYPE if self.name.endswith("/") else AREGTYPE
+        if self.isdir():
+            self.name = self.name.rstrip("/")
 
     def _pax_text(self, value, encoding, fallback_encoding,
                           fallback_errors):
@@ -1310,6 +1344,10 @@ del _tarinfo_replace
 
 # ---------------------------------------------------------------- filters
 
+def _inside(path, root):
+    return os.path.commonpath([path, root]) == root
+
+
 def _filtered_attrs(member, dest_path, for_data):
     changes = {}
     name = member.name
@@ -1320,12 +1358,25 @@ def _filtered_attrs(member, dest_path, for_data):
         raise AbsolutePathError(member)
     target = os.path.realpath(os.path.join(dest_path, name),
                               strict=os.path.ALLOW_MISSING)
-    if os.path.commonpath([target, dest_path]) != dest_path:
+    if not _inside(target, dest_path):
         raise OutsideDestinationError(member, target)
+    is_link = member.islnk() or member.issym()
+    if (not member.isdir() and
+            os.path.normpath(os.path.join(dest_path, name)) == dest_path):
+        # A member named like the destination itself (e.g. a link called
+        # "." or "") would replace it.
+        raise OutsideDestinationError(member, target)
+    if ".." in name.replace(os.sep, "/").split("/"):
+        # Directories along the stored name would be created outside the
+        # destination even though the final path is inside: use the
+        # resolved location instead.
+        name = changes["name"] = os.path.relpath(target, dest_path)
 
     mode = member.mode
     if mode is not None:
-        mode = mode & 0o7777
+        # Both filters drop setuid/setgid/sticky and group/other write.
+        mode = mode & 0o7777 & ~(stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX
+                                 | stat.S_IWGRP | stat.S_IWOTH)
         if for_data:
             if member.isreg() or member.islnk():
                 if not mode & stat.S_IXUSR:
@@ -1335,9 +1386,6 @@ def _filtered_attrs(member, dest_path, for_data):
                 mode = None
             else:
                 raise SpecialFileError(member)
-        else:
-            mode &= ~(stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX
-                      | stat.S_IWGRP | stat.S_IWOTH)
         if mode != member.mode:
             changes["mode"] = mode
 
@@ -1345,20 +1393,22 @@ def _filtered_attrs(member, dest_path, for_data):
         for attr in ("uid", "gid", "uname", "gname"):
             if getattr(member, attr) is not None:
                 changes[attr] = None
-        if member.islnk() or member.issym():
+        if is_link:
             if os.path.isabs(member.linkname):
                 raise AbsoluteLinkError(member)
-            normalized = os.path.normpath(member.linkname)
-            if normalized != member.linkname:
-                changes["linkname"] = normalized
+            linkname = os.path.normpath(member.linkname)
+            if linkname != member.linkname:
+                changes["linkname"] = linkname
             if member.issym():
-                link_target = os.path.join(dest_path, os.path.dirname(name),
-                                           member.linkname)
+                # Relative to the directory holding the link (a trailing
+                # slash on the member name does not make it a directory).
+                parent = os.path.dirname(name.rstrip("/" + os.sep))
+                link_target = os.path.join(dest_path, parent, linkname)
             else:
-                link_target = os.path.join(dest_path, member.linkname)
+                link_target = os.path.join(dest_path, linkname)
             link_target = os.path.realpath(link_target,
                                            strict=os.path.ALLOW_MISSING)
-            if os.path.commonpath([link_target, dest_path]) != dest_path:
+            if not _inside(link_target, dest_path):
                 raise LinkOutsideDestinationError(member, link_target)
     return changes
 
@@ -1703,7 +1753,9 @@ class TarFile(object):
     def getmember(self, name):
         """The TarInfo of member *name* (its last occurrence); KeyError if
         absent."""
-        tarinfo = self._lookup(name.rstrip('/'))
+        tarinfo = self._lookup(name)
+        if tarinfo is None:
+            tarinfo = self._lookup(name.rstrip('/'))
         if tarinfo is None:
             raise KeyError("filename %r not found" % name)
         return tarinfo
@@ -1818,7 +1870,7 @@ class TarFile(object):
                 if tarinfo.mode is None:
                     _safe_print("??????????")
                 else:
-                    _safe_print(stat.filemode(tarinfo.mode))
+                    _safe_print(stat.filemode(tarinfo.mode | _TYPE_MODE_BITS.get(tarinfo.type, 0)))
                 _safe_print("%s/%s" % (tarinfo.uname or tarinfo.uid,
                                        tarinfo.gname or tarinfo.gid))
                 if tarinfo.ischr() or tarinfo.isblk():
@@ -2067,7 +2119,7 @@ class TarFile(object):
 
         upperdirs = os.path.dirname(targetpath)
         if upperdirs and not os.path.exists(upperdirs):
-            os.makedirs(upperdirs)
+            os.makedirs(upperdirs, exist_ok=True)
 
         if tarinfo.islnk() or tarinfo.issym():
             self._debug_msg(1, "%s -> %s" % (tarinfo.name, tarinfo.linkname))
@@ -2191,6 +2243,13 @@ class TarFile(object):
                     + "extraction_root must also not be None")
             try:
                 filtered = filter_function(unfiltered, extraction_root)
+                if filtered is not None and not unfiltered.isreg():
+                    # The copy lands at the link's location, where e.g. a
+                    # relative symlink means something else: check it there.
+                    relocated = unfiltered.replace(name=tarinfo.name,
+                                                   deep=False)
+                    if filter_function(relocated, extraction_root) is None:
+                        filtered = None
             except FilterError as cause:
                 raise LinkFallbackError(tarinfo, unfiltered.name) from cause
         if filtered is not None:
@@ -2299,7 +2358,8 @@ class TarFile(object):
             break
 
         if tarinfo is not None:
-            self.members.append(tarinfo)
+            if not self.stream:
+                self.members.append(tarinfo)
         else:
             self._loaded = True
         return tarinfo

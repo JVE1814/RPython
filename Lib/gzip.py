@@ -196,7 +196,9 @@ class GzipFile(_streams.BaseStream):
             if self.mode == WRITE:
                 self._write_gzip_header(compresslevel)
         except:
-            # Do not leak the file we opened ourselves.
+            # Do not leak the file we opened ourselves; a failed object
+            # counts as closed.
+            self.fileobj = None
             if self.myfileobj is not None:
                 self.myfileobj.close()
                 self.myfileobj = None
