@@ -790,13 +790,6 @@ class TarInfo(object):
     def __repr__(self):
         return "<%s %r at %#x>" % (type(self).__name__, self.name, id(self))
 
-    def replace(self, *, name=None, mtime=None, mode=None, linkname=None,
-                uid=None, gid=None, uname=None, gname=None, deep=True,
-                _KEEP=None):
-        """Return a copy with the given attributes changed (``_KEEP``
-        sentinel semantics: pass the value to set, including None)."""
-        raise NotImplementedError  # replaced below
-
     def get_info(self):
         """Header fields as a dict."""
         mode = self.mode
