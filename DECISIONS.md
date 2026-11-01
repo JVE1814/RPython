@@ -164,3 +164,10 @@ numbers are only indicative; (2) final benchmark, startup, peak-memory and multi
 measurements for REPORT.md/PROGRESS.md are taken on a quiet machine (no agents running, cores
 pinned) against both baselines; (3) concurrency is capped at ~8-10 agents from now on, and
 finished agents' target dirs are deleted promptly (disk: ~14-18 GB free).
+
+## D23 — idlelib's tests are part of the spec
+CPython keeps IDLE's unit tests inside the package (Lib/idlelib/idle_test); test_idle loads them.
+The original extraction (D2) kept only Lib/test, so test_idle could never match the baseline
+(332 run, 88 skipped). The idle_test directory was copied (mechanically, unread) from the pinned
+v3.15.2 checkout into spec/Lib/idlelib/idle_test. No other test packages live outside Lib/test in
+3.15. tools/snapshot.sh installs it into our idlelib package; our idlelib is written from scratch.
