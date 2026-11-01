@@ -119,6 +119,7 @@ pub fn register_all() {
     compress_common::register();
     _decimal::register();
     crate::import::register_builtin("_expat_engine", pyexpat::init);
+    crate::import::register_builtin("pyexpat", pyexpat::xmlparser::init);
     crate::import::register_builtin("_pickle", _pickle::init_module);
     tty::register();
     crate::import::register_builtin("array", array::init_module);
