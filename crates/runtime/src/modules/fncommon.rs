@@ -14,7 +14,7 @@ pub unsafe fn init_type(t: *mut PyTypeObject, name: &'static CStr, size: usize, 
         let t = &mut *t;
         t.tp_name = name.as_ptr();
         t.tp_basicsize = size as isize;
-        t.tp_flags = Py_TPFLAGS_DEFAULT | flags;
+        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_IMMUTABLETYPE | flags;
         t.tp_getattro = Some(crate::types::typeobject::object_generic_getattro);
         if flags & Py_TPFLAGS_BASETYPE != 0 || t.tp_alloc.is_none() {
             t.tp_alloc = Some(crate::types::typeobject::generic_alloc);
@@ -253,6 +253,148 @@ pub fn bool_obj(b: bool) -> PyRef {
 
 pub fn int_obj(v: i64) -> PyRef {
     crate::types::int::new_int(v)
+}
+
+// ------------------------------------------------------------------ Rust-state objects
+//
+// Many of our types are "a PyObject header followed by a Rust struct". `RObj<T>` is
+// that layout; the Rust part is written right after allocation and dropped in
+// tp_dealloc. `T: Trav` reports the contained Python references to the GC.
+
+pub trait Trav {
+    fn trav(&self, _v: &mut dyn FnMut(*mut PyObject) -> c_int) -> c_int {
+        0
+    }
+}
+
+#[repr(C)]
+pub struct RObj<T> {
+    pub ob_base: PyObject,
+    pub weakreflist: *mut PyObject,
+    pub inner: T,
+}
+
+/// Allocate an instance of `tp` (or a subclass) and move `inner` into it.
+pub fn robj_new<T>(tp: *mut PyTypeObject, inner: T) -> PyResult {
+    unsafe {
+        let op = alloc(tp)?;
+        std::ptr::write(&raw mut (*(op as *mut RObj<T>)).inner, inner);
+        Ok(PyRef::from_raw(op))
+    }
+}
+
+/// Access the Rust state. Callers must not keep the reference across calls into
+/// Python code that could re-enter the same object.
+#[inline(always)]
+pub fn rs<T>(o: &PyObject) -> &mut T {
+    unsafe { &mut (*(o.as_ptr() as *mut RObj<T>)).inner }
+}
+
+pub unsafe extern "C" fn robj_dealloc<T>(o: *mut PyObject) {
+    unsafe {
+        crate::gc::untrack(o);
+        let p = o as *mut RObj<T>;
+        crate::types::weakref::clear_weakrefs_at(o, &raw mut (*p).weakreflist);
+        std::ptr::drop_in_place(&raw mut (*p).inner);
+        free(o);
+    }
+}
+
+pub unsafe extern "C" fn robj_traverse<T: Trav>(o: *mut PyObject, v: visitproc, arg: *mut c_void) -> c_int {
+    unsafe {
+        let p = &*(o as *mut RObj<T>);
+        let f = v.unwrap();
+        p.inner.trav(&mut |x: *mut PyObject| if x.is_null() { 0 } else { f(x, arg) })
+    }
+}
+
+/// Initialise a static type whose instances are `RObj<T>`.
+pub unsafe fn init_robj_type<T: Trav>(t: *mut PyTypeObject, name: &'static CStr, flags: c_ulong) {
+    unsafe {
+        init_type(t, name, std::mem::size_of::<RObj<T>>(), flags | Py_TPFLAGS_HAVE_GC);
+        (*t).tp_dealloc = Some(robj_dealloc::<T>);
+        (*t).tp_traverse = Some(robj_traverse::<T>);
+        (*t).tp_weaklistoffset = std::mem::offset_of!(RObj<T>, weakreflist) as isize;
+    }
+}
+
+/// Helper for Trav impls: visit an optional reference.
+#[macro_export]
+macro_rules! trav {
+    ($v:expr; $($e:expr),* $(,)?) => {{
+        $( { let r = $crate::modules::fncommon::trav_opt($v, &$e); if r != 0 { return r; } } )*
+        0
+    }};
+}
+
+pub fn trav_opt(v: &mut dyn FnMut(*mut PyObject) -> c_int, o: &Option<PyRef>) -> c_int {
+    match o {
+        Some(r) => v(r.as_ptr()),
+        None => 0,
+    }
+}
+
+pub fn trav_vec(v: &mut dyn FnMut(*mut PyObject) -> c_int, items: &[PyRef]) -> c_int {
+    for r in items {
+        let x = v(r.as_ptr());
+        if x != 0 {
+            return x;
+        }
+    }
+    0
+}
+
+/// Return a tuple with `items`, reusing `slot`'s tuple in place when nobody else
+/// holds a reference to it (CPython's result-tuple reuse for combinatoric iterators).
+pub fn reuse_tuple(slot: &mut Option<PyRef>, items: Vec<PyRef>) -> PyRef {
+    if let Some(t) = slot.as_ref() {
+        if t.refcnt() == 1 && tuple::tuple_len(t) == items.len() {
+            unsafe {
+                let p = tuple::item_ptr(t.as_ptr());
+                for (i, it) in items.into_iter().enumerate() {
+                    let old = *p.add(i);
+                    *p.add(i) = it.into_raw();
+                    xdecref(old);
+                }
+                crate::gc::track(t.as_ptr());
+            }
+            return t.clone();
+        }
+    }
+    let t = tuple::new_tuple(items);
+    *slot = Some(t.clone());
+    t
+}
+
+/// tp_new arguments converted to the FASTKW convention, ready for `args::parse`.
+pub struct VcArgs {
+    pub vals: Vec<PyRef>,
+    pub names: Option<PyRef>,
+}
+impl VcArgs {
+    pub unsafe fn from_c(args: *mut PyObject, kw: *mut PyObject) -> VcArgs {
+        let (vals, names) = vc_from_kwdict(unsafe { targs(args) }, unsafe { opt(kw) });
+        VcArgs { vals, names }
+    }
+    pub fn refs(&self) -> Vec<&PyObject> {
+        self.vals.iter().map(|x| &**x).collect()
+    }
+    pub fn parse<const N: usize>(&self, p: &crate::args::Params) -> PyResult<[Option<PyRef>; N]> {
+        let r = self.refs();
+        let out = crate::args::parse::<N>(p, &r, self.names.as_deref())?;
+        Ok(out.map(|o| o.map(|x| x.to_ref())))
+    }
+}
+
+/// The keyword check CPython applies to C types that take no keyword arguments:
+/// enforced unless a subclass overrides __init__.
+pub unsafe fn no_kw_unless_init_overridden(tp: *mut PyTypeObject, base: *mut PyTypeObject, fname: &str, kw: *mut PyObject) -> PyResult<()> {
+    unsafe {
+        if tp == base || (*tp).tp_init == (*base).tp_init {
+            no_kw(fname, kw)?;
+        }
+    }
+    Ok(())
 }
 
 /// The raw `tp_name` of the object's type (e.g. "operator.attrgetter" or a subclass name).
