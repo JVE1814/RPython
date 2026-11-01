@@ -37,7 +37,6 @@ import sysconfig
 import textwrap
 import time
 import tokenize
-import urllib.parse
 import warnings
 from annotationlib import Format
 from collections import deque
@@ -909,10 +908,11 @@ class TextDoc(Doc):
 
     def docroutine(self, object, name=None, mod=None, cl=None, homecls=None):
         """Text documentation of a function or method."""
+        if not isinstance(getattr(object, '__name__', None), str):
+            # routine-like object without a name: describe it as a value
+            return self.docother(object, name, mod)
         info = _routine_summary(object, name, mod, cl, homecls)
-        if info['realname'] is None:
-            title = self.bold(stripid(repr(object)))
-        elif info['lambda']:
+        if info['lambda']:
             title = self.bold(info['name']) + ' lambda '
         elif info['alias']:
             title = self.bold(info['name']) + ' = ' + info['alias']
@@ -1189,7 +1189,11 @@ class HTMLDoc(Doc):
             import urllib.request
             url = urllib.request.pathname2url(path)
         except Exception:
-            url = urllib.parse.quote(path)
+            try:
+                import urllib.parse
+                url = urllib.parse.quote(path)
+            except ImportError:
+                url = path
         return self.filelink(url, self.escape(path))
 
     def docmodule(self, object, name=None, mod=None, *ignored):
@@ -1242,7 +1246,9 @@ class HTMLDoc(Doc):
             out.append(self.bigsection('Package Contents', 'pkg-content',
                                        self.multicolumn(entries, self.modpkglink)))
         else:
-            modules = inspect.getmembers(object, inspect.ismodule)
+            modules = [(key, value) for key, value
+                       in inspect.getmembers(object, inspect.ismodule)
+                       if key != '__builtins__']
             if modules:
                 out.append(self.bigsection(
                     'Modules', 'pkg-content',
@@ -1352,12 +1358,11 @@ class HTMLDoc(Doc):
     def docroutine(self, object, name=None, mod=None, funcs={}, classes={},
                    methods={}, cl=None, homecls=None):
         """HTML documentation of a function or method."""
+        if not isinstance(getattr(object, '__name__', None), str):
+            return self.docother(object, name, mod)
         info = _routine_summary(object, name, mod, cl, homecls)
         anchor = ('' if cl is None else cl.__name__) + '-' + (info['name'] or '')
-        if info['realname'] is None:
-            title = (f'<a name="{anchor}"><strong>'
-                     f'{self.escape(stripid(repr(object)))}</strong></a>')
-        elif info['lambda']:
+        if info['lambda']:
             title = f'<strong>{info["name"]}</strong> <em>lambda</em> '
         elif info['alias']:
             if info['skipdocs']:
@@ -1651,7 +1656,7 @@ def writedoc(thing, forceload=0):
     obj, name = resolve(thing, forceload)
     page = html.page(describe(obj), html.document(obj, name))
     with open(name + '.html', 'w', encoding='utf-8',
-              errors='surrogateescape') as file:
+              errors='xmlcharrefreplace') as file:
         file.write(page)
     print('wrote', name + '.html')
 
@@ -1844,8 +1849,9 @@ class Helper:
         self.intro()
         self.interact()
         self.output.write('''
-Leaving the help utility.  At the Python prompt, help(object) shows the
-documentation of an object, and help('text') looks text up as if it was
+Leaving the help utility and returning to the Python interpreter.
+At the Python prompt, help(object) shows the documentation of an
+object, and help('text') looks the text up just as if it had been
 typed at the help> prompt.
 ''')
 
