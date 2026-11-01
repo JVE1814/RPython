@@ -245,6 +245,9 @@ impl Encoder {
                 }
                 self.buf = Vec::new();
                 self.chain = Vec::new();
+                self.pos = 0;
+                self.inserted = 0;
+                return Ok(());
             }
         }
         self.slide();

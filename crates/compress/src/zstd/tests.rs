@@ -93,6 +93,23 @@ fn streaming_modes_and_checksum() {
 }
 
 #[test]
+fn long_streams_slide_the_window() {
+    // More than twice the level-1 window: history is dropped while encoding.
+    let d = sample(3_500_000, 21);
+    let mut e = enc::Encoder::new(enc::Params::from_level(1), None);
+    for _ in 0..2 {
+        let mut out = Vec::new();
+        for c in d.chunks(300_000) {
+            e.compress(c, enc::Mode::Continue, &mut out).unwrap();
+        }
+        e.compress(&[], enc::Mode::End, &mut out).unwrap();
+        assert_eq!(decompress(&out).unwrap(), d);
+    }
+    let c = compress(&d, 1);
+    assert_eq!(decompress(&c).unwrap(), d);
+}
+
+#[test]
 fn dictionaries() {
     let samples: Vec<Vec<u8>> = (0..300).map(|i| sample(200, i)).collect();
     let mut cat = Vec::new();

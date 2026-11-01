@@ -113,6 +113,41 @@ fn incremental_decode_small_pieces() {
 }
 
 #[test]
+#[ignore]
+fn bench_dec_only() {
+    let d = sample(2_000_000, 78);
+    let c = enc(Format::Xz, CHECK_CRC64, vec![lz2(0)], &d, 1);
+    let t = std::time::Instant::now();
+    for _ in 0..3 {
+        let (o, _) = decompress(&c, Format::Xz, None).unwrap();
+        assert_eq!(o.len(), d.len());
+    }
+    eprintln!("lzma dec x3: {:?}", t.elapsed());
+}
+
+#[test]
+#[ignore]
+fn bench_speed() {
+    let d = sample(12_000_000, 77);
+    let t = std::time::Instant::now();
+    let c = enc(Format::Xz, CHECK_CRC64, vec![lz2(6)], &d, 1);
+    let t1 = t.elapsed();
+    let t = std::time::Instant::now();
+    let (o, _) = decompress(&c, Format::Xz, None).unwrap();
+    let t2 = t.elapsed();
+    assert_eq!(o, d);
+    eprintln!("lzma6: ratio {:.3} comp {:?} dec {:?}", c.len() as f64 / d.len() as f64, t1, t2);
+    let t = std::time::Instant::now();
+    let c = crate::zstd::compress(&d, 3);
+    let t1 = t.elapsed();
+    let t = std::time::Instant::now();
+    let o = crate::zstd::decompress(&c).unwrap();
+    let t2 = t.elapsed();
+    assert_eq!(o, d);
+    eprintln!("zstd3: ratio {:.3} comp {:?} dec {:?}", c.len() as f64 / d.len() as f64, t1, t2);
+}
+
+#[test]
 fn x86_filter_is_split_invariant() {
     let mut d = Vec::new();
     for i in 0..20_000u32 {
