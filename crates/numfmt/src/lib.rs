@@ -27,7 +27,8 @@ pub use float_ops::{
     write_float_hex,
 };
 pub use format::{
-    complex_repr, format_complex, format_float, format_int, format_int_char, format_str,
+    complex_repr, format_complex, format_float, format_i128, format_int, format_int_char,
+    format_str,
     write_complex_repr, IntPresentation, Locale,
 };
 pub use parse::{parse_complex, parse_float, parse_float_bytes, parse_float_literal};

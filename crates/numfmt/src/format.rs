@@ -705,3 +705,43 @@ pub fn format_complex(re: f64, im: f64, spec: &str, type_name: &str) -> Result<S
     format_complex_spec(&mut out, re, im, &s, &Locale::c(), type_name)?;
     Ok(out)
 }
+
+// ---------------------------------------------------------------------------
+// convenience for machine-sized ints
+
+fn u128_digits(mut v: u128, radix: u32, buf: &mut [u8; 130]) -> &str {
+    const D: &[u8; 16] = b"0123456789abcdef";
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = D[(v % radix as u128) as usize];
+        v /= radix as u128;
+        if v == 0 {
+            break;
+        }
+    }
+    // SAFETY: ASCII only.
+    unsafe { core::str::from_utf8_unchecked(&buf[i..]) }
+}
+
+/// `format(v, spec)` for an int that fits in an i128 (the runtime's
+/// small-int fast path).  Uses the C locale for 'n'.  Float presentation
+/// types convert `v` to float (exact for |v| < 2^53, correctly rounded
+/// otherwise).
+pub fn format_i128(v: i128, spec: &str, type_name: &str) -> Result<String, NumFmtError> {
+    if spec.is_empty() {
+        return Ok(v.to_string());
+    }
+    let s = FormatSpec::parse_int(spec, type_name)?;
+    let mut out = String::new();
+    match int_presentation(&s, type_name)? {
+        IntPresentation::Radix(r) => {
+            let mut buf = [0u8; 130];
+            let digits = u128_digits(v.unsigned_abs(), r, &mut buf);
+            format_int(&mut out, v < 0, digits, &s, &Locale::c())?;
+        }
+        IntPresentation::Float => format_float_spec(&mut out, v as f64, &s, &Locale::c(), type_name)?,
+        IntPresentation::Char => format_int_char(&mut out, i64::try_from(v).ok(), &s)?,
+    }
+    Ok(out)
+}

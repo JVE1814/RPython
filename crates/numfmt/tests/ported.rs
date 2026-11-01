@@ -1399,3 +1399,45 @@ fn percent_parse_errors() {
     assert_eq!(parse_percent_spec(b"%z.1f", 0, true, &default_is_printable).unwrap_err().msg, "unsupported format %z at position 0");
     assert_eq!(parse_percent_spec(b"%b", 0, true, &default_is_printable).unwrap().conv, 'b');
 }
+
+#[test]
+fn misc_edge_cases() {
+    assert_eq!(ff(1e16, ","), "1e+16");
+    assert_eq!(ff(1234.5, ","), "1,234.5");
+    assert_eq!(ff(1234567.0, "_"), "1_234_567.0");
+    assert_eq!(ff(INF, "010"), "0000000inf");
+    assert_eq!(ff(-INF, "010"), "-000000inf");
+    assert_eq!(ff(NAN, "+010"), "+000000nan");
+    assert_eq!(ff(-0.0, ""), "-0.0");
+    assert_eq!(ff(-0.0, "z"), "0.0");
+    assert_eq!(ff(1.0, ".1"), "1e+00");
+    assert_eq!(ff(1.0, ".3"), "1.0");
+    assert_eq!(ff(INF, "%"), "inf%");
+    assert_eq!(ff(0.5, ".0%"), "50%");
+    assert_eq!(ff(1234.5, "n"), "1234.5");
+    assert_eq!(ff(1e-7, ""), "1e-07");
+    assert_eq!(ff(123.0, "e"), "1.230000e+02");
+    assert_eq!(ff(f64::MAX, ".0f").len(), 309);
+    assert_eq!(ff(5e-324, ".1074f").len(), 1076);
+    let s = ff(5e-324, ".1074f");
+    assert!(s.starts_with("0.000") && s.ends_with("625") && s[2..].trim_start_matches('0').len() == 751);
+    assert_eq!(&ff(5e-324, ".1100e")[..20], "4.940656458412465441");
+    assert_eq!(format_i128(255, "#_b", "int").unwrap(), "0b1111_1111");
+    assert_eq!(format_i128(-255, "08X", "int").unwrap(), "-00000FF");
+    assert_eq!(format_i128(i128::MIN, "x", "int").unwrap(), format!("-{:x}", i128::MIN.unsigned_abs()));
+    assert_eq!(format_i128(10, "%", "int").unwrap(), "1000.000000%");
+    assert_eq!(format_i128(97, "c", "int").unwrap(), "a");
+    assert_eq!(format_i128(-5, "", "int").unwrap(), "-5");
+    // %-format zero padding of non-finite values follows the generic rule
+    assert_eq!(pct_ok("%05f", &[Arg::F(INF)]), "00inf");
+    assert_eq!(pct_ok("%-6f|", &[Arg::F(-INF)]), "-inf  |");
+    assert_eq!(pct_ok("% d", &[Arg::I(5)]), " 5");
+    assert_eq!(pct_ok("%+d", &[Arg::I(0)]), "+0");
+    assert_eq!(pct_ok("%.0d", &[Arg::I(0)]), "0");
+    assert_eq!(pct_ok("%5s|%-5s|", &[Arg::S("ab"), Arg::S("cd")]), "   ab|cd   |");
+    assert_eq!(pct_ok("%05s", &[Arg::S("ab")]), "   ab");
+    assert_eq!(pct_ok("% .3e", &[Arg::F(12345.678)]), " 1.235e+04");
+    assert_eq!(pct_ok("%+.3e", &[Arg::F(12345.678)]), "+1.235e+04");
+    assert_eq!(pct_ok("% 10.3e", &[Arg::F(-12345.678)]), "-1.235e+04");
+    assert_eq!(pct_ok("% 011.3e", &[Arg::F(12345.678)]), " 01.235e+04");
+}

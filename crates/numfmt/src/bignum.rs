@@ -221,18 +221,36 @@ impl Big {
     }
 }
 
+const DIGIT_PAIRS: [u8; 200] = {
+    let mut t = [0u8; 200];
+    let mut i = 0;
+    while i < 100 {
+        t[2 * i] = b'0' + (i / 10) as u8;
+        t[2 * i + 1] = b'0' + (i % 10) as u8;
+        i += 1;
+    }
+    t
+};
+
 /// Write the decimal digits of `v` (nothing for 0) and return the count.
 #[inline]
 pub(crate) fn write_u64(mut v: u64, out: &mut [u8]) -> usize {
-    let mut tmp = [0u8; 20];
-    let mut n = 0;
-    while v != 0 {
-        tmp[n] = b'0' + (v % 10) as u8;
-        v /= 10;
-        n += 1;
+    if v == 0 {
+        return 0;
     }
-    for i in 0..n {
-        out[i] = tmp[n - 1 - i];
+    let n = v.ilog10() as usize + 1;
+    let mut i = n;
+    while v >= 100 {
+        let r = (v % 100) as usize;
+        v /= 100;
+        out[i - 2..i].copy_from_slice(&DIGIT_PAIRS[2 * r..2 * r + 2]);
+        i -= 2;
+    }
+    if v >= 10 {
+        let r = v as usize;
+        out[i - 2..i].copy_from_slice(&DIGIT_PAIRS[2 * r..2 * r + 2]);
+    } else {
+        out[i - 1] = b'0' + v as u8;
     }
     n
 }
