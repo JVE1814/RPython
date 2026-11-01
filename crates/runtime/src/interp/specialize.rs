@@ -335,7 +335,8 @@ fn fill_load_attr(o: &PyObject, nm: &PyObject, method: bool) -> Option<Fill> {
             let dt = d.ty();
             if method && dt.tp_flags & Py_TPFLAGS_METHOD_DESCRIPTOR != 0 {
                 let k = if has_dict { kind::METHOD_SHADOWABLE } else { kind::METHOD };
-                return Some((k, tag as u64, 0, d.as_ptr() as usize));
+                // b = the type (for the optimizing tier: layout of the receiver)
+                return Some((k, tag as u64, tp as u64, d.as_ptr() as usize));
             }
             if dt.tp_descr_get.is_some() && dt.tp_descr_set.is_some() {
                 if let Some((off, tc)) = unsafe { member_offset(d, tp, false) } {

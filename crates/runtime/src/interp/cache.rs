@@ -215,7 +215,7 @@ pub mod kind {
     /// Like CLASS_ATTR but the instance may have a dict that must not shadow it.
     pub const CLASS_ATTR_SHADOWABLE: u32 = 6;
     /// LoadMethod: c is a method descriptor on the type (pushed as unbound + self);
-    /// instance has no dict slot. a = type tag.
+    /// instance has no dict slot. a = type tag, b = the type.
     pub const METHOD: u32 = 7;
     /// LoadMethod with an instance dict that must not shadow the name.
     pub const METHOD_SHADOWABLE: u32 = 8;

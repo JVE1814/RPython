@@ -53,6 +53,8 @@ pub mod layout {
     pub const T2_SITE: i32 = offset_of!(Frame, t2_site) as i32;
     pub const T2_SP: i32 = offset_of!(Frame, t2_sp) as i32;
     pub const FRAME_OBJ: i32 = offset_of!(Frame, frame_obj) as i32;
+    pub const TP_TAG: i32 = offset_of!(PyTypeObject, tp_version_tag) as i32;
+    pub const MANAGED_DICT: i32 = -((crate::alloc::GC_HEAD + crate::alloc::MANAGED) as i32);
     pub const TS_EVAL_BREAKER: i32 = (offset_of!(ThreadState, c) + offset_of!(CThreadState, eval_breaker)) as i32;
     pub use crate::ffi::REF_SHARED_SHIFT;
 }
@@ -68,6 +70,15 @@ pub struct OptCode {
     pub deopts: Box<AtomicU32>,
     /// descriptors referenced by the code (see `Site`)
     pub sites: Vec<Box<Site>>,
+    /// per-site memo cells referenced by the code
+    pub cells: Vec<usize>,
+}
+
+/// Free memo cells made by the builder (`Box<AtomicUsize>` raw pointers).
+pub fn free_cells(cells: &[usize]) {
+    for &c in cells {
+        unsafe { drop(Box::from_raw(c as *mut std::sync::atomic::AtomicUsize)) };
+    }
 }
 
 /// Where the unboxed values of locals live while compiled code runs a template or a
@@ -318,6 +329,7 @@ fn free_opt(p: *mut OptCode) {
     unsafe {
         let b = Box::from_raw(p);
         super::mem::free(b.addr, b.len);
+        free_cells(&b.cells);
     }
 }
 
@@ -398,7 +410,7 @@ fn compile_locked(code: &PyObject, cd: &CodeData, globals: *mut PyObject, builti
         flags,
         fold_globals: cc.t2_invalidations.load(Relaxed) < 3,
     };
-    let built = match build::build(&unit) {
+    let mut built = match build::build(&unit) {
         Ok(b) => b,
         Err(e) => {
             if dbg {
@@ -431,6 +443,7 @@ fn compile_locked(code: &PyObject, cd: &CodeData, globals: *mut PyObject, builti
             if dbg {
                 eprintln!("[jit] tier2 codegen failed for {}: {}", name(), e);
             }
+            free_cells(&built.cells);
             return None;
         }
     };
@@ -444,6 +457,7 @@ fn compile_locked(code: &PyObject, cd: &CodeData, globals: *mut PyObject, builti
         if dbg {
             eprintln!("[jit] tier2 {}: a folded global changed during compilation", name());
         }
+        free_cells(&built.cells);
         return None;
     }
     let asm = &out.asm;
@@ -468,7 +482,7 @@ fn compile_locked(code: &PyObject, cd: &CodeData, globals: *mut PyObject, builti
         );
     }
     let len = asm.buf.len();
-    let oc = Box::into_raw(Box::new(OptCode { addr, len, entries, invalid, deopts, sites: out.sites }));
+    let oc = Box::into_raw(Box::new(OptCode { addr, len, entries, invalid, deopts, sites: out.sites, cells: std::mem::take(&mut built.cells) }));
     let old = slot.swap(oc, AcqRel);
     if !old.is_null() {
         unsafe { (*old).invalid.store(1, Release) };

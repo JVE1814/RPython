@@ -32,6 +32,9 @@ pub enum Ty {
     Unknown,
     /// exact type (pointer to the type object)
     Exact(usize),
+    /// exact (heap) type whose version tag was verified to be this value since the
+    /// last instruction that can run arbitrary code (type tags are unique per type)
+    Tag(u32),
 }
 
 impl Ty {
@@ -235,6 +238,8 @@ pub struct Built {
     pub has_deps: bool,
     /// (dict, key, value or 0 if absent) lookups folded into the code
     pub deps: Vec<(usize, usize, usize)>,
+    /// memo cells (Box<AtomicUsize> raw pointers) owned by the code
+    pub cells: Vec<usize>,
     /// IR block of each bytecode instruction that starts a block (u32::MAX: none)
     pub instr_block: Vec<u32>,
     pub reps: Vec<Rep>,
@@ -259,6 +264,8 @@ struct B<'a> {
     has_deps: bool,
     /// (dict, key) dependencies of folded globals
     deps: Vec<(usize, usize, usize)>,
+    /// per-site memo cells referenced by the code (leaked boxes, freed with the code)
+    cells: Vec<usize>,
     closed: bool,
 }
 
@@ -865,12 +872,18 @@ impl<'a> B<'a> {
                     *l = LS::Frame(Ty::Unknown);
                 }
             }
+            if let LS::Frame(Ty::Tag(_)) = *l {
+                *l = LS::Frame(Ty::Unknown);
+            }
         }
         for a in st.stack.iter_mut() {
             if let AV::InFrame(Ty::Exact(t)) = *a {
                 if is_heap_type(t) {
                     *a = AV::InFrame(Ty::Unknown);
                 }
+            }
+            if let AV::InFrame(Ty::Tag(_)) = *a {
+                *a = AV::InFrame(Ty::Unknown);
             }
         }
     }
@@ -1282,6 +1295,9 @@ impl<'a> B<'a> {
                 self.term(Term::Return(v, d, snap));
             }
             Op::BinarySubscr => self.binary_subscr(i),
+            Op::LoadAttr => self.load_attr(i),
+            Op::LoadMethod => self.load_method(i),
+            Op::StoreAttr => self.store_attr(i),
             Op::StoreSubscr => self.store_subscr(i),
             Op::UnpackSequence => self.unpack_sequence(i),
             Op::DeleteFast | Op::LoadFastAndClear => self.template(i),
@@ -1700,6 +1716,308 @@ impl<'a> B<'a> {
         Ok(())
     }
 
+    // ------------------------------------------------------------ attributes
+
+    /// The single filled inline-cache entry of attribute instruction i (monomorphic
+    /// sites only).
+    fn mono_entry(&self, i: usize) -> Option<crate::interp::cache::Snapshot> {
+        use crate::interp::cache::kind;
+        let pc = self.u.an.instrs[i].pc as usize;
+        let mut found = None;
+        for e in self.u.tables.poly(pc) {
+            let s = e.read()?;
+            match s.kind {
+                kind::EMPTY => {}
+                kind::UNCACHEABLE => return None,
+                _ => {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(s);
+                }
+            }
+        }
+        found
+    }
+
+    /// Receiver at depth n, guarded to have an exact type with version tag `tag`.
+    fn guard_tag(&mut self, n: usize, tag: u32, snap: SnapId) -> V {
+        let p = self.peek_ptr(n);
+        if self.ty_of(&self.peek(n)) != Ty::Tag(tag) {
+            let ty = self.v(Class::G);
+            self.emit(Inst::Load(ty, Base::V(p), OB_TYPE));
+            self.emit(Inst::Guard(Cond::CmpMem32(Base::V(ty), TP_TAG, tag as i64, Cc::NE), snap));
+            self.learn(n, Ty::Tag(tag));
+        }
+        p
+    }
+
+    /// Inline values area of `p` (tagged managed-dict word), deoptimising if the
+    /// object keeps its attributes in a dict. Returns the untagged-plus-one word.
+    fn values_word(&mut self, p: V, snap: SnapId) -> V {
+        // only objects with a managed dict slot (pre-header) can have inline values
+        let gb = self.v(Class::G);
+        self.emit(Inst::Load8(gb, Base::V(p), GC_BITS));
+        self.emit(Inst::Guard(Cond::Test(gb, Opnd::I(crate::alloc::GC_BIT_MANAGED as i64), Cc::E), snap));
+        let w = self.v(Class::G);
+        self.emit(Inst::Load(w, Base::V(p), MANAGED_DICT));
+        self.emit(Inst::Guard(Cond::Test(w, Opnd::I(1), Cc::E), snap));
+        w
+    }
+
+    /// Check that the shape of values word `w` has `name` at index h.
+    fn guard_shape_key(&mut self, w: V, h: u64, name: usize, snap: SnapId) {
+        let (sh_off, _vals, _id, len_off, keys_off) = crate::shape::jit_layout();
+        let sh = self.v(Class::G);
+        self.emit(Inst::Load(sh, Base::V(w), sh_off - 1));
+        self.emit(Inst::Guard(Cond::Test(sh, Opnd::V(sh), Cc::E), snap));
+        self.emit(Inst::Guard(Cond::CmpMem32(Base::V(sh), len_off, h as i64, Cc::BE), snap));
+        let keys = self.v(Class::G);
+        self.emit(Inst::Load(keys, Base::V(sh), keys_off));
+        self.emit(Inst::Guard(Cond::CmpMem(Base::V(keys), 8 * h as i32, name as i64, Cc::NE), snap));
+    }
+
+    fn has_inline_values(tag: u32) -> bool {
+        // the cache stores the tag, not the type: inline values are checked at run
+        // time by values_word (dict-mode objects deoptimise)
+        let _ = tag;
+        true
+    }
+
+    fn load_attr(&mut self, i: usize) {
+        use crate::interp::cache::kind;
+        let ins = self.u.an.instrs[i];
+        let name = self.u.cd.names[ins.arg as usize].as_ptr() as usize;
+        // module attribute of a folded module object: fold the value too
+        if let AV::Const(m) = self.peek(1) {
+            if let Some(v) = self.folded_module_attr(m, i) {
+                self.pop();
+                self.push(AV::Const(v));
+                return;
+            }
+        }
+        let Some(s) = self.mono_entry(i) else {
+            self.template(i);
+            return;
+        };
+        let tag = s.a as u32;
+        match s.kind {
+            kind::INSTANCE_DICT if s.b < (1 << 20) && Self::has_inline_values(tag) => {
+                let snap = self.snap(i, SnapKind::Deopt);
+                let p = self.guard_tag(1, tag, snap);
+                let w = self.values_word(p, snap);
+                self.guard_shape_key(w, s.b, name, snap);
+                let (_sh, vals_off, _id, _len, _keys) = crate::shape::jit_layout();
+                let x = self.v(Class::G);
+                self.emit(Inst::Load(x, Base::V(w), vals_off - 1 + 8 * s.b as i32));
+                self.emit(Inst::Guard(Cond::Test(x, Opnd::V(x), Cc::E), snap));
+                self.emit(Inst::Incref(x));
+                let k = self.st.stack.len() - 1;
+                let a = self.pop();
+                self.discard(a, k);
+                self.push(AV::Obj(x, Own::Owned, Ty::Unknown));
+            }
+            kind::SLOT => {
+                let snap = self.snap(i, SnapKind::Deopt);
+                let p = self.guard_tag(1, tag, snap);
+                let x = self.v(Class::G);
+                self.emit(Inst::Load(x, Base::V(p), s.c as i32));
+                self.emit(Inst::Guard(Cond::Test(x, Opnd::V(x), Cc::E), snap));
+                self.emit(Inst::Incref(x));
+                let k = self.st.stack.len() - 1;
+                let a = self.pop();
+                self.discard(a, k);
+                self.push(AV::Obj(x, Own::Owned, Ty::Unknown));
+            }
+            kind::CLASS_ATTR if unsafe { (*(s.c as *mut PyObject)).ty().tp_descr_get.is_none() } => {
+                let snap = self.snap(i, SnapKind::Deopt);
+                self.guard_tag(1, tag, snap);
+                let k = self.st.stack.len() - 1;
+                let a = self.pop();
+                self.discard(a, k);
+                // borrowed from the class dict, which the tag guard keeps unchanged
+                self.push(AV::Const(s.c));
+            }
+            _ => self.template(i),
+        }
+    }
+
+    /// Value of attribute `name` of a module object folded into the code, with a
+    /// dependency on the module dict entry.
+    fn folded_module_attr(&mut self, m: usize, i: usize) -> Option<usize> {
+        if !self.u.fold_globals {
+            return None;
+        }
+        unsafe {
+            let mo = &*(m as *mut PyObject);
+            if !mo.is_type(crate::types::module::module_type()) {
+                return None;
+            }
+            // a module subclass or a module type attribute could intercept the lookup
+            let nm = &self.u.cd.names[self.u.an.instrs[i].arg as usize];
+            if !crate::types::str::is_str_exact(nm) || crate::types::typeobject::lookup(mo.type_ptr(), nm).is_some() {
+                return None;
+            }
+            let d = crate::types::module::m(mo).md_dict;
+            if d.is_null() || !crate::types::dict::is_dict_exact(&*d) {
+                return None;
+            }
+            let v = crate::types::dict::get_item_str(&*d, nm)?;
+            if crate::types::lazyimport::is_lazy(&v) {
+                return None;
+            }
+            let vp = v.as_ptr() as usize;
+            self.deps.push((d as usize, nm.as_ptr() as usize, vp));
+            self.has_deps = true;
+            Some(vp)
+        }
+    }
+
+    fn load_method(&mut self, i: usize) {
+        use crate::interp::cache::kind;
+        let ins = self.u.an.instrs[i];
+        let name = self.u.cd.names[ins.arg as usize].as_ptr() as usize;
+        let Some(s) = self.mono_entry(i) else {
+            self.template(i);
+            return;
+        };
+        if !matches!(s.kind, kind::METHOD | kind::METHOD_SHADOWABLE) || s.b == 0 {
+            self.template(i);
+            return;
+        }
+        let tp = s.b as *mut PyTypeObject;
+        if s.kind == kind::METHOD_SHADOWABLE && unsafe { (*tp).tp_flags } & crate::ffi::Py_TPFLAGS_INLINE_VALUES == 0 {
+            // instance dict at tp_dictoffset / dict-only managed dict: generic path
+            self.template(i);
+            return;
+        }
+        let tag = s.a as u32;
+        let snap = self.snap(i, SnapKind::Deopt);
+        let p = self.guard_tag(1, tag, snap);
+        if s.kind == kind::METHOD_SHADOWABLE {
+            // the instance must not have an attribute of that name: no dict, or inline
+            // values whose shape lacks the name (memoised per site: shape lacking it)
+            let w = self.v(Class::G);
+            self.emit(Inst::Load(w, Base::V(p), MANAGED_DICT));
+            let cont = self.new_block(u32::MAX);
+            let check = self.new_block(u32::MAX);
+            self.term(Term::Branch(Cond::Test(w, Opnd::V(w), Cc::E), cont, check));
+            self.cur = check;
+            self.closed = false;
+            self.emit(Inst::Guard(Cond::Test(w, Opnd::I(1), Cc::E), snap));
+            let (sh_off, _vals, _id, _len, _keys) = crate::shape::jit_layout();
+            let sh = self.v(Class::G);
+            self.emit(Inst::Load(sh, Base::V(w), sh_off - 1));
+            let cell = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0))) as *const _ as usize;
+            self.cells.push(cell);
+            let cv = self.imm(cell as i64);
+            let memo = self.v(Class::G);
+            self.emit(Inst::Load(memo, Base::V(cv), 0));
+            let slow = self.new_block(u32::MAX);
+            self.term(Term::Branch(Cond::Cmp(sh, Opnd::V(memo), Cc::E), cont, slow));
+            self.cur = slow;
+            self.closed = false;
+            let r = self.v(Class::G);
+            self.emit(Inst::Call { addr: h_shape_lacks as usize, args: vec![Opnd::V(sh), Opnd::I(name as i64), Opnd::I(cell as i64)], fargs: vec![], ret: Some(r), fret: None });
+            self.emit(Inst::Guard(Cond::Test(r, Opnd::V(r), Cc::E), snap));
+            self.term(Term::Jump(cont));
+            self.cur = cont;
+            self.closed = false;
+        }
+        // [recv] -> [method, recv]: the receiver keeps its abstract value
+        let k = self.st.stack.len() - 1;
+        let recv = self.st.stack[k];
+        let recv = match recv {
+            AV::InFrame(t) => AV::Obj(p, Own::Owned, t),
+            other => other,
+        };
+        self.st.stack[k] = AV::Const(s.c);
+        self.push(recv);
+    }
+
+    fn store_attr(&mut self, i: usize) {
+        use crate::interp::cache::kind;
+        let ins = self.u.an.instrs[i];
+        let name = self.u.cd.names[ins.arg as usize].as_ptr() as usize;
+        let Some(s) = self.mono_entry(i) else {
+            self.template(i);
+            return;
+        };
+        let tag = s.a as u32;
+        // [value, owner]
+        match s.kind {
+            kind::INSTANCE_DICT if s.b < (1 << 20) => {
+                let snap = self.snap(i, SnapKind::Deopt);
+                let p = self.guard_tag(1, tag, snap);
+                let w = self.values_word(p, snap);
+                self.guard_shape_key(w, s.b, name, snap);
+                let (_sh, vals_off, _id, _len, _keys) = crate::shape::jit_layout();
+                let off = vals_off - 1 + 8 * s.b as i32;
+                // other threads may read/write the values lock-free: let the runtime
+                // do the locked store with deferred release then
+                let mt = self.v(Class::G);
+                let mta = self.imm((&raw const crate::threads::MULTI_THREADED) as i64);
+                self.emit(Inst::Load(mt, Base::V(mta), 0));
+                let fast = self.new_block(u32::MAX);
+                let slow = self.new_block(u32::MAX);
+                let cont = self.new_block(u32::MAX);
+                let va = self.peek(2);
+                let val = match va {
+                    AV::InFrame(_) => self.peek_ptr(2),
+                    other => {
+                        let t = self.ty_of(&other);
+                        let v = self.obj_owned(other);
+                        let k = self.st.stack.len() - 2;
+                        self.st.stack[k] = AV::Obj(v, Own::Owned, t);
+                        v
+                    }
+                };
+                // the value entry is now an owned reference in `val` (a deopt from the
+                // slow path stores it back into its frame slot)
+                let snap2 = self.snap(i, SnapKind::Deopt);
+                self.term(Term::Branch(Cond::Test(mt, Opnd::V(mt), Cc::NE), slow, fast));
+                self.cur = fast;
+                self.closed = false;
+                let old = self.v(Class::G);
+                self.emit(Inst::Load(old, Base::V(w), off));
+                self.emit(Inst::Store(Base::V(w), off, val));
+                self.emit(Inst::XDecref(old));
+                self.term(Term::Jump(cont));
+                self.cur = slow;
+                self.closed = false;
+                let r = self.v(Class::G);
+                self.emit(Inst::Call { addr: h_attr_replace as usize, args: vec![Opnd::V(p), Opnd::I(s.b as i64), Opnd::I(name as i64), Opnd::V(val)], fargs: vec![], ret: Some(r), fret: None });
+                self.emit(Inst::Guard(Cond::Test(r, Opnd::V(r), Cc::E), snap2));
+                self.term(Term::Jump(cont));
+                self.cur = cont;
+                self.closed = false;
+                // value moved into the object (fast path) / given to the runtime
+                let k = self.st.stack.len() - 1;
+                let a = self.pop();
+                self.discard(a, k);
+                self.pop();
+            }
+            kind::SLOT => {
+                let snap = self.snap(i, SnapKind::Deopt);
+                let p = self.guard_tag(1, tag, snap);
+                let va = self.peek(2);
+                let val = match va {
+                    AV::InFrame(_) => self.peek_ptr(2),
+                    other => self.obj_owned(other),
+                };
+                let old = self.v(Class::G);
+                self.emit(Inst::Load(old, Base::V(p), s.c as i32));
+                self.emit(Inst::Store(Base::V(p), s.c as i32, val));
+                self.emit(Inst::XDecref(old));
+                let k = self.st.stack.len() - 1;
+                let a = self.pop();
+                self.discard(a, k);
+                self.pop();
+            }
+            _ => self.template(i),
+        }
+    }
+
     fn binary_subscr(&mut self, i: usize) {
         let (pa, pb) = self.prof(i);
         let is_list = pa == prof::LIST;
@@ -1862,6 +2180,35 @@ pub extern "C" fn h_fpow(x: f64, y: f64) -> f64 {
     x.powf(y)
 }
 
+/// Does shape `sh` lack attribute `name` (interned)? If so remember the shape in the
+/// site's memo cell. 1: lacks it, 0: has it (or no shape).
+pub unsafe extern "C" fn h_shape_lacks(sh: *const crate::shape::Shape, name: *mut PyObject, cell: *const std::sync::atomic::AtomicUsize) -> u64 {
+    unsafe {
+        if sh.is_null() {
+            return 0;
+        }
+        if (*sh).keys().contains(&name) {
+            return 0;
+        }
+        (*cell).store(sh as usize, std::sync::atomic::Ordering::Relaxed);
+        1
+    }
+}
+
+/// Locked replacement of attribute `name` at inline index `hint` of `o` (other threads
+/// may run): 1 done (the reference to `v` was moved into the object), 0 the shape
+/// changed (nothing consumed).
+pub unsafe extern "C" fn h_attr_replace(o: *mut PyObject, hint: u64, name: *mut PyObject, v: *mut PyObject) -> u64 {
+    unsafe {
+        if crate::shape::replace_hinted(&*o, name, hint, &*v) {
+            crate::object::decref(v); // replace_hinted took its own reference
+            1
+        } else {
+            0
+        }
+    }
+}
+
 // ================================================================ driver
 
 /// Locals that may be given an unboxed representation: plain locals (not cells,
@@ -1928,6 +2275,7 @@ fn build_once(u: &Unit, reps: &[Rep], assume: &mut Vec<Option<State>>) -> Result
         store_kinds: vec![0; u.nlp],
         has_deps: u.fold_globals && u.an.instrs.iter().any(|x| x.op == Op::LoadGlobal),
         deps: Vec::new(),
+        cells: Vec::new(),
         closed: false,
     };
     // OSR unit: a separate entry block unboxes the unboxed locals from the frame and
@@ -1967,7 +2315,7 @@ fn build_once(u: &Unit, reps: &[Rep], assume: &mut Vec<Option<State>>) -> Result
     // emission order: creation order (bytecode RPO with synthetic blocks appended)
     f.order = (0..f.blocks.len() as u32).collect();
     let sk = b.store_kinds;
-    Ok((Built { func: f, has_deps: b.has_deps, deps: b.deps, instr_block, reps: b.reps, homes: b.homes }, restart, sk))
+    Ok((Built { func: f, has_deps: b.has_deps, deps: b.deps, cells: b.cells, instr_block, reps: b.reps, homes: b.homes }, restart, sk))
 }
 
 /// Build the IR of a unit: choose local representations, iterate loop-header
@@ -1984,6 +2332,7 @@ pub fn build(u: &Unit) -> Result<Built, String> {
             Err(_) => return Err("tier2 builder panicked".into()),
         };
         if restart {
+            super::free_cells(&built.cells);
             continue;
         }
         if !chose_reps {
@@ -2004,6 +2353,7 @@ pub fn build(u: &Unit) -> Result<Built, String> {
                 }
             }
             if changed {
+                super::free_cells(&built.cells);
                 assume.clear();
                 continue;
             }
