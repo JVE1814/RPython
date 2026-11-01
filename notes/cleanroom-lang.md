@@ -108,6 +108,27 @@ the other stdlib modules in this repo that import these names.
 7. `lazy from ... import` (PEP 810) not supported by the compiler
    (test_dataclasses test_lazy_import_annotations).
 
-## Test results
-See the report in the final message of this workstream (before/after numbers, measured
-with identical binary + measurement-only stubs for missing stdlib modules).
+## Test results (passing test+subtest lines, regrtest -v)
+Same binary (this branch, master merged), same measurement-only stubs for stdlib modules
+missing in master (doctest, datetime, pydoc, py_compile, array, unittest.mock — kept in
+/tmp, not committed); "old" = previous files from master put first on PYTHONPATH (run,
+not read). Ignored crashers: test_contextmanager_traceback (runtime bug 3),
+test_parameters_deep_recursion and two hanging get_type_hints cycle tests (test_typing).
+
+| test                  | old ok/fail/err | new ok/fail/err |
+|-----------------------|-----------------|-----------------|
+| test_enum             | 1029 / 41 / 9   | 1077 / 1 / 1    |
+| test_dataclasses      | 264 / 15 / 8    | 283 / 0 / 1     |
+| test_contextlib       | 95 / 1 / 3      | 99 / 0 / 0      |
+| test_contextlib_async | 54 / 3 / 9      | 69 / 0 / 0      |
+| test_collections      | 99 / 3 / 0      | 99 / 3 / 0      |
+| test_abc              | 73 / 1 / 2      | 73 / 1 / 2      |
+| test_typing           | 675 / 27 / 34   | 675 / 27 / 34   |
+| test_pprint           | 63 / 20 / 0     | 63 / 20 / 0     |
+| smoke (bool set tuple enumerate re) | identical | identical |
+
+Remaining failures: test_enum test_pydoc (pydoc missing) and
+test_inspect_classify_class_attrs (runtime bug 5); test_dataclasses
+test_lazy_import_annotations (bug 7); test_collections: test_illegal_patma_flags (_abc
+does not reject SEQUENCE|MAPPING __abc_tpflags__) and two Counter tests
+(collections/__init__.py); test_abc: abc/_py_abc instancecheck edge cases.
