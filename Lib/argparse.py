@@ -728,30 +728,24 @@ class _DefaultedHelp(str):
 
 
 class RawDescriptionHelpFormatter(HelpFormatter):
-    """Help message formatter which retains any formatting in descriptions.
-
-    Only the name of this class is considered a public API.
-    """
+    """Formatter that prints the description and epilog exactly as
+    written (line breaks kept); argument help is still wrapped."""
 
     def _fill_text(self, text, width, indent):
         return ''.join(indent + line for line in text.splitlines(keepends=True))
 
 
 class RawTextHelpFormatter(RawDescriptionHelpFormatter):
-    """Help message formatter which retains formatting of all help text.
-
-    Only the name of this class is considered a public API.
-    """
+    """Formatter that keeps the line breaks of all help texts, argument
+    help included."""
 
     def _split_lines(self, text, width):
         return text.splitlines()
 
 
 class ArgumentDefaultsHelpFormatter(HelpFormatter):
-    """Help message formatter which adds default values to argument help.
-
-    Only the name of this class is considered a public API.
-    """
+    """Formatter that appends "(default: ...)" to the help of arguments
+    that have a default worth mentioning."""
 
     def _get_help_string(self, action):
         text = action.help
@@ -805,12 +799,8 @@ def _get_action_name(argument):
 
 
 class ArgumentError(Exception):
-    """An error from creating or using an argument (optional or
-    positional).
-
-    The string value of this exception is the message, augmented with
-    information about the argument that caused it.
-    """
+    """Raised for a problem with a particular argument, while defining the
+    parser or while parsing; str() names the argument."""
 
     def __init__(self, argument, message):
         self.argument_name = _get_action_name(argument)
@@ -824,7 +814,8 @@ class ArgumentError(Exception):
 
 
 class ArgumentTypeError(Exception):
-    """An error from trying to convert a command line string to a type."""
+    """Raise this from a type= function to report an invalid value with
+    a custom message."""
 
 
 # ---------------------------------------------------------------------------
@@ -832,13 +823,10 @@ class ArgumentTypeError(Exception):
 # ---------------------------------------------------------------------------
 
 class Action(_AttributeHolder):
-    """Information about how to convert command line strings to Python
-    objects.
+    """One argument of a parser and what to do when it is encountered.
 
-    Action objects are used by an ArgumentParser to represent the
-    information needed to parse a single argument from one or more strings
-    from the command line.  The keyword arguments to the Action constructor
-    are also all attributes of Action instances:
+    Subclasses implement __call__(parser, namespace, values,
+    option_string).  The constructor arguments become attributes:
 
     - option_strings: the option strings (e.g. ['-f', '--foo']); empty for
       positional arguments.
@@ -1190,22 +1178,10 @@ class _ExtendAction(_AppendAction):
 # ---------------------------------------------------------------------------
 
 class FileType(object):
-    """Deprecated factory for creating file object types.
+    """(Deprecated) a type= callable opening the named file.
 
-    Instances of FileType are typically passed as type= arguments to the
-    ArgumentParser add_argument() method.  The argument '-' stands for
-    stdin/stdout.
-
-    Keyword Arguments:
-        - mode -- A string indicating how the file is to be opened. Accepts
-            the same values as the builtin open() function.
-        - bufsize -- The file's desired buffer size. Accepts the same values
-            as the builtin open() function.
-        - encoding -- The file's encoding. Accepts the same values as the
-            builtin open() function.
-        - errors -- A string indicating how encoding and decoding errors are
-            to be handled. Accepts the same value as the builtin open()
-            function.
+    The arguments are passed on to open(); the name '-' means
+    sys.stdin or sys.stdout depending on the mode.
     """
 
     def __init__(self, mode='r', bufsize=-1, encoding=None, errors=None):
@@ -1253,11 +1229,8 @@ class FileType(object):
 # ---------------------------------------------------------------------------
 
 class Namespace(_AttributeHolder):
-    """Simple object for storing attributes.
-
-    Implements equality by attribute names and values, and provides a
-    simple string representation.
-    """
+    """The result of parsing: a plain attribute container that compares
+    equal to another Namespace with the same attributes."""
 
     def __init__(self, **kwargs):
         for name in kwargs:
@@ -1343,10 +1316,9 @@ class _ActionsContainer(object):
     # -- adding arguments -------------------------------------------------------------
 
     def add_argument(self, *args, **kwargs):
-        """
-        add_argument(dest, ..., name=value, ...)
-        add_argument(option_string, option_string, ..., name=value, ...)
-        """
+        """Define an argument: a positional one given by its name, or an
+        option given by its option strings (e.g. '-f', '--foo');
+        keywords configure it (action, nargs, default, type, ...)."""
         chars = self.prefix_chars
         if not args or len(args) == 1 and args[0][0] not in chars:
             if args and 'dest' in kwargs:
@@ -1623,28 +1595,19 @@ class _MutuallyExclusiveGroup(_ArgumentGroup):
 # ---------------------------------------------------------------------------
 
 class ArgumentParser(_AttributeHolder, _ActionsContainer):
-    """Object for parsing command line strings into Python objects.
+    """Turns a list of command line strings into a Namespace.
 
-    Keyword Arguments:
-        - prog -- The name of the program (default: derived from
-          sys.argv[0] and how the program was started)
-        - usage -- A usage message (default: auto-generated from arguments)
-        - description -- A description of what the program does
-        - epilog -- Text following the argument descriptions
-        - parents -- Parsers whose arguments should be copied into this one
-        - formatter_class -- HelpFormatter class for printing help messages
-        - prefix_chars -- Characters that prefix optional arguments
-        - fromfile_prefix_chars -- Characters that prefix files containing
-            additional arguments
-        - argument_default -- The default value for all arguments
-        - conflict_handler -- String indicating how to handle conflicts
-        - add_help -- Add a -h/-help option
-        - allow_abbrev -- Allow long options to be abbreviated unambiguously
-        - exit_on_error -- Determines whether or not ArgumentParser exits with
-            error info when an error occurs
-        - suggest_on_error - Enables suggestions for mistyped argument choices
-            and subparser names
-        - color - Allow color output in help messages
+    prog names the program in messages (derived from sys.argv[0] by
+    default); usage, description and epilog are the texts of the help
+    message; parents contributes the arguments of other parsers;
+    formatter_class formats the help; prefix_chars are the characters
+    starting options; fromfile_prefix_chars mark arguments naming files
+    of further arguments; argument_default is the default for all
+    arguments; conflict_handler ('error' or 'resolve') decides about
+    clashing option strings; add_help adds -h/--help; allow_abbrev allows
+    unambiguous prefixes of long options; exit_on_error=False raises
+    ArgumentError instead of exiting; suggest_on_error proposes close
+    matches for invalid choices; color allows coloured output.
     """
 
     def __init__(self,
@@ -2135,14 +2098,8 @@ class ArgumentParser(_AttributeHolder, _ActionsContainer):
         return text
 
     def error(self, message):
-        """error(message: string)
-
-        Prints a usage message incorporating the message to stderr and
-        exits.
-
-        If you override this in a subclass, it should not return -- it
-        should either exit or raise an exception.
-        """
+        """Report *message* (after the usage) on stderr and exit with
+        status 2.  Overrides must not return normally."""
         self.print_usage(_sys.stderr)
         self.exit(2, self._diagnostic(_('%(prog)s: error: %(message)s\n'),
                                       'error:', 'error', message))

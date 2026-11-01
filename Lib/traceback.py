@@ -691,7 +691,7 @@ class _MarkedSource:
 # ---------------------------------------------------------------------------
 
 class StackSummary(list):
-    """A list of FrameSummary objects, representing a stack of frames."""
+    """The frames of a traceback or stack (a list of FrameSummary)."""
 
     @classmethod
     def extract(klass, frame_gen, *, limit=None, lookup_lines=True,
@@ -1013,7 +1013,7 @@ class TracebackException:
 
     @classmethod
     def from_exception(cls, exc, *args, **kwargs):
-        """Create a TracebackException from an exception."""
+        """Capture *exc* (with its own traceback)."""
         return cls(type(exc), exc, exc.__traceback__, *args, **kwargs)
 
     @property
@@ -1036,7 +1036,7 @@ class TracebackException:
         return name
 
     def _load_lines(self):
-        """Private API. force all lines in the stack to be loaded."""
+        """Load the source lines of all frames now."""
         for frame in self.stack:
             frame.line
 
@@ -1100,7 +1100,7 @@ class TracebackException:
                     colorize=colorize)
 
     def _format_syntax_error(self, stype, **kwargs):
-        """Format SyntaxError exceptions (internal helper)."""
+        """Location, source line with markers and message of a SyntaxError."""
         colorize = kwargs.get('colorize', False)
         theme = _theme(colorize)
         suffix = ''
@@ -1250,7 +1250,7 @@ class TracebackException:
     # -- the whole report ------------------------------------------------------------
 
     def print(self, *, file=None, chain=True, **kwargs):
-        """Print the result of self.format(chain=chain) to 'file'."""
+        """Write the formatted exception to *file* (default sys.stderr)."""
         colorize = kwargs.get('colorize', False)
         if file is None:
             file = sys.stderr

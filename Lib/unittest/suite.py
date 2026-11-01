@@ -82,7 +82,7 @@ class BaseTestSuite(object):
         return self.run(*args, **kwds)
 
     def debug(self):
-        """Run the tests without collecting errors in a TestResult"""
+        """Run the tests letting exceptions propagate (no result object)."""
         for test in self:
             test.debug()
 
@@ -123,7 +123,7 @@ class TestSuite(BaseTestSuite):
         return result
 
     def debug(self):
-        """Run the tests without collecting errors in a TestResult"""
+        """Run the tests letting exceptions propagate (no result object)."""
         self.run(_DebugResult(), True)
 
     # -- reporting fixture errors ------------------------------------------------

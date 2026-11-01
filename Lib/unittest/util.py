@@ -115,7 +115,7 @@ def unorderable_list_difference(expected, actual):
 
 
 def three_way_cmp(x, y):
-    """Return -1 if x < y, 0 if x == y and 1 if x > y."""
+    """Comparison as -1, 0 or 1 (for sorting with cmp_to_key)."""
     return (x > y) - (x < y)
 
 

@@ -62,10 +62,10 @@ class TestResult(object):
         self._mirrorOutput = False
 
     def printErrors(self):
-        "Called by TestRunner after test run"
+        """Hook for runners: report the collected problems (no-op here)."""
 
     def startTest(self, test):
-        "Called when the given test is about to be run"
+        """A test starts."""
         self.testsRun += 1
         self._mirrorOutput = False
         self._setupStdout()
@@ -80,13 +80,10 @@ class TestResult(object):
         sys.stderr = self._stderr_buffer
 
     def startTestRun(self):
-        """Called once before any tests are executed.
-
-        See startTest for a method called before each test.
-        """
+        """Hook called once before the whole run."""
 
     def stopTest(self, test):
-        """Called when the given test has been run"""
+        """A test finished (whatever the outcome)."""
         self._restoreStdout()
         self._mirrorOutput = False
 
@@ -110,31 +107,23 @@ class TestResult(object):
             buf.truncate()
 
     def stopTestRun(self):
-        """Called once after all tests are executed.
-
-        See stopTest for a method called after each test.
-        """
+        """Hook called once after the whole run."""
 
     @failfast
     def addError(self, test, err):
-        """Called when an error has occurred. 'err' is a tuple of values as
-        returned by sys.exc_info().
-        """
+        """Record an unexpected exception; *err* is (type, value, tb)."""
         self.errors.append((test, self._exc_info_to_string(err, test)))
         self._mirrorOutput = True
 
     @failfast
     def addFailure(self, test, err):
-        """Called when an error has occurred. 'err' is a tuple of values as
-        returned by sys.exc_info()."""
+        """Record a failed assertion; *err* is (type, value, tb)."""
         self.failures.append((test, self._exc_info_to_string(err, test)))
         self._mirrorOutput = True
 
     def addSubTest(self, test, subtest, err):
-        """Called at the end of a subtest.
-        'err' is None if the subtest ended successfully, otherwise it's a
-        tuple of values as returned by sys.exc_info().
-        """
+        """Record the outcome of a subtest: *err* is None on success,
+        else (type, value, tb)."""
         if err is None:
             return
         if getattr(self, 'failfast', False):
@@ -147,44 +136,41 @@ class TestResult(object):
         self._mirrorOutput = True
 
     def addSuccess(self, test):
-        "Called when a test has completed successfully"
+        """Record a passed test."""
 
     def addSkip(self, test, reason):
-        """Called when a test is skipped."""
+        """Record a skipped test and the reason."""
         self.skipped.append((test, reason))
 
     def addExpectedFailure(self, test, err):
-        """Called when an expected failure/error occurred."""
+        """Record a test that failed as it was expected to."""
         self.expectedFailures.append(
             (test, self._exc_info_to_string(err, test)))
 
     @failfast
     def addUnexpectedSuccess(self, test):
-        """Called when a test was expected to fail, but succeed."""
+        """Record a test that passed although it was expected to fail."""
         self.unexpectedSuccesses.append(test)
 
     def addDuration(self, test, elapsed):
-        """Called when a test finished to run, regardless of its outcome.
-        *test* is the test case corresponding to the test method.
-        *elapsed* is the time represented in seconds, and it includes the
-        execution of cleanup functions.
-        """
+        """Record how long *test* took (seconds, cleanups included)."""
         # older result subclasses may lack the list
         if hasattr(self, 'collectedDurations'):
             self.collectedDurations.append((str(test), elapsed))
 
     def wasSuccessful(self):
-        """Tells whether or not this result was a success."""
+        """True if nothing failed, errored or unexpectedly passed."""
         if self.failures or self.errors:
             return False
         return not getattr(self, 'unexpectedSuccesses', ())
 
     def stop(self):
-        """Indicates that the tests should be aborted."""
+        """Ask the running suite to stop after the current test."""
         self.shouldStop = True
 
     def _exc_info_to_string(self, err, test):
-        """Converts a sys.exc_info()-style tuple of values into a string."""
+        """Render (type, value, tb) as traceback text (plus buffered
+        output)."""
         exctype, value, tb = err
         tb = self._clean_tracebacks(exctype, value, tb, test)
         formatter = traceback.TracebackException(

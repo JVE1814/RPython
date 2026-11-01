@@ -461,18 +461,18 @@ class TestCase(object):
     # -- fixtures -----------------------------------------------------------------
 
     def setUp(self):
-        "Hook method for setting up the test fixture before exercising it."
+        """Prepare the fixture of each test (override as needed)."""
 
     def tearDown(self):
-        "Hook method for deconstructing the test fixture after testing it."
+        """Undo setUp() after each test (override as needed)."""
 
     @classmethod
     def setUpClass(cls):
-        "Hook method for setting up class fixture before running tests in the class."
+        """Prepare state shared by the tests of the class (run once)."""
 
     @classmethod
     def tearDownClass(cls):
-        "Hook method for deconstructing the class fixture after running all tests in the class."
+        """Undo setUpClass() once all tests of the class ran."""
 
     # -- identity -------------------------------------------------------------------
 
@@ -693,7 +693,7 @@ class TestCase(object):
             self._callCleanup(function, *args, **kwargs)
 
     def skipTest(self, reason):
-        """Skip this test."""
+        """Skip the running test with the given reason."""
         raise SkipTest(reason)
 
     # -- assertions ------------------------------------------------------------------
@@ -720,12 +720,12 @@ class TestCase(object):
         raise self.failureException(self._formatMessage(msg, standardMsg))
 
     def assertFalse(self, expr, msg=None):
-        """Check that the expression is false."""
+        """Fail if *expr* is true."""
         if expr:
             self._fail_with(msg, '%s is not false' % safe_repr(expr))
 
     def assertTrue(self, expr, msg=None):
-        """Check that the expression is true."""
+        """Fail unless *expr* is true."""
         if not expr:
             self._fail_with(msg, '%s is not true' % safe_repr(expr))
 
@@ -968,27 +968,25 @@ class TestCase(object):
         self.fail(self._formatMessage(msg, '\n'.join(lines)))
 
     def assertIn(self, member, container, msg=None):
-        """Just like self.assertTrue(a in b), but with a nicer message."""
+        """Fail unless *member* is in *container*."""
         if member not in container:
             self._fail_with(msg, '%s not found in %s' % (
                 safe_repr(member), safe_repr(container)))
 
     def assertNotIn(self, member, container, msg=None):
-        """Just like self.assertTrue(a not in b), but with a nicer
-        message."""
+        """Fail if *member* is in *container*."""
         if member in container:
             self._fail_with(msg, '%s unexpectedly found in %s' % (
                 safe_repr(member), safe_repr(container)))
 
     def assertIs(self, expr1, expr2, msg=None):
-        """Just like self.assertTrue(a is b), but with a nicer message."""
+        """Fail unless both arguments are the same object."""
         if expr1 is not expr2:
             self._fail_with(msg, '%s is not %s' % (safe_repr(expr1),
                                                    safe_repr(expr2)))
 
     def assertIsNot(self, expr1, expr2, msg=None):
-        """Just like self.assertTrue(a is not b), but with a nicer
-        message."""
+        """Fail if both arguments are the same object."""
         if expr1 is expr2:
             self._fail_with(msg, 'unexpectedly identical: %s' %
                             safe_repr(expr1))
@@ -1054,42 +1052,41 @@ class TestCase(object):
         self.fail(self._formatMessage(msg, standard))
 
     def assertLess(self, a, b, msg=None):
-        """Just like self.assertTrue(a < b), but with a nicer message."""
+        """Fail unless a < b."""
         if not a < b:
             self._fail_with(msg, '%s not less than %s' % (safe_repr(a),
                                                           safe_repr(b)))
 
     def assertLessEqual(self, a, b, msg=None):
-        """Just like self.assertTrue(a <= b), but with a nicer message."""
+        """Fail unless a <= b."""
         if not a <= b:
             self._fail_with(msg, '%s not less than or equal to %s' % (
                 safe_repr(a), safe_repr(b)))
 
     def assertGreater(self, a, b, msg=None):
-        """Just like self.assertTrue(a > b), but with a nicer message."""
+        """Fail unless a > b."""
         if not a > b:
             self._fail_with(msg, '%s not greater than %s' % (safe_repr(a),
                                                              safe_repr(b)))
 
     def assertGreaterEqual(self, a, b, msg=None):
-        """Just like self.assertTrue(a >= b), but with a nicer message."""
+        """Fail unless a >= b."""
         if not a >= b:
             self._fail_with(msg, '%s not greater than or equal to %s' % (
                 safe_repr(a), safe_repr(b)))
 
     def assertIsNone(self, obj, msg=None):
-        """Same as self.assertTrue(obj is None), with a nicer message."""
+        """Fail unless *obj* is None."""
         if obj is not None:
             self._fail_with(msg, '%s is not None' % (safe_repr(obj),))
 
     def assertIsNotNone(self, obj, msg=None):
-        """Included for symmetry with assertIsNone."""
+        """Fail if *obj* is None."""
         if obj is None:
             self._fail_with(msg, 'unexpectedly None')
 
     def assertIsInstance(self, obj, cls, msg=None):
-        """Same as self.assertTrue(isinstance(obj, cls)), with a nicer
-        message."""
+        """Fail unless isinstance(obj, cls)."""
         if isinstance(obj, cls):
             return
         if isinstance(cls, tuple):
@@ -1099,7 +1096,7 @@ class TestCase(object):
         self._fail_with(msg, standard)
 
     def assertNotIsInstance(self, obj, cls, msg=None):
-        """Included for symmetry with assertIsInstance."""
+        """Fail if isinstance(obj, cls)."""
         if not isinstance(obj, cls):
             return
         if isinstance(cls, tuple):

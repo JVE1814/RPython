@@ -42,8 +42,8 @@ class TextTestResult(result.TestResult):
     separator2 = '-' * 70
 
     def __init__(self, stream, descriptions, verbosity, *, durations=None):
-        """Construct a TextTestResult. Subclasses should accept **kwargs
-        to ensure compatibility as the interface changes."""
+        """*stream* receives the progress output; *descriptions* adds the
+        first docstring line to test names."""
         super(TextTestResult, self).__init__(stream, descriptions, verbosity)
         self.stream = stream
         self.showAll = verbosity > 1
@@ -164,11 +164,8 @@ class TextTestRunner(object):
     def __init__(self, stream=None, descriptions=True, verbosity=1,
                  failfast=False, buffer=False, resultclass=None,
                  warnings=None, *, tb_locals=False, durations=None):
-        """Construct a TextTestRunner.
-
-        Subclasses should accept **kwargs to ensure compatibility as the
-        interface changes.
-        """
+        """The options are copied onto the result object at run time
+        (failfast, buffer, tb_locals) or used for reporting."""
         if stream is None:
             stream = sys.stderr
         self.stream = _WritelnDecorator(stream)
@@ -214,7 +211,7 @@ class TextTestRunner(object):
             self.stream.writeln('')
 
     def run(self, test):
-        "Run the given test case or test suite."
+        """Run *test* (a case or suite) and report on the stream."""
         result = self._makeResult()
         registerResult(result)
         result.failfast = self.failfast
