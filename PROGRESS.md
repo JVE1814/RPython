@@ -18,6 +18,11 @@
 - Known blockers for importing os/functools/collections: range() with big ints (containers),
   warnings.warn, sys.excepthook (harness), enum (functional).
 
+## C ABI / wheels
+pip (bundled 26.2.2 via ensurepip) installs the unmodified numpy-2.5.4-cp315-cp315t-manylinux wheel in a venv on
+our interpreter; `import numpy` works (array math, linalg, fft, datetime64); numpy test_abc 5/5, test_api 59/59.
+Blockers being fixed (numpy workstream): Cython code objects (numpy.random), C-created frame f_locals.
+
 ## Regression suite
 Reference (CPython 3.15.2 free-threaded, this machine, tools/run_tests.sh):
 434 modules: 416 PASS, 18 FAIL; tests run 50,649, failures 24, skipped 3,371.
