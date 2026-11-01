@@ -68,7 +68,30 @@ of the remaining failures are `-I` subprocess tests that cannot see spec/Lib in 
 test_sys_settrace 262 -> fewer failures (jump support added after the last measurement);
 test_monitoring: cascade fixed (tool events left set by a failing test).
 
+## Crash/hang fixes already made here (for the stability workstream)
+* test_descr: `__del__` assigning `__class__` (subtype_dealloc re-reads the type), `__bases__`
+  tp_base cycle (stack overflow), shared `__dict__` descriptor on classes recursed,
+  metaclass without tp_new (unwrap panic).
+* test_exceptions: context-chain cycle hang (Floyd in chain_context), UnicodeError.__str__
+  after `del exc.object` (use-after-free), deeply nested tuples in
+  PyErr_GivenExceptionMatches (stack overflow).
+* test_generators: throw() of a class whose call returns a non-exception (traceback stored
+  into a type object).
+* test_typing/test_isinstance: recursion guards (`__parameters__`, isinstance/issubclass
+  tuples and `__bases__`); threads with small stacks no longer fail at start
+  (stack margin scaled to the thread's stack size).
+* test_builtin: dir() inside eval with non-dict locals read garbage.
+* List races: eval/jit BINARY_SUBSCR and jit UNPACK fast paths on lists now read under the
+  list lock (a stress test of `self[:] = ...` vs readers on a list subclass passed 4x5s);
+  old item arrays are still freed immediately (no deferred reclamation implemented).
+* Not investigated: gc::untrack race, test_enum Flag threads, multiprocessing heap
+  corruption, the startup `ByteString` DeprecationWarning (not reproducible with this
+  tree's stdlib: `-W error -c pass` and `import collections, typing` are clean).
+
 ## Known gaps / bugs
+* Interpreter finalization: no module teardown / `__del__` at exit (test_threading).
+* `_PyImport_FrozenBootstrap/_FrozenStdlib/_FrozenTest` data symbols not exported (no
+  frozen modules exist; test_ctypes test_frozentable).
 * Monitoring offsets are our instruction indices * 4; tests that compare CPython's exact
   offsets (BRANCH_OFFSET recorders) cannot match.
 * f_lineno jumps: target = first instruction of the first line >= n with a compatible
