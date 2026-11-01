@@ -52,6 +52,22 @@ Files: `Lib/inspect.py`, `Lib/logging/__init__.py`, `Lib/logging/handlers.py`,
   multiprocessing.  Hence all four target tests fail at import under the
   real regrtest both before and after this work.
 
+## Results with the stub harness (pre-merge master runtime; failing test methods)
+| module        | tests | old files | new files |
+|---------------|-------|-----------|-----------|
+| test_tempfile | 121   | 8 fail    | 7 fail    |
+| test_shutil   | 227   | 30 fail   | 20 fail   |
+| test_inspect  | 382   | 82 fail   | 66 fail   |
+| test_logging* | 264   | 105 fail  | 42 fail   |
+(*) socket/HTTP/SMTP/listen/QueueListener classes excluded because they
+hang with stubbed sockets/multiprocessing (identically for old and new).
+No test passing with the old files fails with the new ones, except two
+fileConfig tests that "passed" only because logging.config did not exist
+and was stubbed (configparser missing).  Remaining failures are mostly
+stub artefacts (mock/datetime/socket) and runtime gaps (builtins without
+`__text_signature__`, classmethod as metaclass `__call__` not bound,
+co_positions columns, REPL linecache).
+
 ## Measuring
 Because of the import failures, pass rates were measured with a local stub
 harness (not committed): unimportable modules are replaced by inert stubs so
