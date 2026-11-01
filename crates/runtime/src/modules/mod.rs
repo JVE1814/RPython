@@ -13,6 +13,8 @@ pub mod traceback_print;
 pub mod ast_bridge;
 pub mod os_fspath;
 pub mod sys_trace_api;
+pub mod sys_structseq;
+pub mod sys_namespace;
 pub mod codecs_core;
 pub mod codecs_registry;
 pub mod reprlib_guard;
