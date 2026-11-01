@@ -104,7 +104,7 @@ fn plain_modpow(base: &[u32], e: &[u32], m: &[u32]) -> Vec<u32> {
         }
         match &divisor {
             Some(d) => d.divrem(&x).1,
-            None => crate::div::divrem_knuth(&x, m).1,
+            None => nat::divrem(&x, m).1,
         }
     };
     sliding_window(vec![1], base.to_vec(), e, |a, b| {
@@ -135,15 +135,24 @@ impl<'a> Mont<'a> {
     }
 
     /// REDC of t (len 2n, t < m * R): returns t * R^-1 mod m (fully reduced).
-    fn redc(&self, mut t: Vec<u32>) -> Vec<u32> {
+    fn redc(&self, t: Vec<u32>) -> Vec<u32> {
         let n = self.m.len();
-        t.resize(2 * n + 1, 0);
-        for i in 0..n {
-            let u = ((t[i] as u64 * self.minv as u64) as u32) & MASK;
-            let c = nat::mul_digit_add(&mut t[i..i + n], self.m, u);
-            nat::add_digit_assign(&mut t[i + n..], c);
+        let mut acc = vec![0u64; 2 * n + 2];
+        #[cfg(target_arch = "x86_64")]
+        {
+            if crate::cpu::avx512() {
+                unsafe { redc_avx512(&t, self.m, self.minv, &mut acc) };
+            } else if crate::cpu::avx2() {
+                unsafe { redc_avx2(&t, self.m, self.minv, &mut acc) };
+            } else {
+                unsafe { redc_generic(&t, self.m, self.minv, &mut acc) };
+            }
         }
-        let mut r = t[n..].to_vec();
+        #[cfg(not(target_arch = "x86_64"))]
+        unsafe {
+            redc_generic(&t, self.m, self.minv, &mut acc)
+        };
+        let mut r: Vec<u32> = acc[n..2 * n + 1].iter().map(|&v| v as u32).collect();
         nat::normalize(&mut r);
         if nat::cmp(&r, self.m) != Ordering::Less {
             nat::sub_in_place(&mut r, self.m);
@@ -176,3 +185,50 @@ fn mont_modpow(base: &[u32], e: &[u32], m: &[u32]) -> Vec<u32> {
     // convert out of Montgomery form
     ctx.redc(r)
 }
+
+// Montgomery reduction with lazy carries in u64 accumulators (SIMD friendly): each row adds
+// u_i * m into the window; carries are propagated only every 14 rows.
+macro_rules! redc_impl {
+    ($name:ident $(, #[$attr:meta])?) => {
+        $(#[$attr])?
+        unsafe fn $name(t: &[u32], m: &[u32], minv: u32, acc: &mut [u64]) {
+            let n = m.len();
+            for (x, &y) in acc.iter_mut().zip(t.iter()) {
+                *x = y as u64;
+            }
+            let mut pending = 0;
+            for i in 0..n {
+                let u = ((acc[i] as u32).wrapping_mul(minv) & MASK) as u64;
+                for (x, &y) in acc[i..i + n].iter_mut().zip(m.iter()) {
+                    *x += u * y as u64;
+                }
+                let c = acc[i] >> SHIFT;
+                acc[i + 1] += c;
+                pending += 1;
+                if pending == 14 || i + 1 == n {
+                    let mut carry = 0u64;
+                    for x in acc[i + 1..i + n + 1].iter_mut() {
+                        let v = *x + carry;
+                        *x = v & MASK as u64;
+                        carry = v >> SHIFT;
+                    }
+                    acc[i + n + 1] += carry;
+                    pending = 0;
+                }
+            }
+            // final normalization of the result window
+            let mut carry = 0u64;
+            for x in acc[n..2 * n + 2].iter_mut() {
+                let v = *x + carry;
+                *x = v & MASK as u64;
+                carry = v >> SHIFT;
+            }
+        }
+    };
+}
+
+redc_impl!(redc_generic);
+#[cfg(target_arch = "x86_64")]
+redc_impl!(redc_avx2, #[target_feature(enable = "avx2")]);
+#[cfg(target_arch = "x86_64")]
+redc_impl!(redc_avx512, #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2")]);
