@@ -107,4 +107,8 @@ async def staggered_race(coro_fns, delay, *, loop=None):
             raise cancelled_with
         finally:
             cancelled_with = None
-    return outcome['result'], outcome['index'], errors
+    result = outcome['result'], outcome['index'], errors
+    # the frames in the errors' tracebacks reach this list through the
+    # closure cell: clear the cell so no reference cycle remains
+    errors = None
+    return result
