@@ -1,122 +1,110 @@
-"""Support for running coroutines in parallel with staggered start times."""
+"""Race coroutines started at staggered times ("happy eyeballs")."""
 
 __all__ = 'staggered_race',
-
-import contextlib
 
 from . import events
 from . import exceptions as exceptions_mod
 from . import futures
-from . import locks
 from . import tasks
 
 
 async def staggered_race(coro_fns, delay, *, loop=None):
-    """Run coroutines with staggered start times and take the first to finish.
+    """Start the coroutine functions of *coro_fns* one after another and
+    return the first successful result.
 
-    Each coroutine function in *coro_fns* is started either when the
-    previous one failed or *delay* seconds after it started, whichever
-    comes first (delay None: wait for the failure).  The first coroutine
-    to complete successfully wins and all others are cancelled.
+    The next candidate starts as soon as the previous one fails, or
+    *delay* seconds after it started (delay None: only on failure).  Once
+    one succeeds all others are cancelled.
 
-    Returns (winner_result, winner_index, exceptions): winner_index is None
-    if all coroutines failed; exceptions lists the exception of each
-    started coroutine (None for the winner and cancelled ones).
+    Returns (winner_result, winner_index, exceptions) where exceptions has
+    one entry per started candidate (None for the winner).  winner_index is
+    None when every candidate failed.
     """
     loop = loop or events.get_running_loop()
-    parent_task = tasks.current_task(loop)
-    enum_coro_fns = enumerate(coro_fns)
-    winner_result = None
-    winner_index = None
-    unhandled_exceptions = []
-    exceptions = []
-    running_tasks = set()
-    on_completed_fut = None
+    parent = tasks.current_task(loop)
+    errors = []
+    running = set()
+    outcome = {'index': None, 'result': None}
+    wake = None          # future resolved on a failure or a win
+    all_done = None      # future resolved when `running` empties
 
-    def task_done(task):
-        running_tasks.discard(task)
-        futures.future_discard_from_awaited_by(task, parent_task)
-        if (
-            on_completed_fut is not None
-            and not on_completed_fut.done()
-            and not running_tasks
-        ):
-            on_completed_fut.set_result(None)
+    def poke():
+        if wake is not None and not wake.done():
+            wake.set_result(None)
 
-        if task.cancelled():
-            return
+    def attempt_finished(task):
+        running.discard(task)
+        futures.future_discard_from_awaited_by(task, parent)
+        if not running and all_done is not None and not all_done.done():
+            all_done.set_result(None)
 
-        exc = task.exception()
-        if exc is None:
-            return
-        unhandled_exceptions.append(exc)
-
-    async def run_one_coro(ok_to_start, previous_failed) -> None:
-        # With eager tasks this lets the caller register the task in
-        # running_tasks before the coroutine starts.
-        await ok_to_start.wait()
-        if previous_failed is not None:
-            with contextlib.suppress(exceptions_mod.TimeoutError):
-                # wait_for() (not wait()) so that a cancellation here also
-                # cancels the Event.wait() coroutine
-                await tasks.wait_for(previous_failed.wait(), delay)
+    async def attempt(index, fn):
         try:
-            this_index, coro_fn = next(enum_coro_fns)
-        except StopIteration:
-            return
-        this_failed = locks.Event()
-        next_ok_to_start = locks.Event()
-        next_task = loop.create_task(run_one_coro(next_ok_to_start, this_failed))
-        futures.future_add_to_awaited_by(next_task, parent_task)
-        running_tasks.add(next_task)
-        next_task.add_done_callback(task_done)
-        next_ok_to_start.set()
-        exceptions.append(None)
-        assert len(exceptions) == this_index + 1
-
-        try:
-            result = await coro_fn()
+            value = await fn()
         except (SystemExit, KeyboardInterrupt):
             raise
-        except BaseException as e:
-            exceptions[this_index] = e
-            this_failed.set()  # start the next coroutine now
-        else:
-            nonlocal winner_index, winner_result
-            assert winner_index is None
-            winner_index = this_index
-            winner_result = result
-            # Cancel the others, but not ourselves: there is no await left
-            # in this task to deliver a CancelledError to.
-            current_task = tasks.current_task(loop)
-            for t in running_tasks:
-                if t is not current_task:
-                    t.cancel()
+        except BaseException as exc:
+            errors[index] = exc
+            poke()
+            return
+        if outcome['index'] is not None:
+            return
+        outcome['index'], outcome['result'] = index, value
+        me = tasks.current_task(loop)
+        for other in list(running):
+            if other is not me:
+                other.cancel()
+        poke()
 
-    propagate_cancellation_error = None
+    def cancel_everything(*args):
+        for task in list(running):
+            task.cancel(*args)
+
+    cancelled_with = None
     try:
-        ok_to_start = locks.Event()
-        first_task = loop.create_task(run_one_coro(ok_to_start, None))
-        futures.future_add_to_awaited_by(first_task, parent_task)
-        running_tasks.add(first_task)
-        first_task.add_done_callback(task_done)
-        ok_to_start.set()
-        propagate_cancellation_error = None
-        # never leave tasks running behind
-        while running_tasks:
-            on_completed_fut = loop.create_future()
+        for index, fn in enumerate(coro_fns):
+            if outcome['index'] is not None:
+                break
+            errors.append(None)
+            wake = loop.create_future()
+            task = loop.create_task(attempt(index, fn))
+            futures.future_add_to_awaited_by(task, parent)
+            if task.done():
+                attempt_finished(task)
+            else:
+                running.add(task)
+                task.add_done_callback(attempt_finished)
+            if wake.done() or not running:
+                continue
+            timer = None if delay is None else loop.call_later(delay, poke)
             try:
-                await on_completed_fut
-            except exceptions_mod.CancelledError as ex:
-                propagate_cancellation_error = ex
-                for task in running_tasks:
-                    task.cancel(*ex.args)
-            on_completed_fut = None
-        if __debug__ and unhandled_exceptions:
-            # an exception escaping run_one_coro() is a bug: surface it
-            raise ExceptionGroup("staggered race failed", unhandled_exceptions)
-        if propagate_cancellation_error is not None:
-            raise propagate_cancellation_error
-        return winner_result, winner_index, exceptions
-    finally:
-        del exceptions, propagate_cancellation_error, unhandled_exceptions, parent_task
+                await wake
+            finally:
+                if timer is not None:
+                    timer.cancel()
+            if delay is None and outcome['index'] is None and running:
+                # failure of this candidate: start the next one
+                continue
+        # wait for the stragglers (cancelled losers)
+        while running:
+            all_done = loop.create_future()
+            try:
+                await all_done
+            except exceptions_mod.CancelledError as exc:
+                cancelled_with = exc
+                cancel_everything(*exc.args)
+    except exceptions_mod.CancelledError as exc:
+        cancelled_with = exc
+        cancel_everything(*exc.args)
+        while running:
+            all_done = loop.create_future()
+            try:
+                await all_done
+            except exceptions_mod.CancelledError:
+                cancel_everything(*exc.args)
+    if cancelled_with is not None:
+        try:
+            raise cancelled_with
+        finally:
+            cancelled_with = None
+    return outcome['result'], outcome['index'], errors

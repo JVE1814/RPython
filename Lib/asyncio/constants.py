@@ -1,28 +1,28 @@
-"""Constants shared by the asyncio modules."""
+"""Tunables used across the asyncio implementation."""
 
 import enum
 
-# Number of consecutive writes after a lost connection before warning.
+# Warn after this many write() calls on a transport whose connection is lost.
 LOG_THRESHOLD_FOR_CONNLOST_WRITES = 5
 
-# Seconds to wait before retrying accept() after a resource error.
+# Back-off (seconds) after accept() failed for lack of resources.
 ACCEPT_RETRY_DELAY = 1
 
-# Frames kept by Handle/Future/Task source tracebacks in debug mode.
+# Depth of the creation stacks recorded in debug mode.
 DEBUG_STACK_DEPTH = 10
 
-# Default SSL handshake / shutdown timeouts (seconds).
+# TLS handshake and shutdown time limits (seconds).
 SSL_HANDSHAKE_TIMEOUT = 60.0
 SSL_SHUTDOWN_TIMEOUT = 30.0
 
-# Read buffer size of the sendfile() fallback implementation.
-SENDFILE_FALLBACK_READBUFFER_SIZE = 1024 * 256
+# Chunk size of the read()/write() based sendfile emulation.
+SENDFILE_FALLBACK_READBUFFER_SIZE = 256 * 1024
 
-# SSL flow control high-water marks (KiB).
+# Flow control limits of the TLS layer (in KiB).
 FLOW_CONTROL_HIGH_WATER_SSL_READ = 256
 FLOW_CONTROL_HIGH_WATER_SSL_WRITE = 512
 
-# Default timeout for joining threads in loop.shutdown_default_executor().
+# How long loop.shutdown_default_executor() waits for the worker threads.
 THREAD_JOIN_TIMEOUT = 300
 
 

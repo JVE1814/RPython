@@ -1,4 +1,4 @@
-"""Abstract Transport class."""
+"""Transport interfaces and write flow control."""
 
 __all__ = (
     'BaseTransport', 'ReadTransport', 'WriteTransport',
@@ -6,160 +6,103 @@ __all__ = (
 )
 
 
+def _abstract(name, doc):
+    def method(self, *args, **kwargs):
+        raise NotImplementedError
+    method.__name__ = name
+    method.__doc__ = doc
+    return method
+
+
 class BaseTransport:
-    """Base class for transports."""
+    """Common base of all transports."""
 
     __slots__ = ('_extra',)
 
     def __init__(self, extra=None):
-        if extra is None:
-            extra = {}
-        self._extra = extra
+        self._extra = {} if extra is None else extra
 
     def get_extra_info(self, name, default=None):
-        """Get optional transport information."""
+        """Optional information about the transport (peername, socket...)."""
         return self._extra.get(name, default)
 
-    def is_closing(self):
-        """Return True if the transport is closing or closed."""
-        raise NotImplementedError
-
-    def close(self):
-        """Close the transport.
-
-        Buffered data is flushed asynchronously; then the protocol's
-        connection_lost() is called with None.
-        """
-        raise NotImplementedError
-
-    def set_protocol(self, protocol):
-        """Set a new protocol."""
-        raise NotImplementedError
-
-    def get_protocol(self):
-        """Return the current protocol."""
-        raise NotImplementedError
+    is_closing = _abstract('is_closing', "True once close() was called.")
+    close = _abstract('close', "Close; buffered data is still flushed.")
+    set_protocol = _abstract('set_protocol', "Switch to another protocol.")
+    get_protocol = _abstract('get_protocol', "The current protocol.")
 
 
 class ReadTransport(BaseTransport):
-    """Interface for read-only transports."""
+    """Receiving side of a transport."""
 
     __slots__ = ()
 
-    def is_reading(self):
-        """Return True if the transport is receiving."""
-        raise NotImplementedError
-
-    def pause_reading(self):
-        """Stop calling the protocol's data_received() until resumed."""
-        raise NotImplementedError
-
-    def resume_reading(self):
-        """Resume calling the protocol's data_received()."""
-        raise NotImplementedError
+    is_reading = _abstract('is_reading', "True unless reading is paused.")
+    pause_reading = _abstract('pause_reading',
+                              "Stop delivering data to the protocol.")
+    resume_reading = _abstract('resume_reading',
+                               "Deliver data to the protocol again.")
 
 
 class WriteTransport(BaseTransport):
-    """Interface for write-only transports."""
+    """Sending side of a transport."""
 
     __slots__ = ()
 
-    def set_write_buffer_limits(self, high=None, low=None):
-        """Set the high- and low-water limits for write flow control.
-
-        pause_writing() is called on the protocol when the buffer goes
-        over *high*, resume_writing() when it drains to *low* or below.
-        """
-        raise NotImplementedError
-
-    def get_write_buffer_size(self):
-        """Return the current size of the write buffer."""
-        raise NotImplementedError
-
-    def get_write_buffer_limits(self):
-        """Get the high and low watermarks for write flow control.
-        Return a tuple (low, high) where low and high are
-        positive number of bytes."""
-        raise NotImplementedError
-
-    def write(self, data):
-        """Write some data bytes to the transport (never blocks)."""
-        raise NotImplementedError
+    set_write_buffer_limits = _abstract(
+        'set_write_buffer_limits',
+        "Set the high/low water marks driving pause/resume_writing().")
+    get_write_buffer_size = _abstract('get_write_buffer_size',
+                                      "Bytes waiting in the write buffer.")
+    get_write_buffer_limits = _abstract('get_write_buffer_limits',
+                                        "The (low, high) water marks.")
+    write = _abstract('write', "Queue bytes for sending (never blocks).")
+    write_eof = _abstract('write_eof',
+                          "Half-close after the buffered data is sent.")
+    can_write_eof = _abstract('can_write_eof',
+                              "True if write_eof() is supported.")
+    abort = _abstract('abort', "Close at once, dropping buffered data.")
 
     def writelines(self, list_of_data):
-        """Write a list (or any iterable) of data bytes to the transport."""
-        data = b''.join(list_of_data)
-        self.write(data)
-
-    def write_eof(self):
-        """Close the write end after flushing buffered data."""
-        raise NotImplementedError
-
-    def can_write_eof(self):
-        """Return True if this transport supports write_eof()."""
-        raise NotImplementedError
-
-    def abort(self):
-        """Close the transport immediately, discarding buffered data."""
-        raise NotImplementedError
+        """Write an iterable of bytes-like objects."""
+        self.write(b''.join(list_of_data))
 
 
 class Transport(ReadTransport, WriteTransport):
-    """Interface representing a bidirectional transport."""
+    """Bidirectional stream transport."""
 
     __slots__ = ()
 
 
 class DatagramTransport(BaseTransport):
-    """Interface for datagram (UDP) transports."""
+    """Datagram transport."""
 
     __slots__ = ()
 
-    def sendto(self, data, addr=None):
-        """Send *data* (bytes) to *addr* (or the connected peer)."""
-        raise NotImplementedError
-
-    def abort(self):
-        """Close the transport immediately, discarding buffered data."""
-        raise NotImplementedError
+    sendto = _abstract('sendto', "Send a datagram to addr (or the peer).")
+    abort = _abstract('abort', "Close at once, dropping buffered data.")
 
 
 class SubprocessTransport(BaseTransport):
+    """Transport controlling a child process."""
 
     __slots__ = ()
 
-    def get_pid(self):
-        """Get subprocess id."""
-        raise NotImplementedError
-
-    def get_returncode(self):
-        """Get subprocess returncode (None while running)."""
-        raise NotImplementedError
-
-    def get_pipe_transport(self, fd):
-        """Get transport for pipe with number fd."""
-        raise NotImplementedError
-
-    def send_signal(self, signal):
-        """Send signal to subprocess."""
-        raise NotImplementedError
-
-    def terminate(self):
-        """Stop the subprocess (SIGTERM)."""
-        raise NotImplementedError
-
-    def kill(self):
-        """Kill the subprocess (SIGKILL)."""
-        raise NotImplementedError
+    get_pid = _abstract('get_pid', "The child's process id.")
+    get_returncode = _abstract('get_returncode',
+                               "The exit status, None while running.")
+    get_pipe_transport = _abstract('get_pipe_transport',
+                                   "Transport of the child's pipe fd.")
+    send_signal = _abstract('send_signal', "Send a signal to the child.")
+    terminate = _abstract('terminate', "Ask the child to terminate.")
+    kill = _abstract('kill', "Kill the child.")
 
 
 class _FlowControlMixin(Transport):
-    """Write flow control for transports.
+    """Write flow control driven by get_write_buffer_size().
 
-    Subclasses implement get_write_buffer_size() and call
-    _maybe_pause_protocol() after buffering data and
-    _maybe_resume_protocol() after draining it.  They must define
-    self._loop and self._protocol.
+    Users call _maybe_pause_protocol() after buffering and
+    _maybe_resume_protocol() after flushing; self._protocol must be set.
     """
 
     __slots__ = ('_loop', '_protocol_paused', '_high_water', '_low_water')
@@ -171,58 +114,43 @@ class _FlowControlMixin(Transport):
         self._protocol_paused = False
         self._set_write_buffer_limits()
 
+    def _notify_protocol(self, name):
+        try:
+            getattr(self._protocol, name)()
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except BaseException as exc:
+            self._loop.call_exception_handler({
+                'message': f'protocol.{name}() failed',
+                'exception': exc,
+                'transport': self,
+                'protocol': self._protocol,
+            })
+
     def _maybe_pause_protocol(self):
-        size = self.get_write_buffer_size()
-        if size <= self._high_water:
-            return
-        if not self._protocol_paused:
+        if self.get_write_buffer_size() > self._high_water and \
+                not self._protocol_paused:
             self._protocol_paused = True
-            try:
-                self._protocol.pause_writing()
-            except (SystemExit, KeyboardInterrupt):
-                raise
-            except BaseException as exc:
-                self._loop.call_exception_handler({
-                    'message': 'protocol.pause_writing() failed',
-                    'exception': exc,
-                    'transport': self,
-                    'protocol': self._protocol,
-                })
+            self._notify_protocol('pause_writing')
 
     def _maybe_resume_protocol(self):
-        if (self._protocol_paused and
-                self.get_write_buffer_size() <= self._low_water):
+        if self._protocol_paused and \
+                self.get_write_buffer_size() <= self._low_water:
             self._protocol_paused = False
-            try:
-                self._protocol.resume_writing()
-            except (SystemExit, KeyboardInterrupt):
-                raise
-            except BaseException as exc:
-                self._loop.call_exception_handler({
-                    'message': 'protocol.resume_writing() failed',
-                    'exception': exc,
-                    'transport': self,
-                    'protocol': self._protocol,
-                })
+            self._notify_protocol('resume_writing')
 
     def get_write_buffer_limits(self):
         return (self._low_water, self._high_water)
 
     def _set_write_buffer_limits(self, high=None, low=None):
         if high is None:
-            if low is None:
-                high = 64 * 1024
-            else:
-                high = 4 * low
+            high = 64 * 1024 if low is None else 4 * low
         if low is None:
             low = high // 4
-
         if not high >= low >= 0:
             raise ValueError(
                 f'high ({high!r}) must be >= low ({low!r}) must be >= 0')
-
-        self._high_water = high
-        self._low_water = low
+        self._high_water, self._low_water = high, low
 
     def set_write_buffer_limits(self, high=None, low=None):
         self._set_write_buffer_limits(high=high, low=low)

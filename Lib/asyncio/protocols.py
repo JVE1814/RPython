@@ -1,4 +1,4 @@
-"""Abstract protocol classes."""
+"""Protocol interfaces: the callbacks transports invoke."""
 
 __all__ = (
     'BaseProtocol', 'Protocol', 'DatagramProtocol',
@@ -7,111 +7,88 @@ __all__ = (
 
 
 class BaseProtocol:
-    """Common base class for protocol interfaces.
-
-    Callbacks are invoked by transports; the default implementations do
-    nothing.
-    """
+    """Callbacks common to all protocols (all no-ops by default)."""
 
     __slots__ = ()
 
     def connection_made(self, transport):
-        """Called when a connection is made; *transport* represents it."""
+        """The connection is up; *transport* is the way to talk to it."""
 
     def connection_lost(self, exc):
-        """Called when the connection is lost or closed (exc is None on
-        EOF or close)."""
+        """The connection is gone (exc is None for a normal close/EOF)."""
 
     def pause_writing(self):
-        """Called when the transport's buffer goes over the high-water mark."""
+        """The transport's write buffer went above the high-water mark."""
 
     def resume_writing(self):
-        """Called when the transport's buffer drains below the low-water
-        mark."""
+        """The transport's write buffer drained to the low-water mark."""
 
 
 class Protocol(BaseProtocol):
-    """Interface for stream protocols.
-
-    State machine: start -> connection_made [-> data_received]*
-    [-> eof_received]? -> connection_lost -> end
-    """
+    """Stream protocol: connection_made, data_received*, eof_received?,
+    connection_lost."""
 
     __slots__ = ()
 
     def data_received(self, data):
-        """Called when some data (bytes) is received."""
+        """Some bytes arrived."""
 
     def eof_received(self):
-        """Called when the other end called write_eof().
-
-        Returning a true value keeps the transport open (half-closed).
-        """
+        """The peer will send nothing more; a true return value keeps our
+        side open for writing."""
 
 
 class BufferedProtocol(BaseProtocol):
-    """Interface for stream protocols with manual control of the receive
-    buffer.
-
-    State machine: start -> connection_made
-    [-> get_buffer [-> buffer_updated]?]* [-> eof_received]?
-    -> connection_lost -> end
-    """
+    """Stream protocol that lends its own buffer for receiving."""
 
     __slots__ = ()
 
     def get_buffer(self, sizehint):
-        """Return a non-empty writable buffer to receive data into
-        (*sizehint* is a hint, -1 meaning any size)."""
+        """Return a writable, non-empty buffer (sizehint -1: any size)."""
 
     def buffer_updated(self, nbytes):
-        """Called when *nbytes* bytes were written into the buffer."""
+        """*nbytes* bytes were written into the last buffer returned."""
 
     def eof_received(self):
-        """Called when the other end called write_eof()."""
+        """The peer will send nothing more."""
 
 
 class DatagramProtocol(BaseProtocol):
-    """Interface for datagram protocols."""
+    """Datagram (UDP-like) protocol."""
 
     __slots__ = ()
 
     def datagram_received(self, data, addr):
-        """Called when a datagram is received."""
+        """A datagram arrived from *addr*."""
 
     def error_received(self, exc):
-        """Called when a send or receive operation fails (OSError)."""
+        """A send or receive failed with OSError *exc*."""
 
 
 class SubprocessProtocol(BaseProtocol):
-    """Interface for protocols of subprocess transports."""
+    """Protocol of a subprocess transport."""
 
     __slots__ = ()
 
     def pipe_data_received(self, fd, data):
-        """Called when the child writes *data* to its stdout/stderr (*fd*)."""
+        """The child wrote *data* on its stdout (fd 1) or stderr (fd 2)."""
 
     def pipe_connection_lost(self, fd, exc):
-        """Called when a pipe of the child is closed."""
+        """One of the child's pipes was closed."""
 
     def process_exited(self):
-        """Called when the subprocess has exited."""
+        """The child process terminated."""
 
 
 def _feed_data_to_buffered_proto(proto, data):
-    data_len = len(data)
-    while data_len:
-        buf = proto.get_buffer(data_len)
-        buf_len = len(buf)
-        if not buf_len:
+    """Deliver *data* through get_buffer()/buffer_updated()."""
+    view = memoryview(data)
+    while view:
+        buf = proto.get_buffer(len(view))
+        room = len(buf)
+        if not room:
             raise RuntimeError('get_buffer() returned an empty buffer')
-
-        if buf_len >= data_len:
-            buf[:data_len] = data
-            proto.buffer_updated(data_len)
-            return
-        else:
-            buf[:buf_len] = data[:buf_len]
-            proto.buffer_updated(buf_len)
-            data = data[buf_len:]
-            data_len = len(data)
+        n = min(room, len(view))
+        buf[:n] = view[:n]
+        proto.buffer_updated(n)
+        view = view[n:]

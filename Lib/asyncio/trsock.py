@@ -1,53 +1,35 @@
+"""Restricted view of a transport's socket."""
+
 import socket
 
 
 class TransportSocket:
-
-    """A safe wrapper around the socket of a transport.
-
-    Only operations that cannot break the transport (no I/O, no state
-    changes like blocking mode) are exposed.
-    """
+    """Wrapper exposing only socket operations that cannot disturb the
+    owning transport (no I/O, no blocking-mode changes)."""
 
     __slots__ = ('_sock',)
 
     def __init__(self, sock: socket.socket):
         self._sock = sock
 
-    @property
-    def family(self):
-        return self._sock.family
-
-    @property
-    def type(self):
-        return self._sock.type
-
-    @property
-    def proto(self):
-        return self._sock.proto
+    family = property(lambda self: self._sock.family)
+    type = property(lambda self: self._sock.type)
+    proto = property(lambda self: self._sock.proto)
 
     def __repr__(self):
-        s = (
-            f"<asyncio.TransportSocket fd={self.fileno()}, "
-            f"family={self.family!s}, type={self.type!s}, "
-            f"proto={self.proto}"
-        )
-
+        text = (f"<asyncio.TransportSocket fd={self.fileno()}, "
+                f"family={self.family!s}, type={self.type!s}, "
+                f"proto={self.proto}")
         if self.fileno() != -1:
-            try:
-                laddr = self.getsockname()
-                if laddr:
-                    s = f"{s}, laddr={laddr}"
-            except socket.error:
-                pass
-            try:
-                raddr = self.getpeername()
-                if raddr:
-                    s = f"{s}, raddr={raddr}"
-            except socket.error:
-                pass
-
-        return f"{s}>"
+            for label, getter in (('laddr', self.getsockname),
+                                  ('raddr', self.getpeername)):
+                try:
+                    addr = getter()
+                except socket.error:
+                    continue
+                if addr:
+                    text += f", {label}={addr}"
+        return text + ">"
 
     def __getstate__(self):
         raise TypeError("Cannot serialize asyncio.TransportSocket object")
@@ -62,7 +44,6 @@ class TransportSocket:
         return self._sock.get_inheritable()
 
     def shutdown(self, how):
-        # Used by e.g. aiohttp; it is a plain socket operation.
         self._sock.shutdown(how)
 
     def getsockopt(self, *args, **kwargs):
@@ -80,18 +61,15 @@ class TransportSocket:
     def getsockbyname(self):
         return self._sock.getsockbyname()
 
-    def settimeout(self, value):
-        if value == 0:
-            return
-        raise ValueError(
-            'settimeout(): only 0 timeout is allowed on transport sockets')
-
     def gettimeout(self):
         return 0
 
+    def settimeout(self, value):
+        if value != 0:
+            raise ValueError('settimeout(): only 0 timeout is allowed on '
+                             'transport sockets')
+
     def setblocking(self, flag):
-        if not flag:
-            return
-        raise ValueError(
-            'setblocking(): transport sockets cannot be switched '
-            'to blocking mode')
+        if flag:
+            raise ValueError('setblocking(): transport sockets cannot be '
+                             'switched to blocking mode')
