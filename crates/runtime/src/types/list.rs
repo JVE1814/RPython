@@ -447,10 +447,7 @@ pub fn extend(o: &PyObject, it: &PyObject) -> PyResult<()> {
         return Ok(());
     }
     let iter = ab::get_iter(it)?;
-    let hint = ab::length_hint(it, 8).unwrap_or_else(|_| {
-        clear_exc();
-        8
-    });
+    let hint = ab::length_hint(it, 8)?;
     if hint > 0 {
         let n = list_len(o);
         let _g = ob_lock(o);
@@ -869,11 +866,21 @@ unsafe extern "C" fn list_init(o: *mut PyObject, args: *mut PyObject, kw: *mut P
                 clear(o);
             }
             if let Some(x) = a.first() {
-                // preallocate exactly: sys.getsizeof(list(x)) is observable
-                match ab::length_hint(x, 0) {
-                    Ok(n) if n > 0 && n < (1 << 28) => reserve(o, n),
-                    Ok(_) => {}
-                    Err(_) => clear_exc(),
+                // preallocate exactly when len() is available (sys.getsizeof is observable)
+                let tp = x.ty();
+                let has_len = (!tp.tp_as_sequence.is_null() && (*tp.tp_as_sequence).sq_length.is_some())
+                    || (!tp.tp_as_mapping.is_null() && (*tp.tp_as_mapping).mp_length.is_some());
+                if has_len {
+                    match ab::length(x) {
+                        Ok(n) if n > 0 && n < (1 << 28) && list_len(o) == 0 => reserve(o, n),
+                        Ok(_) => {}
+                        Err(e) => {
+                            if !exc_matches(exceptions::TypeError()) {
+                                return Err(e);
+                            }
+                            clear_exc();
+                        }
+                    }
                 }
                 extend(o, x)?;
             }
