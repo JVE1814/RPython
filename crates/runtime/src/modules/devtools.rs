@@ -11,6 +11,7 @@ pub fn register() {
     register_builtin("syslog", super::syslog::init_syslog);
     register_builtin("_posixshmem", super::syslog::init_posixshmem);
     register_builtin("mmap", super::mmap::init);
+    register_builtin("_lsprof", super::lsprof::init);
 }
 
 /// `int::as_i128` restricted to |v| < 2**120 (values with more digits give None).

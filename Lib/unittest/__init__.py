@@ -1,30 +1,20 @@
-"""
-Python unit testing framework, based on Erich Gamma's JUnit and Kent Beck's
-Smalltalk testing framework (used with permission).
+"""Unit testing framework.
 
-This module contains the core framework classes that form the basis of
-specific test cases and suites (TestCase, TestSuite etc.), and also a
-text-based utility class for running the tests and reporting the results
- (TextTestRunner).
-
-Simple usage:
+Write tests as methods (named test*) of TestCase subclasses, checking
+conditions with the assert* methods, then run them with unittest.main(),
+'python -m unittest' or a TestRunner:
 
     import unittest
 
-    class IntegerArithmeticTestCase(unittest.TestCase):
-        def testAdd(self):  # test method names begin with 'test'
-            self.assertEqual((1 + 2), 3)
-            self.assertEqual(0 + 1, 1)
-        def testMultiply(self):
-            self.assertEqual((0 * 10), 0)
-            self.assertEqual((5 * 8), 40)
+    class ArithmeticTest(unittest.TestCase):
+        def test_addition(self):
+            self.assertEqual(1 + 1, 2)
 
     if __name__ == '__main__':
         unittest.main()
 
-Further information is available in the bundled documentation, and from
-
-  http://docs.python.org/library/unittest.html
+TestLoader collects tests into TestSuites, TestResult records outcomes
+and TextTestRunner reports them.  unittest.mock provides mock objects.
 """
 
 __all__ = ['TestResult', 'TestCase', 'IsolatedAsyncioTestCase', 'TestSuite',
@@ -37,28 +27,25 @@ __all__ = ['TestResult', 'TestCase', 'IsolatedAsyncioTestCase', 'TestSuite',
 __unittest = True
 
 from .result import TestResult
-from .case import (addModuleCleanup, TestCase, FunctionTestCase, SkipTest, skip,
-                   skipIf, skipUnless, expectedFailure, doModuleCleanups,
-                   enterModuleContext)
-from .suite import BaseTestSuite, TestSuite  # noqa: F401
+from .case import (addModuleCleanup, TestCase, FunctionTestCase, SkipTest,
+                   skip, skipIf, skipUnless, expectedFailure,
+                   doModuleCleanups, enterModuleContext)
+from .suite import BaseTestSuite, TestSuite
 from .loader import TestLoader, defaultTestLoader
-from .main import TestProgram, main  # noqa: F401
+from .main import TestProgram, main
 from .runner import TextTestRunner, TextTestResult
-from .signals import installHandler, registerResult, removeResult, removeHandler
-# IsolatedAsyncioTestCase will be imported lazily.
+from .signals import (installHandler, registerResult, removeResult,
+                      removeHandler)
 
-
-# Lazy import of IsolatedAsyncioTestCase from .async_case
-# It imports asyncio, which is relatively heavy, but most tests
-# do not need it.
 
 def __dir__():
-    return globals().keys() | {'IsolatedAsyncioTestCase'}
+    return list(globals()) + ['IsolatedAsyncioTestCase']
 
 
 def __getattr__(name):
+    # asyncio is heavy: import the async test case only when asked for
     if name == 'IsolatedAsyncioTestCase':
         global IsolatedAsyncioTestCase
         from .async_case import IsolatedAsyncioTestCase
         return IsolatedAsyncioTestCase
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')

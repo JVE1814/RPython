@@ -1,160 +1,178 @@
-"""Terminal colour support for the standard library (tracebacks, argparse,
-unittest, difflib, the REPL)."""
+"""Terminal colour support shared by the standard library.
+
+Provides the ANSI escape codes, the decision whether output to a given
+stream should be coloured (honouring PYTHON_COLORS, NO_COLOR, FORCE_COLOR
+and TERM) and the colour *theme*: one section of named colours per
+consumer (traceback, argparse, unittest, ...).
+"""
 
 import os
 import sys
 
-from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass, field, Field
+from collections.abc import Mapping
+from dataclasses import dataclass, field, fields
 
+# alias: some section fields shadow builtin names inside class bodies
+_Str = str
+
+# Cleared to switch colouring off globally (e.g. by tests).
 COLORIZE = True
 
 
-# types
-if False:
-    from typing import IO, Self, ClassVar
-    _theme: Theme
-
-
 class ANSIColors:
-    RESET = "\x1b[0m"
+    RESET = '\x1b[0m'
 
-    BLACK = "\x1b[30m"
-    BLUE = "\x1b[34m"
-    CYAN = "\x1b[36m"
-    GREEN = "\x1b[32m"
-    GREY = "\x1b[90m"
-    MAGENTA = "\x1b[35m"
-    RED = "\x1b[31m"
-    WHITE = "\x1b[37m"  # more like LIGHT GRAY
-    YELLOW = "\x1b[33m"
+    BLACK = '\x1b[30m'
+    BLUE = '\x1b[34m'
+    CYAN = '\x1b[36m'
+    GREEN = '\x1b[32m'
+    GREY = '\x1b[90m'
+    MAGENTA = '\x1b[35m'
+    RED = '\x1b[31m'
+    WHITE = '\x1b[37m'
+    YELLOW = '\x1b[33m'
 
-    BOLD = "\x1b[1m"
-    BOLD_BLACK = "\x1b[1;30m"  # DARK GRAY
-    BOLD_BLUE = "\x1b[1;34m"
-    BOLD_CYAN = "\x1b[1;36m"
-    BOLD_GREEN = "\x1b[1;32m"
-    BOLD_MAGENTA = "\x1b[1;35m"
-    BOLD_RED = "\x1b[1;31m"
-    BOLD_WHITE = "\x1b[1;37m"  # actual WHITE
-    BOLD_YELLOW = "\x1b[1;33m"
+    BOLD = '\x1b[1m'
+    BOLD_BLACK = '\x1b[1;30m'
+    BOLD_BLUE = '\x1b[1;34m'
+    BOLD_CYAN = '\x1b[1;36m'
+    BOLD_GREEN = '\x1b[1;32m'
+    BOLD_MAGENTA = '\x1b[1;35m'
+    BOLD_RED = '\x1b[1;31m'
+    BOLD_WHITE = '\x1b[1;37m'
+    BOLD_YELLOW = '\x1b[1;33m'
 
-    # intense = like bold but without being bold
-    INTENSE_BLACK = "\x1b[90m"
-    INTENSE_BLUE = "\x1b[94m"
-    INTENSE_CYAN = "\x1b[96m"
-    INTENSE_GREEN = "\x1b[92m"
-    INTENSE_MAGENTA = "\x1b[95m"
-    INTENSE_RED = "\x1b[91m"
-    INTENSE_WHITE = "\x1b[97m"
-    INTENSE_YELLOW = "\x1b[93m"
+    INTENSE_BLACK = '\x1b[90m'
+    INTENSE_BLUE = '\x1b[94m'
+    INTENSE_CYAN = '\x1b[96m'
+    INTENSE_GREEN = '\x1b[92m'
+    INTENSE_MAGENTA = '\x1b[95m'
+    INTENSE_RED = '\x1b[91m'
+    INTENSE_WHITE = '\x1b[97m'
+    INTENSE_YELLOW = '\x1b[93m'
 
-    BACKGROUND_BLACK = "\x1b[40m"
-    BACKGROUND_BLUE = "\x1b[44m"
-    BACKGROUND_CYAN = "\x1b[46m"
-    BACKGROUND_GREEN = "\x1b[42m"
-    BACKGROUND_MAGENTA = "\x1b[45m"
-    BACKGROUND_RED = "\x1b[41m"
-    BACKGROUND_WHITE = "\x1b[47m"
-    BACKGROUND_YELLOW = "\x1b[43m"
+    BACKGROUND_BLACK = '\x1b[40m'
+    BACKGROUND_BLUE = '\x1b[44m'
+    BACKGROUND_CYAN = '\x1b[46m'
+    BACKGROUND_GREEN = '\x1b[42m'
+    BACKGROUND_MAGENTA = '\x1b[45m'
+    BACKGROUND_RED = '\x1b[41m'
+    BACKGROUND_WHITE = '\x1b[47m'
+    BACKGROUND_YELLOW = '\x1b[43m'
 
-    INTENSE_BACKGROUND_BLACK = "\x1b[100m"
-    INTENSE_BACKGROUND_BLUE = "\x1b[104m"
-    INTENSE_BACKGROUND_CYAN = "\x1b[106m"
-    INTENSE_BACKGROUND_GREEN = "\x1b[102m"
-    INTENSE_BACKGROUND_MAGENTA = "\x1b[105m"
-    INTENSE_BACKGROUND_RED = "\x1b[101m"
-    INTENSE_BACKGROUND_WHITE = "\x1b[107m"
-    INTENSE_BACKGROUND_YELLOW = "\x1b[103m"
-
-
-ColorCodes = set()
-NoColors = ANSIColors()
-
-for attr, code in ANSIColors.__dict__.items():
-    if not attr.startswith("__"):
-        ColorCodes.add(code)
-        setattr(NoColors, attr, "")
+    INTENSE_BACKGROUND_BLACK = '\x1b[100m'
+    INTENSE_BACKGROUND_BLUE = '\x1b[104m'
+    INTENSE_BACKGROUND_CYAN = '\x1b[106m'
+    INTENSE_BACKGROUND_GREEN = '\x1b[102m'
+    INTENSE_BACKGROUND_MAGENTA = '\x1b[105m'
+    INTENSE_BACKGROUND_RED = '\x1b[101m'
+    INTENSE_BACKGROUND_WHITE = '\x1b[107m'
+    INTENSE_BACKGROUND_YELLOW = '\x1b[103m'
 
 
-#
-# Experimental theming support (see gh-133346)
-#
+# All escape codes, longest first so that removal never leaves fragments.
+ColorCodes = sorted({value for name, value in vars(ANSIColors).items()
+                     if not name.startswith('_')},
+                    key=len, reverse=True)
 
-# - Create a theme by copying an existing `Theme` with one or more sections
-#   replaced, using `default_theme.copy_with()`;
-# - create a theme section by copying an existing `ThemeSection` with one or
-#   more colors replaced, using for example `default_theme.syntax.copy_with()`;
-# - create a theme from scratch by instantiating a `Theme` data class with
-#   the required sections (which are also dataclass instances).
-#
-# Then call `_colorize.set_theme(your_theme)` to set it.
-#
-# Put your theme configuration in $PYTHONSTARTUP for the interactive shell,
-# or sitecustomize.py in your virtual environment or Python installation for
-# other uses.  Your applications can call `_colorize.set_theme()` too.
-#
-# Note that thanks to the dataclasses providing default values for all fields,
-# creating a new theme or theme section from scratch is possible without
-# specifying all keys.
-#
-# For example, here's a theme that makes punctuation and operators less prominent:
-#
-#   try:
-#       from _colorize import set_theme, default_theme, Syntax, ANSIColors
-#   except ImportError:
-#       pass
-#   else:
-#       theme_with_dim_operators = default_theme.copy_with(
-#           syntax=Syntax(op=ANSIColors.INTENSE_BLACK),
-#       )
-#       set_theme(theme_with_dim_operators)
-#       del set_theme, default_theme, Syntax, ANSIColors, theme_with_dim_operators
-#
-# Guarding the import ensures that your .pythonstartup file will still work in
-# Python 3.13 and older. Deleting the variables ensures they don't remain in your
-# interactive shell's global scope.
 
+class NoColors:
+    """ANSIColors look-alike whose codes are all empty strings."""
+
+
+for _name in vars(ANSIColors):
+    if not _name.startswith('_'):
+        setattr(NoColors, _name, '')
+del _name
+
+
+def get_colors(colorize=False, *, file=None):
+    """ANSIColors if output to *file* should be coloured, else NoColors."""
+    if colorize or can_colorize(file=file):
+        return ANSIColors()
+    return NoColors
+
+
+def decolor(text):
+    """Remove the ANSI colour codes from *text*."""
+    for code in ColorCodes:
+        text = text.replace(code, '')
+    return text
+
+
+def can_colorize(*, file=None):
+    """Should output written to *file* (default: sys.stdout) use colour?"""
+    if file is None:
+        file = sys.stdout
+
+    environ = os.environ
+    if not sys.flags.ignore_environment:
+        python_colors = environ.get('PYTHON_COLORS')
+        if python_colors == '0':
+            return False
+        if python_colors == '1':
+            return True
+    if environ.get('NO_COLOR'):
+        return False
+    if not COLORIZE:
+        return False
+    if environ.get('FORCE_COLOR'):
+        return True
+    if environ.get('TERM') == 'dumb':
+        return False
+
+    if not hasattr(file, 'fileno'):
+        return False
+
+    if sys.platform == 'win32':
+        try:
+            import nt
+            if not nt._supports_virtual_terminal():
+                return False
+        except (ImportError, AttributeError):
+            return False
+
+    try:
+        return os.isatty(file.fileno())
+    except OSError:
+        # includes io.UnsupportedOperation: no real file descriptor
+        return hasattr(file, 'isatty') and file.isatty()
+
+
+# ---------------------------------------------------------------------------
+# Themes
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True, kw_only=True)
 class ThemeSection(Mapping[str, str]):
-    """A mixin/base class for theme sections.
+    """A named group of colours for one consumer.
 
-    It enables dictionary access to a section, as well as implements convenience
-    methods.
+    Sections are immutable mappings from colour names to escape codes.
     """
 
-    # The two types below are just that: types to inform the type checker that the
-    # mixin will work in context of those fields existing
-    # __dataclass_fields__: ClassVar[dict[str, Field[str]]]
-    # _name_to_value: Callable[[str], str]
-
     def __post_init__(self):
-        name_to_value = {}
-        for color_name in self.__dataclass_fields__:
-            name_to_value[color_name] = getattr(self, color_name)
-        super().__setattr__('_name_to_value', name_to_value.__getitem__)
+        values = {f.name: getattr(self, f.name) for f in fields(self)}
+        object.__setattr__(self, '_ThemeSection__values', values)
 
     def copy_with(self, **kwargs):
-        color_state = {}
-        for color_name in self.__dataclass_fields__:
-            color_state[color_name] = getattr(self, color_name)
-        color_state.update(kwargs)
-        return type(self)(**color_state)
+        """A copy of this section with some colours replaced."""
+        merged = dict(self.__values)
+        merged.update(kwargs)
+        return type(self)(**merged)
 
     @classmethod
     def no_colors(cls):
-        color_state = {}
-        for color_name in cls.__dataclass_fields__:
-            color_state[color_name] = ""
-        return cls(**color_state)
+        """An instance of this section with every colour empty."""
+        return cls(**{f.name: '' for f in fields(cls)})
 
     def __getitem__(self, key):
-        return self._name_to_value(key)
+        return self.__values[key]
 
     def __len__(self):
-        return len(self.__dataclass_fields__)
+        return len(self.__values)
 
     def __iter__(self):
-        return iter(self.__dataclass_fields__)
+        return iter(self.__values)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -173,45 +191,39 @@ class Argparse(ThemeSection):
     action: str = ANSIColors.BOLD_GREEN
     default: str = ANSIColors.GREY
     interpolated_value: str = ANSIColors.YELLOW
-    reset: str = ANSIColors.RESET
+    message: str = ANSIColors.MAGENTA
     error: str = ANSIColors.BOLD_MAGENTA
     warning: str = ANSIColors.BOLD_YELLOW
-    message: str = ANSIColors.MAGENTA
+    reset: str = ANSIColors.RESET
 
 
 @dataclass(frozen=True, kw_only=True)
 class Difflib(ThemeSection):
-    """A 'git diff'-like theme for `difflib.unified_diff`."""
     added: str = ANSIColors.GREEN
-    context: str = ANSIColors.RESET  # context lines
-    header: str = ANSIColors.BOLD  # eg "---" and "+++" lines
-    hunk: str = ANSIColors.CYAN  # the "@@" lines
+    context: str = ANSIColors.RESET
+    header: str = ANSIColors.BOLD
+    hunk: str = ANSIColors.CYAN
     removed: str = ANSIColors.RED
     reset: str = ANSIColors.RESET
 
 
 @dataclass(frozen=True, kw_only=True)
 class FancyCompleter(ThemeSection):
-    # functions and methods
-    function: str = ANSIColors.BOLD_BLUE
-    builtin_function_or_method: str = ANSIColors.BOLD_BLUE
-    method: str = ANSIColors.BOLD_CYAN
-    method_wrapper: str = ANSIColors.BOLD_CYAN
-    wrapper_descriptor: str = ANSIColors.BOLD_CYAN
-    method_descriptor: str = ANSIColors.BOLD_CYAN
-
-    # numbers
-    int: str = ANSIColors.BOLD_YELLOW
-    float: str = ANSIColors.BOLD_YELLOW
-    complex: str = ANSIColors.BOLD_YELLOW
-    bool: str = ANSIColors.BOLD_YELLOW
-
-    # others
-    type: str = ANSIColors.BOLD_MAGENTA
-    module: str = ANSIColors.CYAN
-    NoneType: str = ANSIColors.GREY
-    bytes: str = ANSIColors.BOLD_GREEN
-    str: str = ANSIColors.BOLD_GREEN
+    module: _Str = ANSIColors.BLUE
+    bool: _Str = ANSIColors.BOLD_CYAN
+    type: _Str = ANSIColors.BOLD_MAGENTA
+    none: _Str = ANSIColors.GREY
+    str: _Str = ANSIColors.GREEN
+    bytes: _Str = ANSIColors.BOLD_GREEN
+    int: _Str = ANSIColors.BOLD_YELLOW
+    float: _Str = ANSIColors.BOLD_YELLOW
+    complex: _Str = ANSIColors.BOLD_YELLOW
+    function: _Str = ANSIColors.BOLD_BLUE
+    builtin_function: _Str = ANSIColors.BOLD_BLUE
+    method: _Str = ANSIColors.CYAN
+    builtin_method: _Str = ANSIColors.CYAN
+    exception: _Str = ANSIColors.BOLD_RED
+    reset: _Str = ANSIColors.RESET
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -231,18 +243,9 @@ class HttpServer(ThemeSection):
 
 
 @dataclass(frozen=True, kw_only=True)
-class LiveProfiler(ThemeSection):
-    """Theme section for the live profiling TUI."""
-    title_fg: str = ANSIColors.BOLD_WHITE
-    header_fg: str = ANSIColors.BOLD
-    reset: str = ANSIColors.RESET
-
-
-@dataclass(frozen=True, kw_only=True)
 class Syntax(ThemeSection):
     prompt: str = ANSIColors.BOLD_MAGENTA
     keyword: str = ANSIColors.BOLD_BLUE
-    keyword_constant: str = ANSIColors.BOLD_BLUE
     builtin: str = ANSIColors.CYAN
     comment: str = ANSIColors.RED
     string: str = ANSIColors.GREEN
@@ -256,10 +259,9 @@ class Syntax(ThemeSection):
 @dataclass(frozen=True, kw_only=True)
 class Timeit(ThemeSection):
     timing: str = ANSIColors.CYAN
-    best: str = ANSIColors.BOLD_GREEN
+    best: str = ANSIColors.GREEN
     per_loop: str = ANSIColors.GREEN
     punctuation: str = ANSIColors.GREY
-    warning: str = ANSIColors.YELLOW
     reset: str = ANSIColors.RESET
 
 
@@ -287,159 +289,50 @@ class Unittest(ThemeSection):
 
 @dataclass(frozen=True, kw_only=True)
 class Theme:
-    """A suite of themes for all sections of Python.
+    """All colour sections; customise with copy_with() and set_theme()."""
 
-    When adding a new one, remember to also modify `copy_with` and `no_colors`
-    below.
-    """
     argparse: Argparse = field(default_factory=Argparse)
     difflib: Difflib = field(default_factory=Difflib)
     fancycompleter: FancyCompleter = field(default_factory=FancyCompleter)
     http_server: HttpServer = field(default_factory=HttpServer)
-    live_profiler: LiveProfiler = field(default_factory=LiveProfiler)
     syntax: Syntax = field(default_factory=Syntax)
     timeit: Timeit = field(default_factory=Timeit)
     traceback: Traceback = field(default_factory=Traceback)
     unittest: Unittest = field(default_factory=Unittest)
 
-    def copy_with(
-        self,
-        *,
-        argparse=None,
-        difflib=None,
-        fancycompleter=None,
-        http_server=None,
-        live_profiler=None,
-        syntax=None,
-        timeit=None,
-        traceback=None,
-        unittest=None,
-    ):
-        """Return a new Theme based on this instance with some sections replaced.
+    def copy_with(self, **sections):
+        """A copy of the theme with the given sections replaced (None
+        keeps the current section)."""
+        current = {f.name: getattr(self, f.name) for f in fields(self)}
+        for name, section in sections.items():
+            if name not in current:
+                raise TypeError(f'unknown theme section: {name!r}')
+            if section is not None:
+                current[name] = section
+        return type(self)(**current)
 
-        Themes are immutable to protect against accidental modifications that
-        could lead to invalid terminal states.
-        """
-        return type(self)(
-            argparse=argparse or self.argparse,
-            difflib=difflib or self.difflib,
-            fancycompleter=fancycompleter or self.fancycompleter,
-            http_server=http_server or self.http_server,
-            live_profiler=live_profiler or self.live_profiler,
-            syntax=syntax or self.syntax,
-            timeit=timeit or self.timeit,
-            traceback=traceback or self.traceback,
-            unittest=unittest or self.unittest,
-        )
-
-    @classmethod
-    def no_colors(cls):
-        """Return a new Theme where colors in all sections are empty strings.
-
-        This allows writing user code as if colors are always used. The color
-        fields will be ANSI color code strings when colorization is desired
-        and possible, and empty strings otherwise.
-        """
-        return cls(
-            argparse=Argparse.no_colors(),
-            difflib=Difflib.no_colors(),
-            fancycompleter=FancyCompleter.no_colors(),
-            http_server=HttpServer.no_colors(),
-            live_profiler=LiveProfiler.no_colors(),
-            syntax=Syntax.no_colors(),
-            timeit=Timeit.no_colors(),
-            traceback=Traceback.no_colors(),
-            unittest=Unittest.no_colors(),
-        )
+    def no_colors(self):
+        """A theme of the same shape without any colours."""
+        return type(self)(**{f.name: getattr(self, f.name).no_colors()
+                             for f in fields(self)})
 
 
-def get_colors(colorize=False, *, file=None):
-    if colorize or can_colorize(file=file):
-        return ANSIColors()
-    else:
-        return NoColors
-
-
-def decolor(text):
-    """Remove ANSI color codes from a string."""
-    for code in ColorCodes:
-        text = text.replace(code, "")
-    return text
-
-
-def can_colorize(*, file=None):
-    if file is None:
-        file = sys.stdout
-
-    flags = getattr(sys, 'flags', None)
-    if not getattr(flags, 'ignore_environment', False):
-        if os.environ.get("PYTHON_COLORS") == "0":
-            return False
-        if os.environ.get("PYTHON_COLORS") == "1":
-            return True
-    if os.environ.get("NO_COLOR"):
-        return False
-    if not COLORIZE:
-        return False
-    if os.environ.get("FORCE_COLOR"):
-        return True
-    if os.environ.get("TERM") == "dumb":
-        return False
-
-    if not hasattr(file, "fileno"):
-        return False
-
-    if sys.platform == "win32":
-        try:
-            import nt
-
-            if not nt._supports_virtual_terminal():
-                return False
-        except (ImportError, AttributeError):
-            return False
-
-    try:
-        return os.isatty(file.fileno())
-    except OSError:
-        # includes io.UnsupportedOperation
-        return hasattr(file, "isatty") and file.isatty()
-
-
-default_theme = Theme()
-theme_no_color = default_theme.no_colors()
-
-
-def get_theme(
-    *,
-    tty_file=None,
-    force_color=False,
-    force_no_color=False,
-):
-    """Returns the currently set theme, potentially in a zero-color variant.
-
-    In cases where colorizing is not possible (see `can_colorize`), the returned
-    theme contains all empty strings in all color definitions.
-    See `Theme.no_colors()` for more information.
-
-    It is recommended not to cache the result of this function for extended
-    periods of time because the user might influence theme selection by
-    the interactive shell, a debugger, or application-specific code. The
-    environment (including environment variable state and console configuration
-    on Windows) can also change in the course of the application life cycle.
-    """
-    if force_color or (not force_no_color and
-                       can_colorize(file=tty_file)):
+def get_theme(*, tty_file=None, force_color=False, force_no_color=False):
+    """The theme to use for output to *tty_file*: the current theme if
+    colouring applies (or is forced), else a colourless one."""
+    if force_color or (not force_no_color and can_colorize(file=tty_file)):
         return _theme
     return theme_no_color
 
 
 def set_theme(t):
+    """Make *t* (a Theme) the current theme."""
     global _theme
-
     if not isinstance(t, Theme):
-        raise ValueError(f"Expected Theme object, found {t}")
-
+        raise ValueError(f'Expected Theme object, found {t}')
     _theme = t
 
 
-set_theme(default_theme)
+default_theme = Theme()
+theme_no_color = default_theme.no_colors()
+_theme = default_theme
