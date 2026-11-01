@@ -75,7 +75,7 @@ pub enum ThreadMode {
 #[repr(C)]
 pub struct ThreadState {
     pub c: CThreadState,
-    pub mode: Cell<ThreadMode>,
+    pub mode: ModeCell,
     /// Objects whose shared refcount went negative and need the owner to merge.
     pub merge_queue: Mutex<Vec<usize>>,
     /// Rust-side top interpreter frame (see interp::frame).
@@ -85,6 +85,8 @@ pub struct ThreadState {
     pub reraise_flag: Cell<bool>,
     pub headroom: Cell<bool>,
     pub stack_low: Cell<usize>,
+    /// Set when the OS thread has finished (its state may linger in ALL_THREADS).
+    pub exited: std::sync::atomic::AtomicBool,
 }
 
 unsafe impl Sync for ThreadState {}
@@ -128,7 +130,7 @@ pub fn new_thread_state() -> *mut ThreadState {
         c.gilstate_counter = 1;
         let ts = Box::into_raw(Box::new(ThreadState {
             c,
-            mode: Cell::new(ThreadMode::InVm),
+            mode: ModeCell(std::sync::atomic::AtomicU8::new(ThreadMode::InVm as u8)),
             merge_queue: Mutex::new(Vec::new()),
             frame: Cell::new(std::ptr::null_mut()),
             recursion_depth: Cell::new(0),
@@ -136,6 +138,7 @@ pub fn new_thread_state() -> *mut ThreadState {
             reraise_flag: Cell::new(false),
             headroom: Cell::new(false),
             stack_low: Cell::new(compute_stack_low()),
+            exited: std::sync::atomic::AtomicBool::new(false),
         }));
         (*ts).c.exc_info = &mut (*ts).c.exc_state;
         ALL_THREADS.lock().unwrap().push(ts as usize);
@@ -170,6 +173,7 @@ pub const EVAL_MERGE_REFCOUNTS: usize = 1 << 0;
 pub const EVAL_SAFEPOINT: usize = 1 << 1;
 pub const EVAL_SIGNALS: usize = 1 << 2;
 pub const EVAL_ASYNC_EXC: usize = 1 << 3;
+pub const EVAL_GC: usize = 1 << 4;
 
 /// Process pending merges for the current thread.
 pub fn process_merge_queue(ts: &ThreadState) {
@@ -238,4 +242,42 @@ pub fn current_mut() -> *mut ThreadState {
         return current() as *const ThreadState as *mut ThreadState;
     }
     p
+}
+
+impl ThreadState {
+    pub fn alive(&self) -> bool {
+        !self.exited.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// Run a potentially blocking operation (syscall, lock wait, sleep) with the thread
+/// marked as Blocked so stop-the-world operations (GC safepoints) don't wait for it.
+/// On return the thread polls the safepoint before touching Python objects again.
+pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
+    let ts = current();
+    let prev = ts.mode.get();
+    ts.mode.set(ThreadMode::Blocked);
+    let r = f();
+    ts.mode.set(prev);
+    if ts.c.eval_breaker.load(std::sync::atomic::Ordering::Acquire) & EVAL_SAFEPOINT != 0 {
+        crate::gc::safepoint_poll(ts);
+    }
+    r
+}
+
+/// Thread mode readable from other threads (stop-the-world coordination).
+pub struct ModeCell(pub std::sync::atomic::AtomicU8);
+impl ModeCell {
+    #[inline]
+    pub fn get(&self) -> ThreadMode {
+        match self.0.load(std::sync::atomic::Ordering::Acquire) {
+            0 => ThreadMode::InVm,
+            1 => ThreadMode::InNative,
+            _ => ThreadMode::Blocked,
+        }
+    }
+    #[inline]
+    pub fn set(&self, m: ThreadMode) {
+        self.0.store(m as u8, std::sync::atomic::Ordering::Release)
+    }
 }

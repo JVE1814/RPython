@@ -90,6 +90,7 @@ pub fn init_all() -> crate::errors::PyResult<()> {
     genobject::init_types();
     super_::init_types();
     containers_reg::init_types();
+    frameobject_proxy::init_types();
     use typeobject::type_ready;
     type_ready(typeobject::object_type())?;
     type_ready(typeobject::type_type())?;
@@ -137,6 +138,7 @@ pub fn init_all() -> crate::errors::PyResult<()> {
     }
     exceptions::ready_all()?;
     containers_reg::ready()?;
+    type_ready(frameobject_proxy::proxy_type())?;
     Ok(())
 }
 pub mod complex_pow;

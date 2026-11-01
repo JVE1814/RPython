@@ -154,7 +154,11 @@ fn fstring_body(s: &mut String, values: &[Expr]) {
             }
             ExprKind::FormattedValue { value, conversion, format_spec } | ExprKind::Interpolation { value, conversion, format_spec, .. } => {
                 let mut inner = String::new();
-                expr(&mut inner, value, PR_TEST + 1);
+                match &v.node {
+                    // t-strings keep the source text of the expression
+                    ExprKind::Interpolation { str: text, .. } => inner.push_str(&text.to_string_lossy()),
+                    _ => expr(&mut inner, value, PR_TEST + 1),
+                }
                 s.push('{');
                 if inner.starts_with('{') {
                     s.push(' ');

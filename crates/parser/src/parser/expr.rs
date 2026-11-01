@@ -458,7 +458,12 @@ impl<'a> Parser<'a> {
     fn binop_expr(&mut self, min_prec: u8) -> R<Expr> {
         let start = self.p;
         let Some(mut left) = self.factor()? else { return Ok(None) };
+        let mut chain = 0usize;
         loop {
+            chain += 1;
+            if chain > 64 {
+                self.check_chain(chain)?;
+            }
             let Some((prec, op)) = Self::binop_info(self.peek_ty()) else { break };
             if prec < min_prec {
                 break;
@@ -573,7 +578,12 @@ impl<'a> Parser<'a> {
     pub(crate) fn primary(&mut self) -> R<Expr> {
         let start = self.p;
         let Some(mut a) = self.atom()? else { return Ok(None) };
+        let mut chain = 0usize;
         loop {
+            chain += 1;
+            if chain > 64 {
+                self.check_chain(chain)?;
+            }
             match self.peek_ty() {
                 T::DOT => {
                     let m = self.p;

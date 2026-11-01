@@ -111,16 +111,12 @@ fn source_line(src: &str, lineno: i32) -> Option<String> {
 }
 
 fn parse_error(e: &rpy_parser::SyntaxError, filename: &str) -> PyErr {
-    let class = match e.kind {
-        rpy_parser::ErrorKind::Syntax => {
-            if e.msg == "incomplete input" {
-                crate::types::exceptions::IncompleteInputError()
-            } else {
-                crate::types::exceptions::SyntaxError()
-            }
-        }
-        rpy_parser::ErrorKind::Indentation => crate::types::exceptions::IndentationError(),
-        rpy_parser::ErrorKind::Tab => crate::types::exceptions::TabError(),
+    let class = match e.kind.class_name() {
+        "IndentationError" => crate::types::exceptions::IndentationError(),
+        "TabError" => crate::types::exceptions::TabError(),
+        "_IncompleteInputError" | "IncompleteInputError" => crate::types::exceptions::IncompleteInputError(),
+        _ if e.msg == "incomplete input" => crate::types::exceptions::IncompleteInputError(),
+        _ => crate::types::exceptions::SyntaxError(),
     };
     raise_syntax_error(class, &e.msg, filename, e.lineno, e.offset, e.text.as_deref(), e.end_lineno, e.end_offset)
 }
