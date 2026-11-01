@@ -1401,11 +1401,8 @@ impl<'a> Compiler<'a> {
             None
         };
         self.compile_expr(body)?;
-        if is_gen && self.st.scopes[self.ur().scope].generator {
-            // generator lambdas return None
-            self.emit(Op::PopTop, 0);
-            self.load_none();
-        }
+        // (a generator lambda returns its body's value, like any generator's return)
+        let _ = is_gen;
         self.emit(Op::ReturnValue, 0);
         if let Some(h) = handler {
             self.pop_block();

@@ -1491,6 +1491,13 @@ impl<'a> Analyzer<'a> {
             if let Some(b) = bound {
                 newbound.extend(b.iter().cloned());
             }
+            // a `global` declaration hides enclosing bindings of the name from
+            // nested scopes (they see the global)
+            for (name, flags) in &syms {
+                if flags & DEF_GLOBAL != 0 {
+                    newbound.remove(name);
+                }
+            }
             newglobal.extend(global.iter().cloned());
         } else {
             newbound.insert("__class__".to_string());

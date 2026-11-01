@@ -405,4 +405,13 @@ pub unsafe extern "C" fn PyGC_Collect() -> Py_ssize_t {
 
 pub type gcvisitobjects_t = Option<unsafe extern "C" fn(*mut PyObject, *mut c_void) -> c_int>;
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyUnstable_GC_VisitObjects(_cb: gcvisitobjects_t, _arg: *mut c_void) {}
+pub unsafe extern "C" fn PyUnstable_GC_VisitObjects(cb: gcvisitobjects_t, arg: *mut c_void) {
+    // visits every object tracked by the collector (a snapshot; references held
+    // while the callback runs); a zero result stops the walk
+    let Some(cb) = cb else { return };
+    for o in crate::gc::all_tracked() {
+        if unsafe { cb(o.as_ptr(), arg) } == 0 {
+            break;
+        }
+    }
+}

@@ -215,10 +215,10 @@ pub fn as_i128(o: &PyObject) -> Option<i128> {
     }
     let mut v: u128 = 0;
     for &d in ds.iter().rev() {
-        v = v.checked_shl(SHIFT)? | d as u128;
-        if ds.len() == 5 && v >> 127 != 0 && !(sign(o) < 0 && v == 1u128 << 127) {
-            return None;
+        if v >> (128 - SHIFT) != 0 {
+            return None; // shifting would lose high bits
         }
+        v = (v << SHIFT) | d as u128;
     }
     if v > i128::MAX as u128 {
         return if sign(o) < 0 && v == 1u128 << 127 { Some(i128::MIN) } else { None };

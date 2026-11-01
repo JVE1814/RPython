@@ -132,11 +132,22 @@ unsafe extern "C" fn module_getattro(op: *mut PyObject, nm: *mut PyObject) -> *m
         let o = &*op;
         let n = &*nm;
         match generic_getattr_opt(o, n, None) {
-            Ok(Some(v)) => return v.into_raw(),
+            Ok(Some(v)) => {
+                if crate::types::lazyimport::is_lazy(&v) {
+                    // a lazy import bound in the module: reify and rebind
+                    return into_c(crate::types::lazyimport::reify_in_dict(&module_dict(o), n, &v));
+                }
+                return v.into_raw();
+            }
             Ok(None) => {}
             Err(_) => return std::ptr::null_mut(),
         }
         let d = module_dict(o);
+        match crate::types::lazyimport::pending_submodule(o, n) {
+            Ok(Some(v)) => return v.into_raw(),
+            Ok(None) => {}
+            Err(_) => return std::ptr::null_mut(),
+        }
         if let Some(ga) = dict::get_item_str(&d, name!("__getattr__")) {
             return into_c(ab::call(&ga, &[n]));
         }

@@ -184,8 +184,8 @@ fn f_lineno(o: &PyObject) -> PyResult {
     Ok(if l < 0 { none::none_ref() } else { int::new_int(l as i64) })
 }
 fn f_set_lineno(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
-    let _ = (o, v);
-    raise!(ValueError, "f_lineno can only be set by a trace function");
+    let f = need(o)?;
+    crate::interp::jump::set_lineno(f, v)
 }
 fn f_lasti(o: &PyObject) -> PyResult {
     let f = need(o)?;
