@@ -244,10 +244,15 @@ def walk_stack(f):
     """Yield (frame, lineno) going outwards from frame *f* (default: the
     caller's frame)."""
     if f is None:
+        # resolved now, not when the generator first runs
         f = sys._getframe().f_back
-    while f is not None:
-        yield f, f.f_lineno
-        f = f.f_back
+    return _frames_outwards(f)
+
+
+def _frames_outwards(frame):
+    while frame is not None:
+        yield frame, frame.f_lineno
+        frame = frame.f_back
 
 
 def walk_tb(tb):
@@ -525,6 +530,8 @@ def _char_widths(text):
         if code < 32 or code == 127:
             # shown as ^X
             yield ch, 2
+        elif unicodedata.combining(ch):
+            yield ch, 0
         elif unicodedata.east_asian_width(ch) in ('W', 'F'):
             yield ch, 2
         else:
@@ -572,34 +579,6 @@ class _MarkedSource:
         self.anchors = None
         with suppress(Exception):
             self.anchors = _extract_caret_anchors_from_line_segment(segment)
-
-    def show_markers(self):
-        lines, start, end = self.lines, self.start, self.end
-        with suppress(SyntaxError, ImportError):
-            import ast
-            tree = ast.parse('\n'.join(lines))
-            if not tree.body:
-                return False
-            statement = tree.body[0]
-            call = None
-            if (isinstance(statement, ast.Return)
-                    and isinstance(statement.value, ast.Call)
-                    and isinstance(statement.value.func, ast.Name)):
-                call = statement.value
-            elif (isinstance(statement, ast.Assign)
-                    and isinstance(statement.value, ast.Call)
-                    and len(statement.targets) == 1
-                    and isinstance(statement.targets[0], ast.Name)):
-                call = statement.value
-            # "return f(...)" / "x = f(...)" where the call is all there is
-            if (call is not None and call.lineno == 1
-                    and call.end_lineno == len(lines)
-                    and call.col_offset == start
-                    and call.end_col_offset == end):
-                return False
-        if self.anchors:
-            return True
-        return bool(lines[0][:start].lstrip() or lines[-1][end:].rstrip())
 
     def marker_kinds(self, index, show):
         """Marker character for every display column of line *index*:
@@ -650,8 +629,9 @@ class _MarkedSource:
                 wanted.update(range(lineno - 1, lineno + 2))
         return sorted(n for n in wanted if 0 <= n < len(self.lines))
 
-    def render(self, colorize, theme):
-        show = self.show_markers()
+    def render(self, summary, colorize, theme):
+        show = summary._should_show_carets(self.start, self.end, self.lines,
+                                           self.anchors)
         output = []
 
         def emit(index):
@@ -794,12 +774,43 @@ class StackSummary(list):
                 # no column information: just the first line
                 pieces.append(textwrap.indent(fs.line, '    ') + '\n')
             else:
-                pieces.append(_MarkedSource(fs).render(colorize, theme))
+                pieces.append(_MarkedSource(fs).render(self, colorize, theme))
 
         if fs.locals:
             for name, value in sorted(fs.locals.items()):
                 pieces.append(f'    {name} = {value}\n')
         return ''.join(pieces)
+
+    def _should_show_carets(self, start_offset, end_offset, all_lines,
+                            anchors):
+        """Whether markers add information for this source excerpt: not
+        when the failing expression is the whole line, e.g. a plain
+        "return f(...)" or "x = f(...)"."""
+        with suppress(SyntaxError, ImportError):
+            import ast
+            tree = ast.parse('\n'.join(all_lines))
+            if not tree.body:
+                return False
+            statement = tree.body[0]
+            call = None
+            if (isinstance(statement, ast.Return)
+                    and isinstance(statement.value, ast.Call)
+                    and isinstance(statement.value.func, ast.Name)):
+                call = statement.value
+            elif (isinstance(statement, ast.Assign)
+                    and isinstance(statement.value, ast.Call)
+                    and len(statement.targets) == 1
+                    and isinstance(statement.targets[0], ast.Name)):
+                call = statement.value
+            if (call is not None and call.lineno == 1
+                    and call.end_lineno == len(all_lines)
+                    and call.col_offset == start_offset
+                    and call.end_col_offset == end_offset):
+                return False
+        if anchors:
+            return True
+        return bool(all_lines[0][:start_offset].lstrip()
+                    or all_lines[-1][end_offset:].rstrip())
 
     def format(self, **kwargs):
         """Format the frames as a list of strings, one per frame (each
@@ -1075,8 +1086,8 @@ class TracebackException:
                 notes = [_safe_string(notes, '__notes__', func=repr)]
             for note in notes:
                 note = _safe_string(note, 'note')
-                yield textwrap.indent(
-                    f'{theme.note}{note}{theme.reset}', indent) + '\n'
+                for line in note.split('\n'):
+                    yield f'{indent}{theme.note}{line}{theme.reset}\n'
 
         if self.exceptions and show_group:
             for member in self.exceptions:
@@ -1101,7 +1112,9 @@ class TracebackException:
                 self._find_keyword_typos()
             yield from self._syntax_error_source_lines(theme, colorize)
 
-        msg = self.msg or '<no detail available>'
+        msg = self.msg
+        if msg is None or (isinstance(msg, str) and not msg):
+            msg = '<no detail available>'
         yield '{}{}{}: {}{}{}{}\n'.format(theme.type, stype, theme.reset,
                                          theme.message, msg, theme.reset,
                                          suffix)
@@ -1671,9 +1684,10 @@ def _candidate_names(exc_value, tb, wrong_name):
         obj = exc_value.obj
         try:
             try:
-                names = dir(obj)
+                # the raw __dir__ result: dir() would fail on unsortable
+                # entries, which are filtered out below anyway
+                names = list(type(obj).__dir__(obj))
             except TypeError:
-                # unsortable names
                 names = (list(obj.__class__.__dict__.keys()) +
                          list(obj.__dict__.keys()))
             names = sorted(x for x in names if isinstance(x, str))
@@ -1744,7 +1758,7 @@ def _compute_suggestion_error(exc_value, tb, wrong_name):
     if wrong_len > _MAX_STRING_SIZE:
         return None
     best = None
-    best_distance = wrong_len
+    best_distance = sys.maxsize
     for name in names:
         if name == wrong_name:
             # the name exists after all (e.g. failing property)

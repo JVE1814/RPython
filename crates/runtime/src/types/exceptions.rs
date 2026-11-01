@@ -744,7 +744,9 @@ unsafe extern "C" fn keyerror_str(op: *mut PyObject) -> *mut PyObject {
 unsafe extern "C" fn importerror_str(op: *mut PyObject) -> *mut PyObject {
     unsafe {
         let e = &*(op as *mut ImportErrorExc);
-        if !e.msg.is_null() && !(*e.msg).is(none::none()) {
+        // only an exact str message is used as is (like CPython); anything
+        // else goes through BaseException.__str__
+        if !e.msg.is_null() && crate::types::str::is_str_exact(&*e.msg) {
             return (*e.msg).to_ref().into_raw();
         }
         base_str(op)
