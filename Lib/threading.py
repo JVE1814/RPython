@@ -647,9 +647,13 @@ class Thread:
     def _after_fork(self, new_ident=None):
         self._started._at_fork_reinit()
         if new_ident is not None:
+            # the surviving thread: same ident, new OS thread id
             self._ident = new_ident
             assert self._handle.ident == new_ident
+            if _HAVE_THREAD_NATIVE_ID:
+                self._set_native_id()
         else:
+            # a thread that does not exist in the child: it is done
             pass
 
     def __repr__(self):
