@@ -351,6 +351,8 @@ impl Builder {
         }
         let _ = pk;
         sc.private = self.private.clone();
+        // a block nested in a comprehension iterable inherits the restriction on walrus
+        sc.comp_iter_expr = self.scopes[prev].comp_iter_expr;
         self.scopes.push(sc);
         self.scopes[prev].children.push(id);
         if let Some(k) = k {
