@@ -334,7 +334,14 @@ fn b_vars(_m: &PyObject, args: &[&PyObject]) -> PyResult {
 fn b_dir(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     args::check_pos("dir", args, 0, 1)?;
     if args.is_empty() {
-        let l = list::new_list(dict::keys_vec(&*b_locals(_m)?));
+        let loc = b_locals(_m)?;
+        // locals may be any mapping (exec/eval with a custom locals object)
+        let l = if dict::is_dict_exact(&loc) {
+            list::new_list(dict::keys_vec(&loc))
+        } else {
+            let keys = ab::call_method_str(&loc, "keys", &[])?;
+            list::new_list(ab::collect_iterable(&keys)?)
+        };
         crate::types::list_methods::sort_list(&l, None, false)?;
         return Ok(l);
     }
@@ -592,7 +599,14 @@ fn exec_or_eval(args: &[&PyObject], kw: Option<&PyObject>, is_eval: bool) -> PyR
             b.drain(..i);
         }
         let mode = if is_eval { crate::compile::Mode::Eval } else { crate::compile::Mode::Exec };
-        crate::compile::compile_bytes(&b, "<string>", mode, 0, -1)?.code
+        let flags = crate::modules::ast_bridge::inherited_future_flags();
+        if pystr::is_str(src) {
+            // str source: an encoding declaration is ignored (the text is already decoded)
+            let text = String::from_utf8(b).unwrap_or_default();
+            crate::compile::compile_str(&text, "<string>", mode, flags, -1)?.code
+        } else {
+            crate::compile::compile_bytes(&b, "<string>", mode, flags, -1)?.code
+        }
     };
     let nfree = crate::types::code::code(&code).nfreevars();
     if !is_eval {
@@ -624,6 +638,9 @@ fn b_eval(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult 
 }
 fn b_input(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     args::check_pos("input", args, 0, 1)?;
+    if let Some(r) = crate::modules::tty::input::tty_input(args.first().copied())? {
+        return Ok(r);
+    }
     let out = crate::modules::sys::get_sys_attr("stdout");
     if let (Some(p), Some(o)) = (args.first(), &out) {
         let s = ab::str(p)?;
@@ -688,6 +705,7 @@ pub fn init() -> PyResult<PyRef> {
     ];
     add_methods_to_dict(&d, methods, Some(&m))?;
     add_methods_to_dict(&d, more_builtins(), Some(&m))?;
+    crate::types::lazyimport::install_builtins(&d, &m)?;
     crate::modules::builtins_numbers::install(&d, &m)?;
     if let Some(f) = dict::get_item_rs(&d, "__import__") {
         IMPORT_FN.store(f.as_ptr(), Release);

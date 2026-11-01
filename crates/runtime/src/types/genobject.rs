@@ -316,7 +316,19 @@ pub fn gen_throw_impl(o: &PyObject, typ: &PyObject, val: Option<&PyObject>, tb: 
         }
         let r = if is_any_gen(&yf) {
             g(o).running = true;
+            // the delegating generator's frame is the caller of the sub-generator
+            let ts = crate::threads::current();
+            let gf = g(o).frame;
+            let saved = ts.frame.get();
+            if !gf.is_null() {
+                unsafe { (*gf).prev = saved };
+                ts.frame.set(gf);
+            }
             let r = gen_throw_impl(&yf, typ, val, tb, close_on_genexit);
+            ts.frame.set(saved);
+            if !gf.is_null() {
+                unsafe { (*gf).prev = std::ptr::null_mut() };
+            }
             g(o).running = false;
             r
         } else {
@@ -383,7 +395,7 @@ fn throw_here(o: &PyObject, typ: &PyObject, val: Option<&PyObject>, tb: Option<&
         }
     }
     let inst = if exc::is_exception_class(typ) {
-        match val {
+        let made = match val {
             Some(v) if exc::is_exception_instance(v) && is_subtype(v.type_ptr(), as_type(typ)) => v.to_ref(),
             Some(v) if !v.is(none::none()) => {
                 if tuple::is_tuple(v) {
@@ -394,7 +406,19 @@ fn throw_here(o: &PyObject, typ: &PyObject, val: Option<&PyObject>, tb: Option<&
                 }
             }
             _ => ab::call(typ, &[])?,
+        };
+        if !exc::is_exception_instance(&made) {
+            // the bad result becomes a TypeError raised inside the generator
+            let _ = err!(
+                TypeError,
+                "calling {} should have returned an instance of BaseException, not {}",
+                ab::repr_string(typ)?,
+                tname(&made)
+            );
+            let e = take_exc().unwrap();
+            return resume_with_error(o, e);
         }
+        made
     } else if exc::is_exception_instance(typ) {
         if let Some(v) = val {
             if !v.is(none::none()) {

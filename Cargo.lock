@@ -13,12 +13,21 @@ name = "python"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rpy-bindings",
  "rpy-runtime",
 ]
 
 [[package]]
 name = "rpy-bigint"
 version = "0.1.0"
+
+[[package]]
+name = "rpy-bindings"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rpy-runtime",
+]
 
 [[package]]
 name = "rpy-compiler"

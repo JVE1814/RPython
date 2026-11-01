@@ -7,6 +7,7 @@ sendfile and error reporting.
 """
 
 import collections
+import contextvars
 import collections.abc
 
 import errno
@@ -238,6 +239,8 @@ class Server(events.AbstractServer):
         self._ssl_shutdown_timeout = ssl_shutdown_timeout
         self._serving = False
         self._serving_forever_fut = None
+        # connections are accepted in the context the server was made in
+        self._context = contextvars.copy_context()
 
     def __repr__(self):
         return f'<{type(self).__name__} sockets={self.sockets!r}>'
@@ -266,7 +269,7 @@ class Server(events.AbstractServer):
             self._loop._start_serving(
                 self._protocol_factory, sock, self._ssl_context, self,
                 self._backlog, self._ssl_handshake_timeout,
-                self._ssl_shutdown_timeout)
+                self._ssl_shutdown_timeout, self._context)
 
     def get_loop(self):
         return self._loop
@@ -320,6 +323,8 @@ class Server(events.AbstractServer):
         except exceptions.CancelledError:
             try:
                 self.close()
+                # being cancelled means shutting down: drop the clients too
+                self.close_clients()
                 await self.wait_closed()
             finally:
                 raise
@@ -552,7 +557,7 @@ class BaseEventLoop(events.AbstractEventLoop):
 
     def set_default_executor(self, executor):
         if not isinstance(executor, _thread_pool_class()):
-            raise TypeError('executor must be ThreadPoolExecutor')
+            raise TypeError('executor must be ThreadPoolExecutor instance')
         self._default_executor = executor
 
     # ------------------------------------------------------------ running
@@ -847,8 +852,7 @@ class BaseEventLoop(events.AbstractEventLoop):
             f"and file {file!r} combination")
 
     async def _sock_sendfile_fallback(self, sock, file, offset, count):
-        if offset:
-            file.seek(offset)
+        file.seek(offset)
         chunk = (min(count, constants.SENDFILE_FALLBACK_READBUFFER_SIZE)
                  if count else constants.SENDFILE_FALLBACK_READBUFFER_SIZE)
         buf = bytearray(chunk)
@@ -866,7 +870,7 @@ class BaseEventLoop(events.AbstractEventLoop):
                 sent += n
             return sent
         finally:
-            if sent > 0 and hasattr(file, 'seek'):
+            if hasattr(file, "seek"):
                 file.seek(offset + sent)
 
     def _check_sendfile_params(self, sock, file, offset, count):
@@ -916,8 +920,7 @@ class BaseEventLoop(events.AbstractEventLoop):
             "sendfile syscall is not supported")
 
     async def _sendfile_fallback(self, transp, file, offset, count):
-        if offset:
-            file.seek(offset)
+        file.seek(offset)
         chunk = min(count, 16384) if count else 16384
         buf = bytearray(chunk)
         sent = 0
@@ -935,7 +938,7 @@ class BaseEventLoop(events.AbstractEventLoop):
                 transp.write(view[:n])
                 sent += n
         finally:
-            if sent > 0 and hasattr(file, 'seek'):
+            if hasattr(file, "seek"):
                 file.seek(offset + sent)
             await proto.restore()
 
@@ -1013,7 +1016,10 @@ class BaseEventLoop(events.AbstractEventLoop):
             raise
         except:
             if sock is not None:
-                sock.close()
+                try:
+                    sock.close()
+                except OSError:
+                    pass    # keep the original error
             raise
         finally:
             exceptions = my_exceptions = None
@@ -1077,11 +1083,11 @@ class BaseEventLoop(events.AbstractEventLoop):
                     except OSError:
                         continue
             else:
-                sock, _, _ = await staggered.staggered_race(
+                sock = (await staggered.staggered_race(
                     (lambda info=info: self._connect_sock(errors, info,
                                                           laddr_infos)
                      for info in infos),
-                    happy_eyeballs_delay, loop=self)
+                    happy_eyeballs_delay, loop=self))[0]
 
             if sock is None:
                 flat = [exc for group in errors for exc in group]
@@ -1107,10 +1113,15 @@ class BaseEventLoop(events.AbstractEventLoop):
                 raise ValueError(
                     f'A Stream Socket was expected, got {sock!r}')
 
-        transport, protocol = await self._create_connection_transport(
-            sock, protocol_factory, ssl, server_hostname,
-            ssl_handshake_timeout=ssl_handshake_timeout,
-            ssl_shutdown_timeout=ssl_shutdown_timeout)
+        try:
+            transport, protocol = await self._create_connection_transport(
+                sock, protocol_factory, ssl, server_hostname,
+                ssl_handshake_timeout=ssl_handshake_timeout,
+                ssl_shutdown_timeout=ssl_shutdown_timeout)
+        except:
+            # no transport owns the socket: do not leak it
+            sock.close()
+            raise
         if self._debug:
             logger.debug("%r connected to %s:%r: (%r, %r)",
                          transport.get_extra_info('socket'), host, port,

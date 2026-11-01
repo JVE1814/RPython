@@ -1400,7 +1400,11 @@ unsafe extern "C" fn memory_length(o: *mut PyObject) -> Py_ssize_t {
             return -1;
         }
         let v = &mv(ob).view;
-        if v.ndim == 0 { 1 } else { *v.shape }
+        if v.ndim == 0 {
+            let _ = crate::err!(TypeError, "0-dim memory has no length");
+            return -1;
+        }
+        *v.shape
     }
 }
 

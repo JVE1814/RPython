@@ -71,7 +71,11 @@ fn syntax_error(e: &rpy_parser::SyntaxError) -> PyErr {
         "TabError" => crate::types::exceptions::TabError(),
         _ => crate::types::exceptions::SyntaxError(),
     };
-    crate::compile::raise_syntax_error(class, &e.msg, "<string>", e.lineno, e.offset, e.text.as_deref(), e.end_lineno, e.end_offset)
+    // indentation errors from the tokenizer carry no end position
+    let indent = class != crate::types::exceptions::SyntaxError();
+    let (el, eo) = if indent { (None, None) } else { (e.end_lineno, e.end_offset) };
+    let text = e.text.as_deref().map(|t| if indent { t.trim_end_matches(['\r', '\n']) } else { t });
+    crate::compile::raise_syntax_error(class, &e.msg, "<string>", e.lineno, e.offset, text, el, eo)
 }
 
 unsafe extern "C" fn tokiter_next(o: *mut PyObject) -> *mut PyObject {

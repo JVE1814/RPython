@@ -493,6 +493,41 @@ fn config_lookup(name: &str) -> PyResult {
         }
         "filesystem_encoding" => Ok(pystr::new_str("utf-8")),
         "filesystem_errors" => Ok(pystr::new_str("surrogateescape")),
+        // core-runtime: further PEP 741 options with this runtime's fixed values
+        "code_debug_ranges" => {
+            let xo = sys("_xoptions")?;
+            let off = crate::types::dict::get_item_str(&xo, &pystr::new_str("no_debug_ranges")).is_some()
+                || (std::env::var_os("PYTHONNODEBUGRANGES").is_some_and(|v| !v.is_empty())
+                    && ab::is_true(&*(flag("ignore_environment")?))? == false);
+            Ok(bool_::new_bool(!off))
+        }
+        "coerce_c_locale" | "coerce_c_locale_warn" | "dump_refs" | "malloc_stats" | "pymalloc_hugepages" | "parser_debug"
+        | "show_ref_count" | "skip_source_first_line" | "faulthandler" | "use_hash_seed" => {
+            if name == "faulthandler" {
+                if let Some(m) = crate::import::get_loaded_module("faulthandler") {
+                    if let Ok(f) = ab::getattr_str(&m, "is_enabled") {
+                        return Ok(bool_::new_bool(ab::is_true(&*ab::call(&f, &[])?)?));
+                    }
+                }
+            }
+            if name == "parser_debug" {
+                return Ok(bool_::new_bool(ab::is_true(&*(flag("debug")?))?));
+            }
+            Ok(bool_::new_bool(false))
+        }
+        "configure_locale" | "use_frozen_modules" => Ok(bool_::new_bool(true)),
+        "allocator" | "hash_seed" | "perf_profiling" | "remote_debug" | "tracemalloc" | "enable_gil" | "tlbc_enabled" => {
+            Ok(int::new_int(if name == "enable_gil" { -1 } else { 0 }))
+        }
+        "cpu_count" => Ok(int::new_int(-1)),
+        "optimization_level" => flag("optimize"),
+        "lazy_imports" => Ok(int::new_int(crate::modules::sys_full::config().lazy_imports as i64)),
+        "thread_inherit_context" | "context_aware_warnings" => flag(name),
+        "check_hash_pycs_mode" => Ok(pystr::new_str("default")),
+        "home" | "dump_refs_file" | "run_command" | "run_filename" | "run_module" => Ok(none::none_ref()),
+        "program_name" => sys("executable"),
+        "stdio_encoding" => Ok(pystr::new_str("utf-8")),
+        "stdio_errors" => Ok(pystr::new_str("strict")),
         _ => Err(value_error(&format!("unknown config option name: {}", name))),
     }
 }

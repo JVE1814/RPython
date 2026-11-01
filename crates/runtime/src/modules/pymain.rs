@@ -89,6 +89,23 @@ fn abspath(p: &str) -> String {
     }
 }
 
+/// A ZIP archive (possibly with data prepended, e.g. a launcher stub) has its
+/// end-of-central-directory record within the last 64 KiB + 22 bytes.
+fn looks_like_zip(path: &str) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    let Ok(len) = f.seek(SeekFrom::End(0)) else { return false };
+    let start = len.saturating_sub(65535 + 22);
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return false;
+    }
+    let mut tail = Vec::new();
+    if f.read_to_end(&mut tail).is_err() {
+        return false;
+    }
+    tail.windows(4).any(|w| w == b"PK\x05\x06")
+}
+
 fn insert_path0(p: &str) {
     if let Some(path) = crate::modules::sys::get_sys_attr("path") {
         list::insert(&path, 0, pystr::new_str(p));
@@ -99,11 +116,11 @@ fn run_script(path: &str, opts: &MainOptions) -> Outcome {
     let meta = std::fs::metadata(path);
     // a directory or zip file with __main__.py: run it as a module
     let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-    let is_zip = !is_dir && std::fs::read(path).map(|b| b.starts_with(b"PK")).unwrap_or(false);
+    let is_zip = !is_dir && looks_like_zip(path);
     if is_dir || is_zip {
-        if !opts.safe_path {
-            insert_path0(path);
-        }
+        // The directory or archive is where __main__ comes from, so it is
+        // put on sys.path even in safe-path / isolated mode.
+        insert_path0(path);
         let r = (|| -> PyResult<()> {
             main_module()?;
             let runpy = crate::import::import_absolute("runpy")?;
@@ -255,8 +272,109 @@ fn is_incomplete_error() -> bool {
     inc
 }
 
+/// Call sys.__interactivehook__ (installed by site: readline completion and history).
+fn run_interactive_hook() {
+    if let Some(h) = crate::modules::sys::get_sys_attr("__interactivehook__") {
+        if ab::call(&h, &[]).is_err() {
+            crate::modules::sys::write_stderr("Error in sys.__interactivehook__\n");
+            crate::print_exception_and_clear();
+        }
+    }
+}
+
+/// Read one line through the PyOS_Readline hook (GNU readline when the
+/// readline module was imported).  None: no hook installed.
+fn readline_line(prompt: &str) -> Option<Result<String, ()>> {
+    unsafe extern "C" {
+        static mut stdin: *mut libc::FILE;
+        static mut stdout: *mut libc::FILE;
+    }
+    if unsafe { (*(&raw const crate::capi::misc::PyOS_ReadlineFunctionPointer)).is_none() } {
+        return None;
+    }
+    if let Some(o) = crate::modules::sys::get_sys_attr("stdout") {
+        if ab::call_method_str(&o, "flush", &[]).is_err() {
+            clear_exc();
+        }
+    }
+    let mut p = prompt.as_bytes().to_vec();
+    p.retain(|b| *b != 0);
+    p.push(0);
+    let r = unsafe { crate::capi::misc::PyOS_Readline(stdin, stdout, p.as_ptr() as *const std::ffi::c_char) };
+    if r.is_null() {
+        if !err_occurred() {
+            set_exc_kbd();
+        }
+        return Some(Err(()));
+    }
+    let s = unsafe { std::ffi::CStr::from_ptr(r) }.to_string_lossy().into_owned();
+    unsafe { crate::capi::mem::PyMem_RawFree(r as *mut std::ffi::c_void) };
+    Some(Ok(s))
+}
+
+fn set_exc_kbd() {
+    let _ = set_err_noargs(crate::types::exceptions::KeyboardInterrupt());
+}
+
+/// Make the source of an interactive statement available to tracebacks
+/// (linecache keeps it keyed by the code objects).
+fn register_interactive_source(code: &PyObject, src: &str) {
+    let r = (|| -> PyResult<()> {
+        let lc = crate::import::import_absolute("linecache")?;
+        let f = ab::getattr_str(&lc, "_register_code")?;
+        ab::call(&f, &[code, &pystr::new_str(src), &pystr::new_str("<stdin>")])?;
+        Ok(())
+    })();
+    if r.is_err() {
+        clear_exc();
+    }
+}
+
+/// Run the pure-Python REPL (_pyrepl) when stdin/stdout are a terminal.
+/// Returns None when it is not available (the caller falls back to `repl`).
+fn fancy_repl(quiet: bool) -> Option<i32> {
+    let cfg = crate::modules::sys_full::config();
+    let basic = cfg.ignore_environment == 0 && std::env::var("PYTHON_BASIC_REPL").map(|v| !v.is_empty()).unwrap_or(false);
+    if basic || unsafe { libc::isatty(0) == 0 || libc::isatty(1) == 0 } {
+        return None;
+    }
+    let r = (|| -> PyResult<()> {
+        let m = crate::import::import_absolute("_pyrepl.main")?;
+        let f = ab::getattr_str(&m, "interactive_console")?;
+        let main = main_module()?;
+        let startup = if cfg.ignore_environment == 0 && cfg.isolated == 0 { std::env::var("PYTHONSTARTUP").ok().filter(|s| !s.is_empty()) } else { None };
+        let st = match startup {
+            Some(s) => pystr::new_str(&s),
+            None => none::none_ref(),
+        };
+        let kw = dict::new_dict();
+        dict::set_item_str(&kw, "pythonstartup", &st)?;
+        crate::modules::fncommon::call_kwdict(&f, &[&main, &crate::types::bool_::new_bool(quiet)], Some(&kw))?;
+        Ok(())
+    })();
+    match r {
+        Ok(()) => Some(0),
+        Err(_) => {
+            if exc_matches(crate::types::exceptions::SystemExit()) {
+                let e = take_exc().unwrap();
+                return Some(crate::handle_system_exit(&e));
+            }
+            if exc_matches(crate::types::exceptions::ImportError()) {
+                clear_exc();
+                return None;
+            }
+            crate::print_exception_and_clear();
+            crate::modules::sys::write_stderr("warning: can't use pyrepl, falling back to the basic REPL\n");
+            None
+        }
+    }
+}
+
 /// Simple interactive loop (fallback REPL).
 fn repl(quiet: bool) -> i32 {
+    if let Some(code) = fancy_repl(quiet) {
+        return code;
+    }
     let tty = unsafe { libc::isatty(0) } != 0;
     if !quiet && tty {
         let v = crate::modules::sys::get_sys_attr("version").map(|v| pystr::to_string_lossy(&v)).unwrap_or_default();
@@ -274,15 +392,34 @@ fn repl(quiet: bool) -> i32 {
         }
     }
     run_startup_file();
+    run_interactive_hook();
+    let use_readline = tty && unsafe { libc::isatty(1) } != 0;
     let stdin = std::io::stdin();
     let mut buf = String::new();
     loop {
         let prompt = if buf.is_empty() { get_prompt("ps1", ">>> ") } else { get_prompt("ps2", "... ") };
-        if tty || true {
-            write_prompt(&prompt);
-        }
         let mut line = String::new();
-        let n = crate::threads::blocking(|| stdin.read_line(&mut line));
+        let n = match if use_readline { readline_line(&prompt) } else { None } {
+            Some(Ok(l)) => {
+                line = l;
+                Ok(line.len())
+            }
+            Some(Err(())) => {
+                // KeyboardInterrupt (or another exception) while editing the line
+                if exc_matches(crate::types::exceptions::KeyboardInterrupt()) {
+                    clear_exc();
+                    crate::modules::sys::write_stderr("\nKeyboardInterrupt\n");
+                } else {
+                    crate::print_exception_and_clear();
+                }
+                buf.clear();
+                continue;
+            }
+            None => {
+                write_prompt(&prompt);
+                crate::threads::blocking(|| stdin.read_line(&mut line))
+            }
+        };
         if crate::modules::signal::signals_pending() {
             if crate::modules::signal::check_signals().is_err() {
                 if exc_matches(crate::types::exceptions::KeyboardInterrupt()) {
@@ -304,6 +441,10 @@ fn repl(quiet: bool) -> i32 {
             }
             Ok(_) => {}
         }
+        if !line.ends_with('\n') {
+            // last line before EOF: finish the prompt line like an echoed newline would
+            write_prompt("\n");
+        }
         buf.push_str(&line);
         let src = buf.clone();
         let blank = line.trim().is_empty();
@@ -316,6 +457,7 @@ fn repl(quiet: bool) -> i32 {
                     continue;
                 }
                 buf.clear();
+                register_interactive_source(&code.code, &src);
                 let res = (|| -> PyResult<()> {
                     let m = main_module()?;
                     let d = module::module_dict(&m);

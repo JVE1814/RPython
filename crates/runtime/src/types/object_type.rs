@@ -533,6 +533,12 @@ fn t(o: &PyObject) -> *mut PyTypeObject {
 }
 
 fn type_get_name(o: &PyObject) -> PyResult {
+    unsafe {
+        let tp = t(o);
+        if (*tp).tp_flags & Py_TPFLAGS_HEAPTYPE != 0 && !(*heap(tp)).ht_name.is_null() {
+            return Ok(PyRef::from_borrowed((*heap(tp)).ht_name));
+        }
+    }
     Ok(pystr::new_str(&type_name(unsafe { &*t(o) })))
 }
 fn check_set_special(o: &PyObject, v: Option<&PyObject>, attr: &str) -> PyResult<()> {
@@ -574,6 +580,12 @@ fn type_set_name(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     Ok(())
 }
 fn type_get_qualname(o: &PyObject) -> PyResult {
+    unsafe {
+        let tp = t(o);
+        if (*tp).tp_flags & Py_TPFLAGS_HEAPTYPE != 0 && !(*heap(tp)).ht_qualname.is_null() {
+            return Ok(PyRef::from_borrowed((*heap(tp)).ht_qualname));
+        }
+    }
     Ok(pystr::new_str(&type_qualname(unsafe { &*t(o) })))
 }
 fn type_set_qualname(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
@@ -609,6 +621,14 @@ fn type_set_bases(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         }
         if is_subtype(as_type(b), tp) {
             raise!(TypeError, "a __bases__ item causes an inheritance cycle");
+        }
+        // the MRO may not be updated yet (re-entrant mro()): also follow tp_base
+        let mut p = as_type(b);
+        while !p.is_null() {
+            if p == tp {
+                raise!(TypeError, "a __bases__ item causes an inheritance cycle");
+            }
+            p = unsafe { (*p).tp_base };
         }
     }
     let new_base = best_base(v)?;
@@ -651,6 +671,15 @@ fn type_set_bases(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         decref(old_bases);
         decref(old_base as *mut PyObject);
         crate::types::slots::fixup_slots(tp);
+        // inherited slots of all subclasses may come from the new bases
+        let mut todo = subclasses(tp);
+        let mut seen = std::collections::HashSet::new();
+        while let Some(sub) = todo.pop() {
+            if seen.insert(sub as usize) {
+                crate::types::slots::fixup_slots(sub);
+                todo.extend(subclasses(sub));
+            }
+        }
     }
     Ok(())
 }
@@ -967,7 +996,9 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
     if winner != meta {
         unsafe {
             if (*winner).tp_new != Some(type_new_slot) {
-                let f = (*winner).tp_new.unwrap();
+                let Some(f) = (*winner).tp_new else {
+                    raise!(TypeError, "cannot create '{}' instances", type_name(&*winner));
+                };
                 let kwp = kw.map_or(std::ptr::null_mut(), |k| k.as_ptr());
                 return from_c(f(winner, args.as_ptr(), kwp));
             }
@@ -1153,12 +1184,16 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
         (*h).ht_slots = if slots.is_some() { tuple::new_tuple(slot_names.clone()).into_raw() } else { std::ptr::null_mut() };
         if add_dict {
             (*tp).tp_flags |= Py_TPFLAGS_MANAGED_DICT;
+            if (*base).tp_itemsize == 0 {
+                (*tp).tp_flags |= Py_TPFLAGS_INLINE_VALUES;
+            }
         }
         if add_weak {
             (*tp).tp_flags |= Py_TPFLAGS_MANAGED_WEAKREF;
         }
         // inherit preheader flags from base
         (*tp).tp_flags |= (*base).tp_flags & Py_TPFLAGS_PREHEADER;
+        (*tp).tp_flags |= (*base).tp_flags & Py_TPFLAGS_INLINE_VALUES;
         (*tp).tp_basicsize = slotoffset as isize;
         (*tp).tp_itemsize = (*base).tp_itemsize;
         (*tp).tp_dealloc = Some(subtype_dealloc);
@@ -1167,14 +1202,21 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
         (*tp).tp_alloc = Some(generic_alloc);
         (*tp).tp_free = Some(generic_free);
         if add_dict && (*tp).tp_flags & Py_TPFLAGS_MANAGED_DICT != 0 && dict::get_item_str(&dict, name!("__dict__")).is_none() {
-            let gs = subtype_getset_dict();
-            let descr = crate::types::descr::new_getset_descr(tp, gs);
+            let descr = shared_subtype_descr(0);
             dict::set_item(&dict, name!("__dict__"), &descr)?;
         }
         if (*tp).tp_flags & Py_TPFLAGS_MANAGED_WEAKREF != 0 && add_weak && dict::get_item_str(&dict, name!("__weakref__")).is_none() {
-            let gs = subtype_getset_weakref();
-            let descr = crate::types::descr::new_getset_descr(tp, gs);
+            let descr = shared_subtype_descr(1);
             dict::set_item(&dict, name!("__weakref__"), &descr)?;
+        }
+        // __classcell__ is filled before the MRO is computed (a custom mro() may
+        // already call methods that use __class__)
+        if let Some(cell) = dict::get_item_str(&dict, name!("__classcell__")) {
+            if !cell.is_type(funcobject::cell_type()) {
+                raise!(TypeError, "__classcell__ must be a nonlocal cell, not {}", tname(&cell));
+            }
+            funcobject::cell_set(&cell, Some(typ.clone()));
+            dict::del_item(&dict, name!("__classcell__"))?;
         }
         // __firstlineno__ / __static_attributes__ are provided by the compiler in the namespace
         type_ready(tp)?;
@@ -1188,17 +1230,11 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
                 (*tp).tp_flags |= Py_TPFLAGS_IS_ABSTRACT;
             }
         }
-        // __classcell__
-        if let Some(cell) = dict::get_item_str(&dict, name!("__classcell__")) {
-            if !cell.is_type(funcobject::cell_type()) {
-                raise!(TypeError, "__classcell__ must be a nonlocal cell, not {}", tname(&cell));
-            }
-            funcobject::cell_set(&cell, Some(typ.clone()));
-            dict::del_item(&dict, name!("__classcell__"))?;
-        }
         if let Some(cd) = dict::get_item_str(&dict, name!("__classdictcell__")) {
             if cd.is_type(funcobject::cell_type()) {
-                funcobject::cell_set(&cd, Some(dict.clone()));
+                // the class-body namespace (not the type dict, which would make
+                // class -> dict -> __annotate__ -> cell -> dict cycles)
+                funcobject::cell_set(&cd, Some(ns.to_ref()));
             }
             dict::del_item(&dict, name!("__classdictcell__"))?;
         }
@@ -1224,13 +1260,32 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
     }
 }
 
+/// The `__dict__` (0) / `__weakref__` (1) descriptors that classes add for their
+/// instances: one shared object each, owned by `object` (like CPython 3.15).
+fn shared_subtype_descr(which: usize) -> PyRef {
+    static P: [std::sync::OnceLock<usize>; 2] = [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+    let p = *P[which].get_or_init(|| {
+        let gs = if which == 0 { subtype_getset_dict() } else { subtype_getset_weakref() };
+        let d = crate::types::descr::new_getset_descr(object_type(), gs);
+        d.into_raw() as usize
+    });
+    unsafe { PyRef::from_borrowed(p as *mut PyObject) }
+}
+
 fn subtype_get_dict(o: &PyObject) -> PyResult {
+    if is_type(o) {
+        // classes: the type's own __dict__ (a read-only proxy)
+        return type_get_dict(o);
+    }
     match instance_dict(o) {
         Some(d) => Ok(d),
         None => raise!(AttributeError, "This object has no __dict__"),
     }
 }
 fn subtype_set_dict(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
+    if is_type(o) {
+        raise!(AttributeError, "attribute '__dict__' of 'type' objects is not writable");
+    }
     unsafe {
         let slot = dict_slot(o.as_ptr());
         if slot.is_null() {
@@ -1240,6 +1295,9 @@ fn subtype_set_dict(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
             Some(v) if !dict::is_dict(v) => raise!(TypeError, "__dict__ must be set to a dictionary, not a '{}'", tname(v)),
             _ => {}
         }
+        if crate::alloc::has_managed(o.as_ptr()) {
+            o.ob_gc_bits.fetch_or(crate::alloc::GC_BIT_DICT_DETACHED, std::sync::atomic::Ordering::Relaxed);
+        }
         let old = *slot;
         *slot = v.map_or(std::ptr::null_mut(), |v| v.to_ref().into_raw());
         xdecref(old);
@@ -1247,6 +1305,9 @@ fn subtype_set_dict(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     Ok(())
 }
 fn subtype_get_weakref(o: &PyObject) -> PyResult {
+    if unsafe { crate::types::weakref::weaklist_slot(o.as_ptr()).is_null() } {
+        raise!(AttributeError, "This object has no __weakref__");
+    }
     match crate::types::weakref::first_weakref(o) {
         Some(w) => Ok(w),
         None => Ok(none::none_ref()),
@@ -1343,7 +1404,7 @@ pub fn init_types() {
             ("__dictoffset__", type_dictoffset),
         ];
         t.tp_methods = crate::mdefs![
-            ("mro", NOARGS, type_mro_method, "Return a type's method resolution order."),
+            ("mro", NOARGS, type_mro_method, "mro($self, /)\n--\n\nReturn a type's method resolution order."),
             ("__subclasses__", NOARGS, type_subclasses_method, "Return a list of immediate subclasses."),
             ("__prepare__", FASTKW, type_prepare, "__prepare__($cls, name, bases, /, **kwds)\n--\n\nCreate the namespace for the class statement"; METH_CLASS),
             ("__instancecheck__", O, type_instancecheck, "Check if an object is an instance."),

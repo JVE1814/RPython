@@ -9,4 +9,5 @@ path = "src/main.rs"
 
 [dependencies]
 rpy-runtime = { path = "../runtime" }
+rpy-bindings = { path = "../bindings" }
 libc = "0.2"

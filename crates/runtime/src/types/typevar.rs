@@ -980,7 +980,8 @@ pub fn init_types() {
         t.tp_doc = c"Generic()\n--\n\nAbstract base class for generic types.\n\nOn Python 3.12 and newer, generic classes implicitly inherit from\nGeneric when they declare a parameter list after the class's name::\n\n    class Mapping[KT, VT]:\n        def __getitem__(self, key: KT) -> VT:\n            ...\n        # Etc.\n\nOn older versions of Python, however, generic classes have to\nexplicitly inherit from Generic.\n\nAfter a class has been declared to be generic, it can then be used as\nfollows::\n\n    def lookup_name[KT, VT](mapping: Mapping[KT, VT], key: KT, default: VT) -> VT:\n        try:\n            return mapping[key]\n        except KeyError:\n            return default".as_ptr();
         t.tp_getattro = Some(object_generic_getattro);
         t.tp_setattro = Some(object_generic_setattro);
-        t.tp_new = Some(crate::types::object_type::generic_new);
+        // object.__new__ (core-runtime): keeps its argument and abstract-class checks
+        t.tp_new = Some(crate::types::object_type::object_new);
         t.tp_alloc = Some(generic_alloc);
         t.tp_free = Some(generic_free);
         t.tp_methods = crate::mdefs![

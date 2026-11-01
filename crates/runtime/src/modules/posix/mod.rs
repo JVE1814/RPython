@@ -36,7 +36,10 @@ pub fn typeptr(a: &AtomicPtr<PyTypeObject>) -> *mut PyTypeObject {
 }
 
 /// Called in the child after fork(); resets interpreter state that cannot survive fork.
-pub fn after_fork_child_hook() {}
+pub fn after_fork_child_hook() {
+    // JIT code memory must not stay shared with the parent.
+    crate::interp::jit::mem::after_fork_child();
+}
 
 pub static TERMINAL_SIZE: AtomicPtr<PyTypeObject> = AtomicPtr::new(std::ptr::null_mut());
 
@@ -709,6 +712,7 @@ fn methods() -> *mut crate::ffi::PyMethodDef {
         ("getrandom", FASTKW, os_getrandom, "getrandom($module, /, size, flags=0)\n--\n\nReturn up to size random bytes from the kernel."),
         ("register_at_fork", FASTKW, os_register_at_fork, "register_at_fork($module, /, *, before=<unrepresentable>,\n                 after_in_child=<unrepresentable>,\n                 after_in_parent=<unrepresentable>)\n--\n\nRegister callables to run around fork()."),
         ("fork", NOARGS, os_fork),
+        ("forkpty", NOARGS, os_forkpty),
         ("execv", FAST, os_execv, "execv($module, path, argv, /)\n--\n\nReplace the current process with a new program."),
         ("execve", FASTKW, os_execve, "execve($module, /, path, argv, env)\n--\n\nReplace the current process with a new program and environment."),
         ("waitpid", FAST, os_waitpid, "waitpid($module, pid, options, /)\n--\n\nWait for a child process; return (pid, status)."),

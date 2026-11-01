@@ -42,6 +42,7 @@ pub mod typeobject;
 pub mod typevar;
 pub mod union;
 pub mod sentinel;
+pub mod lazyimport;
 pub mod weakref;
 pub mod frameobject_proxy;
 pub mod format_impl;
@@ -108,6 +109,7 @@ pub fn init_all() -> crate::errors::PyResult<()> {
     super_::init_types();
     containers_reg::init_types();
     sentinel::init_types();
+    lazyimport::init_types();
     frameobject_proxy::init_types();
     use typeobject::type_ready;
     type_ready(typeobject::object_type())?;
@@ -157,6 +159,7 @@ pub fn init_all() -> crate::errors::PyResult<()> {
     exceptions::ready_all()?;
     containers_reg::ready()?;
     sentinel::ready()?;
+    lazyimport::ready()?;
     type_ready(frameobject_proxy::proxy_type())?;
     bytes_methods::ready()?;
     bytearray::ready()?;

@@ -646,6 +646,11 @@ fn fh_read_null(_m: &PyObject) -> PyResult {
     }
 }
 fn fh_sigsegv(_m: &PyObject, _args: &[&PyObject]) -> PyResult {
+    if !ENABLED.load(Acquire) {
+        // Rust's own SIGSEGV handler (stack overflow detection) swallows a
+        // raised signal that is not a guard-page fault: crash for real.
+        unsafe { libc::signal(libc::SIGSEGV, libc::SIG_DFL) };
+    }
     unsafe { libc::raise(libc::SIGSEGV) };
     Ok(none::none_ref())
 }

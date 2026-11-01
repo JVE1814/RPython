@@ -66,6 +66,7 @@ build_time_vars = {
     'SIZEOF_WCHAR_T': 4,
     'SIZEOF__BOOL': 1,
     'SOABI': 'cpython-315t-x86_64-linux-gnu',
+    'SOABI_PLATFORM': 'x86_64-linux-gnu',
     'SO': '.cpython-315t-x86_64-linux-gnu.so',
     'TZPATH': '/usr/share/zoneinfo:/usr/lib/zoneinfo:/usr/share/lib/zoneinfo:/etc/zoneinfo',
     'VERSION': '3.15',
