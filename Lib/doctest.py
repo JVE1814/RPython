@@ -1170,7 +1170,12 @@ def _make_redirecting_pdb():
             self.__debugger_used = True
             if frame is None:
                 frame = sys._getframe().f_back
-            pdb.Pdb.set_trace(self, frame, commands=commands)
+            captured = sys.stdout
+            sys.stdout = self.__out
+            try:
+                pdb.Pdb.set_trace(self, frame, commands=commands)
+            finally:
+                sys.stdout = captured
 
         def set_continue(self):
             # only switch off tracing if the debugger was actually used
