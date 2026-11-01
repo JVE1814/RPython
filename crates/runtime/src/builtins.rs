@@ -624,6 +624,9 @@ fn b_eval(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult 
 }
 fn b_input(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     args::check_pos("input", args, 0, 1)?;
+    if let Some(r) = crate::modules::tty::input::tty_input(args.first().copied())? {
+        return Ok(r);
+    }
     let out = crate::modules::sys::get_sys_attr("stdout");
     if let (Some(p), Some(o)) = (args.first(), &out) {
         let s = ab::str(p)?;
