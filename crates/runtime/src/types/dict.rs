@@ -232,6 +232,7 @@ pub fn table(d: &PyObject) -> &mut DictTable {
 #[inline(always)]
 fn set_used(d: &PyObject, n: usize) {
     unsafe { AtomicIsizePtr::store(&raw mut (*(d.as_ptr() as *mut PyDictObject)).ma_used, n as isize) }
+    crate::interp::cache::on_dict_write(d); // jit: type-dict writes invalidate caches
 }
 struct AtomicIsizePtr;
 impl AtomicIsizePtr {
@@ -500,6 +501,7 @@ pub fn set_item_hash(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) -
             let old = t.entries[ix].value;
             t.entries[ix].value = value.as_ptr();
             t.version = next_version();
+            crate::interp::cache::on_dict_write(d); // jit
             drop(g);
             unsafe { decref(old) };
         }

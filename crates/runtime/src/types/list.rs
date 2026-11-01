@@ -585,7 +585,7 @@ pub fn list_getitem(o: &PyObject, k: &PyObject) -> PyResult {
     }
     raise!(TypeError, "list indices must be integers or slices, not {}", tname(k));
 }
-unsafe extern "C" fn list_subscript(o: *mut PyObject, k: *mut PyObject) -> *mut PyObject {
+pub unsafe extern "C" fn list_subscript(o: *mut PyObject, k: *mut PyObject) -> *mut PyObject {
     unsafe { into_c(list_getitem(&*o, &*k)) }
 }
 

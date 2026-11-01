@@ -143,6 +143,7 @@ fn sizeof_m(o: &PyObject) -> PyResult {
     Ok(int::new_int((o.ty().tp_basicsize as usize + l.allocated.max(0) as usize * 8) as i64))
 }
 fn getitem_m(o: &PyObject, k: &PyObject) -> PyResult {
+    // list's own subscript, never the (possibly overridden) slot of a subclass
     crate::types::list::list_getitem(o, k)
 }
 fn class_getitem_m(cls: &PyObject, item: &PyObject) -> PyResult {

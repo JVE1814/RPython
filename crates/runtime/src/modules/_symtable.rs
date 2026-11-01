@@ -67,7 +67,8 @@ fn m_symtable(_m: &PyObject, args: &[&PyObject]) -> PyResult {
             None => raise!(TypeError, "symtable() arg 1 must be a string, bytes or AST object"),
         }
     };
-    let module = crate::compile::parse_to_ast(&src, &fname, mode, 0, None)?;
+    let popts = crate::compile::Opts::new(&fname, mode, 0, 0);
+    let (module, text) = crate::compile::parse_mod(crate::compile::Source::Bytes(&src), &popts)?;
     let opts = rpy_compiler::CompileOptions::new(fname.clone(), match mode {
         crate::compile::Mode::Eval => rpy_compiler::Mode::Eval,
         crate::compile::Mode::Single => rpy_compiler::Mode::Single,
@@ -75,10 +76,7 @@ fn m_symtable(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     });
     let table = match rpy_compiler::symtable(&module, &opts) {
         Ok(t) => t,
-        Err(e) => {
-            let text = String::from_utf8_lossy(&src).into_owned();
-            return Err(crate::compile::compile_error(&e, &fname, Some(&text)));
-        }
+        Err(e) => return Err(crate::compile::raise_compile_error(&e, &fname, Some(&text))),
     };
     entry(&table, 0)
 }

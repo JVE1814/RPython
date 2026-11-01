@@ -154,7 +154,12 @@ macro_rules! binop {
     ($name:ident, $slot:ident) => {
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $name(a: *mut PyObject, b: *mut PyObject) -> *mut PyObject {
-            unsafe { ret(ab::binary_op(&*a, &*b, NbSlot::$slot)) }
+            unsafe {
+                if a.is_null() || b.is_null() {
+                    return null_arg();
+                }
+                ret(ab::binary_op(&*a, &*b, NbSlot::$slot))
+            }
         }
     };
 }
@@ -162,7 +167,12 @@ macro_rules! ibinop {
     ($name:ident, $slot:ident) => {
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $name(a: *mut PyObject, b: *mut PyObject) -> *mut PyObject {
-            unsafe { ret(ab::inplace_op(&*a, &*b, NbSlot::$slot)) }
+            unsafe {
+                if a.is_null() || b.is_null() {
+                    return null_arg();
+                }
+                ret(ab::inplace_op(&*a, &*b, NbSlot::$slot))
+            }
         }
     };
 }
@@ -194,7 +204,7 @@ ibinop!(PyNumber_InPlaceOr, Or);
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyNumber_Power(a: *mut PyObject, b: *mut PyObject, m: *mut PyObject) -> *mut PyObject {
-    unsafe { ret(ab::power(&*a, &*b, opt(m).unwrap_or(none::none()))) }
+    unsafe { if a.is_null() || b.is_null() { return null_arg(); } ret(ab::power(&*a, &*b, opt(m).unwrap_or(none::none()))) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyNumber_InPlacePower(a: *mut PyObject, b: *mut PyObject, m: *mut PyObject) -> *mut PyObject {
@@ -217,19 +227,39 @@ pub unsafe extern "C" fn PyNumber_InPlacePower(a: *mut PyObject, b: *mut PyObjec
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyNumber_Negative(a: *mut PyObject) -> *mut PyObject {
-    unsafe { ret(ab::negative(&*a)) }
+    unsafe {
+        if a.is_null() {
+            return null_arg();
+        }
+        ret(ab::negative(&*a))
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyNumber_Positive(a: *mut PyObject) -> *mut PyObject {
-    unsafe { ret(ab::positive(&*a)) }
+    unsafe {
+        if a.is_null() {
+            return null_arg();
+        }
+        ret(ab::positive(&*a))
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyNumber_Invert(a: *mut PyObject) -> *mut PyObject {
-    unsafe { ret(ab::invert(&*a)) }
+    unsafe {
+        if a.is_null() {
+            return null_arg();
+        }
+        ret(ab::invert(&*a))
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyNumber_Absolute(a: *mut PyObject) -> *mut PyObject {
-    unsafe { ret(ab::absolute(&*a)) }
+    unsafe {
+        if a.is_null() {
+            return null_arg();
+        }
+        ret(ab::absolute(&*a))
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyNumber_Index(a: *mut PyObject) -> *mut PyObject {
@@ -244,6 +274,10 @@ pub unsafe extern "C" fn PyNumber_Index(a: *mut PyObject) -> *mut PyObject {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyNumber_AsSsize_t(a: *mut PyObject, exc: *mut PyObject) -> Py_ssize_t {
     unsafe {
+        if a.is_null() {
+            null_arg();
+            return -1;
+        }
         let v = match ab::index(&*a) {
             Ok(v) => v,
             Err(_) => return -1,
@@ -290,6 +324,9 @@ pub unsafe extern "C" fn PyNumber_Float(a: *mut PyObject) -> *mut PyObject {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyNumber_ToBase(a: *mut PyObject, base: c_int) -> *mut PyObject {
     unsafe {
+        if a.is_null() {
+            return null_arg();
+        }
         let f = match base {
             2 => "bin",
             8 => "oct",
@@ -881,7 +918,7 @@ pub unsafe extern "C" fn PyMapping_Items(o: *mut PyObject) -> *mut PyObject {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_GetIter(o: *mut PyObject) -> *mut PyObject {
-    unsafe { ret(ab::get_iter(&*o)) }
+    unsafe { if o.is_null() { return null_arg(); } ret(ab::get_iter(&*o)) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_GetAIter(o: *mut PyObject) -> *mut PyObject {

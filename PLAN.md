@@ -52,7 +52,7 @@ Running (clean-room, D19): cleanroom-ut (unittest+mock/argparse/traceback), clea
 (inspect/logging+config/tempfile/shutil), cleanroom-lang (enum/dataclasses/contextlib/_collections_abc).
 Finished also: lang, functional, text, osio, containers, system, harness.
 Running (wave 3): decimal (_decimal/_pydecimal), devtools (marshal/pathlib/pwd/grp/resource/termios/fcntl/mmap/dis/opcode/pdb/profile/doctest/timeit/runpy/pkgutil/site...).
-Unassigned: email/xml(pyexpat)/html/mailbox/mimetypes; pathlib/pwd/grp/
+Unassigned: _testinternalcapi/_testmultiphase/_testclinic re-implemented by us (spec lacks internal headers / generated clinic files); email/xml(pyexpat)/html/mailbox/mimetypes; pathlib/pwd/grp/
 resource/termios/tty/pty/getpass/fcntl/mmap/marshal/py_compile/compileall/getopt/trace/pdb/
 bdb/profile/cProfile/pstats/timeit/doctest; ctypes/_ctypes; multiprocessing/concurrent;
 sqlite3 (own SQLite? decide); curses/readline/_pyrepl; no-GIL thread-safety audit.
