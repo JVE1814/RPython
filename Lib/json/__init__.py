@@ -1,388 +1,205 @@
-r"""JSON (JavaScript Object Notation) <https://json.org> is a subset of
-JavaScript syntax (ECMA-262 3rd edition) used as a lightweight data
-interchange format.
+"""Reading and writing JSON (RFC 8259, ECMA-404).
 
-:mod:`json` exposes an API familiar to users of the standard library
-:mod:`marshal` and :mod:`pickle` modules.
+The four entry points mirror pickle/marshal:
 
-Encoding basic Python object hierarchies::
+* ``dumps(obj)`` / ``dump(obj, fp)`` turn Python data into JSON text,
+* ``loads(text)`` / ``load(fp)`` turn JSON text into Python data.
 
-    >>> import json
-    >>> json.dumps(['foo', {'bar': ('baz', None, 1.0, 2)}])
-    '["foo", {"bar": ["baz", null, 1.0, 2]}]'
-    >>> print(json.dumps("\"foo\bar"))
-    "\"foo\bar"
-    >>> print(json.dumps('ሴ'))
-    "ሴ"
-    >>> print(json.dumps('\\'))
-    "\\"
-    >>> print(json.dumps({"c": 0, "b": 0, "a": 0}, sort_keys=True))
-    {"a": 0, "b": 0, "c": 0}
-    >>> from io import StringIO
-    >>> io = StringIO()
-    >>> json.dump(['streaming API'], io)
-    >>> io.getvalue()
-    '["streaming API"]'
+Mapping between the two worlds (decoding direction in brackets)::
 
-Compact encoding::
+    dict, frozendict       <->  object
+    list, tuple            <->  array    [list]
+    str                    <->  string
+    int, float             <->  number
+    True / False / None    <->  true / false / null
 
     >>> import json
-    >>> mydict = {'4': 5, '6': 7}
-    >>> json.dumps([1,2,3,mydict], separators=(',', ':'))
-    '[1,2,3,{"4":5,"6":7}]'
+    >>> json.dumps({"id": 7, "tags": ("a", "b")}, sort_keys=True)
+    '{"id": 7, "tags": ["a", "b"]}'
+    >>> json.loads('[1.5, null, {"k": false}]')
+    [1.5, None, {'k': False}]
+    >>> print(json.dumps([1, {"x": [2]}], indent=2))
+    [
+      1,
+      {
+        "x": [
+          2
+        ]
+      }
+    ]
 
-Pretty printing::
+Customisation goes through ``JSONEncoder``/``JSONDecoder`` subclasses (the
+``cls`` argument) or through the hook arguments (``default`` when encoding;
+``object_hook``, ``object_pairs_hook``, ``array_hook``, ``parse_float``,
+``parse_int`` and ``parse_constant`` when decoding).
 
-    >>> import json
-    >>> print(json.dumps({'4': 5, '6': 7}, sort_keys=True, indent=4))
-    {
-        "4": 5,
-        "6": 7
-    }
-
-Decoding JSON::
-
-    >>> import json
-    >>> obj = ['foo', {'bar': ['baz', None, 1.0, 2]}]
-    >>> json.loads('["foo", {"bar":["baz", null, 1.0, 2]}]') == obj
-    True
-    >>> json.loads('"\\"foo\\bar"') == '"foo\x08ar'
-    True
-    >>> from io import StringIO
-    >>> io = StringIO('["streaming API"]')
-    >>> json.load(io)[0] == 'streaming API'
-    True
-
-Specializing JSON object decoding::
-
-    >>> import json
-    >>> def as_complex(dct):
-    ...     if '__complex__' in dct:
-    ...         return complex(dct['real'], dct['imag'])
-    ...     return dct
-    ...
-    >>> json.loads('{"__complex__": true, "real": 1, "imag": 2}',
-    ...     object_hook=as_complex)
-    (1+2j)
-    >>> from decimal import Decimal
-    >>> json.loads('1.1', parse_float=Decimal) == Decimal('1.1')
-    True
-
-Specializing JSON object encoding::
-
-    >>> import json
-    >>> def encode_complex(obj):
-    ...     if isinstance(obj, complex):
-    ...         return [obj.real, obj.imag]
-    ...     raise TypeError(f'Object of type {obj.__class__.__name__} '
-    ...                     f'is not JSON serializable')
-    ...
-    >>> json.dumps(2 + 1j, default=encode_complex)
-    '[2.0, 1.0]'
-    >>> json.JSONEncoder(default=encode_complex).encode(2 + 1j)
-    '[2.0, 1.0]'
-    >>> ''.join(json.JSONEncoder(default=encode_complex).iterencode(2 + 1j))
-    '[2.0, 1.0]'
-
-
-Using json from the shell to validate and pretty-print::
-
-    $ echo '{"json":"obj"}' | python -m json
-    {
-        "json": "obj"
-    }
-    $ echo '{ 1.2:3.4}' | python -m json
-    Expecting property name enclosed in double quotes: line 1 column 3 (char 2)
+``python -m json`` validates and pretty-prints JSON from the command line.
 """
+
 __all__ = [
     'dump', 'dumps', 'load', 'loads',
     'JSONDecoder', 'JSONDecodeError', 'JSONEncoder',
 ]
 
-__author__ = 'Bob Ippolito <bob@redivi.com>'
-
 from .decoder import JSONDecoder, JSONDecodeError
 from .encoder import JSONEncoder
 import codecs
 
-_default_encoder = JSONEncoder(
-    skipkeys=False,
-    ensure_ascii=True,
-    check_circular=True,
-    allow_nan=True,
-    indent=None,
-    separators=None,
-    default=None,
+
+def __getattr__(name):
+    if name == '__version__':
+        import warnings
+        warnings.warn(
+            "'__version__' is deprecated and slated for removal in "
+            "Python 3.20",
+            DeprecationWarning, stacklevel=2)
+        return '2.0.9'
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+# --------------------------------------------------------------------------
+# encoding
+
+_ENCODER_DEFAULTS = dict(
+    skipkeys=False, ensure_ascii=True, check_circular=True, allow_nan=True,
+    indent=None, separators=None, default=None, sort_keys=False,
 )
 
+_shared_encoder = JSONEncoder()
+
+
+def _pick_encoder(cls, options, extra):
+    """The shared default encoder when nothing is customised, else a new
+    instance of *cls* (JSONEncoder by default)."""
+    if cls is None and not extra and options == _ENCODER_DEFAULTS:
+        return _shared_encoder
+    if cls is None:
+        cls = JSONEncoder
+    return cls(**options, **extra)
+
+
 def dump(obj, fp, *, skipkeys=False, ensure_ascii=True, check_circular=True,
-        allow_nan=True, cls=None, indent=None, separators=None,
-        default=None, sort_keys=False, **kw):
-    """Serialize ``obj`` as a JSON formatted stream to ``fp`` (a
-    ``.write()``-supporting file-like object).
+         allow_nan=True, cls=None, indent=None, separators=None,
+         default=None, sort_keys=False, **kw):
+    """Write *obj* as JSON to the text stream *fp* (anything with a
+    ``write(str)`` method).
 
-    If ``skipkeys`` is true then ``dict`` keys that are not basic types
-    (``str``, ``int``, ``float``, ``bool``, ``None``) will be skipped
-    instead of raising a ``TypeError``.
-
-    If ``ensure_ascii`` is false, then the strings written to ``fp`` can
-    contain non-ASCII and non-printable characters if they appear in strings
-    contained in ``obj``.  Otherwise, all such characters are escaped in
-    JSON strings.
-
-    If ``check_circular`` is false, then the circular reference check
-    for container types will be skipped and a circular reference will
-    result in an ``RecursionError`` (or worse).
-
-    If ``allow_nan`` is false, then it will be a ``ValueError`` to
-    serialize out of range ``float`` values (``nan``, ``inf``, ``-inf``)
-    in strict compliance of the JSON specification, instead of using the
-    JavaScript equivalents (``NaN``, ``Infinity``, ``-Infinity``).
-
-    If ``indent`` is a non-negative integer, then JSON array elements and
-    object members will be pretty-printed with that indent level. An indent
-    level of 0 will only insert newlines. ``None`` is the most compact
-    representation.
-
-    If specified, ``separators`` should be an ``(item_separator,
-    key_separator)`` tuple.  The default is ``(', ', ': ')`` if *indent* is
-    ``None`` and ``(',', ': ')`` otherwise.  To get the most compact JSON
-    representation, you should specify ``(',', ':')`` to eliminate
-    whitespace.
-
-    ``default(obj)`` is a function that should return a serializable version
-    of obj or raise TypeError. The default simply raises TypeError.
-
-    If *sort_keys* is true (default: ``False``), then the output of
-    dictionaries will be sorted by key.
-
-    To use a custom ``JSONEncoder`` subclass (e.g. one that overrides the
-    ``.default()`` method to serialize additional types), specify it with
-    the ``cls`` kwarg; otherwise ``JSONEncoder`` is used.
-
+    The keyword arguments have the meaning documented for JSONEncoder;
+    *cls* selects a JSONEncoder subclass and extra keyword arguments are
+    passed to its constructor.
     """
-    # cached encoder
-    if (not skipkeys and ensure_ascii and
-        check_circular and allow_nan and
-        cls is None and indent is None and separators is None and
-        default is None and not sort_keys and not kw):
-        iterable = _default_encoder.iterencode(obj)
-    else:
-        if cls is None:
-            cls = JSONEncoder
-        iterable = cls(skipkeys=skipkeys, ensure_ascii=ensure_ascii,
-            check_circular=check_circular, allow_nan=allow_nan, indent=indent,
-            separators=separators,
-            default=default, sort_keys=sort_keys, **kw).iterencode(obj)
-    # could accelerate with writelines in some versions of Python, at
-    # a debuggability cost
-    for chunk in iterable:
-        fp.write(chunk)
+    options = dict(skipkeys=skipkeys, ensure_ascii=ensure_ascii,
+                   check_circular=check_circular, allow_nan=allow_nan,
+                   indent=indent, separators=separators, default=default,
+                   sort_keys=sort_keys)
+    write = fp.write
+    for piece in _pick_encoder(cls, options, kw).iterencode(obj):
+        write(piece)
 
 
 def dumps(obj, *, skipkeys=False, ensure_ascii=True, check_circular=True,
-        allow_nan=True, cls=None, indent=None, separators=None,
-        default=None, sort_keys=False, **kw):
-    """Serialize ``obj`` to a JSON formatted ``str``.
+          allow_nan=True, cls=None, indent=None, separators=None,
+          default=None, sort_keys=False, **kw):
+    """Return *obj* serialised as a JSON ``str``.
 
-    If ``skipkeys`` is true then ``dict`` keys that are not basic types
-    (``str``, ``int``, ``float``, ``bool``, ``None``) will be skipped
-    instead of raising a ``TypeError``.
-
-    If ``ensure_ascii`` is false, then the return value can contain
-    non-ASCII and non-printable characters if they appear in strings
-    contained in ``obj``.  Otherwise, all such characters are escaped in
-    JSON strings.
-
-    If ``check_circular`` is false, then the circular reference check
-    for container types will be skipped and a circular reference will
-    result in an ``RecursionError`` (or worse).
-
-    If ``allow_nan`` is false, then it will be a ``ValueError`` to
-    serialize out of range ``float`` values (``nan``, ``inf``, ``-inf``) in
-    strict compliance of the JSON specification, instead of using the
-    JavaScript equivalents (``NaN``, ``Infinity``, ``-Infinity``).
-
-    If ``indent`` is a non-negative integer, then JSON array elements and
-    object members will be pretty-printed with that indent level. An indent
-    level of 0 will only insert newlines. ``None`` is the most compact
-    representation.
-
-    If specified, ``separators`` should be an ``(item_separator,
-    key_separator)`` tuple.  The default is ``(', ', ': ')`` if *indent* is
-    ``None`` and ``(',', ': ')`` otherwise.  To get the most compact JSON
-    representation, you should specify ``(',', ':')`` to eliminate
-    whitespace.
-
-    ``default(obj)`` is a function that should return a serializable version
-    of obj or raise TypeError. The default simply raises TypeError.
-
-    If *sort_keys* is true (default: ``False``), then the output of
-    dictionaries will be sorted by key.
-
-    To use a custom ``JSONEncoder`` subclass (e.g. one that overrides the
-    ``.default()`` method to serialize additional types), specify it with
-    the ``cls`` kwarg; otherwise ``JSONEncoder`` is used.
-
+    The keyword arguments are those of dump().
     """
-    # cached encoder
-    if (not skipkeys and ensure_ascii and
-        check_circular and allow_nan and
-        cls is None and indent is None and separators is None and
-        default is None and not sort_keys and not kw):
-        return _default_encoder.encode(obj)
-    if cls is None:
-        cls = JSONEncoder
-    return cls(
-        skipkeys=skipkeys, ensure_ascii=ensure_ascii,
-        check_circular=check_circular, allow_nan=allow_nan, indent=indent,
-        separators=separators, default=default, sort_keys=sort_keys,
-        **kw).encode(obj)
+    options = dict(skipkeys=skipkeys, ensure_ascii=ensure_ascii,
+                   check_circular=check_circular, allow_nan=allow_nan,
+                   indent=indent, separators=separators, default=default,
+                   sort_keys=sort_keys)
+    return _pick_encoder(cls, options, kw).encode(obj)
 
 
-_default_decoder = JSONDecoder()
+# --------------------------------------------------------------------------
+# decoding
+
+_shared_decoder = JSONDecoder()
+
+_DECODER_HOOKS = ('object_hook', 'parse_float', 'parse_int',
+                  'parse_constant', 'object_pairs_hook', 'array_hook')
 
 
 def detect_encoding(b):
-    bstartswith = b.startswith
-    if bstartswith((codecs.BOM_UTF32_BE, codecs.BOM_UTF32_LE)):
-        return 'utf-32'
-    if bstartswith((codecs.BOM_UTF16_BE, codecs.BOM_UTF16_LE)):
-        return 'utf-16'
-    if bstartswith(codecs.BOM_UTF8):
-        return 'utf-8-sig'
+    """Guess the Unicode encoding of the JSON document in the bytes *b*.
 
-    if len(b) >= 4:
-        if not b[0]:
-            # 00 00 -- -- - utf-32-be
-            # 00 XX -- -- - utf-16-be
-            return 'utf-16-be' if b[1] else 'utf-32-be'
-        if not b[1]:
-            # XX 00 00 00 - utf-32-le
-            # XX 00 00 XX - utf-16-le
-            # XX 00 XX -- - utf-16-le
-            return 'utf-16-le' if b[2] or b[3] else 'utf-32-le'
-    elif len(b) == 2:
-        if not b[0]:
-            # 00 XX - utf-16-be
+    A byte order mark wins; otherwise the pattern of zero bytes among the
+    first four bytes tells UTF-16/UTF-32 and their byte order apart (JSON
+    text starts with an ASCII character).
+    """
+    head = bytes(b[:4])
+    if head.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+        return 'utf-32'
+    if head.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return 'utf-16'
+    if head.startswith(codecs.BOM_UTF8):
+        return 'utf-8-sig'
+    zeros = tuple(byte == 0 for byte in head)
+    if len(head) >= 4:
+        if zeros[0]:
+            # 00 xx: big endian; 00 00 00 xx: UTF-32
+            return 'utf-32-be' if zeros[1] else 'utf-16-be'
+        if zeros[1]:
+            # xx 00 00 00: UTF-32 little endian, xx 00 yy ..: UTF-16
+            return 'utf-32-le' if zeros[2] and zeros[3] else 'utf-16-le'
+    elif len(head) == 2:
+        if zeros[0]:
             return 'utf-16-be'
-        if not b[1]:
-            # XX 00 - utf-16-le
+        if zeros[1]:
             return 'utf-16-le'
-    # default
     return 'utf-8'
 
 
 def load(fp, *, cls=None, object_hook=None, parse_float=None,
-        parse_int=None, parse_constant=None, object_pairs_hook=None,
-        array_hook=None, **kw):
-    """Deserialize ``fp`` (a ``.read()``-supporting file-like object containing
-    a JSON document) to a Python object.
+         parse_int=None, parse_constant=None, object_pairs_hook=None,
+         array_hook=None, **kw):
+    """Read a JSON document from the file-like *fp* (``fp.read()`` may
+    return str or bytes) and return the Python value.
 
-    ``object_hook`` is an optional function that will be called with the
-    result of any object literal decode (a ``dict``). The return value of
-    ``object_hook`` will be used instead of the ``dict``. This feature
-    can be used to implement custom decoders (e.g. JSON-RPC class hinting).
-
-    ``object_pairs_hook`` is an optional function that will be called with
-    the result of any object literal decoded with an ordered list of pairs.
-    The return value of ``object_pairs_hook`` will be used instead of the
-    ``dict``. This feature can be used to implement custom decoders.  If
-    ``object_hook`` is also defined, the ``object_pairs_hook`` takes
-    priority.
-
-    ``array_hook`` is an optional function that will be called with the
-    result of any array literal decode (a ``list``).  Its return value is
-    used instead of the ``list``.
-
-    To use a custom ``JSONDecoder`` subclass, specify it with the ``cls``
-    kwarg; otherwise ``JSONDecoder`` is used.
+    Arguments are those of loads().
     """
-    return loads(fp.read(),
-        cls=cls, object_hook=object_hook,
-        parse_float=parse_float, parse_int=parse_int,
-        parse_constant=parse_constant, object_pairs_hook=object_pairs_hook,
-        array_hook=array_hook, **kw)
+    return loads(fp.read(), cls=cls, object_hook=object_hook,
+                 parse_float=parse_float, parse_int=parse_int,
+                 parse_constant=parse_constant,
+                 object_pairs_hook=object_pairs_hook,
+                 array_hook=array_hook, **kw)
 
 
 def loads(s, *, cls=None, object_hook=None, parse_float=None,
-        parse_int=None, parse_constant=None, object_pairs_hook=None,
-        array_hook=None, **kw):
-    """Deserialize ``s`` (a ``str``, ``bytes`` or ``bytearray`` instance
-    containing a JSON document) to a Python object.
+          parse_int=None, parse_constant=None, object_pairs_hook=None,
+          array_hook=None, **kw):
+    """Parse the JSON document *s* (str, bytes or bytearray) into Python
+    data.
 
-    ``object_hook`` is an optional function that will be called with the
-    result of any object literal decode (a ``dict``). The return value of
-    ``object_hook`` will be used instead of the ``dict``. This feature
-    can be used to implement custom decoders (e.g. JSON-RPC class hinting).
+    * object_hook(dict) replaces each decoded object;
+    * object_pairs_hook(list of pairs) does the same from the ordered key/
+      value pairs and takes precedence over object_hook;
+    * array_hook(list) replaces each decoded array;
+    * parse_float(str) / parse_int(str) build numbers (float / int by
+      default);
+    * parse_constant(str) is called for 'NaN', 'Infinity' and '-Infinity'.
 
-    ``object_pairs_hook`` is an optional function that will be called with
-    the result of any object literal decoded with an ordered list of pairs.
-    The return value of ``object_pairs_hook`` will be used instead of the
-    ``dict``. This feature can be used to implement custom decoders.  If
-    ``object_hook`` is also defined, the ``object_pairs_hook`` takes
-    priority.
-
-    ``array_hook`` is an optional function that will be called with the
-    result of any array literal decode (a ``list``).  Its return value is
-    used instead of the ``list``.
-
-    ``parse_float``, if specified, will be called with the string
-    of every JSON float to be decoded. By default this is equivalent to
-    float(num_str). This can be used to use another datatype or parser
-    for JSON floats (e.g. decimal.Decimal).
-
-    ``parse_int``, if specified, will be called with the string
-    of every JSON int to be decoded. By default this is equivalent to
-    int(num_str). This can be used to use another datatype or parser
-    for JSON integers (e.g. float).
-
-    ``parse_constant``, if specified, will be called with one of the
-    following strings: -Infinity, Infinity, NaN.
-    This can be used to raise an exception if invalid JSON numbers
-    are encountered.
-
-    To use a custom ``JSONDecoder`` subclass, specify it with the ``cls``
-    kwarg; otherwise ``JSONDecoder`` is used.
+    *cls* selects a JSONDecoder subclass; extra keyword arguments go to its
+    constructor.  Bytes are decoded with the encoding detect_encoding()
+    reports.
     """
     if isinstance(s, str):
         if s.startswith('﻿'):
-            raise JSONDecodeError("Unexpected UTF-8 BOM (decode using utf-8-sig)",
-                                  s, 0)
-    else:
-        if not isinstance(s, (bytes, bytearray)):
-            raise TypeError(f'the JSON object must be str, bytes or bytearray, '
-                            f'not {s.__class__.__name__}')
+            raise JSONDecodeError(
+                "Unexpected UTF-8 BOM (decode using utf-8-sig)", s, 0)
+    elif isinstance(s, (bytes, bytearray)):
         s = s.decode(detect_encoding(s), 'surrogatepass')
+    else:
+        raise TypeError(f'the JSON object must be str, bytes or bytearray, '
+                        f'not {type(s).__name__}')
 
-    if (cls is None and object_hook is None and
-            parse_int is None and parse_float is None and
-            parse_constant is None and object_pairs_hook is None and
-            array_hook is None and not kw):
-        return _default_decoder.decode(s)
+    hooks = dict(object_hook=object_hook, parse_float=parse_float,
+                 parse_int=parse_int, parse_constant=parse_constant,
+                 object_pairs_hook=object_pairs_hook, array_hook=array_hook)
+    given = {name: value for name, value in hooks.items()
+             if value is not None}
+    if cls is None and not given and not kw:
+        return _shared_decoder.decode(s)
     if cls is None:
         cls = JSONDecoder
-    if object_hook is not None:
-        kw['object_hook'] = object_hook
-    if object_pairs_hook is not None:
-        kw['object_pairs_hook'] = object_pairs_hook
-    if array_hook is not None:
-        kw['array_hook'] = array_hook
-    if parse_float is not None:
-        kw['parse_float'] = parse_float
-    if parse_int is not None:
-        kw['parse_int'] = parse_int
-    if parse_constant is not None:
-        kw['parse_constant'] = parse_constant
-    return cls(**kw).decode(s)
-
-
-def __getattr__(name):
-    if name == "__version__":
-        import warnings
-        warnings.warn("'__version__' is deprecated and slated for "
-                      "removal in Python 3.20", DeprecationWarning,
-                      stacklevel=2)
-        return "2.0.9"  # Do not change
-
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    return cls(**given, **kw).decode(s)

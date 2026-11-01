@@ -3249,10 +3249,10 @@ pub fn init_module() -> PyResult {
             t.tp_getattro = Some(object_generic_getattro);
             let bp = Box::leak(Box::new(PyBufferProcs { bf_getbuffer: Some(pb_getbuffer), bf_releasebuffer: None }));
             t.tp_as_buffer = bp;
-            t.tp_doc = c"Wrapper for potentially out-of-band buffers".as_ptr();
+            t.tp_doc = c"PickleBuffer(buffer)\n--\n\nMarks a buffer for out-of-band transfer by protocol 5 pickling.".as_ptr();
             t.tp_methods = mdefs![
-                ("raw", NOARGS, pb_raw, "raw($self, /)\n--\n\nReturn a memoryview of the raw memory underlying this buffer.\nWill raise BufferError is the buffer isn't contiguous."),
-                ("release", NOARGS, pb_release, "release($self, /)\n--\n\nRelease the underlying buffer exposed by the PickleBuffer object."),
+                ("raw", NOARGS, pb_raw, "raw($self, /)\n--\n\nThe wrapped memory as a byte-format memoryview (BufferError if it is not contiguous)."),
+                ("release", NOARGS, pb_release, "release($self, /)\n--\n\nGive up the wrapped buffer."),
             ];
             type_ready(picklebuffer_type())?;
 
@@ -3269,15 +3269,15 @@ pub fn init_module() -> PyResult {
                 let _ = (copy, clear, reduce);
                 if tp == pmemo_type() {
                     t.tp_methods = mdefs![
-                        ("copy", NOARGS, pmemo_copy, "Copy the memo to a new object."),
-                        ("clear", NOARGS, pmemo_clear, "Remove all items from memo."),
-                        ("__reduce__", NOARGS, pmemo_reduce, "Implement pickle support."),
+                        ("copy", NOARGS, pmemo_copy, "The memo as a new dict."),
+                        ("clear", NOARGS, pmemo_clear, "Forget every memoized object."),
+                        ("__reduce__", NOARGS, pmemo_reduce, "Pickling support."),
                     ];
                 } else {
                     t.tp_methods = mdefs![
-                        ("copy", NOARGS, umemo_copy, "Copy the memo to a new object."),
-                        ("clear", NOARGS, umemo_clear, "Remove all items from memo."),
-                        ("__reduce__", NOARGS, umemo_reduce, "Implement pickling support."),
+                        ("copy", NOARGS, umemo_copy, "The memo as a new dict."),
+                        ("clear", NOARGS, umemo_clear, "Forget every memoized object."),
+                        ("__reduce__", NOARGS, umemo_reduce, "Pickling support."),
                     ];
                 }
                 type_ready(tp)?;
@@ -3295,12 +3295,12 @@ pub fn init_module() -> PyResult {
             t.tp_alloc = Some(generic_alloc);
             t.tp_getattro = Some(object_generic_getattro);
             t.tp_setattro = Some(object_generic_setattro);
-            t.tp_doc = c"Pickler(file, protocol=None, fix_imports=True, buffer_callback=None)\n--\n\nThis takes a binary file for writing a pickle data stream.".as_ptr();
+            t.tp_doc = c"Pickler(file, protocol=None, fix_imports=True, buffer_callback=None)\n--\n\nSerialises objects to a binary file (anything with write()).".as_ptr();
             t.tp_methods = mdefs![
-                ("dump", O, pickler_dump, "dump($self, obj, /)\n--\n\nWrite a pickled representation of the given object to the open file."),
-                ("clear_memo", NOARGS, pickler_clear_memo, "clear_memo($self, /)\n--\n\nClears the pickler's \"memo\"."),
-                ("persistent_id", O, pickler_persistent_id, "persistent_id($self, obj, /)\n--\n\nReturn a persistent id for obj, or None."),
-                ("__sizeof__", NOARGS, pickler_sizeof, "Returns size in memory, in bytes."),
+                ("dump", O, pickler_dump, "dump($self, obj, /)\n--\n\nPickle obj to the file."),
+                ("clear_memo", NOARGS, pickler_clear_memo, "clear_memo($self, /)\n--\n\nForget the objects pickled so far (later references are pickled again)."),
+                ("persistent_id", O, pickler_persistent_id, "persistent_id($self, obj, /)\n--\n\nHook for out-of-stream references: an id for obj, or None to pickle it normally."),
+                ("__sizeof__", NOARGS, pickler_sizeof, "Memory used by the pickler, in bytes."),
             ];
             t.tp_getset = crate::getset_table![
                 ("memo", get_pmemo, set_pmemo),
@@ -3326,12 +3326,12 @@ pub fn init_module() -> PyResult {
             t.tp_alloc = Some(generic_alloc);
             t.tp_getattro = Some(object_generic_getattro);
             t.tp_setattro = Some(object_generic_setattro);
-            t.tp_doc = c"Unpickler(file, *, fix_imports=True, encoding='ASCII', errors='strict', buffers=())\n--\n\nThis takes a binary file for reading a pickle data stream.".as_ptr();
+            t.tp_doc = c"Unpickler(file, *, fix_imports=True, encoding='ASCII', errors='strict', buffers=())\n--\n\nRebuilds objects from a pickle in a binary file (anything with read() and readline()).".as_ptr();
             t.tp_methods = mdefs![
-                ("load", NOARGS, unpickler_load, "load($self, /)\n--\n\nLoad a pickle."),
-                ("find_class", FAST, unpickler_find_class, "find_class($self, module_name, global_name, /)\n--\n\nReturn an object from a specified module."),
-                ("persistent_load", O, unpickler_persistent_load, "persistent_load($self, pid, /)\n--\n\n"),
-                ("__sizeof__", NOARGS, unpickler_sizeof, "Returns size in memory, in bytes."),
+                ("load", NOARGS, unpickler_load, "load($self, /)\n--\n\nRead one pickled object from the file."),
+                ("find_class", FAST, unpickler_find_class, "find_class($self, module_name, global_name, /)\n--\n\nLook up global_name in module module_name (the hook for restricting what may be loaded)."),
+                ("persistent_load", O, unpickler_persistent_load, "persistent_load($self, pid, /)\n--\n\nResolve a persistent id produced by Pickler.persistent_id()."),
+                ("__sizeof__", NOARGS, unpickler_sizeof, "Memory used by the unpickler, in bytes."),
             ];
             t.tp_getset = crate::getset_table![("memo", get_umemo, set_umemo)];
             type_ready(unpickler_type())?;
@@ -3353,7 +3353,7 @@ pub fn init_module() -> PyResult {
     let g = globals();
     let m = crate::types::module::new_module("_pickle")?;
     let d = crate::types::module::module_dict(&m);
-    dict::set_item_str(&d, "__doc__", &pystr::new_str("Optimized C implementation for the Python pickle module."))?;
+    dict::set_item_str(&d, "__doc__", &pystr::new_str("Native accelerator behind the pickle module."))?;
     dict::set_item_str(&d, "PickleError", &g.pickle_error)?;
     dict::set_item_str(&d, "PicklingError", &g.pickling_error)?;
     dict::set_item_str(&d, "UnpicklingError", &g.unpickling_error)?;
@@ -3363,10 +3363,10 @@ pub fn init_module() -> PyResult {
     crate::builtins::add_methods_to_dict(
         &d,
         mdefs![
-            ("dump", FASTKW, m_dump, "dump($module, /, obj, file, protocol=None, *, fix_imports=True,\n     buffer_callback=None)\n--\n\nWrite a pickled representation of obj to the open file object file."),
-            ("dumps", FASTKW, m_dumps, "dumps($module, /, obj, protocol=None, *, fix_imports=True,\n      buffer_callback=None)\n--\n\nReturn the pickled representation of the object as a bytes object."),
-            ("load", FASTKW, m_load, "load($module, /, file, *, fix_imports=True, encoding='ASCII',\n     errors='strict', buffers=())\n--\n\nRead and return an object from the pickle data stored in a file."),
-            ("loads", FASTKW, m_loads, "loads($module, data, /, *, fix_imports=True, encoding='ASCII',\n      errors='strict', buffers=())\n--\n\nRead and return an object from the given pickle data."),
+            ("dump", FASTKW, m_dump, "dump($module, /, obj, file, protocol=None, *, fix_imports=True,\n     buffer_callback=None)\n--\n\nPickle obj to the binary file object file."),
+            ("dumps", FASTKW, m_dumps, "dumps($module, /, obj, protocol=None, *, fix_imports=True,\n      buffer_callback=None)\n--\n\nPickle obj and return the bytes."),
+            ("load", FASTKW, m_load, "load($module, /, file, *, fix_imports=True, encoding='ASCII',\n     errors='strict', buffers=())\n--\n\nUnpickle one object from the binary file object file."),
+            ("loads", FASTKW, m_loads, "loads($module, data, /, *, fix_imports=True, encoding='ASCII',\n      errors='strict', buffers=())\n--\n\nUnpickle one object from bytes-like data."),
         ],
         Some(&m),
     )?;
