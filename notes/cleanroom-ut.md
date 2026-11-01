@@ -32,6 +32,8 @@ rewritten from the documented API plus what the spec tests observe.
   Suggestions: cross-language table, mutable-on-immutable hints, float bitwise hint, NFKC
   matches ("instead of"), nested attribute ('.inner.value') search over the first 20 public
   attributes using dir() only. Keyword-typo hints use `SyntaxError._metadata` when present.
+  For "invalid syntax. Perhaps ..." messages only names inside the highlighted range are
+  tried (so a missing-comma error never gets a bogus keyword hint).
 * argparse: help/usage built from per-action "parts"; mutually exclusive groups are placed at
   their first positional (else first) member; colour is applied after wrapping (wrapping is
   done on the plain text, `_recolor_lines` maps the colours back), so colour never changes
@@ -49,20 +51,25 @@ rewritten from the documented API plus what the spec tests observe.
   (`str(ImportError(5))` raised TypeError).
 * `compile.rs`: parser SyntaxErrors get `_metadata = (0, 0, source)` (keyword typo hints
   for `-c` and other non-file sources).
+* `abstract_.rs` + `types/exceptions.rs`: an AttributeError coming out of a custom
+  `tp_getattro` (e.g. `__getattr__` raising a bare AttributeError) gets `name`/`obj` filled
+  in (`fill_attribute_error_context`), so tracebacks can suggest names.
+* `modules/pymain.rs`: `-c` source is dedented (common leading whitespace of non-blank
+  lines removed, whitespace-only lines emptied).
 
 ## Known gaps / not mine (found while testing)
 * `test_unittest` as a package does not load: `test_assertions`/`testhelpers` need `datetime`,
   `testpatch` needs `types.LazyImportType` and `_testmultiphase`, `testthreadingmock` needs
   `concurrent.futures`. With a local datetime shim testhelpers passes 84/84.
-* AttributeError raised by `__getattr__` without name/obj does not get `name`/`obj` filled in
-  by the runtime (2 suggestion tests).
 * Frames: `frame.f_back` is None after the frame returned (test_extract_stack); positions of
   instruction 0 lack columns; `-X no_debug_ranges` ignored; naked re-raise in `except*` has
   another line; Rust fallback printer prints source without io.open; tracebacks printed from
   `__del__` at shutdown missing.
-* `python -c` does not dedent its argument (two traceback tests); running a directory /
-  zipfile / .pyc as script fails in runpy (argparse prog-name tests).
-* Lazy-import tests: `import re` imports `warnings` (enum/functools), `dataclasses` imports
-  re/inspect/copy — argparse and _colorize lazy-import tests fail because of that.
+* Running a directory / zipfile / .pyc as script fails (argparse TestProgName, 7 tests).
+* `_testcapi` does not exist: the CPython-only C-API variants in test_traceback error
+  (~144 errors; regrtest counts only failures in its summary).
+* traceback: `_suggestions` extension module missing; GBK codec missing (test_encoded_file).
+* Lazy-import tests: argparse and _colorize lazy-import tests pass now (argparse validates
+  metavars/help with an uncoloured formatter so `_colorize` stays unimported).
 * subprocess-based tests that need the `test` package with `-E`/`-I` cannot import it
   (environment: spec/Lib is only on PYTHONPATH).

@@ -1358,7 +1358,7 @@ class _ActionsContainer(object):
 
         # the metavar must work in usage messages
         if hasattr(self, '_get_formatter'):
-            formatter = self._get_formatter()
+            formatter = self._plain_formatter()
             try:
                 formatter._format_args(action, None)
             except TypeError:
@@ -1517,7 +1517,7 @@ class _ActionsContainer(object):
 
     def _check_help(self, action):
         if action.help and hasattr(self, '_get_formatter'):
-            formatter = self._get_formatter()
+            formatter = self._plain_formatter()
             try:
                 formatter._expand_help(action)
             except (ValueError, TypeError, KeyError) as exc:
@@ -2035,6 +2035,10 @@ class ArgumentParser(_AttributeHolder, _ActionsContainer):
         formatter.add_text(self.epilog)
         return formatter.format_help()
 
+    def _plain_formatter(self):
+        # for validating metavars and help strings: never coloured
+        return self.formatter_class(prog=self.prog)
+
     def _get_formatter(self, file=None):
         formatter = self.formatter_class(prog=self.prog)
         set_color = getattr(formatter, '_set_color', None)
@@ -2045,7 +2049,7 @@ class ArgumentParser(_AttributeHolder, _ActionsContainer):
     def _check_help(self, action):
         if action.help:
             # validated without colours (and without importing _colorize)
-            formatter = self.formatter_class(prog=self.prog)
+            formatter = self._plain_formatter()
             try:
                 formatter._expand_help(action)
             except (ValueError, TypeError, KeyError) as exc:

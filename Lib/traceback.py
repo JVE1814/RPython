@@ -1167,13 +1167,37 @@ class TracebackException:
         yield '    {}\n'.format(content)
         yield '    {}{}\n'.format(pad, markers)
 
+    def _in_error_range(self, tok, first_line):
+        """Whether token *tok* lies inside the highlighted error range."""
+        try:
+            start_row = int(self.lineno)
+            start_col = int(self.offset) - 1
+        except (TypeError, ValueError):
+            return False
+        try:
+            end_row = int(self.end_lineno)
+            end_col = int(self.end_offset) - 1
+        except (TypeError, ValueError):
+            end_row, end_col = start_row, start_col + 1
+        row = tok.start[0] + first_line - 1
+        tok_start = (row, tok.start[1])
+        tok_end = (tok.end[0] + first_line - 1, tok.end[1])
+        return (start_row, start_col) <= tok_start and \
+            tok_end <= (end_row, end_col)
+
     def _find_keyword_typos(self):
         """For a plain "invalid syntax" error, look for a name next to the
         error that is a misspelt keyword: if replacing it makes the code
         valid, say so in the message."""
+        within_range = False
         if self.msg != 'invalid syntax':
-            # the parser already gave a specific explanation
-            return
+            if not (isinstance(self.msg, str) and
+                    self.msg.startswith('invalid syntax. Perhaps')):
+                # the parser already gave a specific explanation
+                return
+            # the parser only guessed: a name inside the highlighted
+            # range may still be a misspelt keyword
+            within_range = True
         lines = None
         first_line = 1
         if self._exc_metadata:
@@ -1221,7 +1245,10 @@ class TracebackException:
                     if tok.type == tokenize.NAME
                     and tok.start[0] == error_line - first_line + 1
                     and tok.string not in keyword.kwlist]
-        if not relevant:
+        if within_range:
+            relevant = [tok for tok in relevant
+                        if self._in_error_range(tok, first_line)]
+        elif not relevant:
             relevant = [tok for tok in tokens if tok.type == tokenize.NAME
                         and tok.string not in keyword.kwlist]
         for tok in relevant:
