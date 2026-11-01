@@ -795,13 +795,11 @@ def listen(port=DEFAULT_LOGGING_CONFIG_PORT, verify=None):
             try:
                 server = self.rcvr(port=self.port, handler=self.hdlr,
                                    ready=self.ready, verify=self.verify)
-            except BaseException:
-                # Unblock whoever waits for the server to come up.
+                if self.port == 0:
+                    self.port = server.server_address[1]
+            finally:
+                # Unblock whoever waits for the server, even on failure.
                 self.ready.set()
-                raise
-            if self.port == 0:
-                self.port = server.server_address[1]
-            self.ready.set()
             global _listener
             with logging._lock:
                 _listener = server
