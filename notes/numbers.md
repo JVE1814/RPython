@@ -3,7 +3,7 @@
 Owner files: `crates/runtime/src/types/{int.rs,int_methods.rs,float.rs,float_math.rs,float_methods.rs,
 complex.rs,complex_pow.rs,complex_methods.rs,bool_.rs}`, `crates/runtime/src/modules/{math.rs,cmath.rs,
 _struct.rs,binascii.rs,_random.rs,builtins_numbers.rs,numbers_registry.rs}`, `Lib/{numbers,fractions,
-random,struct}.py`.
+random,struct,statistics}.py`.
 
 ## Layout
 * float and complex type definitions were moved out of `core_slots.rs` into `float_methods.rs` /
@@ -45,7 +45,7 @@ random,struct}.py`.
 * binomialvariate guards random() == 0.0 by redrawing (gh-149222 tests).
 
 ## Missing / known gaps
-* Lib/statistics.py not written yet.
+* Lib/statistics.py written (all public functions, kde/kde_random, NormalDist with AS241 inv_cdf, the private helpers the tests use) but not yet executed (decimal/collections missing in the tree).
 * Tests could not be run through unittest yet (no unittest/collections/enum in the tree at the
   time); validated with ad-hoc scripts and the full math/cmath data files.
 * `_struct.Buf` is a local buffer-protocol helper; switch to the shared BufView once merged.
