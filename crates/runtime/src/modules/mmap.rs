@@ -353,7 +353,7 @@ fn m_flush(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult 
         None => libc::MS_SYNC,
     };
     let m = check_valid(o)?;
-    let size = size.unwrap_or(m.size as isize);
+    let size = size.unwrap_or(m.size as isize - off);
     if size < 0 || off < 0 || (m.size as isize) - off < size {
         raise!(ValueError, "flush values out of range");
     }
@@ -432,7 +432,8 @@ fn m_read(o: &PyObject, args: &[&PyObject]) -> PyResult {
         Some(n) if n >= 0 && (n as usize) <= remaining => n as usize,
         _ => remaining,
     };
-    let r = bytes::new_bytes(&data(m)[m.pos..m.pos + n]);
+    let start = m.pos.min(m.size);
+    let r = bytes::new_bytes(&data(m)[start..start + n]);
     m.pos += n;
     Ok(r)
 }
@@ -450,7 +451,8 @@ fn m_read_byte(o: &PyObject) -> PyResult {
 fn m_readline(o: &PyObject) -> PyResult {
     let m = check_valid(o)?;
     let remaining = if m.pos < m.size { m.size - m.pos } else { 0 };
-    let d = &data(m)[m.pos..m.pos + remaining];
+    let start = m.pos.min(m.size);
+    let d = &data(m)[start..start + remaining];
     let n = match d.iter().position(|&b| b == b'\n') {
         Some(i) => i + 1,
         None => remaining,
@@ -673,7 +675,7 @@ fn subscript(o: &PyObject, item: &PyObject) -> PyResult {
                 raise!(IndexError, "mmap index out of range");
             }
             out.push(d[i as usize]);
-            i += step;
+            i = i.wrapping_add(step);
         }
         return Ok(bytes::new_bytes(&out));
     }
@@ -720,12 +722,12 @@ fn ass_subscript(o: &PyObject, item: &PyObject, value: Option<&PyObject>) -> PyR
             if i < 0 || i as usize >= d.len() {
                 raise!(IndexError, "mmap index out of range");
             }
-            i += step;
+            i = i.wrapping_add(step);
         }
         let mut i = start;
         for b in vb {
             d[i as usize] = b;
-            i += step;
+            i = i.wrapping_add(step);
         }
         return Ok(());
     }

@@ -1,7 +1,9 @@
-# Abstract base classes for containers (PEP 3119).
-"""Abstract Base Classes (ABCs) for collections, according to PEP 3119.
+"""Abstract base classes for containers (the implementation behind
+collections.abc).
 
-Unit tests are in test_collections.
+The "one-trick pony" ABCs recognise any class that defines the relevant
+special methods (setting such a method to None opts out).  The larger ABCs
+provide mixin methods on top of a small set of abstract ones.
 """
 
 from abc import ABCMeta, abstractmethod
@@ -9,9 +11,14 @@ import sys
 
 GenericAlias = type(list[int])
 EllipsisType = type(...)
-def _f(): pass
-FunctionType = type(_f)
-del _f
+
+
+def _probe():
+    pass
+
+
+FunctionType = type(_probe)
+del _probe
 
 __all__ = ["Awaitable", "Coroutine",
            "AsyncIterable", "AsyncIterator", "AsyncGenerator",
@@ -24,63 +31,24 @@ __all__ = ["Awaitable", "Coroutine",
            "Buffer",
            ]
 
-# Pretend these all live in collections.abc (for repr and pickling).
+# The classes below report the public module as their home, so reprs,
+# pickles and typing show "collections.abc.X".
 __name__ = "collections.abc"
 
+
 # ---------------------------------------------------------------------------
-# Concrete types of builtin iterators and views, registered below.
-
-def _iter_type(make):
-    # type(iter(make())); None if that object cannot be iterated (only
-    # possible while the runtime is incomplete).
-    try:
-        return type(iter(make()))
-    except (TypeError, OverflowError):
-        return None
-
-bytes_iterator = _iter_type(lambda: b'')
-bytearray_iterator = _iter_type(lambda: bytearray())
-dict_keyiterator = _iter_type(lambda: {}.keys())
-dict_valueiterator = _iter_type(lambda: {}.values())
-dict_itemiterator = _iter_type(lambda: {}.items())
-list_iterator = _iter_type(lambda: [])
-list_reverseiterator = _iter_type(lambda: reversed([]))
-range_iterator = _iter_type(lambda: range(0))
-longrange_iterator = _iter_type(lambda: range(1 << 1000))
-set_iterator = _iter_type(lambda: set())
-str_iterator = _iter_type(lambda: "")
-tuple_iterator = _iter_type(lambda: ())
-zip_iterator = _iter_type(lambda: zip())
-dict_keys = type({}.keys())
-dict_values = type({}.values())
-dict_items = type({}.items())
-mappingproxy = type(type.__dict__)
-def _get_framelocalsproxy():
-    return type(sys._getframe().f_locals)
-framelocalsproxy = _get_framelocalsproxy()
-del _get_framelocalsproxy
-generator = type((lambda: (yield))())
-
-async def _coro(): pass
-_coro = _coro()
-coroutine = type(_coro)
-_coro.close()  # Prevent ResourceWarning
-del _coro
-
-async def _ag(): yield
-_ag = _ag()
-async_generator = type(_ag)
-del _ag
-
+# Structural checks
+# ---------------------------------------------------------------------------
 
 def _check_methods(C, *methods):
-    """True if every name in *methods* is defined (and not None) somewhere
-    in C's MRO; NotImplemented otherwise."""
+    """Return True if every name in *methods* is defined somewhere in the
+    MRO of C with a value other than None, else NotImplemented."""
     mro = C.__mro__
-    for method in methods:
-        for B in mro:
-            if method in B.__dict__:
-                if B.__dict__[method] is None:
+    for name in methods:
+        for klass in mro:
+            namespace = klass.__dict__
+            if name in namespace:
+                if namespace[name] is None:
                     return NotImplemented
                 break
         else:
@@ -88,8 +56,35 @@ def _check_methods(C, *methods):
     return True
 
 
+def _structural(*methods):
+    """Make a __subclasshook__ that recognises classes providing *methods*.
+
+    The hook only answers for the ABC whose namespace it was placed in;
+    explicit subclasses of that ABC fall back to normal ABC rules.
+    """
+    def __subclasshook__(cls, C):
+        if cls.__dict__.get("__subclasshook__") is hook:
+            return _check_methods(C, *methods)
+        return NotImplemented
+    hook = classmethod(__subclasshook__)
+    return hook
+
+
+def _raise_thrown(typ, val, tb):
+    # Default behaviour shared by the abstract throw()/athrow() methods:
+    # raise what was thrown in, like a generator without handlers would.
+    if val is None:
+        if tb is None:
+            raise typ
+        val = typ()
+    if tb is not None:
+        val = val.with_traceback(tb)
+    raise val
+
+
 # ---------------------------------------------------------------------------
-# One trick ponies
+# One-trick ponies
+# ---------------------------------------------------------------------------
 
 class Hashable(metaclass=ABCMeta):
 
@@ -99,11 +94,7 @@ class Hashable(metaclass=ABCMeta):
     def __hash__(self):
         return 0
 
-    @classmethod
-    def __subclasshook__(cls, C):
-        if cls is Hashable:
-            return _check_methods(C, "__hash__")
-        return NotImplemented
+    __subclasshook__ = _structural("__hash__")
 
 
 class Awaitable(metaclass=ABCMeta):
@@ -114,11 +105,7 @@ class Awaitable(metaclass=ABCMeta):
     def __await__(self):
         yield
 
-    @classmethod
-    def __subclasshook__(cls, C):
-        if cls is Awaitable:
-            return _check_methods(C, "__await__")
-        return NotImplemented
+    __subclasshook__ = _structural("__await__")
 
     __class_getitem__ = classmethod(GenericAlias)
 
@@ -129,42 +116,25 @@ class Coroutine(Awaitable):
 
     @abstractmethod
     def send(self, value):
-        """Send a value into the coroutine.
-        Return next yielded value or raise StopIteration.
-        """
+        """Resume the coroutine with *value*; returns what it yields next
+        (StopIteration signals completion)."""
         raise StopIteration
 
     @abstractmethod
     def throw(self, typ, val=None, tb=None):
-        """Raise an exception in the coroutine.
-        Return next yielded value or raise StopIteration.
-        """
-        if val is None:
-            if tb is None:
-                raise typ
-            val = typ()
-        if tb is not None:
-            val = val.with_traceback(tb)
-        raise val
+        """Resume the coroutine by raising an exception at its suspension
+        point; returns what it yields next."""
+        _raise_thrown(typ, val, tb)
 
     def close(self):
-        """Raise GeneratorExit inside coroutine.
-        """
+        """Finish the coroutine by throwing GeneratorExit into it."""
         try:
             self.throw(GeneratorExit)
         except (GeneratorExit, StopIteration):
-            pass
-        else:
-            raise RuntimeError("coroutine ignored GeneratorExit")
+            return
+        raise RuntimeError("coroutine ignored GeneratorExit")
 
-    @classmethod
-    def __subclasshook__(cls, C):
-        if cls is Coroutine:
-            return _check_methods(C, '__await__', 'send', 'throw', 'close')
-        return NotImplemented
-
-
-Coroutine.register(coroutine)
+    __subclasshook__ = _structural("__await__", "send", "throw", "close")
 
 
 class AsyncIterable(metaclass=ABCMeta):
@@ -175,11 +145,7 @@ class AsyncIterable(metaclass=ABCMeta):
     def __aiter__(self):
         return AsyncIterator()
 
-    @classmethod
-    def __subclasshook__(cls, C):
-        if cls is AsyncIterable:
-            return _check_methods(C, "__aiter__")
-        return NotImplemented
+    __subclasshook__ = _structural("__aiter__")
 
     __class_getitem__ = classmethod(GenericAlias)
 
@@ -190,17 +156,13 @@ class AsyncIterator(AsyncIterable):
 
     @abstractmethod
     async def __anext__(self):
-        """Return the next item or raise StopAsyncIteration when exhausted."""
+        """Produce the next value; StopAsyncIteration when there is none."""
         raise StopAsyncIteration
 
     def __aiter__(self):
         return self
 
-    @classmethod
-    def __subclasshook__(cls, C):
-        if cls is AsyncIterator:
-            return _check_methods(C, "__anext__", "__aiter__")
-        return NotImplemented
+    __subclasshook__ = _structural("__anext__", "__aiter__")
 
 
 class AsyncGenerator(AsyncIterator):
@@ -208,50 +170,31 @@ class AsyncGenerator(AsyncIterator):
     __slots__ = ()
 
     async def __anext__(self):
-        """Return the next item from the asynchronous generator.
-        When exhausted, raise StopAsyncIteration.
-        """
+        """Advance the generator; equivalent to ``await self.asend(None)``."""
         return await self.asend(None)
 
     @abstractmethod
     async def asend(self, value):
-        """Send a value into the asynchronous generator.
-        Return next yielded value or raise StopAsyncIteration.
-        """
+        """Resume the generator with *value*; returns what it yields next
+        (StopAsyncIteration signals exhaustion)."""
         raise StopAsyncIteration
 
     @abstractmethod
     async def athrow(self, typ, val=None, tb=None):
-        """Raise an exception in the asynchronous generator.
-        Return next yielded value or raise StopAsyncIteration.
-        """
-        if val is None:
-            if tb is None:
-                raise typ
-            val = typ()
-        if tb is not None:
-            val = val.with_traceback(tb)
-        raise val
+        """Resume the generator by raising an exception at its suspension
+        point; returns what it yields next."""
+        _raise_thrown(typ, val, tb)
 
     async def aclose(self):
-        """Raise GeneratorExit inside generator.
-        """
+        """Finish the generator by throwing GeneratorExit into it."""
         try:
             await self.athrow(GeneratorExit)
         except (GeneratorExit, StopAsyncIteration):
-            pass
-        else:
-            raise RuntimeError("asynchronous generator ignored GeneratorExit")
+            return
+        raise RuntimeError("asynchronous generator ignored GeneratorExit")
 
-    @classmethod
-    def __subclasshook__(cls, C):
-        if cls is AsyncGenerator:
-            return _check_methods(C, '__aiter__', '__anext__',
-                                  'asend', 'athrow', 'aclose')
-        return NotImplemented
-
-
-AsyncGenerator.register(async_generator)
+    __subclasshook__ = _structural("__aiter__", "__anext__",
+                                   "asend", "athrow", "aclose")
 
 
 class Iterable(metaclass=ABCMeta):
@@ -260,14 +203,10 @@ class Iterable(metaclass=ABCMeta):
 
     @abstractmethod
     def __iter__(self):
-        while False:
-            yield None
+        return
+        yield
 
-    @classmethod
-    def __subclasshook__(cls, C):
-        if cls is Iterable:
-            return _check_methods(C, "__iter__")
-        return NotImplemented
+    __subclasshook__ = _structural("__iter__")
 
     __class_getitem__ = classmethod(GenericAlias)
 
@@ -278,26 +217,13 @@ class Iterator(Iterable):
 
     @abstractmethod
     def __next__(self):
-        'Return the next item from the iterator. When exhausted, raise StopIteration'
+        """Produce the next value; StopIteration when there is none."""
         raise StopIteration
 
     def __iter__(self):
         return self
 
-    @classmethod
-    def __subclasshook__(cls, C):
-        if cls is Iterator:
-            return _check_methods(C, '__iter__', '__next__')
-        return NotImplemented
-
-
-for _it in (bytes_iterator, bytearray_iterator, dict_keyiterator,
-            dict_valueiterator, dict_itemiterator, list_iterator,
-            list_reverseiterator, range_iterator, longrange_iterator,
-            set_iterator, str_iterator, tuple_iterator, zip_iterator):
-    if _it is not None:
-        Iterator.register(_it)
-del _it
+    __subclasshook__ = _structural("__iter__", "__next__")
 
 
 class Reversible(Iterable):
@@ -306,14 +232,10 @@ class Reversible(Iterable):
 
     @abstractmethod
     def __reversed__(self):
-        while False:
-            yield None
+        return
+        yield
 
-    @classmethod
-    def __subclasshook__(cls, C):
-        if cls is Reversible:
-            return _check_methods(C, "__reversed__", "__iter__")
-        return NotImplemented
+    __subclasshook__ = _structural("__reversed__", "__iter__")
 
 
 class Generator(Iterator):
@@ -321,50 +243,31 @@ class Generator(Iterator):
     __slots__ = ()
 
     def __next__(self):
-        """Return the next item from the generator.
-        When exhausted, raise StopIteration.
-        """
+        """Advance the generator; equivalent to ``self.send(None)``."""
         return self.send(None)
 
     @abstractmethod
     def send(self, value):
-        """Send a value into the generator.
-        Return next yielded value or raise StopIteration.
-        """
+        """Resume the generator with *value*; returns what it yields next
+        (StopIteration signals exhaustion)."""
         raise StopIteration
 
     @abstractmethod
     def throw(self, typ, val=None, tb=None):
-        """Raise an exception in the generator.
-        Return next yielded value or raise StopIteration.
-        """
-        if val is None:
-            if tb is None:
-                raise typ
-            val = typ()
-        if tb is not None:
-            val = val.with_traceback(tb)
-        raise val
+        """Resume the generator by raising an exception at its suspension
+        point; returns what it yields next."""
+        _raise_thrown(typ, val, tb)
 
     def close(self):
-        """Raise GeneratorExit inside generator.
-        """
+        """Finish the generator by throwing GeneratorExit into it."""
         try:
             self.throw(GeneratorExit)
         except (GeneratorExit, StopIteration):
-            pass
-        else:
-            raise RuntimeError("generator ignored GeneratorExit")
+            return
+        raise RuntimeError("generator ignored GeneratorExit")
 
-    @classmethod
-    def __subclasshook__(cls, C):
-        if cls is Generator:
-            return _check_methods(C, '__iter__', '__next__',
-                                  'send', 'throw', 'close')
-        return NotImplemented
-
-
-Generator.register(generator)
+    __subclasshook__ = _structural("__iter__", "__next__",
+                                   "send", "throw", "close")
 
 
 class Sized(metaclass=ABCMeta):
@@ -375,11 +278,7 @@ class Sized(metaclass=ABCMeta):
     def __len__(self):
         return 0
 
-    @classmethod
-    def __subclasshook__(cls, C):
-        if cls is Sized:
-            return _check_methods(C, "__len__")
-        return NotImplemented
+    __subclasshook__ = _structural("__len__")
 
 
 class Container(metaclass=ABCMeta):
@@ -390,11 +289,7 @@ class Container(metaclass=ABCMeta):
     def __contains__(self, x):
         return False
 
-    @classmethod
-    def __subclasshook__(cls, C):
-        if cls is Container:
-            return _check_methods(C, "__contains__")
-        return NotImplemented
+    __subclasshook__ = _structural("__contains__")
 
     __class_getitem__ = classmethod(GenericAlias)
 
@@ -403,11 +298,7 @@ class Collection(Sized, Iterable, Container):
 
     __slots__ = ()
 
-    @classmethod
-    def __subclasshook__(cls, C):
-        if cls is Collection:
-            return _check_methods(C,  "__len__", "__iter__", "__contains__")
-        return NotImplemented
+    __subclasshook__ = _structural("__len__", "__iter__", "__contains__")
 
 
 class Buffer(metaclass=ABCMeta):
@@ -418,21 +309,47 @@ class Buffer(metaclass=ABCMeta):
     def __buffer__(self, flags: int, /) -> memoryview:
         raise NotImplementedError
 
-    @classmethod
-    def __subclasshook__(cls, C):
-        if cls is Buffer:
-            return _check_methods(C, "__buffer__")
-        return NotImplemented
+    __subclasshook__ = _structural("__buffer__")
+
+
+# ---------------------------------------------------------------------------
+# Callable and its parameterised alias
+# ---------------------------------------------------------------------------
+
+def _is_param_expr(obj):
+    """True for things that may stand for a whole parameter list of a
+    Callable: ``...``, a list, a ParamSpec or a typing.Concatenate form."""
+    if obj is Ellipsis or isinstance(obj, list):
+        return True
+    kind = type(obj)
+    return (getattr(kind, "__module__", None) == "typing"
+            and kind.__name__ in ("ParamSpec", "_ConcatenateGenericAlias"))
+
+
+def _type_repr(obj):
+    """repr() for a type argument, in the style typing uses."""
+    if isinstance(obj, type) and not isinstance(obj, GenericAlias):
+        if obj.__module__ == "builtins":
+            return obj.__qualname__
+        return f"{obj.__module__}.{obj.__qualname__}"
+    if obj is Ellipsis:
+        return "..."
+    if isinstance(obj, FunctionType):
+        return obj.__name__
+    return repr(obj)
+
+
+def _has_param_expr(args):
+    # Callable[P, R] style: a single parameter expression plus the result.
+    return len(args) == 2 and _is_param_expr(args[0])
 
 
 class _CallableGenericAlias(GenericAlias):
-    """ Represent `Callable[argtypes, resulttype]`.
+    """The result of subscripting Callable, e.g. Callable[[int], str].
 
-    This sets ``__args__`` to a tuple containing the flattened ``argtypes``
-    followed by ``resulttype``.
-
-    Example: ``Callable[[int, str], float]`` sets ``__args__`` to
-    ``(int, str, float)``.
+    __args__ are stored flattened, ``(int, str)``, so that this alias
+    compares equal to typing.Callable[[int], str]; a parameter expression
+    (``...``, ParamSpec, Concatenate) is kept as a single first argument.
     """
 
     __slots__ = ()
@@ -441,51 +358,43 @@ class _CallableGenericAlias(GenericAlias):
         if not (isinstance(args, tuple) and len(args) == 2):
             raise TypeError(
                 "Callable must be used as Callable[[arg, ...], result].")
-        t_args, t_result = args
-        if isinstance(t_args, (tuple, list)):
-            args = (*t_args, t_result)
-        elif not _is_param_expr(t_args):
-            raise TypeError(f"Expected a list of types, an ellipsis, "
-                            f"ParamSpec, or Concatenate. Got {t_args}")
-        return super().__new__(cls, origin, args)
+        params, result = args
+        if isinstance(params, (list, tuple)):
+            flat = (*params, result)
+        elif _is_param_expr(params):
+            flat = (params, result)
+        else:
+            raise TypeError(
+                "Expected a list of types, an ellipsis, ParamSpec, or "
+                f"Concatenate. Got {params}")
+        return super().__new__(cls, origin, flat)
 
     def __repr__(self):
-        if len(self.__args__) == 2 and _is_param_expr(self.__args__[0]):
+        if _has_param_expr(self.__args__):
             return super().__repr__()
-        from annotationlib import type_repr
-        return (f'collections.abc.Callable'
-                f'[[{", ".join([type_repr(a) for a in self.__args__[:-1]])}], '
-                f'{type_repr(self.__args__[-1])}]')
+        *params, result = self.__args__
+        inner = ", ".join(_type_repr(p) for p in params)
+        return (f"collections.abc.Callable"
+                f"[[{inner}], {_type_repr(result)}]")
 
     def __reduce__(self):
         args = self.__args__
-        if not (len(args) == 2 and _is_param_expr(args[0])):
-            args = list(args[:-1]), args[-1]
-        return _CallableGenericAlias, (Callable, args)
+        if not _has_param_expr(self.__args__):
+            args = (list(args[:-1]), args[-1])
+        return _CallableGenericAlias, (self.__origin__, args)
 
     def __getitem__(self, item):
-        # Substitute through a plain GenericAlias, then rebuild the
-        # flattened Callable form.
-        if not isinstance(item, tuple):
-            item = (item,)
-        new_args = super().__getitem__(item).__args__
-        # args[0] occurs due to things like Z[[int, str, bool]] from PEP 612
-        if not isinstance(new_args[0], (tuple, list)):
-            t_result = new_args[-1]
-            t_args = new_args[:-1]
-            new_args = (t_args, t_result)
-        return _CallableGenericAlias(Callable, tuple(new_args))
-
-
-def _is_param_expr(obj):
-    """True for `...`, a ParamSpec or a Concatenate[...] form."""
-    if obj is Ellipsis:
-        return True
-    if isinstance(obj, list):
-        return True
-    obj = type(obj)
-    names = ('ParamSpec', '_ConcatenateGenericAlias')
-    return obj.__module__ == 'typing' and any(obj.__name__ == name for name in names)
+        # Let GenericAlias do the type variable substitution, then fold the
+        # flat result back into (parameters, result) form.
+        substituted = super().__getitem__(item).__args__
+        first = substituted[0]
+        if isinstance(first, (tuple, list)) and len(substituted) == 2:
+            pair = (list(first), substituted[1])
+        elif len(substituted) == 2 and _is_param_expr(first):
+            pair = (first, substituted[1])
+        else:
+            pair = (list(substituted[:-1]), substituted[-1])
+        return _CallableGenericAlias(self.__origin__, pair)
 
 
 class Callable(metaclass=ABCMeta):
@@ -496,27 +405,22 @@ class Callable(metaclass=ABCMeta):
     def __call__(self, *args, **kwds):
         return False
 
-    @classmethod
-    def __subclasshook__(cls, C):
-        if cls is Callable:
-            return _check_methods(C, "__call__")
-        return NotImplemented
+    __subclasshook__ = _structural("__call__")
 
     __class_getitem__ = classmethod(_CallableGenericAlias)
 
 
 # ---------------------------------------------------------------------------
 # Sets
+# ---------------------------------------------------------------------------
 
 class Set(Collection):
-    """A set is a finite, iterable container.
+    """Read-only set interface.
 
-    This class provides concrete generic implementations of all
-    methods except for __contains__, __iter__ and __len__.
-
-    To override the comparisons (presumably for speed, as the
-    semantics are fixed), redefine __le__ and __ge__,
-    then the other operations will automatically follow suit.
+    Subclasses supply __contains__, __iter__ and __len__; comparisons and
+    the &, |, -, ^ operators are derived from them.  Operator results are
+    created through the _from_iterable() hook, which subclasses whose
+    constructor does not take an iterable should override.
     """
 
     __slots__ = ()
@@ -558,32 +462,31 @@ class Set(Collection):
 
     @classmethod
     def _from_iterable(cls, it):
-        '''Construct an instance of the class from any iterable input.
-
-        Must override this method if the class constructor signature
-        does not accept an iterable for an input.
-        '''
+        """Create an instance holding the values of *it* (used by the
+        operators to build their results)."""
         return cls(it)
 
     def __and__(self, other):
         if not isinstance(other, Iterable):
             return NotImplemented
-        return self._from_iterable(value for value in other if value in self)
+        return self._from_iterable(x for x in other if x in self)
 
     __rand__ = __and__
 
     def isdisjoint(self, other):
-        'Return True if two sets have a null intersection.'
-        for value in other:
-            if value in self:
+        """True when no value of *other* is a member of this set."""
+        for x in other:
+            if x in self:
                 return False
         return True
 
     def __or__(self, other):
         if not isinstance(other, Iterable):
             return NotImplemented
-        chain = (e for s in (self, other) for e in s)
-        return self._from_iterable(chain)
+        def both():
+            yield from self
+            yield from other
+        return self._from_iterable(both())
 
     __ror__ = __or__
 
@@ -592,16 +495,14 @@ class Set(Collection):
             if not isinstance(other, Iterable):
                 return NotImplemented
             other = self._from_iterable(other)
-        return self._from_iterable(value for value in self
-                                   if value not in other)
+        return self._from_iterable(x for x in self if x not in other)
 
     def __rsub__(self, other):
         if not isinstance(other, Set):
             if not isinstance(other, Iterable):
                 return NotImplemented
             other = self._from_iterable(other)
-        return self._from_iterable(value for value in other
-                                   if value not in self)
+        return self._from_iterable(x for x in other if x not in self)
 
     def __xor__(self, other):
         if not isinstance(other, Set):
@@ -613,89 +514,68 @@ class Set(Collection):
     __rxor__ = __xor__
 
     def _hash(self):
-        """Compute the hash value of a set.
+        """Hash the members the same way frozenset does.
 
-        Note that we don't define __hash__: not all sets are hashable.
-        But if you define a hashable set type, its __hash__ should
-        call this function.
-
-        This must be compatible __eq__.
-
-        All sets ought to compare equal if they contain the same
-        elements, regardless of how they are implemented, and
-        regardless of the order of the elements; so there's not much
-        freedom for __eq__ or __hash__.  We match the algorithm used
-        by the built-in frozenset type.
+        Set itself is not hashable; an immutable subclass may use
+        ``__hash__ = Set._hash``.
         """
-        MAX = sys.maxsize
-        MASK = 2 * MAX + 1
-        n = len(self)
-        h = 1927868237 * (n + 1)
-        h &= MASK
-        for x in self:
-            hx = hash(x)
-            h ^= (hx ^ (hx << 16) ^ 89869747)  * 3644798167
-            h &= MASK
-        h ^= (h >> 11) ^ (h >> 25)
-        h = h * 69069 + 907133923
-        h &= MASK
-        if h > MAX:
-            h -= MASK + 1
-        if h == -1:
-            h = 590923713
-        return h
-
-
-Set.register(frozenset)
+        bits = 2 * sys.maxsize + 1          # all-ones machine word
+        acc = 0
+        count = 0
+        for elem in self:
+            eh = hash(elem) & bits
+            acc ^= (((eh ^ 89869747) ^ (eh << 16)) * 3644798167) & bits
+            count += 1
+        acc ^= ((count + 1) * 1927868237) & bits
+        acc ^= (acc >> 11) ^ (acc >> 25)
+        acc = (acc * 69069 + 907133923) & bits
+        if acc > sys.maxsize:
+            acc -= bits + 1
+        if acc == -1:
+            acc = 590923713
+        return acc
 
 
 class MutableSet(Set):
-    """A mutable set is a finite, iterable container.
+    """Set interface with in-place modification.
 
-    This class provides concrete generic implementations of all
-    methods except for __contains__, __iter__, __len__,
-    add(), and discard().
-
-    To override the comparisons (presumably for speed, as the
-    semantics are fixed), all you have to do is redefine __le__ and
-    then the other operations will automatically follow suit.
+    Subclasses additionally supply add() and discard().
     """
 
     __slots__ = ()
 
     @abstractmethod
     def add(self, value):
-        """Add an element."""
+        """Insert *value* into the set."""
         raise NotImplementedError
 
     @abstractmethod
     def discard(self, value):
-        """Remove an element.  Do not raise an exception if absent."""
+        """Take *value* out of the set if present (no error otherwise)."""
         raise NotImplementedError
 
     def remove(self, value):
-        """Remove an element. If not a member, raise a KeyError."""
+        """Take *value* out of the set; KeyError if it is not a member."""
         if value not in self:
             raise KeyError(value)
         self.discard(value)
 
     def pop(self):
-        """Return the popped value.  Raise KeyError if empty."""
-        it = iter(self)
-        try:
-            value = next(it)
-        except StopIteration:
+        """Remove some member and return it; KeyError if the set is empty."""
+        for value in self:
+            break
+        else:
             raise KeyError from None
         self.discard(value)
         return value
 
     def clear(self):
-        """This is slow (creates N new iterators!) but effective."""
-        try:
-            while True:
+        """Remove every member (one pop() at a time)."""
+        while True:
+            try:
                 self.pop()
-        except KeyError:
-            pass
+            except KeyError:
+                return
 
     def __ior__(self, it):
         for value in it:
@@ -703,21 +583,21 @@ class MutableSet(Set):
         return self
 
     def __iand__(self, it):
-        for value in (self - it):
+        for value in self - it:
             self.discard(value)
         return self
 
     def __ixor__(self, it):
         if it is self:
             self.clear()
-        else:
-            if not isinstance(it, Set):
-                it = self._from_iterable(it)
-            for value in it:
-                if value in self:
-                    self.discard(value)
-                else:
-                    self.add(value)
+            return self
+        if not isinstance(it, Set):
+            it = self._from_iterable(it)
+        for value in it:
+            if value in self:
+                self.discard(value)
+            else:
+                self.add(value)
         return self
 
     def __isub__(self, it):
@@ -729,31 +609,28 @@ class MutableSet(Set):
         return self
 
 
-MutableSet.register(set)
-
-
 # ---------------------------------------------------------------------------
 # Mappings
+# ---------------------------------------------------------------------------
 
 class Mapping(Collection):
-    """A Mapping is a generic container for associating key/value
-    pairs.
+    """Read-only mapping interface.
 
-    This class provides concrete generic implementations of all
-    methods except for __getitem__, __iter__, and __len__.
+    Subclasses supply __getitem__, __iter__ and __len__; lookups with
+    defaults, membership, views and equality are derived from them.
     """
 
     __slots__ = ()
 
-    # Tell ABCMeta.__new__ that this class should have TPFLAGS_MAPPING set.
-    __abc_tpflags__ = 1 << 6 # Py_TPFLAGS_MAPPING
+    # Py_TPFLAGS_MAPPING: lets instances match mapping patterns.
+    __abc_tpflags__ = 1 << 6
 
     @abstractmethod
     def __getitem__(self, key):
         raise KeyError
 
     def get(self, key, default=None):
-        'D.get(k[,d]) -> D[k] if k in D, else d.  d defaults to None.'
+        """Look up *key*, giving *default* when it is missing."""
         try:
             return self[key]
         except KeyError:
@@ -764,19 +641,18 @@ class Mapping(Collection):
             self[key]
         except KeyError:
             return False
-        else:
-            return True
+        return True
 
     def keys(self):
-        "D.keys() -> a set-like object providing a view on D's keys"
+        """Set-like view of the keys."""
         return KeysView(self)
 
     def items(self):
-        "D.items() -> a set-like object providing a view on D's items"
+        """Set-like view of the (key, value) pairs."""
         return ItemsView(self)
 
     def values(self):
-        "D.values() -> an object providing a view on D's values"
+        """View of the values."""
         return ValuesView(self)
 
     def __eq__(self, other):
@@ -787,13 +663,9 @@ class Mapping(Collection):
     __reversed__ = None
 
 
-Mapping.register(mappingproxy)
-Mapping.register(framelocalsproxy)
-
-
 class MappingView(Sized):
 
-    __slots__ = '_mapping',
+    __slots__ = ('_mapping',)
 
     def __init__(self, mapping):
         self._mapping = mapping
@@ -802,7 +674,7 @@ class MappingView(Sized):
         return len(self._mapping)
 
     def __repr__(self):
-        return '{0.__class__.__name__}({0._mapping!r})'.format(self)
+        return f'{type(self).__name__}({self._mapping!r})'
 
     __class_getitem__ = classmethod(GenericAlias)
 
@@ -822,9 +694,6 @@ class KeysView(MappingView, Set):
         yield from self._mapping
 
 
-KeysView.register(dict_keys)
-
-
 class ItemsView(MappingView, Set):
 
     __slots__ = ()
@@ -836,18 +705,15 @@ class ItemsView(MappingView, Set):
     def __contains__(self, item):
         key, value = item
         try:
-            v = self._mapping[key]
+            actual = self._mapping[key]
         except KeyError:
             return False
-        else:
-            return v is value or v == value
+        return actual is value or actual == value
 
     def __iter__(self):
-        for key in self._mapping:
-            yield (key, self._mapping[key])
-
-
-ItemsView.register(dict_items)
+        mapping = self._mapping
+        for key in mapping:
+            yield (key, mapping[key])
 
 
 class ValuesView(MappingView, Collection):
@@ -855,27 +721,26 @@ class ValuesView(MappingView, Collection):
     __slots__ = ()
 
     def __contains__(self, value):
-        for key in self._mapping:
-            v = self._mapping[key]
-            if v is value or v == value:
+        mapping = self._mapping
+        for key in mapping:
+            candidate = mapping[key]
+            if candidate is value or candidate == value:
                 return True
         return False
 
     def __iter__(self):
-        for key in self._mapping:
-            yield self._mapping[key]
+        mapping = self._mapping
+        for key in mapping:
+            yield mapping[key]
 
 
-ValuesView.register(dict_values)
+_absent = object()
 
 
 class MutableMapping(Mapping):
-    """A MutableMapping is a generic container for associating
-    key/value pairs.
+    """Mapping interface with in-place modification.
 
-    This class provides concrete generic implementations of all
-    methods except for __getitem__, __setitem__, __delitem__,
-    __iter__, and __len__.
+    Subclasses additionally supply __setitem__ and __delitem__.
     """
 
     __slots__ = ()
@@ -888,26 +753,21 @@ class MutableMapping(Mapping):
     def __delitem__(self, key):
         raise KeyError
 
-    __marker = object()
-
-    def pop(self, key, default=__marker):
-        '''D.pop(k[,d]) -> v, remove specified key and return the corresponding value.
-          If key is not found, d is returned if given, otherwise KeyError is raised.
-        '''
+    def pop(self, key, default=_absent):
+        """Remove *key* and return its value.  A missing key gives
+        *default* if one was passed, KeyError otherwise."""
         try:
             value = self[key]
         except KeyError:
-            if default is self.__marker:
+            if default is _absent:
                 raise
             return default
-        else:
-            del self[key]
-            return value
+        del self[key]
+        return value
 
     def popitem(self):
-        '''D.popitem() -> (k, v), remove and return some (key, value) pair
-           as a 2-tuple; but raise KeyError if D is empty.
-        '''
+        """Remove some (key, value) pair and return it; KeyError when
+        the mapping is empty."""
         try:
             key = next(iter(self))
         except StopIteration:
@@ -917,19 +777,19 @@ class MutableMapping(Mapping):
         return key, value
 
     def clear(self):
-        'D.clear() -> None.  Remove all items from D.'
-        try:
-            while True:
+        """Remove every item."""
+        while True:
+            try:
                 self.popitem()
-        except KeyError:
-            pass
+            except KeyError:
+                return
 
     def update(self, other=(), /, **kwds):
-        ''' D.update([E, ]**F) -> None.  Update D from mapping/iterable E and F.
-            If E present and has a .keys() method, does:     for k in E.keys(): D[k] = E[k]
-            If E present and lacks .keys() method, does:     for (k, v) in E: D[k] = v
-            In either case, this is followed by: for k, v in F.items(): D[k] = v
-        '''
+        """Store the items of *other* and then of *kwds*.
+
+        *other* may be a mapping, an object with a keys() method, or an
+        iterable of (key, value) pairs.
+        """
         if isinstance(other, Mapping):
             for key in other:
                 self[key] = other[key]
@@ -943,7 +803,8 @@ class MutableMapping(Mapping):
             self[key] = value
 
     def setdefault(self, key, default=None):
-        'D.setdefault(k[,d]) -> D.get(k,d), also set D[k]=d if k not in D'
+        """Return the value of *key*, first storing *default* under it if
+        the key is missing."""
         try:
             return self[key]
         except KeyError:
@@ -951,23 +812,22 @@ class MutableMapping(Mapping):
         return default
 
 
-MutableMapping.register(dict)
-
-
 # ---------------------------------------------------------------------------
 # Sequences
+# ---------------------------------------------------------------------------
 
 class Sequence(Reversible, Collection):
-    """All the operations on a read-only sequence.
+    """Read-only sequence interface.
 
-    Concrete subclasses must override __new__ or __init__,
-    __getitem__, and __len__.
+    Subclasses supply __getitem__ (integer indexes, IndexError past the
+    end) and __len__; iteration, membership, reversal, index() and
+    count() are derived from them.
     """
 
     __slots__ = ()
 
-    # Tell ABCMeta.__new__ that this class should have TPFLAGS_SEQUENCE set.
-    __abc_tpflags__ = 1 << 5 # Py_TPFLAGS_SEQUENCE
+    # Py_TPFLAGS_SEQUENCE: lets instances match sequence patterns.
+    __abc_tpflags__ = 1 << 5
 
     @abstractmethod
     def __getitem__(self, index):
@@ -977,29 +837,25 @@ class Sequence(Reversible, Collection):
         i = 0
         try:
             while True:
-                v = self[i]
-                yield v
+                item = self[i]
+                yield item
                 i += 1
         except IndexError:
             return
 
     def __contains__(self, value):
-        for v in self:
-            if v is value or v == value:
+        for item in self:
+            if item is value or item == value:
                 return True
         return False
 
     def __reversed__(self):
-        for i in reversed(range(len(self))):
+        for i in range(len(self) - 1, -1, -1):
             yield self[i]
 
     def index(self, value, start=0, stop=None):
-        '''S.index(value, [start, [stop]]) -> integer -- return first index of value.
-           Raises ValueError if the value is not present.
-
-           Supporting start and stop arguments is optional, but
-           recommended.
-        '''
+        """Position of the first occurrence of *value* within
+        [start:stop]; ValueError when it does not occur."""
         if start is not None and start < 0:
             start = max(len(self) + start, 0)
         if stop is not None and stop < 0:
@@ -1008,75 +864,65 @@ class Sequence(Reversible, Collection):
         i = start
         while stop is None or i < stop:
             try:
-                v = self[i]
+                item = self[i]
             except IndexError:
                 break
-            if v is value or v == value:
+            if item is value or item == value:
                 return i
             i += 1
         raise ValueError
 
     def count(self, value):
-        'S.count(value) -> integer -- return number of occurrences of value'
-        return sum(1 for v in self if v is value or v == value)
+        """How many items are equal to (or are) *value*."""
+        n = 0
+        for item in self:
+            if item is value or item == value:
+                n += 1
+        return n
 
 
-Sequence.register(tuple)
-Sequence.register(str)
-Sequence.register(bytes)
-Sequence.register(range)
-Sequence.register(memoryview)
+def _warn_bytestring():
+    import warnings
+    warnings._deprecated("collections.abc.ByteString", remove=(3, 17))
 
 
-class _DeprecateByteStringMeta(ABCMeta):
-    def __new__(cls, name, bases, namespace, **kwargs):
-        if name != "ByteString":
-            import warnings
-            warnings._deprecated(
-                "collections.abc.ByteString",
-                remove=(3, 17),
-            )
-        return super().__new__(cls, name, bases, namespace, **kwargs)
+class _ByteStringWarningMeta(ABCMeta):
+    # ByteString is deprecated: warn whenever it is subclassed or used in
+    # an isinstance() check.
+
+    def __new__(mcls, name, bases, namespace, /, **kwargs):
+        if any(isinstance(b, _ByteStringWarningMeta) for b in bases):
+            _warn_bytestring()
+        return super().__new__(mcls, name, bases, namespace, **kwargs)
 
     def __instancecheck__(cls, instance):
-        import warnings
-        warnings._deprecated(
-            "collections.abc.ByteString",
-            remove=(3, 17),
-        )
+        _warn_bytestring()
         return super().__instancecheck__(instance)
 
 
-class _ByteString(Sequence, metaclass=_DeprecateByteStringMeta):
-    """Deprecated ABC serving as a common supertype of ``bytes`` and ``bytearray``.
-
-    This ABC is scheduled for removal in Python 3.17.
-    Use ``isinstance(obj, collections.abc.Buffer)`` to test if ``obj``
-    implements the buffer protocol at runtime. For use in type annotations,
-    either use ``Buffer`` or a union that explicitly specifies the types your
-    code supports (e.g., ``bytes | bytearray | memoryview``).
-    """
+class ByteString(Sequence, metaclass=_ByteStringWarningMeta):
+    """Deprecated common supertype of bytes and bytearray."""
 
     __slots__ = ()
 
-_ByteString.__name__ = _ByteString.__qualname__ = "ByteString"
-_ByteString.register(bytes)
-_ByteString.register(bytearray)
+
+# Only reachable through the warning __getattr__ hooks below and in
+# collections.abc.
+_ByteString = ByteString
+del ByteString
 
 
 def __getattr__(attr):
     if attr == "ByteString":
-        import warnings
-        warnings._deprecated("collections.abc.ByteString", remove=(3, 17))
+        _warn_bytestring()
         return _ByteString
-    raise AttributeError(f"module 'collections.abc' has no attribute {attr!r}")
+    raise AttributeError(f"module {__name__!r} has no attribute {attr!r}")
 
 
 class MutableSequence(Sequence):
-    """All the operations on a read-write sequence.
+    """Sequence interface with in-place modification.
 
-    Concrete subclasses must provide __new__ or __init__,
-    __getitem__, __setitem__, __delitem__, __len__, and insert().
+    Subclasses additionally supply __setitem__, __delitem__ and insert().
     """
 
     __slots__ = ()
@@ -1091,15 +937,15 @@ class MutableSequence(Sequence):
 
     @abstractmethod
     def insert(self, index, value):
-        'S.insert(index, value) -- insert value before index'
+        """Put *value* in front of position *index*."""
         raise IndexError
 
     def append(self, value):
-        'S.append(value) -- append value to the end of the sequence'
+        """Add *value* after the last item."""
         self.insert(len(self), value)
 
     def clear(self):
-        'S.clear() -> None -- remove all items from S'
+        """Remove every item."""
         try:
             while True:
                 self.pop()
@@ -1107,30 +953,29 @@ class MutableSequence(Sequence):
             pass
 
     def reverse(self):
-        'S.reverse() -- reverse *IN PLACE*'
-        n = len(self)
-        for i in range(n//2):
-            self[i], self[n-i-1] = self[n-i-1], self[i]
+        """Reverse the order of the items in place."""
+        lo, hi = 0, len(self) - 1
+        while lo < hi:
+            self[lo], self[hi] = self[hi], self[lo]
+            lo += 1
+            hi -= 1
 
     def extend(self, values):
-        'S.extend(iterable) -- extend sequence by appending elements from the iterable'
+        """Append every value produced by the iterable *values*."""
         if values is self:
             values = list(values)
         for v in values:
             self.append(v)
 
     def pop(self, index=-1):
-        '''S.pop([index]) -> item -- remove and return item at index (default last).
-           Raise IndexError if list is empty or index is out of range.
-        '''
-        v = self[index]
+        """Remove the item at *index* (the last one by default) and return
+        it; IndexError when there is no such item."""
+        item = self[index]
         del self[index]
-        return v
+        return item
 
     def remove(self, value):
-        '''S.remove(value) -- remove first occurrence of value.
-           Raise ValueError if the value is not present.
-        '''
+        """Delete the first item equal to *value*; ValueError if none is."""
         del self[self.index(value)]
 
     def __iadd__(self, values):
@@ -1138,5 +983,100 @@ class MutableSequence(Sequence):
         return self
 
 
-MutableSequence.register(list)
-MutableSequence.register(bytearray)
+# ---------------------------------------------------------------------------
+# Registration of the built-in types
+# ---------------------------------------------------------------------------
+
+def _type_of_iter(obj):
+    return type(iter(obj))
+
+
+# Several built-in types have no public name; they are bound here so that
+# they can be registered (and looked up by name).
+bytes_iterator = _type_of_iter(b'')
+bytearray_iterator = _type_of_iter(bytearray())
+dict_keyiterator = _type_of_iter({}.keys())
+dict_valueiterator = _type_of_iter({}.values())
+dict_itemiterator = _type_of_iter({}.items())
+list_iterator = _type_of_iter([])
+list_reverseiterator = _type_of_iter(reversed([]))
+range_iterator = _type_of_iter(range(0))
+longrange_iterator = _type_of_iter(range(1 << 1000))
+set_iterator = _type_of_iter(set())
+str_iterator = _type_of_iter("")
+tuple_iterator = _type_of_iter(())
+zip_iterator = type(zip())
+dict_keys = type({}.keys())
+dict_values = type({}.values())
+dict_items = type({}.items())
+mappingproxy = type(type.__dict__)
+
+
+def _frame_locals():
+    return sys._getframe().f_locals
+
+
+framelocalsproxy = type(_frame_locals())
+del _frame_locals
+
+
+def _plain_generator():
+    yield
+
+
+generator = type(_plain_generator())
+del _plain_generator
+
+
+async def _plain_coroutine():
+    pass
+
+
+_coro = _plain_coroutine()
+coroutine = type(_coro)
+_coro.close()
+del _coro, _plain_coroutine
+
+
+async def _plain_async_generator():
+    yield
+
+
+async_generator = type(_plain_async_generator())
+del _plain_async_generator
+
+
+def _register_builtins():
+    table = {
+        Iterator: (bytes_iterator, bytearray_iterator, dict_keyiterator,
+                   dict_valueiterator, dict_itemiterator, list_iterator,
+                   list_reverseiterator, range_iterator, longrange_iterator,
+                   set_iterator, str_iterator, tuple_iterator, zip_iterator),
+        Generator: (generator,),
+        Coroutine: (coroutine,),
+        AsyncGenerator: (async_generator,),
+        Set: (frozenset,),
+        MutableSet: (set,),
+        KeysView: (dict_keys,),
+        ItemsView: (dict_items,),
+        ValuesView: (dict_values,),
+        Mapping: (mappingproxy,),
+        MutableMapping: (dict,),
+        Sequence: (tuple, str, range, memoryview, bytes),
+        MutableSequence: (list, bytearray),
+        _ByteString: (bytes, bytearray),
+    }
+    for abc, concrete in table.items():
+        for cls in concrete:
+            abc.register(cls)
+    # Frame-locals proxies are read/write views but not full mutable
+    # mappings (no deletion); some builds hand out plain dicts instead.
+    if framelocalsproxy is not dict:
+        Mapping.register(framelocalsproxy)
+    frozen = getattr(sys.modules.get("builtins"), "frozendict", None)
+    if frozen is not None:
+        Mapping.register(frozen)
+
+
+_register_builtins()
+del _register_builtins
