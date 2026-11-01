@@ -88,6 +88,7 @@ pub(crate) struct Vm<'a, T: CodeUnit> {
     pub origin: usize,
     lastindex: isize,
     cur_rep: u32,
+    dirty: bool,
     sc: &'a mut Scratch,
 }
 
@@ -111,6 +112,7 @@ impl<'a, T: CodeUnit> Vm<'a, T> {
             origin: 0,
             lastindex: -1,
             cur_rep: NONE,
+            dirty: false,
             sc,
         }
     }
@@ -132,8 +134,11 @@ impl<'a, T: CodeUnit> Vm<'a, T> {
 
     fn reset(&mut self) {
         let sc = &mut *self.sc;
-        for x in sc.slots.iter_mut() {
-            *x = UNSET;
+        if self.dirty {
+            for x in sc.slots.iter_mut() {
+                *x = UNSET;
+            }
+            self.dirty = false;
         }
         sc.bt.clear();
         sc.trail.clear();
@@ -364,6 +369,7 @@ impl<'a, T: CodeUnit> Vm<'a, T> {
                         let old = self.sc.slots[slot as usize];
                         self.log(U_SLOT, slot, old);
                         self.sc.slots[slot as usize] = pos;
+                        self.dirty = true;
                         if slot & 1 == 1 {
                             let li = self.lastindex;
                             self.log(U_LASTINDEX, 0, li as usize);
@@ -375,6 +381,15 @@ impl<'a, T: CodeUnit> Vm<'a, T> {
                     Inst::Split(a, b) => {
                         self.push(F_CHOICE, b, pos, 0, 0);
                         pc = a as usize;
+                        true
+                    }
+                    Inst::SplitG(a, b, g) => {
+                        if pos < end && self.ch(pos) == g {
+                            self.push(F_CHOICE, b, pos, 0, 0);
+                            pc = a as usize;
+                        } else {
+                            pc = b as usize;
+                        }
                         true
                     }
                     Inst::Jmp(t) => {

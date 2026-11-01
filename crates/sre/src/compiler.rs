@@ -54,6 +54,8 @@ pub(crate) enum Inst {
     At(At),
     Mark(u32),
     Split(u32, u32),
+    /// Split whose first alternative needs the current char to be `.2`.
+    SplitG(u32, u32, u32),
     Jmp(u32),
     GroupRef(u32, RefMode),
     /// (group, else-pc)
@@ -235,6 +237,8 @@ pub(crate) struct Program {
     pub min_width: usize,
     /// Whole pattern is a single literal string without groups.
     pub pure_literal: bool,
+    /// Possible (first, second) character pairs of any match (empty = unknown).
+    pub pairs: Vec<(FirstSet, FirstSet)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -289,6 +293,7 @@ impl<'a> Compiler<'a> {
                 anchored_start: false,
                 min_width: 0,
                 pure_literal: false,
+                pairs: Vec::new(),
             },
         };
         // Literal prefix (top level, case-sensitive).
@@ -325,6 +330,13 @@ impl<'a> Compiler<'a> {
             }
         }
         c.set_hints();
+        c.set_guards();
+        if flags & LOCALE == 0 {
+            let mut v: Vec<&Node> = nodes.iter().collect();
+            if let Some(p) = c.pairs(&mut v, flags) {
+                c.prog.pairs = p;
+            }
+        }
         Ok(c.prog)
     }
 
@@ -862,5 +874,72 @@ impl<'a> Compiler<'a> {
     #[allow(dead_code)]
     fn unused(&self) -> &[(u128, u128)] {
         self.group_widths
+    }
+}
+
+impl<'a> Compiler<'a> {
+    /// Replace `Split(a, b)` by `SplitG(a, b, c)` when alternative `a`
+    /// starts with the plain character `c`.
+    fn set_guards(&mut self) {
+        for pc in 0..self.prog.insts.len() {
+            if let Inst::Split(a, b) = self.prog.insts[pc] {
+                let g = match self.prog.insts.get(a as usize) {
+                    Some(Inst::Char(c)) => *c,
+                    Some(Inst::Lit(s, _)) => self.prog.lits[*s as usize],
+                    _ => continue,
+                };
+                self.prog.insts[pc] = Inst::SplitG(a, b, g);
+            }
+        }
+    }
+
+    fn full_set() -> FirstSet {
+        FirstSet { bits: [u64::MAX; 4], high: true }
+    }
+
+    fn single_set(&self, n: &Node, flags: u32) -> Option<FirstSet> {
+        match n {
+            Node::Literal(_) | Node::NotLiteral(_) | Node::Any | Node::In(..) => {
+                Some(self.first_node(n, flags).0.unwrap_or_else(Self::full_set))
+            }
+            _ => None,
+        }
+    }
+
+    /// Possible (first, second) character pairs for a sequence.
+    fn pairs(&self, seq: &mut Vec<&Node>, flags: u32) -> Option<Vec<(FirstSet, FirstSet)>> {
+        let first = *seq.first()?;
+        match first {
+            Node::Subpattern { add: 0, del: 0, body, .. } => {
+                let mut v: Vec<&Node> = body.iter().collect();
+                v.extend_from_slice(&seq[1..]);
+                self.pairs(&mut v, flags)
+            }
+            Node::Branch(alts) => {
+                let mut out = Vec::new();
+                for a in alts {
+                    let mut v: Vec<&Node> = a.iter().collect();
+                    v.extend_from_slice(&seq[1..]);
+                    out.extend(self.pairs(&mut v, flags)?);
+                    if out.len() > 16 {
+                        return None;
+                    }
+                }
+                Some(out)
+            }
+            _ => {
+                let s0 = self.single_set(first, flags)?;
+                let second = *seq.get(1)?;
+                let (s1, _, nullable) = self.first_node(second, flags);
+                if nullable {
+                    return None;
+                }
+                let s1 = s1.unwrap_or_else(Self::full_set);
+                if s0.high && s1.high && s0.bits == [u64::MAX; 4] {
+                    return None;
+                }
+                Some(vec![(s0, s1)])
+            }
+        }
     }
 }

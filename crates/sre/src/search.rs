@@ -115,6 +115,21 @@ pub(crate) fn exec<T: CodeUnit>(
         }
         return None;
     }
+    if !prog.pairs.is_empty() {
+        let pairs = &prog.pairs[..];
+        let mut i = pos;
+        while i <= last && i + 1 < end {
+            let c0: u32 = s[i].into();
+            let c1: u32 = s[i + 1].into();
+            if pairs.iter().any(|(a, b)| a.test(c0) && b.test(c1)) {
+                if let Some(e) = vm.run(0, i) {
+                    return Some(build(&vm, i, e, groups));
+                }
+            }
+            i += 1;
+        }
+        return None;
+    }
     if let Some(first) = &prog.first {
         let mut i = pos;
         while i <= last && i < end {

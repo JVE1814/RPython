@@ -180,7 +180,12 @@ fn build_case_tables() -> CaseTables {
     let mut inverse: HashMap<u32, Vec<u32>> = HashMap::new();
     // full uppercase string -> distinct full lowercase characters
     let mut by_upper: HashMap<Vec<char>, Vec<u32>> = HashMap::new();
-    for cp in 0u32..=0x10FFFF {
+    // No character outside planes 0-1 has a case mapping; the big CJK,
+    // Hangul and private-use blocks are caseless too.
+    for cp in 0u32..0x20000 {
+        if matches!(cp, 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7A3 | 0xD800..=0xF8FF) {
+            continue;
+        }
         let Some(ch) = char::from_u32(cp) else { continue };
         let mut lo = ch.to_lowercase();
         let l0 = lo.next().map_or(cp, |x| x as u32);
@@ -425,6 +430,17 @@ mod tests {
         assert!(default_case_class(0x1C80).contains(&0x412));
         assert!(default_case_class('1' as u32).is_empty());
         assert_eq!(default_lower(0x130), 'i' as u32);
+    }
+
+    #[test]
+    fn skipped_blocks_are_caseless() {
+        for cp in (0x3400u32..=0x4DBF).chain(0x4E00..=0x9FFF).chain(0xAC00..=0xD7A3).chain(0xE000..=0xF8FF).chain(0x20000..=0x10FFFF) {
+            if let Some(ch) = char::from_u32(cp) {
+                let l: Vec<char> = ch.to_lowercase().collect();
+                let u: Vec<char> = ch.to_uppercase().collect();
+                assert!(l == [ch] && u == [ch], "{cp:x}");
+            }
+        }
     }
 
     #[test]
