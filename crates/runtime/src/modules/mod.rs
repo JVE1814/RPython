@@ -17,5 +17,9 @@ pub mod codecs_core;
 pub mod codecs_registry;
 pub mod reprlib_guard;
 
+pub mod _weakref;
+
 /// Register all builtin (Rust-implemented) modules with the import system.
-pub fn register_all() {}
+pub fn register_all() {
+    crate::import::register_builtin("_weakref", _weakref::init);
+}
