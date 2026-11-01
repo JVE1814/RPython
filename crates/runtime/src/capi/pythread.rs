@@ -1,5 +1,5 @@
 //! pythread.h / cpython/pylock.h / critical_section.h: native threads, locks, TSS,
-//! PyMutex (parking-lot slow path) and per-object critical sections (ob_mutex).
+//! PyMutex (parking slow path) and critical sections (own lock table, see below).
 
 use super::*;
 use std::ffi::{c_uint, c_ulong, c_void};
@@ -83,6 +83,21 @@ pub unsafe extern "C" fn PyMutex_IsLocked(m: *mut u8) -> c_int {
 }
 
 // ---------------------------------------------------------------- critical sections
+//
+// Design (ours): the runtime uses `ob_mutex` as a short leaf lock around single
+// container operations and never holds it while running other code. Extension
+// critical sections, however, stay open across arbitrary C-API calls, which take
+// that same leaf lock or run Python code. So `PyCriticalSection_Begin(op)` does
+// not touch `ob_mutex`; it takes an entry for `op` in a separate lock table
+// (keyed by object address). Sections over an explicit PyMutex
+// (`*_BeginMutex`) lock that mutex itself.
+//
+// Rules: re-entering a lock this thread already holds through an active section
+// is a no-op (the record is not pushed). Before blocking on a contended lock, and
+// when the thread detaches (PyEval_SaveThread), every section this thread holds
+// is suspended (its locks dropped); a suspended section takes its locks back when
+// it is the innermost one again (on the inner section's End, or on reattach).
+// That keeps the lock graph acyclic, so sections cannot deadlock each other.
 
 #[repr(C)]
 pub struct PyCriticalSection {
@@ -94,111 +109,262 @@ pub struct PyCriticalSection2 {
     pub _cs_base: PyCriticalSection,
     pub _cs_mutex2: *mut u8,
 }
+/// Tag on a chain link: the record is a PyCriticalSection2.
 const CS_TWO: usize = 1;
+/// Flag in a record's own `_cs_prev`: its locks are currently dropped.
+const CS_SUSPENDED: usize = 2;
+const LINK_MASK: usize = !(CS_TWO | CS_SUSPENDED);
+/// Tag on a lock key: an object address in the lock table (else a PyMutex address).
+const KEY_OBJECT: usize = 1;
 
-/// Is mutex `m` held by an active critical section of this thread?
-unsafe fn held_by_me(m: *mut u8) -> bool {
+struct LockShard {
+    held: Mutex<Vec<usize>>,
+    freed: Condvar,
+}
+const NSHARDS: usize = 64;
+static LOCK_TABLE: [LockShard; NSHARDS] =
+    [const { LockShard { held: Mutex::new(Vec::new()), freed: Condvar::new() } }; NSHARDS];
+fn shard(key: usize) -> &'static LockShard {
+    &LOCK_TABLE[(key >> 4).wrapping_mul(0x9E37_79B9) % NSHARDS]
+}
+
+fn key_try_lock(key: usize) -> bool {
+    if key & KEY_OBJECT == 0 {
+        let m = unsafe { AtomicU8::from_ptr(key as *mut u8) };
+        let v = m.load(Relaxed);
+        return v & LOCKED == 0 && m.compare_exchange(v, v | LOCKED, Acquire, Relaxed).is_ok();
+    }
+    let mut held = shard(key).held.lock().unwrap();
+    if held.contains(&key) {
+        return false;
+    }
+    held.push(key);
+    true
+}
+fn key_lock(key: usize) {
+    if key & KEY_OBJECT == 0 {
+        return mutex_lock(unsafe { AtomicU8::from_ptr(key as *mut u8) });
+    }
+    let s = shard(key);
+    let mut held = s.held.lock().unwrap();
+    while held.contains(&key) {
+        held = s.freed.wait(held).unwrap();
+    }
+    held.push(key);
+}
+fn key_unlock(key: usize) {
+    if key == 0 {
+        return;
+    }
+    if key & KEY_OBJECT == 0 {
+        return mutex_unlock(unsafe { AtomicU8::from_ptr(key as *mut u8) });
+    }
+    let s = shard(key);
+    let mut held = s.held.lock().unwrap();
+    if let Some(i) = held.iter().position(|&k| k == key) {
+        held.swap_remove(i);
+    }
+    drop(held);
+    s.freed.notify_all();
+}
+fn object_key(op: *mut PyObject) -> *mut u8 {
+    (op as usize | KEY_OBJECT) as *mut u8
+}
+
+/// The two lock keys of the record a chain link points at (0 = none).
+unsafe fn record_keys(link: usize) -> (usize, usize) {
     unsafe {
-        let mut p = (*crate::threads::current_mut()).c.critical_section;
-        let mut n = 0;
-        while p != 0 && n < 10_000 {
-            let cs = (p & !CS_TWO) as *mut PyCriticalSection;
-            if (*cs)._cs_mutex == m {
-                return true;
+        let cs = (link & LINK_MASK) as *mut PyCriticalSection;
+        let k2 = if link & CS_TWO != 0 { (*(cs as *mut PyCriticalSection2))._cs_mutex2 as usize } else { 0 };
+        ((*cs)._cs_mutex as usize, k2)
+    }
+}
+unsafe fn record(link: usize) -> *mut PyCriticalSection {
+    (link & LINK_MASK) as *mut PyCriticalSection
+}
+unsafe fn chain_head(ts: *mut crate::threads::ThreadState) -> *mut usize {
+    unsafe { &raw mut (*ts).c.critical_section }
+}
+
+/// Does an active (not suspended) section of this thread hold `key`?
+unsafe fn held_by_me(ts: *mut crate::threads::ThreadState, key: usize) -> bool {
+    unsafe {
+        let mut link = *chain_head(ts);
+        while link != 0 {
+            let cs = record(link);
+            if (*cs)._cs_prev & CS_SUSPENDED == 0 {
+                let (a, b) = record_keys(link);
+                if a == key || (b != 0 && b == key) {
+                    return true;
+                }
             }
-            if p & CS_TWO != 0 && (*(cs as *mut PyCriticalSection2))._cs_mutex2 == m {
-                return true;
-            }
-            p = (*cs)._cs_prev;
-            n += 1;
+            link = (*cs)._cs_prev & !CS_SUSPENDED;
         }
         false
     }
 }
-unsafe fn push(c: *mut PyCriticalSection, tag: usize) {
+
+/// Drop the locks of every section of thread `ts` (they are re-taken lazily).
+pub(crate) unsafe fn suspend_all(ts: *mut crate::threads::ThreadState) {
     unsafe {
-        let ts = crate::threads::current_mut();
-        (*c)._cs_prev = (*ts).c.critical_section;
-        (*ts).c.critical_section = c as usize | tag;
+        if ts.is_null() {
+            return;
+        }
+        let mut link = *chain_head(ts);
+        while link != 0 {
+            let cs = record(link);
+            if (*cs)._cs_prev & CS_SUSPENDED == 0 {
+                let (a, b) = record_keys(link);
+                key_unlock(b);
+                key_unlock(a);
+                (*cs)._cs_prev |= CS_SUSPENDED;
+            }
+            link = (*cs)._cs_prev & !CS_SUSPENDED;
+        }
     }
 }
-unsafe fn pop(c: *mut PyCriticalSection) {
+
+/// Re-take the locks of the innermost section of `ts` if it was suspended.
+pub(crate) unsafe fn resume_top(ts: *mut crate::threads::ThreadState) {
+    unsafe {
+        if ts.is_null() {
+            return;
+        }
+        let link = *chain_head(ts);
+        if link == 0 {
+            return;
+        }
+        let cs = record(link);
+        if (*cs)._cs_prev & CS_SUSPENDED == 0 {
+            return;
+        }
+        let (a, b) = record_keys(link);
+        // keys of a two-lock record are stored in address order
+        if a != 0 {
+            key_lock(a);
+        }
+        if b != 0 {
+            key_lock(b);
+        }
+        (*cs)._cs_prev &= !CS_SUSPENDED;
+    }
+}
+
+/// Acquire `keys` (in the given order, zeros skipped) for a new section, suspending
+/// this thread's other sections first if any of them is contended.
+unsafe fn acquire_for_new(ts: *mut crate::threads::ThreadState, keys: [usize; 2]) {
+    unsafe {
+        let mut got = [false; 2];
+        let mut contended = false;
+        for (i, &k) in keys.iter().enumerate() {
+            if k == 0 {
+                continue;
+            }
+            if key_try_lock(k) {
+                got[i] = true;
+            } else {
+                contended = true;
+                break;
+            }
+        }
+        if !contended {
+            return;
+        }
+        for i in (0..2).rev() {
+            if got[i] {
+                key_unlock(keys[i]);
+            }
+        }
+        suspend_all(ts);
+        for &k in &keys {
+            if k != 0 {
+                key_lock(k);
+            }
+        }
+    }
+}
+
+unsafe fn begin_one(c: *mut PyCriticalSection, key: *mut u8) {
     unsafe {
         let ts = crate::threads::current_mut();
-        (*ts).c.critical_section = (*c)._cs_prev;
+        if held_by_me(ts, key as usize) {
+            (*c)._cs_mutex = std::ptr::null_mut();
+            (*c)._cs_prev = 0;
+            return;
+        }
+        acquire_for_new(ts, [key as usize, 0]);
+        (*c)._cs_mutex = key;
+        (*c)._cs_prev = *chain_head(ts);
+        *chain_head(ts) = c as usize;
+    }
+}
+
+unsafe fn end_record(c: *mut PyCriticalSection, two: bool) {
+    unsafe {
+        let ts = crate::threads::current_mut();
+        let link = c as usize | if two { CS_TWO } else { 0 };
+        if *chain_head(ts) != link {
+            // not pushed (fully re-entrant) or ended out of order: nothing to release
+            return;
+        }
+        if (*c)._cs_prev & CS_SUSPENDED == 0 {
+            let (a, b) = record_keys(link);
+            key_unlock(b);
+            key_unlock(a);
+        }
+        *chain_head(ts) = (*c)._cs_prev & !CS_SUSPENDED;
+        resume_top(ts);
     }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyCriticalSection_BeginMutex(c: *mut PyCriticalSection, m: *mut u8) {
-    unsafe {
-        if held_by_me(m) {
-            (*c)._cs_mutex = std::ptr::null_mut();
-            (*c)._cs_prev = 0;
-            return;
-        }
-        mutex_lock(AtomicU8::from_ptr(m));
-        (*c)._cs_mutex = m;
-        push(c, 0);
-    }
+    unsafe { begin_one(c, m) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyCriticalSection_Begin(c: *mut PyCriticalSection, op: *mut PyObject) {
-    unsafe { PyCriticalSection_BeginMutex(c, (*op).ob_mutex.as_ptr()) }
+    unsafe { begin_one(c, object_key(op)) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyCriticalSection_End(c: *mut PyCriticalSection) {
+    unsafe { end_record(c, false) }
+}
+
+unsafe fn begin_two(c: *mut PyCriticalSection2, k1: *mut u8, k2: *mut u8) {
     unsafe {
-        if (*c)._cs_mutex.is_null() {
+        if k1 == k2 {
+            begin_one(&mut (*c)._cs_base, k1);
+            (*c)._cs_mutex2 = std::ptr::null_mut();
             return;
         }
-        mutex_unlock(AtomicU8::from_ptr((*c)._cs_mutex));
-        pop(c);
+        let ts = crate::threads::current_mut();
+        let (lo, hi) = if (k1 as usize) < (k2 as usize) { (k1, k2) } else { (k2, k1) };
+        let lo = if held_by_me(ts, lo as usize) { 0 } else { lo as usize };
+        let hi = if held_by_me(ts, hi as usize) { 0 } else { hi as usize };
+        if lo == 0 && hi == 0 {
+            (*c)._cs_base._cs_mutex = std::ptr::null_mut();
+            (*c)._cs_mutex2 = std::ptr::null_mut();
+            (*c)._cs_base._cs_prev = 0;
+            return;
+        }
+        acquire_for_new(ts, [lo, hi]);
+        (*c)._cs_base._cs_mutex = lo as *mut u8;
+        (*c)._cs_mutex2 = hi as *mut u8;
+        (*c)._cs_base._cs_prev = *chain_head(ts);
+        *chain_head(ts) = c as usize | CS_TWO;
     }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyCriticalSection2_BeginMutex(c: *mut PyCriticalSection2, m1: *mut u8, m2: *mut u8) {
-    unsafe {
-        if m1 == m2 {
-            PyCriticalSection_BeginMutex(&mut (*c)._cs_base, m1);
-            (*c)._cs_mutex2 = std::ptr::null_mut();
-            return;
-        }
-        // lock in address order to avoid deadlocks
-        let (a, b) = if (m1 as usize) < (m2 as usize) { (m1, m2) } else { (m2, m1) };
-        let ha = held_by_me(a);
-        let hb = held_by_me(b);
-        if !ha {
-            mutex_lock(AtomicU8::from_ptr(a));
-        }
-        if !hb {
-            mutex_lock(AtomicU8::from_ptr(b));
-        }
-        (*c)._cs_base._cs_mutex = if ha { std::ptr::null_mut() } else { a };
-        (*c)._cs_mutex2 = if hb { std::ptr::null_mut() } else { b };
-        push(&mut (*c)._cs_base, CS_TWO);
-    }
+    unsafe { begin_two(c, m1, m2) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyCriticalSection2_Begin(c: *mut PyCriticalSection2, a: *mut PyObject, b: *mut PyObject) {
-    unsafe { PyCriticalSection2_BeginMutex(c, (*a).ob_mutex.as_ptr(), (*b).ob_mutex.as_ptr()) }
+    unsafe { begin_two(c, object_key(a), object_key(b)) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyCriticalSection2_End(c: *mut PyCriticalSection2) {
-    unsafe {
-        let m1 = (*c)._cs_base._cs_mutex;
-        let m2 = (*c)._cs_mutex2;
-        if !m2.is_null() {
-            mutex_unlock(AtomicU8::from_ptr(m2));
-        }
-        if !m1.is_null() {
-            mutex_unlock(AtomicU8::from_ptr(m1));
-        }
-        let ts = crate::threads::current_mut();
-        if (*ts).c.critical_section & !CS_TWO == c as usize {
-            pop(&mut (*c)._cs_base);
-        }
-    }
+    unsafe { end_record(&mut (*c)._cs_base, true) }
 }
 
 // ---------------------------------------------------------------- PyThread locks

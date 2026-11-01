@@ -23,16 +23,7 @@ pub unsafe extern "C" fn PyImport_ImportModuleNoBlock(name: *const c_char) -> *m
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyWeakref_GetObject(r: *mut PyObject) -> *mut PyObject {
     unsafe {
-        let mut out = std::ptr::null_mut();
-        match super::funcs::PyWeakref_GetRef(r, &mut out) {
-            1 => {
-                // borrowed: the referent is kept alive elsewhere (legacy semantics)
-                decref(out);
-                out
-            }
-            0 => none::none().as_ptr(),
-            _ => std::ptr::null_mut(),
-        }
+        super::funcs::weakref_get_borrowed(r)
     }
 }
 #[unsafe(no_mangle)]
