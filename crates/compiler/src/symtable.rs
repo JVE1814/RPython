@@ -1250,7 +1250,10 @@ impl Builder {
         value: Option<&Expr>,
     ) -> R {
         let is_generator = kind == CompKind::Gen;
-        let outermost = &generators[0];
+        let outermost = match generators.first() {
+            Some(g) => g,
+            None => return Err(CompileError::other(crate::error::ErrorKind::ValueError, "comprehension with no generators")),
+        };
         self.cur_mut().comp_iter_expr += 1;
         let r = self.visit_expr(&outermost.iter);
         self.cur_mut().comp_iter_expr -= 1;
