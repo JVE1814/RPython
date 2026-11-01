@@ -28,6 +28,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rpy-compress"
+version = "0.1.0"
+
+[[package]]
 name = "rpy-numfmt"
 version = "0.1.0"
 
@@ -45,6 +49,7 @@ dependencies = [
  "libc",
  "rpy-bigint",
  "rpy-compiler",
+ "rpy-compress",
  "rpy-numfmt",
  "rpy-parser",
  "rpy-sre",

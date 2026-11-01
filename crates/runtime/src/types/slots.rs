@@ -618,15 +618,34 @@ pub fn update_slot(tp: *mut PyTypeObject, attr: &PyObject) {
     rec(tp, &slots);
 }
 
+/// SLOTDEFS grouped by slot with their interned names, built once (class creation
+/// runs update_one_slot for every slot; rebuilding these lists dominated it).
+fn slot_names(slot: Slot) -> &'static [(&'static SlotDef, usize)] {
+    static T: std::sync::OnceLock<Vec<(Slot, Vec<(&'static SlotDef, usize)>)>> = std::sync::OnceLock::new();
+    let t = T.get_or_init(|| {
+        let mut v: Vec<(Slot, Vec<(&'static SlotDef, usize)>)> = Vec::new();
+        for sd in SLOTDEFS.iter() {
+            let nm = pystr::intern_str(sd.name).into_raw() as usize; // interned: immortal
+            match v.iter_mut().find(|(s, _)| *s == sd.slot) {
+                Some((_, l)) => l.push((sd, nm)),
+                None => v.push((sd.slot, vec![(sd, nm)])),
+            }
+        }
+        v
+    });
+    t.iter().find(|(s, _)| *s == slot).map(|(_, l)| l.as_slice()).unwrap_or(&[])
+}
+
 fn update_one_slot(tp: *mut PyTypeObject, slot: Slot) {
     // Find the first dunder (in MRO order, considering all names mapping to this slot).
-    let names: Vec<&SlotDef> = SLOTDEFS.iter().filter(|s| s.slot == slot).collect();
+    let names = slot_names(slot);
     let mut chosen: *mut c_void = std::ptr::null_mut();
     let mut use_generic = false;
     let mut any = false;
-    for sd in &names {
-        let nm = pystr::intern_str(sd.name);
-        let descr = match lookup(tp, &nm) {
+    for &(sd, nmp) in names {
+        let _ = sd;
+        let nm: &PyObject = unsafe { &*(nmp as *mut PyObject) };
+        let descr = match lookup(tp, nm) {
             Some(d) => d,
             None => continue,
         };

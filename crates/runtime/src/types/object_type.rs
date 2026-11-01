@@ -458,6 +458,7 @@ unsafe extern "C" fn type_dealloc(op: *mut PyObject) {
     unsafe {
         let tp = op as *mut PyTypeObject;
         crate::gc::untrack(op);
+        crate::interp::cache::unwatch_type_dict(tp); // jit
         crate::types::weakref::clear_weakrefs(op);
         if !(*tp).tp_bases.is_null() {
             for b in tuple::tuple_items(&*(*tp).tp_bases) {
@@ -1165,7 +1166,7 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
         (*tp).tp_clear = Some(subtype_clear);
         (*tp).tp_alloc = Some(generic_alloc);
         (*tp).tp_free = Some(generic_free);
-        if (*tp).tp_flags & Py_TPFLAGS_MANAGED_DICT != 0 && dict::get_item_str(&dict, name!("__dict__")).is_none() {
+        if add_dict && (*tp).tp_flags & Py_TPFLAGS_MANAGED_DICT != 0 && dict::get_item_str(&dict, name!("__dict__")).is_none() {
             let gs = subtype_getset_dict();
             let descr = crate::types::descr::new_getset_descr(tp, gs);
             dict::set_item(&dict, name!("__dict__"), &descr)?;
