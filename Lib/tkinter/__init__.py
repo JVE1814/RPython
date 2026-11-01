@@ -42,38 +42,26 @@ EXCEPTION = _tkinter.EXCEPTION
 # ---------------------------------------------------------------------------
 # Tcl list quoting
 
-_needs_quoting = re.compile(r'[\s{}\[\]$;"\\]')
-_backslash_specials = re.compile(r'([\s{}\[\]$;"\\])')
-_ws_escapes = {'\n': '\\n', '\t': '\\t', '\r': '\\r', '\v': '\\v', '\f': '\\f'}
+# Strings containing braces or backslashes are protected with backslashes
+# (braces could be unbalanced); other strings with blanks or a leading quote
+# are enclosed in braces.  Lists become a braced sub-list.
+_brace_or_backslash = re.compile(r'[\\{}]')
+_blank = re.compile(r'\s')
 
 
-def _braces_ok(s):
-    """True if *s* can be put between braces unchanged as a list element."""
-    if '\\' in s:
-        return False
-    depth = 0
+def _backslash_quote(s):
+    out = []
     for ch in s:
-        if ch == '{':
-            depth += 1
-        elif ch == '}':
-            depth -= 1
-            if depth < 0:
-                return False
-    return depth == 0
-
-
-def _quote_element(s):
-    if not s:
-        return '{}'
-    if not _needs_quoting.search(s) and s[0] != '#':
-        return s
-    if _braces_ok(s):
-        return '{%s}' % s
-    def esc(m):
-        ch = m.group(1)
-        return _ws_escapes.get(ch, '\\' + ch)
-    s = _backslash_specials.sub(esc, s)
-    if s[0] == '#':
+        if ch in '\\{}':
+            out.append('\\' + ch)
+        elif ch == '\n':
+            out.append('\\n')
+        elif ch.isspace():
+            out.append('\\' + ch)
+        else:
+            out.append(ch)
+    s = ''.join(out)
+    if s[0] == '"':
         s = '\\' + s
     return s
 
@@ -81,10 +69,23 @@ def _quote_element(s):
 def _stringify(value):
     """Return *value* as a single Tcl list element."""
     if isinstance(value, (list, tuple)):
-        return _quote_element(_join(value))
-    if not isinstance(value, str):
+        if len(value) != 1:
+            return '{%s}' % _join(value)
+        s = _stringify(value[0])
+        if _brace_or_backslash.search(s):
+            s = '{%s}' % s
+        return s
+    if isinstance(value, bytes):
+        value = str(value, 'latin1')
+    else:
         value = str(value)
-    return _quote_element(value)
+    if not value:
+        return '{}'
+    if _brace_or_backslash.search(value):
+        return _backslash_quote(value)
+    if value[0] == '"' or _blank.search(value):
+        return '{%s}' % value
+    return value
 
 
 def _join(value):
