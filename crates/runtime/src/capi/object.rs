@@ -483,9 +483,9 @@ pub unsafe extern "C" fn _PyObject_FunctionStr(o: *mut PyObject) -> *mut PyObjec
             let m = ab::getattr_opt(&*o, crate::name!("__module__"))?;
             match m {
                 Some(m) if pystr::is_str(&m) && pystr::to_string_lossy(&m) != "builtins" => {
-                    Ok(pystr::new_str(&format!("{}.{}()", pystr::to_string_lossy(&m), pystr::to_string_lossy(&ab::str(&q)?))))
+                    Ok(pystr::new_str(&format!("{}.{}()", pystr::to_string_lossy(&m), pystr::to_string_lossy(&*(ab::str(&q)?)))))
                 }
-                _ => Ok(pystr::new_str(&format!("{}()", pystr::to_string_lossy(&ab::str(&q)?)))),
+                _ => Ok(pystr::new_str(&format!("{}()", pystr::to_string_lossy(&*(ab::str(&q)?))))),
             }
         })())
     }

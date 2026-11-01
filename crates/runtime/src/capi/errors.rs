@@ -394,7 +394,7 @@ pub unsafe extern "C" fn PyErr_NewExceptionWithDoc(name: *const c_char, doc: *co
                 dict::set_item_str(&ns, "__module__", &pystr::new_str(module))?;
             }
             if !doc.is_null() {
-                dict::set_item_str(&ns, "__doc__", &cstr_obj(doc)?)?;
+                dict::set_item_str(&ns, "__doc__", &*(cstr_obj(doc)?))?;
             }
             let bases = match opt(base) {
                 None => tuple::new_tuple(vec![type_ref(exc::Exception())]),

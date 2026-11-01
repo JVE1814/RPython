@@ -28,7 +28,6 @@ pub mod mem;
 pub mod misc;
 pub mod modsupport;
 pub mod module;
-pub mod number;
 pub mod object;
 pub mod printf;
 pub mod pystate;
