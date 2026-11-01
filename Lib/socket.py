@@ -1,9 +1,10 @@
-"""Socket interface: a thin object-oriented layer over the _socket module.
+"""Object-oriented socket interface built on the _socket extension.
 
-The socket class adds makefile(), sendfile(), context-manager support and
-IntEnum-typed family/type attributes to _socket.socket.  Helper functions:
-create_connection(), create_server(), socketpair(), fromfd(), send_fds(),
-recv_fds(), getfqdn() and an enum-aware getaddrinfo().
+socket.socket extends _socket.socket with context management, makefile(),
+sendfile(), dup()/accept() returning socket.socket objects and enum-typed
+family/type attributes.  Module helpers: create_connection(),
+create_server(), socketpair(), fromfd(), send_fds(), recv_fds(), getfqdn()
+and getaddrinfo() returning enum members.
 """
 
 import _socket
@@ -24,24 +25,26 @@ EWOULDBLOCK = getattr(errno, 'EWOULDBLOCK', 11)
 
 __all__ = ["fromfd", "getfqdn", "create_connection", "create_server",
            "has_dualstack_ipv6", "AddressFamily", "SocketKind"]
-__all__.extend(getattr(_socket, "__all__", None) or
-               [n for n in dir(_socket) if n[0] != "_"])
+__all__ += [_n for _n in dir(_socket) if not _n.startswith('_')]
 
-IntEnum._convert_('AddressFamily', __name__,
-                  lambda C: C.isupper() and C.startswith('AF_'))
-IntEnum._convert_('SocketKind', __name__,
-                  lambda C: C.isupper() and C.startswith('SOCK_'))
-IntFlag._convert_('MsgFlag', __name__,
-                  lambda C: C.isupper() and C.startswith('MSG_'))
-IntFlag._convert_('AddressInfo', __name__,
-                  lambda C: C.isupper() and C.startswith('AI_'))
+
+def _enum_from_prefix(base, name, prefix):
+    base._convert_(name, __name__,
+                   lambda const: const.isupper() and const.startswith(prefix))
+
+
+_enum_from_prefix(IntEnum, 'AddressFamily', 'AF_')
+_enum_from_prefix(IntEnum, 'SocketKind', 'SOCK_')
+_enum_from_prefix(IntFlag, 'MsgFlag', 'MSG_')
+_enum_from_prefix(IntFlag, 'AddressInfo', 'AI_')
+del _enum_from_prefix
 
 _LOCALHOST = '127.0.0.1'
 _LOCALHOST_V6 = '::1'
 
 
 def _intenum_converter(value, enum_klass):
-    """Map *value* to a member of *enum_klass*; unknown values pass through."""
+    """enum_klass(value) if it is a known member, else value unchanged."""
     try:
         return enum_klass(value)
     except ValueError:
@@ -49,7 +52,10 @@ def _intenum_converter(value, enum_klass):
 
 
 class _GiveupOnSendfile(Exception):
-    pass
+    """os.sendfile() cannot be used for this file: fall back to send()."""
+
+
+_WOULD_BLOCK = frozenset((EAGAIN, EWOULDBLOCK))
 
 
 class socket(_socket.socket):
@@ -59,12 +65,10 @@ class socket(_socket.socket):
 
     def __init__(self, family=-1, type=-1, proto=-1, fileno=None):
         if fileno is None:
-            if family == -1:
-                family = AF_INET
-            if type == -1:
-                type = SOCK_STREAM
-            if proto == -1:
-                proto = 0
+            # explicit defaults; with a fileno, -1 means "ask the kernel"
+            family = AF_INET if family == -1 else family
+            type = SOCK_STREAM if type == -1 else type
+            proto = 0 if proto == -1 else proto
         _socket.socket.__init__(self, family, type, proto, fileno)
         self._io_refs = 0
         self._closed = False
@@ -72,150 +76,142 @@ class socket(_socket.socket):
     def __enter__(self):
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, *exc_info):
         if not self._closed:
             self.close()
 
     def __repr__(self):
         closed = getattr(self, '_closed', False)
-        parts = ["<%s.%s%s fd=%i, family=%s, type=%s, proto=%i"
-                 % (self.__class__.__module__, self.__class__.__qualname__,
-                    " [closed]" if closed else "", self.fileno(),
-                    self.family, self.type, self.proto)]
+        text = (f"<{type(self).__module__}.{type(self).__qualname__}"
+                f"{' [closed]' if closed else ''} fd={self.fileno()}, "
+                f"family={self.family}, type={self.type}, proto={self.proto}")
         if not closed:
-            try:
-                laddr = self.getsockname()
-                if laddr:
-                    parts.append(", laddr=%s" % str(laddr))
-            except (error, AttributeError):
-                pass
-            try:
-                raddr = self.getpeername()
-                if raddr:
-                    parts.append(", raddr=%s" % str(raddr))
-            except (error, AttributeError):
-                pass
-        parts.append('>')
-        return ''.join(parts)
+            for label, getter in (('laddr', 'getsockname'),
+                                  ('raddr', 'getpeername')):
+                try:
+                    addr = getattr(self, getter)()
+                except (error, AttributeError):
+                    continue
+                if addr:
+                    text += f", {label}={addr}"
+        return text + '>'
 
     def __getstate__(self):
         raise TypeError(f"cannot pickle {self.__class__.__name__!r} object")
 
     def dup(self):
-        """Return a new (non-inheritable) socket object for the same socket."""
-        fd = dup(self.fileno())
-        sock = self.__class__(self.family, self.type, self.proto, fileno=fd)
-        sock.settimeout(self.gettimeout())
-        return sock
+        """Duplicate the socket (the new descriptor is non-inheritable)."""
+        twin = self.__class__(self.family, self.type, self.proto,
+                              fileno=dup(self.fileno()))
+        twin.settimeout(self.gettimeout())
+        return twin
 
     def accept(self):
-        """Wait for a connection; return (new socket, client address)."""
-        fd, addr = self._accept()
-        sock = socket(self.family, self.type, self.proto, fileno=fd)
-        # Without a default timeout the accepted socket must be blocking,
-        # whatever flags the platform copied from the listening socket.
+        """Accept a connection; return (connected socket, peer address)."""
+        fd, address = self._accept()
+        conn = socket(self.family, self.type, self.proto, fileno=fd)
         if getdefaulttimeout() is None and self.gettimeout():
-            sock.setblocking(True)
-        return sock, addr
+            # Some platforms let the accepted socket inherit O_NONBLOCK from
+            # a listening socket with a timeout; without a default timeout
+            # the new socket must be blocking.
+            conn.setblocking(True)
+        return conn, address
 
     def makefile(self, mode="r", buffering=None, *,
                  encoding=None, errors=None, newline=None):
-        """Return a file object reading from and/or writing to the socket.
-
-        Only the mode characters 'r', 'w' and 'b' are supported.
-        """
+        """Return a file object for the socket ('r', 'w' and/or 'b' modes)."""
         if not set(mode) <= {"r", "w", "b"}:
             raise ValueError("invalid mode %r (only r, w, b allowed)" % (mode,))
         writing = "w" in mode
         reading = "r" in mode or not writing
         binary = "b" in mode
-        rawmode = ("r" if reading else "") + ("w" if writing else "")
-        raw = SocketIO(self, rawmode)
+        raw = SocketIO(self, ("r" if reading else "") + ("w" if writing else ""))
         self._io_refs += 1
-        if buffering is None:
-            buffering = -1
-        if buffering < 0:
+        if buffering is None or buffering < 0:
             buffering = io.DEFAULT_BUFFER_SIZE
         if buffering == 0:
             if not binary:
                 raise ValueError("unbuffered streams must be binary")
             return raw
         if reading and writing:
-            buffer = io.BufferedRWPair(raw, raw, buffering)
+            stream = io.BufferedRWPair(raw, raw, buffering)
         elif reading:
-            buffer = io.BufferedReader(raw, buffering)
+            stream = io.BufferedReader(raw, buffering)
         else:
-            buffer = io.BufferedWriter(raw, buffering)
+            stream = io.BufferedWriter(raw, buffering)
         if binary:
-            return buffer
-        encoding = io.text_encoding(encoding)
-        text = io.TextIOWrapper(buffer, encoding, errors, newline)
+            return stream
+        text = io.TextIOWrapper(stream, io.text_encoding(encoding),
+                                errors, newline)
         text.mode = mode
         return text
 
-    if hasattr(os, 'sendfile'):
+    # -- sendfile
 
-        def _sendfile_use_sendfile(self, file, offset=0, count=None):
-            import selectors
+    def _check_sendfile_params(self, file, offset, count):
+        if 'b' not in getattr(file, 'mode', 'b'):
+            raise ValueError("file should be opened in binary mode")
+        if not self.type & SOCK_STREAM:
+            raise ValueError("only SOCK_STREAM type sockets are supported")
+        if count is None:
+            return
+        if not isinstance(count, int):
+            raise TypeError(f"count must be a positive integer (got {count!r})")
+        if count <= 0:
+            raise ValueError(f"count must be a positive integer (got {count!r})")
 
-            self._check_sendfile_params(file, offset, count)
-            sockno = self.fileno()
-            try:
-                fileno = file.fileno()
-            except (AttributeError, io.UnsupportedOperation) as err:
-                raise _GiveupOnSendfile(err)
-            try:
-                fsize = os.fstat(fileno).st_size
-            except OSError as err:
-                raise _GiveupOnSendfile(err)
-            if not fsize:
-                return 0
-            # os.sendfile() may overflow above 2 GiB: send at most 1 GiB per call
-            blocksize = min(count or fsize, 2 ** 30)
-            timeout = self.gettimeout()
-            if timeout == 0:
-                raise ValueError("non-blocking sockets are not supported")
-            if hasattr(selectors, 'PollSelector'):
-                selector = selectors.PollSelector()
-            else:
-                selector = selectors.SelectSelector()
-            selector.register(sockno, selectors.EVENT_WRITE)
+    def _sendfile_use_sendfile(self, file, offset=0, count=None):
+        if not hasattr(os, 'sendfile'):
+            raise _GiveupOnSendfile("os.sendfile() not available on this platform")
+        import selectors
 
-            total_sent = 0
-            wait = selector.select
-            sendfile = os.sendfile
-            try:
-                while True:
-                    if timeout and not wait(timeout):
-                        raise TimeoutError('timed out')
-                    if count:
-                        blocksize = min(count - total_sent, blocksize)
-                        if blocksize <= 0:
-                            break
-                    try:
-                        sent = sendfile(sockno, fileno, offset, blocksize)
-                    except BlockingIOError:
-                        if not timeout:
-                            wait()
-                        continue
-                    except OSError as err:
-                        if total_sent == 0:
-                            # e.g. not a regular file: fall back to send()
-                            raise _GiveupOnSendfile(err)
-                        raise err from None
-                    else:
-                        if sent == 0:
-                            break
-                        offset += sent
-                        total_sent += sent
-                return total_sent
-            finally:
-                if total_sent > 0 and hasattr(file, 'seek'):
-                    file.seek(offset)
-    else:
-        def _sendfile_use_sendfile(self, file, offset=0, count=None):
-            raise _GiveupOnSendfile(
-                "os.sendfile() not available on this platform")
+        self._check_sendfile_params(file, offset, count)
+        try:
+            in_fd = file.fileno()
+        except (AttributeError, io.UnsupportedOperation) as exc:
+            raise _GiveupOnSendfile(exc)
+        try:
+            size = os.fstat(in_fd).st_size
+        except OSError as exc:
+            raise _GiveupOnSendfile(exc)
+        if size == 0:
+            return 0
+        timeout = self.gettimeout()
+        if timeout == 0:
+            raise ValueError("non-blocking sockets are not supported")
+        # one sendfile() call moves at most 1 GiB (avoids size overflows)
+        chunk = min(count or size, 1 << 30)
+        out_fd = self.fileno()
+        waiter = (selectors.PollSelector() if hasattr(selectors, 'PollSelector')
+                  else selectors.SelectSelector())
+        waiter.register(out_fd, selectors.EVENT_WRITE)
+        sent_total = 0
+        try:
+            while count is None or sent_total < count:
+                if timeout and not waiter.select(timeout):
+                    raise TimeoutError('timed out')
+                if count is not None:
+                    chunk = min(chunk, count - sent_total)
+                try:
+                    n = os.sendfile(out_fd, in_fd, offset, chunk)
+                except BlockingIOError:
+                    if not timeout:
+                        waiter.select()
+                    continue
+                except OSError as exc:
+                    if sent_total:
+                        raise exc from None
+                    # nothing sent yet: let sendfile() retry with send()
+                    raise _GiveupOnSendfile(exc)
+                if n == 0:
+                    break
+                offset += n
+                sent_total += n
+            return sent_total
+        finally:
+            waiter.close()
+            if sent_total and hasattr(file, 'seek'):
+                file.seek(offset)
 
     def _sendfile_use_send(self, file, offset=0, count=None):
         self._check_sendfile_params(file, offset, count)
@@ -223,57 +219,39 @@ class socket(_socket.socket):
             raise ValueError("non-blocking sockets are not supported")
         if offset:
             file.seek(offset)
-        blocksize = min(count, 8192) if count else 8192
-        total_sent = 0
-        read = file.read
-        send = self.send
+        piece = min(count, 8192) if count else 8192
+        sent_total = 0
         try:
-            while True:
-                if count:
-                    blocksize = min(count - total_sent, blocksize)
-                    if blocksize <= 0:
-                        break
-                data = memoryview(read(blocksize))
-                if not data:
+            while count is None or sent_total < count:
+                if count is not None:
+                    piece = min(piece, count - sent_total)
+                view = memoryview(file.read(piece))
+                if not view:
                     break
-                while True:
+                while view:
                     try:
-                        sent = send(data)
+                        n = self.send(view)
                     except BlockingIOError:
                         continue
-                    total_sent += sent
-                    if sent < len(data):
-                        data = data[sent:]
-                    else:
-                        break
-            return total_sent
+                    sent_total += n
+                    view = view[n:]
+            return sent_total
         finally:
-            if total_sent > 0 and hasattr(file, 'seek'):
-                file.seek(offset + total_sent)
-
-    def _check_sendfile_params(self, file, offset, count):
-        if 'b' not in getattr(file, 'mode', 'b'):
-            raise ValueError("file should be opened in binary mode")
-        if not self.type & SOCK_STREAM:
-            raise ValueError("only SOCK_STREAM type sockets are supported")
-        if count is not None:
-            if not isinstance(count, int):
-                raise TypeError(
-                    "count must be a positive integer (got {!r})".format(count))
-            if count <= 0:
-                raise ValueError(
-                    "count must be a positive integer (got {!r})".format(count))
+            if sent_total and hasattr(file, 'seek'):
+                file.seek(offset + sent_total)
 
     def sendfile(self, file, offset=0, count=None):
-        """Send a binary file over the socket; return the number of bytes sent.
+        """Send the contents of a binary file; return the byte count.
 
-        os.sendfile() is used when possible, send() otherwise.  The file
-        position is left after the last byte sent.
+        Uses os.sendfile() for regular files and send() otherwise.  The
+        file position ends after the last byte sent.
         """
         try:
             return self._sendfile_use_sendfile(file, offset, count)
         except _GiveupOnSendfile:
             return self._sendfile_use_send(file, offset, count)
+
+    # -- closing
 
     def _decref_socketios(self):
         if self._io_refs > 0:
@@ -281,92 +259,76 @@ class socket(_socket.socket):
         if self._closed:
             self.close()
 
-    def _real_close(self, _ss=_socket.socket):
-        # must not touch module globals: may run during interpreter shutdown
-        _ss.close(self)
+    def _real_close(self, _close=_socket.socket.close):
+        # bound default: works even when module globals are torn down
+        _close(self)
 
     def close(self):
-        """Close the socket (once all makefile() objects are closed too)."""
+        """Close the socket once no makefile() stream uses it any more."""
         self._closed = True
         if self._io_refs <= 0:
             self._real_close()
 
     def detach(self):
-        """Disown the file descriptor and return it; the object becomes closed."""
+        """Give up the descriptor without closing it and return it."""
         self._closed = True
         return super().detach()
 
     @property
     def family(self):
-        """The socket's address family."""
+        """The address family (an AddressFamily member when known)."""
         return _intenum_converter(super().family, AddressFamily)
 
     @property
     def type(self):
-        """The socket type."""
+        """The socket type (a SocketKind member when known)."""
         return _intenum_converter(super().type, SocketKind)
 
-    if os.name == 'nt':
-        def get_inheritable(self):
-            return os.get_handle_inheritable(self.fileno())
-        def set_inheritable(self, inheritable):
-            os.set_handle_inheritable(self.fileno(), inheritable)
-    else:
-        def get_inheritable(self):
-            return os.get_inheritable(self.fileno())
-        def set_inheritable(self, inheritable):
-            os.set_inheritable(self.fileno(), inheritable)
-    get_inheritable.__doc__ = "Get the inheritable flag of the socket"
-    set_inheritable.__doc__ = "Set the inheritable flag of the socket"
+    def get_inheritable(self):
+        """Get the inheritable flag of the socket"""
+        return os.get_inheritable(self.fileno())
+
+    def set_inheritable(self, inheritable):
+        """Set the inheritable flag of the socket"""
+        os.set_inheritable(self.fileno(), inheritable)
 
 
 def fromfd(fd, family, type, proto=0):
-    """Create a socket object from a duplicate of file descriptor *fd*."""
-    nfd = dup(fd)
-    return socket(family, type, proto, nfd)
+    """Wrap a duplicate of descriptor *fd* in a new socket object."""
+    return socket(family, type, proto, dup(fd))
 
 
-if hasattr(_socket.socket, "sendmsg"):
-    def send_fds(sock, buffers, fds, flags=0, address=None):
-        """Send the file descriptors *fds* over an AF_UNIX socket."""
-        import array
+def send_fds(sock, buffers, fds, flags=0, address=None):
+    """Send *buffers* plus the descriptors *fds* over an AF_UNIX socket."""
+    import array
+    rights = array.array("i", fds)
+    return sock.sendmsg(buffers, [(SOL_SOCKET, SCM_RIGHTS, rights)])
 
-        return sock.sendmsg(buffers, [(_socket.SOL_SOCKET,
-                                       _socket.SCM_RIGHTS, array.array("i", fds))])
-    __all__.append("send_fds")
 
-if hasattr(_socket.socket, "recvmsg"):
-    def recv_fds(sock, bufsize, maxfds, flags=0):
-        """Receive data and up to *maxfds* file descriptors.
+def recv_fds(sock, bufsize, maxfds, flags=0):
+    """Receive up to *maxfds* descriptors; return
+    (data, fds, msg_flags, address)."""
+    import array
+    received = array.array("i")
+    size = received.itemsize
+    data, ancillary, msg_flags, address = sock.recvmsg(
+        bufsize, CMSG_LEN(maxfds * size))
+    for level, kind, payload in ancillary:
+        if (level, kind) == (SOL_SOCKET, SCM_RIGHTS):
+            usable = len(payload) - len(payload) % size
+            received.frombytes(payload[:usable])
+    return data, list(received), msg_flags, address
 
-        Return (data, list of fds, msg_flags, address).
-        """
-        import array
 
-        fds = array.array("i")
-        msg, ancdata, flags, addr = sock.recvmsg(
-            bufsize, _socket.CMSG_LEN(maxfds * fds.itemsize))
-        for level, kind, data in ancdata:
-            if level == _socket.SOL_SOCKET and kind == _socket.SCM_RIGHTS:
-                fds.frombytes(data[:len(data) - (len(data) % fds.itemsize)])
-        return msg, list(fds), flags, addr
-    __all__.append("recv_fds")
-
-if hasattr(_socket.socket, "share"):
-    def fromshare(info):
-        """Create a socket from the bytes returned by socket.share()."""
-        return socket(0, 0, 0, info)
-    __all__.append("fromshare")
+__all__ += ["send_fds", "recv_fds"]
 
 
 def _fallback_socketpair(family=AF_INET, type=SOCK_STREAM, proto=0):
-    # socketpair() emulation over a loopback TCP connection (kept available
-    # everywhere so the tests can exercise it)
-    if family == AF_INET:
-        host = _LOCALHOST
-    elif family == AF_INET6:
-        host = _LOCALHOST_V6
-    else:
+    """socketpair() built from a loopback TCP connection."""
+    hosts = {AF_INET: _LOCALHOST}
+    if 'AF_INET6' in globals():
+        hosts[AF_INET6] = _LOCALHOST_V6
+    if family not in hosts:
         raise ValueError("Only AF_INET and AF_INET6 socket address families "
                          "are supported")
     if type != SOCK_STREAM:
@@ -374,79 +336,63 @@ def _fallback_socketpair(family=AF_INET, type=SOCK_STREAM, proto=0):
     if proto != 0:
         raise ValueError("Only protocol zero is supported")
 
-    lsock = socket(family, type, proto)
-    try:
-        lsock.bind((host, 0))
-        lsock.listen()
-        addr, port = lsock.getsockname()[:2]
-        csock = socket(family, type, proto)
+    with socket(family, type, proto) as listener:
+        listener.bind((hosts[family], 0))
+        listener.listen()
+        target = listener.getsockname()[:2]
+        client = socket(family, type, proto)
         try:
-            csock.setblocking(False)
+            # connect without blocking, then accept the other end
+            client.setblocking(False)
             try:
-                csock.connect((addr, port))
+                client.connect(target)
             except (BlockingIOError, InterruptedError):
                 pass
-            csock.setblocking(True)
-            ssock, _ = lsock.accept()
+            client.setblocking(True)
+            server, _ = listener.accept()
         except:
-            csock.close()
+            client.close()
             raise
-    finally:
-        lsock.close()
-
-    # make sure the accepted connection really is our own client
     try:
-        if (ssock.getsockname() != csock.getpeername()
-                or csock.getsockname() != ssock.getpeername()):
+        # someone else might have connected first: check it is our client
+        if (server.getsockname() != client.getpeername()
+                or client.getsockname() != server.getpeername()):
             raise ConnectionError("Unexpected peer connection")
     except:
-        ssock.close()
-        csock.close()
+        server.close()
+        client.close()
         raise
-    return (ssock, csock)
+    return server, client
 
 
-if hasattr(_socket, "socketpair"):
-    def socketpair(family=None, type=SOCK_STREAM, proto=0):
-        if family is None:
-            try:
-                family = AF_UNIX
-            except NameError:
-                family = AF_INET
-        a, b = _socket.socketpair(family, type, proto)
-        a = socket(family, type, proto, a.detach())
-        b = socket(family, type, proto, b.detach())
-        return a, b
-else:
-    socketpair = _fallback_socketpair
-    __all__.append("socketpair")
+def socketpair(family=None, type=SOCK_STREAM, proto=0):
+    """socketpair([family[, type[, proto]]]) -> (socket object, socket object)
 
-socketpair.__doc__ = """socketpair([family[, type[, proto]]]) -> (socket object, socket object)
-
-Return a pair of connected socket objects.  The default family is AF_UNIX
-where available, AF_INET otherwise.
-"""
-
-_blocking_errnos = {EAGAIN, EWOULDBLOCK}
+    Return two connected sockets (AF_UNIX by default).
+    """
+    if family is None:
+        family = globals().get('AF_UNIX', AF_INET)
+    if not hasattr(_socket, 'socketpair'):
+        return _fallback_socketpair(family, type, proto)
+    pair = _socket.socketpair(family, type, proto)
+    return tuple(socket(family, type, proto, s.detach()) for s in pair)
 
 
 class SocketIO(io.RawIOBase):
-    """Raw binary stream on top of a stream socket (used by makefile())."""
+    """Raw binary stream over a stream socket (what makefile() wraps)."""
 
     def __init__(self, sock, mode):
         if mode not in ("r", "w", "rw", "rb", "wb", "rwb"):
             raise ValueError("invalid mode: %r" % mode)
         io.RawIOBase.__init__(self)
         self._sock = sock
-        if "b" not in mode:
-            mode += "b"
-        self._mode = mode
+        self._mode = mode if "b" in mode else mode + "b"
         self._reading = "r" in mode
         self._writing = "w" in mode
         self._timeout_occurred = False
 
     def readinto(self, b):
-        """Receive into *b*; None if a non-blocking socket has no data."""
+        """Receive into *b*; None when a non-blocking socket has no data."""
         self._checkClosed()
         self._checkReadable()
         if self._timeout_occurred:
@@ -454,37 +400,39 @@ class SocketIO(io.RawIOBase):
         try:
             return self._sock.recv_into(b)
         except timeout:
+            # the stream position is unknown after a timeout
             self._timeout_occurred = True
             raise
-        except error as e:
-            if e.errno in _blocking_errnos:
+        except error as exc:
+            if exc.errno in _WOULD_BLOCK:
                 return None
             raise
 
     def write(self, b):
-        """Send *b*; return the byte count or None if it would block."""
+        """Send *b*; return the byte count, or None if it would block."""
         self._checkClosed()
         self._checkWritable()
         try:
             return self._sock.send(b)
-        except error as e:
-            if e.errno in _blocking_errnos:
+        except error as exc:
+            if exc.errno in _WOULD_BLOCK:
                 return None
             raise
 
-    def readable(self):
+    def _ensure_open(self):
         if self.closed:
             raise ValueError("I/O operation on closed socket.")
+
+    def readable(self):
+        self._ensure_open()
         return self._reading
 
     def writable(self):
-        if self.closed:
-            raise ValueError("I/O operation on closed socket.")
+        self._ensure_open()
         return self._writing
 
     def seekable(self):
-        if self.closed:
-            raise ValueError("I/O operation on closed socket.")
+        self._ensure_open()
         return super().seekable()
 
     def fileno(self):
@@ -493,40 +441,33 @@ class SocketIO(io.RawIOBase):
 
     @property
     def name(self):
-        if not self.closed:
-            return self.fileno()
-        return -1
+        return -1 if self.closed else self.fileno()
 
     @property
     def mode(self):
         return self._mode
 
     def close(self):
-        """Close this stream; the socket closes once nothing references it."""
-        if self.closed:
-            return
-        io.RawIOBase.close(self)
-        self._sock._decref_socketios()
-        self._sock = None
+        """Close the stream (the socket closes when nothing uses it)."""
+        if not self.closed:
+            io.RawIOBase.close(self)
+            self._sock._decref_socketios()
+            self._sock = None
 
 
 def getfqdn(name=''):
-    """Return a fully qualified domain name for *name* (default: this host)."""
+    """Best fully qualified name for *name* (default: the local host)."""
     name = name.strip()
-    if not name or name in ('0.0.0.0', '::'):
+    if name in ('', '0.0.0.0', '::'):
         name = gethostname()
     try:
-        hostname, aliases, ipaddrs = gethostbyaddr(name)
+        primary, aliases, _ = gethostbyaddr(name)
     except error:
-        pass
-    else:
-        aliases.insert(0, hostname)
-        for name in aliases:
-            if '.' in name:
-                break
-        else:
-            name = hostname
-    return name
+        return name
+    for candidate in [primary, *aliases]:
+        if '.' in candidate:
+            return candidate
+    return primary
 
 
 _GLOBAL_DEFAULT_TIMEOUT = object()
@@ -534,57 +475,60 @@ _GLOBAL_DEFAULT_TIMEOUT = object()
 
 def create_connection(address, timeout=_GLOBAL_DEFAULT_TIMEOUT,
                       source_address=None, *, all_errors=False):
-    """Connect a TCP socket to *address* (host, port) and return it.
+    """Open a TCP connection to (host, port) and return the socket.
 
-    Each address returned by getaddrinfo() is tried in turn.  On failure the
-    last error is raised, or an ExceptionGroup of all errors if *all_errors*.
+    Every address getaddrinfo() returns is tried in order.  If all fail,
+    the last error is raised -- or, with all_errors=True, an
+    ExceptionGroup of all of them.
     """
     host, port = address
-    exceptions = []
-    for af, socktype, proto, canonname, sa in getaddrinfo(host, port, 0, SOCK_STREAM):
+    failures = []
+    for family, kind, proto, _, sockaddr in getaddrinfo(host, port, 0,
+                                                          SOCK_STREAM):
         sock = None
         try:
-            sock = socket(af, socktype, proto)
+            sock = socket(family, kind, proto)
             if timeout is not _GLOBAL_DEFAULT_TIMEOUT:
                 sock.settimeout(timeout)
             if source_address:
                 sock.bind(source_address)
-            sock.connect(sa)
-            exceptions.clear()
-            return sock
+            sock.connect(sockaddr)
         except error as exc:
-            if not all_errors:
-                exceptions.clear()
-            exceptions.append(exc)
             if sock is not None:
                 sock.close()
-
-    if exceptions:
-        try:
-            if not all_errors:
-                raise exceptions[0]
-            raise ExceptionGroup("create_connection failed", exceptions)
-        finally:
-            exceptions.clear()
-    raise error("getaddrinfo returns an empty list")
+            if all_errors:
+                failures.append(exc)
+            else:
+                failures = [exc]
+            continue
+        failures = None
+        return sock
+    if not failures:
+        raise error("getaddrinfo returns an empty list")
+    try:
+        if all_errors:
+            raise ExceptionGroup("create_connection failed", failures)
+        raise failures[0]
+    finally:
+        failures = None
 
 
 def has_dualstack_ipv6():
-    """Return True if an AF_INET6 socket can accept IPv4 connections too."""
-    if (not has_ipv6 or not hasattr(_socket, 'IPPROTO_IPV6')
-            or not hasattr(_socket, 'IPV6_V6ONLY')):
+    """True if one AF_INET6 socket can serve IPv4 and IPv6 clients."""
+    if not (has_ipv6 and hasattr(_socket, 'IPPROTO_IPV6')
+            and hasattr(_socket, 'IPV6_V6ONLY')):
         return False
     try:
-        with socket(AF_INET6, SOCK_STREAM) as sock:
-            sock.setsockopt(IPPROTO_IPV6, IPV6_V6ONLY, 0)
-            return True
+        with socket(AF_INET6, SOCK_STREAM) as probe:
+            probe.setsockopt(IPPROTO_IPV6, IPV6_V6ONLY, 0)
     except error:
         return False
+    return True
 
 
 def create_server(address, *, family=AF_INET, backlog=None, reuse_port=False,
                   dualstack_ipv6=False):
-    """Create a listening TCP socket bound to *address* and return it."""
+    """Return a TCP socket bound to *address* and listening."""
     if reuse_port and not hasattr(_socket, "SO_REUSEPORT"):
         raise ValueError("SO_REUSEPORT not supported on this platform")
     if dualstack_ipv6:
@@ -598,38 +542,31 @@ def create_server(address, *, family=AF_INET, backlog=None, reuse_port=False,
             try:
                 sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
             except error:
-                pass
+                pass  # bind() will report real problems
         if reuse_port and family in (AF_INET, AF_INET6):
             sock.setsockopt(SOL_SOCKET, SO_REUSEPORT, 1)
-        if has_ipv6 and family == AF_INET6:
-            if dualstack_ipv6:
-                sock.setsockopt(IPPROTO_IPV6, IPV6_V6ONLY, 0)
-            elif hasattr(_socket, "IPV6_V6ONLY") and hasattr(_socket, "IPPROTO_IPV6"):
-                sock.setsockopt(IPPROTO_IPV6, IPV6_V6ONLY, 1)
+        if has_ipv6 and family == AF_INET6 and hasattr(_socket, "IPV6_V6ONLY"):
+            sock.setsockopt(IPPROTO_IPV6, IPV6_V6ONLY, 0 if dualstack_ipv6 else 1)
         try:
             sock.bind(address)
-        except error as err:
-            msg = '%s (while attempting to bind on address %r)' % (err.strerror, address)
-            raise error(err.errno, msg) from None
+        except error as exc:
+            raise error(exc.errno, f'{exc.strerror} (while attempting to bind '
+                                   f'on address {address!r})') from None
         if backlog is None:
             sock.listen()
         else:
             sock.listen(backlog)
-        return sock
     except error:
         sock.close()
         raise
+    return sock
 
 
 def getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-    """Resolve (host, port) into a list of
-    (family, type, proto, canonname, sockaddr) tuples, with family and type
-    converted to AddressFamily / SocketKind members.
+    """Resolve (host, port) to a list of
+    (family, type, proto, canonname, sockaddr) with enum-typed family/type.
     """
-    addrlist = []
-    for af, socktype, proto, canonname, sa in _socket.getaddrinfo(
-            host, port, family, type, proto, flags):
-        addrlist.append((_intenum_converter(af, AddressFamily),
-                         _intenum_converter(socktype, SocketKind),
-                         proto, canonname, sa))
-    return addrlist
+    return [(_intenum_converter(fam, AddressFamily),
+             _intenum_converter(kind, SocketKind), pr, canon, sa)
+            for fam, kind, pr, canon, sa in
+            _socket.getaddrinfo(host, port, family, type, proto, flags)]
