@@ -200,8 +200,9 @@ pub fn double_to_string(
             dtoa::significant(ax, precision as usize, &mut d);
         }
         _ => {
-            dtoa::shortest(ax, &mut d);
-            precision = 0;
+            let sh = dtoa::shortest(ax);
+            format_digits(out, sh.digits(), sh.decpt as i64, neg, mode, 0, flags, upper);
+            return Ok(FloatKind::Finite);
         }
     }
     format_digits(out, d.digits(), d.decpt as i64, neg, mode, precision, flags, upper);
@@ -218,18 +219,71 @@ pub fn write_float_repr(out: &mut String, x: f64) {
         out.push_str(if x < 0.0 { "-inf" } else { "inf" });
         return;
     }
-    let mut d = Digits::new();
-    dtoa::shortest(x.abs(), &mut d);
-    format_digits(
-        out,
-        d.digits(),
-        d.decpt as i64,
-        x.is_sign_negative(),
-        b'r',
-        0,
-        DtoaFlags { add_dot_0: true, ..Default::default() },
-        false,
-    );
+    let d = dtoa::shortest(x.abs());
+    let digits = d.digits();
+    let n = digits.len();
+    let decpt = d.decpt;
+    // Longest output: "-0.0000" + 17 digits, or "-d.dddddddddddddddde-308".
+    let mut buf = [0u8; 32];
+    let mut p = 0;
+    if x.is_sign_negative() {
+        buf[0] = b'-';
+        p = 1;
+    }
+    if 0 < decpt && decpt <= 16 {
+        let dp = decpt as usize;
+        if dp >= n {
+            buf[p..p + n].copy_from_slice(digits);
+            p += n;
+            for _ in n..dp {
+                buf[p] = b'0';
+                p += 1;
+            }
+            buf[p] = b'.';
+            buf[p + 1] = b'0';
+            p += 2;
+        } else {
+            buf[p..p + dp].copy_from_slice(&digits[..dp]);
+            p += dp;
+            buf[p] = b'.';
+            p += 1;
+            buf[p..p + n - dp].copy_from_slice(&digits[dp..]);
+            p += n - dp;
+        }
+    } else if -4 < decpt && decpt <= 0 {
+        buf[p] = b'0';
+        buf[p + 1] = b'.';
+        p += 2;
+        for _ in 0..(-decpt) {
+            buf[p] = b'0';
+            p += 1;
+        }
+        buf[p..p + n].copy_from_slice(digits);
+        p += n;
+    } else {
+        buf[p] = digits[0];
+        p += 1;
+        if n > 1 {
+            buf[p] = b'.';
+            p += 1;
+            buf[p..p + n - 1].copy_from_slice(&digits[1..]);
+            p += n - 1;
+        }
+        let e = decpt - 1;
+        buf[p] = b'e';
+        buf[p + 1] = if e < 0 { b'-' } else { b'+' };
+        p += 2;
+        let a = e.unsigned_abs();
+        if a >= 100 {
+            buf[p] = b'0' + (a / 100) as u8;
+            p += 1;
+        }
+        buf[p] = b'0' + ((a / 10) % 10) as u8;
+        buf[p + 1] = b'0' + (a % 10) as u8;
+        p += 2;
+    }
+    // SAFETY: ASCII only.
+    out.push_str(unsafe { core::str::from_utf8_unchecked(&buf[..p]) });
 }
 
 /// `repr(x)` for a Python float.

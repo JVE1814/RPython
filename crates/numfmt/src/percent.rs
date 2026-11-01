@@ -311,6 +311,19 @@ fn sign_for(negative: bool, flags: &PercentFlags) -> Option<char> {
 /// Format a float for `%e %E %f %F %g %G` and append to `out`.
 pub fn percent_format_float(out: &mut String, x: f64, conv: char, opts: &PercentOpts) -> Result<(), NumFmtError> {
     let prec = opts.precision.unwrap_or(6);
+    if opts.width.is_none() {
+        let start = out.len();
+        let space = opts.flags.space && !opts.flags.plus;
+        if space {
+            out.push(' ');
+        }
+        let f = DtoaFlags { alt: opts.flags.alt, sign: opts.flags.plus, ..Default::default() };
+        double_to_string(out, x, conv, prec, f)?;
+        if space && out.as_bytes().get(start + 1) == Some(&b'-') {
+            out.remove(start);
+        }
+        return Ok(());
+    }
     let mut buf = String::with_capacity(32);
     double_to_string(&mut buf, x, conv, prec, DtoaFlags { alt: opts.flags.alt, ..Default::default() })?;
     let (neg, body) = match buf.strip_prefix('-') {

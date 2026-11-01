@@ -13,6 +13,7 @@
 //! which give empty digits and decpt = -ndigits (matching David Gay's dtoa).
 
 use crate::bignum::{write_u64, Big};
+#[cfg(test)]
 use core::fmt::Write as _;
 
 /// Maximum number of digits ever produced by the exact generator.
@@ -40,12 +41,14 @@ impl Digits {
     }
 }
 
-/// Small stack buffer implementing `fmt::Write`.
+/// Small stack buffer implementing `fmt::Write` (test oracle only).
+#[cfg(test)]
 pub(crate) struct StackBuf<const N: usize> {
     pub buf: [u8; N],
     pub len: usize,
 }
 
+#[cfg(test)]
 impl<const N: usize> StackBuf<N> {
     #[inline]
     pub(crate) fn new() -> Self {
@@ -57,6 +60,7 @@ impl<const N: usize> StackBuf<N> {
     }
 }
 
+#[cfg(test)]
 impl<const N: usize> core::fmt::Write for StackBuf<N> {
     #[inline]
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
@@ -83,9 +87,143 @@ pub(crate) fn decompose(x: f64) -> (u64, i32) {
     }
 }
 
+/// Shortest digits that round-trip (Python repr): value = 0.DIGITS * 10^decpt.
+pub(crate) struct Short {
+    pub buf: [u8; 24],
+    pub len: usize,
+    pub decpt: i32,
+}
+
+impl Short {
+    #[inline]
+    pub(crate) fn digits(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+include!(concat!(env!("OUT_DIR"), "/g_table.rs"));
+
+const K_MIN: i32 = -324;
+const C_MIN: u64 = 1 << 52;
+const Q_MIN: i32 = -1074;
+
+#[inline]
+fn flog10pow2(q: i32) -> i32 {
+    ((q as i64 * 661_971_961_083) >> 41) as i32
+}
+#[inline]
+fn flog10_three_quarters_pow2(q: i32) -> i32 {
+    ((q as i64 * 661_971_961_083 - 274_743_187_321) >> 41) as i32
+}
+#[inline]
+fn flog2pow10(e: i32) -> i32 {
+    ((e as i64 * 913_124_641_741) >> 38) as i32
+}
+
+/// Schubfach's r_o'(g cp 2^-127) with g = g1 2^63 + g0: an approximate
+/// round-to-odd that deliberately ignores the lowest 64 bits of g0*cp
+/// (this is what absorbs the error of the rounded-up table entry).
+#[inline]
+fn rop(g: u128, cp: u64) -> u64 {
+    const MASK_63: u64 = (1u64 << 63) - 1;
+    let g1 = (g >> 63) as u64;
+    let g0 = (g as u64) & MASK_63;
+    let x1 = ((g0 as u128 * cp as u128) >> 64) as u64;
+    let y = g1 as u128 * cp as u128;
+    let y0 = y as u64;
+    let y1 = (y >> 64) as u64;
+    let z = (y0 >> 1) + x1;
+    let vbp = y1 + (z >> 63);
+    vbp | (((z & MASK_63) + MASK_63) >> 63)
+}
+
+/// Schubfach (R. Giulietti): shortest decimal f * 10^e in the rounding
+/// interval of v = c * 2^q, closest to v (ties to even).
+#[inline]
+fn schubfach_to_decimal(q: i32, c: u64) -> (u64, i32) {
+    let out = c & 1;
+    let cb = c << 2;
+    let cbr = cb + 2;
+    let (cbl, k) = if c != C_MIN || q == Q_MIN {
+        (cb - 2, flog10pow2(q))
+    } else {
+        (cb - 1, flog10_three_quarters_pow2(q))
+    };
+    let h = q + flog2pow10(-k) + 2;
+    let g = G_TABLE[(k - K_MIN) as usize];
+    let vb = rop(g, cb << h);
+    let vbl = rop(g, cbl << h);
+    let vbr = rop(g, cbr << h);
+    let s = vb >> 2;
+    // The reference algorithm uses `s >= 100` (Java wants at least two
+    // digits); Python wants the true shortest, so also try the coarser
+    // grid for two-digit s (tiny subnormals).
+    if s >= 10 {
+        let sp10 = 10 * (s / 10);
+        let tp10 = sp10 + 10;
+        let upin = vbl + out <= sp10 << 2;
+        let wpin = (tp10 << 2) + out <= vbr;
+        if upin != wpin {
+            return (if upin { sp10 } else { tp10 }, k);
+        }
+    }
+    let t = s + 1;
+    let uin = vbl + out <= s << 2;
+    let win = (t << 2) + out <= vbr;
+    if uin != win {
+        return (if uin { s } else { t }, k);
+    }
+    let cmp = vb as i64 - ((s + t) << 1) as i64;
+    (if cmp < 0 || (cmp == 0 && s & 1 == 0) { s } else { t }, k)
+}
+
+/// Shortest round-trip decimal for a finite, positive double: (f, e) with
+/// value = f * 10^e (f may have trailing zeros).
+#[inline]
+fn shortest_fe(x: f64) -> (u64, i32) {
+    let bits = x.to_bits();
+    let t = bits & ((1u64 << 52) - 1);
+    let bq = ((bits >> 52) & 0x7ff) as i32;
+    if bq != 0 {
+        let mq = 1075 - bq;
+        let c = C_MIN | t;
+        if 0 < mq && mq < 53 {
+            let f = c >> mq;
+            if f << mq == c {
+                return (f, 0);
+            }
+        }
+        schubfach_to_decimal(-mq, c)
+    } else {
+        schubfach_to_decimal(Q_MIN, t)
+    }
+}
+
 /// Shortest digits that round-trip (Python repr).  `x` must be finite and
 /// non-negative.
-pub(crate) fn shortest(x: f64, out: &mut Digits) {
+#[inline]
+pub(crate) fn shortest(x: f64) -> Short {
+    let mut out = Short { buf: [0; 24], len: 0, decpt: 1 };
+    if x == 0.0 {
+        out.buf[0] = b'0';
+        out.len = 1;
+        return out;
+    }
+    let (mut f, e) = shortest_fe(x);
+    let mut e = e;
+    while f % 10 == 0 {
+        f /= 10;
+        e += 1;
+    }
+    let n = write_u64(f, &mut out.buf);
+    out.len = n;
+    out.decpt = n as i32 + e;
+    out
+}
+
+/// Reference implementation based on Rust's core formatting (test oracle).
+#[cfg(test)]
+pub(crate) fn shortest_core(x: f64, out: &mut Digits) {
     if x == 0.0 {
         out.buf[0] = b'0';
         out.len = 1;
@@ -93,7 +231,6 @@ pub(crate) fn shortest(x: f64, out: &mut Digits) {
         return;
     }
     let mut sb: StackBuf<40> = StackBuf::new();
-    // `{:e}` gives the shortest round-trip digits, e.g. "1.2345e-5".
     let _ = write!(sb, "{:e}", x);
     let s = sb.as_bytes();
     let mut n = 0;
@@ -105,7 +242,6 @@ pub(crate) fn shortest(x: f64, out: &mut Digits) {
         }
         i += 1;
     }
-    // exponent
     i += 1;
     let mut neg = false;
     if i < s.len() && s[i] == b'-' {
@@ -276,9 +412,71 @@ mod tests {
         (String::from_utf8(d.digits().to_vec()).unwrap(), d.decpt)
     }
     fn short(x: f64) -> (String, i32) {
-        let mut d = Digits::new();
-        shortest(x, &mut d);
+        let d = shortest(x);
         (String::from_utf8(d.digits().to_vec()).unwrap(), d.decpt)
+    }
+    fn short_core(x: f64) -> (String, i32) {
+        let mut d = Digits::new();
+        shortest_core(x, &mut d);
+        (String::from_utf8(d.digits().to_vec()).unwrap(), d.decpt)
+    }
+
+    /// Schubfach vs Rust's core shortest formatting.
+    #[test]
+    fn shortest_vs_core() {
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let check = |x: f64| {
+            if x.is_finite() && x > 0.0 {
+                let (a, b) = (short(x), short_core(x));
+                if a != b {
+                    // Allowed only for an exact tie between two shortest
+                    // candidates: Gay's dtoa (CPython) then picks the even
+                    // last digit, Rust's core rounds up.
+                    let (exact, _) = sig(x, 800);
+                    assert_eq!(a.0.len(), b.0.len(), "x={:e}", x);
+                    assert_eq!(a.1, b.1);
+                    assert_eq!(exact.len(), a.0.len() + 1, "x={:e} not a tie", x);
+                    assert!(exact.ends_with('5'), "x={:e} not a tie", x);
+                    assert_eq!(&exact[..a.0.len()], &a.0[..], "x={:e}", x);
+                    assert!((a.0.as_bytes()[a.0.len() - 1] - b'0') % 2 == 0, "x={:e}", x);
+                }
+            }
+        };
+        let n = if cfg!(debug_assertions) { 300_000 } else { 3_000_000 };
+        for _ in 0..n {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            check(f64::from_bits(state & 0x7fff_ffff_ffff_ffff));
+        }
+        // powers of two (irregular spacing) and neighbours
+        for e in 1..2047u64 {
+            let b = e << 52;
+            for d in [0u64, 1, 2, 3] {
+                check(f64::from_bits(b + d));
+                check(f64::from_bits(b - d));
+            }
+        }
+        // subnormals
+        for t in 1..50_000u64 {
+            check(f64::from_bits(t));
+            check(f64::from_bits((1u64 << 52) - t));
+        }
+        // integers and short decimals
+        for i in 1..50_000u64 {
+            check(i as f64);
+            check(i as f64 / 1000.0);
+            check(i as f64 * 1e10);
+            check(1.0 / i as f64);
+        }
+        for p in -325..309 {
+            check(10f64.powi(p));
+            check(format!("1e{}", p).parse().unwrap());
+            check(format!("9.999999999999999e{}", p).parse().unwrap());
+            check(format!("5e{}", p).parse().unwrap());
+        }
+        check(f64::MAX);
+        check(f64::MIN_POSITIVE);
     }
 
     #[test]

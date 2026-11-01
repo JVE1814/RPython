@@ -379,6 +379,23 @@ pub fn format_float_spec(
             p
         }
     };
+    if spec.width.is_none() && spec.grouping.is_none() && spec.frac_grouping.is_none() && !is_n {
+        // Fast path: no padding or grouping; write straight into `out`.
+        let start = out.len();
+        let space = spec.sign == Some(' ');
+        if space {
+            out.push(' ');
+        }
+        let f = DtoaFlags { sign: spec.sign == Some('+'), ..flags };
+        double_to_string(out, val, code, precision, f)?;
+        if space && out.as_bytes().get(start + 1) == Some(&b'-') {
+            out.remove(start);
+        }
+        if add_pct {
+            out.push('%');
+        }
+        return Ok(());
+    }
     let mut buf = String::with_capacity(32);
     let neg = float_component(&mut buf, val, code, precision, flags)?;
     if add_pct {
