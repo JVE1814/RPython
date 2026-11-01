@@ -359,15 +359,18 @@ class _MethodSource:
         self.names.append(name)
 
     def compile(self):
+        # The factory is named __create_fn__: generated functions keep a
+        # qualname of "__create_fn__.<locals>.NAME" (for the __repr__ that
+        # pprint recognises as generated) until _set_new_attribute time.
         if not self.names:
             return {}
         params = ', '.join(self.closure)
-        source = (f'def __dataclass_methods__({params}):\n'
+        source = (f'def __create_fn__({params}):\n'
                   + '\n'.join(self.chunks)
                   + f'\n  return ({", ".join(self.names)},)\n')
         scope = {}
         exec(source, self.module_globals, scope)
-        made = scope['__dataclass_methods__'](**self.closure)
+        made = scope['__create_fn__'](**self.closure)
         return dict(zip(self.names, made))
 
 
@@ -652,12 +655,16 @@ def _process_class(cls, init, repr, eq, order, unsafe_hash, frozen,
     made = src.compile()
 
     for name, how in wanted.items():
-        method = _tidy_method(cls, made[name])
+        method = made[name]
+        if how == 'repr':
+            # pprint looks at the wrapped function to recognise a generated
+            # __repr__; only the wrapper gets the class-based qualname
+            _set_new_attribute(cls, name, _tidy_method(cls, recursive_repr()(method)))
+            continue
+        method = _tidy_method(cls, method)
         if how == 'init':
             method.__annotate__ = _make_init_annotate(cls, init_fields)
             _set_new_attribute(cls, name, method)
-        elif how == 'repr':
-            _set_new_attribute(cls, name, recursive_repr()(method))
         elif how == 'order':
             if _set_new_attribute(cls, name, method):
                 raise TypeError(f'Cannot overwrite attribute {name} '
