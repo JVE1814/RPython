@@ -670,8 +670,7 @@ fn raise_file_or_ssl(path_obj: &PyObject) -> PyErr {
     if err_get_lib(e) == 2 || (e == 0 && errno != 0) || errno == libc::ENOENT {
         cr!(ERR_clear_error());
         let en = if errno != 0 { errno } else { libc::ENOENT };
-        let _ = path_obj;
-        return rpy_runtime::types::exceptions::os_error_from_errno(en, None, None);
+        return rpy_runtime::types::exceptions::os_error_from_errno(en, Some(path_obj), None);
     }
     raise_from_queue(None, "unknown error")
 }
@@ -743,24 +742,17 @@ fn add_cadata(c: *mut c_void, data: &[u8], pem: bool) -> PyResult<()> {
     let store = sl!(SSL_CTX_get_cert_store(c));
     let bio = cr!(BIO_new_mem_buf(data.as_ptr() as *const c_void, data.len() as c_int));
     let mut loaded = 0;
+    let mut der_pos: *const u8 = data.as_ptr();
+    let der_end = unsafe { data.as_ptr().add(data.len()) };
     loop {
         let x = if pem {
             cr!(PEM_read_bio_X509(bio, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()))
         } else {
-            let pending = cr!(BIO_ctrl_pending(bio));
-            if pending == 0 {
+            let remaining = der_end as usize - der_pos as usize;
+            if remaining == 0 {
                 std::ptr::null_mut()
             } else {
-                let mut buf = vec![0u8; pending];
-                let n = cr!(BIO_read(bio, buf.as_mut_ptr() as *mut c_void, pending as c_int));
-                let mut p = buf.as_ptr();
-                let x = cr!(d2i_X509(std::ptr::null_mut(), &mut p, n as c_long));
-                // put back the bytes after this certificate
-                let used = p as usize - buf.as_ptr() as usize;
-                if !x.is_null() && used < n as usize {
-                    cr!(BIO_write(bio, buf[used..].as_ptr() as *const c_void, (n as usize - used) as c_int));
-                }
-                x
+                cr!(d2i_X509(std::ptr::null_mut(), &mut der_pos, remaining as c_long))
             }
         };
         if x.is_null() {
