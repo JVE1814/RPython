@@ -1,8 +1,8 @@
-"""Keyed-hashing for message authentication (HMAC, RFC 2104).
+"""Message authentication codes built from hash functions (RFC 2104).
 
-new(key, msg=None, digestmod) returns an HMAC object; digest(key, msg, digest)
-computes an HMAC in one call.  compare_digest() compares digests in constant
-time.
+Create objects with new(key, msg, digestmod) / HMAC(...), or compute a MAC in
+a single call with digest(key, msg, digest).  compare_digest() performs a
+comparison whose duration does not depend on where the inputs differ.
 """
 
 try:
@@ -13,6 +13,7 @@ except ImportError:
     from _operator import _compare_digest as compare_digest
 else:
     compare_digest = _hashopenssl.compare_digest
+    # Type of the accelerated named constructors such as openssl_sha256.
     _functype = type(_hashopenssl.openssl_sha256)
 
 try:
@@ -20,57 +21,66 @@ try:
 except ImportError:
     _hmac = None
 
-trans_5C = bytes(x ^ 0x5C for x in range(256))
-trans_36 = bytes(x ^ 0x36 for x in range(256))
-
-# HMAC objects expose their own digest_size; this module-level value is kept
-# for backwards compatibility only.
-digest_size = None
-
 __all__ = ['HMAC', 'new', 'digest', 'compare_digest']
 
+# Translation tables applying the outer (0x5C) and inner (0x36) pads.
+trans_5C = bytes(i ^ 0x5C for i in range(256))
+trans_36 = bytes(i ^ 0x36 for i in range(256))
 
-def _get_digest_constructor(digest_like):
-    """Turn a digestmod (callable, name or module) into a constructor."""
-    if callable(digest_like):
-        return digest_like
-    if isinstance(digest_like, str):
-        def digest_wrapper(d=b''):
+# Kept for compatibility; the real size is an attribute of each HMAC object.
+digest_size = None
+
+
+def _constructor_for(digestmod):
+    """Return a callable creating a fresh hash object for *digestmod*."""
+    if callable(digestmod):
+        return digestmod
+    if isinstance(digestmod, str):
+        name = digestmod
+
+        def make(data=b''):
             import hashlib
-            return hashlib.new(digest_like, d)
-    else:
-        def digest_wrapper(d=b''):
-            return digest_like.new(d)
-    return digest_wrapper
+            return hashlib.new(name, data)
+        return make
+
+    module = digestmod
+
+    def make(data=b''):
+        return module.new(data)
+    return make
 
 
-def _is_shake_constructor(digest_like):
-    if isinstance(digest_like, str):
-        name = digest_like
-    else:
-        h = digest_like() if callable(digest_like) else digest_like.new()
-        if not isinstance(name := getattr(h, "name", None), str):
-            return False
-    return name.startswith(("shake", "SHAKE"))
+def _is_xof(constructor):
+    """True if *constructor* builds an extendable-output (SHAKE) hash."""
+    probe = constructor()
+    name = getattr(probe, "name", None)
+    return isinstance(name, str) and name.lower().startswith("shake")
+
+
+def _padded_key(key, blocksize, constructor):
+    if len(key) > blocksize:
+        key = constructor(key).digest()
+    return key.ljust(blocksize, b'\0')
 
 
 class HMAC:
-    """RFC 2104 HMAC class.  Also complies with RFC 4231.
+    """Keyed hash object implementing RFC 2104 (and the RFC 4231 vectors).
 
-    This supports the API for Cryptographic Hash Functions (PEP 247).
+    The interface mirrors hash objects: update(), digest(), hexdigest(),
+    copy(), plus the name, digest_size and block_size attributes.
     """
 
-    blocksize = 64  # fallback block size used by _init_old()
+    # Block size assumed when the hash object does not report a usable one.
+    blocksize = 64
 
     __slots__ = ("_hmac", "_inner", "_outer", "block_size", "digest_size")
 
     def __init__(self, key, msg=None, digestmod=''):
-        """Create a new HMAC object.
+        """Prepare a MAC computation.
 
-        key: bytes or buffer, key for the keyed hash object.
-        msg: bytes or buffer, initial input for the hash or None.
-        digestmod: a hash name, a constructor returning a hash object, or a
-                   module supporting PEP 247.  Required.
+        key must be bytes or bytearray; msg (optional) is fed through
+        update(); digestmod selects the hash: a name, a constructor or a
+        module with a new() function.  It has no default.
         """
         if not isinstance(key, (bytes, bytearray)):
             raise TypeError("key: expected bytes or bytearray, "
@@ -78,145 +88,128 @@ class HMAC:
         if not digestmod:
             raise TypeError("Missing required parameter 'digestmod'.")
 
-        if _hashopenssl and isinstance(digestmod, (str, _functype)):
+        accelerated = (str,) if _functype is None else (str, _functype)
+        if _hashopenssl is not None and isinstance(digestmod, accelerated):
             try:
-                self._init_openssl_hmac(key, msg, digestmod)
-                return
+                return self._init_openssl_hmac(key, msg, digestmod)
             except _hashopenssl.UnsupportedDigestmodError:
                 pass
-        if _hmac and isinstance(digestmod, str):
+        if _hmac is not None and isinstance(digestmod, str):
             try:
-                self._init_builtin_hmac(key, msg, digestmod)
-                return
+                return self._init_builtin_hmac(key, msg, digestmod)
             except _hmac.UnknownHashError:
                 pass
         self._init_old(key, msg, digestmod)
 
-    def _init_openssl_hmac(self, key, msg, digestmod):
-        self._hmac = _hashopenssl.hmac_new(key, msg, digestmod=digestmod)
-        self._inner = self._outer = None
-        self.digest_size = self._hmac.digest_size
-        self.block_size = self._hmac.block_size
+    def _adopt(self, native):
+        self._hmac = native
+        self._inner = None
+        self._outer = None
+        self.digest_size = native.digest_size
+        self.block_size = native.block_size
 
-    _init_hmac = _init_openssl_hmac  # older private name
+    def _init_openssl_hmac(self, key, msg, digestmod):
+        self._adopt(_hashopenssl.hmac_new(key, msg, digestmod=digestmod))
+
+    _init_hmac = _init_openssl_hmac
 
     def _init_builtin_hmac(self, key, msg, digestmod):
-        self._hmac = _hmac.new(key, msg, digestmod=digestmod)
-        self._inner = self._outer = None
-        self.digest_size = self._hmac.digest_size
-        self.block_size = self._hmac.block_size
+        self._adopt(_hmac.new(key, msg, digestmod=digestmod))
 
     def _init_old(self, key, msg, digestmod):
-        import warnings
-
-        digest_cons = _get_digest_constructor(digestmod)
-        if _is_shake_constructor(digest_cons):
+        make = _constructor_for(digestmod)
+        if _is_xof(make):
             raise ValueError(f"unsupported hash type {digestmod}")
-
         self._hmac = None
-        self._outer = digest_cons()
-        self._inner = digest_cons()
-        self.digest_size = self._inner.digest_size
+        inner = make()
+        outer = make()
+        self.digest_size = inner.digest_size
 
-        if hasattr(self._inner, 'block_size'):
-            blocksize = self._inner.block_size
-            if blocksize < 16:
-                warnings.warn(f'block_size of {blocksize} seems too small; '
-                              f'using our default of {self.blocksize}.',
-                              RuntimeWarning, 2)
-                blocksize = self.blocksize
-        else:
+        bs = getattr(inner, 'block_size', None)
+        if bs is None:
+            import warnings
             warnings.warn('No block_size attribute on given digest object; '
-                          f'Assuming {self.blocksize}.',
+                          f'Assuming {self.blocksize}.', RuntimeWarning, 2)
+            bs = self.blocksize
+        elif bs < 16:
+            import warnings
+            warnings.warn(f'block_size of {bs} seems too small; '
+                          f'using our default of {self.blocksize}.',
                           RuntimeWarning, 2)
-            blocksize = self.blocksize
+            bs = self.blocksize
+        self.block_size = bs
 
-        if len(key) > blocksize:
-            key = digest_cons(key).digest()
-
-        self.block_size = blocksize
-        key = key.ljust(blocksize, b'\0')
-        self._outer.update(key.translate(trans_5C))
-        self._inner.update(key.translate(trans_36))
+        padded = _padded_key(key, bs, make)
+        inner.update(padded.translate(trans_36))
+        outer.update(padded.translate(trans_5C))
+        self._inner = inner
+        self._outer = outer
         if msg is not None:
             self.update(msg)
 
     @property
     def name(self):
-        if self._hmac:
+        if self._hmac is not None:
             return self._hmac.name
-        return f"hmac-{self._inner.name}"
+        return "hmac-" + self._inner.name
 
     def update(self, msg):
-        """Feed data from msg into this hashing object."""
-        (self._hmac or self._inner).update(msg)
+        """Append msg to the authenticated data."""
+        target = self._hmac if self._hmac is not None else self._inner
+        target.update(msg)
 
     def copy(self):
-        """Return a separate copy of this hashing object.
-
-        An update to this copy won't affect the original object.
-        """
-        other = self.__class__.__new__(self.__class__)
-        other.digest_size = self.digest_size
-        other.block_size = self.block_size
-        if self._hmac:
-            other._hmac = self._hmac.copy()
-            other._inner = other._outer = None
+        """Return an independent clone of the current state."""
+        cls = type(self)
+        clone = cls.__new__(cls)
+        clone.digest_size = self.digest_size
+        clone.block_size = self.block_size
+        if self._hmac is not None:
+            clone._hmac = self._hmac.copy()
+            clone._inner = clone._outer = None
         else:
-            other._hmac = None
-            other._inner = self._inner.copy()
-            other._outer = self._outer.copy()
-        return other
+            clone._hmac = None
+            clone._inner = self._inner.copy()
+            clone._outer = self._outer.copy()
+        return clone
 
-    def _current(self):
-        """Return a hash object for the current state."""
-        if self._hmac:
+    def _final(self):
+        if self._hmac is not None:
             return self._hmac
-        h = self._outer.copy()
-        h.update(self._inner.digest())
-        return h
+        result = self._outer.copy()
+        result.update(self._inner.digest())
+        return result
 
     def digest(self):
-        """Return the hash value of this hashing object.
-
-        This returns the hmac value as bytes.  The object is
-        not altered in any way by this function; you can continue
-        updating the object after calling this function.
-        """
-        return self._current().digest()
+        """Return the MAC of the data seen so far as bytes (non-destructive)."""
+        return self._final().digest()
 
     def hexdigest(self):
-        """Like digest(), but returns a string of hexadecimal digits instead.
-        """
-        return self._current().hexdigest()
+        """Return the MAC of the data seen so far as a hex string."""
+        return self._final().hexdigest()
 
 
 def new(key, msg=None, digestmod=''):
-    """Create a new hashing object and return it.
-
-    key: bytes or buffer, the starting key for the hash.
-    msg: bytes or buffer, initial input for the hash, or None.
-    digestmod: a hash name, constructor or PEP 247 module.  Required.
-    """
+    """Return a new HMAC object; see HMAC for the arguments."""
     return HMAC(key, msg, digestmod)
 
 
 def digest(key, msg, digest):
-    """Fast inline implementation of HMAC.
+    """Compute the HMAC of msg under key in one step.
 
-    key: bytes or buffer, the key for the keyed hash object.
-    msg: bytes or buffer, input message.
-    digest: a hash name, constructor or PEP 247 module.
+    digest names the hash function (a name, constructor or module).
     """
-    if _hashopenssl and isinstance(digest, (str, _functype)):
+    if _hashopenssl is not None and isinstance(
+            digest, (str,) if _functype is None else (str, _functype)):
         try:
             return _hashopenssl.hmac_digest(key, msg, digest)
         except OverflowError:
+            # Key too large for the accelerated path.
             return _compute_digest_fallback(key, msg, digest)
         except _hashopenssl.UnsupportedDigestmodError:
             pass
 
-    if _hmac and isinstance(digest, str):
+    if _hmac is not None and isinstance(digest, str):
         try:
             return _hmac.compute_digest(key, msg, digest)
         except (OverflowError, _hmac.UnknownHashError):
@@ -226,17 +219,14 @@ def digest(key, msg, digest):
 
 
 def _compute_digest_fallback(key, msg, digest):
-    digest_cons = _get_digest_constructor(digest)
-    if _is_shake_constructor(digest_cons):
+    make = _constructor_for(digest)
+    if _is_xof(make):
         raise ValueError(f"unsupported hash type {digest}")
-    inner = digest_cons()
-    outer = digest_cons()
-    blocksize = getattr(inner, 'block_size', 64)
-    if len(key) > blocksize:
-        key = digest_cons(key).digest()
-    key = key.ljust(blocksize, b'\0')
-    inner.update(key.translate(trans_36))
-    outer.update(key.translate(trans_5C))
+    inner = make()
+    outer = make()
+    padded = _padded_key(key, getattr(inner, 'block_size', 64), make)
+    inner.update(padded.translate(trans_36))
     inner.update(msg)
+    outer.update(padded.translate(trans_5C))
     outer.update(inner.digest())
     return outer.digest()

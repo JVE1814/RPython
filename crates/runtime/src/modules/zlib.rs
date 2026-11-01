@@ -519,6 +519,20 @@ fn zd_needs_input(o: &PyObject) -> PyResult {
 
 // ------------------------------------------------------------------ module
 
+/// Module `__getattr__`: the deprecated `__version__` attribute.
+fn z_getattr(_m: &PyObject, name: &PyObject) -> PyResult {
+    let n = pystr::to_string_lossy(name);
+    if n == "__version__" {
+        crate::modules::warnings::warn(
+            crate::types::exceptions::DeprecationWarning(),
+            "'__version__' is deprecated and slated for removal in Python 3.20",
+            1,
+        )?;
+        return Ok(pystr::new_str("1.0"));
+    }
+    raise!(AttributeError, "module 'zlib' has no attribute '{}'", n);
+}
+
 static INIT: std::sync::Once = std::sync::Once::new();
 
 fn init_types() -> PyResult<()> {
@@ -616,6 +630,7 @@ pub fn init_module() -> PyResult {
     cc::set_str(&d, "ZLIB_VERSION", ZLIB_VERSION)?;
     cc::set_str(&d, "ZLIB_RUNTIME_VERSION", ZLIB_VERSION)?;
     let methods = crate::mdefs![
+        ("__getattr__", O, z_getattr),
         ("adler32", FAST, z_adler32, "adler32($module, data, value=1, /)\n--\n\nCompute an Adler-32 checksum of data."),
         ("crc32", FAST, z_crc32, "crc32($module, data, value=0, /)\n--\n\nCompute a CRC-32 checksum of data."),
         ("adler32_combine", FAST, z_adler32_combine, "adler32_combine($module, adler1, adler2, len2, /)\n--\n\nCombine two Adler-32 check values into one."),
