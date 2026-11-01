@@ -533,3 +533,48 @@ pub fn all_tracked() -> Vec<PyRef> {
     let v = snapshot();
     v.into_iter().map(|o| unsafe { PyRef::from_borrowed(o) }).collect()
 }
+
+// ---------------------------------------------------------------- fork support
+//
+// fork() keeps only the calling thread.  Before forking, the other threads
+// are brought to a safepoint (so that none of them is inside the collector or
+// in the middle of a GC list update), and the forking thread holds the list
+// spin lock across the fork.  See crate::fork.
+
+/// Stop every other thread for fork().  Returns whether they all arrived
+/// (threads blocked in system calls count as stopped).
+pub fn fork_prepare() -> bool {
+    // no collection may run concurrently
+    while COLLECTING.compare_exchange(false, true, AcqRel, Acquire).is_err() {
+        crate::threads::blocking(|| std::thread::sleep(std::time::Duration::from_micros(200)));
+    }
+    let me = crate::threads::current_mut();
+    let mut stopped = false;
+    for _ in 0..40 {
+        if stop_the_world(me) {
+            stopped = true;
+            break;
+        }
+    }
+    while LIST_LOCK.compare_exchange_weak(false, true, Acquire, Relaxed).is_err() {
+        std::hint::spin_loop();
+    }
+    stopped
+}
+
+/// Undo fork_prepare() in the parent.
+pub fn fork_parent(stopped: bool) {
+    LIST_LOCK.store(false, Release);
+    if stopped {
+        start_the_world();
+    }
+    COLLECTING.store(false, Release);
+}
+
+/// Reset the collector state in the child: the other threads are gone.
+pub fn fork_child() {
+    LIST_LOCK.store(false, Release);
+    PARKED.store(0, Release);
+    RELEASE.store(true, Release);
+    COLLECTING.store(false, Release);
+}

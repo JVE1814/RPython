@@ -208,6 +208,9 @@ pub fn sleep_secs(secs: f64) -> PyResult<()> {
     nsec %= 1_000_000_000;
     deadline.tv_nsec = nsec;
     loop {
+        // A signal that arrived just before the call would otherwise only be
+        // handled after the whole sleep.
+        crate::modules::posix::path::check_signals()?;
         let r = crate::threads::blocking(|| unsafe {
             libc::clock_nanosleep(libc::CLOCK_MONOTONIC, libc::TIMER_ABSTIME, &deadline, std::ptr::null_mut())
         });

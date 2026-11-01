@@ -28,7 +28,7 @@ __all__ = ['get_ident', 'active_count', 'Condition', 'current_thread',
            'Event', 'Lock', 'RLock', 'Semaphore', 'BoundedSemaphore', 'Thread',
            'Barrier', 'BrokenBarrierError', 'Timer', 'ThreadError',
            'ExceptHookArgs', 'setprofile', 'settrace', 'local', 'stack_size',
-           'excepthook', 'get_native_id', 'getprofile', 'gettrace',
+           'excepthook', 'getprofile', 'gettrace',
            'setprofile_all_threads', 'settrace_all_threads']
 
 _start_joinable_thread = _thread.start_joinable_thread
@@ -112,19 +112,12 @@ def gettrace():
 Lock = _LockType
 
 
-def RLock(*args, **kwargs):
+def RLock():
     """Factory returning a new reentrant lock: the lock must be released by
     the thread that acquired it, as many times as it was acquired."""
-    if args or kwargs:
-        import warnings
-        warnings.warn(
-            'Passing arguments to RLock is deprecated and will be removed in 3.15',
-            DeprecationWarning,
-            stacklevel=2,
-        )
     if _CRLock is None:
-        return _PyRLock(*args, **kwargs)
-    return _CRLock(*args, **kwargs)
+        return _PyRLock()
+    return _CRLock()
 
 
 class _RLock:
@@ -256,6 +249,10 @@ class Condition:
     def __repr__(self):
         return "<Condition(%s, %d)>" % (self._lock, len(self._waiters))
 
+    def locked(self):
+        """True if the underlying lock is held."""
+        return self._lock.locked()
+
     def _release_save(self):
         self._lock.release()
 
@@ -274,6 +271,8 @@ class Condition:
         expires, then re-acquire the lock.  Returns False on timeout."""
         if not self._is_owned():
             raise RuntimeError("cannot wait on un-acquired lock")
+        if timeout is not None and timeout != timeout:
+            raise ValueError("Invalid value NaN (not a number)")
         waiter = _allocate_lock()
         waiter.acquire()
         self._waiters.append(waiter)
@@ -648,9 +647,13 @@ class Thread:
     def _after_fork(self, new_ident=None):
         self._started._at_fork_reinit()
         if new_ident is not None:
+            # the surviving thread: same ident, new OS thread id
             self._ident = new_ident
             assert self._handle.ident == new_ident
+            if _HAVE_THREAD_NATIVE_ID:
+                self._set_native_id()
         else:
+            # a thread that does not exist in the child: it is done
             pass
 
     def __repr__(self):
