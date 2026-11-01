@@ -280,9 +280,28 @@ _UNRESERVED = frozenset(b'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
                         b'0123456789_.-~')
 
 
-def _percent_encode(s, encoding):
+def _percent_encode(s, encoding, errors='strict'):
     return ''.join(chr(b) if b in _UNRESERVED else '%%%02X' % b
-                   for b in s.encode(encoding))
+                   for b in s.encode(encoding, errors))
+
+
+def _percent_decode_to_bytes(s):
+    # Like urllib.parse.unquote_to_bytes (str input is utf-8 encoded first,
+    # so surrogates raise UnicodeEncodeError).
+    raw = s.encode('utf-8')
+    if b'%' not in raw:
+        return raw
+    out = bytearray()
+    pos = 0
+    n = len(raw)
+    while pos < n:
+        if raw[pos] == 0x25 and _ishex(raw[pos + 1:pos + 3].decode('latin-1')):
+            out.append(int(raw[pos + 1:pos + 3], 16))
+            pos += 3
+        else:
+            out.append(raw[pos])
+            pos += 1
+    return bytes(out)
 
 
 def _percent_decode(s, encoding):

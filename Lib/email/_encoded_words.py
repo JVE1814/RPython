@@ -78,6 +78,9 @@ def decode_b(encoded):
         defects.append(errors.InvalidBase64CharactersDefect())
     stripped = kept.rstrip(b'=')
     present = len(kept) - len(stripped)
+    if b'=' in stripped and not defects:
+        # padding in the middle of the data
+        defects.append(errors.InvalidBase64CharactersDefect())
     data = stripped.replace(b'=', b'')
     remainder = len(data) % 4
     if remainder == 1:

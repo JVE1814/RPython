@@ -113,6 +113,14 @@ def _decode_uu(encoded):
     return b''.join(out)
 
 
+_valid_name = re.compile(r"[\041-\071\073-\176]+\Z")
+
+
+def _check_header_name(name):
+    if not _valid_name.match(name):
+        raise ValueError(f"Invalid header name {name!r}")
+
+
 class Message:
     """A message: headers plus a payload.
 
@@ -197,7 +205,7 @@ class Message:
         if i is not None and not isinstance(self._payload, list):
             raise TypeError('Expected list, got %s' % type(self._payload))
         payload = self._payload
-        cte = str(self.get('content-transfer-encoding', '')).lower()
+        cte = str(self.get('content-transfer-encoding', '')).strip().lower()
         raw = None
         if isinstance(payload, str):
             if utils._has_surrogates(payload):
@@ -295,6 +303,7 @@ class Message:
 
     def __setitem__(self, name, val):
         """Append a header (existing headers of that name are kept)."""
+        _check_header_name(name)
         max_count = self.policy.header_max_count(name)
         if max_count:
             lname = name.lower()

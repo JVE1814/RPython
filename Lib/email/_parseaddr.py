@@ -386,7 +386,8 @@ class AddrlistClass:
             # a bare addr-spec
             self.pos = start
             self.commentlist = saved_comments
-            result = [(SPACE.join(self.commentlist), self.getaddrspec())]
+            spec = self.getaddrspec()
+            result = [(SPACE.join(self.commentlist), spec)]
         elif field[self.pos] == ':':
             # a group: display-name ":" [mailbox-list] ";"
             self.pos += 1

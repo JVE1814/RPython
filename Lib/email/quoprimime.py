@@ -100,6 +100,10 @@ def _encode_line(line, maxlinelen, out):
     out.append(current)
 
 
+# Only CR and LF end lines (str.splitlines() would also split on NEL etc.).
+_LINE_SPLIT = re.compile(r'\r\n|\r|\n').split
+
+
 def body_encode(body, maxlinelen=76, eol=NL):
     """Encode a body string with quoted-printable.
 
@@ -112,13 +116,11 @@ def body_encode(body, maxlinelen=76, eol=NL):
     if not body:
         return body
     out = []
-    for line in body.splitlines():
+    for line in _LINE_SPLIT(body):
         if line:
             _encode_line(line, maxlinelen, out)
         else:
             out.append('')
-    if body[-1] in '\r\n':
-        out.append('')
     return eol.join(out)
 
 
@@ -130,7 +132,10 @@ def decode(encoded, eol=NL):
     if not encoded:
         return encoded
     pieces = []
-    for line in encoded.splitlines():
+    lines = _LINE_SPLIT(encoded)
+    if lines[-1] == '':
+        lines.pop()
+    for line in lines:
         line = line.rstrip()
         if not line:
             pieces.append(eol)

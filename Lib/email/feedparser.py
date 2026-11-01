@@ -85,12 +85,10 @@ class BufferedSubFile:
 
     @staticmethod
     def _split(text, final):
-        lines = []
-        pos = 0
-        for m in _LINE_RE.finditer(text):
-            lines.append(m.group())
-            pos = m.end()
-        rest = text[pos:]
+        pieces = NLCRE_crack.split(text)
+        # pieces alternate: text, line ending, text, ...
+        lines = [pieces[i] + pieces[i + 1] for i in range(0, len(pieces) - 1, 2)]
+        rest = pieces[-1]
         if final:
             if rest:
                 lines.append(rest)
