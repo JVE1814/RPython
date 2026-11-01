@@ -3,28 +3,53 @@
 #   tools/build_test_exts.sh [OUTDIR] [module...]      (default OUTDIR: <repo>/build/ext)
 #   tools/build_test_exts.sh --check                   (syntax-check every source, report errors)
 # Output: OUTDIR/<name>.cpython-315t-x86_64-linux-gnu.so; put OUTDIR on sys.path / PYTHONPATH.
-# Out of scope (DECISIONS D2): _testinternalcapi (needs Include/internal).
+#
+# Some sources include CPython *internal* headers (Include/internal is not part of the spec,
+# DECISIONS D2). tools/capi_shim/ holds project-written stand-ins for the few internal helpers
+# that Argument-Clinic output and the tests use (implemented with the public API only).
+# Parts that test genuinely internal behaviour are excluded and replaced by stub init functions:
+#   _testcapi/bytes.c      (pycore_bytesobject.h: private _PyBytesWriter API)
+#   _testcapi/immortal.c   (pycore_long.h immortality bits)
+#   _testcapi/monitoring.c (pycore_instruments.h)
+# Not buildable at all: _testinternalcapi (internal headers), _testmultiphase, _testclinic,
+# _testclinic_limited (their generated Modules/clinic/*.c.h files are not in the spec).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CC="${CC:-gcc}"
 SUFFIX=".cpython-315t-x86_64-linux-gnu.so"
 INC="$(mktemp -d)"; trap 'rm -rf "$INC"' EXIT
 cp "$ROOT/tools/pyconfig.h" "$INC/pyconfig.h"
-CFLAGS="-fPIC -g -O1 -fno-strict-aliasing -fwrapv -Wno-unused-result -Wsign-compare -std=c11 -D_GNU_SOURCE"
-CFLAGS="$CFLAGS -I$INC -I$ROOT/spec/Include ${EXTRA_CFLAGS:-}"
+CFLAGS="-fPIC -g -O1 -fno-strict-aliasing -fwrapv -Wno-unused-result -std=c11 -D_GNU_SOURCE"
+CFLAGS="$CFLAGS -I$INC -I$ROOT/spec/Include -I$ROOT/tools/capi_shim ${EXTRA_CFLAGS:-}"
 M="$ROOT/spec/Modules"
+EXCLUDED="bytes immortal monitoring"
 
 sources() { # module name -> list of sources
   case "$1" in
-    _testcapi) echo "$M/_testcapimodule.c" "$M"/_testcapi/*.c ;;
+    _testcapi)
+      echo "$M/_testcapimodule.c"
+      for f in "$M"/_testcapi/*.c; do
+        b="$(basename "$f" .c)"
+        case " $EXCLUDED " in *" $b "*) ;; *) echo "$f" ;; esac
+      done
+      echo "$INC/_testcapi_excluded.c" ;;
     _testlimitedcapi) echo "$M/_testlimitedcapi.c" "$M"/_testlimitedcapi/*.c ;;
     *) echo "$M/$1.c" ;;
   esac
 }
-ALL="_testcapi _testlimitedcapi _testbuffer _testmultiphase _testsinglephase _testimportmultiple _testclinic _testclinic_limited"
+# stub init functions for the excluded _testcapi parts
+{
+  echo '#include "Python.h"'
+  for b in $EXCLUDED; do
+    up="$(echo "${b:0:1}" | tr a-z A-Z)${b:1}"
+    echo "int _PyTestCapi_Init_${up}(PyObject *m) { (void)m; return 0; }"
+  done
+} > "$INC/_testcapi_excluded.c"
+
+ALL="_testcapi _testlimitedcapi _testbuffer _testsinglephase _testimportmultiple"
 
 if [ "${1:-}" = "--check" ]; then
-  for mod in $ALL; do
+  for mod in $ALL _testmultiphase _testclinic _testclinic_limited; do
     for src in $(sources "$mod"); do
       err=$("$CC" -fsyntax-only -w $CFLAGS "$src" 2>&1 | grep -m3 'error')
       [ -n "$err" ] && printf '%s:\n%s\n' "${src#$ROOT/}" "$err"
@@ -55,4 +80,8 @@ for mod in $MODS; do
     echo "FAILED to link $mod"; status=1
   fi
 done
+# _testimportmultiple also provides _testimportmultiple_foo / _bar via the same file
+if [ -f "$OUT/_testimportmultiple$SUFFIX" ]; then
+  for sub in foo bar; do ln -sf "_testimportmultiple$SUFFIX" "$OUT/_testimportmultiple_$sub$SUFFIX"; done
+fi
 exit $status

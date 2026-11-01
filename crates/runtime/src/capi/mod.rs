@@ -14,6 +14,7 @@ pub mod bytes;
 pub mod capsule;
 pub mod ceval;
 pub mod codecs;
+pub mod compat;
 pub mod containers;
 pub mod data;
 pub mod dict;
