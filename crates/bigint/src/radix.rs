@@ -299,6 +299,14 @@ pub fn from_digits(s: &[u8], radix: u32) -> Option<Vec<u32>> {
 
 /// Parse digits already validated for `radix`.
 fn from_valid_digits(s: &[u8], radix: u32) -> Vec<u32> {
+    if s.len() <= 12 || (radix <= 10 && s.len() <= 19) {
+        // fits in u64 (36^12 < 2^63, 10^19 < 2^64)
+        let mut v: u64 = 0;
+        for &c in s {
+            v = v * radix as u64 + digit_value(c) as u64;
+        }
+        return nat::from_u64(v);
+    }
     if radix.is_power_of_two() {
         let bits_per = radix.trailing_zeros();
         let total = s.len() as u64 * bits_per as u64;
