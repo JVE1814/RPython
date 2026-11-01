@@ -313,6 +313,12 @@ pub enum Intrinsic1 {
     SubscriptGeneric,
     /// (name, type_params, compute_value) -> TypeAliasType
     TypeAlias,
+    /// ADDED by the compiler: [value] -> [wrapped] marks a value yielded by a `yield`
+    /// expression in an async generator (CPython's INTRINSIC_ASYNC_GEN_WRAP). Values yielded
+    /// by the `await` loops inside the same frame are NOT wrapped; the async generator
+    /// machinery must treat wrapped values as items produced by `__anext__`/`asend` and
+    /// unwrapped ones as values for the event loop.
+    AsyncGenWrap,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
