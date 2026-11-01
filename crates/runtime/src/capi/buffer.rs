@@ -81,7 +81,7 @@ pub unsafe extern "C" fn PyBuffer_Release(view: *mut Py_buffer) {
 pub unsafe extern "C" fn PyBuffer_FillInfo(view: *mut Py_buffer, obj: *mut PyObject, buf: *mut c_void, len: Py_ssize_t, readonly: c_int, flags: c_int) -> c_int {
     unsafe {
         if view.is_null() {
-            let _ = value_error("PyBuffer_FillInfo: view==NULL argument is obsolete");
+            let _ = crate::err!(BufferError, "PyBuffer_FillInfo: view==NULL argument is obsolete");
             return -1;
         }
         if flags != -1 && (flags & PYBUF_WRITABLE) == PYBUF_WRITABLE && readonly == 1 {

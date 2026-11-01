@@ -1,31 +1,93 @@
 //! pystate.h / ceval.h thread-state parts: thread states, the (emulated) GIL API
-//! mapped to HotSpot-style thread modes (detached = InNative), interpreter state,
-//! pending calls, PEP 788 guards/views.
+//! mapped to HotSpot-style thread modes (detached = InNative), interpreter states,
+//! PEP 788 guards/views/tokens, pending calls.
+//!
+//! Model: the current (attached) thread state lives in `threads::CURRENT`; each OS
+//! thread also remembers its "GILState" thread state. There is one real interpreter;
+//! `Py_NewInterpreter` creates additional interpreter *identities* (own id, dict and
+//! atexit list) that share the runtime — enough for the C-level thread-state API, not
+//! for isolation (sub-interpreter isolation is not supported).
 
 use super::*;
 use crate::threads::{self, ThreadMode, ThreadState};
 use crate::types::dict;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::sync::Mutex;
 
-/// The single interpreter: an opaque, zeroed block (C code only passes pointers around;
-/// `tstate->interp` must be non-NULL and stable).
-#[repr(C, align(64))]
-struct Interp([u8; 4096]);
-static mut INTERP: Interp = Interp([0; 4096]);
-static INTERP_DICT: Mutex<usize> = Mutex::new(0);
+pub struct Interp {
+    pub id: i64,
+    pub alive: std::sync::atomic::AtomicBool,
+    pub dict: Mutex<usize>,
+    pub atexit: Mutex<Vec<(usize, usize)>>,
+}
+static MAIN_INTERP: Interp = Interp {
+    id: 0,
+    alive: std::sync::atomic::AtomicBool::new(true),
+    dict: Mutex::new(0),
+    atexit: Mutex::new(Vec::new()),
+};
+static NEXT_INTERP_ID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
 
 pub fn interp_ptr() -> *mut c_void {
-    &raw mut INTERP as *mut c_void
+    &MAIN_INTERP as *const Interp as *mut c_void
+}
+unsafe fn interp<'a>(p: *mut c_void) -> &'a Interp {
+    unsafe { if p.is_null() { &MAIN_INTERP } else { &*(p as *const Interp) } }
+}
+unsafe fn interp_of(ts: *mut ThreadState) -> *mut c_void {
+    unsafe {
+        if (*ts).c.interp.is_null() {
+            (*ts).c.interp = interp_ptr();
+        }
+        (*ts).c.interp
+    }
+}
+
+thread_local! {
+    /// This OS thread's GILState thread state.
+    static GILSTATE: Cell<*mut ThreadState> = const { Cell::new(std::ptr::null_mut()) };
+    /// Thread states created by PyThreadState_Ensure: (tstate, ensure depth, previous gilstate).
+    static ENSURED: RefCell<Vec<(usize, usize, usize)>> = const { RefCell::new(Vec::new()) };
+    /// Ensure depth of thread states that were not created by Ensure.
+    static DEPTH: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn gilstate() -> *mut ThreadState {
+    let g = GILSTATE.with(|c| c.get());
+    if g.is_null() {
+        let cur = threads::current_ptr();
+        if !cur.is_null() {
+            GILSTATE.with(|c| c.set(cur));
+        }
+        return cur;
+    }
+    g
+}
+fn attach(ts: *mut ThreadState) {
+    threads::set_current(ts);
+    if !ts.is_null() {
+        unsafe { (*ts).mode.set(ThreadMode::InVm) };
+    }
 }
 
 #[inline]
 fn ts_ptr() -> *mut ThreadState {
     let ts = threads::current_mut();
     unsafe {
-        if (*ts).c.interp.is_null() {
-            (*ts).c.interp = interp_ptr();
-        }
+        interp_of(ts);
+    }
+    if GILSTATE.with(|c| c.get()).is_null() {
+        GILSTATE.with(|c| c.set(ts));
+    }
+    ts
+}
+
+fn new_tstate(interp: *mut c_void) -> *mut ThreadState {
+    let ts = threads::new_thread_state();
+    unsafe {
+        (*ts).c.interp = interp;
+        (*ts).mode.set(ThreadMode::InNative);
     }
     ts
 }
@@ -43,23 +105,16 @@ pub unsafe extern "C" fn PyThreadState_Swap(new: *mut c_void) -> *mut c_void {
     let old = threads::current_ptr();
     unsafe {
         if !old.is_null() {
+            gilstate();
             (*old).mode.set(ThreadMode::InNative);
         }
-        threads::set_current(new as *mut ThreadState);
-        if !new.is_null() {
-            (*(new as *mut ThreadState)).mode.set(ThreadMode::InVm);
-        }
     }
+    attach(new as *mut ThreadState);
     old as *mut c_void
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyThreadState_New(_interp: *mut c_void) -> *mut c_void {
-    let ts = threads::new_thread_state();
-    unsafe {
-        (*ts).c.interp = interp_ptr();
-        (*ts).mode.set(ThreadMode::InNative);
-    }
-    ts as *mut c_void
+pub unsafe extern "C" fn PyThreadState_New(interp: *mut c_void) -> *mut c_void {
+    new_tstate(if interp.is_null() { interp_ptr() } else { interp }) as *mut c_void
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyThreadState_Clear(ts: *mut c_void) {
@@ -119,7 +174,10 @@ pub unsafe extern "C" fn PyThreadState_GetID(ts: *mut c_void) -> u64 {
     unsafe { (*(ts as *mut ThreadState)).c.id }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyThreadState_GetInterpreter(_ts: *mut c_void) -> *mut c_void {
+pub unsafe extern "C" fn PyThreadState_GetInterpreter(ts: *mut c_void) -> *mut c_void {
+    if !ts.is_null() {
+        return unsafe { interp_of(ts as *mut ThreadState) };
+    }
     interp_ptr()
 }
 #[unsafe(no_mangle)]
@@ -164,20 +222,25 @@ pub unsafe extern "C" fn PyUnstable_ThreadState_SetStackProtection(_ts: *mut c_v
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_ThreadState_ResetStackProtection(_ts: *mut c_void) {}
 
+
 // ---------------------------------------------------------------- GIL API (no GIL)
 
 /// PyGILState_LOCKED = 0, PyGILState_UNLOCKED = 1
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyGILState_Ensure() -> c_int {
     unsafe {
-        let had = !threads::current_ptr().is_null();
-        let ts = ts_ptr();
-        if had && (*ts).mode.get() == ThreadMode::InVm {
-            (*ts).c.gilstate_counter += 1;
+        let cur = threads::current_ptr();
+        if !cur.is_null() {
+            (*cur).c.gilstate_counter += 1;
             return 0;
         }
-        (*ts).mode.set(ThreadMode::InVm);
-        (*ts).c.gilstate_counter += 1;
+        let mut g = gilstate();
+        if g.is_null() {
+            g = new_tstate(interp_ptr());
+            GILSTATE.with(|c| c.set(g));
+        }
+        attach(g);
+        (*g).c.gilstate_counter += 1;
         1
     }
 }
@@ -191,25 +254,25 @@ pub unsafe extern "C" fn PyGILState_Release(state: c_int) {
         (*ts).c.gilstate_counter -= 1;
         if state == 1 {
             (*ts).mode.set(ThreadMode::InNative);
+            threads::set_current(std::ptr::null_mut());
         }
     }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyGILState_GetThisThreadState() -> *mut c_void {
-    threads::current_ptr() as *mut c_void
+    gilstate() as *mut c_void
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyGILState_Check() -> c_int {
-    unsafe {
-        let ts = threads::current_ptr();
-        (!ts.is_null() && (*ts).mode.get() == ThreadMode::InVm) as c_int
-    }
+    let ts = threads::current_ptr();
+    (!ts.is_null() && ts == gilstate()) as c_int
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyEval_SaveThread() -> *mut c_void {
     unsafe {
         let ts = ts_ptr();
         (*ts).mode.set(ThreadMode::InNative);
+        threads::set_current(std::ptr::null_mut());
         ts as *mut c_void
     }
 }
@@ -219,8 +282,7 @@ pub unsafe extern "C" fn PyEval_RestoreThread(ts: *mut c_void) {
         if ts.is_null() {
             super::refcount::fatal("PyEval_RestoreThread: NULL thread state");
         }
-        threads::set_current(ts as *mut ThreadState);
-        (*(ts as *mut ThreadState)).mode.set(ThreadMode::InVm);
+        attach(ts as *mut ThreadState);
         // safepoint/handshake poll on re-entering the VM
         crate::gc::safepoint_poll(&*(ts as *mut ThreadState));
     }
@@ -235,6 +297,7 @@ pub unsafe extern "C" fn PyEval_ReleaseThread(ts: *mut c_void) {
         if !ts.is_null() {
             (*(ts as *mut ThreadState)).mode.set(ThreadMode::InNative);
         }
+        threads::set_current(std::ptr::null_mut());
     }
 }
 #[unsafe(no_mangle)]
@@ -244,7 +307,7 @@ pub unsafe extern "C" fn PyEval_InitThreads() {}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInterpreterState_Get() -> *mut c_void {
-    interp_ptr()
+    unsafe { interp_of(ts_ptr()) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInterpreterState_Main() -> *mut c_void {
@@ -259,30 +322,83 @@ pub unsafe extern "C" fn PyInterpreterState_Next(_i: *mut c_void) -> *mut c_void
     std::ptr::null_mut()
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyInterpreterState_ThreadHead(_i: *mut c_void) -> *mut c_void {
-    threads::ALL_THREADS.lock().unwrap().first().map_or(std::ptr::null_mut(), |&t| t as *mut c_void)
+pub unsafe extern "C" fn PyInterpreterState_ThreadHead(i: *mut c_void) -> *mut c_void {
+    let g = threads::ALL_THREADS.lock().unwrap();
+    g.iter()
+        .find(|&&t| unsafe { interp_of(t as *mut ThreadState) } == if i.is_null() { interp_ptr() } else { i })
+        .map_or(std::ptr::null_mut(), |&t| t as *mut c_void)
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyInterpreterState_GetID(_i: *mut c_void) -> i64 {
-    0
+pub unsafe extern "C" fn PyInterpreterState_GetID(i: *mut c_void) -> i64 {
+    unsafe { interp(i).id }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyInterpreterState_GetDict(_i: *mut c_void) -> *mut PyObject {
-    let mut g = INTERP_DICT.lock().unwrap();
-    if *g == 0 {
-        *g = dict::new_dict().into_raw() as usize;
+pub unsafe extern "C" fn PyInterpreterState_GetDict(i: *mut c_void) -> *mut PyObject {
+    unsafe {
+        let mut g = interp(i).dict.lock().unwrap();
+        if *g == 0 {
+            *g = dict::new_dict().into_raw() as usize;
+        }
+        *g as *mut PyObject
     }
-    *g as *mut PyObject
+}
+fn new_interp() -> *mut c_void {
+    let i = Box::leak(Box::new(Interp {
+        id: NEXT_INTERP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        alive: std::sync::atomic::AtomicBool::new(true),
+        dict: Mutex::new(0),
+        atexit: Mutex::new(Vec::new()),
+    }));
+    i as *mut Interp as *mut c_void
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInterpreterState_New() -> *mut c_void {
-    let _ = crate::err!(RuntimeError, "sub-interpreters are not supported");
-    std::ptr::null_mut()
+    new_interp()
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInterpreterState_Clear(_i: *mut c_void) {}
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyInterpreterState_Delete(_i: *mut c_void) {}
+pub unsafe extern "C" fn PyInterpreterState_Delete(i: *mut c_void) {
+    unsafe {
+        if !i.is_null() && i != interp_ptr() {
+            interp(i).alive.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+/// Run (and clear) the PyUnstable_AtExit callbacks of an interpreter.
+pub fn run_interp_atexit(i: *mut c_void) {
+    let v: Vec<(usize, usize)> = std::mem::take(&mut *unsafe { interp(i) }.atexit.lock().unwrap());
+    for (f, d) in v.into_iter().rev() {
+        let f: unsafe extern "C" fn(*mut c_void) = unsafe { std::mem::transmute(f) };
+        unsafe { f(d as *mut c_void) };
+    }
+}
+pub fn add_interp_atexit(i: *mut c_void, f: usize, data: usize) {
+    unsafe { interp(i) }.atexit.lock().unwrap().push((f, data));
+}
+/// Py_NewInterpreter: a new interpreter identity with an attached thread state.
+pub fn new_interpreter() -> *mut c_void {
+    let i = new_interp();
+    let ts = new_tstate(i);
+    attach(ts);
+    GILSTATE.with(|c| c.set(ts));
+    ts as *mut c_void
+}
+pub unsafe fn end_interpreter(ts: *mut c_void) {
+    unsafe {
+        let ts = ts as *mut ThreadState;
+        let i = interp_of(ts);
+        run_interp_atexit(i);
+        interp(i).alive.store(false, std::sync::atomic::Ordering::Release);
+        if threads::current_ptr() == ts {
+            threads::set_current(std::ptr::null_mut());
+        }
+        if GILSTATE.with(|c| c.get()) == ts {
+            GILSTATE.with(|c| c.set(std::ptr::null_mut()));
+        }
+        PyThreadState_Delete(ts as *mut c_void);
+    }
+}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _PyInterpreterState_RequiresIDRef(_i: *mut c_void) -> c_int {
     0
@@ -308,41 +424,137 @@ pub unsafe extern "C" fn _PyInterpreterState_IsSpecializationEnabled(_i: *mut c_
 
 // ---------------------------------------------------------------- PEP 788
 
-static GUARD_TOKEN: u8 = 0;
+/// Guards and views are interpreter pointers.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInterpreterGuard_FromCurrent() -> *mut c_void {
-    &GUARD_TOKEN as *const u8 as *mut c_void
+    unsafe { PyInterpreterState_Get() }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyInterpreterGuard_FromView(_v: *mut c_void) -> *mut c_void {
-    &GUARD_TOKEN as *const u8 as *mut c_void
+pub unsafe extern "C" fn PyInterpreterGuard_FromView(v: *mut c_void) -> *mut c_void {
+    unsafe {
+        if interp(v).alive.load(std::sync::atomic::Ordering::Acquire) { v } else { std::ptr::null_mut() }
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInterpreterGuard_Close(_g: *mut c_void) {}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInterpreterView_FromCurrent() -> *mut c_void {
-    &GUARD_TOKEN as *const u8 as *mut c_void
+    unsafe { PyInterpreterState_Get() }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInterpreterView_FromMain() -> *mut c_void {
-    &GUARD_TOKEN as *const u8 as *mut c_void
+    interp_ptr()
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInterpreterView_Close(_v: *mut c_void) {}
-/// Token: 1 + PyGILState_STATE (never NULL on success).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyThreadState_Ensure(_g: *mut c_void) -> *mut c_void {
-    unsafe { (1 + PyGILState_Ensure() as usize) as *mut c_void }
+
+static DETACHED_TOKEN: u8 = 0;
+
+fn depth_inc(ts: *mut ThreadState) {
+    let created = ENSURED.with(|e| {
+        let mut e = e.borrow_mut();
+        if let Some(x) = e.iter_mut().find(|x| x.0 == ts as usize) {
+            x.1 += 1;
+            true
+        } else {
+            false
+        }
+    });
+    if !created {
+        DEPTH.with(|d| {
+            let mut d = d.borrow_mut();
+            match d.iter_mut().find(|x| x.0 == ts as usize) {
+                Some(x) => x.1 += 1,
+                None => d.push((ts as usize, 1)),
+            }
+        });
+    }
+}
+unsafe fn ensure(i: *mut c_void) -> *mut c_void {
+    unsafe {
+        let i = if i.is_null() { interp_ptr() } else { i };
+        let cur = threads::current_ptr();
+        if !cur.is_null() && interp_of(cur) == i {
+            depth_inc(cur);
+            return cur as *mut c_void;
+        }
+        let g = gilstate();
+        let ts = if !g.is_null() && g != cur && interp_of(g) == i {
+            depth_inc(g);
+            g
+        } else {
+            let t = new_tstate(i);
+            let prev = GILSTATE.with(|c| c.replace(t));
+            ENSURED.with(|e| e.borrow_mut().push((t as usize, 1, prev as usize)));
+            t
+        };
+        attach(ts);
+        if cur.is_null() { &DETACHED_TOKEN as *const u8 as *mut c_void } else { cur as *mut c_void }
+    }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyThreadState_EnsureFromView(_v: *mut c_void) -> *mut c_void {
-    unsafe { (1 + PyGILState_Ensure() as usize) as *mut c_void }
+pub unsafe extern "C" fn PyThreadState_Ensure(g: *mut c_void) -> *mut c_void {
+    unsafe { ensure(g) }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyThreadState_EnsureFromView(v: *mut c_void) -> *mut c_void {
+    unsafe {
+        if !interp(v).alive.load(std::sync::atomic::Ordering::Acquire) {
+            return std::ptr::null_mut();
+        }
+        ensure(v)
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyThreadState_Release(tok: *mut c_void) {
-    unsafe { PyGILState_Release(tok as usize as c_int - 1) }
+    unsafe {
+        let ts = threads::current_ptr();
+        if ts.is_null() {
+            return;
+        }
+        // decrement the ensure depth of the current thread state
+        let created = ENSURED.with(|e| {
+            let mut e = e.borrow_mut();
+            if let Some(pos) = e.iter().position(|x| x.0 == ts as usize) {
+                e[pos].1 -= 1;
+                if e[pos].1 == 0 {
+                    let x = e.remove(pos);
+                    return Some(x.2);
+                }
+                return Some(usize::MAX);
+            }
+            None
+        });
+        if created.is_none() {
+            DEPTH.with(|d| {
+                let mut d = d.borrow_mut();
+                if let Some(pos) = d.iter().position(|x| x.0 == ts as usize) {
+                    d[pos].1 -= 1;
+                    if d[pos].1 == 0 {
+                        d.remove(pos);
+                    }
+                }
+            });
+        }
+        if tok == ts as *mut c_void {
+            return; // nested fast path
+        }
+        let prev = if tok == &DETACHED_TOKEN as *const u8 as *mut c_void { std::ptr::null_mut() } else { tok as *mut ThreadState };
+        if let Some(prev_gil) = created {
+            if prev_gil != usize::MAX {
+                // the thread state was created by Ensure: destroy it
+                if GILSTATE.with(|c| c.get()) == ts {
+                    GILSTATE.with(|c| c.set(prev_gil as *mut ThreadState));
+                }
+                (*ts).mode.set(ThreadMode::InNative);
+                threads::set_current(std::ptr::null_mut());
+                PyThreadState_Delete(ts as *mut c_void);
+            }
+        }
+        (*ts).mode.set(ThreadMode::InNative);
+        attach(prev);
+    }
 }
-
 // ---------------------------------------------------------------- pending calls
 
 static PENDING: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());

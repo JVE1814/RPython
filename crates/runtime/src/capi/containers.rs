@@ -370,9 +370,18 @@ pub unsafe extern "C" fn PySet_New(it: *mut PyObject) -> *mut PyObject {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyFrozenSet_New(it: *mut PyObject) -> *mut PyObject {
     unsafe {
-        match opt(it) {
-            None => ret(set::new_frozenset_from_vec(Vec::new())),
-            Some(i) => ret(ab::call(type_obj(set::frozenset_type()), &[i])),
+        let r = match opt(it) {
+            None => set::new_frozenset_from_vec(Vec::new()),
+            Some(i) => ab::call(type_obj(set::frozenset_type()), &[i]),
+        };
+        match r {
+            Ok(s) => {
+                if !set::set_items(&s).iter().any(|x| crate::gc::is_tracked(x)) {
+                    crate::gc::untrack(s.as_ptr());
+                }
+                s.into_raw()
+            }
+            Err(_) => std::ptr::null_mut(),
         }
     }
 }
@@ -397,7 +406,7 @@ pub unsafe extern "C" fn PySet_Size(o: *mut PyObject) -> Py_ssize_t {
 pub unsafe extern "C" fn PySet_Contains(o: *mut PyObject, k: *mut PyObject) -> c_int {
     unsafe {
         let Ok(s) = chk_anyset(o) else { return -1 };
-        ret_b(ab::contains(s, &*k))
+        ret_b(set::set_contains(s, &*k))
     }
 }
 #[unsafe(no_mangle)]
@@ -409,7 +418,13 @@ pub unsafe extern "C" fn PySet_Add(o: *mut PyObject, k: *mut PyObject) -> c_int 
             let _ = bad_internal();
             return -1;
         }
-        ret_i(set::set_add(s, &*k))
+        if set::set_add(s, &*k).is_err() {
+            return -1;
+        }
+        if set::is_frozenset(s) && crate::gc::is_tracked(&*k) {
+            crate::gc::track(o);
+        }
+        0
     }
 }
 #[unsafe(no_mangle)]

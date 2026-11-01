@@ -44,6 +44,7 @@ static ATEXIT: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 static UNSTABLE_ATEXIT: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
 pub fn run_c_atexit() {
+    super::pystate::run_interp_atexit(super::pystate::interp_ptr());
     let v: Vec<(usize, usize)> = std::mem::take(&mut *UNSTABLE_ATEXIT.lock().unwrap());
     for (f, d) in v.into_iter().rev() {
         let f: unsafe extern "C" fn(*mut c_void) = unsafe { std::mem::transmute(f) };
@@ -94,10 +95,10 @@ pub unsafe extern "C" fn Py_AtExit(f: Option<unsafe extern "C" fn()>) -> c_int {
     }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyUnstable_AtExit(_interp: *mut c_void, f: Option<unsafe extern "C" fn(*mut c_void)>, data: *mut c_void) -> c_int {
+pub unsafe extern "C" fn PyUnstable_AtExit(interp: *mut c_void, f: Option<unsafe extern "C" fn(*mut c_void)>, data: *mut c_void) -> c_int {
     match f {
         Some(f) => {
-            UNSTABLE_ATEXIT.lock().unwrap().push((f as usize, data as usize));
+            super::pystate::add_interp_atexit(interp, f as usize, data as usize);
             0
         }
         None => -1,
@@ -105,18 +106,19 @@ pub unsafe extern "C" fn PyUnstable_AtExit(_interp: *mut c_void, f: Option<unsaf
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Py_NewInterpreter() -> *mut c_void {
-    let _ = crate::err!(RuntimeError, "sub-interpreters are not supported");
-    std::ptr::null_mut()
+    super::pystate::new_interpreter()
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Py_NewInterpreterFromConfig(tstate: *mut *mut c_void, _cfg: *const c_void) -> PyStatus {
     unsafe {
-        *tstate = std::ptr::null_mut();
-        PyStatus_Error(c"sub-interpreters are not supported".as_ptr())
+        *tstate = super::pystate::new_interpreter();
+        PyStatus_Ok()
     }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn Py_EndInterpreter(_ts: *mut c_void) {}
+pub unsafe extern "C" fn Py_EndInterpreter(ts: *mut c_void) {
+    unsafe { super::pystate::end_interpreter(ts) }
+}
 
 unsafe fn run_main_with_args(args: Vec<String>) -> c_int {
     let mut i = 1;

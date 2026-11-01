@@ -553,11 +553,11 @@ unsafe fn skip_unit(ctx: &mut Ctx, u: &[u8]) -> Result<(), ()> {
         };
         // validate modifiers like the real converter would
         let ok_mod = match (u[0], u.get(1).copied()) {
+            (b'w', m) => m == Some(b'*'),
+            (b'e', m) => matches!(m, Some(b's' | b't')) && u.get(2) != Some(&b'*'),
             (_, None) => true,
             (b'O', Some(b'!' | b'&')) => true,
             (b's' | b'z' | b'y', Some(b'#' | b'*')) => true,
-            (b'w', Some(b'*')) => true,
-            (b'e', Some(b's' | b't')) => u.get(2) != Some(&b'*'),
             _ => false,
         };
         if !ok_mod || !b"bBhHiIlkLKncCfdDOpSYUszyweN".contains(&u[0]) && u[0] != b'O' {

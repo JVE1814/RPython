@@ -630,6 +630,9 @@ pub unsafe extern "C" fn PyUnstable_IsImmortal(o: *mut PyObject) -> c_int {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_SetImmortal(o: *mut PyObject) -> c_int {
     unsafe {
+        if (*o).is_immortal() || pystr::is_str(&*o) {
+            return 0;
+        }
         make_immortal(o);
         1
     }
@@ -661,7 +664,11 @@ pub unsafe extern "C" fn PyUnstable_TryIncRef(o: *mut PyObject) -> c_int {
     }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyUnstable_EnableTryIncRef(_o: *mut PyObject) {}
+pub unsafe extern "C" fn PyUnstable_EnableTryIncRef(o: *mut PyObject) {
+    unsafe {
+        let _ = (*o).ob_ref_shared.compare_exchange(0, REF_MAYBE_WEAKREF, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_Object_EnableDeferredRefcount(_o: *mut PyObject) -> c_int {
     0
