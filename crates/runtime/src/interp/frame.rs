@@ -34,6 +34,8 @@ pub struct Frame {
     pub f_trace_opcodes: bool,
     /// Index of the `Send` instruction if suspended inside a yield-from/await loop, else -1.
     pub yield_from_send: i32,
+    /// Instruction index to use for the next exception-table lookup (set by Reraise), or -1.
+    pub unwind_pc: i32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -71,6 +73,7 @@ impl Frame {
             f_trace_lines: true,
             f_trace_opcodes: false,
             yield_from_send: -1,
+            unwind_pc: -1,
         })
     }
 

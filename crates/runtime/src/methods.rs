@@ -22,10 +22,12 @@ fn conjure<F>() -> F {
 
 unsafe extern "C" fn shim_noargs<F: Fn(&PyObject) -> PyResult>(s: *mut PyObject, _a: *mut PyObject) -> *mut PyObject {
     let f: F = conjure();
+    let s = if s.is_null() { crate::types::none::none().as_ptr() } else { s };
     unsafe { into_c(f(&*s)) }
 }
 unsafe extern "C" fn shim_o<F: Fn(&PyObject, &PyObject) -> PyResult>(s: *mut PyObject, a: *mut PyObject) -> *mut PyObject {
     let f: F = conjure();
+    let s = if s.is_null() { crate::types::none::none().as_ptr() } else { s };
     unsafe { into_c(f(&*s, &*a)) }
 }
 unsafe extern "C" fn shim_fast<F: Fn(&PyObject, &[&PyObject]) -> PyResult>(
@@ -34,6 +36,7 @@ unsafe extern "C" fn shim_fast<F: Fn(&PyObject, &[&PyObject]) -> PyResult>(
     n: Py_ssize_t,
 ) -> *mut PyObject {
     let f: F = conjure();
+    let s = if s.is_null() { crate::types::none::none().as_ptr() } else { s };
     unsafe {
         let args: &[&PyObject] = if n == 0 { &[] } else { std::slice::from_raw_parts(a as *const &PyObject, n as usize) };
         into_c(f(&*s, args))
@@ -46,6 +49,7 @@ unsafe extern "C" fn shim_fastkw<F: Fn(&PyObject, &[&PyObject], Option<&PyObject
     kw: *mut PyObject,
 ) -> *mut PyObject {
     let f: F = conjure();
+    let s = if s.is_null() { crate::types::none::none().as_ptr() } else { s };
     unsafe {
         let nkw = if kw.is_null() { 0 } else { crate::types::tuple::tuple_len(&*kw) };
         let total = n as usize + nkw;
