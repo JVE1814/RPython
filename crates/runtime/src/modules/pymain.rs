@@ -362,7 +362,8 @@ pub fn run_main(opts: MainOptions) -> i32 {
             if !opts.safe_path {
                 insert_path0("");
             }
-            let mut src = c.clone().into_bytes();
+            // 3.14+: the -c code is dedented (indented snippets just work)
+            let mut src = dedent_command(c).into_bytes();
             src.push(b'\n');
             outcome_code(run_code_in_main(&src, "<string>"))
         }
@@ -408,3 +409,30 @@ pub fn run_main(opts: MainOptions) -> i32 {
 
 #[allow(dead_code)]
 fn _unused(_: &PyObject, _: PyRef) {}
+
+/// Remove the whitespace prefix common to all non-blank lines of a -c
+/// command (whitespace-only lines become empty).
+fn dedent_command(src: &str) -> String {
+    let blank = |line: &str| line.trim_matches(|c| c == ' ' || c == '\t' || c == '\r').is_empty();
+    let lines: Vec<&str> = src.split('\n').collect();
+    let mut prefix: Option<&str> = None;
+    for line in &lines {
+        if blank(line) {
+            continue;
+        }
+        let indent_len = line.len() - line.trim_start_matches([' ', '\t']).len();
+        let indent = &line[..indent_len];
+        prefix = Some(match prefix {
+            None => indent,
+            Some(p) => {
+                let common = p.bytes().zip(indent.bytes()).take_while(|(a, b)| a == b).count();
+                &p[..common]
+            }
+        });
+    }
+    let prefix = prefix.unwrap_or("");
+    if prefix.is_empty() {
+        return src.to_string();
+    }
+    lines.iter().map(|line| if blank(line) { "" } else { &line[prefix.len()..] }).collect::<Vec<_>>().join("\n")
+}
