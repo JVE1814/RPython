@@ -395,11 +395,20 @@ pub fn lzma2_dict_size(b: u8) -> Option<u32> {
     Some((2 | (b as u32 & 1)) << (b / 2 + 11))
 }
 
-/// Incremental LZMA2 decoder: whole chunks are decoded once they are fully available.
+/// Chunk being decoded.
+enum Chunk {
+    /// Stored data: bytes left to copy.
+    Stored(usize),
+    /// LZMA data: total output at which the chunk ends, packed bytes left, coder state.
+    Lzma { limit: u64, packed_left: usize, rc: Option<(u32, u32)> },
+}
+
+/// Incremental LZMA2 decoder.  Chunks are decoded as their bytes arrive.
 pub struct Lzma2Dec {
     pub model: Option<Model>,
     pub win: Window,
     need_dict_reset: bool,
+    chunk: Option<Chunk>,
     pub done: bool,
     undo: Vec<(*mut u16, u16)>,
 }
@@ -413,95 +422,160 @@ impl Lzma2Dec {
             model: None,
             win: Window::new((dict_size as usize).min(1 << 31)),
             need_dict_reset: true,
+            chunk: None,
             done: false,
             undo: Vec::new(),
         }
     }
 
-    /// Decode whole chunks from `input` while fewer than `target` bytes are pending.
-    /// Returns the bytes consumed.
-    pub fn decode(&mut self, input: &[u8], target: usize) -> Result<usize, Error> {
-        let mut used = 0;
-        while !self.done && self.win.pending() < target {
-            let inp = &input[used..];
-            if inp.is_empty() {
-                break;
+    /// Parse a chunk header at the start of `inp`: returns header bytes consumed (0 if
+    /// incomplete).
+    fn header(&mut self, inp: &[u8]) -> Result<usize, Error> {
+        let ctl = inp[0];
+        if ctl == 0 {
+            self.done = true;
+            return Ok(1);
+        }
+        if ctl == 1 || ctl == 2 {
+            if inp.len() < 3 {
+                return Ok(0);
             }
-            let ctl = inp[0];
-            if ctl == 0 {
-                used += 1;
-                self.done = true;
-                break;
-            }
-            if ctl == 1 || ctl == 2 {
-                if inp.len() < 3 {
-                    break;
-                }
-                let size = (((inp[1] as usize) << 8) | inp[2] as usize) + 1;
-                if inp.len() < 3 + size {
-                    break;
-                }
-                if ctl == 1 {
-                    self.win.reset_dict();
-                    self.need_dict_reset = false;
-                } else if self.need_dict_reset {
-                    return Err(Error::Data);
-                }
-                self.win.append(&inp[3..3 + size]);
-                used += 3 + size;
-                continue;
-            }
-            if ctl < 0x80 {
-                return Err(Error::Data);
-            }
-            let reset = (ctl >> 5) & 3;
-            let hdr = if reset >= 2 { 6 } else { 5 };
-            if inp.len() < hdr {
-                break;
-            }
-            let unpacked = ((((ctl & 0x1F) as usize) << 16) | ((inp[1] as usize) << 8) | inp[2] as usize) + 1;
-            let packed = (((inp[3] as usize) << 8) | inp[4] as usize) + 1;
-            if inp.len() < hdr + packed {
-                break;
-            }
-            if reset == 3 {
+            if ctl == 1 {
                 self.win.reset_dict();
                 self.need_dict_reset = false;
             } else if self.need_dict_reset {
                 return Err(Error::Data);
             }
-            if reset >= 2 {
-                let props = Props::from_byte(inp[5]).ok_or(Error::Data)?;
-                if props.lc + props.lp > 4 {
-                    return Err(Error::Data);
-                }
-                match &mut self.model {
-                    Some(m) => m.reset(props),
-                    None => self.model = Some(Model::new(props)),
-                }
-            } else {
-                match &mut self.model {
-                    Some(m) if reset == 1 => {
-                        let p = m.props;
-                        m.reset(p)
-                    }
-                    Some(_) => {}
-                    None => return Err(Error::Data),
-                }
-            }
-            let chunk = &inp[hdr..hdr + packed];
-            let m = self.model.as_mut().unwrap();
-            let mut rc = RcDec::init(chunk, 0).ok_or(Error::Data)?;
-            let limit = self.win.total + unpacked as u64;
-            match run(m, &mut rc, &mut self.win, usize::MAX, Some(limit), Mode::Exact, &mut self.undo)? {
-                Step::NeedInput if self.win.total == limit => {}
-                _ => return Err(Error::Data),
-            }
-            rc.normalize();
-            if rc.starved || rc.pos != chunk.len() {
+            let size = (((inp[1] as usize) << 8) | inp[2] as usize) + 1;
+            self.chunk = Some(Chunk::Stored(size));
+            return Ok(3);
+        }
+        if ctl < 0x80 {
+            return Err(Error::Data);
+        }
+        let reset = (ctl >> 5) & 3;
+        let hdr = if reset >= 2 { 6 } else { 5 };
+        if inp.len() < hdr {
+            return Ok(0);
+        }
+        let unpacked = ((((ctl & 0x1F) as u64) << 16) | ((inp[1] as u64) << 8) | inp[2] as u64) + 1;
+        let packed = (((inp[3] as usize) << 8) | inp[4] as usize) + 1;
+        if reset == 3 {
+            self.win.reset_dict();
+            self.need_dict_reset = false;
+        } else if self.need_dict_reset {
+            return Err(Error::Data);
+        }
+        if reset >= 2 {
+            let props = Props::from_byte(inp[5]).ok_or(Error::Data)?;
+            if props.lc + props.lp > 4 {
                 return Err(Error::Data);
             }
-            used += hdr + packed;
+            match &mut self.model {
+                Some(m) => m.reset(props),
+                None => self.model = Some(Model::new(props)),
+            }
+        } else {
+            match &mut self.model {
+                Some(m) if reset == 1 => {
+                    let p = m.props;
+                    m.reset(p)
+                }
+                Some(_) => {}
+                None => return Err(Error::Data),
+            }
+        }
+        self.chunk = Some(Chunk::Lzma { limit: self.win.total + unpacked, packed_left: packed, rc: None });
+        Ok(hdr)
+    }
+
+    /// Decode from `input` while fewer than `target` bytes are pending; returns the bytes
+    /// consumed.
+    pub fn decode(&mut self, input: &[u8], target: usize) -> Result<usize, Error> {
+        let mut used = 0;
+        while !self.done && self.win.pending() < target {
+            let inp = &input[used..];
+            match self.chunk.take() {
+                None => {
+                    if inp.is_empty() {
+                        break;
+                    }
+                    let n = self.header(inp)?;
+                    if n == 0 {
+                        break;
+                    }
+                    used += n;
+                }
+                Some(Chunk::Stored(left)) => {
+                    let k = left.min(inp.len());
+                    self.win.append(&inp[..k]);
+                    used += k;
+                    if k < left {
+                        self.chunk = Some(Chunk::Stored(left - k));
+                        break;
+                    }
+                }
+                Some(Chunk::Lzma { limit, packed_left, rc }) => {
+                    let avail = inp.len().min(packed_left);
+                    let complete = avail == packed_left;
+                    let buf = &inp[..avail];
+                    let (mut range, mut code, mut start) = match rc {
+                        Some((r, c)) => (r, c, 0),
+                        None => {
+                            if avail < 5 {
+                                if complete {
+                                    return Err(Error::Data);
+                                }
+                                self.chunk = Some(Chunk::Lzma { limit, packed_left, rc });
+                                break;
+                            }
+                            let r = RcDec::init(buf, 0).ok_or(Error::Data)?;
+                            (r.range, r.code, 5)
+                        }
+                    };
+                    let m = self.model.as_mut().unwrap();
+                    let mut r = RcDec { range, code, buf, pos: start, starved: false, undo: None };
+                    let mut finished = false;
+                    loop {
+                        let mode = if complete {
+                            Mode::Exact
+                        } else if buf.len() - r.pos < 64 {
+                            Mode::Tail
+                        } else {
+                            Mode::Fast
+                        };
+                        match run(m, &mut r, &mut self.win, target, Some(limit), mode, &mut self.undo)? {
+                            Step::End => return Err(Error::Data),
+                            Step::Full => break,
+                            Step::NeedInput => {
+                                if self.win.total >= limit {
+                                    if complete {
+                                        r.normalize();
+                                        if r.starved || r.pos != buf.len() {
+                                            return Err(Error::Data);
+                                        }
+                                        finished = true;
+                                    }
+                                    break;
+                                }
+                                if mode != Mode::Fast {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    range = r.range;
+                    code = r.code;
+                    start = r.pos;
+                    used += start;
+                    if !finished {
+                        self.chunk = Some(Chunk::Lzma { limit, packed_left: packed_left - start, rc: Some((range, code)) });
+                        if self.win.pending() < target {
+                            break;
+                        }
+                    }
+                }
+            }
         }
         Ok(used)
     }

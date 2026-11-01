@@ -162,7 +162,7 @@ fn parse_chain(o: &PyObject) -> PyResult<Vec<FilterSpec>> {
     if !crate::types::list::is_list(o) && !crate::types::tuple::is_tuple(o) && ab::lookup_special(o, name!("__len__"))?.is_none() {
         raise!(TypeError, "filters must be a sequence of filter specifiers");
     }
-    if pystr::is_str(o) || crate::types::bytes::is_bytes(o) {
+    if pystr::is_str(o) || crate::types::bytes::is_bytes(o) || dict::is_dict(o) {
         raise!(TypeError, "filters must be a sequence of filter specifiers");
     }
     let n = ab::length(o)?;

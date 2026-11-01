@@ -43,6 +43,7 @@ class LZMAFile(_streams.BaseStream):
         self._fp = None
         self._closefp = False
         self._mode = _CLOSED
+        self._mode_str = mode
 
         if mode in ("r", "rb"):
             if check != -1:
@@ -67,7 +68,7 @@ class LZMAFile(_streams.BaseStream):
         if isinstance(filename, (str, bytes, os.PathLike)):
             if "b" not in mode:
                 mode += "b"
-            self._fp = builtins.open(filename, mode)
+            self._fp = builtins.open(os.fspath(filename), mode)
             self._closefp = True
         elif hasattr(filename, "read") or hasattr(filename, "write"):
             self._fp = filename
@@ -113,7 +114,7 @@ class LZMAFile(_streams.BaseStream):
 
     @property
     def mode(self):
-        return "wb" if self._mode == _WRITING else "rb"
+        return "wb" if self._mode_str[0] in "wxa" else "rb"
 
     def fileno(self):
         self._check_not_closed()
