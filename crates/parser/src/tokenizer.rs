@@ -324,7 +324,7 @@ impl<'a> Lexer<'a> {
 
     fn lex_normal(&mut self) -> Result<Token, LexError> {
         'nextline: loop {
-            self.blankline = false;
+            // (blankline persists until the end of the line: COMMENT may be returned first)
             if self.atbol {
                 self.atbol = false;
                 self.line_has_tokens = false;
@@ -354,7 +354,8 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 let c = self.peek();
-                if c == b'#' as i32 || c == b'\n' as i32 || c == b'\r' as i32 || c < 0 {
+                self.blankline = c == b'#' as i32 || c == b'\n' as i32 || c == b'\r' as i32 || c < 0;
+                if self.blankline {
                     self.blankline = true;
                 }
                 if !self.blankline && self.parens.is_empty() {
@@ -538,9 +539,7 @@ impl<'a> Lexer<'a> {
         if self.b.is_empty() {
             return 1;
         }
-        if self.implicit_newline {
-            self.lineno
-        } else if self.lineno > 1 {
+        if self.lineno > 1 {
             self.lineno - 1
         } else {
             1
@@ -1481,7 +1480,7 @@ impl<'a> Lexer<'a> {
                 } else if c2 == b'=' as i32 {
                     self.pos += 1;
                     LESSEQUAL
-                } else if c2 == b'>' as i32 {
+                } else if c2 == b'>' as i32 && !self.opts.extra_tokens {
                     self.pos += 1;
                     NOTEQUAL
                 } else {
