@@ -525,7 +525,11 @@ fn asdl_doc(doc: &str) -> String {
     if d.contains(" = ") && !d.contains('(') {
         return d.replace("\n  | ", " | ");
     }
-    d
+    // continuation lines of a sum type line the `|` up under the `=`
+    match d.find(" = ") {
+        Some(i) => d.replace("\n  | ", &format!("\n{}| ", " ".repeat(i + 1))),
+        None => d,
+    }
 }
 
 fn build_state() -> PyResult<State> {

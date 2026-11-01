@@ -44,7 +44,43 @@ impl Mode {
     }
 }
 
+thread_local! {
+    /// Set while the parser runs on this (Python) thread: identifiers are then
+    /// normalized through `unicodedata.normalize`, as CPython does.
+    static PY_NFKC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static NFKC_ERROR: std::cell::RefCell<Option<PyRef>> = const { std::cell::RefCell::new(None) };
+}
+
+fn py_nfkc(s: &str) -> Option<String> {
+    let r = (|| -> PyResult<PyRef> {
+        let ud = crate::import::import_absolute("unicodedata")?;
+        let f = crate::abstract_::getattr_str(&ud, "normalize")?;
+        let v = crate::abstract_::call(&f, &[&pystr::new_str("NFKC"), &pystr::new_str(s)])?;
+        if !pystr::is_str(&v) {
+            crate::raise!(TypeError, "unicodedata.normalize() must return a string, not {}", crate::types::typeobject::tname(&v));
+        }
+        Ok(v)
+    })();
+    match r {
+        Ok(v) => Some(pystr::to_string_lossy(&v)),
+        Err(_) => {
+            let e = take_exc();
+            NFKC_ERROR.with(|c| {
+                if c.borrow().is_none() {
+                    *c.borrow_mut() = e;
+                }
+            });
+            None
+        }
+    }
+}
+
 fn nfkc(s: &str) -> String {
+    if PY_NFKC.with(|c| c.get()) {
+        if let Some(r) = py_nfkc(s) {
+            return r;
+        }
+    }
     let cps: Vec<u32> = s.chars().map(|c| c as u32).collect();
     let out = rpy_unicode::normalize(rpy_unicode::Form::NFKC, &cps);
     out.into_iter().filter_map(char::from_u32).collect()
@@ -278,7 +314,13 @@ pub fn parse_mod(src: Source, o: &Opts) -> PyResult<(rpy_parser::ast::Mod, Strin
         Source::Bytes(b) => std::borrow::Cow::Owned(decode_source(b, o.filename)?),
     };
     let popts = full_parse_options(o);
+    PY_NFKC.with(|c| c.set(true));
     let out = rpy_parser::parse(&text, &popts);
+    PY_NFKC.with(|c| c.set(false));
+    if let Some(e) = NFKC_ERROR.with(|c| c.borrow_mut().take()) {
+        set_exc(e);
+        return Err(PyErr);
+    }
     for w in &out.warnings {
         let cat = format!("{:?}", w.category);
         emit_warning_m(&cat, &w.msg, &w.error_msg, o.filename, w.lineno, w.offset, source_line(&text, w.lineno).as_deref(), o.module)?;
