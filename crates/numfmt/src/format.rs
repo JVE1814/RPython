@@ -109,24 +109,39 @@ impl GroupGen<'_> {
 
 /// CPython's `_PyUnicode_InsertThousandsGrouping`: insert separators into
 /// `digits` (ASCII), zero padding on the left up to `min_width` characters.
-/// Returns the number of characters written.
-fn insert_grouping(out: &mut String, digits: &str, mut min_width: isize, g: &Grouping) -> usize {
+/// Returns the number of characters written.  The output is produced right
+/// to left into a byte buffer (memory proportional to the output only).
+fn insert_grouping(
+    out: &mut String,
+    digits: &str,
+    mut min_width: isize,
+    g: &Grouping,
+) -> Result<usize, NumFmtError> {
     let sep_len = g.sep.chars().count() as isize;
-    let mut segs: [(isize, isize); 128] = [(0, 0); 128];
-    let mut segs_vec: Vec<(isize, isize)> = Vec::new();
-    let mut nseg = 0usize;
-    let mut push = |seg: (isize, isize), nseg: &mut usize| {
-        if *nseg < segs.len() {
-            segs[*nseg] = seg;
-        } else {
-            if segs_vec.is_empty() {
-                segs_vec.extend_from_slice(&segs);
-            }
-            segs_vec.push(seg);
+    let sepb = g.sep.as_bytes();
+    let db = digits.as_bytes();
+    let base = db.len().saturating_add(min_width.max(0) as usize);
+    let smallest = g.sizes.iter().copied().filter(|&s| s > 0 && s < 127).min().unwrap_or(1) as usize;
+    let estimate = base.saturating_add((base / smallest).saturating_mul(sepb.len())).saturating_add(16);
+    let mut rev: Vec<u8> = Vec::new();
+    rev.try_reserve(estimate)
+        .map_err(|_| NumFmtError { kind: crate::ErrorKind::MemoryError, msg: String::new() })?;
+    let mut end = db.len();
+    let mut written = 0usize;
+    let mut first = true;
+    let mut emit = |n_zeros: isize, n_chars: isize, rev: &mut Vec<u8>| {
+        if !first {
+            rev.extend(sepb.iter().rev());
+            written += sep_len as usize;
         }
-        *nseg += 1;
+        first = false;
+        let n_chars = n_chars as usize;
+        rev.extend(db[end - n_chars..end].iter().rev());
+        end -= n_chars;
+        rev.extend(core::iter::repeat_n(b'0', n_zeros as usize));
+        written += n_chars + n_zeros as usize;
     };
-    let mut remaining = digits.len() as isize;
+    let mut remaining = db.len() as isize;
     let mut groups = GroupGen { sizes: g.sizes, idx: 0, previous: 0 };
     let mut broken = false;
     loop {
@@ -137,7 +152,7 @@ fn insert_grouping(out: &mut String, digits: &str, mut min_width: isize, g: &Gro
         let l = l0.min(remaining.max(min_width).max(1));
         let n_zeros = (l - remaining).max(0);
         let n_chars = remaining.min(l).max(0);
-        push((n_zeros, n_chars), &mut nseg);
+        emit(n_zeros, n_chars, &mut rev);
         remaining -= n_chars;
         min_width -= l;
         if remaining <= 0 && min_width <= 0 {
@@ -150,24 +165,13 @@ fn insert_grouping(out: &mut String, digits: &str, mut min_width: isize, g: &Gro
         let l = remaining.max(min_width).max(1);
         let n_zeros = (l - remaining).max(0);
         let n_chars = remaining.min(l).max(0);
-        push((n_zeros, n_chars), &mut nseg);
+        emit(n_zeros, n_chars, &mut rev);
     }
-    let segs: &[(isize, isize)] = if nseg <= 128 { &segs[..nseg] } else { &segs_vec };
-    let mut written = 0usize;
-    let mut idx = 0usize;
-    for (k, &(z, c)) in segs.iter().rev().enumerate() {
-        if k > 0 {
-            out.push_str(g.sep);
-            written += sep_len as usize;
-        }
-        for _ in 0..z {
-            out.push('0');
-        }
-        out.push_str(&digits[idx..idx + c as usize]);
-        idx += c as usize;
-        written += (z + c) as usize;
-    }
-    written
+    rev.reverse();
+    try_reserve(out, rev.len())?;
+    // SAFETY: ASCII digits plus whole (reversed twice) UTF-8 separators.
+    out.push_str(unsafe { core::str::from_utf8_unchecked(&rev) });
+    Ok(written)
 }
 
 fn frac_grouped_len(n: usize) -> usize {
@@ -253,7 +257,7 @@ fn render_number(
         grouped.push_str(p.digits);
         p.digits.len()
     } else {
-        insert_grouping(&mut grouped, p.digits, min_width, grouping)
+        insert_grouping(&mut grouped, p.digits, min_width, grouping)?
     };
     let total = non_digit + n_grouped;
     let n_pad = match width {
