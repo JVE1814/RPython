@@ -161,4 +161,9 @@ provider from its `unicodedata` tables:
 * `tests/test_re.rs`: port of test_re.py (106 test functions; everything that
   concerns the engine, parser errors, templates, split/sub/findall rules).
 * `tests/stress.rs`: 10^6-char inputs, code-unit widths, locale provider
-  switching at match time, pos/endpos.
+  switching at match time, pos/endpos, empty-match rules, scanner.match.
+
+Not covered: `re.DEBUG` dump (test_re DebugTests compare CPython bytecode
+listings), `_fail_after` (debug-build only), everything that lives in the
+Python-level `re` module (repr, pickling, caching, Scanner class, argument
+handling, warnings for positional count/maxsplit).

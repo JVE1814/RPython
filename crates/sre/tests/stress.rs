@@ -146,3 +146,22 @@ fn pos_endpos_semantics() {
     assert!(c("").search(&cp("abc"), 2, 1).is_none());
     assert!(c("").match_at(&cp("abc"), 5, 10).unwrap().spans[0] == (3, 3));
 }
+
+#[test]
+fn empty_match_rules() {
+    assert_eq!(sub("x*", "-", "abxd"), "-a-b--d-");
+    assert_eq!(findall(r"\d*", "a12"), strs(&["", "12", ""]));
+    assert_eq!(split("x*", "axbc"), somes(&["", "a", "", "b", "c", ""]));
+    assert_eq!(re_match("(a)|(b)", "b").unwrap().lastindex(), Some(2));
+    assert!(re_fullmatch(r"(?x)a\ b", "a b").is_some());
+    assert!(re_match_f("\u{df}", "\u{1e9e}", IGNORECASE).is_some());
+    assert!(re_match_f("\u{1e9e}", "\u{df}", IGNORECASE).is_some());
+    // scanner.match
+    let p = c(r"\w+|\s+");
+    let v = cp("ab  cd");
+    let mut sc = p.scanner(&v, 0, usize::MAX);
+    assert_eq!(sc.match_().unwrap().spans[0], (0, 2));
+    assert_eq!(sc.match_().unwrap().spans[0], (2, 4));
+    assert_eq!(sc.match_().unwrap().spans[0], (4, 6));
+    assert!(sc.match_().is_none());
+}

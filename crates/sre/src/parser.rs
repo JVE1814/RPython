@@ -281,7 +281,6 @@ fn flag_of(c: u32) -> Option<u32> {
 }
 
 const TYPE_FLAGS: u32 = ASCII | LOCALE | UNICODE;
-const GLOBAL_FLAGS: u32 = 0; // DEBUG is not an inline flag; no global-only inline flags remain
 
 fn digits_value(v: &[u32]) -> u128 {
     let mut n: u128 = 0;
@@ -942,9 +941,6 @@ impl<'p> Parser<'p> {
             self.flags |= add;
             return Ok(None);
         }
-        if add & GLOBAL_FLAGS != 0 {
-            return Err(src.error("bad inline flags: cannot turn on global flag", 1));
-        }
         if ch.is('-') {
             let Some(t) = src.get()? else {
                 return Err(src.error("missing flag", 0));
@@ -983,9 +979,6 @@ impl<'p> Parser<'p> {
                     return Err(src.error(msg, ch.len()));
                 }
             }
-        }
-        if del & GLOBAL_FLAGS != 0 {
-            return Err(src.error("bad inline flags: cannot turn off global flag", 1));
         }
         if add & del != 0 {
             return Err(src.error("bad inline flags: flag turned on and off", 1));
