@@ -135,9 +135,25 @@ class zipimporter(_bootstrap_external._LoaderBasics):
         return _member_data(self.archive, entry)
 
     def get_filename(self, fullname):
-        """Return the __file__ value the module would get."""
-        _, _, modpath = _load_code(self, fullname)
-        return modpath
+        """Return the __file__ value the module would get (without
+        compiling anything)."""
+        relpath = _module_relpath(self, fullname)
+        files = self._get_files()
+        for suffix, is_bytecode, _ in _SEARCH_ORDER:
+            candidate = relpath + suffix
+            entry = files.get(candidate)
+            if entry is None:
+                continue
+            if is_bytecode:
+                # A stale or invalid .pyc is skipped, as get_code() does.
+                try:
+                    data = _member_data(self.archive, entry)
+                    if _check_pyc(self, candidate, fullname, data) is None:
+                        continue
+                except ImportError:
+                    continue
+            return entry[0]
+        raise ZipImportError(f"can't find module {fullname!r}", name=fullname)
 
     def get_source(self, fullname):
         """Return the source of *fullname* as str, or None when only
@@ -308,10 +324,7 @@ def _read_directory(archive):
                 raise ZipImportError(f"bad file name in {archive!r}",
                                      path=archive) from e
         else:
-            try:
-                name = raw_name.decode('cp437')
-            except (UnicodeDecodeError, LookupError):
-                name = raw_name.decode('latin1')
+            name = _decode_cp437(raw_name)
         name = name.replace('/', path_sep)
         full = _bootstrap_external._path_join(archive, name)
         files[name] = (full, compress, data_size, file_size,
@@ -401,6 +414,28 @@ def _add_implicit_directories(files):
             d = path_sep.join(parts[:i]) + path_sep
             if d not in files:
                 files[d] = None
+
+
+# Upper half of code page 437 (the legacy ZIP name encoding).  Decoded here
+# without the codec machinery: importing an encoding module could itself
+# require this importer.
+_CP437_HIGH = (
+    '\xc7\xfc\xe9\xe2\xe4\xe0\xe5\xe7\xea\xeb\xe8\xef\xee\xec\xc4\xc5'
+    '\xc9\xe6\xc6\xf4\xf6\xf2\xfb\xf9\xff\xd6\xdc\xa2\xa3\xa5₧ƒ'
+    '\xe1\xed\xf3\xfa\xf1\xd1\xaa\xba\xbf⌐\xac\xbd\xbc\xa1\xab\xbb'
+    '░▒▓│┤╡╢╖╕╣║╗╝╜╛┐'
+    '└┴┬├─┼╞╟╚╔╩╦╠═╬╧'
+    '╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀'
+    'α\xdfΓπΣσ\xb5τΦΘΩδ∞φε∩'
+    '≡\xb1≥≤⌠⌡\xf7≈\xb0∙\xb7√ⁿ\xb2■\xa0'
+)
+
+
+def _decode_cp437(raw):
+    try:
+        return raw.decode('ascii')
+    except UnicodeDecodeError:
+        return ''.join(chr(b) if b < 128 else _CP437_HIGH[b - 128] for b in raw)
 
 
 def _u16(b, i):
@@ -566,6 +601,17 @@ def _source_of_pyc(importer, pyc_path):
 
 def _code_from_pyc(importer, pathname, fullpath, fullname, data):
     """Validate a .pyc payload and unmarshal it; None if it is stale."""
+    if _check_pyc(importer, fullpath, fullname, data) is None:
+        return None
+    code = marshal.loads(data[16:])
+    if not isinstance(code, _bootstrap_external._code_type):
+        raise TypeError(f'compiled module {pathname!r} is not a code object')
+    return code
+
+
+def _check_pyc(importer, fullpath, fullname, data):
+    """True if the .pyc header is valid and matches its source (when the
+    source is present); None if stale; ImportError if malformed."""
     details = {'name': fullname, 'path': fullpath}
     flags = _bootstrap_external._classify_pyc(data, fullname, details)
     if flags & 0b1:
@@ -588,10 +634,7 @@ def _code_from_pyc(importer, pathname, fullpath, fullname, data):
                 _bootstrap._verbose_message(
                     'bytecode is stale for {!r}', fullname)
                 return None
-    code = marshal.loads(data[16:])
-    if not isinstance(code, _bootstrap_external._code_type):
-        raise TypeError(f'compiled module {pathname!r} is not a code object')
-    return code
+    return True
 
 
 def _code_from_source(pathname, source):
