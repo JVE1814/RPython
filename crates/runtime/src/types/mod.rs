@@ -42,6 +42,7 @@ pub mod core_slots;
 pub mod dictview;
 pub mod float_math;
 pub mod str_sub;
+pub mod str_methods;
 
 use crate::ffi::PyTypeObject;
 
@@ -135,6 +136,7 @@ pub fn init_all() -> crate::errors::PyResult<()> {
     }
     exceptions::ready_all()?;
     dictview::ready()?;
+    str_methods::ready_types()?;
     Ok(())
 }
 pub mod complex_pow;
