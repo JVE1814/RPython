@@ -142,7 +142,19 @@ pub fn isinstance_exact_or_sub(o: &PyObject, tp: *mut PyTypeObject) -> bool {
 }
 
 /// Look up `name` along the MRO (no descriptors invoked). `name` must be a str.
+/// Results are memoised in the global method cache keyed on the type version tag
+/// (jit workstream, interp/cache.rs).
 pub fn lookup(tp: *mut PyTypeObject, name: &PyObject) -> Option<PyRef> {
+    if let Some(r) = crate::interp::cache::mc_lookup(tp, name) {
+        return r;
+    }
+    let tag = crate::interp::cache::assign_type_tag(tp);
+    let r = lookup_uncached(tp, name);
+    crate::interp::cache::mc_store(tag, name, r.as_deref());
+    r
+}
+
+fn lookup_uncached(tp: *mut PyTypeObject, name: &PyObject) -> Option<PyRef> {
     unsafe {
         let mro = (*tp).tp_mro;
         if mro.is_null() {
@@ -630,6 +642,7 @@ pub fn type_ready(tp: *mut PyTypeObject) -> PyResult<()> {
             add_subclass(as_type(b), tp);
         }
         (*tp).tp_flags = ((*tp).tp_flags & !Py_TPFLAGS_READYING) | Py_TPFLAGS_READY;
+        crate::interp::cache::watch_type_dict(tp); // jit: dict writes invalidate caches
         Ok(())
     }
 }
