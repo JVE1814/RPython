@@ -49,6 +49,7 @@ pub mod pymain;
 pub mod text_util;
 pub mod _sre;
 pub mod _codecs;
+pub mod cjk;
 pub mod codec_impl;
 pub mod codec_charmap;
 pub mod unicodedata;

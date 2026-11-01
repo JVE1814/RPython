@@ -1,0 +1,11 @@
+[package]
+name = "gencjk"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone generator (not part of the main workspace): turns the public CJK
+# mapping tables (see fetch.sh) into crates/runtime/src/modules/cjk/data_*.rs.
+[workspace]
+
+[dependencies]

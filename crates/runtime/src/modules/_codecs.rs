@@ -154,6 +154,33 @@ pub fn lookup(encoding: &str) -> PyResult {
     raise!(LookupError, "unknown encoding: {}", encoding)
 }
 
+/// `codecs.lookup(name)` for a str object, which may contain lone
+/// surrogates (such names are never cached and normally unknown).
+pub fn lookup_obj(name: &PyObject) -> PyResult {
+    if let Some(s) = pystr::to_string_strict(name) {
+        return lookup(&s);
+    }
+    ensure_encodings_imported()?;
+    tu::warn(exc::DeprecationWarning(), "Support for non-ascii encoding names will be removed in 3.17", 1)?;
+    let key: Vec<u32> = pystr::str_data(name)
+        .iter()
+        .map(|c| if c == b' ' as u32 { b'-' as u32 } else if c < 0x80 { (c as u8).to_ascii_lowercase() as u32 } else { c })
+        .collect();
+    let k = pystr::from_codepoints(&key);
+    let funcs = REGISTRY.lock().unwrap().search.clone();
+    for f in funcs {
+        let res = ab::call(&f, &[&k])?;
+        if none::is_none(&res) {
+            continue;
+        }
+        if !tuple::is_tuple(&res) || tuple::tuple_len(&res) != 4 {
+            raise!(TypeError, "codec search functions must return 4-tuples");
+        }
+        return Ok(res);
+    }
+    raise!(LookupError, "unknown encoding: {}", pystr::to_string_lossy(name))
+}
+
 // =====================================================================================
 // Error handler kinds and the built-in handler logic
 // =====================================================================================
@@ -800,6 +827,10 @@ fn add_note(op: &str, encoding: &str) {
 
 fn lookup_text_codec(encoding: &str, alternate: &str) -> PyResult {
     let info = lookup(encoding)?;
+    check_text_codec(info, encoding, alternate)
+}
+
+fn check_text_codec(info: PyRef, encoding: &str, alternate: &str) -> PyResult {
     if let Some(v) = ab::getattr_opt(&info, crate::name!("_is_text_encoding"))? {
         if !ab::is_true(&v)? {
             raise!(LookupError, "'{}' is not a text encoding; use {} to handle arbitrary codecs", tu::trunc_chars(encoding, 400), alternate);
@@ -831,7 +862,7 @@ fn call_codec(func: &PyObject, obj: &PyObject, errors: Option<&str>, op: &str, e
 
 /// `str.encode(encoding, errors)`.
 pub fn encode_text(s: &PyObject, encoding: &str, errors: &str) -> PyResult {
-    if let Some(f) = fast_codec(encoding) {
+    if let Some(f) = if encoding.is_ascii() { fast_codec(encoding) } else { None } {
         let mut ctx = EncCtx::new(
             match f {
                 Fast::Utf8 => "utf-8",
@@ -853,6 +884,17 @@ pub fn encode_text(s: &PyObject, encoding: &str, errors: &str) -> PyResult {
         return Ok(bytes::new_bytes(&v));
     }
     let info = lookup_text_codec(encoding, "codecs.encode()")?;
+    encode_with(s, &info, encoding, errors)
+}
+
+/// `str.encode` with an encoding name that contains lone surrogates.
+pub fn encode_text_obj(s: &PyObject, name: &PyObject, errors: &str) -> PyResult {
+    let encoding = pystr::to_string_lossy(name);
+    let info = check_text_codec(lookup_obj(name)?, &encoding, "codecs.encode()")?;
+    encode_with(s, &info, &encoding, errors)
+}
+
+fn encode_with(s: &PyObject, info: &PyObject, encoding: &str, errors: &str) -> PyResult {
     let enc = tuple::tuple_get(&info, 0).to_ref();
     let v = call_codec(&enc, s, Some(errors), "encoding", encoding)?;
     if bytes::is_bytes(&v) {
@@ -872,7 +914,7 @@ pub fn encode_text(s: &PyObject, encoding: &str, errors: &str) -> PyResult {
 /// `bytes.decode(encoding, errors)`; `obj` is the original object (for the
 /// registry path), `data` its contents.
 pub fn decode_text(data: &[u8], obj: Option<&PyObject>, encoding: &str, errors: &str) -> PyResult {
-    if let Some(f) = fast_codec(encoding) {
+    if let Some(f) = if encoding.is_ascii() { fast_codec(encoding) } else { None } {
         let name = match f {
             Fast::Utf8 => "utf-8",
             Fast::Utf16 => "utf-16",
@@ -890,6 +932,17 @@ pub fn decode_text(data: &[u8], obj: Option<&PyObject>, encoding: &str, errors: 
         };
     }
     let info = lookup_text_codec(encoding, "codecs.decode()")?;
+    decode_with(data, obj, &info, encoding, errors)
+}
+
+/// `bytes.decode` with an encoding name that contains lone surrogates.
+pub fn decode_text_obj(data: &[u8], obj: Option<&PyObject>, name: &PyObject, errors: &str) -> PyResult {
+    let encoding = pystr::to_string_lossy(name);
+    let info = check_text_codec(lookup_obj(name)?, &encoding, "codecs.decode()")?;
+    decode_with(data, obj, &info, &encoding, errors)
+}
+
+fn decode_with(data: &[u8], obj: Option<&PyObject>, info: &PyObject, encoding: &str, errors: &str) -> PyResult {
     let dec = tuple::tuple_get(&info, 1).to_ref();
     let tmp;
     let o = match obj {
@@ -1015,7 +1068,7 @@ fn m_unregister(_m: &PyObject, f: &PyObject) -> PyResult {
 
 fn m_lookup(_m: &PyObject, e: &PyObject) -> PyResult {
     let e = str_arg(e, "lookup", 1)?;
-    lookup(pystr::as_utf8(e)?)
+    lookup_obj(e)
 }
 
 fn m_forget_codec(_m: &PyObject, e: &PyObject) -> PyResult {
