@@ -370,6 +370,30 @@ pub unsafe fn clear_weakrefs_at(o: *mut PyObject, list: *mut *mut PyObject) {
 /// With `callbacks_only`, only weakrefs that have a callback are cleared (the GC
 /// does this before running finalizers; plain weakrefs are cleared afterwards).
 pub unsafe fn clear_weakrefs_for_gc(garbage: &[*mut PyObject], callbacks_only: bool) {
+    unsafe { detach_weakrefs_for_gc(garbage, callbacks_only).finish() }
+}
+
+/// Weakrefs detached by the collector whose callbacks have not run yet.
+#[derive(Default)]
+pub struct DetachedWeakrefs {
+    pending: Vec<(PyRef, PyRef)>,
+    dropped: Vec<PyRef>,
+}
+
+impl DetachedWeakrefs {
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty() && self.dropped.is_empty()
+    }
+    /// Run the callbacks and release the dropped ones (may run Python code).
+    pub unsafe fn finish(self) {
+        drop(self.dropped);
+        unsafe { run_callbacks(self.pending) };
+    }
+}
+
+/// First half of `clear_weakrefs_for_gc`: detach the weakrefs without running
+/// any Python code or releasing anything (usable while the world is stopped).
+pub unsafe fn detach_weakrefs_for_gc(garbage: &[*mut PyObject], callbacks_only: bool) -> DetachedWeakrefs {
     unsafe {
         let set: std::collections::HashSet<usize> = garbage.iter().map(|&p| p as usize).collect();
         let mut pending: Vec<(PyRef, PyRef)> = Vec::new();
@@ -403,8 +427,7 @@ pub unsafe fn clear_weakrefs_for_gc(garbage: &[*mut PyObject], callbacks_only: b
                 }
             }
         }
-        drop(dropped);
-        run_callbacks(pending);
+        DetachedWeakrefs { pending, dropped }
     }
 }
 

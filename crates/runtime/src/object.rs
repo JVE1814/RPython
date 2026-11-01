@@ -159,16 +159,17 @@ pub unsafe fn decref_shared(op: *mut PyObject) {
         let o = &*op;
         let mut cur = o.ob_ref_shared.load(Relaxed);
         loop {
-            let new = cur - (1 << REF_SHARED_SHIFT);
-            let mut target = new;
-            let mut queue = false;
-            if (new >> REF_SHARED_SHIFT) < 0 && (cur & REF_SHARED_FLAG_MASK) != REF_MERGED
-                && (cur & REF_SHARED_FLAG_MASK) != REF_QUEUED
-            {
-                // The owner still holds local references; ask it to merge.
-                target = (new & !REF_SHARED_FLAG_MASK) | REF_QUEUED;
-                queue = true;
-            }
+            let flags = cur & REF_SHARED_FLAG_MASK;
+            let queue = (cur >> REF_SHARED_SHIFT) <= 0 && flags != REF_MERGED && flags != REF_QUEUED;
+            let target = if queue {
+                // The reference being dropped is part of the owner's local count.
+                // Hand it to the owner's merge queue instead of decrementing: the
+                // queue entry keeps the object alive until the owner merges (a
+                // queued object must never be freed before the queue is drained).
+                (cur & !REF_SHARED_FLAG_MASK) | REF_QUEUED
+            } else {
+                cur - (1 << REF_SHARED_SHIFT)
+            };
             match o.ob_ref_shared.compare_exchange_weak(cur, target, AcqRel, Relaxed) {
                 Ok(_) => {
                     if queue {
@@ -189,12 +190,22 @@ pub unsafe fn decref_shared(op: *mut PyObject) {
 /// Merge an object's local count into the shared count (owner thread only,
 /// or any thread at a safepoint when the owner has exited).
 pub unsafe fn explicit_merge(op: *mut PyObject) {
+    unsafe { merge_with_delta(op, 0) }
+}
+
+/// Merge an object taken from a merge queue: the queue entry owned one reference
+/// (see `decref_shared`), which is released by the merge.
+pub unsafe fn merge_queued(op: *mut PyObject) {
+    unsafe { merge_with_delta(op, -1) }
+}
+
+unsafe fn merge_with_delta(op: *mut PyObject, delta: isize) {
     unsafe {
         let o = &*op;
         if o.is_immortal() {
             return;
         }
-        let local = o.ob_ref_local.load(Relaxed) as isize;
+        let local = o.ob_ref_local.load(Relaxed) as isize + delta;
         o.ob_ref_local.store(0, Relaxed);
         o.ob_tid.store(0, Relaxed);
         let mut cur = o.ob_ref_shared.load(Relaxed);
