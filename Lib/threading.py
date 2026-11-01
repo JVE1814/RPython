@@ -1,9 +1,19 @@
-"""Thread module emulating a subset of Java's threading model."""
+"""Higher-level threading interface on top of _thread: Thread, locks,
+conditions, semaphores, events, barriers, timers and thread-local data."""
 
 import os as _os
 import sys as _sys
 import _thread
-import _contextvars
+try:
+    import _contextvars
+except ImportError:
+    class _contextvars:
+        class Context:
+            def run(self, func, *args, **kwargs):
+                return func(*args, **kwargs)
+        @staticmethod
+        def copy_context():
+            return _contextvars.Context()
 
 from time import monotonic as _time
 from _weakrefset import WeakSet
