@@ -1,7 +1,7 @@
 """Base classes for SAX event handlers, and the feature and property
 names of SAX 2."""
 
-version = '2.0beta'
+_VERSION = '2.0beta'
 
 
 class ErrorHandler:
@@ -127,3 +127,12 @@ all_properties = [property_lexical_handler,
                   property_xml_string,
                   property_encoding,
                   property_interning_dict]
+
+def __getattr__(name):
+    # the module version attribute is kept only for compatibility
+    if name == "version":
+        import warnings
+        warnings.warn("'version' is deprecated and slated for removal in "
+                      "Python 3.20", DeprecationWarning, stacklevel=2)
+        return _VERSION
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

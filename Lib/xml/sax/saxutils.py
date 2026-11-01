@@ -132,9 +132,9 @@ class XMLGenerator(handler.ContentHandler):
         if qualify:
             for prefix, uri in self._undeclared_ns_maps:
                 if prefix:
-                    self._write(' xmlns:%s="%s"' % (prefix, uri))
+                    self._write(' xmlns:%s=%s' % (prefix, quoteattr(uri)))
                 else:
-                    self._write(' xmlns="%s"' % uri)
+                    self._write(' xmlns=%s' % quoteattr(uri))
             self._undeclared_ns_maps = []
         for key, value in attrs.items():
             if qualify:

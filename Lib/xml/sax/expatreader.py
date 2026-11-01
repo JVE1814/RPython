@@ -1,6 +1,6 @@
 """SAX driver for the expat parser."""
 
-version = "0.20"
+_VERSION = "0.20"
 
 from xml.sax._exceptions import *
 from xml.sax.handler import feature_validation, feature_namespaces
@@ -382,3 +382,12 @@ class ExpatParser(xmlreader.IncrementalParser, xmlreader.Locator):
 
 def create_parser(*args, **kwargs):
     return ExpatParser(*args, **kwargs)
+
+def __getattr__(name):
+    # the module version attribute is kept only for compatibility
+    if name == "version":
+        import warnings
+        warnings.warn("'version' is deprecated and slated for removal in "
+                      "Python 3.20", DeprecationWarning, stacklevel=2)
+        return _VERSION
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
