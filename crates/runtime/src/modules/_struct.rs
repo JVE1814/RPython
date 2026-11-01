@@ -611,6 +611,10 @@ impl Fmt {
 #[repr(C)]
 pub struct StructObj {
     ob_base: PyObject,
+    /// Packed size and number of items, right after the header: C test helpers
+    /// (_testbuffer) read them directly from the object.
+    s_size: isize,
+    s_len: isize,
     st: *mut StructState,
 }
 struct StructState {
@@ -671,6 +675,10 @@ fn build_state(f: &PyObject) -> PyResult<Box<StructState>> {
 unsafe fn set_state(o: &PyObject, st: Option<Box<StructState>>) {
     unsafe {
         let so = &mut *(o.as_ptr() as *mut StructObj);
+        (so.s_size, so.s_len) = match &st {
+            Some(s) => (s.fmt.size as isize, s.fmt.nitems as isize),
+            None => (0, 0),
+        };
         let old = std::mem::replace(&mut so.st, st.map(Box::into_raw).unwrap_or(std::ptr::null_mut()));
         if !old.is_null() {
             drop(Box::from_raw(old));

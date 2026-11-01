@@ -547,7 +547,7 @@ pub fn os_urandom(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     if n < 0 {
         raise!(ValueError, "negative argument not allowed");
     }
-    let mut buf = vec![0u8; n as usize];
+    let mut buf = crate::errors::try_zeroed_vec(n as usize)?;
     fill_random(&mut buf)?;
     Ok(bytes::new_bytes(&buf))
 }
@@ -578,7 +578,7 @@ pub fn os_getrandom(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) ->
         Some(f) => c_int(f)? as u32,
         None => 0,
     };
-    let mut buf = vec![0u8; n as usize];
+    let mut buf = crate::errors::try_zeroed_vec(n as usize)?;
     let r = retry_eintr(-1, || unsafe { libc::getrandom(buf.as_mut_ptr() as *mut libc::c_void, n as usize, flags) })?;
     if r < 0 {
         return Err(os_err());

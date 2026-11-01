@@ -720,6 +720,14 @@ impl<'a> Gen<'a> {
             self.a.mov_ri(Rdx, tp);
             self.a.cmp_rm(Rdx, M(Rax, OB_TYPE));
             self.a.jcc(Cc::NE, if is_list { not_list } else { slow });
+            if is_list {
+                // lock-free item reads only while the process is single-threaded
+                // (a concurrent writer may free the item array): the helper
+                // reads under the list lock otherwise
+                self.a.mov_ri(Rdx, (&raw const crate::threads::MULTI_THREADED) as i64);
+                self.a.cmp_mi(M(Rdx, 0), 0);
+                self.a.jcc(Cc::NE, slow);
+            }
             self.a.load(Rdx, M(Rax, LIST_SIZE));
             let pos = self.a.label();
             self.a.test_rr(Rsi, Rsi);
@@ -784,6 +792,10 @@ impl<'a> Gen<'a> {
             self.a.mov_ri(Rcx, (&raw mut crate::types::list::PyListIter_Type) as i64);
             self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
             self.a.jcc(Cc::NE, not_list);
+            // single-threaded only (see binary_subscr)
+            self.a.mov_ri(Rdx, (&raw const crate::threads::MULTI_THREADED) as i64);
+            self.a.cmp_mi(M(Rdx, 0), 0);
+            self.a.jcc(Cc::NE, generic);
             self.a.load(Rdx, M(Rax, 40));
             self.a.test_rr(Rdx, Rdx);
             self.a.jcc(Cc::E, generic);

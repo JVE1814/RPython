@@ -130,6 +130,8 @@ pub fn current_ptr() -> *mut ThreadState {
 fn attach_new() -> &'static ThreadState {
     let ts = new_thread_state();
     CURRENT.with(|c| c.set(ts));
+    // new states start in a safe mode; entering the VM honours a stopped world
+    unsafe { (*ts).mode.set(ThreadMode::InVm) };
     unsafe { &*ts }
 }
 
@@ -147,7 +149,7 @@ pub fn new_thread_state() -> *mut ThreadState {
         c.py_recursion_remaining = limit;
         let st = ThreadState {
             c,
-            mode: ModeCell(std::sync::atomic::AtomicU8::new(ThreadMode::InVm as u8)),
+            mode: ModeCell(std::sync::atomic::AtomicU8::new(ThreadMode::Blocked as u8)),
             merge_queue: Mutex::new(Vec::new()),
             frame: Cell::new(std::ptr::null_mut()),
             recursion_depth: Cell::new(0),
@@ -176,12 +178,29 @@ pub fn new_thread_state() -> *mut ThreadState {
             None => Box::into_raw(Box::new(st)),
         };
         (*ts).c.exc_info = &mut (*ts).c.exc_state;
-        ALL_THREADS.lock().unwrap().push(ts as usize);
+        {
+            let mut all = ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+            if !all.is_empty() {
+                MULTI_THREADED.store(1, SeqCst);
+            }
+            all.push(ts as usize);
+        }
         ts
     }
 }
 
 pub(crate) static FREE_STATES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// 1 once a second thread state was ever created (never reset). Container fast
+/// paths that read without the object lock (interpreter, JIT inline code) are
+/// only taken while this is 0: with a single thread no writer can race them.
+/// (A u64 so JIT code can test it with one qword compare.)
+pub static MULTI_THREADED: AtomicUsize = AtomicUsize::new(0);
+
+#[inline(always)]
+pub fn multi_threaded() -> bool {
+    MULTI_THREADED.load(Relaxed) != 0
+}
 static RECURSION_LIMIT: AtomicUsize = AtomicUsize::new(1000);
 /// pthread id of the main Python thread (0 = not yet known).
 pub static MAIN_THREAD_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -237,18 +256,31 @@ pub fn thread_exit() {
             crate::object::xdecref(o);
         }
         process_merge_queue(ts);
-        ts.alive.store(false, Release);
-        ts.exited.store(true, Release);
+        // Nobody queues objects for this owner once `alive` is false (checked under
+        // the ALL_THREADS lock). Drain the queue while this thread still counts as
+        // running for stop-the-world purposes.
         {
-            let mut all = ALL_THREADS.lock().unwrap();
+            let _all = ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+            ts.alive.store(false, SeqCst);
+        }
+        loop {
+            let rest: Vec<usize> = std::mem::take(&mut *ts.merge_queue.lock().unwrap_or_else(|e| e.into_inner()));
+            if rest.is_empty() {
+                break;
+            }
+            for op in rest {
+                crate::object::merge_queued(op as *mut PyObject);
+            }
+        }
+        ts.c.eval_breaker.fetch_and(!EVAL_MERGE_REFCOUNTS, AcqRel);
+        // from here on this thread touches no Python object
+        ts.mode.set(ThreadMode::Blocked);
+        ts.exited.store(true, SeqCst);
+        {
+            let mut all = ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner());
             all.retain(|&t| t != p as usize);
         }
-        // objects still queued for this owner get merged by the next decref (owner gone)
-        let rest: Vec<usize> = std::mem::take(&mut *ts.merge_queue.lock().unwrap());
-        for op in rest {
-            crate::object::explicit_merge(op as *mut PyObject);
-        }
-        FREE_STATES.lock().unwrap().push(p as usize);
+        FREE_STATES.lock().unwrap_or_else(|e| e.into_inner()).push(p as usize);
         set_current(std::ptr::null_mut());
     }
 }
@@ -257,22 +289,23 @@ pub fn set_current(ts: *mut ThreadState) {
     CURRENT.with(|c| c.set(ts));
 }
 
-/// Called from `decref_shared` when a non-owner drove the shared count negative.
+/// Called from `decref_shared` when a non-owner dropped a reference that is part
+/// of the owner's local count. The queue entry owns that reference.
 pub unsafe fn queue_object_for_merge(op: *mut PyObject) {
     unsafe {
         let tid = (*op).ob_tid.load(Relaxed);
-        let threads = ALL_THREADS.lock().unwrap();
+        let threads = ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner());
         for &t in threads.iter() {
             let ts = &*(t as *const ThreadState);
-            if ts.owner_tid == tid {
-                ts.merge_queue.lock().unwrap().push(op as usize);
+            if ts.owner_tid == tid && ts.alive.load(SeqCst) {
+                ts.merge_queue.lock().unwrap_or_else(|e| e.into_inner()).push(op as usize);
                 ts.c.eval_breaker.fetch_or(EVAL_MERGE_REFCOUNTS, Release);
                 return;
             }
         }
         drop(threads);
         // Owner is gone: merge right here.
-        crate::object::explicit_merge(op);
+        crate::object::merge_queued(op);
     }
 }
 
@@ -284,10 +317,10 @@ pub const EVAL_GC: usize = 1 << 4;
 
 /// Process pending merges for the current thread.
 pub fn process_merge_queue(ts: &ThreadState) {
-    let items: Vec<usize> = std::mem::take(&mut *ts.merge_queue.lock().unwrap());
     ts.c.eval_breaker.fetch_and(!EVAL_MERGE_REFCOUNTS, AcqRel);
+    let items: Vec<usize> = std::mem::take(&mut *ts.merge_queue.lock().unwrap_or_else(|e| e.into_inner()));
     for op in items {
-        unsafe { crate::object::explicit_merge(op as *mut PyObject) };
+        unsafe { crate::object::merge_queued(op as *mut PyObject) };
     }
 }
 
@@ -411,9 +444,16 @@ impl ModeCell {
             _ => ThreadMode::Blocked,
         }
     }
+    /// Switching to `InVm` waits while another thread has stopped the world
+    /// (see the handshake in gc.rs).
     #[inline]
     pub fn set(&self, m: ThreadMode) {
-        self.0.store(m as u8, std::sync::atomic::Ordering::Release)
+        if m == ThreadMode::InVm {
+            let cur = self.get();
+            crate::gc::enter_vm(self, cur);
+        } else {
+            self.0.store(m as u8, std::sync::atomic::Ordering::SeqCst)
+        }
     }
     #[inline]
     pub fn replace(&self, m: ThreadMode) -> ThreadMode {

@@ -205,11 +205,9 @@ pub unsafe extern "C" fn PyList_GetItemRef(o: *mut PyObject, i: Py_ssize_t) -> *
             let _ = type_error("expected a list");
             return std::ptr::null_mut();
         }
-        match list_slot(o, i) {
-            Some(s) => {
-                xincref(*s);
-                *s
-            }
+        // the strong-reference variant is safe against concurrent writers
+        match if i < 0 { None } else { list::get_signed(&*o, i as i64) } {
+            Some(v) => v.into_raw(),
             None => {
                 let _ = crate::err!(IndexError, "list index out of range");
                 std::ptr::null_mut()
@@ -224,10 +222,12 @@ pub unsafe extern "C" fn PyList_SetItem(o: *mut PyObject, i: Py_ssize_t, v: *mut
             xdecref(v);
             return -1;
         }
-        match list_slot(o, i) {
-            Some(s) => {
-                let old = *s;
-                *s = v;
+        let old = {
+            let _g = crate::types::dict::ob_lock(&*o);
+            list_slot(o, i).map(|s| std::mem::replace(&mut *s, v))
+        };
+        match old {
+            Some(old) => {
                 xdecref(old);
                 0
             }
@@ -278,6 +278,7 @@ pub unsafe extern "C" fn PyList_Append(o: *mut PyObject, v: *mut PyObject) -> c_
 pub unsafe extern "C" fn PyList_GetSlice(o: *mut PyObject, lo: Py_ssize_t, hi: Py_ssize_t) -> *mut PyObject {
     unsafe {
         let Ok(l) = chk_list(o) else { return std::ptr::null_mut() };
+        let _g = crate::types::dict::ob_lock(l);
         let n = list::list_len(l) as isize;
         let lo = lo.clamp(0, n);
         let hi = hi.clamp(lo, n);

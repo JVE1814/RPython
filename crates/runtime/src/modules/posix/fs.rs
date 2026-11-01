@@ -106,7 +106,7 @@ pub fn os_read(_m: &PyObject, args: &[&PyObject]) -> PyResult {
 
 /// Read up to n bytes from fd (EINTR-retrying), returns bytes.
 pub fn read_fd(fd: i32, n: usize) -> PyResult {
-    let mut buf = vec![0u8; n];
+    let mut buf = crate::errors::try_zeroed_vec(n)?;
     let r = retry_eintr(-1, || unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, n) })?;
     if r < 0 {
         return Err(os_err());
@@ -134,7 +134,7 @@ pub fn os_pread(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     if n < 0 {
         return Err(crate::types::exceptions::os_error_from_errno(libc::EINVAL, None, None));
     }
-    let mut buf = vec![0u8; n as usize];
+    let mut buf = crate::errors::try_zeroed_vec(n as usize)?;
     let r = retry_eintr(-1, || unsafe { libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, n as usize, off) })?;
     if r < 0 {
         return Err(os_err());

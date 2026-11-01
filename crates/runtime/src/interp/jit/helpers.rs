@@ -389,13 +389,7 @@ pub unsafe extern "C" fn h_binary_subscr(sp: *mut *mut PyObject) -> u64 {
         let c = take(sp.sub(2));
         helper!({
             let r = if list::is_list_exact(&c) && int::is_int_exact(&k) && int::is_compact(&k) {
-                let mut i = int::compact_value(&k);
-                let n = list::list_len(&c) as i64;
-                if i < 0 {
-                    i += n;
-                }
-                // locked read (core-runtime): another thread may resize the list
-                match if i < 0 { None } else { list::get(&c, i as usize) } {
+                match list::get_signed(&c, int::compact_value(&k)) {
                     Some(v) => v,
                     None => {
                         let _ = err!(IndexError, "list index out of range");
@@ -641,12 +635,10 @@ pub unsafe extern "C" fn h_unpack_sequence(sp: *mut *mut PyObject, n: u64) -> u6
             }
             return OK;
         }
-        if list::is_list_exact(&seq) && list::list_len(&seq) == n {
-            // snapshot under the list lock (core-runtime: concurrent resizes)
-            let items = list::list_to_vec(&seq);
-            if items.len() == n {
-                for (i, it) in items.into_iter().enumerate() {
-                    *base.add(n - 1 - i) = it.into_raw();
+        if list::is_list_exact(&seq) {
+            if let Some(items) = list::items_if_len(&seq, n) {
+                for (i, v) in items.into_iter().enumerate() {
+                    *base.add(n - 1 - i) = v.into_raw();
                 }
                 return OK;
             }

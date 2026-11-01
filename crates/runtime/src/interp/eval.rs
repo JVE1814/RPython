@@ -1009,13 +1009,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             let k = popref!(f);
                             let c = popref!(f);
                             let r = if list::is_list_exact(&c) && int::is_int_exact(&k) && int::is_compact(&k) {
-                                let mut i = int::compact_value(&k);
-                                let n = list::list_len(&c) as i64;
-                                if i < 0 {
-                                    i += n;
-                                }
-                                // locked read: another thread may resize the list
-                                match if i < 0 { None } else { list::get(&c, i as usize) } {
+                                match list::get_signed(&c, int::compact_value(&k)) {
                                     Some(v) => v,
                                     None => raise!(IndexError, "list index out of range"),
                                 }
