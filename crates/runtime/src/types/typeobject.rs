@@ -615,7 +615,11 @@ pub fn type_ready(tp: *mut PyTypeObject) -> PyResult<()> {
         (*tp).tp_flags |= Py_TPFLAGS_READYING;
         let o = tp as *mut PyObject;
         if (*o).ob_type.load(std::sync::atomic::Ordering::Relaxed).is_null() {
-            (*o).ob_type.store(type_type(), std::sync::atomic::Ordering::Relaxed);
+            // a static type without an explicit metatype gets its base's metatype (numpy's
+            // DTypes set only tp_base = &PyArrayDescr_Type and expect _DTypeMeta)
+            let b = (*tp).tp_base;
+            let meta = if b.is_null() { std::ptr::null_mut() } else { (*(b as *mut PyObject)).ob_type.load(std::sync::atomic::Ordering::Relaxed) };
+            (*o).ob_type.store(if meta.is_null() { type_type() } else { meta }, std::sync::atomic::Ordering::Relaxed);
         }
         if !is_heap_type(tp) {
             make_immortal(o);

@@ -778,6 +778,9 @@ class _BaseGenericAlias(_Final, _root=True):
     def __getattr__(self, attr):
         if attr in {'__origin__', '__args__'}:
             return super().__getattr__(attr)
+        if attr in {'__name__', '__qualname__'} and '__origin__' in self.__dict__:
+            # an alias is named after its typing name (List, Callable) or its origin
+            return self._name or self.__origin__.__name__
         # Forward non-dunder attributes to the origin (but be careful during
         # copy/pickle, when __origin__ may not be set yet).
         if '__origin__' in self.__dict__ and not _is_dunder(attr):
