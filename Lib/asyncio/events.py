@@ -97,6 +97,32 @@ class Handle:
         self = None
 
 
+class _ThreadSafeHandle(Handle):
+    """Handle returned by call_soon_threadsafe(): cancel() and cancelled()
+    from another thread wait while the callback is running, so that a
+    callback that has started is never reported as cancelled."""
+
+    __slots__ = ('_lock',)
+
+    def __init__(self, callback, args, loop, context=None):
+        super().__init__(callback, args, loop, context)
+        self._lock = threading.RLock()
+
+    def cancelled(self):
+        with self._lock:
+            return self._cancelled
+
+    def cancel(self):
+        with self._lock:
+            if not self._cancelled:
+                super().cancel()
+
+    def _run(self):
+        # the callback may cancel its own handle (same thread: re-entrant)
+        with self._lock:
+            super()._run()
+
+
 class TimerHandle(Handle):
     """A callback scheduled for a point in (loop) time."""
 

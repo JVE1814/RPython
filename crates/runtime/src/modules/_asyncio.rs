@@ -410,6 +410,17 @@ _eager_tasks = set()
 _current_tasks = {}
 
 
+def _forget_current_tasks():
+    # a forked child runs none of its parent's tasks
+    _current_tasks.clear()
+
+
+import os as _os
+if hasattr(_os, 'register_at_fork'):
+    _os.register_at_fork(after_in_child=_forget_current_tasks)
+del _os
+
+
 def _register_task(task):
     """Add a task to the registry of known tasks."""
     _scheduled_tasks.add(task)
