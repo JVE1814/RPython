@@ -689,9 +689,11 @@ class BaseEventLoop(events.AbstractEventLoop):
         self._check_closed()
         if self._debug:
             self._check_callback(callback, 'call_soon_threadsafe')
-        handle = self._call_soon(callback, args, context)
+        handle = events._ThreadSafeHandle(callback, args, self, context)
         if handle._source_traceback:
-            handle._source_traceback.pop()
+            # drop the frames of this method and of the handle constructor
+            del handle._source_traceback[-2:]
+        self._ready.append(handle)
         self._write_to_self()
         return handle
 

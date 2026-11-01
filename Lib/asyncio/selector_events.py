@@ -962,12 +962,14 @@ class _SelectorSocketTransport(_SelectorTransport):
             raise RuntimeError('Cannot call writelines() after write_eof()')
         if self._empty_waiter is not None:
             raise RuntimeError('unable to writelines; sendfile is in progress')
-        if not list_of_data:
+        # empty chunks would never be drained: leave them out
+        chunks = [memoryview(bytes(chunk)) for chunk in list_of_data if chunk]
+        if not chunks:
             return
         if self._conn_lost:
             self._log_lost_write()
             return
-        self._buffer.extend(memoryview(bytes(chunk)) for chunk in list_of_data)
+        self._buffer.extend(chunks)
         self._write_ready()
         if self._buffer:
             self._loop._add_writer(self._sock_fd, self._write_ready,
