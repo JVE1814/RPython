@@ -674,11 +674,15 @@ class _MarkedSource:
         # map display columns back to characters
         kinds = []
         col = 0
-        for ch in line:
+        for ch, width in _char_widths(line):
+            if width == 0 and kinds:
+                # combining marks etc. belong to the preceding character
+                kinds.append(kinds[-1])
+                continue
             if col >= len(column_kinds):
                 break
             kinds.append(column_kinds[col])
-            col += _display_width(ch)
+            col += width
         return kinds
 
 
