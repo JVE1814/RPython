@@ -70,6 +70,8 @@ pub(crate) struct CompSlot {
 pub(crate) struct CompCtx {
     pub scope: ScopeId,
     pub slots: HashMap<String, CompSlot>,
+    /// the inlined comprehension protects its saved locals with a SETUP_FINALLY block
+    pub has_setup: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -434,6 +436,17 @@ impl<'a> Compiler<'a> {
 
     pub fn error(&self, msg: impl Into<String>, loc: Loc) -> CompileError {
         CompileError::syntax(msg, loc)
+    }
+
+    /// Static block nesting limit (CPython's CO_MAXBLOCKS): `extra` is the number of blocks
+    /// the caller is about to add on top of the ones already open.
+    pub fn check_block_limit(&self, limit: usize, loc: Loc) -> R {
+        let u = self.ur();
+        let open = u.fblocks.len() + u.comps.iter().filter(|c| c.has_setup).count();
+        if open >= limit {
+            return Err(self.error("too many statically nested blocks", loc));
+        }
+        Ok(())
     }
 
     pub fn enter_depth(&mut self) -> R {

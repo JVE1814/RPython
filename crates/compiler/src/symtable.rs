@@ -436,7 +436,8 @@ impl Builder {
 
     fn record_directive(&mut self, name: &str, loc: Loc) {
         let m = self.mangle(name);
-        self.cur_mut().directives.insert(m, loc);
+        // errors point at the first global/nonlocal statement naming it
+        self.cur_mut().directives.entry(m).or_insert(loc);
     }
 
     fn enter_depth(&mut self) -> R {

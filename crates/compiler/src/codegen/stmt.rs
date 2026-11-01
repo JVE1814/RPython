@@ -115,12 +115,13 @@ impl<'a> Compiler<'a> {
                 }
                 let end = self.new_label();
                 self.compile_jump_if(test, true, end)?;
-                self.set_loc(s.loc);
+                // the failure is reported at the asserted expression
+                self.set_loc(test.loc);
                 self.emit(Op::LoadCommonConstant, CommonConstant::AssertionError as u32);
                 if let Some(m) = msg {
                     self.emit(Op::PushNull, 0);
                     self.compile_expr(m)?;
-                    self.set_loc(s.loc);
+                    self.set_loc(test.loc);
                     self.emit(Op::Call, 1);
                 }
                 self.emit(Op::RaiseVarargs, 1);
@@ -355,8 +356,17 @@ impl<'a> Compiler<'a> {
         self.emit(Op::Call, 3);
     }
 
-    fn push_fblock(&mut self, kind: FbKind, block: Label, exit: Label, loc: Location) {
+    fn guard_block(&mut self) -> R {
+        let at = self.ur().loc;
+        let col = if at.col == u32::MAX { 0 } else { at.col as i32 };
+        let end_col = if at.end_col == u32::MAX { col } else { at.end_col as i32 };
+        self.check_block_limit(21, ast::Loc::new(at.lineno as i32, col, at.end_lineno as i32, end_col))
+    }
+
+    fn push_fblock(&mut self, kind: FbKind, block: Label, exit: Label, loc: Location) -> R {
+        self.guard_block()?;
         self.u().fblocks.push(FBlock { kind, block, exit, loc, finally: None, name: None });
+        Ok(())
     }
 
     // ------------------------------------------------------------------ loops
@@ -369,7 +379,7 @@ impl<'a> Compiler<'a> {
         self.set_loc(f.iter.loc);
         self.emit(Op::GetIter, 0);
         self.use_label(start);
-        self.push_fblock(FbKind::ForLoop, start, end, loc_of(s.loc));
+        self.push_fblock(FbKind::ForLoop, start, end, loc_of(s.loc))?;
         self.set_loc(f.iter.loc);
         self.emit_jump(Op::ForIter, cleanup);
         self.compile_store(&f.target)?;
@@ -394,7 +404,7 @@ impl<'a> Compiler<'a> {
         self.set_loc(f.iter.loc);
         self.emit(Op::GetAiter, 0);
         self.use_label(start);
-        self.push_fblock(FbKind::ForLoop, start, end, loc_of(s.loc));
+        self.push_fblock(FbKind::ForLoop, start, end, loc_of(s.loc))?;
         self.emit_pseudo(IOp::SetupFinally, except);
         self.emit(Op::GetAnext, 0);
         self.load_none();
@@ -418,7 +428,7 @@ impl<'a> Compiler<'a> {
         let anchor = self.new_label();
         let end = self.new_label();
         self.use_label(lp);
-        self.push_fblock(FbKind::WhileLoop, lp, end, loc_of(s.loc));
+        self.push_fblock(FbKind::WhileLoop, lp, end, loc_of(s.loc))?;
         self.set_loc(s.loc);
         self.emit(Op::Nop, 0);
         self.compile_jump_if(test, false, anchor)?;
@@ -443,6 +453,7 @@ impl<'a> Compiler<'a> {
         self.emit(Op::Nop, 0);
         self.emit_pseudo(IOp::SetupFinally, end);
         self.use_label(body);
+        self.guard_block()?;
         self.u().fblocks.push(FBlock {
             kind: FbKind::FinallyTry,
             block: body,
@@ -469,7 +480,7 @@ impl<'a> Compiler<'a> {
         self.u().loc = NO_LOC;
         self.emit_pseudo(IOp::SetupCleanup, cleanup);
         self.emit_noloc(Op::PushExcInfo, 0);
-        self.push_fblock(FbKind::FinallyEnd, end, NO_LABEL, NO_LOC);
+        self.push_fblock(FbKind::FinallyEnd, end, NO_LABEL, NO_LOC)?;
         self.compile_stmts(&t.finalbody)?;
         self.u().fblocks.pop();
         self.emit_noloc(Op::Reraise, 0);
@@ -494,7 +505,7 @@ impl<'a> Compiler<'a> {
         self.emit(Op::Nop, 0);
         self.emit_pseudo(IOp::SetupFinally, except);
         self.use_label(body);
-        self.push_fblock(FbKind::TryExcept, body, NO_LABEL, loc_of(s.loc));
+        self.push_fblock(FbKind::TryExcept, body, NO_LABEL, loc_of(s.loc))?;
         self.compile_stmts(&t.body)?;
         self.u().fblocks.pop();
         self.pop_block();
@@ -505,7 +516,7 @@ impl<'a> Compiler<'a> {
         self.u().loc = NO_LOC;
         self.emit_pseudo(IOp::SetupCleanup, cleanup);
         self.emit_noloc(Op::PushExcInfo, 0);
-        self.push_fblock(FbKind::ExceptionHandler, NO_LABEL, NO_LABEL, NO_LOC);
+        self.push_fblock(FbKind::ExceptionHandler, NO_LABEL, NO_LABEL, NO_LOC)?;
         for (i, h) in t.handlers.iter().enumerate() {
             let h: &'a ExceptHandler = h;
             if h.type_.is_none() && i < n - 1 {
@@ -525,6 +536,7 @@ impl<'a> Compiler<'a> {
                 self.nameop(name, ExprContext::Store)?;
                 self.emit_pseudo(IOp::SetupCleanup, cleanup_end);
                 self.use_label(cleanup_body);
+                self.guard_block()?;
                 self.u().fblocks.push(FBlock {
                     kind: FbKind::HandlerCleanup,
                     block: cleanup_body,
@@ -553,6 +565,7 @@ impl<'a> Compiler<'a> {
                 let cleanup_body = self.new_label();
                 self.emit(Op::PopTop, 0);
                 self.use_label(cleanup_body);
+                self.guard_block()?;
                 self.u().fblocks.push(FBlock {
                     kind: FbKind::HandlerCleanup,
                     block: cleanup_body,
@@ -590,7 +603,7 @@ impl<'a> Compiler<'a> {
         self.emit(Op::Nop, 0);
         self.emit_pseudo(IOp::SetupFinally, except);
         self.use_label(body);
-        self.push_fblock(FbKind::TryExcept, body, NO_LABEL, loc_of(s.loc));
+        self.push_fblock(FbKind::TryExcept, body, NO_LABEL, loc_of(s.loc))?;
         self.compile_stmts(&t.body)?;
         self.u().fblocks.pop();
         self.pop_block();
@@ -600,7 +613,7 @@ impl<'a> Compiler<'a> {
         self.u().loc = NO_LOC;
         self.emit_pseudo(IOp::SetupCleanup, cleanup);
         self.emit_noloc(Op::PushExcInfo, 0);
-        self.push_fblock(FbKind::ExceptionGroupHandler, NO_LABEL, NO_LABEL, NO_LOC);
+        self.push_fblock(FbKind::ExceptionGroupHandler, NO_LABEL, NO_LABEL, NO_LOC)?;
         for (i, h) in t.handlers.iter().enumerate() {
             let h: &'a ExceptHandler = h;
             self.set_loc(h.loc);
@@ -627,6 +640,7 @@ impl<'a> Compiler<'a> {
             }
             self.emit_pseudo(IOp::SetupCleanup, cleanup_end);
             self.use_label(cleanup_body);
+            self.guard_block()?;
             self.u().fblocks.push(FBlock {
                 kind: FbKind::HandlerCleanup,
                 block: cleanup_body,
@@ -705,7 +719,7 @@ impl<'a> Compiler<'a> {
         self.emit(Op::BeforeWith, 0);
         self.emit_pseudo(IOp::SetupWith, final_);
         self.use_label(block);
-        self.push_fblock(FbKind::With, block, final_, loc_of(item.context_expr.loc));
+        self.push_fblock(FbKind::With, block, final_, loc_of(item.context_expr.loc))?;
         match &item.optional_vars {
             Some(v) => self.compile_store(v)?,
             None => self.emit(Op::PopTop, 0),
@@ -771,7 +785,7 @@ impl<'a> Compiler<'a> {
         self.compile_yield_from_loop(true)?;
         self.emit_pseudo(IOp::SetupWith, final_);
         self.use_label(block);
-        self.push_fblock(FbKind::AsyncWith, block, final_, loc_of(item.context_expr.loc));
+        self.push_fblock(FbKind::AsyncWith, block, final_, loc_of(item.context_expr.loc))?;
         match &item.optional_vars {
             Some(v) => self.compile_store(v)?,
             None => self.emit(Op::PopTop, 0),

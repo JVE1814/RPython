@@ -1048,7 +1048,7 @@ impl<'a> Compiler<'a> {
             self.emit(Op::GetIter, 0);
         }
         // isolate names bound in the comprehension
-        let mut ctx = CompCtx { scope: sid, slots: HashMap::new() };
+        let mut ctx = CompCtx { scope: sid, slots: HashMap::new(), has_setup: false };
         let mut pushed: Vec<CompSlot> = Vec::new();
         let syms: Vec<(String, u32, SymScope)> =
             self.st.scopes[sid].symbols.iter().map(|s| (s.name.clone(), s.flags, s.scope)).collect();
@@ -1070,6 +1070,8 @@ impl<'a> Compiler<'a> {
         let cleanup = self.new_label();
         let end = self.new_label();
         if !pushed.is_empty() {
+            self.check_block_limit(21, e.loc)?;
+            ctx.has_setup = true;
             self.emit(Op::Swap, pushed.len() as u32 + 1);
             self.emit_pseudo(IOp::SetupFinally, cleanup);
         }
