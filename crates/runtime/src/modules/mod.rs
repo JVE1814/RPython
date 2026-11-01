@@ -24,6 +24,8 @@ pub mod _abc;
 pub mod itertools;
 pub mod _collections;
 pub mod _types;
+pub mod _heapq;
+pub mod _bisect;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
 pub fn register_all() {

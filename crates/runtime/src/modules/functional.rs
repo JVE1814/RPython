@@ -8,4 +8,6 @@ pub fn register() {
     register_builtin("itertools", super::itertools::init_module);
     register_builtin("_collections", super::_collections::init_module);
     register_builtin("_types", super::_types::init_module);
+    register_builtin("_heapq", super::_heapq::init_module);
+    register_builtin("_bisect", super::_bisect::init_module);
 }
