@@ -36,7 +36,10 @@ pub fn typeptr(a: &AtomicPtr<PyTypeObject>) -> *mut PyTypeObject {
 }
 
 /// Called in the child after fork(); resets interpreter state that cannot survive fork.
-pub fn after_fork_child_hook() {}
+pub fn after_fork_child_hook() {
+    // JIT code memory must not stay shared with the parent.
+    crate::interp::jit::mem::after_fork_child();
+}
 
 pub static TERMINAL_SIZE: AtomicPtr<PyTypeObject> = AtomicPtr::new(std::ptr::null_mut());
 

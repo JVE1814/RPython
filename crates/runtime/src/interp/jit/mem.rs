@@ -126,3 +126,39 @@ pub fn free(rx: usize, len: usize) {
         libc::munmap(rx as *mut libc::c_void, (len + 4095) & !4095);
     }
 }
+
+/// In a forked child: the code chunks are MAP_SHARED views of a memfd that
+/// the parent keeps using, so code installed later by either process would
+/// overwrite live code of the other.  Give the child private copies, mapped
+/// at the same addresses (compiled code pointers stay valid).
+pub fn after_fork_child() {
+    let h = match HEAP.try_lock() {
+        Ok(h) => h,
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        // held by a thread that no longer exists: leave it (the world is
+        // stopped before fork, so this does not happen in practice)
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    for c in h.chunks.iter() {
+        unsafe {
+            let fd = libc::syscall(libc::SYS_memfd_create, c"rpython-jit".as_ptr(), libc::MFD_CLOEXEC as libc::c_uint) as i32;
+            if fd < 0 {
+                continue;
+            }
+            if libc::ftruncate(fd, c.size as libc::off_t) != 0 {
+                libc::close(fd);
+                continue;
+            }
+            let tmp = libc::mmap(std::ptr::null_mut(), c.size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0);
+            if tmp == libc::MAP_FAILED {
+                libc::close(fd);
+                continue;
+            }
+            std::ptr::copy_nonoverlapping(c.rw as *const u8, tmp as *mut u8, c.size);
+            libc::mmap(c.rw as *mut libc::c_void, c.size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED | libc::MAP_FIXED, fd, 0);
+            libc::mmap(c.rx as *mut libc::c_void, c.size, libc::PROT_READ | libc::PROT_EXEC, libc::MAP_SHARED | libc::MAP_FIXED, fd, 0);
+            libc::munmap(tmp, c.size);
+            libc::close(fd);
+        }
+    }
+}
