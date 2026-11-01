@@ -7,6 +7,7 @@ pub mod sys;
 pub mod thread;
 pub mod traceback_util;
 pub mod warnings;
+pub mod _warnings;
 pub mod sys_full;
 pub mod sys_trace;
 pub mod traceback_print;
@@ -40,3 +41,4 @@ pub mod numbers_registry;
     functional::register();
 }
     numbers_registry::register();
+    crate::import::register_builtin("_warnings", _warnings::init_module);

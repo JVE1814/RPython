@@ -29,6 +29,8 @@ unsafe extern "C" fn shim_o<F: Fn(&PyObject, &PyObject) -> PyResult>(s: *mut PyO
     let f: F = conjure();
     let s = if s.is_null() { crate::types::none::none().as_ptr() } else { s };
     unsafe { into_c(f(&*s, &*a)) }
+    unsafe { into_c(f(self_or_none(s))) }
+    unsafe { into_c(f(self_or_none(s), &*a)) }
 }
 unsafe extern "C" fn shim_fast<F: Fn(&PyObject, &[&PyObject]) -> PyResult>(
     s: *mut PyObject,
@@ -39,7 +41,7 @@ unsafe extern "C" fn shim_fast<F: Fn(&PyObject, &[&PyObject]) -> PyResult>(
     let s = if s.is_null() { crate::types::none::none().as_ptr() } else { s };
     unsafe {
         let args: &[&PyObject] = if n == 0 { &[] } else { std::slice::from_raw_parts(a as *const &PyObject, n as usize) };
-        into_c(f(&*s, args))
+        into_c(f(self_or_none(s), args))
     }
 }
 unsafe extern "C" fn shim_fastkw<F: Fn(&PyObject, &[&PyObject], Option<&PyObject>) -> PyResult>(
@@ -55,7 +57,7 @@ unsafe extern "C" fn shim_fastkw<F: Fn(&PyObject, &[&PyObject], Option<&PyObject
         let total = n as usize + nkw;
         let args: &[&PyObject] = if total == 0 { &[] } else { std::slice::from_raw_parts(a as *const &PyObject, total) };
         let kw = if kw.is_null() { None } else { Some(&*kw) };
-        into_c(f(&*s, args, kw))
+        into_c(f(self_or_none(s), args, kw))
     }
 }
 
@@ -304,4 +306,11 @@ unsafe extern "C" fn shim_binary<F: Fn(&PyObject, &PyObject) -> PyResult>(a: *mu
 /// Turn a Rust binary function into a C binaryfunc slot.
 pub fn binary_shim<F: Fn(&PyObject, &PyObject) -> PyResult + Copy>(_f: F) -> unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject {
     shim_binary::<F>
+}
+
+/// Module-level functions registered without a module object get a NULL
+/// `self`; Rust signatures take `&PyObject`, so substitute None.
+#[inline(always)]
+unsafe fn self_or_none<'a>(s: *mut PyObject) -> &'a PyObject {
+    if s.is_null() { crate::types::none::none() } else { unsafe { &*s } }
 }
