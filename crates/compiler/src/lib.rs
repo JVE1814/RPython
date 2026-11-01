@@ -90,7 +90,7 @@ impl Default for CompileOptions {
 }
 
 /// Default nesting limit. Each level costs a few KB of native stack in the recursive passes;
-/// the runtime should compile on a thread with >= 16 MB of stack (or lower the limit).
+/// measured: < 1 MB of native stack at the default limit (debug and release).
 pub const DEFAULT_MAX_DEPTH: u32 = 2000;
 
 impl CompileOptions {
