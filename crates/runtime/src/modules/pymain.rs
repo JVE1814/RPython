@@ -172,6 +172,7 @@ fn pyrepr_str(s: &str) -> String {
 
 fn run_module(name: &str) -> Outcome {
     let r = (|| -> PyResult<()> {
+        // like CPython, __main__ exists before runpy replaces it
         main_module()?;
         let runpy = crate::import::import_absolute("runpy")?;
         let f = ab::getattr_str(&runpy, "_run_module_as_main")?;
