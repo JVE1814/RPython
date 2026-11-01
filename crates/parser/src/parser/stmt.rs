@@ -1294,6 +1294,7 @@ impl<'a> Parser<'a> {
             }
         } else if self.at(T::COMMA) {
             // PEP 758: except A, B: (tuple without parentheses, no 'as')
+            self.check_version(14, "except expressions without parentheses are")?;
             let mut elts = vec![type_];
             while self.at(T::COMMA) {
                 let m = self.p;
@@ -1394,7 +1395,10 @@ impl<'a> Parser<'a> {
                     self.advance();
                     let e = if t.ty == T::STAR { self.star_expression()? } else { self.expression()? };
                     match e {
-                        Some(e) => default_value = Some(bx(e)),
+                        Some(e) => {
+                            self.check_version(13, "Type parameter defaults are")?;
+                            default_value = Some(bx(e));
+                        }
                         None => {
                             if self.invalid {
                                 let eq = self.tok_at(self.p - 1);
@@ -1429,7 +1433,10 @@ impl<'a> Parser<'a> {
                 if self.at(T::EQUAL) {
                     self.advance();
                     match self.expression()? {
-                        Some(e) => default_value = Some(bx(e)),
+                        Some(e) => {
+                            self.check_version(13, "Type parameter defaults are")?;
+                            default_value = Some(bx(e));
+                        }
                         None => {
                             if self.invalid {
                                 let eq = self.tok_at(self.p - 1);
