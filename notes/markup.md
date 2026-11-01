@@ -49,9 +49,9 @@ Branch: `worktree-agent-a76d7c540a0506f43`.
 | test_pulldom | 11/11 (3 expected failures) |
 | test_sax | 192/192 (needs urllib from the web workstream) |
 | test_xml_dom_minicompat | 11/11 |
-| test_xml_dom_xmlbuilder | not runnable yet: imports http.client and test_httplib (needs `array` + http) |
+| test_xml_dom_xmlbuilder | 4/4 (needs http from the web workstream and array from master) |
 | test_email (package) | 1803/1814; rest = CJK codecs (8) + codec-name DeprecationWarning (2, runtime) + gb2312 |
-| test_html / test_htmlparser | 2/2, 68/68 (htmlparser takes ~40 s: some test is slow, not investigated) |
+| test_html / test_htmlparser | 2/2, 68/68 |
 | test_optparse | 155/155 (translation snapshot test skipped: no Tools/i18n) |
 | test_mailbox | 386/386 |
 | test_smtplib | 85/85 |
