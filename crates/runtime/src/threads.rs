@@ -249,3 +249,18 @@ impl ThreadState {
         !self.exited.load(std::sync::atomic::Ordering::Acquire)
     }
 }
+
+/// Run a potentially blocking system call with the thread marked `Blocked` so a
+/// stop-the-world collection does not wait for it; parks at a safepoint on return
+/// if a collection is in progress.
+pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
+    let ts = current();
+    let prev = ts.mode.get();
+    ts.mode.set(ThreadMode::Blocked);
+    let r = f();
+    ts.mode.set(prev);
+    if prev == ThreadMode::InVm && ts.c.eval_breaker.load(std::sync::atomic::Ordering::Acquire) & EVAL_SAFEPOINT != 0 {
+        crate::gc::safepoint_poll(ts);
+    }
+    r
+}

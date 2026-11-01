@@ -903,7 +903,7 @@ wfunc!(os_wstopsig, "WSTOPSIG", libc::WSTOPSIG, int);
 pub fn os_system(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
     let [cmd] = kwparse::<1>("system", &["command"], 0, 1, 0, args, kw)?;
     let c = super::path::path_named("system", "command", cmd.unwrap())?;
-    let r = unsafe { libc::system(c.ptr()) };
+    let r = crate::threads::blocking(|| unsafe { libc::system(c.ptr()) });
     Ok(i(r as i64))
 }
 

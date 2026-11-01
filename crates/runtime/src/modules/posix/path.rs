@@ -302,7 +302,7 @@ pub fn os_err_with2(p: &PathArg, p2: &PathArg) -> PyErr {
 /// Run `f` retrying on EINTR, checking for pending signals between attempts.
 pub fn retry_eintr<T: PartialEq + Copy>(fail: T, mut f: impl FnMut() -> T) -> PyResult<T> {
     loop {
-        let r = f();
+        let r = crate::threads::blocking(&mut f);
         if r == fail && errno() == libc::EINTR {
             check_signals()?;
             continue;
