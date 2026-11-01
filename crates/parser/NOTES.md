@@ -23,7 +23,10 @@ pub struct ParseOptions {
     dont_imply_dedent /*PyCF_DONT_IMPLY_DEDENT*/, hooks: UnicodeHooks,
     filename: String /*only for "Non-UTF-8 code ... in file X"*/,
     decode: Option<tokenizer::DecodeHook> /*codec fallback for parse_bytes*/,
+    max_stack_bytes: usize /*default 256 KiB of caller stack*/, grow_stack: bool /*default true*/,
+    int_max_str_digits: usize /*sys.get_int_max_str_digits(); default 4300, 0 = unlimited*/,
 }
+impl ParseOptions { pub fn new(mode: Mode) -> ParseOptions }   // and Default
 
 pub struct SyntaxError { kind: ErrorKind /*Syntax|Indentation|Tab|IncompleteInput|MemoryError|RecursionError*/, msg,
     lineno, col_offset /*0-based UTF-8 byte*/, end_lineno: Option, end_col_offset: Option,
@@ -126,6 +129,7 @@ pub struct Warning { category /*SyntaxWarning|DeprecationWarning*/, msg,
 | `tokenize.rs` | every constant `check_tokenize` in test_tokenize.py (tokenize + C tokenizer streams) | 182/182 |
 | `type_comments.rs` | port of test_type_comments.py incl. feature_version | pass |
 | `codeop.rs` | av/ai lists of test_codeop.py with `_maybe_compile` emulation | 174/174 |
+| `misc.rs` | test_compile lists (leading zeros, None, imports), int max str digits, 200 nested brackets, recursion limits (RecursionError / MemoryError "too complex"), class table | pass |
 
 ### Files expected not to parse (`EXPECTED_INVALID` in tests/parse_all.rs)
 
