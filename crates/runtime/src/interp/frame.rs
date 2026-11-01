@@ -355,6 +355,8 @@ pub unsafe fn alloc_call(code: *mut PyObject, func: *mut PyObject, globals: *mut
         f.f_trace = std::ptr::null_mut();
         f.f_trace_lines = true;
         f.f_trace_opcodes = false;
+        f.trace_event = 0;
+        f.jump_to = -1;
         f.yield_from_send = -1;
         f.unwind_pc = -1;
         f
@@ -383,6 +385,8 @@ unsafe fn alloc_call_slow(code: *mut PyObject, func: *mut PyObject, globals: *mu
         f_trace: std::ptr::null_mut(),
         f_trace_lines: true,
         f_trace_opcodes: false,
+        trace_event: 0,
+        jump_to: -1,
         yield_from_send: -1,
         unwind_pc: -1,
     })
