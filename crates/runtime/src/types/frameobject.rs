@@ -11,15 +11,28 @@ use crate::raise;
 use rpy_compiler::bytecode as bc;
 use std::ffi::{c_int, c_void};
 
+/// The first fields keep the offsets of CPython's frame object, because compiled
+/// extensions write some of them directly: Cython stores the traceback line of the
+/// frames it creates with PyFrame_New into `f_lineno` (offset 56).
 #[repr(C)]
 pub struct PyFrameObject {
     pub ob_base: PyObject,
+    /// Offset of CPython's `f_back` (not used here: see the `f_back` getter).
+    pub _f_back: *mut PyObject,
     pub frame: *mut Frame,
+    /// Offset of CPython's `f_trace` (the trace function lives in `Frame`).
+    pub _f_trace: *mut PyObject,
+    /// Line number stored by C code; 0 means "compute it from the instruction".
+    pub f_lineno: c_int,
+    pub _f_trace_lines: u8,
+    pub _f_trace_opcodes: u8,
     /// Owned frame once the execution finished.
     pub owned: *mut Frame,
     pub weakreflist: *mut PyObject,
     pub locals_snapshot: *mut PyObject,
 }
+
+const _: () = assert!(std::mem::offset_of!(PyFrameObject, f_lineno) == 56);
 
 #[unsafe(no_mangle)]
 pub static mut PyFrame_Type: PyTypeObject = PyTypeObject::ZERO;
@@ -163,6 +176,10 @@ fn f_builtins(o: &PyObject) -> PyResult {
 }
 fn f_lineno(o: &PyObject) -> PyResult {
     let f = need(o)?;
+    let stored = fo(o).f_lineno;
+    if stored > 0 {
+        return Ok(int::new_int(stored as i64));
+    }
     let l = if f.state == FrameState::Created { crate::types::code::code(f.code()).obj.co_firstlineno } else { f.lineno() };
     Ok(if l < 0 { none::none_ref() } else { int::new_int(l as i64) })
 }

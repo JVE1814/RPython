@@ -371,28 +371,201 @@ pub unsafe extern "C" fn PyCode_Addr2Location(co: *mut PyObject, addr: c_int, sl
 pub unsafe extern "C" fn _PyCode_CheckLineNumber(addr: c_int, _bounds: *mut c_void) -> c_int {
     addr
 }
-/// Build a code object through `types.CodeType`-compatible construction: compile an
-/// empty function body and replace its metadata.
+/// Body shared by every code object created from C: it raises AssertionError when run
+/// (an "empty" code object must not crash the VM when executed). Built once by compiling
+/// `assert 0` and kept alive for the life of the process.
+fn c_code_stub() -> &'static PyObject {
+    static STUB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let p = *STUB.get_or_init(|| match crate::compile::compile_str("assert 0", "<C>", crate::compile::Mode::Exec, 0, 0) {
+        Ok(c) => c.code.into_raw() as usize,
+        Err(_) => {
+            clear_exc();
+            0
+        }
+    });
+    assert!(p != 0, "cannot build the stub body for C-created code objects");
+    unsafe { &*(p as *const PyObject) }
+}
+
+fn str_tuple(o: Option<&PyObject>, what: &str) -> PyResult<Vec<PyRef>> {
+    let Some(o) = o else { return Ok(Vec::new()) };
+    if !tuple::is_tuple(o) {
+        return Err(system_error(&format!("code: {} must be a tuple", what)));
+    }
+    let v = tuple::tuple_to_vec(o);
+    for n in &v {
+        if !pystr::is_str(n) {
+            return Err(system_error(&format!("code: {} must be a tuple of str", what)));
+        }
+    }
+    Ok(v.into_iter().map(pystr::intern).collect())
+}
+
+/// What a C caller (PyUnstable_Code_New*, PyCode_NewEmpty) supplies. CPython-format
+/// bytecode, line tables and exception tables are accepted but not interpreted: these code
+/// objects carry metadata (names, flags, argument counts, file and first line) for
+/// tracebacks, frames and introspection; executing one raises AssertionError.
+pub(crate) struct CCodeArgs<'a> {
+    pub argcount: i32,
+    pub posonlyargcount: i32,
+    pub kwonlyargcount: i32,
+    pub flags: i32,
+    pub consts: Option<&'a PyObject>,
+    pub names: Option<&'a PyObject>,
+    pub varnames: Option<&'a PyObject>,
+    pub freevars: Option<&'a PyObject>,
+    pub cellvars: Option<&'a PyObject>,
+    pub filename: &'a PyObject,
+    pub name: &'a PyObject,
+    pub qualname: Option<&'a PyObject>,
+    pub firstlineno: i32,
+}
+
+pub(crate) fn new_code_from_c(a: CCodeArgs) -> PyResult {
+    use rpy_compiler::bytecode::fast;
+    if a.argcount < 0 || a.posonlyargcount < 0 || a.kwonlyargcount < 0 {
+        return Err(system_error("code: argument counts must not be negative"));
+    }
+    for (o, what) in [(a.filename, "filename"), (a.name, "name")] {
+        if !pystr::is_str(o) {
+            return Err(system_error(&format!("code: {} must be a str", what)));
+        }
+    }
+    let qualname = match a.qualname {
+        Some(q) if pystr::is_str(q) => q,
+        Some(_) => return Err(system_error("code: qualname must be a str")),
+        None => a.name,
+    };
+    let consts = match a.consts {
+        Some(c) if tuple::is_tuple(c) => c.to_ref(),
+        Some(_) => return Err(system_error("code: consts must be a tuple")),
+        None => tuple::new_tuple(Vec::new()),
+    };
+    let names = str_tuple(a.names, "names")?;
+    let varnames = str_tuple(a.varnames, "varnames")?;
+    let freevars = str_tuple(a.freevars, "freevars")?;
+    let cellvars = str_tuple(a.cellvars, "cellvars")?;
+    // localsplus: the variable names (arguments first), then cells that are not also
+    // variables, then free variables
+    let flags = a.flags as u32;
+    let npos = a.argcount as usize;
+    let nkw = a.kwonlyargcount as usize;
+    let nstar = (flags & 0x4 != 0) as usize + (flags & 0x8 != 0) as usize;
+    let mut lpn: Vec<PyRef> = Vec::new();
+    let mut kinds: Vec<u8> = Vec::new();
+    for (i, n) in varnames.iter().enumerate() {
+        let k = if i < npos {
+            fast::LOCAL | fast::ARG_POS
+        } else if i < npos + nkw {
+            fast::LOCAL | fast::ARG_KW
+        } else if i < npos + nkw + nstar {
+            fast::LOCAL | fast::ARG_VAR
+        } else {
+            fast::LOCAL
+        };
+        lpn.push(n.clone());
+        kinds.push(k);
+    }
+    for n in &cellvars {
+        match lpn.iter().position(|x| pystr::str_eq(x, n)) {
+            Some(i) => kinds[i] |= fast::CELL,
+            None => {
+                lpn.push(n.clone());
+                kinds.push(fast::CELL);
+            }
+        }
+    }
+    for n in &freevars {
+        lpn.push(n.clone());
+        kinds.push(fast::FREE);
+    }
+    let stub = c_code_stub();
+    let sd = code::code_data(stub);
+    let line = a.firstlineno.max(0) as u32;
+    let locations = sd
+        .locations
+        .iter()
+        .map(|_| rpy_compiler::bytecode::Location { lineno: line, end_lineno: line, col: u32::MAX, end_col: u32::MAX })
+        .collect();
+    let parts = code::CodeParts {
+        argcount: a.argcount as u32,
+        posonlyargcount: a.posonlyargcount as u32,
+        kwonlyargcount: a.kwonlyargcount as u32,
+        flags,
+        stacksize: code::code(stub).obj.co_stacksize as u32,
+        firstlineno: line,
+        code: sd.code.clone(),
+        locations,
+        exception_table: sd.exception_table.clone(),
+        kinds,
+        filename: a.filename.to_ref(),
+        consts: sd.consts.clone(),
+        names: sd.names.clone(),
+        localsplusnames: lpn,
+        name: pystr::intern(a.name.to_ref()),
+        qualname: qualname.to_ref(),
+    };
+    let r = code::new_code_from_parts(parts)?;
+    // co_consts / co_names show the caller's tuples; the stub body keeps its own
+    // constants and names in the code data.
+    unsafe {
+        let c = &mut *(r.as_ptr() as *mut code::PyCodeObject);
+        let old = std::mem::replace(&mut c.co_consts, consts.into_raw());
+        xdecref(old);
+        let old = std::mem::replace(&mut c.co_names, tuple::new_tuple(names).into_raw());
+        xdecref(old);
+    }
+    Ok(r)
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn code_new_c(
+    a: c_int, p: c_int, k: c_int, f: c_int, consts: *mut PyObject, names: *mut PyObject, varnames: *mut PyObject,
+    freevars: *mut PyObject, cellvars: *mut PyObject, filename: *mut PyObject, name: *mut PyObject, qualname: *mut PyObject,
+    fl: c_int,
+) -> *mut PyObject {
+    unsafe {
+        if filename.is_null() || name.is_null() {
+            return null_arg();
+        }
+        ret(new_code_from_c(CCodeArgs {
+            argcount: a,
+            posonlyargcount: p,
+            kwonlyargcount: k,
+            flags: f,
+            consts: opt(consts),
+            names: opt(names),
+            varnames: opt(varnames),
+            freevars: opt(freevars),
+            cellvars: opt(cellvars),
+            filename: &*filename,
+            name: &*name,
+            qualname: opt(qualname),
+            firstlineno: fl,
+        }))
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyCode_NewEmpty(filename: *const c_char, funcname: *const c_char, firstlineno: c_int) -> *mut PyObject {
     unsafe {
-        ret((|| -> PyResult {
-            let fname = pystr::to_string_lossy(&*(cstr_obj(filename)?));
-            let c = crate::compile::compile_str("pass", &fname, crate::compile::Mode::Exec, 0, -1)?;
-            let co = c.code.clone();
-            let rep = ab::getattr_str(&co, "replace")?;
-            let kw = dict::new_dict();
-            dict::set_item_str(&kw, "co_name", &*(cstr_obj(funcname)?))?;
-            dict::set_item_str(&kw, "co_qualname", &*(cstr_obj(funcname)?))?;
-            dict::set_item_str(&kw, "co_firstlineno", &int::new_int(firstlineno as i64))?;
-            match ab::call_with_kwargs_dict(&rep, &[], Some(&kw)) {
-                Ok(r) => Ok(r),
-                Err(_) => {
-                    clear_exc();
-                    Ok(co)
-                }
-            }
-        })())
+        let Ok(fname) = cstr_obj(filename) else { return std::ptr::null_mut() };
+        let Ok(name) = cstr_obj(funcname) else { return std::ptr::null_mut() };
+        ret(new_code_from_c(CCodeArgs {
+            argcount: 0,
+            posonlyargcount: 0,
+            kwonlyargcount: 0,
+            flags: 0,
+            consts: None,
+            names: None,
+            varnames: None,
+            freevars: None,
+            cellvars: None,
+            filename: &fname,
+            name: &name,
+            qualname: None,
+            firstlineno,
+        }))
     }
 }
 #[unsafe(no_mangle)]
@@ -401,21 +574,19 @@ pub unsafe extern "C" fn PyCode_Optimize(code: *mut PyObject, _c: *mut PyObject,
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_Code_New(
-    _a: c_int, _p: c_int, _k: c_int, _n: c_int, _s: c_int, _f: c_int, _code: *mut PyObject, _consts: *mut PyObject, _names: *mut PyObject,
-    _varnames: *mut PyObject, _freevars: *mut PyObject, _cellvars: *mut PyObject, _filename: *mut PyObject, _name: *mut PyObject,
-    _qualname: *mut PyObject, _fl: c_int, _lt: *mut PyObject, _et: *mut PyObject,
+    a: c_int, k: c_int, _n: c_int, _s: c_int, f: c_int, _code: *mut PyObject, consts: *mut PyObject, names: *mut PyObject,
+    varnames: *mut PyObject, freevars: *mut PyObject, cellvars: *mut PyObject, filename: *mut PyObject, name: *mut PyObject,
+    qualname: *mut PyObject, fl: c_int, _lt: *mut PyObject, _et: *mut PyObject,
 ) -> *mut PyObject {
-    let _ = system_error("PyUnstable_Code_New: CPython bytecode is not supported by this runtime");
-    std::ptr::null_mut()
+    unsafe { code_new_c(a, 0, k, f, consts, names, varnames, freevars, cellvars, filename, name, qualname, fl) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_Code_NewWithPosOnlyArgs(
-    _a: c_int, _p: c_int, _k: c_int, _n: c_int, _s: c_int, _f: c_int, _code: *mut PyObject, _consts: *mut PyObject, _names: *mut PyObject,
-    _varnames: *mut PyObject, _freevars: *mut PyObject, _cellvars: *mut PyObject, _filename: *mut PyObject, _name: *mut PyObject,
-    _qualname: *mut PyObject, _fl: c_int, _lt: *mut PyObject, _et: *mut PyObject,
+    a: c_int, p: c_int, k: c_int, _n: c_int, _s: c_int, f: c_int, _code: *mut PyObject, consts: *mut PyObject,
+    names: *mut PyObject, varnames: *mut PyObject, freevars: *mut PyObject, cellvars: *mut PyObject, filename: *mut PyObject,
+    name: *mut PyObject, qualname: *mut PyObject, fl: c_int, _lt: *mut PyObject, _et: *mut PyObject,
 ) -> *mut PyObject {
-    let _ = system_error("PyUnstable_Code_NewWithPosOnlyArgs: CPython bytecode is not supported by this runtime");
-    std::ptr::null_mut()
+    unsafe { code_new_c(a, p, k, f, consts, names, varnames, freevars, cellvars, filename, name, qualname, fl) }
 }
 static CODE_EXTRA: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 static CODE_EXTRA_DATA: std::sync::Mutex<Vec<(usize, isize, usize)>> = std::sync::Mutex::new(Vec::new());
@@ -567,6 +738,12 @@ pub unsafe extern "C" fn PyFrame_New(_ts: *mut c_void, code: *mut PyObject, glob
     unsafe {
         let b = crate::builtins::builtins_module();
         let bd = crate::types::module::module_dict(&b);
+        if code.is_null() || !code::is_code(&*code) || globals.is_null() {
+            let _ = bad_internal();
+            return std::ptr::null_mut();
+        }
+        // a frame for non-optimized code without a locals mapping uses its globals
+        let locals = if locals.is_null() && code::code(&*code).flags() & 1 == 0 { globals } else { locals };
         let fr = crate::interp::frame::Frame::new(&*code, None, &*globals, &bd, opt(locals));
         let p = Box::into_raw(fr);
         let fobj = frameobject::new_frame_object(&mut *p);
