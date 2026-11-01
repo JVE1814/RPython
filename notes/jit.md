@@ -113,7 +113,18 @@ from scratch (no codegen crates, no reference to other implementations' source).
   * pointer hasher;
   * the allocation counter is decremented on untrack;
   * spin lock for the list.
-* `types/dict.rs`: version stamps and the hook for type-dict writes.
+* `types/dict.rs`:
+  * version stamps and the hook for type-dict writes;
+  * storage layout (assigned to this workstream): the `DictTable` header is a TLAB
+    block, and indices plus entries share one data block (TLAB when ≤2 KiB, else
+    malloc). A new dict is 2 small-object allocations instead of a Box and two Vecs
+    (3 mallocs).
+  * `entries_p`, `nentries` and `version` sit at fixed offsets for JIT code;
+    `entries()` / `entries_mut()` return slices.
+  * Exception/cycle loop (100k iterations): 1.28G → 1.10G instructions.
+  * Spec tests unchanged against master: test_dict 7 failures, test_ordered_dict 16,
+    test_weakref 4, test_gc 15 (identical failure lists); test_dictviews and test_set
+    pass.
 * `types/str.rs`: interning keyed on the cached hash (no key copies).
 * `types/code.rs`: `new_code_from_parts` builds code objects directly from objects (used
   by marshal).
@@ -152,7 +163,7 @@ Tools:
 The machine is shared and heavily loaded (load average 20–30 on 4 cores), so
 instruction counts are the primary metric.
 
-Startup (`-c pass`, instructions): 135M at the master merge → **49M** now
+Startup (`-c pass`, instructions): 135M at the master merge → **45M** now
 (CPython default 40.5M). With `-S`: **21M** (CPython 27.7M).
 
 Micro benchmarks (callgrind instructions, whole process; subtract startup: ours ~49M,
@@ -222,8 +233,12 @@ storage.
   opcodes so fewer deopts happen (with, raise/except, LoadSuperAttr inline).
 * Calls: Frame (Box + Vec slots, pool) setup/teardown is ~150 instructions; it should be
   a contiguous per-thread frame stack.
-* Dict storage (the coordinator assigned this): single-allocation small tables and
-  inline instance values. Every instance dict currently costs 3 mallocs.
+* Inline instance values (coordinator assignment, not started). Attributes would live
+  in a values array keyed by a per-type shared "shape", and a real dict would be
+  materialised only for `__dict__` or when the shape is broken. This touches generic
+  getattr/setattr, `dict_slot` users, subtype traverse/dealloc and the C API
+  (PyObject_GetDict, _PyObject_GetDictPtr). Small dicts are already allocation-cheap
+  (see above).
 * Startup: 49M vs 40.5M. The remaining cost is executing importlib for ~20 modules and
   class creation; the next step is caching module code or avoiding Python-level
   importlib for builtin/frozen modules.
