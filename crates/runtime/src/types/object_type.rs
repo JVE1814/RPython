@@ -767,6 +767,9 @@ fn type_get_module(o: &PyObject) -> PyResult {
     let tp = t(o);
     if is_heap_type(tp) {
         match dict::get_item_str(type_dict(tp), name!("__module__")) {
+            Some(m) if crate::types::typeobject::module_is_instance_descr(&m) => {
+                Ok(pystr::new_str(&type_module(tp).unwrap_or_else(|| "builtins".into())))
+            }
             Some(m) => Ok(m),
             None => raise!(AttributeError, "__module__"),
         }

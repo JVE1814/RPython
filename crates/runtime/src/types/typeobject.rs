@@ -81,18 +81,30 @@ pub fn type_name_of(o: &PyObject) -> String {
 }
 
 /// `__module__` of a type as Rust string (best effort).
+/// True if `__module__` in a heap type's dict is a member/getset descriptor for its
+/// instances (C types whose instances carry their own module, e.g. Cython's function
+/// type made with PyType_FromSpec); the type's own module then comes from its dotted name.
+pub fn module_is_instance_descr(m: &PyObject) -> bool {
+    let t = m.type_ptr();
+    t == crate::types::descr::member_descr_type() || t == crate::types::descr::getset_descr_type()
+}
+
 pub fn type_module(tp: *mut PyTypeObject) -> Option<String> {
     unsafe {
         if is_heap_type(tp) {
             let d = (*tp).tp_dict;
+            let mut from_name = false;
             if !d.is_null() {
                 if let Some(m) = dict::get_item_str(&*d, name!("__module__")) {
                     if pystr::is_str(&m) {
                         return Some(pystr::to_string_lossy(&m));
                     }
+                    from_name = module_is_instance_descr(&m);
                 }
             }
-            return None;
+            if !from_name {
+                return None;
+            }
         }
         let full = CStr::from_ptr((*tp).tp_name).to_string_lossy();
         match full.rfind('.') {

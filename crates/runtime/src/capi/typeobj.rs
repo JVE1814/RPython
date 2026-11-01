@@ -663,12 +663,17 @@ pub(crate) unsafe fn type_from_desc(desc: TypeDesc, token: *mut c_void) -> PyRes
         }
         // dict with __module__ / __doc__
         let d = dict::new_dict();
-        if let Some(m) = &modname {
-            dict::set_item_str(&d, "__module__", &pystr::new_str(m))?;
-        }
         (*tp).tp_dict = d.into_raw();
         let disallow = (*tp).tp_flags & Py_TPFLAGS_DISALLOW_INSTANTIATION != 0;
         to::type_ready(tp)?;
+        // the module from the dotted name, unless the type defines a `__module__` member or
+        // getset for its instances (Cython's function type: each function has its own)
+        if let Some(m) = &modname {
+            let d = &*(*tp).tp_dict;
+            if dict::get_item_str(d, crate::name!("__module__")).is_none() {
+                dict::set_item_str(d, "__module__", &pystr::new_str(m))?;
+            }
+        }
         if disallow {
             (*tp).tp_new = None;
             let _ = dict::del_item(&*(*tp).tp_dict, crate::name!("__new__"));
