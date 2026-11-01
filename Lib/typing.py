@@ -1585,8 +1585,12 @@ def get_type_hints(obj, globalns=None, localns=None, include_extras=False,
             globalns = obj.__dict__
         else:
             nsobj = obj
+            visited = {id(nsobj)}
             while hasattr(nsobj, '__wrapped__'):
                 nsobj = nsobj.__wrapped__
+                if id(nsobj) in visited:
+                    raise ValueError(f'wrapper loop when unwrapping {obj!r}')
+                visited.add(id(nsobj))
             globalns = getattr(nsobj, '__globals__', {})
         if localns is None:
             localns = globalns
