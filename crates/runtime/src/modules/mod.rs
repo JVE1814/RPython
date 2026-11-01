@@ -73,6 +73,7 @@ pub mod fcntl;
 pub mod termios;
 pub mod syslog;
 pub mod mmap;
+pub mod lsprof;
 pub mod _json;
 pub mod compress_common;
 pub mod zlib;
