@@ -58,8 +58,9 @@ tests are matched.  `ftplib` was written by markup (theirs is in master); mine w
 - test_ipaddress 212/212, test_urlparse 81 OK, test_urllib_response OK,
   test_http_cookies OK, test_http_cookiejar OK, test_robotparser OK,
   test_urllib2_localnet OK, test_httplib 151 OK (12 skipped: ssl), test_wsgiref 46 OK,
-  test_urllib 106 OK, test_urllib2 85 (2 failures: `array` stub, mimetypes `;type=a`),
-  test_ftplib 96 OK (49 skipped: ssl, IPv6), test_httpservers: all non-datetime tests.
+  test_urllib 106 OK, test_urllib2 85 (1 failure: mimetypes `;type=a`, see below),
+  test_ftplib 96 OK (49 skipped: ssl, IPv6), test_httpservers 101 OK.
+  asyncio REPL: all TestAsyncioREPL / test_asyncio_repl_* tests of test_repl pass.
 - test_asyncio: C variants run against `_asyncio`; test_proactor_events 82 OK,
   test_sock_lowlevel 45 OK, test_tools 22 OK (with a stub `_remote_debugging` providing
   only the record types — see below).
@@ -73,12 +74,33 @@ tests are matched.  `ftplib` was written by markup (theirs is in master); mine w
   used there); `asyncio ps/pstree` need `RemoteUnwinder(pid).get_all_awaited_by()`.
 
 ## Runtime issues found (not my files)
+- `types.FunctionType(module_code, globals)()` fails with "SystemError: no locals found
+  when storing X" (a function whose code lacks CO_NEWLOCALS should use its globals as
+  locals), and `eval()` of code compiled with PyCF_ALLOW_TOP_LEVEL_AWAIT does not return
+  a coroutine ("yield from a non-generator frame").  The asyncio REPL works around both
+  (sync statements via exec; statements with await recompiled from the AST into an
+  `async def` whose assigned names are declared global).
+- An exception propagating out of awaited coroutines gets every frame twice in its
+  traceback ("line 427, in wait_for" twice): test_futures2.test_future_traceback.
+- `decimal.getcontext()` is not contextvar-based although `decimal.HAVE_CONTEXTVAR` is
+  True (a context changed inside `Context.run` leaks out): test_asyncio.test_context.
+- Intermittent segfault when `gc.get_referrers()` runs while another thread executes
+  (test_streams.test_open_connection_happy_eyeball_refcycles, ~1 in 3 runs).
 - `class B(A, tuple): __slots__ = ()` with a dict-having A: instances get no __dict__.
 - Re-raising a stored exception with `with_traceback(tb)` appears to extend the stored
   traceback chain (test_futures2.test_future_traceback counts 2 frames; Py and C
   variants alike).
 - mimetypes (markup): `guess_type('ftp://h/baz.gif;type=a')` ignores the `;params` of
   the URL path (CPython gives image/gif).
+
+## asyncio 3.15 behaviour implemented (from the tests)
+- servers accept connections in the context captured when the Server was created
+  (`_start_serving(..., context)`), transports run all their callbacks in their creation
+  context (gh-140947 test), `call_soon_threadsafe()` returns `events._ThreadSafeHandle`,
+  `writelines()` drops empty chunks, cancelled `sock_accept()` leaves the connection
+  pending, subprocess `wait()` returns when the child exits even if a pipe stays open,
+  a failing synchronous `client_connected_cb` is reported and closes the transport,
+  `TaskGroup.cancel()`.
 
 ## Missing / TODO
 - asyncio `windows_events`/`windows_utils` (Windows only).
