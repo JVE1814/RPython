@@ -157,6 +157,17 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_expr_inner(&mut self, e: &'a Expr) -> R {
+        // guards against malformed hand-built ASTs (see validate_ast)
+        let malformed = match &e.node {
+            ExprKind::BoolOp { values, .. } => values.len() < 2,
+            ExprKind::Compare { ops, comparators, .. } => ops.is_empty() || ops.len() != comparators.len(),
+            ExprKind::ListComp { generators, .. } | ExprKind::SetComp { generators, .. } | ExprKind::GeneratorExp { generators, .. } | ExprKind::DictComp { generators, .. } => generators.is_empty(),
+            ExprKind::Dict { keys, values } => keys.len() != values.len(),
+            _ => false,
+        };
+        if malformed {
+            return Err(CompileError::other(ErrorKind::ValueError, format!("malformed {} node", e.class_name())));
+        }
         match &e.node {
             ExprKind::BoolOp { op, values } => {
                 let end = self.new_label();
