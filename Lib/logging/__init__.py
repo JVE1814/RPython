@@ -386,9 +386,14 @@ class StringTemplateStyle(PercentStyle):
         fmt = self._fmt
         return fmt.find('$asctime') >= 0 or fmt.find(self.asctime_search) >= 0
 
+    # $-placeholders as string.Template understands them.
+    _placeholder = re.compile(
+        r'\$(?:(?P<escaped>\$)|(?P<named>[_a-z][_a-z0-9]*)'
+        r'|\{(?P<braced>[_a-z][_a-z0-9]*)\}|(?P<invalid>))', re.I | re.A)
+
     def validate(self):
         seen = set()
-        for match in Template.pattern.finditer(self._fmt):
+        for match in self._placeholder.finditer(self._fmt):
             groups = match.groupdict()
             if groups['named']:
                 seen.add(groups['named'])
