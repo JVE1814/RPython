@@ -44,6 +44,7 @@ pub mod codec_charmap;
 pub mod _struct;
 pub mod binascii;
 pub mod _random;
+pub mod _imp;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
 pub fn register_all() {
