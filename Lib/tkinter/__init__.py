@@ -712,14 +712,14 @@ class Misc:
         name = self.tk.call('focus')
         if name == 'none' or not name:
             return None
-        return self._nametowidget(name)
+        return self._widget_or_none(name)
 
     def focus_displayof(self):
         """Return the widget that has the focus on this widget's display."""
         name = self.tk.call('focus', '-displayof', self._w)
         if name == 'none' or not name:
             return None
-        return self._nametowidget(name)
+        return self._widget_or_none(name)
 
     def focus_lastfor(self):
         """Return the widget that would get the focus if this widget's
@@ -727,7 +727,7 @@ class Misc:
         name = self.tk.call('focus', '-lastfor', self._w)
         if name == 'none' or not name:
             return None
-        return self._nametowidget(name)
+        return self._widget_or_none(name)
 
     def tk_focusFollowsMouse(self):
         """Make the focus follow the mouse pointer."""
@@ -749,7 +749,7 @@ class Misc:
 
     # -- timers
 
-    def after(self, ms, func=None, *args):
+    def after(self, ms, func=None, *args, **kw):
         """Call *func(*args)* once after *ms* milliseconds.
 
         Without *func*, just wait (processing no events).  Returns an
@@ -760,7 +760,7 @@ class Misc:
             return None
         def callit():
             try:
-                func(*args)
+                func(*args, **kw)
             finally:
                 try:
                     self.deletecommand(name)
@@ -773,9 +773,9 @@ class Misc:
         name = self._register(callit)
         return self.tk.call('after', ms, name)
 
-    def after_idle(self, func, *args):
-        """Call *func(*args)* once when Tk has nothing else to do."""
-        return self.after('idle', func, *args)
+    def after_idle(self, func, *args, **kw):
+        """Call *func(*args, **kw)* once when Tk has nothing else to do."""
+        return self.after('idle', func, *args, **kw)
 
     def after_cancel(self, id):
         """Cancel a callback scheduled with after() or after_idle()."""
@@ -1213,14 +1213,30 @@ class Misc:
             return self.tk.splitlist(self.tk.call('bindtags', self._w))
         self.tk.call('bindtags', self._w, tagList)
 
+    # Each Python callback bound to an event is one line of the binding
+    # script:   if {"[FUNCID %# %b ...]" == "break"} break
+    _bound_funcid = re.compile(r'^if \{"\[(\S+) ', re.MULTILINE)
+
+    def _bound_funcids(self, script):
+        return self._bound_funcid.findall(str(script))
+
+    def _forget_commands(self, funcids):
+        for funcid in funcids:
+            try:
+                self.deletecommand(funcid)
+            except TclError:
+                pass
+
     def _bind(self, what, sequence, func, add, needcleanup=1):
         if isinstance(func, str):
             self.tk.call(what + (sequence, func))
         elif func:
+            replaced = () if add else self._bound_funcids(self.tk.call(what + (sequence,)))
             funcid = self._register(func, self._substitute, needcleanup)
             cmd = '%sif {"[%s %s]" == "break"} break\n' % (
                 '+' if add else '', funcid, self._subst_format_str)
             self.tk.call(what + (sequence, cmd))
+            self._forget_commands(replaced)
             return funcid
         elif sequence:
             return self.tk.call(what + (sequence,))
@@ -1241,14 +1257,14 @@ class Misc:
 
     def _unbind(self, what, funcid=None):
         if funcid is None:
+            old = self.tk.call(what)
             self.tk.call(*what, '')
+            self._forget_commands(self._bound_funcids(old))
         else:
-            lines = self.tk.call(what).split('\n')
             prefix = 'if {"[%s ' % funcid
-            keep = [l for l in lines if not l.startswith(prefix)]
-            if not keep[0:1] or not ''.join(keep).strip():
-                keep = []
-            self.tk.call(*what, '\n'.join(keep))
+            keep = [line for line in str(self.tk.call(what)).split('\n')
+                    if line.strip() and not line.startswith(prefix)]
+            self.tk.call(*what, '\n'.join(keep) + '\n' if keep else '')
             self.deletecommand(funcid)
 
     def unbind(self, sequence, funcid=None):
@@ -1347,10 +1363,25 @@ class Misc:
         for n in name:
             if not n:
                 break
-            w = w.children[n]
+            try:
+                w = w.children[n]
+            except KeyError:
+                # Tk names a clone of a menu (menubars, cascades) after the
+                # original's path name with every '.' turned into '#'.
+                if n[:1] != '#':
+                    raise
+                w = w._root().nametowidget('.' + n.lstrip('#').replace('#', '.'))
         return w
 
     _nametowidget = nametowidget
+
+    def _widget_or_none(self, name):
+        # The widget for a Tcl path name, or None for windows that tkinter
+        # did not create (e.g. torn-off menus).
+        try:
+            return self._nametowidget(name)
+        except KeyError:
+            return None
 
     def _register(self, func, subst=None, needcleanup=1):
         """Create a Tcl command that calls *func*; return its name."""
@@ -1515,9 +1546,8 @@ class Misc:
         return '<%s.%s object %s>' % (
             self.__class__.__module__, self.__class__.__qualname__, self._w)
 
-    # Widgets are neither containers nor iterables
+    # Widgets are not iterable (despite __getitem__)
     __iter__ = None
-    __contains__ = None
 
     # -- geometry managers: shared queries
 
@@ -1918,13 +1948,15 @@ class Wm:
             command = self._register(func)
         else:
             command = func
+        if name is None:
+            return self.tk.splitlist(self.tk.call('wm', 'protocol', self._w))
         return self.tk.call('wm', 'protocol', self._w, name, command)
 
     protocol = wm_protocol
 
     def wm_resizable(self, width=None, height=None):
         """Get or set whether the window can be resized in each direction."""
-        return self.tk.call('wm', 'resizable', self._w, width, height)
+        return self._getints(self.tk.call('wm', 'resizable', self._w, width, height))
 
     resizable = wm_resizable
 
@@ -2600,11 +2632,21 @@ class Checkbutton(Widget):
     def _setup(self, master, cnf):
         # Without an explicit variable Tk would use a global variable named
         # after the last path component, shared between same-named buttons.
+        # The number continues both the application-wide checkbutton count
+        # and the parent's numbering of generated child names, so the name
+        # is unique in the application and does not clash with siblings.
         if not cnf.get('name'):
             global _checkbutton_count
+            if master is None:
+                master = _get_default_root()
             name = self.__class__.__name__.lower()
-            _checkbutton_count += 1
-            cnf['name'] = '!%s%d' % (name, _checkbutton_count)
+            if name[-1].isdigit():
+                name += '!'
+            if master._last_child_ids is None:
+                master._last_child_ids = {}
+            count = max(_checkbutton_count, master._last_child_ids.get(name, 0)) + 1
+            _checkbutton_count = master._last_child_ids[name] = count
+            cnf['name'] = '!%s%d' % (name, count)
         super()._setup(master, cnf)
 
     def deselect(self):
@@ -3191,6 +3233,8 @@ class Text(Widget, XView, YView):
 
     def edit_modified(self, arg=None):
         """Get or set the modified flag."""
+        if arg is None:
+            return self.tk.getboolean(self.edit("modified"))
         return self.edit("modified", arg)
 
     def edit_redo(self):
@@ -3316,7 +3360,7 @@ class Text(Widget, XView, YView):
             args.append('--')
         args.append(pattern)
         args.append(index)
-        if stopindex:
+        if stopindex is not None:
             args.append(stopindex)
         return str(self.tk.call(tuple(args)))
 
@@ -3341,7 +3385,7 @@ class Text(Widget, XView, YView):
             args.append('--')
         args.append(pattern)
         args.append(index)
-        if stopindex:
+        if stopindex is not None:
             args.append(stopindex)
         result = self.tk.call(tuple(args))
         return self.tk.splitlist(result)
@@ -3494,6 +3538,19 @@ class Image:
     """Base class for images."""
 
     _last_id = 0
+    _tclCommands = None
+
+    # images are not iterable (despite __getitem__)
+    __iter__ = None
+
+    def _register(self, func):
+        # Make *func* callable from Tcl; the command lives as long as the image.
+        cmd = repr(id(func)) + getattr(func, '__name__', '')
+        self.tk.createcommand(cmd, func)
+        if self._tclCommands is None:
+            self._tclCommands = []
+        self._tclCommands.append(cmd)
+        return cmd
 
     def __init__(self, imgtype, name=None, cnf={}, master=None, **kw):
         self.name = None
@@ -3524,6 +3581,12 @@ class Image:
                 self.tk.call('image', 'delete', self.name)
             except TclError:
                 pass
+        for cmd in self._tclCommands or ():
+            try:
+                self.tk.deletecommand(cmd)
+            except TclError:
+                pass
+        self._tclCommands = None
 
     def __setitem__(self, key, value):
         self.tk.call(self.name, 'configure', '-' + key, value)
@@ -3623,7 +3686,7 @@ class PhotoImage(Image):
 
     def get(self, x, y):
         """Return the (red, green, blue) color of pixel (x, y)."""
-        return self._getints(self.tk.call(self.name, 'get', x, y))
+        return self.tk.call(self.name, 'get', x, y)
 
     def _getints(self, string):
         if string:

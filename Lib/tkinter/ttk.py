@@ -8,7 +8,17 @@ replace their classic tkinter counterparts; Combobox, Notebook, Progressbar,
 Separator, Sizegrip, Spinbox and Treeview are new.
 """
 
-__version__ = "0.3.1"
+_VERSION = "0.3.1"
+
+
+def __getattr__(name):
+    if name == "__version__":
+        import warnings
+        warnings.warn("'__version__' is deprecated and slated for removal "
+                      "in Python 3.20", DeprecationWarning, stacklevel=2)
+        return _VERSION
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = ["Button", "Checkbutton", "Combobox", "Entry", "Frame", "Label",
            "Labelframe", "LabelFrame", "Menubutton", "Notebook", "Panedwindow",
@@ -158,16 +168,17 @@ def _script_from_settings(settings):
 def _list_from_statespec(stuple):
     """Turn a flat (statespec, value, ...) sequence into
     [(state..., value), ...]."""
-    items = []
-    for val in stuple:
-        typename = getattr(val, 'typename', None)
-        if typename is not None:
+    result = []
+    it = iter(stuple)
+    for spec, val in zip(it, it):
+        # a state spec arrives as a StateSpec object, a plain string (when
+        # objects are not wanted) or already as a sequence
+        if hasattr(spec, 'typename') or isinstance(spec, str):
+            spec = str(spec).split()
+        if hasattr(val, 'typename'):
             val = str(val)
-            if typename == 'StateSpec':
-                val = val.split()
-        items.append(val)
-    it = iter(items)
-    return [_flatten(spec) + (val,) for spec, val in zip(it, it)]
+        result.append(_flatten(spec) + (val,))
+    return result
 
 
 def _list_from_layouttuple(tk, ltuple):

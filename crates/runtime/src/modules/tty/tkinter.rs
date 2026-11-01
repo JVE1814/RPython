@@ -109,6 +109,9 @@ dl_api! {
         fn Tcl_GetWideIntFromObj(i: Interp, o: *mut TclObj, v: *mut i64) -> c_int;
         fn Tcl_GetDoubleFromObj(i: Interp, o: *mut TclObj, v: *mut f64) -> c_int;
         fn Tcl_GetBooleanFromObj(i: Interp, o: *mut TclObj, v: *mut c_int) -> c_int;
+        fn Tcl_GetBoolean(i: Interp, s: *const c_char, v: *mut c_int) -> c_int;
+        fn Tcl_SetSystemEncoding(i: Interp, name: *const c_char) -> c_int;
+        fn Tcl_GetEncodingName(e: *mut c_void) -> *const c_char;
         fn Tcl_GetByteArrayFromObj(o: *mut TclObj, n: *mut c_int) -> *mut u8;
         fn Tcl_ListObjGetElements(i: Interp, o: *mut TclObj, n: *mut c_int, v: *mut *mut *mut TclObj) -> c_int;
         fn Tcl_GetObjType(name: *const c_char) -> *const TclObjType;
@@ -926,11 +929,16 @@ macro_rules! on_interp {
 
 fn tk_call(o: &PyObject, args: &[&PyObject]) -> PyResult {
     // a single tuple argument stands for the whole argument list
-    let owned: Vec<PyRef> = if args.len() == 1 && tuple::is_tuple(args[0]) {
+    let mut owned: Vec<PyRef> = if args.len() == 1 && tuple::is_tuple(args[0]) {
         tuple::tuple_to_vec(args[0])
     } else {
         args.iter().map(|a| a.to_ref()).collect()
     };
+    // A None argument ends the argument list (tkinter passes optional
+    // trailing arguments as None).
+    if let Some(n) = owned.iter().position(|v| none::is_none(v)) {
+        owned.truncate(n);
+    }
     if let Some(tr) = app(o).trace.clone() {
         ab::call(&tr, &[&tuple::new_tuple(owned.clone())])?;
     }
@@ -1123,11 +1131,17 @@ fn tk_getboolean(o: &PyObject, v: &PyObject) -> PyResult {
     if int::is_int(v) {
         return Ok(bool_::new_bool(ab::is_true(v)?));
     }
+    // Strings must be boolean words or 0/1 (not any number, as for objects).
+    let text = if is_tclobj(v) { None } else { Some(str_arg("getboolean", v)?) };
     let arg = conv_arg("getboolean", v)?;
     let argp = SendPtr(arg.0 as *const TclObj);
     on_interp!(o, move |a: &App| unsafe {
         let mut b: c_int = 0;
-        if (api().Tcl_GetBooleanFromObj)(a.interp, argp.0 as *mut TclObj, &mut b) != TCL_OK {
+        let rc = match &text {
+            Some(s) => (api().Tcl_GetBoolean)(a.interp, s.as_ptr(), &mut b),
+            None => (api().Tcl_GetBooleanFromObj)(a.interp, argp.0 as *mut TclObj, &mut b),
+        };
+        if rc != TCL_OK {
             return Err(app_error(a));
         }
         Ok(bool_::new_bool(b != 0))
@@ -1233,7 +1247,8 @@ fn tk_splitlist(o: &PyObject, v: &PyObject) -> PyResult {
 // ---- commands implemented in Python
 
 struct CmdData {
-    app: PyRef,
+    // Borrowed: the interpreter (and with it this command) dies with the app.
+    app: *mut PyObject,
     func: PyRef,
 }
 
@@ -1241,7 +1256,8 @@ unsafe extern "C" fn python_cmd(cd: *mut c_void, _interp: Interp, objc: c_int, o
     unsafe {
         let data = &*(cd as *const CmdData);
         in_vm(|| {
-            let a = app(&data.app);
+            let app_ref = (*data.app).to_ref();
+            let a = app(&app_ref);
             let want2 = a.wantobjects.load(Ordering::Relaxed) >= 2;
             let r = (|| -> PyResult {
                 let mut args = Vec::with_capacity(objc.max(1) as usize - 1);
@@ -1287,9 +1303,9 @@ fn tk_createcommand(o: &PyObject, args: &[&PyObject]) -> PyResult {
     if !ab::is_callable(&func) {
         raise!(TypeError, "command not callable");
     }
-    let me = o.to_ref();
+    let me = Hold::new(o);
     on_interp!(o, move |a: &App| unsafe {
-        let data = Box::into_raw(Box::new(CmdData { app: me, func }));
+        let data = Box::into_raw(Box::new(CmdData { app: me.0, func }));
         let r = (api().Tcl_CreateObjCommand)(a.interp, name.as_ptr(), python_cmd, data as *mut c_void, Some(python_cmd_delete));
         if r.is_null() {
             drop(Box::from_raw(data));
@@ -1586,7 +1602,17 @@ fn m_create(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     let screen = opt_str("create", g(0))?;
     let _base = opt_str("create", g(1))?;
     let class_name = match g(2) {
-        Some(v) => str_arg("create", v)?,
+        Some(v) => {
+            // Tcl 8 cannot title-case a first letter outside the BMP.
+            if pystr::is_str(v) && pystr::str_len(v) > 0 {
+                if let pystr::StrData::U4(d) = pystr::str_data(v) {
+                    if d[0] > 0xFFFF {
+                        raise!(ValueError, "className must not start with a character outside the BMP");
+                    }
+                }
+            }
+            str_arg("create", v)?
+        }
         None => CString::new("Tk").unwrap(),
     };
     let interactive = opt_bool(g(3), false)?;
@@ -1711,6 +1737,18 @@ pub fn init() -> PyResult {
         clear_exc();
         let exe = CString::new(exe).unwrap_or_default();
         unsafe { (a.Tcl_FindExecutable)(exe.as_ptr()) };
+        // Keep Tcl's idea of file names and system strings in line with
+        // Python's: a C locale makes Tcl choose iso8859-1, while Python then
+        // uses UTF-8 for the file system.
+        let fsenc = crate::import::import_absolute("sys")
+            .and_then(|s| ab::call_method_str(&s, "getfilesystemencoding", &[]))
+            .ok()
+            .map(|e| pystr::to_string_lossy(&e))
+            .unwrap_or_default();
+        clear_exc();
+        if fsenc == "utf-8" {
+            unsafe { (a.Tcl_SetSystemEncoding)(std::ptr::null_mut(), c"utf-8".as_ptr()) };
+        }
     }
     unsafe {
         let t = tclobj_type();
