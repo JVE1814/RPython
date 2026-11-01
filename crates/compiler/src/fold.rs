@@ -900,14 +900,18 @@ impl<'w> Folder<'w> {
 
     fn check_compare(&mut self, e: &Expr) {
         if let ExprKind::Compare { left, ops, comparators } = &e.node {
-            let is_arg = |x: &Expr| -> bool {
+            fn is_arg(x: &Expr) -> bool {
                 match &x.node {
                     ExprKind::Constant { value, .. } => {
                         matches!(value, Constant::None | Constant::Bool(_) | Constant::Ellipsis)
                     }
+                    // a tuple display of constants is a (folded) tuple literal
+                    ExprKind::Tuple { elts, .. } => {
+                        !elts.iter().all(|e| matches!(e.node, ExprKind::Constant { .. }) || (matches!(e.node, ExprKind::Tuple { .. }) && !is_arg(e)))
+                    }
                     _ => true,
                 }
-            };
+            }
             let mut left_ok = is_arg(left);
             let mut left_expr: &Expr = left;
             for (op, right) in ops.iter().zip(comparators.iter()) {

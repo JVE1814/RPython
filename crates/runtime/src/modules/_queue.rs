@@ -154,7 +154,8 @@ fn sq_get(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
         None => true,
     };
     let timeout = match t {
-        Some(t) if !t.is(none::none()) => {
+        // a non-blocking get ignores the timeout
+        Some(t) if block && !t.is(none::none()) => {
             let v = ab::float_value(t)?;
             if v < 0.0 {
                 raise!(ValueError, "'timeout' must be a non-negative number");

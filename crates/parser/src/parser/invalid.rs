@@ -45,9 +45,17 @@ impl<'a> Parser<'a> {
                     let level = if self.p > 0 { self.toks[self.p - 1].level } else { 0 };
                     let a_is_str = matches!(self.toks[start].ty, T::STRING | T::FSTRING_START | T::TSTRING_START)
                         && matches!(a.node, ExprKind::Constant { .. } | ExprKind::JoinedStr { .. } | ExprKind::TemplateStr { .. });
-                    if is_legacy(&a).is_none() {
+                    // `( 1, 2\nb = 3`: the "missing comma" is really an unclosed bracket
+                    let unclosed_at_eof = self.toks.iter().rev().find(|t| t.ty != T::ENDMARKER && t.ty != T::ERRORTOKEN && t.ty != T::NEWLINE).is_some_and(|t| t.level > 0);
+                    let in_fstring = self.toks[..start].iter().fold(0i32, |d, t| match t.ty {
+                        T::FSTRING_START | T::TSTRING_START => d + 1,
+                        T::FSTRING_END | T::TSTRING_END => d - 1,
+                        _ => d,
+                    }) > 0;
+                    let looks_like_new_stmt = unclosed_at_eof && !in_fstring && b.loc.lineno > a.loc.end_lineno && self.at(T::EQUAL);
+                    if is_legacy(&a).is_none() && !looks_like_new_stmt {
                         if level != 0 {
-                            // gh-142236: for implicit string concatenation point at the last string
+                            // for implicit string concatenation the error points at the last string
                             let mut aloc = a.loc;
                             if a_is_str {
                                 let mut i = start;
@@ -165,7 +173,7 @@ impl<'a> Parser<'a> {
         t.ty == T::NAME
             && matches!(
                 t.kw,
-                Kw::Pass | Kw::Break | Kw::Continue | Kw::Return | Kw::Raise | Kw::Del | Kw::Import | Kw::From | Kw::Global | Kw::Nonlocal | Kw::Assert
+                Kw::Pass | Kw::Break | Kw::Continue | Kw::Return | Kw::Raise | Kw::Del | Kw::Import | Kw::From | Kw::Global | Kw::Nonlocal | Kw::Assert | Kw::Yield
             )
     }
 

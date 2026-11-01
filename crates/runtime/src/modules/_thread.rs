@@ -291,8 +291,13 @@ fn my_ident() -> u64 {
     unsafe { libc::pthread_self() as u64 }
 }
 
-unsafe extern "C" fn rlock_new(tp: *mut PyTypeObject, _args: *mut PyObject, _kw: *mut PyObject) -> *mut PyObject {
+unsafe extern "C" fn rlock_new(tp: *mut PyTypeObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
     unsafe {
+        // Arguments are only accepted when a subclass defines its own __init__.
+        let has_args = (!args.is_null() && tuple::tuple_len(&*args) != 0) || (!kw.is_null() && dict::dict_len(&*kw) != 0);
+        if has_args && (tp == &raw mut RLOCK_TYPE || (*tp).tp_init == RLOCK_TYPE.tp_init) {
+            return into_c(Err(err!(TypeError, "RLock() takes no arguments")));
+        }
         let op = crate::alloc::alloc_object(tp, std::mem::size_of::<RLockObject>().max((*tp).tp_basicsize as usize));
         let r = op as *mut RLockObject;
         std::ptr::write(&raw mut (*r).lock, RawLock::new());
@@ -445,11 +450,16 @@ impl HandleInner {
     }
     fn effective_state(&self) -> HState {
         let s = *self.state.lock().unwrap();
-        if s == HState::Running && self.generation.load(Relaxed) != FORK_GENERATION.load(Relaxed) && self.ident.load(Relaxed) != my_ident() {
+        if s == HState::Running && self.lost_by_fork(self.generation.load(Relaxed)) {
             // the OS thread does not exist in this (forked) process
             return HState::Done;
         }
         s
+    }
+    /// True if this handle's thread did not survive a fork() since the
+    /// handle was created (only the forking thread survives).
+    fn lost_by_fork(&self, created_generation: u64) -> bool {
+        created_generation != FORK_GENERATION.load(Relaxed) && self.ident.load(Relaxed) != FORK_SURVIVOR.load(Relaxed)
     }
     fn set_done(&self) {
         *self.state.lock().unwrap() = HState::Done;
@@ -458,6 +468,8 @@ impl HandleInner {
 }
 
 static FORK_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Ident of the thread that called fork() most recently (in a forked child).
+static FORK_SURVIVOR: AtomicU64 = AtomicU64::new(0);
 static NON_DAEMON: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 static THREAD_COUNT: AtomicUsize = AtomicUsize::new(0);
 static STACK_SIZE: AtomicUsize = AtomicUsize::new(0);
@@ -537,7 +549,7 @@ fn handle_join(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRes
     wait_interruptible(
         &h.state,
         &h.cv,
-        |s| *s == HState::Done || (fgen != FORK_GENERATION.load(Relaxed)),
+        |s| *s == HState::Done || h.lost_by_fork(fgen),
         timeout,
     )?;
     Ok(none::none_ref())
@@ -737,7 +749,7 @@ fn thread_shutdown(_m: &PyObject) -> PyResult {
         match next {
             Some(h) => {
                 let fgen = h.generation.load(Relaxed);
-                wait_interruptible(&h.state, &h.cv, |s| *s == HState::Done || fgen != FORK_GENERATION.load(Relaxed), None)?;
+                wait_interruptible(&h.state, &h.cv, |s| *s == HState::Done || h.lost_by_fork(fgen), None)?;
                 let mut nd = NON_DAEMON.lock().unwrap();
                 let me = Arc::as_ptr(&h) as usize;
                 if let Some(i) = nd.iter().position(|&p| p == me) {
@@ -807,6 +819,9 @@ fn interrupt_main(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> P
         None => libc::SIGINT,
     };
     crate::modules::signal::set_interrupt(signum)?;
+    // Called from the main thread: the handler runs right away (before the
+    // caller's next statement), as it would after the call returns.
+    crate::modules::signal::check_signals()?;
     Ok(none::none_ref())
 }
 fn daemon_threads_allowed(_m: &PyObject) -> PyResult {
@@ -1050,7 +1065,13 @@ unsafe extern "C" fn local_getattro(op: *mut PyObject, name: *mut PyObject) -> *
         let n = &*name;
         let r = (|| -> PyResult {
             let d = local_dict(o)?;
-            if pystr::is_str(n) && pystr::str_eq_ascii(n, "__dict__") {
+            let is_dict_name = if pystr::is_str(n) {
+                pystr::str_eq_ascii(n, "__dict__")
+            } else {
+                // compared like any object (the name check comes first)
+                ab::rich_compare_bool(n, &pystr::new_str("__dict__"), crate::ffi::Py_EQ)?
+            };
+            if is_dict_name {
                 return Ok(d);
             }
             match crate::types::typeobject::generic_getattr_opt(o, n, Some(&d))? {
@@ -1066,7 +1087,13 @@ unsafe extern "C" fn local_setattro(op: *mut PyObject, name: *mut PyObject, v: *
         let o = &*op;
         let n = &*name;
         let r = (|| -> PyResult<()> {
-            if pystr::is_str(n) && pystr::str_eq_ascii(n, "__dict__") {
+            let is_dict_name = if pystr::is_str(n) {
+                pystr::str_eq_ascii(n, "__dict__")
+            } else {
+                // compared like any object (the name check comes first)
+                ab::rich_compare_bool(n, &pystr::new_str("__dict__"), crate::ffi::Py_EQ)?
+            };
+            if is_dict_name {
                 raise!(AttributeError, "'{}' object attribute '__dict__' is read-only", tname(o));
             }
             let d = local_dict(o)?;
@@ -1157,6 +1184,7 @@ fn thread_excepthook(_m: &PyObject, a: &PyObject) -> PyResult {
 
 extern "C" fn atfork_child() {
     FORK_GENERATION.fetch_add(1, Relaxed);
+    FORK_SURVIVOR.store(my_ident(), Relaxed);
     let me = my_ident();
     crate::threads::MAIN_THREAD_ID.store(me, Release);
     let ts = crate::threads::current_ptr();

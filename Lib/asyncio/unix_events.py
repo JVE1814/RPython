@@ -415,8 +415,8 @@ class _UnixSelectorEventLoop(selector_events.BaseSelectorEventLoop):
                                 total_sent)
 
     def _sock_sendfile_update_filepos(self, fileno, offset, total_sent):
-        if total_sent > 0:
-            os.lseek(fileno, offset, os.SEEK_SET)
+        # the file position ends after the data sent (even if none was)
+        os.lseek(fileno, offset, os.SEEK_SET)
 
     def _sock_add_cancellation_callback(self, fut, sock):
         def cb(fut):

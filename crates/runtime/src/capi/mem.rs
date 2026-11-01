@@ -156,7 +156,11 @@ macro_rules! domain_fns {
             }
             unsafe {
                 let a = dom($d);
-                a.malloc.unwrap()(a.ctx, n)
+                let p = a.malloc.unwrap()(a.ctx, n);
+                if crate::modules::_tracemalloc::TRACING.load(Relaxed) {
+                    crate::modules::_tracemalloc::track(p as *const u8, n);
+                }
+                p
             }
         }
         #[unsafe(no_mangle)]
@@ -166,7 +170,11 @@ macro_rules! domain_fns {
             }
             unsafe {
                 let a = dom($d);
-                a.calloc.unwrap()(a.ctx, n, s)
+                let p = a.calloc.unwrap()(a.ctx, n, s);
+                if crate::modules::_tracemalloc::TRACING.load(Relaxed) {
+                    crate::modules::_tracemalloc::track(p as *const u8, n * s);
+                }
+                p
             }
         }
         #[unsafe(no_mangle)]
@@ -176,12 +184,19 @@ macro_rules! domain_fns {
             }
             unsafe {
                 let a = dom($d);
-                a.realloc.unwrap()(a.ctx, p, n)
+                let np = a.realloc.unwrap()(a.ctx, p, n);
+                if crate::modules::_tracemalloc::TRACING.load(Relaxed) {
+                    crate::modules::_tracemalloc::retrack(p as *const u8, np as *const u8, n);
+                }
+                np
             }
         }
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $f(p: *mut c_void) {
             unsafe {
+                if crate::modules::_tracemalloc::TRACING.load(Relaxed) {
+                    crate::modules::_tracemalloc::untrack(p as *const u8);
+                }
                 let a = dom($d);
                 a.free.unwrap()(a.ctx, p)
             }
@@ -222,14 +237,7 @@ pub unsafe extern "C" fn PyObject_SetArenaAllocator(a: *mut PyObjectArenaAllocat
     }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyTraceMalloc_Track(_domain: std::ffi::c_uint, _ptr: usize, _size: usize) -> c_int {
-    -2
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyTraceMalloc_Untrack(_domain: std::ffi::c_uint, _ptr: usize) -> c_int {
-    -2
-}
+// PyTraceMalloc_Track/Untrack live in modules/_tracemalloc.rs.
 
 // ---------------------------------------------------------------- object init
 
@@ -397,4 +405,13 @@ pub unsafe extern "C" fn PyGC_Collect() -> Py_ssize_t {
 
 pub type gcvisitobjects_t = Option<unsafe extern "C" fn(*mut PyObject, *mut c_void) -> c_int>;
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyUnstable_GC_VisitObjects(_cb: gcvisitobjects_t, _arg: *mut c_void) {}
+pub unsafe extern "C" fn PyUnstable_GC_VisitObjects(cb: gcvisitobjects_t, arg: *mut c_void) {
+    // visits every object tracked by the collector (a snapshot; references held
+    // while the callback runs); a zero result stops the walk
+    let Some(cb) = cb else { return };
+    for o in crate::gc::all_tracked() {
+        if unsafe { cb(o.as_ptr(), arg) } == 0 {
+            break;
+        }
+    }
+}

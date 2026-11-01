@@ -44,6 +44,9 @@ pub const E_RESERVED_PREFIX_XMLNS: u32 = 39;
 pub const E_RESERVED_NAMESPACE_URI: u32 = 40;
 pub const E_AMPLIFICATION_LIMIT_BREACH: u32 = 43;
 
+/// Memory every parser holds before any input (allocation limiter model).
+const PARSER_BASE_BYTES: u64 = 1024;
+
 pub const ERROR_MESSAGES: &[&str] = &[
     "",
     "out of memory",
@@ -155,22 +158,51 @@ pub struct ModelNode {
     pub children: Vec<usize>,
 }
 
+// The payloads of rare events are boxed so that Ev (and the event batches)
+// stay small.
+pub struct StartDoctypeEv {
+    pub name: String,
+    pub sysid: Option<String>,
+    pub pubid: Option<String>,
+    pub internal: bool,
+}
+pub struct AttlistDeclEv {
+    pub elname: String,
+    pub attname: String,
+    pub atype: String,
+    pub default: Option<String>,
+    pub required: bool,
+}
+pub struct EntityDeclEv {
+    pub name: String,
+    pub is_pe: bool,
+    pub value: Option<String>,
+    pub base: Option<String>,
+    pub sysid: Option<String>,
+    pub pubid: Option<String>,
+    pub notation: Option<String>,
+}
+pub struct NotationDeclEv {
+    pub name: String,
+    pub base: Option<String>,
+    pub sysid: Option<String>,
+    pub pubid: Option<String>,
+}
+pub struct ExternalEntityRefEv {
+    pub context: Option<String>,
+    pub base: Option<String>,
+    pub sysid: Option<String>,
+    pub pubid: Option<String>,
+}
+
 pub enum Ev {
     XmlDecl { version: Option<String>, encoding: Option<String>, standalone: i32 },
-    StartDoctype { name: String, sysid: Option<String>, pubid: Option<String>, internal: bool },
+    StartDoctype(Box<StartDoctypeEv>),
     EndDoctype,
     ElementDecl { name: String, model: Vec<ModelNode> },
-    AttlistDecl { elname: String, attname: String, atype: String, default: Option<String>, required: bool },
-    EntityDecl {
-        name: String,
-        is_pe: bool,
-        value: Option<String>,
-        base: Option<String>,
-        sysid: Option<String>,
-        pubid: Option<String>,
-        notation: Option<String>,
-    },
-    NotationDecl { name: String, base: Option<String>, sysid: Option<String>, pubid: Option<String> },
+    AttlistDecl(Box<AttlistDeclEv>),
+    EntityDecl(Box<EntityDeclEv>),
+    NotationDecl(Box<NotationDeclEv>),
     StartElement { name: String, attrs: Vec<(String, String)>, nspecified: usize },
     EndElement { name: String },
     StartNs { prefix: Option<String>, uri: Option<String> },
@@ -182,7 +214,7 @@ pub enum Ev {
     EndCdata,
     Default(String),
     SkippedEntity { name: String, is_pe: bool },
-    ExternalEntityRef { context: Option<String>, base: Option<String>, sysid: Option<String>, pubid: Option<String> },
+    ExternalEntityRef(Box<ExternalEntityRefEv>),
     NotStandalone,
     NeedEncoding(String),
     Error(u32),
@@ -235,9 +267,26 @@ pub fn is_name_start(c: char) -> bool {
         | '\u{F900}'..='\u{FDCF}' | '\u{FDF0}'..='\u{FFFD}' | '\u{10000}'..='\u{EFFFF}')
 }
 
+/// ASCII name characters: bit 0 = may start a name, bit 1 = may continue one.
+static ASCII_NAME: [u8; 128] = {
+    let mut t = [0u8; 128];
+    let mut c = 0;
+    while c < 128 {
+        let ch = c as u8;
+        let start = ch.is_ascii_alphabetic() || ch == b'_' || ch == b':';
+        let more = start || ch.is_ascii_digit() || ch == b'-' || ch == b'.';
+        t[c] = (start as u8) | ((more as u8) << 1);
+        c += 1;
+    }
+    t
+};
+
+#[inline]
 pub fn is_name_char(c: char) -> bool {
-    is_name_start(c)
-        || matches!(c, '-' | '.' | '0'..='9' | '\u{B7}' | '\u{300}'..='\u{36F}' | '\u{203F}'..='\u{2040}')
+    if (c as u32) < 128 {
+        return ASCII_NAME[c as usize] & 2 != 0;
+    }
+    is_name_start(c) || matches!(c, '\u{B7}' | '\u{300}'..='\u{36F}' | '\u{203F}'..='\u{2040}')
 }
 
 fn is_xml_char(c: char) -> bool {
@@ -306,6 +355,12 @@ pub struct Engine {
     pub reparse_deferral: bool,
     pub ampl_threshold: u64,
     pub ampl_max: f64,
+    /// Allocation limiter: once the memory the parser holds (a model:
+    /// buffered input, DTD storage, a fixed base) reaches `alloc_threshold`
+    /// bytes, it may be at most `alloc_max` times the input fed so far.
+    pub alloc_threshold: u64,
+    pub alloc_max: f64,
+    alloc_bytes: u64,
     pub base: Option<String>,
     pub forced_encoding: Option<String>,
 
@@ -366,6 +421,9 @@ impl Engine {
             reparse_deferral: true,
             ampl_threshold: 8 * 1024 * 1024,
             ampl_max: 100.0,
+            alloc_threshold: 64 * 1024 * 1024,
+            alloc_max: 100.0,
+            alloc_bytes: PARSER_BASE_BYTES,
             base: None,
             forced_encoding: encoding,
             raw: Vec::new(),
@@ -413,6 +471,8 @@ impl Engine {
         e.reparse_deferral = parent.reparse_deferral;
         e.ampl_threshold = parent.ampl_threshold;
         e.ampl_max = parent.ampl_max;
+        e.alloc_threshold = parent.alloc_threshold;
+        e.alloc_max = parent.alloc_max;
         e.base = parent.base.clone();
         e.dtd = parent.dtd.clone();
         e.is_external = true;
@@ -490,9 +550,16 @@ impl Engine {
             return std::mem::take(&mut self.events);
         }
         self.started = true;
+        // roughly one event per dozen input bytes in typical documents
+        self.events.reserve((data.len() / 12).min(1 << 16));
         self.raw.extend_from_slice(data);
         self.direct_bytes += data.len() as u64;
         self.final_ = final_;
+        if self.track_alloc(data.len()).is_err() {
+            let p = self.pos;
+            self.fail(E_NO_MEMORY, p);
+            return std::mem::take(&mut self.events);
+        }
         if self.awaiting_encoding {
             return std::mem::take(&mut self.events);
         }
@@ -791,6 +858,17 @@ impl Engine {
                 Enc::Utf8 | Enc::Detect => {
                     let b = raw[i];
                     if b < 0x80 {
+                        if b != b'\r' && self.pending_cr_width == 0 {
+                            // a run of plain ASCII needs no per-character work
+                            let mut j = i + 1;
+                            while j < n && raw[j] < 0x80 && raw[j] != b'\r' {
+                                j += 1;
+                            }
+                            self.buf.extend(raw[i..j].iter().map(|&x| x as char));
+                            self.widths.resize(self.widths.len() + (j - i), 1);
+                            i = j;
+                            continue;
+                        }
                         self.push_char(b as char, 1);
                         i += 1;
                         continue;
@@ -1053,6 +1131,19 @@ impl Engine {
         Ok(())
     }
 
+    /// Record `bytes` more held by the parser; Err if the allocation
+    /// limiter trips.
+    fn track_alloc(&mut self, bytes: usize) -> Result<(), ()> {
+        self.alloc_bytes += bytes as u64;
+        if self.alloc_bytes >= self.alloc_threshold && self.direct_bytes > 0 {
+            let factor = self.alloc_bytes as f64 / self.direct_bytes as f64;
+            if factor > self.alloc_max {
+                return Err(());
+            }
+        }
+        Ok(())
+    }
+
     fn account(&mut self, chars: usize, at: usize) -> R<()> {
         self.indirect_bytes += chars as u64;
         let total = self.direct_bytes + self.indirect_bytes;
@@ -1297,7 +1388,7 @@ impl Engine {
                     self.seen_doctype = true;
                     self.dtd.lock().unwrap().has_pe_refs = true;
                     let base = self.base.clone();
-                    self.emit_at(i, Ev::ExternalEntityRef { context: None, base, sysid: None, pubid: None });
+                    self.emit_at(i, Ev::ExternalEntityRef(Box::new(ExternalEntityRefEv { context: None, base, sysid: None, pubid: None })));
                 }
                 self.seen_doctype = true;
                 match self.parse_start_tag(i)? {
@@ -1494,7 +1585,7 @@ impl Engine {
             self.doctype_extid = Some((None, None));
         }
         let internal = self.buf[stop] == '[';
-        self.emit_at(i, Ev::StartDoctype { name, sysid, pubid, internal });
+        self.emit_at(i, Ev::StartDoctype(Box::new(StartDoctypeEv { name, sysid, pubid, internal })));
         self.pos = stop + 1;
         if internal {
             self.state = State::Subset;
@@ -1510,7 +1601,7 @@ impl Engine {
             let parse = self.param_entity_parsing == 2 || (self.param_entity_parsing == 1 && !standalone);
             if parse {
                 let base = self.base.clone();
-                self.emit_at(at, Ev::ExternalEntityRef { context: None, base, sysid, pubid });
+                self.emit_at(at, Ev::ExternalEntityRef(Box::new(ExternalEntityRefEv { context: None, base, sysid, pubid })));
             }
         }
         self.emit_at(at, Ev::EndDoctype);
@@ -1697,12 +1788,12 @@ impl Engine {
                 }
                 None => {
                     let base = ent.base.clone();
-                    self.emit_at(i, Ev::ExternalEntityRef {
+                    self.emit_at(i, Ev::ExternalEntityRef(Box::new(ExternalEntityRefEv {
                         context: Some(name),
                         base,
                         sysid: ent.sysid.clone(),
                         pubid: ent.pubid.clone(),
-                    });
+                    })));
                 }
             },
         }
@@ -1934,13 +2025,13 @@ impl Engine {
                     list.push(AttDef { name: attname.clone(), is_cdata: atype == "CDATA", default: default.clone() });
                 }
             }
-            self.emit_at(start, Ev::AttlistDecl {
+            self.emit_at(start, Ev::AttlistDecl(Box::new(AttlistDeclEv {
                 elname: elname.clone(),
                 attname,
                 atype,
                 default,
                 required,
-            });
+            })));
             p = after;
         }
         Ok(())
@@ -2063,6 +2154,7 @@ impl Engine {
                 notation: notation.clone(),
             };
         }
+        let stored = name.len() + entity.text.as_ref().map_or(0, |t| 4 * t.len());
         let fresh = {
             let mut dtd = self.dtd.lock().unwrap();
             let map = if is_pe { &mut dtd.params } else { &mut dtd.general };
@@ -2073,9 +2165,12 @@ impl Engine {
                 true
             }
         };
+        if fresh && self.track_alloc(stored).is_err() {
+            return Err((E_NO_MEMORY, start));
+        }
         if fresh {
             let base = if value_str.is_some() { None } else { base };
-            self.emit_at(start, Ev::EntityDecl { name, is_pe, value: value_str, base, sysid, pubid, notation });
+            self.emit_at(start, Ev::EntityDecl(Box::new(EntityDeclEv { name, is_pe, value: value_str, base, sysid, pubid, notation })));
         }
         Ok(())
     }
@@ -2094,7 +2189,7 @@ impl Engine {
             return Err((E_SYNTAX, q));
         }
         let base = self.base.clone();
-        self.emit_at(start, Ev::NotationDecl { name, base, sysid, pubid });
+        self.emit_at(start, Ev::NotationDecl(Box::new(NotationDeclEv { name, base, sysid, pubid })));
         Ok(())
     }
 
@@ -2280,12 +2375,12 @@ impl Engine {
         match entity.text {
             None => {
                 let base = entity.base.clone();
-                self.emit_at(at, Ev::ExternalEntityRef {
+                self.emit_at(at, Ev::ExternalEntityRef(Box::new(ExternalEntityRefEv {
                     context: Some(name),
                     base,
                     sysid: entity.sysid.clone(),
                     pubid: entity.pubid.clone(),
-                });
+                })));
                 Ok(())
             }
             Some(text) => {

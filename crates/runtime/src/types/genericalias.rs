@@ -201,7 +201,12 @@ pub fn make_parameters(args: &PyObject) -> PyResult {
         }
         let mut sub = ab::getattr_opt(t, name!("__parameters__"))?;
         if sub.is_none() && (tuple::is_tuple(t) || list::is_list(t)) {
-            sub = Some(make_parameters(t)?);
+            // nested lists/tuples recurse (core-runtime: native stack guard)
+            let ts = crate::threads::current();
+            crate::interp::enter_recursive_call(ts, " in __parameter__ calculation")?;
+            let r = make_parameters(t);
+            crate::interp::leave_recursive_call(ts);
+            sub = Some(r?);
         }
         if let Some(s) = sub {
             if tuple::is_tuple(&s) {

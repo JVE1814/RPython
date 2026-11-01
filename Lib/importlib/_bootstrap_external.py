@@ -211,7 +211,7 @@ _code_type = type(_write_atomic.__code__)
 
 # Bytecode format number of this implementation (our bytecode differs from
 # CPython's, so .pyc files are never shared with it).
-MAGIC_NUMBER = (3999).to_bytes(2, 'little') + b'\r\n'
+MAGIC_NUMBER = _imp.pyc_magic_number_token.to_bytes(4, 'little')
 
 _RAW_MAGIC_NUMBER = int.from_bytes(MAGIC_NUMBER, 'little')
 
@@ -860,6 +860,24 @@ class ExtensionFileLoader(FileLoader, _LoaderBasics):
     def get_filename(self, fullname):
         """Return the path to the shared library."""
         return self.path
+
+
+class AppleFrameworkLoader(ExtensionFileLoader):
+    """Extension loader for Apple platforms, where binaries live in a
+    Frameworks folder and the module file is a ".fwork" marker pointing at
+    them. On other platforms it behaves like ExtensionFileLoader."""
+
+    def create_module(self, spec):
+        path = spec.origin
+        if path.endswith(".fwork"):
+            with _io.FileIO(path, "r") as f:
+                target = f.read().decode().strip()
+            bundle = path.rpartition("/")[0].rpartition("/")[0] if "/" in path else ""
+            spec.origin = _path_join(bundle, target) if bundle else target
+            self.path = spec.origin
+        module = _bootstrap._call_with_frames_removed(_imp.create_dynamic, spec)
+        module.__file__ = path
+        return module
 
 
 class _NamespacePath:
