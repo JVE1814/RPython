@@ -1133,6 +1133,22 @@ unsafe extern "C" fn slot_tp_richcompare(s: *mut PyObject, o: *mut PyObject, op:
     unsafe {
         let s = &*s;
         let nm = pystr::intern_str(RICHCMP_NAMES[op as usize]);
+        // a descriptor whose __get__ fails makes the comparison NotImplemented
+        if let Some(f) = lookup(s.type_ptr(), &nm) {
+            if !crate::types::funcobject::is_function(&f) {
+                if let Some(get) = f.ty().tp_descr_get {
+                    if f.ty().tp_flags & Py_TPFLAGS_METHOD_DESCRIPTOR == 0 {
+                        let bound = get(f.as_ptr(), s.as_ptr(), s.type_ptr() as *mut PyObject);
+                        if bound.is_null() {
+                            clear_exc();
+                            return crate::types::none::not_implemented().to_ref().into_raw();
+                        }
+                        let bound = PyRef::from_raw(bound);
+                        return into_c(ab::call(&bound, &[&*o]));
+                    }
+                }
+            }
+        }
         match call_special(s, &nm, &[&*o]) {
             Ok(Some(r)) => r.into_raw(),
             Ok(None) => crate::types::none::not_implemented().to_ref().into_raw(),

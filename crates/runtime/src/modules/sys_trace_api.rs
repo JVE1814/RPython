@@ -104,6 +104,10 @@ fn event_set_arg(o: &PyObject, local: bool) -> PyResult<u32> {
     if local && v & !st::LOCAL_EVENTS_MASK != 0 {
         raise!(ValueError, "invalid local event set 0x{:x}", n);
     }
+    // C_RETURN / C_RAISE are delivered with CALL only
+    if v & ((1 << 16) | (1 << 17)) != 0 && v & (1 << 4) == 0 {
+        raise!(ValueError, "cannot set C_RETURN or C_RAISE events independently");
+    }
     // BRANCH is an alias for BRANCH_LEFT|BRANCH_RIGHT
     if v & (1 << 18) != 0 {
         v = (v & !(1 << 18)) | (1 << 8) | (1 << 9);
@@ -278,7 +282,9 @@ pub fn install_monitoring(d: &PyObject) -> PyResult<()> {
     let disable = ab::call(obj, &[])?;
     st::DISABLE_OBJ.store(disable.clone().into_raw(), Release);
     dict::set_item_str(&md, "DISABLE", &disable)?;
-    dict::set_item_str(&md, "MISSING", &*ab::call(obj, &[])?)?;
+    let missing = ab::call(obj, &[])?;
+    st::MISSING_OBJ.store(missing.clone().into_raw(), Release);
+    dict::set_item_str(&md, "MISSING", &missing)?;
     for (k, v) in [("DEBUGGER_ID", 0), ("COVERAGE_ID", 1), ("PROFILER_ID", 2), ("OPTIMIZER_ID", 5)] {
         dict::set_item_str(&md, k, &int::new_int(v))?;
     }

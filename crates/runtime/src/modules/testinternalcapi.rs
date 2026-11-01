@@ -82,7 +82,7 @@ fn iframe_getline(_m: &PyObject, o: &PyObject) -> PyResult {
 }
 fn iframe_getlasti(_m: &PyObject, o: &PyObject) -> PyResult {
     let f = frame_arg(o)?;
-    Ok(int::new_int(f.lasti as i64 * 2))
+    Ok(int::new_int(f.lasti as i64 * 4))
 }
 
 fn get_co_framesize(_m: &PyObject, o: &PyObject) -> PyResult {
@@ -90,7 +90,7 @@ fn get_co_framesize(_m: &PyObject, o: &PyObject) -> PyResult {
         raise!(TypeError, "argument must be a code object");
     }
     let c = crate::types::code::code(o);
-    Ok(int::new_int(c.co_nlocalsplus as i64 + c.co_stacksize as i64))
+    Ok(int::new_int(c.obj.co_nlocalsplus as i64 + c.obj.co_stacksize as i64))
 }
 
 fn is_static_immortal(_m: &PyObject, o: &PyObject) -> PyResult {

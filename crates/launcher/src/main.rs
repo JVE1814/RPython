@@ -74,7 +74,7 @@ const HELP_X: &str = "The following implementation-specific options are availabl
 -X gil=[0|1]: enable (1) or disable (0) the GIL
 -X importtime[=2]: show how long each import takes
 -X int_max_str_digits=N: limit the size of int<->str conversions
--X lazy_imports=[all|none|normal]: control lazy imports
+-X lazy_imports=[all|normal]: control lazy imports
 -X no_debug_ranges: don't include extra location information in code objects
 -X pycache_prefix=PATH: write .pyc files to a parallel tree under PATH
 -X tracemalloc[=N]: trace Python memory allocations
@@ -337,8 +337,9 @@ fn real_main() -> i32 {
     if let Some(v) = env(&cfg, "PYTHON_LAZY_IMPORTS") {
         cfg.lazy_imports = match v.as_str() {
             "all" => 1,
-            "none" => 0,
-            _ => -1,
+            "normal" => 0,
+            "" => -1,
+            _ => fatal("PYTHON_LAZY_IMPORTS: invalid value; expected 'all' or 'normal'"),
         };
     }
     if let Some(v) = env(&cfg, "PYTHON_THREAD_INHERIT_CONTEXT") {
@@ -380,9 +381,8 @@ fn real_main() -> i32 {
             "lazy_imports" => {
                 cfg.lazy_imports = match v {
                     Some("all") => 1,
-                    Some("none") => 0,
-                    Some("normal") => -1,
-                    _ => fatal("-X lazy_imports: invalid value; must be 'all', 'none', or 'normal'"),
+                    Some("normal") => 0,
+                    _ => fatal("-X lazy_imports: invalid value; expected 'all' or 'normal'"),
                 }
             }
             "thread_inherit_context" => cfg.thread_inherit_context = if v == Some("0") { 0 } else { 1 },

@@ -622,6 +622,14 @@ fn type_set_bases(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         if is_subtype(as_type(b), tp) {
             raise!(TypeError, "a __bases__ item causes an inheritance cycle");
         }
+        // the MRO may not be updated yet (re-entrant mro()): also follow tp_base
+        let mut p = as_type(b);
+        while !p.is_null() {
+            if p == tp {
+                raise!(TypeError, "a __bases__ item causes an inheritance cycle");
+            }
+            p = unsafe { (*p).tp_base };
+        }
     }
     let new_base = best_base(v)?;
     if !compatible_for_assignment(unsafe { (*tp).tp_base }, new_base) {

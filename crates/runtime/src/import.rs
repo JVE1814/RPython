@@ -733,3 +733,8 @@ pub fn load_source(abs: &str, file: &std::path::Path, pkg_dir: Option<&std::path
 fn _t(_: &PyObject) -> PyRef {
     tuple::empty_tuple()
 }
+
+/// Resolve a relative module name (`level` > 0) against `globals` (PEP 328 rules).
+pub fn resolve_relative(nm: &str, globals: Option<&PyObject>, level: i64) -> PyResult<String> {
+    resolve_name(nm, globals, level)
+}

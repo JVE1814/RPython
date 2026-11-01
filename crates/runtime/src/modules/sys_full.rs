@@ -146,7 +146,22 @@ pub fn audit(event: &str, args: &[&PyObject]) -> PyResult<()> {
 fn audit_tuple(event: &PyObject, args: &PyObject) -> PyResult<()> {
     let hooks: Vec<PyRef> = AUDIT_HOOKS.lock().unwrap().iter().map(|&p| unsafe { PyRef::from_borrowed(p as *mut PyObject) }).collect();
     for h in hooks {
-        ab::call(&h, &[event, args])?;
+        // hooks are not traced or profiled unless they opt in with __cantrace__
+        let suppress = crate::modules::sys::tracing_active()
+            && match ab::getattr_opt(&h, crate::name!("__cantrace__")) {
+                Ok(Some(v)) => !ab::is_true(&v)?,
+                Ok(None) => true,
+                Err(e) => return Err(e),
+            };
+        if suppress {
+            let ts = crate::threads::current();
+            ts.tracing_depth.set(ts.tracing_depth.get() + 1);
+            let r = ab::call(&h, &[event, args]);
+            ts.tracing_depth.set(ts.tracing_depth.get() - 1);
+            r?;
+        } else {
+            ab::call(&h, &[event, args])?;
+        }
     }
     Ok(())
 }
@@ -799,11 +814,9 @@ pub fn dlopenflags() -> i32 {
 // lazy imports (PEP 810)
 pub fn lazy_imports_mode() -> String {
     match *LAZY_MODE.lock().unwrap() {
-        Some(0) => "none".into(),
         Some(1) => "all".into(),
         Some(_) => "normal".into(),
         None => match config().lazy_imports {
-            0 => "none".into(),
             1 => "all".into(),
             _ => "normal".into(),
         },
@@ -819,8 +832,7 @@ fn sys_set_lazy_imports(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>
     let v = match pystr::to_string_lossy(m).as_str() {
         "normal" => 2,
         "all" => 1,
-        "none" => 0,
-        _ => raise!(ValueError, "mode must be \"normal\", \"none\", or \"all\""),
+        _ => raise!(ValueError, "mode must be \"normal\" or \"all\""),
     };
     *LAZY_MODE.lock().unwrap() = Some(v);
     Ok(none::none_ref())
@@ -1247,5 +1259,20 @@ pub fn populate(d: &PyObject) -> PyResult<()> {
         }
     }
     crate::modules::sys_trace_api::install_monitoring(d)?;
+    crate::types::lazyimport::install_sys(d)?;
     Ok(())
+}
+
+/// PyImport_SetLazyImportsMode: true = "all", false = "normal".
+pub fn set_lazy_imports_all(all: bool) {
+    *LAZY_MODE.lock().unwrap() = Some(if all { 1 } else { 2 });
+}
+/// PyImport_SetLazyImportsFilter (None/NULL clears the filter).
+pub fn set_lazy_imports_filter_obj(f: Option<&PyObject>) {
+    let nv = match f {
+        Some(f) if !f.is(none::none()) => f.to_ref().into_raw(),
+        _ => std::ptr::null_mut(),
+    };
+    let old = LAZY_FILTER.swap(nv, AcqRel);
+    unsafe { xdecref(old) };
 }

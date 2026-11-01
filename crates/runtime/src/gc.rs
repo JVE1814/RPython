@@ -102,9 +102,24 @@ pub unsafe fn track(op: *mut PyObject) {
 
 fn trigger_threshold() -> usize {
     // Like a generational heuristic: collect after THRESHOLD new objects, but also
-    // at least a quarter of the live set (amortises full collections).
-    THRESHOLD.load(Relaxed).max(LAST_LIVE.load(Relaxed) / 4)
+    // at least a quarter of the live set (amortises full collections). A threshold
+    // set explicitly with gc.set_threshold() is honoured as is; 0 disables
+    // automatic collection.
+    let t = THRESHOLD.load(Relaxed);
+    if t == 0 {
+        return usize::MAX;
+    }
+    if USER_THRESHOLD.load(Relaxed) {
+        return t;
+    }
+    t.max(LAST_LIVE.load(Relaxed) / 4)
 }
+
+/// gc.set_threshold() was called.
+pub static USER_THRESHOLD: AtomicBool = AtomicBool::new(false);
+/// Objects examined by collections (sum) and total time spent collecting.
+pub static CANDIDATES: AtomicUsize = AtomicUsize::new(0);
+pub static DURATION_NS: AtomicUsize = AtomicUsize::new(0);
 
 #[inline]
 pub unsafe fn untrack(op: *mut PyObject) {
@@ -197,12 +212,7 @@ fn stop_the_world(me: *mut ThreadState) -> bool {
         return true;
     }
     RELEASE.store(false, Release);
-    for t in         // keep garbage alive while we work on it
-        let garbage: Vec<PyRef> = unreachable.iter().map(|&o| PyRef::from_borrowed(o)).collect();
-        // 0. weakrefs with callbacks to garbage are cleared first (their callbacks run
-        //    unless the weakref itself is garbage), so finalizers cannot observe them
-        crate::types::weakref::clear_weakrefs_for_gc(&unreachable, true);
-thers {
+    for t in &others {
         t.c.eval_breaker.fetch_or(crate::threads::EVAL_SAFEPOINT, Release);
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
@@ -346,7 +356,9 @@ pub fn collect() -> usize {
         COLLECTING.store(false, Release);
         return 0;
     }
+    let t0 = std::time::Instant::now();
     let n = unsafe { collect_stopped() };
+    DURATION_NS.fetch_add((t0.elapsed().as_nanos() as usize).max(1), Relaxed);
     start_the_world();
     ALLOCS_SINCE.store(0, Relaxed);
     LAST_LIVE.store(TRACKED.load(Relaxed).max(0) as usize, Relaxed);
@@ -359,6 +371,7 @@ unsafe fn collect_stopped() -> usize {
     unsafe {
         let saved_exc = crate::errors::take_exc();
         let objs = snapshot();
+        CANDIDATES.fetch_add(objs.len(), Relaxed);
         let unreachable = find_unreachable(objs);
         if unreachable.is_empty() {
             if let Some(e) = saved_exc {
@@ -368,6 +381,9 @@ unsafe fn collect_stopped() -> usize {
         }
         // keep garbage alive while we work on it
         let garbage: Vec<PyRef> = unreachable.iter().map(|&o| PyRef::from_borrowed(o)).collect();
+        // 0. weakrefs with callbacks are cleared before finalizers run (callbacks of
+        //    weakrefs that are not garbage themselves are called); others stay
+        crate::types::weakref::clear_weakrefs_for_gc(&unreachable, true);
         // 1. finalizers (each object finalized at most once)
         let mut finalized_any = false;
         for g in &garbage {
@@ -397,8 +413,39 @@ unsafe fn collect_stopped() -> usize {
         } else {
             garbage.clone()
         };
-        let n = to_clear.len();
-        // 3. the remaining weak references to garbage are cleared before tp_clear
+        // Instance __dict__s are separate objects here but part of the instance in
+        // CPython's layout: they are not counted as collected objects.
+        let owned_dicts: std::collections::HashSet<usize> = {
+            to_clear
+                .iter()
+                .filter_map(|g| {
+                    let op = g.as_ptr();
+                    if crate::alloc::has_managed(op) {
+                        let d = *crate::alloc::managed_dict_slot(op);
+                        if !d.is_null() {
+                            return Some(d as usize);
+                        }
+                    }
+                    None
+                })
+                .collect()
+        };
+        let n = to_clear.iter().filter(|g| !owned_dicts.contains(&(g.as_ptr() as usize))).count();
+        // DEBUG_SAVEALL: keep the garbage in gc.garbage instead of freeing it
+        if crate::modules::gc_mod::debug_flags() & crate::modules::gc_mod::DEBUG_SAVEALL != 0 {
+            let gl = crate::modules::gc_mod::garbage_list();
+            for g in to_clear.iter().filter(|g| !owned_dicts.contains(&(g.as_ptr() as usize))) {
+                crate::types::list::append(&gl, g.clone());
+            }
+            drop(to_clear);
+            drop(garbage);
+            COLLECTED.fetch_add(n, Relaxed);
+            if let Some(e) = saved_exc {
+                crate::errors::set_exc(e);
+            }
+            return n;
+        }
+        // 3. weak references to garbage are cleared (callbacks run) before tp_clear
         {
             let ptrs: Vec<*mut PyObject> = to_clear.iter().map(|g| g.as_ptr()).collect();
             crate::types::weakref::clear_weakrefs_for_gc(&ptrs, false);

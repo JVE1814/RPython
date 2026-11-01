@@ -688,6 +688,7 @@ pub fn init() -> PyResult<PyRef> {
     ];
     add_methods_to_dict(&d, methods, Some(&m))?;
     add_methods_to_dict(&d, more_builtins(), Some(&m))?;
+    crate::types::lazyimport::install_builtins(&d, &m)?;
     crate::modules::builtins_numbers::install(&d, &m)?;
     if let Some(f) = dict::get_item_rs(&d, "__import__") {
         IMPORT_FN.store(f.as_ptr(), Release);
