@@ -49,6 +49,7 @@ pub mod _collections;
 pub mod _types;
 pub mod _heapq;
 pub mod _bisect;
+pub mod _socket;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
 pub fn register_all() {
@@ -63,4 +64,5 @@ pub fn register_all() {
     sys_full::register_system_modules();
     text_util::register();
     crate::import::register_builtin("_typing", crate::types::typevar::make_typing_module);
+    crate::import::register_builtin("_socket", _socket::init);
 }
