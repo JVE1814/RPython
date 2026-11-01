@@ -255,7 +255,7 @@ pub fn attribute_error_for(o: &PyObject, name: &PyObject) -> PyErr {
     let msg = if is_type(o) {
         format!(
             "type object '{}' has no attribute '{}'",
-            type_name(unsafe { &*as_type(o) }),
+            unsafe { CStr::from_ptr((*as_type(o)).tp_name).to_string_lossy() },
             pystr::to_string_lossy(name)
         )
     } else {

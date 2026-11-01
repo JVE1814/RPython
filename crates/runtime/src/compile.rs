@@ -117,6 +117,7 @@ fn parse_error(e: &rpy_parser::SyntaxError, filename: &str) -> PyErr {
         K::Tab => crate::types::exceptions::TabError(),
         K::IncompleteInput => crate::types::exceptions::IncompleteInputError(),
         K::MemoryError => return err!(MemoryError, "{}", e.msg),
+        K::ValueError => return err!(ValueError, "{}", e.msg),
         K::RecursionError => return err!(RecursionError, "{}", e.msg),
         K::Syntax if e.msg == "incomplete input" => crate::types::exceptions::IncompleteInputError(),
         K::Syntax => crate::types::exceptions::SyntaxError(),

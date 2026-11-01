@@ -15,6 +15,8 @@ pub enum ErrorKind {
     MemoryError,
     /// AST too deep for the compiler (CPython: RecursionError).
     RecursionError,
+    /// ValueError raised by the parser (e.g. an identifier normalizing to `True`).
+    ValueError,
 }
 
 impl ErrorKind {
@@ -26,6 +28,7 @@ impl ErrorKind {
             ErrorKind::IncompleteInput => "_IncompleteInputError",
             ErrorKind::MemoryError => "MemoryError",
             ErrorKind::RecursionError => "RecursionError",
+            ErrorKind::ValueError => "ValueError",
         }
     }
 }
