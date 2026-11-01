@@ -8,6 +8,11 @@ to origin claude/rpython-dev. Latest full-suite run: run 4 (208/434 modules pass
 Known issue after the final merges: test_threading hangs (it failed without running tests in run 4); test_class has
 2 failures from inline-values semantics (notes/perf-runtime.md). Leftover processes from finished agents may still
 be running (killing them was not permitted in this environment).
+PENDING MERGE: the jit2 workstream (tier-2 optimizing JIT, off by default; faster tier-1 Python->Python calls; type
+profiles) is on remote branch `claude/jit2-tier2-unmerged` (notes/jit.md "jit2 workstream" on that branch). It conflicts
+semantically with perf-runtime's frame changes already in master (borrowed code/func refs in Frame::new_call vs jit2's
+owning alloc_call/recycle_call frame pool): port jit2's call path onto Frame::new_call, then merge and run
+tools/jit_tests/run.sh. Tier 2 also has an open segfault in test_generators with RPYTHON_JIT2=1.
 Not yet in spec: idlelib's own tests (Lib/idlelib/idle_test) are imported by test_idle but were not kept by the
 D2 extraction — revisit D2 for test_idle.
 

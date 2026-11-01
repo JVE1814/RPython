@@ -44,7 +44,8 @@ numpy.random work. numpy's own test suite has not yet been run on our interprete
 - ~226 suite modules still fail/crash/time out; test_threading hangs; subinterpreters
   (_interpreters, concurrent.interpreters) absent; tkinter/_tkinter and idlelib absent; interpreter
   finalization (module teardown/__del__ at exit) missing; frozen modules stubbed.
-- Tier-2 optimizing JIT (speculation/deopt/unboxing/inlining) in progress (jit2), not merged.
+- Tier-2 optimizing JIT (typed SSA IR, unboxed int/float, deopt, linear-scan regalloc) written but off by default
+  and NOT merged: remote branch `claude/jit2-tier2-unmerged`; conflicts with master's new frame model (see PROGRESS.md).
 - Not yet faster than CPython on any pyperformance benchmark; startup and memory not beaten.
 - numpy's own test suite and other wheels not yet validated.
 - D2 gap: idlelib's own tests (needed by test_idle) were not kept in spec/.
