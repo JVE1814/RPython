@@ -1,8 +1,9 @@
+pub mod bootstrap_builtins;
+pub mod complex_pow;
+pub mod namespace;
 pub mod genericalias;
 pub mod lang_util;
 pub mod structseq;
-pub mod bootstrap_builtins;
-pub mod complex_pow;
 pub mod asyncgen;
 pub mod bool_;
 pub mod bytearray;
