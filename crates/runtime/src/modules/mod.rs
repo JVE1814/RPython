@@ -74,6 +74,9 @@ pub mod termios;
 pub mod syslog;
 pub mod mmap;
 pub mod _json;
+pub mod compress_common;
+pub mod zlib;
+pub mod hashes;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
 pub fn register_all() {
@@ -96,4 +99,5 @@ pub fn register_all() {
     crate::import::register_builtin("_typing", crate::types::typevar::make_typing_module);
     devtools::register();
     crate::import::register_builtin("_json", _json::init_module);
+    compress_common::register();
 }
