@@ -203,7 +203,8 @@ pub mod kind {
     /// LoadGlobal: a = globals version, b = builtins version, c = value (borrowed)
     pub const GLOBAL: u32 = 1;
     /// LoadAttr/StoreAttr: attribute lives in the instance dict. a = type tag,
-    /// b = entry-index hint in the dict.
+    /// b = entry-index hint in the dict; c = class attribute fallback (LoadAttr) or
+    /// the type (StoreAttr).
     pub const INSTANCE_DICT: u32 = 2;
     /// LoadAttr/StoreAttr: __slots__ member at byte offset c. a = type tag.
     pub const SLOT: u32 = 3;

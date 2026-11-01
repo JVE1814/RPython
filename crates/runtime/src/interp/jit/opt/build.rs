@@ -72,6 +72,13 @@ pub enum AV {
     Null,
 }
 
+/// Where a failed check goes: deoptimisation, or a slow-path block.
+#[derive(Clone, Copy)]
+enum Fail {
+    Deopt(SnapId),
+    Block(BlockId),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Def {
     No,
@@ -318,6 +325,12 @@ fn const_float(p: usize) -> Option<f64> {
         }
         Some(crate::types::float::float_value(&*(p as *mut PyObject)))
     }
+}
+/// Is `tp` (a type pointer recorded in an inline-cache entry) still the live type
+/// with version tag `tag`? Tags are unique and never reused, so a freed or modified
+/// type cannot match.
+fn live_type(tp: usize, tag: u64) -> bool {
+    tag != 0 && crate::interp::cache::type_tag(tp as *mut PyTypeObject) as u64 == tag
 }
 fn is_heap_type(tp: usize) -> bool {
     unsafe { (*(tp as *mut PyTypeObject)).tp_flags & Py_TPFLAGS_HEAPTYPE != 0 }
@@ -1718,29 +1731,49 @@ impl<'a> B<'a> {
 
     // ------------------------------------------------------------ attributes
 
-    /// The single filled inline-cache entry of attribute instruction i (monomorphic
-    /// sites only).
-    fn mono_entry(&self, i: usize) -> Option<crate::interp::cache::Snapshot> {
+    /// Filled inline-cache entries of attribute instruction i (None: a writer is
+    /// active or the site is megamorphic).
+    fn attr_entries(&self, i: usize) -> Option<Vec<crate::interp::cache::Snapshot>> {
         use crate::interp::cache::kind;
         let pc = self.u.an.instrs[i].pc as usize;
-        let mut found = None;
+        let mut out = Vec::new();
         for e in self.u.tables.poly(pc) {
             let s = e.read()?;
             match s.kind {
                 kind::EMPTY => {}
                 kind::UNCACHEABLE => return None,
-                _ => {
-                    if found.is_some() {
-                        return None;
-                    }
-                    found = Some(s);
-                }
+                _ => out.push(s),
             }
         }
-        found
+        Some(out)
     }
 
-    /// Receiver at depth n, guarded to have an exact type with version tag `tag`.
+    fn entries_addr(&self, i: usize) -> i64 {
+        let pc = self.u.an.instrs[i].pc as usize;
+        self.u.tables.poly(pc).as_ptr() as i64
+    }
+
+    /// Leave for `f` when `c` holds: deoptimise, or branch to a slow-path block.
+    fn check(&mut self, c: Cond, f: Fail) {
+        match f {
+            Fail::Deopt(s) => self.emit(Inst::Guard(c, s)),
+            Fail::Block(b) => {
+                let next = self.new_block(u32::MAX);
+                self.term(Term::Branch(c, b, next));
+                self.cur = next;
+                self.closed = false;
+            }
+        }
+    }
+
+    /// Continue emitting into block b.
+    fn switch_to(&mut self, b: BlockId) {
+        self.cur = b;
+        self.closed = false;
+    }
+
+    /// Receiver at depth n, guarded (deoptimising) to have an exact type with version
+    /// tag `tag`.
     fn guard_tag(&mut self, n: usize, tag: u32, snap: SnapId) -> V {
         let p = self.peek_ptr(n);
         if self.ty_of(&self.peek(n)) != Ty::Tag(tag) {
@@ -1752,36 +1785,59 @@ impl<'a> B<'a> {
         p
     }
 
-    /// Inline values area of `p` (tagged managed-dict word), deoptimising if the
-    /// object keeps its attributes in a dict. Returns the untagged-plus-one word.
-    fn values_word(&mut self, p: V, snap: SnapId) -> V {
-        // only objects with a managed dict slot (pre-header) can have inline values
+    /// Type-tag dispatch over the cases of a polymorphic site: returns, per case, the
+    /// block where the receiver is known to have that case's tag; the current block
+    /// then continues as the "no case matched" path.
+    fn tag_switch(&mut self, p: V, tags: &[u32]) -> Vec<BlockId> {
+        let ty = self.v(Class::G);
+        self.emit(Inst::Load(ty, Base::V(p), OB_TYPE));
+        let tg = self.v(Class::G);
+        self.emit(Inst::Load32(tg, Base::V(ty), TP_TAG));
+        let mut out = Vec::new();
+        for &t in tags {
+            let body = self.new_block(u32::MAX);
+            let next = self.new_block(u32::MAX);
+            self.term(Term::Branch(Cond::Cmp32(tg, Opnd::I(t as i64), Cc::E), body, next));
+            out.push(body);
+            self.switch_to(next);
+        }
+        out
+    }
+
+    /// Values word of `p` (tagged pointer to its inline values), leaving for `f` if the
+    /// object keeps its attributes in a dict (or has no managed dict slot).
+    fn values_word(&mut self, p: V, f: Fail) -> V {
         let gb = self.v(Class::G);
         self.emit(Inst::Load8(gb, Base::V(p), GC_BITS));
-        self.emit(Inst::Guard(Cond::Test(gb, Opnd::I(crate::alloc::GC_BIT_MANAGED as i64), Cc::E), snap));
+        self.check(Cond::Test(gb, Opnd::I(crate::alloc::GC_BIT_MANAGED as i64), Cc::E), f);
         let w = self.v(Class::G);
         self.emit(Inst::Load(w, Base::V(p), MANAGED_DICT));
-        self.emit(Inst::Guard(Cond::Test(w, Opnd::I(1), Cc::E), snap));
+        self.check(Cond::Test(w, Opnd::I(1), Cc::E), f);
         w
     }
 
-    /// Check that the shape of values word `w` has `name` at index h.
-    fn guard_shape_key(&mut self, w: V, h: u64, name: usize, snap: SnapId) {
-        let (sh_off, _vals, _id, len_off, keys_off) = crate::shape::jit_layout();
+    /// Current shape of values word `w`.
+    fn shape_of(&mut self, w: V) -> V {
+        let (sh_off, _vals, _id, _len, _keys) = crate::shape::jit_layout();
         let sh = self.v(Class::G);
         self.emit(Inst::Load(sh, Base::V(w), sh_off - 1));
-        self.emit(Inst::Guard(Cond::Test(sh, Opnd::V(sh), Cc::E), snap));
-        self.emit(Inst::Guard(Cond::CmpMem32(Base::V(sh), len_off, h as i64, Cc::BE), snap));
-        let keys = self.v(Class::G);
-        self.emit(Inst::Load(keys, Base::V(sh), keys_off));
-        self.emit(Inst::Guard(Cond::CmpMem(Base::V(keys), 8 * h as i32, name as i64, Cc::NE), snap));
+        sh
     }
 
-    fn has_inline_values(tag: u32) -> bool {
-        // the cache stores the tag, not the type: inline values are checked at run
-        // time by values_word (dict-mode objects deoptimise)
-        let _ = tag;
-        true
+    /// Leave for `f` unless the shape of values word `w` has `name` at index h.
+    fn check_shape_key(&mut self, w: V, h: u64, name: usize, f: Fail) {
+        let (_sh, _vals, _id, len_off, keys_off) = crate::shape::jit_layout();
+        let sh = self.shape_of(w);
+        self.check(Cond::Test(sh, Opnd::V(sh), Cc::E), f);
+        self.check(Cond::CmpMem32(Base::V(sh), len_off, h as i64, Cc::BE), f);
+        let keys = self.v(Class::G);
+        self.emit(Inst::Load(keys, Base::V(sh), keys_off));
+        self.check(Cond::CmpMem(Base::V(keys), 8 * h as i32, name as i64, Cc::NE), f);
+    }
+
+    fn vals_off(h: u64) -> i32 {
+        let (_sh, vals_off, _id, _len, _keys) = crate::shape::jit_layout();
+        vals_off - 1 + 8 * h as i32
     }
 
     fn load_attr(&mut self, i: usize) {
@@ -1796,50 +1852,95 @@ impl<'a> B<'a> {
                 return;
             }
         }
-        let Some(s) = self.mono_entry(i) else {
+        let Some(es) = self.attr_entries(i) else {
             self.template(i);
             return;
         };
-        let tag = s.a as u32;
-        match s.kind {
-            kind::INSTANCE_DICT if s.b < (1 << 20) && Self::has_inline_values(tag) => {
-                let snap = self.snap(i, SnapKind::Deopt);
-                let p = self.guard_tag(1, tag, snap);
-                let w = self.values_word(p, snap);
-                self.guard_shape_key(w, s.b, name, snap);
-                let (_sh, vals_off, _id, _len, _keys) = crate::shape::jit_layout();
-                let x = self.v(Class::G);
-                self.emit(Inst::Load(x, Base::V(w), vals_off - 1 + 8 * s.b as i32));
-                self.emit(Inst::Guard(Cond::Test(x, Opnd::V(x), Cc::E), snap));
-                self.emit(Inst::Incref(x));
-                let k = self.st.stack.len() - 1;
-                let a = self.pop();
-                self.discard(a, k);
-                self.push(AV::Obj(x, Own::Owned, Ty::Unknown));
-            }
-            kind::SLOT => {
-                let snap = self.snap(i, SnapKind::Deopt);
-                let p = self.guard_tag(1, tag, snap);
+        let ok = |s: &crate::interp::cache::Snapshot| match s.kind {
+            kind::INSTANCE_DICT => s.b < (1 << 20),
+            kind::SLOT => true,
+            kind::CLASS_ATTR => unsafe { (*(s.c as *mut PyObject)).ty().tp_descr_get.is_none() },
+            _ => false,
+        };
+        let cases: Vec<_> = es.iter().copied().filter(|s| ok(s)).collect();
+        if cases.is_empty() {
+            self.template(i);
+            return;
+        }
+        let snap = self.snap(i, SnapKind::Deopt);
+        if es.len() == 1 && cases[0].kind != kind::INSTANCE_DICT {
+            // monomorphic slot / class attribute: no slow path needed
+            let s = cases[0];
+            let p = self.guard_tag(1, s.a as u32, snap);
+            let k = self.st.stack.len() - 1;
+            if s.kind == kind::SLOT {
                 let x = self.v(Class::G);
                 self.emit(Inst::Load(x, Base::V(p), s.c as i32));
                 self.emit(Inst::Guard(Cond::Test(x, Opnd::V(x), Cc::E), snap));
                 self.emit(Inst::Incref(x));
-                let k = self.st.stack.len() - 1;
                 let a = self.pop();
                 self.discard(a, k);
                 self.push(AV::Obj(x, Own::Owned, Ty::Unknown));
-            }
-            kind::CLASS_ATTR if unsafe { (*(s.c as *mut PyObject)).ty().tp_descr_get.is_none() } => {
-                let snap = self.snap(i, SnapKind::Deopt);
-                self.guard_tag(1, tag, snap);
-                let k = self.st.stack.len() - 1;
+            } else {
                 let a = self.pop();
                 self.discard(a, k);
                 // borrowed from the class dict, which the tag guard keeps unchanged
                 self.push(AV::Const(s.c));
             }
-            _ => self.template(i),
+            return;
         }
+        let esnap = self.snap(i, SnapKind::Error);
+        let res = self.v(Class::G);
+        let cont = self.new_block(u32::MAX);
+        let slow = self.new_block(u32::MAX);
+        let p;
+        let bodies = if es.len() == 1 {
+            p = self.guard_tag(1, cases[0].a as u32, snap);
+            vec![self.cur]
+        } else {
+            p = self.peek_ptr(1);
+            let tags: Vec<u32> = cases.iter().map(|s| s.a as u32).collect();
+            let b = self.tag_switch(p, &tags);
+            self.term(Term::Jump(slow));
+            b
+        };
+        for (s, b) in cases.iter().zip(bodies) {
+            self.switch_to(b);
+            let f = Fail::Block(slow);
+            let x = match s.kind {
+                kind::INSTANCE_DICT => {
+                    let w = self.values_word(p, f);
+                    self.check_shape_key(w, s.b, name, f);
+                    let x = self.v(Class::G);
+                    self.emit(Inst::Load(x, Base::V(w), Self::vals_off(s.b)));
+                    self.check(Cond::Test(x, Opnd::V(x), Cc::E), f);
+                    x
+                }
+                kind::SLOT => {
+                    let x = self.v(Class::G);
+                    self.emit(Inst::Load(x, Base::V(p), s.c as i32));
+                    self.check(Cond::Test(x, Opnd::V(x), Cc::E), f);
+                    x
+                }
+                _ => self.imm(s.c as i64),
+            };
+            self.emit(Inst::Incref(x));
+            self.emit(Inst::Mov(res, x));
+            self.term(Term::Jump(cont));
+        }
+        // generic lookup (refills the inline cache)
+        self.switch_to(slow);
+        let ea = self.entries_addr(i);
+        let r = self.v(Class::G);
+        self.emit(Inst::Call { addr: h2_load_attr as usize, args: vec![Opnd::V(p), Opnd::I(name as i64), Opnd::I(ea)], fargs: vec![], ret: Some(r), fret: None });
+        self.emit(Inst::Guard(Cond::Test(r, Opnd::V(r), Cc::E), esnap));
+        self.emit(Inst::Mov(res, r));
+        self.term(Term::Jump(cont));
+        self.switch_to(cont);
+        let k = self.st.stack.len() - 1;
+        let a = self.pop();
+        self.discard(a, k);
+        self.push(AV::Obj(res, Own::Owned, Ty::Unknown));
     }
 
     /// Value of attribute `name` of a module object folded into the code, with a
@@ -1873,65 +1974,83 @@ impl<'a> B<'a> {
         }
     }
 
+    /// Instances may shadow method `name` (inline values): leave for `f` unless the
+    /// shape lacks it. Per-site memo of the last shape seen lacking the name.
+    fn check_not_shadowed(&mut self, p: V, name: usize, f: Fail, snap: SnapId) {
+        let w = self.v(Class::G);
+        self.emit(Inst::Load(w, Base::V(p), MANAGED_DICT));
+        let cont = self.new_block(u32::MAX);
+        let check = self.new_block(u32::MAX);
+        // no dict and no values: nothing can shadow
+        self.term(Term::Branch(Cond::Test(w, Opnd::V(w), Cc::E), cont, check));
+        self.switch_to(check);
+        self.check(Cond::Test(w, Opnd::I(1), Cc::E), f);
+        let sh = self.shape_of(w);
+        let cell = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0))) as *const _ as usize;
+        self.cells.push(cell);
+        let cv = self.imm(cell as i64);
+        let memo = self.v(Class::G);
+        self.emit(Inst::Load(memo, Base::V(cv), 0));
+        let slow = self.new_block(u32::MAX);
+        self.term(Term::Branch(Cond::Cmp(sh, Opnd::V(memo), Cc::E), cont, slow));
+        self.switch_to(slow);
+        let r = self.v(Class::G);
+        self.emit(Inst::Call { addr: h_shape_lacks as usize, args: vec![Opnd::V(sh), Opnd::I(name as i64), Opnd::I(cell as i64)], fargs: vec![], ret: Some(r), fret: None });
+        self.emit(Inst::Guard(Cond::Test(r, Opnd::V(r), Cc::E), snap));
+        self.term(Term::Jump(cont));
+        self.switch_to(cont);
+    }
+
     fn load_method(&mut self, i: usize) {
         use crate::interp::cache::kind;
         let ins = self.u.an.instrs[i];
         let name = self.u.cd.names[ins.arg as usize].as_ptr() as usize;
-        let Some(s) = self.mono_entry(i) else {
+        let Some(es) = self.attr_entries(i) else {
             self.template(i);
             return;
         };
-        if !matches!(s.kind, kind::METHOD | kind::METHOD_SHADOWABLE) || s.b == 0 {
+        let ok = |s: &crate::interp::cache::Snapshot| match s.kind {
+            kind::METHOD => true,
+            // instance dict at tp_dictoffset / dict-only managed dicts: generic path
+            kind::METHOD_SHADOWABLE => s.b != 0 && live_type(s.b as usize, s.a) && unsafe { (*(s.b as *mut PyTypeObject)).tp_flags } & crate::ffi::Py_TPFLAGS_INLINE_VALUES != 0,
+            _ => false,
+        };
+        if es.is_empty() || !es.iter().all(|s| ok(s)) {
             self.template(i);
             return;
         }
-        let tp = s.b as *mut PyTypeObject;
-        if s.kind == kind::METHOD_SHADOWABLE && unsafe { (*tp).tp_flags } & crate::ffi::Py_TPFLAGS_INLINE_VALUES == 0 {
-            // instance dict at tp_dictoffset / dict-only managed dict: generic path
-            self.template(i);
-            return;
-        }
-        let tag = s.a as u32;
         let snap = self.snap(i, SnapKind::Deopt);
-        let p = self.guard_tag(1, tag, snap);
-        if s.kind == kind::METHOD_SHADOWABLE {
-            // the instance must not have an attribute of that name: no dict, or inline
-            // values whose shape lacks the name (memoised per site: shape lacking it)
-            let w = self.v(Class::G);
-            self.emit(Inst::Load(w, Base::V(p), MANAGED_DICT));
+        let meth = if es.len() == 1 {
+            let s = es[0];
+            let p = self.guard_tag(1, s.a as u32, snap);
+            if s.kind == kind::METHOD_SHADOWABLE {
+                self.check_not_shadowed(p, name, Fail::Deopt(snap), snap);
+            }
+            AV::Const(s.c)
+        } else {
+            // polymorphic: the method per receiver type (borrowed from the type dicts)
+            let p = self.peek_ptr(1);
+            let res = self.v(Class::G);
             let cont = self.new_block(u32::MAX);
-            let check = self.new_block(u32::MAX);
-            self.term(Term::Branch(Cond::Test(w, Opnd::V(w), Cc::E), cont, check));
-            self.cur = check;
-            self.closed = false;
-            self.emit(Inst::Guard(Cond::Test(w, Opnd::I(1), Cc::E), snap));
-            let (sh_off, _vals, _id, _len, _keys) = crate::shape::jit_layout();
-            let sh = self.v(Class::G);
-            self.emit(Inst::Load(sh, Base::V(w), sh_off - 1));
-            let cell = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0))) as *const _ as usize;
-            self.cells.push(cell);
-            let cv = self.imm(cell as i64);
-            let memo = self.v(Class::G);
-            self.emit(Inst::Load(memo, Base::V(cv), 0));
-            let slow = self.new_block(u32::MAX);
-            self.term(Term::Branch(Cond::Cmp(sh, Opnd::V(memo), Cc::E), cont, slow));
-            self.cur = slow;
-            self.closed = false;
-            let r = self.v(Class::G);
-            self.emit(Inst::Call { addr: h_shape_lacks as usize, args: vec![Opnd::V(sh), Opnd::I(name as i64), Opnd::I(cell as i64)], fargs: vec![], ret: Some(r), fret: None });
-            self.emit(Inst::Guard(Cond::Test(r, Opnd::V(r), Cc::E), snap));
-            self.term(Term::Jump(cont));
-            self.cur = cont;
-            self.closed = false;
-        }
+            let tags: Vec<u32> = es.iter().map(|s| s.a as u32).collect();
+            let bodies = self.tag_switch(p, &tags);
+            self.term(Term::Deopt(snap));
+            for (s, b) in es.iter().zip(bodies) {
+                self.switch_to(b);
+                if s.kind == kind::METHOD_SHADOWABLE {
+                    self.check_not_shadowed(p, name, Fail::Deopt(snap), snap);
+                }
+                let m = self.imm(s.c as i64);
+                self.emit(Inst::Mov(res, m));
+                self.term(Term::Jump(cont));
+            }
+            self.switch_to(cont);
+            AV::Obj(res, Own::Const, Ty::Unknown)
+        };
         // [recv] -> [method, recv]: the receiver keeps its abstract value
         let k = self.st.stack.len() - 1;
         let recv = self.st.stack[k];
-        let recv = match recv {
-            AV::InFrame(t) => AV::Obj(p, Own::Owned, t),
-            other => other,
-        };
-        self.st.stack[k] = AV::Const(s.c);
+        self.st.stack[k] = meth;
         self.push(recv);
     }
 
@@ -1939,83 +2058,104 @@ impl<'a> B<'a> {
         use crate::interp::cache::kind;
         let ins = self.u.an.instrs[i];
         let name = self.u.cd.names[ins.arg as usize].as_ptr() as usize;
-        let Some(s) = self.mono_entry(i) else {
+        let Some(es) = self.attr_entries(i) else {
             self.template(i);
             return;
         };
-        let tag = s.a as u32;
-        // [value, owner]
-        match s.kind {
-            kind::INSTANCE_DICT if s.b < (1 << 20) => {
-                let snap = self.snap(i, SnapKind::Deopt);
-                let p = self.guard_tag(1, tag, snap);
-                let w = self.values_word(p, snap);
-                self.guard_shape_key(w, s.b, name, snap);
-                let (_sh, vals_off, _id, _len, _keys) = crate::shape::jit_layout();
-                let off = vals_off - 1 + 8 * s.b as i32;
-                // other threads may read/write the values lock-free: let the runtime
-                // do the locked store with deferred release then
-                let mt = self.v(Class::G);
-                let mta = self.imm((&raw const crate::threads::MULTI_THREADED) as i64);
-                self.emit(Inst::Load(mt, Base::V(mta), 0));
-                let fast = self.new_block(u32::MAX);
-                let slow = self.new_block(u32::MAX);
-                let cont = self.new_block(u32::MAX);
-                let va = self.peek(2);
-                let val = match va {
-                    AV::InFrame(_) => self.peek_ptr(2),
-                    other => {
-                        let t = self.ty_of(&other);
-                        let v = self.obj_owned(other);
-                        let k = self.st.stack.len() - 2;
-                        self.st.stack[k] = AV::Obj(v, Own::Owned, t);
-                        v
-                    }
-                };
-                // the value entry is now an owned reference in `val` (a deopt from the
-                // slow path stores it back into its frame slot)
-                let snap2 = self.snap(i, SnapKind::Deopt);
-                self.term(Term::Branch(Cond::Test(mt, Opnd::V(mt), Cc::NE), slow, fast));
-                self.cur = fast;
-                self.closed = false;
-                let old = self.v(Class::G);
-                self.emit(Inst::Load(old, Base::V(w), off));
-                self.emit(Inst::Store(Base::V(w), off, val));
-                self.emit(Inst::XDecref(old));
-                self.term(Term::Jump(cont));
-                self.cur = slow;
-                self.closed = false;
-                let r = self.v(Class::G);
-                self.emit(Inst::Call { addr: h_attr_replace as usize, args: vec![Opnd::V(p), Opnd::I(s.b as i64), Opnd::I(name as i64), Opnd::V(val)], fargs: vec![], ret: Some(r), fret: None });
-                self.emit(Inst::Guard(Cond::Test(r, Opnd::V(r), Cc::E), snap2));
-                self.term(Term::Jump(cont));
-                self.cur = cont;
-                self.closed = false;
-                // value moved into the object (fast path) / given to the runtime
-                let k = self.st.stack.len() - 1;
-                let a = self.pop();
-                self.discard(a, k);
-                self.pop();
-            }
-            kind::SLOT => {
-                let snap = self.snap(i, SnapKind::Deopt);
-                let p = self.guard_tag(1, tag, snap);
-                let va = self.peek(2);
-                let val = match va {
-                    AV::InFrame(_) => self.peek_ptr(2),
-                    other => self.obj_owned(other),
-                };
-                let old = self.v(Class::G);
-                self.emit(Inst::Load(old, Base::V(p), s.c as i32));
-                self.emit(Inst::Store(Base::V(p), s.c as i32, val));
-                self.emit(Inst::XDecref(old));
-                let k = self.st.stack.len() - 1;
-                let a = self.pop();
-                self.discard(a, k);
-                self.pop();
-            }
-            _ => self.template(i),
+        let ok = |s: &crate::interp::cache::Snapshot| match s.kind {
+            kind::INSTANCE_DICT => s.b < (1 << 20),
+            kind::SLOT => true,
+            _ => false,
+        };
+        let cases: Vec<_> = es.iter().copied().filter(|s| ok(s)).collect();
+        if cases.is_empty() {
+            self.template(i);
+            return;
         }
+        // [value, owner]
+        let snap = self.snap(i, SnapKind::Deopt);
+        let p = if es.len() == 1 { self.guard_tag(1, cases[0].a as u32, snap) } else { self.peek_ptr(1) };
+        // the value as an owned reference (moved into the object on the fast paths)
+        let val = match self.peek(2) {
+            AV::InFrame(_) => self.peek_ptr(2),
+            other => {
+                let t = self.ty_of(&other);
+                let v = self.obj_owned(other);
+                let k = self.st.stack.len() - 2;
+                self.st.stack[k] = AV::Obj(v, Own::Owned, t);
+                v
+            }
+        };
+        let esnap = self.snap(i, SnapKind::Error);
+        let cont = self.new_block(u32::MAX);
+        let slow = self.new_block(u32::MAX);
+        let bodies = if es.len() == 1 {
+            vec![self.cur]
+        } else {
+            let tags: Vec<u32> = cases.iter().map(|s| s.a as u32).collect();
+            let b = self.tag_switch(p, &tags);
+            self.term(Term::Jump(slow));
+            b
+        };
+        let mt_addr = (&raw const crate::threads::MULTI_THREADED) as i64;
+        for (s, b) in cases.iter().zip(bodies) {
+            self.switch_to(b);
+            let f = Fail::Block(slow);
+            match s.kind {
+                kind::INSTANCE_DICT => {
+                    // other threads may access the values lock-free: locked runtime path
+                    let mta = self.imm(mt_addr);
+                    self.check(Cond::CmpMem(Base::V(mta), 0, 0, Cc::NE), f);
+                    let w = self.values_word(p, f);
+                    let off = Self::vals_off(s.b);
+                    let trans = if s.c != 0 && live_type(s.c, s.a) { crate::shape::transitions_adding(s.c as *mut PyTypeObject, name as *mut PyObject, s.b as usize) } else { Vec::new() };
+                    if trans.len() == 1 {
+                        // replace (shape = child) or add (shape = parent, room left)
+                        let (parent, child) = trans[0];
+                        let sh = self.shape_of(w);
+                        let add = self.new_block(u32::MAX);
+                        let replace = self.new_block(u32::MAX);
+                        let notc = self.new_block(u32::MAX);
+                        self.term(Term::Branch(Cond::Cmp(sh, Opnd::I(child as i64), Cc::E), replace, notc));
+                        self.switch_to(notc);
+                        self.check(Cond::Cmp(sh, Opnd::I(parent as i64), Cc::NE), f);
+                        self.check(Cond::CmpMem32(Base::V(w), crate::shape::values_cap_offset() - 1, s.b as i64, Cc::BE), f);
+                        self.term(Term::Jump(add));
+                        self.switch_to(add);
+                        self.emit(Inst::Store(Base::V(w), off, val));
+                        let (sh_off, _vals, _id, _len, _keys) = crate::shape::jit_layout();
+                        let cv = self.imm(child as i64);
+                        self.emit(Inst::Store(Base::V(w), sh_off - 1, cv));
+                        self.term(Term::Jump(cont));
+                        self.switch_to(replace);
+                    } else {
+                        self.check_shape_key(w, s.b, name, f);
+                    }
+                    let old = self.v(Class::G);
+                    self.emit(Inst::Load(old, Base::V(w), off));
+                    self.emit(Inst::Store(Base::V(w), off, val));
+                    self.emit(Inst::XDecref(old));
+                }
+                _ => {
+                    let old = self.v(Class::G);
+                    self.emit(Inst::Load(old, Base::V(p), s.c as i32));
+                    self.emit(Inst::Store(Base::V(p), s.c as i32, val));
+                    self.emit(Inst::XDecref(old));
+                }
+            }
+            self.term(Term::Jump(cont));
+        }
+        // generic store (refills the inline cache); the value reference is released
+        self.switch_to(slow);
+        let ea = self.entries_addr(i);
+        self.emit(Inst::CallChecked { addr: h2_store_attr as usize, args: vec![Opnd::V(p), Opnd::I(name as i64), Opnd::V(val), Opnd::I(ea)], err: esnap });
+        self.term(Term::Jump(cont));
+        self.switch_to(cont);
+        // value moved into the object / released by the runtime
+        let k = self.st.stack.len() - 1;
+        let a = self.pop();
+        self.discard(a, k);
+        self.pop();
     }
 
     fn binary_subscr(&mut self, i: usize) {
@@ -2195,16 +2335,29 @@ pub unsafe extern "C" fn h_shape_lacks(sh: *const crate::shape::Shape, name: *mu
     }
 }
 
-/// Locked replacement of attribute `name` at inline index `hint` of `o` (other threads
-/// may run): 1 done (the reference to `v` was moved into the object), 0 the shape
-/// changed (nothing consumed).
-pub unsafe extern "C" fn h_attr_replace(o: *mut PyObject, hint: u64, name: *mut PyObject, v: *mut PyObject) -> u64 {
+/// Generic attribute load through the inline cache (slow path of tier-2 LoadAttr):
+/// new reference, or NULL with an exception set.
+pub unsafe extern "C" fn h2_load_attr(o: *mut PyObject, name: *mut PyObject, es: *const crate::interp::cache::Entry) -> *mut PyObject {
     unsafe {
-        if crate::shape::replace_hinted(&*o, name, hint, &*v) {
-            crate::object::decref(v); // replace_hinted took its own reference
-            1
-        } else {
-            0
+        let es = std::slice::from_raw_parts(es, crate::interp::cache::POLY);
+        match crate::interp::specialize::load_attr(&*o, &*name, es) {
+            Ok(v) => v.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+}
+
+/// Generic attribute store through the inline cache (slow path of tier-2 StoreAttr).
+/// 0: done, the reference to `v` was consumed; 1: exception set, `v` untouched.
+pub unsafe extern "C" fn h2_store_attr(o: *mut PyObject, name: *mut PyObject, v: *mut PyObject, es: *const crate::interp::cache::Entry) -> u64 {
+    unsafe {
+        let es = std::slice::from_raw_parts(es, crate::interp::cache::POLY);
+        match crate::interp::specialize::store_attr(&*o, &*name, &*v, es) {
+            Ok(()) => {
+                crate::object::decref(v);
+                0
+            }
+            Err(_) => 1,
         }
     }
 }

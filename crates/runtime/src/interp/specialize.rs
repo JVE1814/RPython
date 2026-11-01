@@ -522,13 +522,13 @@ fn fill_store_attr(o: &PyObject, nm: &PyObject) -> Option<Fill> {
                 return Some((kind::DATA_DESCR, tag as u64, 0, d.as_ptr() as usize));
             }
             if type_has_dict(tp) {
-                return Some((kind::INSTANCE_DICT, tag as u64, hint(), 0));
+                return Some((kind::INSTANCE_DICT, tag as u64, hint(), tp as usize));
             }
             None
         }
         None => {
             if type_has_dict(tp) {
-                return Some((kind::INSTANCE_DICT, tag as u64, hint(), 0));
+                return Some((kind::INSTANCE_DICT, tag as u64, hint(), tp as usize));
             }
             None
         }

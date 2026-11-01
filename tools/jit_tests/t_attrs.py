@@ -154,3 +154,38 @@ bs = [Big(), Big()]
 for k in range(40):
     r = big(bs, 5)
 print(r, bs[0].a3)
+
+# polymorphic receivers and attribute-adding stores in __init__
+class A:
+    def __init__(self, v):
+        self.v = v
+        self.w = v * 2
+    def get(self):
+        return self.v
+class B(A):
+    def __init__(self, v):
+        self.w = v
+        self.v = v + 1
+    def get(self):
+        return -self.v
+class D:
+    __slots__ = ('v', 'w')
+    def __init__(self, v):
+        self.v = v
+        self.w = 0
+    def get(self):
+        return self.v * 10
+def poly(n):
+    t = 0
+    for i in range(n):
+        for o in (A(i), B(i), D(i), A(-i)):
+            t += o.v + o.w + o.get()
+            o.w = i
+            t += o.w
+    return t
+for k in range(40):
+    r = poly(10)
+print(r)
+class E(A):
+    pass
+print(poly(3), [o.get() for o in (E(1), A(2))])
