@@ -58,7 +58,9 @@ Running (wave 4): compress2 (lzma/zstd/tarfile/zipimport/uuid; owns crates/compr
 mailbox/mimetypes/smtplib.../tomllib/optparse).
 Finished also: capi (all 1208 C-API functions exported), compress (zlib/hashes/bz2/gzip/
 zipfile), net (_socket/select/subprocess/asyncio).
-Unassigned: _testinternalcapi/_testmultiphase/_testclinic re-implemented by us (spec lacks
-internal headers / generated clinic files); ctypes/_ctypes (own libffi-equivalent);
-sqlite3 (own SQLite-compatible engine? decide); curses/readline/_pyrepl; tkinter (skip like a
-build without Tk); no-GIL thread-safety audit; startup time (jit owns perf).
+Running (wave 5): bindings (_ssl/_sqlite3/_ctypes via system libs, D20), core-runtime (monitoring/settrace/gc/
+ slots bugs, lazy imports, list reclamation, _testinternalcapi/_testmultiphase, core test failures).
+Finished also: decimal (662/663 test_decimal), devtools.
+Unassigned: _testclinic re-implemented by us (spec lacks
+internal headers / generated clinic files); curses/_curses_panel/readline/_pyrepl (bind ncurses/
+readline, D20); _tkinter + tkinter (bind Tcl/Tk, D20 — the rebuilt baseline has Tk); _dbm/_gdbm; no-GIL thread-safety audit; startup time (jit owns perf).
