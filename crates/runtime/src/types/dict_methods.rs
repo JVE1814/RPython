@@ -9,7 +9,7 @@ use crate::types::{bool_, dict, dictview, exceptions, frozendict, int, none, str
 use std::ffi::c_int;
 
 pub fn raise_key_error(k: &PyObject) {
-    let _ = set_err_obj(exceptions::KeyError(), if tuple::is_tuple(k) { tuple::new_tuple(vec![k.to_ref()]) } else { k.to_ref() });
+    let _ = set_err_obj(exceptions::KeyError(), k.to_ref());
 }
 
 #[inline]
