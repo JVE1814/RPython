@@ -42,16 +42,38 @@ pub static UNCOLLECTABLE: AtomicUsize = AtomicUsize::new(0);
 /// Size of the live set after the last collection (for adaptive triggering).
 static LAST_LIVE: AtomicUsize = AtomicUsize::new(0);
 
+/// Spin lock protecting the list (critical sections are a few pointer writes; a
+/// std Mutex cost a TLS poison check + futex word on every track/untrack).
+static LIST_LOCK: AtomicBool = AtomicBool::new(false);
+static LIST_HEAD: std::sync::atomic::AtomicPtr<GcHead> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+struct ListGuard;
+impl Drop for ListGuard {
+    fn drop(&mut self) {
+        LIST_LOCK.store(false, Release);
+    }
+}
+
+#[inline]
 fn with_list<R>(f: impl FnOnce(*mut GcHead) -> R) -> R {
-    let mut g = LIST.lock().unwrap_or_else(|e| e.into_inner());
-    let l = g.get_or_insert_with(|| {
-        let mut b = Box::new(List { head: GcHead { next: std::ptr::null_mut(), prev: std::ptr::null_mut() } });
-        let p = &mut b.head as *mut GcHead;
-        b.head.next = p;
-        b.head.prev = p;
-        b
-    });
-    f(&mut l.head as *mut GcHead)
+    while LIST_LOCK.compare_exchange_weak(false, true, Acquire, Relaxed).is_err() {
+        std::hint::spin_loop();
+    }
+    let _g = ListGuard;
+    let mut head = LIST_HEAD.load(Relaxed);
+    if head.is_null() {
+        let mut g = LIST.lock().unwrap_or_else(|e| e.into_inner());
+        let l = g.get_or_insert_with(|| {
+            let mut b = Box::new(List { head: GcHead { next: std::ptr::null_mut(), prev: std::ptr::null_mut() } });
+            let p = &mut b.head as *mut GcHead;
+            b.head.next = p;
+            b.head.prev = p;
+            b
+        });
+        head = &mut l.head as *mut GcHead;
+        LIST_HEAD.store(head, Relaxed);
+    }
+    f(head)
 }
 
 #[inline]
