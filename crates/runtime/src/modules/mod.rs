@@ -22,6 +22,7 @@ pub mod posix;
 pub mod stat_mod;
 pub mod time;
 pub mod io;
+pub mod posixsubprocess;
 pub mod fncommon;
 pub mod functional;
 pub mod _operator;
@@ -47,6 +48,7 @@ pub fn register_all() {
     crate::import::register_builtin("_stat", stat_mod::init);
     crate::import::register_builtin("time", time::init);
     crate::import::register_builtin("_io", io::init);
+    crate::import::register_builtin("_posixsubprocess", posixsubprocess::init);
     functional::register();
     numbers_registry::register();
     crate::import::register_builtin("_warnings", _warnings::init_module);
