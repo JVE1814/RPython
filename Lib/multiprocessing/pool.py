@@ -632,6 +632,9 @@ class Pool(object):
 
         # no more workers
         worker_handler._state = TERMINATE
+        # wake the worker handler: it exits and ends the task handler, which
+        # sends the sentinels that free the workers (and the inqueue lock)
+        change_notifier.put(None)
         # no more tasks
         task_handler._state = TERMINATE
 
