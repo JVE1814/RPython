@@ -373,6 +373,20 @@ impl Asm {
     pub fn add32_mi(&mut self, m: M, i: i32) {
         self.alu_mi(0, m, i, false)
     }
+    /// or word [m], imm16
+    pub fn or16_mi(&mut self, m: M, i: u16) {
+        self.b(0x66);
+        self.rex(false, 0, 0, m.0 as u8, false);
+        if i < 0x80 {
+            self.b(0x83);
+            self.modrm_mem(1, m);
+            self.b(i as u8);
+        } else {
+            self.b(0x81);
+            self.modrm_mem(1, m);
+            self.buf.extend_from_slice(&i.to_le_bytes());
+        }
+    }
     /// cmp r64, qword [m]
     pub fn cmp_rm(&mut self, r: R, m: M) {
         self.rex(true, r as u8, 0, m.0 as u8, false);
@@ -506,6 +520,125 @@ impl Asm {
     /// xorpd x, x
     pub fn xorpd(&mut self, d: X, s: X) {
         self.sse_rr(0x66, 0x57, d, s)
+    }
+
+    /// movsd xmm, xmm
+    pub fn movsd_rr(&mut self, d: X, s: X) {
+        self.sse_rr(0xf2, 0x10, d, s)
+    }
+    pub fn sqrtsd(&mut self, d: X, s: X) {
+        self.sse_rr(0xf2, 0x51, d, s)
+    }
+    /// movq xmm, r64
+    pub fn movq_xr(&mut self, d: X, s: R) {
+        self.b(0x66);
+        self.rex(true, d.0, 0, s as u8, false);
+        self.b(0x0f);
+        self.b(0x6e);
+        self.modrm_reg(d.0, s as u8);
+    }
+    /// movq r64, xmm
+    pub fn movq_rx(&mut self, d: R, s: X) {
+        self.b(0x66);
+        self.rex(true, s.0, 0, d as u8, false);
+        self.b(0x0f);
+        self.b(0x7e);
+        self.modrm_reg(s.0, d as u8);
+    }
+
+    // ------------------------------------------------------------------ more ALU
+    /// cmp qword [m], r64   ([m] - r)
+    pub fn cmp_mr(&mut self, m: M, r: R) {
+        self.rex(true, r as u8, 0, m.0 as u8, false);
+        self.b(0x39);
+        self.modrm_mem(r as u8, m);
+    }
+    /// cmp dword [m], r32
+    pub fn cmp32_mr(&mut self, m: M, r: R) {
+        self.rex(false, r as u8, 0, m.0 as u8, false);
+        self.b(0x39);
+        self.modrm_mem(r as u8, m);
+    }
+    /// cmp r32, r32
+    pub fn cmp32_rr(&mut self, d: R, s: R) {
+        self.rex(false, s as u8, 0, d as u8, false);
+        self.b(0x39);
+        self.modrm_reg(s as u8, d as u8);
+    }
+    /// cmp byte [m], imm8
+    pub fn cmp8_mi(&mut self, m: M, i: i8) {
+        self.rex(false, 0, 0, m.0 as u8, false);
+        self.b(0x80);
+        self.modrm_mem(7, m);
+        self.b(i as u8);
+    }
+    /// mov byte [m], imm8
+    pub fn store8_i(&mut self, m: M, i: u8) {
+        self.rex(false, 0, 0, m.0 as u8, false);
+        self.b(0xc6);
+        self.modrm_mem(0, m);
+        self.b(i);
+    }
+    /// test r64, imm32
+    pub fn test_ri(&mut self, d: R, i: i32) {
+        self.rex(true, 0, 0, d as u8, false);
+        self.b(0xf7);
+        self.modrm_reg(0, d as u8);
+        self.d32(i);
+    }
+    pub fn or_ri(&mut self, d: R, i: i32) {
+        self.alu_ri(1, d, i)
+    }
+    pub fn xor_ri(&mut self, d: R, i: i32) {
+        self.alu_ri(6, d, i)
+    }
+    /// imul r64, r64, imm32
+    pub fn imul_rri(&mut self, d: R, s: R, i: i32) {
+        self.rex(true, d as u8, 0, s as u8, false);
+        self.b(0x69);
+        self.modrm_reg(d as u8, s as u8);
+        self.d32(i);
+    }
+    /// shl r64, cl
+    pub fn shl_cl(&mut self, d: R) {
+        self.rex(true, 0, 0, d as u8, false);
+        self.b(0xd3);
+        self.modrm_reg(4, d as u8);
+    }
+    /// sar r64, cl
+    pub fn sar_cl(&mut self, d: R) {
+        self.rex(true, 0, 0, d as u8, false);
+        self.b(0xd3);
+        self.modrm_reg(7, d as u8);
+    }
+    /// cqo (sign-extend rax into rdx)
+    pub fn cqo(&mut self) {
+        self.b(0x48);
+        self.b(0x99);
+    }
+    /// idiv r64 (rdx:rax / r -> rax quotient, rdx remainder)
+    pub fn idiv(&mut self, r: R) {
+        self.rex(true, 0, 0, r as u8, false);
+        self.b(0xf7);
+        self.modrm_reg(7, r as u8);
+    }
+    /// lock cmpxchg byte [m], r8 (compares with al)
+    pub fn lock_cmpxchg8(&mut self, m: M, r: R) {
+        self.b(0xf0);
+        self.rex(false, r as u8, 0, m.0 as u8, (r as u8) >= 4);
+        self.b(0x0f);
+        self.b(0xb0);
+        self.modrm_mem(r as u8, m);
+    }
+    /// sub dword [m], imm
+    pub fn sub32_mi(&mut self, m: M, i: i32) {
+        self.alu_mi(5, m, i, false)
+    }
+    /// lea r64, [base + index*scale + disp]
+    pub fn lea_idx(&mut self, dst: R, base: R, index: R, scale: u8, disp: i32) {
+        self.rex(true, dst as u8, index as u8, base as u8, false);
+        self.b(0x8d);
+        self.modrm_sib(dst as u8, base, index, scale, disp);
     }
 
     // ------------------------------------------------------------------ control
