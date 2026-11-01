@@ -123,6 +123,10 @@ class Task(futures._PyFuture):
         if not coroutines.iscoroutine(coro):
             self._log_destroy_pending = False
             raise TypeError(f"a coroutine was expected, got {coro!r}")
+        if context is not None and not isinstance(context, contextvars.Context):
+            self._log_destroy_pending = False
+            raise TypeError(f"context must be a contextvars.Context, not "
+                            f"{type(context).__name__}")
         self._name = f'Task-{next(_task_names)}' if name is None else str(name)
         self._num_cancels_requested = 0
         self._must_cancel = False
@@ -482,6 +486,10 @@ class _AsCompletedIterator:
                 futures.future_add_to_awaited_by(fut, me)
         try:
             fut = await self._finished.get()
+        except exceptions.CancelledError:
+            # a cancelled wait does not use up one of the results
+            self._remaining += 1
+            raise
         finally:
             if me is not None:
                 for other in self._everything:
@@ -588,6 +596,13 @@ def gather(*coros_or_futures, return_exceptions=False):
     count = 0
     finished = 0
 
+    def forget_pending():
+        # children that outlive gather() are no longer awaited by parent
+        if parent is not None:
+            for item in children:
+                if not item.done():
+                    futures.future_discard_from_awaited_by(item, parent)
+
     def child_done(child):
         nonlocal finished
         finished += 1
@@ -600,10 +615,12 @@ def gather(*coros_or_futures, return_exceptions=False):
         if not return_exceptions:
             if child.cancelled():
                 outer.set_exception(child._make_cancelled_error())
+                forget_pending()
                 return
             failure = child.exception()
             if failure is not None:
                 outer.set_exception(failure)
+                forget_pending()
                 return
         if finished < count:
             return
@@ -676,6 +693,8 @@ def shield(arg):
     def outer_done(outer):
         if not inner.done():
             inner.remove_done_callback(inner_done)
+            if parent is not None:
+                futures.future_discard_from_awaited_by(inner, parent)
 
     inner.add_done_callback(inner_done)
     outer.add_done_callback(outer_done)
