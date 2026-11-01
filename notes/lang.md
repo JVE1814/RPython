@@ -52,8 +52,7 @@
   made `pub`; async-gen finalizer called also for unstarted generators; `__await__`
   returning a plain generator is fine (only iterable coroutines are rejected; the old
   check leaked an exception); `cr_origin`; message "async generator already executing".
-- `types/slots.rs::add_operators`: no slot wrappers for slots inherited by heap types
-  (they caused infinite recursion: `class G(F)` with F having `__slots__` + `__init__`).
+- (`slots.rs`: an equivalent fix for inherited heap-type slot wrappers landed in master)
 - `types/object_type.rs`: a `__doc__` entry in `__slots__` keeps its member descriptor;
   `__class__` assignment between types adding the same `__slots__` to the same base;
   immutable-type error message uses the full tp_name.
