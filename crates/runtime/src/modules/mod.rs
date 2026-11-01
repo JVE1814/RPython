@@ -50,8 +50,11 @@ pub mod _types;
 pub mod _heapq;
 pub mod _bisect;
 
+pub mod _weakref;
+
 /// Register all builtin (Rust-implemented) modules with the import system.
 pub fn register_all() {
+    crate::import::register_builtin("_weakref", _weakref::init);
     crate::import::register_builtin("_string", crate::types::str_methods::init_string_module);
     crate::import::register_builtin("posix", posix::init);
     crate::import::register_builtin("errno", errno::init);
