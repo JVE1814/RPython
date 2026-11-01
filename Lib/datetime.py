@@ -1,7 +1,7 @@
-"""Specific date/time and related types.
+"""Dates, times, durations and time zones.
 
-See https://data.iana.org/time-zones/tz-link.html for
-time zone and DST data sources.
+The classes come from the native ``_datetime`` module when it is available
+and from the pure-Python ``_pydatetime`` otherwise; both behave the same.
 """
 
 try:
