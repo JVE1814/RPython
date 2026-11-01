@@ -48,7 +48,7 @@ def _encode_integer(n, bias, out):
 
 
 def punycode_encode(text):
-    basic = bytearray()
+    basic = []
     others = set()
     for c in text:
         if ord(c) < 0x80:
@@ -56,7 +56,7 @@ def punycode_encode(text):
         else:
             others.add(ord(c))
 
-    out = bytearray()
+    out = []
     n = _INITIAL_N
     delta = 0
     bias = _INITIAL_BIAS
