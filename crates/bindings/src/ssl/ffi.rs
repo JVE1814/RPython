@@ -180,6 +180,7 @@ crate::dyn_lib!(LibSsl, ["libssl.so.3", "libssl.so"], {
     fn SSL_get_peer_finished(s: P, buf: *mut c_void, n: usize) -> usize;
     fn SSL_session_reused(s: P) -> c_int;
     fn SSL_get1_session(s: P) -> P;
+    fn SSL_SESSION_dup(s: P) -> P;
     fn SSL_set_session(s: P, sess: P) -> c_int;
     fn SSL_get_servername(s: P, t: c_int) -> *const c_char;
     fn SSL_set_SSL_CTX(s: P, c: P) -> P;

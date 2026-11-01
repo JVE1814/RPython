@@ -698,6 +698,16 @@ fn g_session(o: &PyObject) -> PyResult {
     if sess.is_null() {
         return Ok(none());
     }
+    // A session object is a snapshot that outlives the connection: OpenSSL marks the
+    // connection's own SSL_SESSION non-resumable when the connection is freed without a
+    // close_notify, so hand out a copy.
+    let copy = sl!(SSL_SESSION_dup(sess));
+    let sess = if copy.is_null() {
+        sess
+    } else {
+        sl!(SSL_SESSION_free(sess));
+        copy
+    };
     new_session(sess, ss(o).context.clone())
 }
 
@@ -719,7 +729,14 @@ fn set_session(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     if handshake_done(o) {
         raise!(ValueError, "Cannot set session after handshake.");
     }
-    if sl!(SSL_set_session(s.ssl, session(v).sess)) != 1 {
+    // the connection gets its own copy, so the Python object stays resumable
+    let copy = sl!(SSL_SESSION_dup(session(v).sess));
+    let src = if copy.is_null() { session(v).sess } else { copy };
+    let r = sl!(SSL_set_session(s.ssl, src));
+    if !copy.is_null() {
+        sl!(SSL_SESSION_free(copy));
+    }
+    if r != 1 {
         return Err(raise_from_queue(None, "failed to set session"));
     }
     Ok(())
