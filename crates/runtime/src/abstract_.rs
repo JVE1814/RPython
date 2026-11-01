@@ -35,11 +35,13 @@ pub fn getattr_str(o: &PyObject, nm: &str) -> PyResult {
 /// getattr that returns None (no exception) on AttributeError.
 pub fn getattr_opt(o: &PyObject, nm: &PyObject) -> PyResult<Option<PyRef>> {
     let tp = o.ty();
-    if tp.tp_getattro.map(|f| f as usize) == Some(object_generic_getattro as usize) {
-        return generic_getattr_opt(o, nm, None);
-    }
-    match getattr(o, nm) {
-        Ok(v) => Ok(Some(v)),
+    let r = if tp.tp_getattro.map(|f| f as usize) == Some(object_generic_getattro as usize) {
+        generic_getattr_opt(o, nm, None)
+    } else {
+        getattr(o, nm).map(Some)
+    };
+    match r {
+        Ok(v) => Ok(v),
         Err(e) => {
             if exc_matches(crate::types::exceptions::AttributeError()) {
                 clear_exc();
@@ -146,7 +148,7 @@ fn check_result(callable: &PyObject, r: *mut PyObject) -> *mut PyObject {
         if !err_occurred() {
             let _ = err!(SystemError, "{} returned NULL without setting an exception", repr_for_error(callable));
         }
-    } else if err_occurred() {
+    } else if cfg!(debug_assertions) && err_occurred() {
         unsafe { decref(r) };
         let cause = take_exc();
         let _ = err!(SystemError, "{} returned a result with an exception set", repr_for_error(callable));
@@ -1032,6 +1034,9 @@ pub fn getitem(o: &PyObject, key: &PyObject) -> PyResult {
         }
     }
     if is_type(o) {
+        if o.is(crate::types::typeobject::type_obj(crate::types::typeobject::type_type())) {
+            return crate::types::genericalias::new_generic_alias(o, key);
+        }
         // __class_getitem__
         if let Some(m) = getattr_opt(o, name!("__class_getitem__"))? {
             return call(&m, &[key]);

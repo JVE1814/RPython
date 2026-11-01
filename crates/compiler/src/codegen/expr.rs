@@ -225,14 +225,7 @@ impl<'a> Compiler<'a> {
                 self.compile_comprehension(e)?
             }
             ExprKind::Await { value } => {
-                if !self.in_async_context() {
-                    let sc = &self.st.scopes[self.ur().scope];
-                    if !(sc.comprehension != CompKind::None && sc.coroutine) && !self.ur().comps.is_empty() {
-                        // inlined async comprehension in an async function: fine
-                    } else if sc.comprehension == CompKind::None {
-                        return Err(self.error("'await' outside async function", e.loc));
-                    }
-                }
+                // placement errors were reported by the symbol table
                 self.compile_expr(value)?;
                 self.set_loc(e.loc);
                 self.emit(Op::GetAwaitable, 0);
@@ -340,7 +333,8 @@ impl<'a> Compiler<'a> {
     fn check_yield_allowed(&mut self, e: &Expr) -> R {
         let sc = &self.st.scopes[self.ur().scope];
         if !sc.is_function_like() {
-            return Err(self.error("'yield' outside function", e.loc));
+            let what = if matches!(e.node, ExprKind::YieldFrom { .. }) { "'yield from'" } else { "'yield'" };
+            return Err(self.error(format!("{} outside function", what), e.loc));
         }
         Ok(())
     }
@@ -808,8 +802,6 @@ impl<'a> Compiler<'a> {
             }
             return Ok(());
         }
-        let dummy: &'a Expr = args.first().unwrap_or_else(|| &keywords[0].value);
-        let _ = dummy;
         self.compile_call_ex_loc(loc_e, pushed, args, keywords, generic)
     }
 
