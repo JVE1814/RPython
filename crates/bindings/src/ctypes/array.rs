@@ -167,7 +167,7 @@ fn char_array_get_value(o: &PyObject) -> PyResult {
 fn char_array_set_value(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     let v = match v {
         Some(v) => v,
-        None => raise!(AttributeError, "cannot delete attribute"),
+        None => raise!(TypeError, "can't delete attribute"),
     };
     if !is_bytes(v) {
         raise!(TypeError, "bytes expected instead of {} instance", tname(v));
@@ -333,7 +333,7 @@ pub fn subscript_impl(o: &PyObject, key: &PyObject) -> PyResult {
                     let mut cur = start;
                     for _ in 0..n {
                         out.push(unsafe { *c.b_ptr.offset(cur) });
-                        cur += step;
+                        cur = cur.wrapping_add(step);
                     }
                     return Ok(bytes::new_bytes(&out));
                 }
@@ -342,7 +342,7 @@ pub fn subscript_impl(o: &PyObject, key: &PyObject) -> PyResult {
                     let mut cur = start;
                     for _ in 0..n {
                         out.push(unsafe { *(c.b_ptr as *const i32).offset(cur) });
-                        cur += step;
+                        cur = cur.wrapping_add(step);
                     }
                     return simple::wide_to_str(out.as_ptr(), out.len());
                 }
@@ -354,7 +354,7 @@ pub fn subscript_impl(o: &PyObject, key: &PyObject) -> PyResult {
         for _ in 0..n {
             let v = array_item_impl(o, cur)?;
             list::append(&l, v);
-            cur += step;
+            cur = cur.wrapping_add(step);
         }
         return Ok(l);
     }
@@ -383,7 +383,7 @@ pub fn ass_subscript_impl(o: &PyObject, key: &PyObject, v: Option<&PyObject>) ->
         for i in 0..n {
             let item = rpy_runtime::abstract_::getitem(v, &new_int(i as i64))?;
             array_setitem_impl(o, cur, &item)?;
-            cur += step;
+            cur = cur.wrapping_add(step);
         }
         return Ok(());
     }

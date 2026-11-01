@@ -92,14 +92,14 @@ fn struct_meta_init_impl(cls: &PyObject, is_struct: bool) -> PyResult<()> {
 unsafe extern "C" fn struct_meta_setattro(o: *mut PyObject, name: *mut PyObject, v: *mut PyObject) -> c_int {
     unsafe {
         let ts = (*rpy_runtime::types::typeobject::type_type()).tp_setattro.unwrap();
-        if ts(o, name, v) < 0 {
-            return -1;
-        }
         if !v.is_null() && is_str(&*name) && str_of(&*name) == "_fields_" {
+            // validate and apply the layout before storing the attribute
             let is_struct = is_struct_meta(o as *mut PyTypeObject);
-            return int_into_c(update_stginfo(&*o, &*v, is_struct));
+            if update_stginfo(&*o, &*v, is_struct).is_err() {
+                return -1;
+            }
         }
-        0
+        ts(o, name, v)
     }
 }
 
@@ -112,6 +112,15 @@ pub fn update_stginfo(cls: &PyObject, fields: &PyObject, is_struct: bool) -> PyR
     };
     if info.dict_flags & DICTFLAG_FINAL != 0 {
         raise!(AttributeError, "_fields_ is final");
+    }
+    if let Ok(items) = rpy_runtime::abstract_::collect_iterable(fields) {
+        for it in &items {
+            if is_tuple(it) && tuple::tuple_len(it) >= 2 && tuple::tuple_get(it, 1).is(cls) {
+                raise!(AttributeError, "Structure or union cannot contain itself");
+            }
+        }
+    } else {
+        rpy_runtime::errors::clear_exc();
     }
     let base = unsafe { (*tp).tp_base };
     let (base_size, base_align, base_length, base_obj) = match stginfo(base) {
@@ -180,6 +189,8 @@ pub fn update_stginfo(cls: &PyObject, fields: &PyObject, is_struct: bool) -> PyR
         if fi.dict_flags & TYPEFLAG_HASBITFIELD != 0 {
             flags |= TYPEFLAG_HASBITFIELD;
         }
+        // a type used as a field can no longer change its layout
+        fi.dict_flags |= DICTFLAG_FINAL;
         let ft: *mut FfiType = match fi.kind {
             Kind::Simple => simple::code_ffi(fi.code),
             Kind::Struct | Kind::Union => fi.ffi_ptr(),
@@ -188,7 +199,7 @@ pub fn update_stginfo(cls: &PyObject, fields: &PyObject, is_struct: bool) -> PyR
                 // a struct of `n` items of the innermost element type
                 let (item, n) = array::flat_item_ffi(fi);
                 let mut ch = Box::new(FfiType { size: fi.size as usize, alignment: fi.align.max(1) as u16, type_: libffi::FFI_TYPE_STRUCT, elements: std::ptr::null_mut() });
-                let mut els: Vec<*mut FfiType> = vec![item; n];
+                let mut els: Vec<*mut FfiType> = vec![item; n.min(4096)];
                 els.push(std::ptr::null_mut());
                 ch.elements = Box::leak(els.into_boxed_slice()).as_mut_ptr();
                 let p = &mut *ch as *mut FfiType;

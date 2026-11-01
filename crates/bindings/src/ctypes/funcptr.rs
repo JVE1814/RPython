@@ -118,6 +118,7 @@ unsafe extern "C" fn carg_repr(op: *mut PyObject) -> *mut PyObject {
             b'd' => format!("<cparam '{}' ({})>", t, fmt_double(*(vp as *const f64))),
             b'f' => format!("<cparam '{}' ({})>", t, fmt_double(*(vp as *const f32) as f64)),
             b'g' => format!("<cparam '{}' at {:#x}>", t, op as usize),
+            b'F' | b'D' | b'G' => format!("<cparam 'Z{}' at {:#x}>", (a.tag as char).to_ascii_lowercase(), op as usize),
             b'c' => {
                 let c = *vp;
                 if (0x20..0x7f).contains(&c) {
@@ -248,7 +249,7 @@ pub fn converters_from_argtypes(argtypes: &PyObject) -> PyResult<(PyRef, PyRef)>
     };
     let n = tuple::tuple_len(&t);
     if n > 1024 {
-        raise!(TypeError, "_argtypes_ has too many arguments ({}), maximum is 1024", n);
+        return Err(set_err(argument_error(), &format!("_argtypes_ has too many arguments ({}), maximum is 1024", n)));
     }
     let mut convs = Vec::with_capacity(n);
     for (i, tp) in tuple::tuple_items(&t).iter().enumerate() {
@@ -333,6 +334,9 @@ fn fp_argtypes_set(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     match v {
         Some(v) if !is_none(v) => {
             let (t, c) = converters_from_argtypes(v)?;
+            if !f.paramflags.is_null() {
+                validate_paramflags_with(Some(&t), Some(r(f.paramflags)))?;
+            }
             set_slot(&mut f.argtypes, Some(t));
             set_slot(&mut f.converters, Some(c));
         }
@@ -362,6 +366,11 @@ const PARAMFLAG_FOUT: i64 = 2;
 const PARAMFLAG_FLCID: i64 = 4;
 
 fn validate_paramflags(tp: *mut PyTypeObject, paramflags: Option<&PyObject>) -> PyResult<()> {
+    let argtypes = stginfo(tp).and_then(|i| i.argtypes.clone());
+    validate_paramflags_with(argtypes.as_deref(), paramflags)
+}
+
+fn validate_paramflags_with(argtypes: Option<&PyObject>, paramflags: Option<&PyObject>) -> PyResult<()> {
     let pf = match paramflags {
         None => return Ok(()),
         Some(p) if is_none(p) => return Ok(()),
@@ -370,9 +379,8 @@ fn validate_paramflags(tp: *mut PyTypeObject, paramflags: Option<&PyObject>) -> 
     if !is_tuple(pf) {
         raise!(TypeError, "paramflags must be a tuple or None");
     }
-    let info = stginfo(tp);
-    let argtypes = match info.as_ref().and_then(|i| i.argtypes.clone()) {
-        Some(a) => a,
+    let argtypes = match argtypes {
+        Some(a) => a.to_ref(),
         None => raise!(TypeError, "paramflags require argtypes"),
     };
     if tuple::tuple_len(pf) != tuple::tuple_len(&argtypes) {
@@ -394,7 +402,9 @@ fn validate_paramflags(tp: *mut PyTypeObject, paramflags: Option<&PyObject>) -> 
         match flag & (PARAMFLAG_FIN | PARAMFLAG_FOUT | PARAMFLAG_FLCID) {
             0 | 1 | 4 | 5 => {}
             2 | 3 => {
-                let ok = stginfo_of_type(typ).map_or(false, |ti| ti.kind == Kind::Pointer || ti.kind == Kind::Array);
+                let ok = stginfo_of_type(typ).map_or(false, |ti| {
+                    ti.kind == Kind::Pointer || ti.kind == Kind::Array || (ti.kind == Kind::Simple && matches!(ti.code, b'P' | b'z' | b'Z'))
+                });
                 if !ok {
                     raise!(TypeError, "'out' parameter {} must be a pointer type, not {}", i + 1, type_name(typ.as_ptr() as *mut PyTypeObject));
                 }
@@ -480,6 +490,7 @@ fn funcptr_from_dll(tp: *mut PyTypeObject, a: &[&PyObject]) -> PyResult {
     } else {
         raise!(TypeError, "function name must be string, bytes object or integer");
     };
+    validate_paramflags(tp, paramflags)?;
     unsafe {
         if capi::PySys_Audit(cs!("ctypes.dlsym"), cs!("OO"), dll.as_ptr(), name.as_ptr()) < 0 {
             return Err(PyErr);
@@ -497,7 +508,6 @@ fn funcptr_from_dll(tp: *mut PyTypeObject, a: &[&PyObject]) -> PyResult {
         }
         raise!(AttributeError, "{}", e);
     }
-    validate_paramflags(tp, paramflags)?;
     let o = new_funcptr_obj(tp)?;
     unsafe { *(cd(&o).b_ptr as *mut *mut c_void) = addr };
     if let Some(p) = paramflags {
@@ -788,6 +798,9 @@ fn funcptr_call_impl(o: &PyObject, args_tuple: *mut PyObject, args: &[&PyObject]
     if addr.is_null() {
         raise!(ValueError, "NULL pointer access");
     }
+    if args.len() > 1024 {
+        return Err(set_err(argument_error(), &format!("too many arguments ({}), maximum is 1024", args.len())));
+    }
     // callargs + output bookkeeping
     let (callargs, outmask, inoutmask, numretvals) = build_callargs(o, argtypes.as_deref(), paramflags.as_deref(), args_tuple, args, kw)?;
     let n = tuple::tuple_len(&callargs);
@@ -909,6 +922,10 @@ fn build_callargs(
                     Some(ti) => ti,
                     None => raise!(TypeError, "NULL stgdict unexpected"),
                 };
+                if tinfo.kind == Kind::Simple {
+                    raise!(TypeError, "{} 'out' parameter must be passed as default value", type_name(typ.as_ptr() as *mut PyTypeObject));
+                }
+                // an instance of the target type; the converter passes it by reference
                 let ob = if tinfo.kind == Kind::Array {
                     call(typ, &[])?
                 } else if let Some(p) = &tinfo.proto {
@@ -916,8 +933,6 @@ fn build_callargs(
                 } else {
                     raise!(TypeError, "'out' parameter {} must be a pointer type", i + 1);
                 };
-                let ob = if tinfo.kind == Kind::Array { ob } else { byref_impl(&ob, 0).map(|a| { let _ = &a; a })?.clone() };
-                // keep the created object (not the CArg) as the out value
                 outmask |= 1 << i;
                 numretvals += 1;
                 out.push(ob);

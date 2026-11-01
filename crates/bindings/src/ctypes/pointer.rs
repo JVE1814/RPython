@@ -244,7 +244,7 @@ fn subscript(o: &PyObject, key: &PyObject) -> PyResult {
                 let mut cur = start;
                 for _ in 0..len {
                     out.push(unsafe { *p.offset(cur) });
-                    cur += step;
+                    cur = cur.wrapping_add(step);
                 }
                 return Ok(bytes::new_bytes(&out));
             }
@@ -253,7 +253,7 @@ fn subscript(o: &PyObject, key: &PyObject) -> PyResult {
                 let mut cur = start;
                 for _ in 0..len {
                     out.push(unsafe { *(p as *const i32).offset(cur) });
-                    cur += step;
+                    cur = cur.wrapping_add(step);
                 }
                 return simple::wide_to_str(out.as_ptr(), out.len());
             }

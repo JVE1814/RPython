@@ -92,6 +92,7 @@ pub fn generic_new(tp: *mut PyTypeObject) -> PyResult {
     };
     let size = info.size;
     let length = info.length;
+    info.dict_flags |= DICTFLAG_FINAL;
     let obj = alloc_instance(tp)?;
     malloc_buffer(&obj, size)?;
     let c = cd(&obj);
@@ -411,14 +412,14 @@ fn cdata_setstate(o: &PyObject, args: &[&PyObject]) -> PyResult {
     let c = cd(o);
     let n = data.len().min(c.b_size.max(0) as usize);
     unsafe { std::ptr::copy(data.as_ptr(), c.b_ptr, n) };
-    if let Some(mydict) = rpy_runtime::types::typeobject::instance_dict(o) {
-        unsafe {
-            if capi::PyDict_Update(mydict.as_ptr(), args[0].as_ptr()) < 0 {
-                return Err(PyErr);
-            }
+    let mydict = getattr(o, "__dict__")?;
+    if !dict::is_dict(&mydict) {
+        raise!(TypeError, "{}.__dict__ must be a dictionary, not {}", tname(o), tname(&mydict));
+    }
+    unsafe {
+        if capi::PyDict_Update(mydict.as_ptr(), args[0].as_ptr()) < 0 {
+            return Err(PyErr);
         }
-    } else {
-        raise!(TypeError, "__dict__ must be a dictionary");
     }
     Ok(none())
 }
@@ -724,8 +725,18 @@ pub fn ct_from_param(cls: &PyObject, value: &PyObject) -> PyResult {
     }
     if funcptr::is_carg(value) {
         let a = funcptr::carg(value);
-        if !a.obj.is_null() && isinstance(r(a.obj), cls)? {
-            return Ok(value.to_ref());
+        if !a.obj.is_null() {
+            if isinstance(r(a.obj), cls)? {
+                return Ok(value.to_ref());
+            }
+            // byref(x) where a pointer to x's type is expected
+            if let Some(info) = stginfo_of_type(cls) {
+                if let Some(proto) = &info.proto {
+                    if info.kind == Kind::Pointer && isinstance(r(a.obj), proto)? {
+                        return Ok(value.to_ref());
+                    }
+                }
+            }
         }
     }
     if let Some(info) = stginfo_of_type(cls) {

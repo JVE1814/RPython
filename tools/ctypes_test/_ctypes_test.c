@@ -255,6 +255,45 @@ ARRAY_STRUCT(3C, 4)
 ARRAY_STRUCT(3D, 8)
 ARRAY_STRUCT(3E, 9)
 
+/* rectangles: four exported coordinates and functions mixing by-value and
+   by-reference structure arguments */
+
+EXPORT(long) left = 10;
+EXPORT(long) top = 20;
+EXPORT(long) right = 30;
+EXPORT(long) bottom = 40;
+
+typedef struct { long left, top, right, bottom; } RECT;
+typedef struct { long x, y; } POINT;
+
+static int same_rect(RECT a, RECT b)
+{
+    return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom;
+}
+
+EXPORT(int) PointInRect(RECT *prc, POINT pt)
+{
+    if (prc == NULL)
+        return 0;
+    return pt.x >= prc->left && pt.x <= prc->right && pt.y >= prc->top && pt.y <= prc->bottom;
+}
+
+EXPORT(RECT) ReturnRect(int i, RECT ar, RECT *br, POINT cp, RECT dr, RECT *er, POINT fp, RECT gr)
+{
+    RECT bad = {0, 0, 0, 0};
+    if (!same_rect(ar, *br) || !same_rect(ar, dr) || !same_rect(ar, *er) || !same_rect(ar, gr))
+        return bad;
+    if (cp.x != fp.x || cp.y != fp.y)
+        return bad;
+    switch (i) {
+    case 0: return ar;
+    case 1: return *br;
+    case 2: return dr;
+    case 3: return *er;
+    default: return gr;
+    }
+}
+
 /* unions and bit fields (the by-value variants are rejected by ctypes itself) */
 
 typedef struct { int an_int; int another_int; } Nested1;
@@ -384,6 +423,18 @@ EXPORT(int) unpack_bitfields_msvc(struct BITS_msvc *bits, char name)
 #endif
 
 /* ------------------------------------------------------------------ libc-like helpers */
+
+#include <stdarg.h>
+
+EXPORT(int) myprintf(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vprintf(fmt, ap);
+    va_end(ap);
+    fflush(stdout);
+    return n;
+}
 
 EXPORT(char *) my_strtok(char *token, const char *delim) { return strtok(token, delim); }
 

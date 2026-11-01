@@ -156,7 +156,8 @@ fn py_dlopen(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     let cname: Option<std::ffi::CString> = if is_none(name) {
         None
     } else {
-        let b = from_c(unsafe { capi::PyUnicode_EncodeFSDefault(rpy_runtime::modules::posix::path::fspath(name)?.as_ptr()) })?;
+        let p = rpy_runtime::modules::posix::path::fspath(name)?;
+        let b = if is_bytes(&p) { p } else { from_c(unsafe { capi::PyUnicode_EncodeFSDefault(p.as_ptr()) })? };
         Some(std::ffi::CString::new(bytes::bytes_data(&b).to_vec()).map_err(|_| err!(ValueError, "embedded null byte"))?)
     };
     unsafe {
@@ -310,11 +311,22 @@ unsafe extern "C" fn c_wstring_at(ptr: *const i32, size: isize) -> *mut PyObject
         let mut n = size;
         if n == -1 {
             n = 0;
-            while *ptr.offset(n) != 0 {
+            while std::ptr::read_unaligned(ptr.offset(n)) != 0 {
                 n += 1;
             }
         }
-        capi::PyUnicode_FromWideChar(ptr, n)
+        if n <= 0 {
+            return capi::PyUnicode_FromWideChar(std::ptr::NonNull::<i32>::dangling().as_ptr(), 0);
+        }
+        // the memory may be unaligned: copy it first
+        let mut buf: Vec<i32> = Vec::new();
+        if n as usize > (isize::MAX as usize) / 4 || buf.try_reserve_exact(n as usize).is_err() {
+            capi::PyErr_NoMemory();
+            return std::ptr::null_mut();
+        }
+        std::ptr::copy_nonoverlapping(ptr as *const u8, buf.as_mut_ptr() as *mut u8, n as usize * 4);
+        buf.set_len(n as usize);
+        capi::PyUnicode_FromWideChar(buf.as_ptr(), n)
     }
 }
 
@@ -351,28 +363,23 @@ fn cast_impl(ptr: *mut c_void, src: &PyObject, ctype: &PyObject) -> PyResult {
     let result = call(ctype, &[])?;
     // keep the source's objects alive in the result
     if is_cdata(src) {
-        let rc = cd(&result);
-        // result._objects = {id(src): src} merged with src's objects
-        let container = get_container(&result);
-        let cc = cdp(container);
-        let _ = rc;
-        let srcobjs = get_kept_objects(src);
+        // share the source's keep-alive dict and add the source itself to it
+        let root = cdp(get_container(src));
         unsafe {
-            if cc.b_objects.is_null() || !is_dict_exact(&*cc.b_objects) {
-                let old = cc.b_objects;
-                cc.b_objects = rpy_runtime::types::dict::new_dict().into_raw();
+            if root.b_objects.is_null() || is_none(&*root.b_objects) {
+                let old = root.b_objects;
+                root.b_objects = rpy_runtime::types::dict::new_dict().into_raw();
                 xdecref(old);
             }
-            let d = &*cc.b_objects;
-            if !is_none(&srcobjs) {
-                if is_dict_exact(&srcobjs) {
-                    if capi::PyDict_Update(d.as_ptr(), srcobjs.as_ptr()) < 0 {
-                        return Err(PyErr);
-                    }
-                }
+            let rc = cd(&result);
+            let old = rc.b_objects;
+            incref(root.b_objects);
+            rc.b_objects = root.b_objects;
+            xdecref(old);
+            if is_dict_exact(&*root.b_objects) {
+                let key = new_ptr_int(src.as_ptr() as usize);
+                rpy_runtime::types::dict::set_item(&*root.b_objects, &key, src)?;
             }
-            let key = new_int(src.as_ptr() as usize as i64);
-            rpy_runtime::types::dict::set_item(d, &key, src)?;
         }
     }
     unsafe { *(cd(&result).b_ptr as *mut *mut c_void) = ptr };

@@ -253,7 +253,7 @@ fn store_ld(ptr: *mut u8, swapped: bool, v: f64) {
 unsafe fn wcslen(p: *const i32) -> usize {
     let mut n = 0;
     unsafe {
-        while *p.add(n) != 0 {
+        while std::ptr::read_unaligned(p.add(n)) != 0 {
             n += 1;
         }
     }
@@ -261,6 +261,14 @@ unsafe fn wcslen(p: *const i32) -> usize {
 }
 
 pub fn wide_to_str(p: *const i32, n: usize) -> PyResult {
+    if n == 0 {
+        return Ok(new_str(""));
+    }
+    if (p as usize) % 4 != 0 {
+        let mut buf: Vec<i32> = vec![0; n];
+        unsafe { std::ptr::copy_nonoverlapping(p as *const u8, buf.as_mut_ptr() as *mut u8, n * 4) };
+        return from_c(unsafe { capi::PyUnicode_FromWideChar(buf.as_ptr(), n as isize) });
+    }
     from_c(unsafe { capi::PyUnicode_FromWideChar(p, n as isize) })
 }
 
@@ -474,7 +482,9 @@ pub fn set(code: u8, swapped: bool, ptr: *mut u8, value: &PyObject, size: isize,
             if !is_bytes(value) {
                 raise!(TypeError, "expected bytes, {} found", tname(value));
             }
-            let data = bytes::bytes_data(value);
+            let full = bytes::bytes_data(value);
+            // C string semantics: stop at the first NUL
+            let data = &full[..full.iter().position(|&b| b == 0).unwrap_or(full.len())];
             let n = size.max(0) as usize;
             if data.len() > n {
                 raise!(ValueError, "bytes too long ({}, maximum length {})", data.len(), n);
@@ -760,6 +770,8 @@ fn simple_meta_init_impl(cls: &PyObject) -> PyResult<()> {
                 rpy_runtime::types::dict::set_item(d, &new_str("from_param"), &descr)?;
                 capi::PyType_Modified(tp);
             }
+        }
+        if ob_type(cls.as_ptr()) == simple_meta() {
             // byte-order variants
             if !swapped && (swappable(code) || self_swapped(code)) {
                 let (native, other) = if cfg!(target_endian = "little") { ("__ctype_le__", "__ctype_be__") } else { ("__ctype_be__", "__ctype_le__") };
@@ -783,7 +795,7 @@ fn simple_meta_init_impl(cls: &PyObject) -> PyResult<()> {
 fn create_swapped_type(cls: &PyObject, code: u8) -> PyResult {
     let tp = cls.as_ptr() as *mut PyTypeObject;
     let name = new_str(&type_name(tp));
-    let bases = rpy_runtime::types::tuple::new_tuple(vec![rpy_runtime::types::typeobject::type_ref(simple_type())]);
+    let bases = unsafe { PyRef::from_borrowed((*tp).tp_bases) };
     let d = rpy_runtime::types::dict::new_dict();
     unsafe {
         let src = &*(*tp).tp_dict;
