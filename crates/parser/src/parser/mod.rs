@@ -642,19 +642,15 @@ impl<'a> Parser<'a> {
             if fast {
                 self.invalid = false;
             }
-            let r = self.statement();
+            let r = self.statement_into(&mut body);
             self.invalid = save;
-            match r? {
-                Some(mut s) => {
-                    if !self.invalid {
-                        self.top_ok.insert(m, self.p);
-                    }
-                    body.append(&mut s);
+            if r? {
+                if !self.invalid {
+                    self.top_ok.insert(m, self.p);
                 }
-                None => {
-                    self.p = m;
-                    break;
-                }
+            } else {
+                self.p = m;
+                break;
             }
         }
         if !self.at(TokenType::ENDMARKER) {
