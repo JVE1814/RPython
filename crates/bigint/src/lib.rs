@@ -364,6 +364,18 @@ impl core::ops::Shr<u64> for &BigInt {
         ops::rshift(self.as_ref(), n)
     }
 }
+impl core::ops::Shr<u64> for BigInt {
+    type Output = BigInt;
+    fn shr(self, n: u64) -> BigInt {
+        ops::rshift(self.as_ref(), n)
+    }
+}
+impl core::ops::Shl<u64> for BigInt {
+    type Output = BigInt;
+    fn shl(self, n: u64) -> BigInt {
+        ops::lshift(self.as_ref(), n).expect("shift too large")
+    }
+}
 impl core::ops::AddAssign<&BigInt> for BigInt {
     fn add_assign(&mut self, o: &BigInt) {
         if self.neg == o.neg {
