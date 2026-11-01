@@ -849,8 +849,7 @@ class BaseEventLoop(events.AbstractEventLoop):
             f"and file {file!r} combination")
 
     async def _sock_sendfile_fallback(self, sock, file, offset, count):
-        if offset:
-            file.seek(offset)
+        file.seek(offset)
         chunk = (min(count, constants.SENDFILE_FALLBACK_READBUFFER_SIZE)
                  if count else constants.SENDFILE_FALLBACK_READBUFFER_SIZE)
         buf = bytearray(chunk)
@@ -868,7 +867,7 @@ class BaseEventLoop(events.AbstractEventLoop):
                 sent += n
             return sent
         finally:
-            if sent > 0 and hasattr(file, 'seek'):
+            if hasattr(file, "seek"):
                 file.seek(offset + sent)
 
     def _check_sendfile_params(self, sock, file, offset, count):
@@ -918,8 +917,7 @@ class BaseEventLoop(events.AbstractEventLoop):
             "sendfile syscall is not supported")
 
     async def _sendfile_fallback(self, transp, file, offset, count):
-        if offset:
-            file.seek(offset)
+        file.seek(offset)
         chunk = min(count, 16384) if count else 16384
         buf = bytearray(chunk)
         sent = 0
@@ -937,7 +935,7 @@ class BaseEventLoop(events.AbstractEventLoop):
                 transp.write(view[:n])
                 sent += n
         finally:
-            if sent > 0 and hasattr(file, 'seek'):
+            if hasattr(file, "seek"):
                 file.seek(offset + sent)
             await proto.restore()
 
