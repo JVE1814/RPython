@@ -15,9 +15,11 @@ pub mod capi;
 pub mod ctypes;
 pub mod dl;
 pub mod sqlite;
+pub mod ssl;
 
 /// Register the binding modules as builtin modules (call before runtime initialisation).
 pub fn register() {
     rpy_runtime::import::register_builtin("_ctypes", ctypes::module::init);
     rpy_runtime::import::register_builtin("_sqlite3", sqlite::init);
+    rpy_runtime::import::register_builtin("_ssl", ssl::init);
 }
