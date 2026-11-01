@@ -273,4 +273,5 @@ pub fn register() {
     register_builtin("unicodedata", crate::modules::unicodedata::init_module);
     register_builtin("_string", crate::modules::_string::init_module);
     register_builtin("_tokenize", crate::modules::_tokenize::init_module);
+    register_builtin("_locale", crate::modules::_locale::init_module);
 }
