@@ -77,10 +77,11 @@ due to missing gc/pickle/copy/atexit/re/script_helper modules or the items below
   2000 GC allocations trigger a full collection (CPython counts allocations minus
   deallocations). Untracked atomic tuples hide most of it, but e.g. building many small
   lists is still slowed down.
-* str: `super().__hash__()` in a str subclass returns a different value than
-  `hash(str)`; `hash("key3")` evaluated inside a function differs from the same
-  literal hashed at module level (string constants with a different representation?).
-  Both break dict lookups (test_dict.test_update_shared_keys / test_str_nonstr).
+* slots: the generic `tp_hash` for a Python `__hash__` re-hashes the returned int with
+  the int hash (mod 2**61-1) even when it fits in Py_ssize_t (CPython uses the value
+  as is and only re-hashes on overflow): `class K: __hash__ = lambda s: hash("x")`
+  gives `hash(K()) != hash("x")`. Breaks dict lookups of str-equal keys
+  (test_dict.test_update_shared_keys / test_str_nonstr).
 * type_new: a `__slots__ = ("__doc__",)` member descriptor is shadowed by `__doc__ = None`
   in the class dict (test_property.test_property_with_slots_and_doc_slot_docstring_present).
 * `collections.UserDict.__or__/__ror__` should accept frozendict, and frozendict should
