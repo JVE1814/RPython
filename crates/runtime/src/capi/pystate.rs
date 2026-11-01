@@ -194,22 +194,10 @@ pub unsafe extern "C" fn PyThreadState_Next(ts: *mut c_void) -> *mut c_void {
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyThreadState_SetAsyncExc(id: std::ffi::c_ulong, exc: *mut PyObject) -> c_int {
-    unsafe {
-        let g = threads::ALL_THREADS.lock().unwrap();
-        let mut n = 0;
-        for &t in g.iter() {
-            let ts = &mut *(t as *mut ThreadState);
-            if ts.c.thread_id == id {
-                let old = std::mem::replace(&mut ts.c.async_exc, if exc.is_null() { std::ptr::null_mut() } else { (*exc).to_ref().into_raw() });
-                xdecref(old);
-                if !exc.is_null() {
-                    ts.c.eval_breaker.fetch_or(threads::EVAL_ASYNC_EXC, std::sync::atomic::Ordering::Release);
-                }
-                n += 1;
-            }
-        }
-        n
-    }
+    // the pending exception lives in ThreadState::async_exc, where the eval
+    // breaker looks for it
+    let exc = if exc.is_null() { None } else { Some(unsafe { &*exc }) };
+    crate::modules::thread::set_async_exc(id as u64, exc) as c_int
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyThreadState_EnterTracing(ts: *mut c_void) {

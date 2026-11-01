@@ -59,3 +59,120 @@ pub fn save_all(countable: &[*mut PyObject]) -> bool {
     }
     true
 }
+
+unsafe extern "C" fn collect_referent(op: *mut PyObject, arg: *mut std::ffi::c_void) -> std::ffi::c_int {
+    if !op.is_null() {
+        unsafe { (*(arg as *mut Vec<usize>)).push(op as usize) };
+    }
+    0
+}
+
+/// Order in which the finalizers of a set of garbage objects run: referrers
+/// before what they refer to, so that a wrapper (a text file over a buffered
+/// file over a raw file) is finalized while the objects it delegates to still
+/// work. Objects in one reference cycle keep their original order. Returns
+/// indices into `garbage`.
+pub fn finalization_order(garbage: &[PyRef]) -> Vec<usize> {
+    use std::collections::HashMap;
+    let n = garbage.len();
+    let index: HashMap<usize, usize> = garbage.iter().enumerate().map(|(i, g)| (g.as_ptr() as usize, i)).collect();
+    // adjacency lists restricted to the garbage set
+    let mut edges: Vec<Vec<usize>> = Vec::with_capacity(n);
+    let mut buf: Vec<usize> = Vec::new();
+    for g in garbage {
+        buf.clear();
+        unsafe {
+            if let Some(t) = (*g.type_ptr()).tp_traverse {
+                t(g.as_ptr(), Some(collect_referent), &mut buf as *mut Vec<usize> as *mut std::ffi::c_void);
+            }
+        }
+        edges.push(buf.iter().filter_map(|p| index.get(p).copied()).collect());
+    }
+    // Tarjan's strongly connected components, iteratively; components come out
+    // referents-first, so the result is reversed at the end
+    const UNSEEN: usize = usize::MAX;
+    let mut num = vec![UNSEEN; n];
+    let mut low = vec![0usize; n];
+    let mut on_stack = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut comps: Vec<Vec<usize>> = Vec::new();
+    let mut counter = 0usize;
+    let mut call: Vec<(usize, usize)> = Vec::new();
+    for root in 0..n {
+        if num[root] != UNSEEN {
+            continue;
+        }
+        call.push((root, 0));
+        num[root] = counter;
+        low[root] = counter;
+        counter += 1;
+        stack.push(root);
+        on_stack[root] = true;
+        while let Some(top) = call.len().checked_sub(1) {
+            let (v, next) = call[top];
+            if next < edges[v].len() {
+                let w = edges[v][next];
+                call[top].1 += 1;
+                if num[w] == UNSEEN {
+                    num[w] = counter;
+                    low[w] = counter;
+                    counter += 1;
+                    stack.push(w);
+                    on_stack[w] = true;
+                    call.push((w, 0));
+                } else if on_stack[w] {
+                    low[v] = low[v].min(num[w]);
+                }
+                continue;
+            }
+            call.pop();
+            if let Some(&(parent, _)) = call.last() {
+                low[parent] = low[parent].min(low[v]);
+            }
+            if low[v] == num[v] {
+                let mut comp = Vec::new();
+                while let Some(w) = stack.pop() {
+                    on_stack[w] = false;
+                    comp.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                comp.sort_unstable();
+                comps.push(comp);
+            }
+        }
+    }
+    comps.into_iter().rev().flatten().collect()
+}
+
+/// At shutdown, report what is left in gc.garbage (unless DEBUG_SAVEALL put it
+/// there on purpose): a ResourceWarning with the count, and with
+/// DEBUG_UNCOLLECTABLE also the list itself on stderr.
+pub fn dump_shutdown_stats() {
+    use crate::modules::gc_mod;
+    let flags = gc_mod::debug_flags();
+    if flags & gc_mod::DEBUG_SAVEALL != 0 {
+        return;
+    }
+    let garbage = gc_mod::garbage_list();
+    let n = crate::types::list::list_len(&garbage);
+    if n == 0 {
+        return;
+    }
+    let msg = if flags & gc_mod::DEBUG_UNCOLLECTABLE != 0 {
+        format!("gc: {} uncollectable objects at shutdown", n)
+    } else {
+        format!("gc: {} uncollectable objects at shutdown; use gc.set_debug(gc.DEBUG_UNCOLLECTABLE) to list them", n)
+    };
+    let cat = crate::types::exceptions::ResourceWarning();
+    if crate::modules::warnings::warn(cat, &msg, 1).is_err() {
+        crate::modules::sys_full::write_unraisable(None, None);
+    }
+    if flags & gc_mod::DEBUG_UNCOLLECTABLE != 0 {
+        match crate::abstract_::repr_string(&garbage) {
+            Ok(r) => crate::modules::sys::write_stderr(&format!("      gc.garbage: {}\n", r)),
+            Err(_) => crate::errors::clear_exc(),
+        }
+    }
+}

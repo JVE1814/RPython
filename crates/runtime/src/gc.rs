@@ -296,14 +296,71 @@ fn wait_for_release() {
 pub fn enter_vm(cell: &crate::threads::ModeCell, safe: crate::threads::ThreadMode) {
     use crate::threads::ThreadMode;
     let safe = if safe == ThreadMode::InVm { ThreadMode::Blocked } else { safe };
+    let me = cell as *const _ as usize;
     loop {
         cell.0.store(ThreadMode::InVm as u8, SeqCst);
-        if RELEASE.load(SeqCst) || STW_OWNER.load(SeqCst) == cell as *const _ as usize {
+        if STW_OWNER.load(SeqCst) == me {
             return;
+        }
+        if RELEASE.load(SeqCst) {
+            if !PARK_ALL.load(SeqCst) || FINALIZER.load(SeqCst) == me {
+                return;
+            }
+            cell.0.store(safe as u8, SeqCst);
+            park_forever();
         }
         cell.0.store(safe as u8, SeqCst);
         wait_for_release();
     }
+}
+
+// ---------------------------------------------------------------- finalization
+//
+// Once the interpreter starts finalizing, every thread other than the finalizing
+// one is stopped for good: it may stay blocked in native code, but as soon as it
+// tries to run Python code again (leaving a blocking call, reaching a safepoint)
+// it parks forever. The process exits around it.
+
+static PARK_ALL: AtomicBool = AtomicBool::new(false);
+static FINALIZER: AtomicUsize = AtomicUsize::new(0);
+
+#[cold]
+fn park_forever() -> ! {
+    loop {
+        std::thread::park();
+    }
+}
+
+/// Have all other threads been stopped for good (interpreter finalization)?
+#[inline]
+pub fn others_parked() -> bool {
+    PARK_ALL.load(Relaxed)
+}
+
+/// Is the calling thread the one finalizing the interpreter?
+pub fn is_finalizer_thread() -> bool {
+    let p = crate::threads::current_ptr();
+    !p.is_null() && FINALIZER.load(Relaxed) == unsafe { &(*p).mode as *const _ as usize }
+}
+
+/// Stop every other thread permanently (each parks at its next transition into
+/// the VM). Called by the finalizing thread; returns once no other thread runs
+/// Python code.
+pub fn park_other_threads() {
+    let me = crate::threads::current_mut();
+    // a collection running on another thread finishes first
+    crate::threads::blocking(|| {
+        while COLLECTING.swap(true, AcqRel) {
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+    });
+    while !stop_the_world(me) {
+        std::thread::yield_now();
+    }
+    FINALIZER.store(unsafe { &(*me).mode as *const _ as usize }, SeqCst);
+    PARK_ALL.store(true, SeqCst);
+    start_the_world();
+    COLLECTING.store(false, Release);
 }
 
 /// Is a stop-the-world operation in progress?
@@ -315,7 +372,7 @@ pub fn world_stopped() -> bool {
 /// Called by threads at safepoints (backedges, function entry via the eval breaker).
 pub fn safepoint_poll(ts: &ThreadState) {
     ts.c.eval_breaker.fetch_and(!crate::threads::EVAL_SAFEPOINT, AcqRel);
-    if RELEASE.load(SeqCst) || STW_OWNER.load(SeqCst) == &ts.mode as *const _ as usize {
+    if (RELEASE.load(SeqCst) && !PARK_ALL.load(SeqCst)) || STW_OWNER.load(SeqCst) == &ts.mode as *const _ as usize {
         return;
     }
     if ts.mode.get() != crate::threads::ThreadMode::InVm {
@@ -635,7 +692,8 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
             start_the_world();
             // ---- phase 2 (running): callbacks and finalizers
             early.finish();
-            for g in &garbage {
+            for i in crate::gc_support::finalization_order(&garbage) {
+                let g = &garbage[i];
                 let op = g.as_ptr();
                 let tp = (*op).type_ptr();
                 if (*tp).tp_finalize.is_some() && !is_finalized(op) {

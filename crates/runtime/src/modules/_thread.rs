@@ -79,6 +79,10 @@ impl RawLock {
         if timeout == Some(Duration::ZERO) {
             return Ok(AcquireResult::TimedOut);
         }
+        if crate::gc::others_parked() {
+            // every other thread is stopped for good: nobody can release it
+            raise!(PythonFinalizationError, "cannot acquire lock at interpreter finalization");
+        }
         let deadline = timeout.map(|t| Instant::now().checked_add(t).unwrap_or_else(|| Instant::now() + Duration::from_secs(1 << 40)));
         let main = crate::threads::is_main_thread();
         let ts = crate::threads::current();
@@ -545,6 +549,10 @@ fn handle_join(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRes
     if h.ident.load(Relaxed) == my_ident() {
         raise!(RuntimeError, "Cannot join current thread");
     }
+    if crate::gc::others_parked() {
+        // the thread is stopped for good and will never finish
+        raise!(PythonFinalizationError, "cannot join thread at interpreter shutdown");
+    }
     let fgen = h.generation.load(Relaxed);
     wait_interruptible(
         &h.state,
@@ -577,6 +585,9 @@ fn spawn_thread(func: PyRef, args: PyRef, kwargs: Option<PyRef>, handle: Arc<Han
         let mut st = handle.state.lock().unwrap();
         if *st != HState::NotStarted {
             raise!(RuntimeError, "thread already started");
+        }
+        if crate::modules::sys_full::is_finalizing() {
+            raise!(PythonFinalizationError, "can't create new thread at interpreter shutdown");
         }
         *st = HState::Starting;
     }

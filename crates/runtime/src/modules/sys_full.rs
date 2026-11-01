@@ -1242,7 +1242,7 @@ pub fn import_site() -> PyResult<()> {
     Ok(())
 }
 
-fn call_module_func(module: &str, func: &str) {
+pub(crate) fn call_module_func(module: &str, func: &str) {
     if let Some(m) = crate::import::get_loaded_module(module) {
         let r = ab::getattr_str(&m, func).and_then(|f| ab::call(&f, &[]));
         if r.is_err() {
@@ -1256,7 +1256,7 @@ fn call_module_func(module: &str, func: &str) {
 }
 
 /// Flush a standard stream; returns false on failure (exception reported).
-fn flush_std(name: &str) -> bool {
+pub(crate) fn flush_std(name: &str) -> bool {
     if let Some(s) = crate::modules::sys::get_sys_attr(name) {
         if !s.is(none::none()) {
             if ab::call_method_str(&s, "flush", &[]).is_err() {
@@ -1270,12 +1270,7 @@ fn flush_std(name: &str) -> bool {
 
 /// Interpreter shutdown. Returns false if flushing sys.stdout failed (exit status 120).
 pub fn finalize() -> bool {
-    call_module_func("threading", "_shutdown");
-    call_module_func("atexit", "_run_exitfuncs");
-    FINALIZING.store(true, Release);
-    let ok = flush_std("stdout");
-    flush_std("stderr");
-    ok
+    crate::modules::sys_finalize::finalize()
 }
 
 pub fn populate(d: &PyObject) -> PyResult<()> {

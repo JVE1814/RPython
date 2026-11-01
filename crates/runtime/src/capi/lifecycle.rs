@@ -39,17 +39,21 @@ pub unsafe extern "C" fn Py_PreInitializeFromBytesArgs(_c: *const c_void, _argc:
 pub unsafe extern "C" fn Py_PreInitializeFromArgs(_c: *const c_void, _argc: Py_ssize_t, _argv: *mut *mut libc::wchar_t) -> PyStatus {
     PyStatus_Ok()
 }
-static FINALIZING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static ATEXIT: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 static UNSTABLE_ATEXIT: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
-pub fn run_c_atexit() {
+/// Interpreter-level C callbacks (PyUnstable_AtExit): run right after the
+/// Python atexit callbacks.
+pub fn run_interp_atexit() {
     super::pystate::run_interp_atexit(super::pystate::interp_ptr());
     let v: Vec<(usize, usize)> = std::mem::take(&mut *UNSTABLE_ATEXIT.lock().unwrap());
     for (f, d) in v.into_iter().rev() {
         let f: unsafe extern "C" fn(*mut c_void) = unsafe { std::mem::transmute(f) };
         unsafe { f(d as *mut c_void) };
     }
+}
+/// Process-level C callbacks (Py_AtExit): the very last step of finalization.
+pub fn run_process_atexit() {
     let v: Vec<usize> = std::mem::take(&mut *ATEXIT.lock().unwrap());
     for f in v.into_iter().rev() {
         let f: unsafe extern "C" fn() = unsafe { std::mem::transmute(f) };
@@ -58,13 +62,7 @@ pub fn run_c_atexit() {
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Py_FinalizeEx() -> c_int {
-    FINALIZING.store(true, std::sync::atomic::Ordering::Relaxed);
-    if let Ok(m) = crate::import::import_absolute("atexit") {
-        let _ = ab::call_method_str(&m, "_run_exitfuncs", &[]);
-    }
-    clear_exc();
-    run_c_atexit();
-    0
+    if crate::modules::sys_finalize::finalize() { 0 } else { -1 }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Py_Finalize() {
@@ -74,7 +72,7 @@ pub unsafe extern "C" fn Py_Finalize() {
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Py_IsFinalizing() -> c_int {
-    FINALIZING.load(std::sync::atomic::Ordering::Relaxed) as c_int
+    crate::modules::sys_full::is_finalizing() as c_int
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Py_Exit(code: c_int) -> ! {
