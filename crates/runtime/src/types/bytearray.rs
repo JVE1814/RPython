@@ -601,7 +601,7 @@ fn ass_subscript_impl(o: &PyObject, k: &PyObject, v: Option<&PyObject>) -> PyRes
             for (i, &c) in d.iter().enumerate() {
                 if deleted < slicelen as usize && i == next_del {
                     deleted += 1;
-                    next_del += st as usize;
+                    next_del = next_del.saturating_add(st as usize);
                     continue;
                 }
                 out.push(c);
@@ -629,7 +629,7 @@ fn ass_subscript_impl(o: &PyObject, k: &PyObject, v: Option<&PyObject>) -> PyRes
             let mut i = start;
             for &c in &vals {
                 d[i as usize] = c;
-                i += step;
+                i = i.wrapping_add(step);
             }
             Ok(())
         }

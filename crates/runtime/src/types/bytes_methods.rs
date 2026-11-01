@@ -1972,7 +1972,7 @@ pub fn slice_bytes(d: &[u8], start: isize, step: isize, len: isize) -> Vec<u8> {
     let mut i = start;
     for _ in 0..len {
         v.push(d[i as usize]);
-        i += step;
+        i = i.wrapping_add(step);
     }
     v
 }

@@ -194,7 +194,7 @@ unsafe extern "C" fn str_subscript(a: *mut PyObject, k: *mut PyObject) -> *mut P
                 let mut i = start;
                 for _ in 0..len {
                     v.push(d.get(i as usize));
-                    i += step;
+                    i = i.wrapping_add(step);
                 }
                 Ok(str::from_codepoints(&v))
             })());
@@ -564,7 +564,7 @@ fn seq_subscript(items: &[&PyObject], k: &PyObject, what: &str) -> PyResult<SeqI
         let mut i = start;
         for _ in 0..len {
             v.push(items[i as usize].to_ref());
-            i += step;
+            i = i.wrapping_add(step);
         }
         return Ok(SeqIdx::Slice(v));
     }
@@ -853,7 +853,7 @@ unsafe extern "C" fn list_ass_subscript(o: *mut PyObject, k: *mut PyObject, v: *
                 let mut i = start;
                 for _ in 0..len {
                     idxs.push(i as usize);
-                    i += step;
+                    i = i.wrapping_add(step);
                 }
                 if v.is_null() {
                     idxs.sort_unstable();
