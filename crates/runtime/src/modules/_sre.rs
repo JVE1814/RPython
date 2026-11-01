@@ -1425,18 +1425,18 @@ fn init_types() -> PyResult<()> {
         t.tp_weaklistoffset = std::mem::offset_of!(PatternObj, weakreflist) as isize;
         t.tp_doc = c"Compiled regular expression object.".as_ptr();
         t.tp_methods = crate::mdefs![
-            ("match", FASTKW, pattern_match, "Matches zero or more characters at the beginning of the string."),
-            ("prefixmatch", FASTKW, pattern_prefixmatch, "Matches zero or more characters at the beginning of the string."),
-            ("fullmatch", FASTKW, pattern_fullmatch, "Matches against all of the string."),
-            ("search", FASTKW, pattern_search, "Scan through string looking for a match, and return a corresponding match object instance.\n\nReturn None if no position in the string matches."),
-            ("sub", FASTKW, pattern_sub, "Return the string obtained by replacing the leftmost non-overlapping occurrences of pattern in string by the replacement repl."),
-            ("subn", FASTKW, pattern_subn, "Return the tuple (new_string, number_of_subs_made) found by replacing the leftmost non-overlapping occurrences of pattern with the replacement repl."),
-            ("findall", FASTKW, pattern_findall, "Return a list of all non-overlapping matches of pattern in string."),
-            ("split", FASTKW, pattern_split, "Split string by the occurrences of pattern."),
-            ("finditer", FASTKW, pattern_finditer, "Return an iterator over all non-overlapping matches for the RE pattern in string.\n\nFor each match, the iterator returns a match object."),
-            ("scanner", FASTKW, pattern_scanner),
+            ("match", FASTKW, pattern_match, "Same as prefixmatch(): match at the start of the string."),
+            ("prefixmatch", FASTKW, pattern_prefixmatch, "prefixmatch($self, /, string, pos=0, endpos=sys.maxsize)\n--\n\nTry to match the pattern at the start of string[pos:endpos]; return a Match or None."),
+            ("fullmatch", FASTKW, pattern_fullmatch, "fullmatch($self, /, string, pos=0, endpos=sys.maxsize)\n--\n\nMatch only if the pattern covers the whole of string[pos:endpos]."),
+            ("search", FASTKW, pattern_search, "search($self, /, string, pos=0, endpos=sys.maxsize)\n--\n\nReturn a Match for the first place the pattern matches, or None."),
+            ("sub", FASTKW, pattern_sub, "sub($self, /, repl, string, count=0)\n--\n\nReturn string with up to count (0: all) non-overlapping matches replaced by repl.\n\nrepl is a string (backslash escapes are processed) or a callable that\nreceives the Match and returns the replacement."),
+            ("subn", FASTKW, pattern_subn, "subn($self, /, repl, string, count=0)\n--\n\nLike sub(), but return (new_string, number_of_substitutions)."),
+            ("findall", FASTKW, pattern_findall, "findall($self, /, string, pos=0, endpos=sys.maxsize)\n--\n\nReturn a list of all non-overlapping matches (or of their groups)."),
+            ("split", FASTKW, pattern_split, "split($self, /, string, maxsplit=0)\n--\n\nSplit string at the matches; captured groups are kept in the result."),
+            ("finditer", FASTKW, pattern_finditer, "finditer($self, /, string, pos=0, endpos=sys.maxsize)\n--\n\nReturn an iterator yielding a Match for each non-overlapping match."),
+            ("scanner", FASTKW, pattern_scanner, "scanner($self, /, string, pos=0, endpos=sys.maxsize)\n--\n\n"),
             ("__copy__", NOARGS, pattern_copy),
-            ("__deepcopy__", O, pattern_deepcopy),
+            ("__deepcopy__", O, pattern_deepcopy, "__deepcopy__($self, memo, /)\n--\n\n"),
             ("__class_getitem__", O, class_getitem, "See PEP 585"; METH_CLASS),
         ];
         t.tp_getset = crate::getset_table![
@@ -1459,14 +1459,14 @@ fn init_types() -> PyResult<()> {
         t.tp_doc = c"The result of re.match() and re.search().\nMatch objects always have a boolean value of True.".as_ptr();
         t.tp_methods = crate::mdefs![
             ("group", FAST, match_group, "group([group1, ...]) -> str or tuple.\n    Return subgroup(s) of the match by indices or names.\n    For 0 returns the entire match."),
-            ("start", FAST, match_start, "Return index of the start of the substring matched by group."),
-            ("end", FAST, match_end, "Return index of the end of the substring matched by group."),
-            ("span", FAST, match_span, "For match object m, return the 2-tuple (m.start(group), m.end(group))."),
-            ("groups", FASTKW, match_groups, "Return a tuple containing all the subgroups of the match, from 1."),
-            ("groupdict", FASTKW, match_groupdict, "Return a dictionary containing all the named subgroups of the match, keyed by the subgroup name."),
-            ("expand", O, match_expand, "Return the string obtained by doing backslash substitution on the string template, as done by the sub() method."),
+            ("start", FAST, match_start, "start($self, group=0, /)\n--\n\nReturn the start index of the text matched by group (-1 if it did not take part)."),
+            ("end", FAST, match_end, "end($self, group=0, /)\n--\n\nReturn the end index of the text matched by group (-1 if it did not take part)."),
+            ("span", FAST, match_span, "span($self, group=0, /)\n--\n\nReturn (start(group), end(group))."),
+            ("groups", FASTKW, match_groups, "groups($self, /, default=None)\n--\n\nReturn a tuple of all groups from 1 on; default stands in for unmatched groups."),
+            ("groupdict", FASTKW, match_groupdict, "groupdict($self, /, default=None)\n--\n\nReturn a dict mapping group names to the matched text (default if unmatched)."),
+            ("expand", O, match_expand, "expand($self, template, /)\n--\n\nSubstitute the match into template, as sub() does with its repl string."),
             ("__copy__", NOARGS, match_copy),
-            ("__deepcopy__", O, match_deepcopy),
+            ("__deepcopy__", O, match_deepcopy, "__deepcopy__($self, memo, /)\n--\n\n"),
             ("__class_getitem__", O, class_getitem, "See PEP 585"; METH_CLASS),
         ];
         t.tp_getset = crate::getset_table![
@@ -1509,13 +1509,13 @@ pub fn init_module() -> PyResult {
     crate::builtins::add_methods_to_dict(
         &d,
         crate::mdefs![
-            ("compile", FASTKW, sre_compile),
-            ("template", FAST, sre_template, "template(pattern, template)\n\ntemplate\n  A list containing interleaved literal strings (str or bytes) and group\n  indices (int), as returned by re._parser.parse_template():\n      [literal1, group1, literal2, ..., literalN]."),
+            ("compile", FASTKW, sre_compile, "compile($module, /, pattern, flags, code, groupindex, indexgroup)\n--\n\n"),
+            ("template", FAST, sre_template, "template($module, pattern, template, /)\n--\n\nBuild a compiled replacement template.\n\ntemplate is a list alternating literal strings and group indices."),
             ("getcodesize", NOARGS, sre_getcodesize),
-            ("ascii_iscased", O, sre_ascii_iscased),
-            ("unicode_iscased", O, sre_unicode_iscased),
-            ("ascii_tolower", O, sre_ascii_tolower),
-            ("unicode_tolower", O, sre_unicode_tolower),
+            ("ascii_iscased", O, sre_ascii_iscased, "ascii_iscased($module, character, /)\n--\n\n"),
+            ("unicode_iscased", O, sre_unicode_iscased, "unicode_iscased($module, character, /)\n--\n\n"),
+            ("ascii_tolower", O, sre_ascii_tolower, "ascii_tolower($module, character, /)\n--\n\n"),
+            ("unicode_tolower", O, sre_unicode_tolower, "unicode_tolower($module, character, /)\n--\n\n"),
         ],
         Some(&m),
     )?;

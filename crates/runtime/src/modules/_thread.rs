@@ -1186,16 +1186,16 @@ fn init_types() -> PyResult<()> {
         t.tp_dealloc = Some(lock_dealloc);
         t.tp_repr = Some(lock_repr);
         t.tp_getattro = Some(crate::types::typeobject::object_generic_getattro);
-        t.tp_doc = c"A lock object is a synchronization primitive.".as_ptr();
+        t.tp_doc = c"lock()\n--\n\nA primitive mutual-exclusion lock, initially unlocked.".as_ptr();
         t.tp_methods = crate::mdefs![
-            ("acquire", FASTKW, lock_acquire),
-            ("acquire_lock", FASTKW, lock_acquire),
+            ("acquire", FASTKW, lock_acquire, "acquire($self, /, blocking=True, timeout=-1)\n--\n\nAcquire the lock, waiting up to timeout seconds (-1: forever) if blocking.\n\nReturn True if the lock was acquired."),
+            ("acquire_lock", FASTKW, lock_acquire, "acquire_lock($self, /, blocking=True, timeout=-1)\n--\n\nDeprecated alias of acquire()."),
             ("release", NOARGS, lock_release),
             ("release_lock", NOARGS, lock_release),
             ("locked", NOARGS, lock_locked),
             ("locked_lock", NOARGS, lock_locked),
             ("__enter__", NOARGS, lock_enter),
-            ("__exit__", FAST, lock_exit),
+            ("__exit__", FAST, lock_exit, "__exit__($self, /, *exc_info)\n--\n\nRelease the lock when leaving a with block."),
             ("_at_fork_reinit", NOARGS, lock_at_fork_reinit),
         ];
         crate::types::typeobject::type_ready(&raw mut LOCK_TYPE)?;
@@ -1211,11 +1211,11 @@ fn init_types() -> PyResult<()> {
         t.tp_repr = Some(rlock_repr);
         t.tp_getattro = Some(crate::types::typeobject::object_generic_getattro);
         t.tp_methods = crate::mdefs![
-            ("acquire", FASTKW, rlock_acquire),
+            ("acquire", FASTKW, rlock_acquire, "acquire($self, /, blocking=True, timeout=-1)\n--\n\nAcquire the lock; the owning thread may acquire it again.\n\nReturn True if the lock was acquired."),
             ("release", NOARGS, rlock_release),
             ("locked", NOARGS, rlock_locked),
             ("__enter__", NOARGS, rlock_enter),
-            ("__exit__", FAST, rlock_exit),
+            ("__exit__", FAST, rlock_exit, "__exit__($self, /, *exc_info)\n--\n\nRelease the lock once when leaving a with block."),
             ("_is_owned", NOARGS, rlock_is_owned),
             ("_recursion_count", NOARGS, rlock_recursion_count),
             ("_release_save", NOARGS, rlock_release_save),
@@ -1234,7 +1234,7 @@ fn init_types() -> PyResult<()> {
         t.tp_repr = Some(handle_repr);
         t.tp_getattro = Some(crate::types::typeobject::object_generic_getattro);
         t.tp_methods = crate::mdefs![
-            ("join", FASTKW, handle_join),
+            ("join", FASTKW, handle_join, "join($self, /, timeout=None)\n--\n\nWait for the thread to finish."),
             ("is_done", NOARGS, handle_is_done),
             ("_set_done", NOARGS, handle_set_done),
         ];
@@ -1253,7 +1253,7 @@ fn init_types() -> PyResult<()> {
         t.tp_clear = Some(local_clear);
         t.tp_getattro = Some(local_getattro);
         t.tp_setattro = Some(local_setattro);
-        t.tp_doc = c"Thread-local data".as_ptr();
+        t.tp_doc = c"_local()\n--\n\nAn object whose attributes are separate for every thread.".as_ptr();
         crate::types::typeobject::type_ready(&raw mut LOCAL_TYPE)?;
 
         let eh = crate::modules::sys_structseq::make_type(
@@ -1275,9 +1275,9 @@ pub fn init_module() -> PyResult {
     crate::builtins::add_methods_to_dict(
         &d,
         crate::mdefs![
-            ("start_new_thread", FAST, start_new_thread),
-            ("start_new", FAST, start_new_thread),
-            ("start_joinable_thread", FASTKW, start_joinable_thread),
+            ("start_new_thread", FAST, start_new_thread, "start_new_thread($module, function, args, kwargs=None, /)\n--\n\nStart a thread running function(*args, **kwargs); return its identifier."),
+            ("start_new", FAST, start_new_thread, "start_new($module, function, args, kwargs=None, /)\n--\n\nDeprecated alias of start_new_thread()."),
+            ("start_joinable_thread", FASTKW, start_joinable_thread, "start_joinable_thread($module, /, function, handle=None, daemon=True)\n--\n\nStart a thread running function() and return a handle that can be joined."),
             ("allocate_lock", NOARGS, allocate_lock),
             ("allocate", NOARGS, allocate_lock),
             ("get_ident", NOARGS, get_ident),
@@ -1285,15 +1285,15 @@ pub fn init_module() -> PyResult {
             ("_count", NOARGS, thread_count),
             ("exit", NOARGS, thread_exit_fn),
             ("exit_thread", NOARGS, thread_exit_fn),
-            ("stack_size", FAST, stack_size),
-            ("interrupt_main", FASTKW, interrupt_main),
+            ("stack_size", FAST, stack_size, "stack_size($module, size=0, /)\n--\n\nReturn the stack size for new threads, setting a new one when size is given."),
+            ("interrupt_main", FASTKW, interrupt_main, "interrupt_main($module, /, signum=2)\n--\n\nSimulate the arrival of a signal (SIGINT by default) in the main thread."),
             ("daemon_threads_allowed", NOARGS, daemon_threads_allowed),
             ("_shutdown", NOARGS, thread_shutdown),
             ("_make_thread_handle", O, make_thread_handle),
             ("_get_main_thread_ident", NOARGS, get_main_thread_ident),
             ("_is_main_interpreter", NOARGS, is_main_interpreter),
             ("_excepthook", O, thread_excepthook),
-            ("set_name", FASTKW, set_name),
+            ("set_name", FASTKW, set_name, "set_name($module, /, name)\n--\n\nGive the current thread a name at the operating system level."),
             ("_get_name", NOARGS, get_name),
         ],
         Some(&m),

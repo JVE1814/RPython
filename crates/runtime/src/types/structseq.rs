@@ -374,7 +374,7 @@ pub fn init_type(tp: *mut PyTypeObject, desc: &Desc) -> PyResult<()> {
         t.tp_getattro = Some(object_generic_getattro);
         t.tp_methods = crate::mdefs![
             ("__reduce__", NOARGS, structseq_reduce),
-            ("__replace__", FASTKW, structseq_replace),
+            ("__replace__", FASTKW, structseq_replace, "__replace__($self, /, **changes)\n--\n\nReturn a copy with the named fields replaced."),
         ];
         let mut members = Vec::new();
         for (i, f) in desc.fields.iter().enumerate() {

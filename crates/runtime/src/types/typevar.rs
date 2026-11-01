@@ -892,7 +892,7 @@ pub fn init_types() {
         ]);
         t.tp_methods = crate::mdefs![
             ("__typing_subst__", O, typevar_subst),
-            ("__typing_prepare_subst__", FAST, typevar_prepare_subst),
+            ("__typing_prepare_subst__", FAST, typevar_prepare_subst, "__typing_prepare_subst__($self, alias, args, /)\n--\n\n"),
             ("__reduce__", NOARGS, param_reduce),
             ("__mro_entries__", O, no_mro_entries),
             ("has_default", NOARGS, has_default),
@@ -912,7 +912,7 @@ pub fn init_types() {
         ]);
         t.tp_methods = crate::mdefs![
             ("__typing_subst__", O, paramspec_subst),
-            ("__typing_prepare_subst__", FAST, paramspec_prepare_subst),
+            ("__typing_prepare_subst__", FAST, paramspec_prepare_subst, "__typing_prepare_subst__($self, alias, args, /)\n--\n\n"),
             ("__reduce__", NOARGS, param_reduce),
             ("__mro_entries__", O, no_mro_entries),
             ("has_default", NOARGS, has_default),
@@ -927,7 +927,7 @@ pub fn init_types() {
         ]);
         t.tp_methods = crate::mdefs![
             ("__typing_subst__", O, typevartuple_subst),
-            ("__typing_prepare_subst__", FAST, typevartuple_prepare_subst),
+            ("__typing_prepare_subst__", FAST, typevartuple_prepare_subst, "__typing_prepare_subst__($self, alias, args, /)\n--\n\n"),
             ("__reduce__", NOARGS, param_reduce),
             ("__mro_entries__", O, no_mro_entries),
             ("has_default", NOARGS, has_default),
@@ -977,7 +977,7 @@ pub fn init_types() {
         t.tp_name = c"typing.Generic".as_ptr();
         t.tp_basicsize = std::mem::size_of::<PyObject>() as isize;
         t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE;
-        t.tp_doc = c"Abstract base class for generic types.\n\nOn Python 3.12 and newer, generic classes implicitly inherit from\nGeneric when they declare a parameter list after the class's name::\n\n    class Mapping[KT, VT]:\n        def __getitem__(self, key: KT) -> VT:\n            ...\n        # Etc.\n\nOn older versions of Python, however, generic classes have to\nexplicitly inherit from Generic.\n\nAfter a class has been declared to be generic, it can then be used as\nfollows::\n\n    def lookup_name[KT, VT](mapping: Mapping[KT, VT], key: KT, default: VT) -> VT:\n        try:\n            return mapping[key]\n        except KeyError:\n            return default".as_ptr();
+        t.tp_doc = c"Generic()\n--\n\nAbstract base class for generic types.\n\nOn Python 3.12 and newer, generic classes implicitly inherit from\nGeneric when they declare a parameter list after the class's name::\n\n    class Mapping[KT, VT]:\n        def __getitem__(self, key: KT) -> VT:\n            ...\n        # Etc.\n\nOn older versions of Python, however, generic classes have to\nexplicitly inherit from Generic.\n\nAfter a class has been declared to be generic, it can then be used as\nfollows::\n\n    def lookup_name[KT, VT](mapping: Mapping[KT, VT], key: KT, default: VT) -> VT:\n        try:\n            return mapping[key]\n        except KeyError:\n            return default".as_ptr();
         t.tp_getattro = Some(object_generic_getattro);
         t.tp_setattro = Some(object_generic_setattro);
         t.tp_new = Some(crate::types::object_type::generic_new);

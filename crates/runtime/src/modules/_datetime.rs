@@ -612,6 +612,31 @@ fn build_namespace() -> PyResult<()> {
     for (name, tp) in pairs {
         dict::set_item_str(&ns, name, &type_ref(tp))?;
     }
+    // The copied pure methods whose defaults mean "keep the current value"
+    // advertise that through a text signature inspect cannot evaluate, as the
+    // C implementation does.
+    for (tp, meth, sig) in [
+        (date_type(), "replace", "($self, /, year=unchanged, month=unchanged, day=unchanged)"),
+        (
+            time_type(),
+            "replace",
+            "($self, /, hour=unchanged, minute=unchanged, second=unchanged,\n        microsecond=unchanged, tzinfo=unchanged, *, fold=unchanged)",
+        ),
+        (
+            datetime_type(),
+            "replace",
+            "($self, /, year=unchanged, month=unchanged, day=unchanged,\n        hour=unchanged, minute=unchanged, second=unchanged,\n        microsecond=unchanged, tzinfo=unchanged, *, fold=unchanged)",
+        ),
+        (datetime_type(), "combine", "($type, /, date, time, tzinfo=<unrepresentable>)"),
+    ] {
+        if let Some(f) = dict::get_item_rs(type_dict(tp), meth) {
+            let f = match ab::getattr_opt(&f, crate::name!("__func__"))? {
+                Some(inner) => inner,
+                None => f,
+            };
+            ab::setattr(&f, &pystr::new_str("__text_signature__"), &pystr::new_str(sig))?;
+        }
+    }
     crate::builtins::add_methods_to_dict(
         &ns,
         mdefs![("_set_class_attr", FAST, m_set_class_attr, "Store a class attribute on a datetime type.")],
@@ -859,13 +884,19 @@ fn init_types() -> PyResult<()> {
         (*date_type()).tp_methods = mdefs![
             ("isocalendar", NOARGS, m_isocalendar, "isocalendar($self, /)\n--\n\nThe ISO 8601 (year, week, weekday) of this date as a named tuple."),
         ];
+        (*timezone_type()).tp_doc = c"timezone(offset, name=<unrepresentable>)\n--\n\nA tzinfo with a fixed offset from UTC.".as_ptr();
+        (*delta_type()).tp_doc = c"timedelta(days=0, seconds=0, microseconds=0, milliseconds=0, minutes=0, hours=0, weeks=0)\n--\n\nA duration: the difference between two dates or datetimes.".as_ptr();
+        (*date_type()).tp_doc = c"date(year, month, day)\n--\n\nA calendar date in the proleptic Gregorian calendar.".as_ptr();
+        (*time_type()).tp_doc = c"time(hour=0, minute=0, second=0, microsecond=0, tzinfo=None, *, fold=0)\n--\n\nA time of day, optionally aware of a time zone.".as_ptr();
+        (*datetime_type()).tp_doc = c"datetime(year, month, day, hour=0, minute=0, second=0, microsecond=0, tzinfo=None, *, fold=0)\n--\n\nA date together with a time of day.".as_ptr();
+        // tzinfo gets a __new__ of its own (no signature, like CPython's).
         setup_type(
             tzinfo_type(),
             c"datetime.tzinfo",
             std::mem::size_of::<PyObject>(),
             std::ptr::null_mut(),
             true,
-            Some(crate::types::object_type::object_new),
+            Some(crate::types::object_type::generic_new),
             plain_dealloc,
             std::ptr::null_mut(),
         )?;

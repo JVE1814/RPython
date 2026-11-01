@@ -873,7 +873,7 @@ static mut TP_NEW_DEF: PyMethodDef = PyMethodDef {
     ml_name: c"__new__".as_ptr(),
     ml_meth: std::ptr::null(),
     ml_flags: METH_VARARGS | METH_KEYWORDS,
-    ml_doc: c"Create and return a new object.  See help(type) for accurate signature.".as_ptr(),
+    ml_doc: c"__new__($type, *args, **kwargs)\n--\n\nCreate a new instance of the type (help(type) shows its real parameters).".as_ptr(),
 };
 
 unsafe extern "C" fn tp_new_wrapper(slf: *mut PyObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {

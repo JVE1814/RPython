@@ -780,9 +780,9 @@ pub fn get_anext_awaitable(aiter: &PyObject) -> PyResult {
 pub fn init_types() {
     unsafe {
         let gen_methods = crate::mdefs![
-            ("send", O, gen_send),
+            ("send", O, gen_send, "send($self, value, /)\n--\n\nResume the generator, making the current yield expression return value."),
             ("throw", FAST, gen_throw),
-            ("close", NOARGS, gen_close_m),
+            ("close", NOARGS, gen_close_m, "close($self, /)\n--\n\nRaise GeneratorExit inside the generator to make it finish."),
             ("__sizeof__", NOARGS, gen_sizeof),
         ];
         for (tp, nm) in [(gen_type(), c"generator"), (coro_type(), c"coroutine"), (asyncgen_type(), c"async_generator")] {

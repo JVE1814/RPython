@@ -835,6 +835,19 @@ unsafe fn setup_hash_type(i: usize, name: &'static std::ffi::CStr, xof: bool, sh
         let flags = Py_TPFLAGS_IMMUTABLETYPE as u64 | if instantiable { 0 } else { Py_TPFLAGS_DISALLOW_INSTANTIATION as u64 };
         cc::init_state_type::<HState>(tp(i), name, flags);
         let t = &mut *tp(i);
+        if instantiable {
+            let short = name.to_str().unwrap_or("").rsplit('.').next().unwrap_or("");
+            let doc = match short {
+                "blake2b" | "blake2s" => {
+                    let (ds, kind) = if short == "blake2b" { (64, "BLAKE2b") } else { (32, "BLAKE2s") };
+                    format!(
+                        "{short}(data=b'', /, *, digest_size={ds}, key=b'', salt=b'', person=b'',\n        fanout=1, depth=1, leaf_size=0, node_offset=0, node_depth=0,\n        inner_size=0, last_node=False, usedforsecurity=True, string=None)\n--\n\nReturn a new {kind} hash object."
+                    )
+                }
+                _ => format!("{short}(data=b'', /, *, usedforsecurity=True, string=None)\n--\n\nReturn a new {short} hash object, optionally fed with data."),
+            };
+            t.tp_doc = crate::methods::cstr_static(&doc);
+        }
         t.tp_methods = if xof {
             crate::mdefs![
                 ("update", O, h_update, "update($self, data, /)\n--\n\nUpdate this hash object's state with the provided string."),

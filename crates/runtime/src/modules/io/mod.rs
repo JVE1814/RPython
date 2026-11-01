@@ -520,9 +520,9 @@ pub fn init() -> PyResult {
     crate::builtins::add_methods_to_dict(
         &d,
         crate::mdefs![
-            ("open", FASTKW, io_open),
-            ("open_code", FASTKW, io_open_code),
-            ("text_encoding", FAST, io_text_encoding),
+            ("open", FASTKW, io_open, "open($module, /, file, mode='r', buffering=-1, encoding=None,\n     errors=None, newline=None, closefd=True, opener=None)\n--\n\nOpen a file and return a stream object for it.\n\nfile is a path (str, bytes or os.PathLike) or an integer file descriptor.\nmode combines 'r', 'w', 'x' or 'a' with optional '+' (update), and 'b'\n(binary) or 't' (text, the default).  Text streams decode with encoding\n(locale.getencoding() if None) using the errors handler, and translate\nline endings according to newline.  buffering selects the buffer size\n(0 = unbuffered, binary only; 1 = line buffered, text only).  When file\nis a descriptor, closefd=False keeps it open after the stream is closed.\nopener(path, flags) may supply the descriptor to use."),
+            ("open_code", FASTKW, io_open_code, "open_code($module, /, path)\n--\n\nOpen a file meant to be executed as code, in binary read mode."),
+            ("text_encoding", FAST, io_text_encoding, "text_encoding($module, encoding, stacklevel=2, /)\n--\n\nReturn the encoding a text stream would use for the given encoding argument.\n\nNone maps to \"locale\" (or \"utf-8\" in UTF-8 mode) and may emit an\nEncodingWarning; other values are returned unchanged."),
         ],
         Some(&m),
     )?;

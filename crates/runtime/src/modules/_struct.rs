@@ -1122,11 +1122,11 @@ fn init_types() -> PyResult<()> {
         t.tp_doc = c"Struct(format)\n--\n\nCreate a compiled struct object.\n\nReturn a new Struct object which writes and reads binary data according to\nthe format string.\n\nSee help(struct) for more on format strings.".as_ptr();
         t.tp_methods = crate::mdefs![
             ("iter_unpack", O, s_iter_unpack, "iter_unpack($self, buffer, /)\n--\n\nReturn an iterator yielding tuples.\n\nTuples are unpacked from the given bytes source, like a repeated\ninvocation of unpack_from().\n\nRequires that the bytes length be a multiple of the struct size."),
-            ("pack", FAST, s_pack, "S.pack(v1, v2, ...) -> bytes\n\nReturn a bytes object containing values v1, v2, ... packed according\nto the format string S.format.  See help(struct) for more on format\nstrings."),
-            ("pack_into", FAST, s_pack_into, "S.pack_into(buffer, offset, v1, v2, ...)\n\nPack the values v1, v2, ... according to the format string S.format\nand write the packed bytes into the writable buffer buf starting at\noffset.  Note that the offset is a required argument.  See\nhelp(struct) for more on format strings."),
+            ("pack", FAST, s_pack, "pack($self, /, *values)\n--\n\nPack the values according to the format and return the bytes."),
+            ("pack_into", FAST, s_pack_into, "pack_into($self, buffer, offset, /, *values)\n--\n\nPack the values into a writable buffer, starting at offset."),
             ("unpack", O, s_unpack, "unpack($self, buffer, /)\n--\n\nReturn a tuple containing unpacked values.\n\nUnpack according to the format string Struct.format. The buffer's size\nin bytes must be Struct.size.\n\nSee help(struct) for more on format strings."),
             ("unpack_from", FASTKW, s_unpack_from, "unpack_from($self, /, buffer, offset=0)\n--\n\nReturn a tuple containing unpacked values.\n\nValues are unpacked according to the format string Struct.format.\n\nThe buffer's size in bytes, starting at position offset, must be\nat least Struct.size.\n\nSee help(struct) for more on format strings."),
-            ("__sizeof__", NOARGS, s_sizeof, "S.__sizeof__() -> size of S in memory, in bytes"),
+            ("__sizeof__", NOARGS, s_sizeof, "__sizeof__($self, /)\n--\n\nReturn the memory used by the Struct object, in bytes."),
         ];
         t.tp_getset = crate::getset_table![
             ("format", get_format; "struct format string"),
@@ -1165,8 +1165,8 @@ pub fn init_module() -> PyResult {
         ("_clearcache", NOARGS, m_clearcache, "_clearcache($module, /)\n--\n\nClear the internal cache."),
         ("calcsize", O, m_calcsize, "calcsize($module, format, /)\n--\n\nReturn size in bytes of the struct described by the format string."),
         ("iter_unpack", FAST, m_iter_unpack, "iter_unpack($module, format, buffer, /)\n--\n\nReturn an iterator yielding tuples unpacked from the given bytes.\n\nThe bytes are unpacked according to the format string, like\na repeated invocation of unpack_from().\n\nRequires that the bytes length be a multiple of the format struct size."),
-        ("pack", FAST, m_pack, "pack(format, v1, v2, ...) -> bytes\n\nReturn a bytes object containing the values v1, v2, ... packed according\nto the format string.  See help(struct) for more on format strings."),
-        ("pack_into", FAST, m_pack_into, "pack_into(format, buffer, offset, v1, v2, ...)\n\nPack the values v1, v2, ... according to the format string and write\nthe packed bytes into the writable buffer buf starting at offset.  Note\nthat the offset is a required argument.  See help(struct) for more\non format strings."),
+        ("pack", FAST, m_pack, "pack($module, format, /, *values)\n--\n\nPack the values according to format and return the bytes."),
+        ("pack_into", FAST, m_pack_into, "pack_into($module, format, buffer, offset, /, *values)\n--\n\nPack the values according to format into a writable buffer at offset."),
         ("unpack", FAST, m_unpack, "unpack($module, format, buffer, /)\n--\n\nReturn a tuple containing values unpacked according to the format string.\n\nThe buffer's size in bytes must be calcsize(format).\n\nSee help(struct) for more on format strings."),
         ("unpack_from", FASTKW, m_unpack_from, "unpack_from($module, format, /, buffer, offset=0)\n--\n\nReturn a tuple containing values unpacked according to the format string.\n\nThe buffer's size, minus offset, must be at least calcsize(format).\n\nSee help(struct) for more on format strings."),
     ];

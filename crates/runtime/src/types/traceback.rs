@@ -152,6 +152,7 @@ pub fn init_types() {
     unsafe {
         let t = &mut *traceback_type();
         t.tp_name = c"traceback".as_ptr();
+        t.tp_doc = c"traceback(tb_next, tb_frame, tb_lasti, tb_lineno)\n--\n\nOne entry of the stack recorded when an exception propagates.".as_ptr();
         t.tp_basicsize = std::mem::size_of::<PyTracebackObject>() as isize;
         t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC;
         t.tp_dealloc = Some(tb_dealloc);

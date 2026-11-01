@@ -109,6 +109,20 @@ EXTRA_MODULES = [
 ]
 
 
+# Accelerator modules share the expectations of their public module.
+ALIASES = {
+    '_types': 'types', '_typing': 'typing', '_io': 'io', '_signal': 'signal',
+    '_weakref': 'weakref', '_datetime': 'datetime', '_collections': 'collections',
+    '_functools': 'functools', '_warnings': 'warnings', '_struct': 'struct',
+    '_operator': 'operator', '_locale': 'locale', 'posix': 'os', '_stat': 'stat',
+    '_codecs': 'codecs', '_tracemalloc': 'tracemalloc', '_tokenize': 'tokenize',
+    '_symtable': 'symtable', '_abc': 'abc', '_sre': 're',
+}
+
+# Modules test_inspect walks: legacy doc lines are no excuse there.
+STRICT_MODULES = set(name.split(".")[0] for name in EXPECT) | set(ALIASES)
+
+
 def is_public(name):
     return not name.startswith('_') or name.startswith('__') and name.endswith('__')
 
@@ -143,12 +157,34 @@ class Report:
         self.checked += 1
         if not has_sig(obj):
             ts = text_sig(obj)
-            if ts:
+            if ts and ('<unrepresentable>' in ts or '[' in ts) and \
+                    qual.split('.')[0] not in STRICT_MODULES:
+                # Same as CPython: a default without a Python spelling, or
+                # optional groups, make the signature unsupported by inspect.
+                if self.verbose:
+                    self.add('UNSUPP', qual, repr(ts))
+            elif ts:
                 self.add('BADSIG', qual, repr(ts))
+            elif self.old_style(qual, obj):
+                # A legacy "name(args) -> result" doc line: CPython has no
+                # introspectable signature for these either.
+                if self.verbose:
+                    self.add('OLDSTYLE', qual)
             else:
                 self.add('MISSING', qual)
         elif self.verbose:
             print('ok', qual, inspect.signature(obj))
+
+    @staticmethod
+    def old_style(qual, obj):
+        if qual.split('.')[0] in STRICT_MODULES:
+            return False
+        try:
+            doc = obj.__doc__
+            name = obj.__name__
+        except Exception:
+            return False
+        return isinstance(doc, str) and doc.startswith(name + '(')
 
     def check_none(self, qual, obj):
         self.checked += 1
@@ -188,7 +224,7 @@ def check_module(rep, modname, all_names=False):
         rep.add('NOMODULE', modname, str(e))
         return
     no_sig, unsupported, mno, munsup, good_exc = EXPECT.get(
-        modname, (set(), set(), {}, {}, ()))
+        ALIASES.get(modname, modname), (set(), set(), {}, {}, ()))
     no_sig = set(no_sig)
     ns = vars(module)
     try:

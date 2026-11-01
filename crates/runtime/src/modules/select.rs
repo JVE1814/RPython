@@ -613,7 +613,7 @@ pub fn init() -> PyResult {
             ("unregister", FASTKW, epoll_unregister, "unregister($self, /, fd)\n--\n\nRemove a registered file descriptor from the epoll object."),
             ("poll", FASTKW, epoll_poll, "poll($self, /, timeout=None, maxevents=-1)\n--\n\nWait for events on the epoll file descriptor."),
             ("__enter__", NOARGS, epoll_enter),
-            ("__exit__", FAST, epoll_exit),
+            ("__exit__", FAST, epoll_exit, "__exit__($self, exc_type=None, exc_value=None, exc_tb=None, /)\n--\n\nClose the epoll object when leaving a with block."),
         ];
         t.tp_getset = crate::getset_table![("closed", epoll_closed; "True if the epoll handler is closed")];
         res = type_ready(epoll_type());

@@ -412,6 +412,7 @@ fn ensure_types() -> PyResult<()> {
         }
         fc::init_robj_type::<Context>(t, c"_contextvars.Context", 0);
         (*t).tp_new = Some(ctx_new);
+        (*t).tp_doc = c"Context()\n--\n\nA mapping from ContextVars to their values, used as an execution context.".as_ptr();
         (*t).tp_iter = Some(ctx_iter);
         (*t).tp_richcompare = Some(ctx_richcompare);
         (*t).tp_hash = Some(crate::types::slots::hash_not_implemented);
@@ -434,6 +435,7 @@ fn ensure_types() -> PyResult<()> {
         let t = var_type();
         fc::init_robj_type::<ContextVar>(t, c"_contextvars.ContextVar", 0);
         (*t).tp_new = Some(var_new);
+        (*t).tp_doc = c"ContextVar(name, *, default=<unrepresentable>)\n--\n\nA variable whose value depends on the current Context.".as_ptr();
         (*t).tp_hash = Some(var_hash);
         (*t).tp_repr = Some(var_repr);
         (*t).tp_methods = mdefs![
@@ -451,7 +453,7 @@ fn ensure_types() -> PyResult<()> {
         (*t).tp_hash = Some(crate::types::object_type::object_hash);
         (*t).tp_methods = mdefs![
             ("__enter__", NOARGS, token_enter, "Enter into Token context manager."),
-            ("__exit__", FAST, token_exit, "Exit from Token context manager, restore the linked ContextVar."),
+            ("__exit__", FAST, token_exit, "__exit__($self, *args, /)\n--\n\nLeave the with block: reset the ContextVar to its value before set()."),
             ("__class_getitem__", O, fc::class_getitem, "See PEP 585"; METH_CLASS),
         ];
         (*t).tp_getset = crate::getset_table![("var", token_get_var), ("old_value", token_get_old)];

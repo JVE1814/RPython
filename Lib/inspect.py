@@ -1679,6 +1679,14 @@ def _signature_strip_non_python_syntax(signature):
             j = i
             while j < length and (text[j].isalnum() or text[j] in '_.'):
                 j += 1
+            if (j < length and text[j] in '\'"'
+                    and text[i:j].lower() in ('b', 'r', 'u', 'rb', 'br')):
+                # A prefixed string literal such as b'' stays one token.
+                quote = text[j]
+                j += 1
+                while j < length and text[j] != quote:
+                    j += 2 if text[j] == '\\' else 1
+                j += 1
             tokens.append(text[i:j])
             i = j
             continue

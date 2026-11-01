@@ -310,7 +310,7 @@ pub fn new_type(desc: &Desc) -> PyResult<*mut PyTypeObject> {
         if !desc.doc.is_empty() {
             t.tp_doc = crate::methods::cstr_static(desc.doc);
         }
-        t.tp_methods = crate::mdefs![("__reduce__", NOARGS, ss_reduce), ("__replace__", FASTKW, ss_replace),];
+        t.tp_methods = crate::mdefs![("__reduce__", NOARGS, ss_reduce), ("__replace__", FASTKW, ss_replace, "__replace__($self, /, **changes)\n--\n\nReturn a copy with the named fields replaced."),];
         let off0 = std::mem::offset_of!(PyTupleObject, ob_item);
         let mut members: Vec<PyMemberDef> = Vec::new();
         let mut nunnamed = 0;

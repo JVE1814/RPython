@@ -170,6 +170,7 @@ pub fn init_module() -> PyResult {
         let t = &mut *(&raw mut TOKITER_TYPE);
         if t.tp_name.is_null() {
             t.tp_name = c"_tokenize.TokenizerIter".as_ptr();
+            t.tp_doc = c"TokenizerIter(readline, /, *, extra_tokens, encoding=<unrepresentable>)\n--\n\nIterator producing the tokens of the source returned by readline.".as_ptr();
             t.tp_basicsize = std::mem::size_of::<TokIterObj>() as isize;
             t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE;
             t.tp_new = Some(tokiter_new);

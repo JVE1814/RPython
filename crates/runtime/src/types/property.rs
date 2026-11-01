@@ -273,7 +273,7 @@ pub fn init_types() {
             ("getter", O, getter_m, "Descriptor to obtain a copy of the property with a different getter."),
             ("setter", O, setter_m, "Descriptor to obtain a copy of the property with a different setter."),
             ("deleter", O, deleter_m, "Descriptor to obtain a copy of the property with a different deleter."),
-            ("__set_name__", FAST, set_name_m, "Method to set name of a property."),
+            ("__set_name__", FAST, set_name_m, "__set_name__($self, owner, name, /)\n--\n\nRecord the attribute name the property was assigned to."),
         ];
     }
 }

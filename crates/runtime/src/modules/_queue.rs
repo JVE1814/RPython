@@ -192,11 +192,11 @@ pub fn init_module() -> PyResult {
             t.tp_traverse = Some(sq_traverse);
             t.tp_clear = Some(sq_clear);
             t.tp_getattro = Some(crate::types::typeobject::object_generic_getattro);
-            t.tp_doc = c"Simple, unbounded, reentrant FIFO queue.".as_ptr();
+            t.tp_doc = c"SimpleQueue()\n--\n\nAn unbounded FIFO queue that is safe to use from several threads and\nfrom reentrant code.".as_ptr();
             t.tp_methods = crate::mdefs![
-                ("put", FASTKW, sq_put),
-                ("put_nowait", FASTKW, sq_put_nowait),
-                ("get", FASTKW, sq_get),
+                ("put", FASTKW, sq_put, "put($self, /, item, block=True, timeout=None)\n--\n\nAppend item to the queue; block and timeout are accepted for\ncompatibility with Queue.put() and ignored."),
+                ("put_nowait", FASTKW, sq_put_nowait, "put_nowait($self, /, item)\n--\n\nAppend item to the queue without blocking."),
+                ("get", FASTKW, sq_get, "get($self, /, block=True, timeout=None)\n--\n\nRemove and return the oldest item, waiting up to timeout seconds\n(forever if None) when block is true; raise Empty otherwise."),
                 ("get_nowait", NOARGS, sq_get_nowait),
                 ("empty", NOARGS, sq_empty),
                 ("qsize", NOARGS, sq_qsize),

@@ -1287,12 +1287,12 @@ pub fn init_types() {
         o.tp_free = Some(generic_free);
         o.tp_getset = crate::getset_table![("__class__", object_get_class, object_set_class; "the object's class")];
         o.tp_methods = crate::mdefs![
-            ("__reduce_ex__", O, object_reduce_ex, "Helper for pickle."),
+            ("__reduce_ex__", O, object_reduce_ex, "__reduce_ex__($self, protocol, /)\n--\n\nHelper for pickle."),
             ("__reduce__", NOARGS, object_reduce, "Helper for pickle."),
             ("__getstate__", NOARGS, object_getstate, "Helper for pickle."),
-            ("__subclasshook__", FAST, object_subclasshook, "Abstract classes can override this to customize issubclass().\n\nThis is invoked early on by abc.ABCMeta.__subclasscheck__().\nIt should return True, False or NotImplemented.  If it returns\nNotImplemented, the normal algorithm is used.  Otherwise, it\noverrides the normal algorithm (and the outcome is cached).\n"; METH_CLASS),
-            ("__init_subclass__", FASTKW, object_init_subclass, "This method is called when a class is subclassed.\n\nThe default implementation does nothing. It may be\noverridden to extend subclasses.\n"; METH_CLASS),
-            ("__format__", O, object_format, "Default object formatter.\n\nReturn str(self) if format_spec is empty. Raise TypeError otherwise."),
+            ("__subclasshook__", FAST, object_subclasshook, "__subclasshook__($type, subclass, /)\n--\n\nHook consulted by abc.ABCMeta.__subclasscheck__().\n\nAn abstract class may override it to decide issubclass() itself by\nreturning True or False; NotImplemented (the default) falls back to\nthe ordinary check.\n"; METH_CLASS),
+            ("__init_subclass__", FASTKW, object_init_subclass, "__init_subclass__($type, /)\n--\n\nCalled on the parent whenever a subclass is created.\n\nThe default does nothing; override it to customise new subclasses.\n"; METH_CLASS),
+            ("__format__", O, object_format, "__format__($self, format_spec, /)\n--\n\nFormat the object; only an empty format_spec (meaning str(self)) is accepted."),
             ("__sizeof__", NOARGS, object_sizeof, "Size of object in memory, in bytes."),
             ("__dir__", NOARGS, object_dir, "Default dir() implementation."),
         ];

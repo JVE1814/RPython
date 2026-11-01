@@ -977,6 +977,7 @@ pub fn init_types() {
     unsafe {
         let t = &mut *function_type();
         t.tp_name = c"function".as_ptr();
+        t.tp_doc = c"function(code, globals, name=None, argdefs=None, closure=None, kwdefaults=None)\n--\n\nBuild a Python function from a code object and a globals dict.".as_ptr();
         t.tp_basicsize = std::mem::size_of::<PyFunctionObject>() as isize;
         t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC | Py_TPFLAGS_HAVE_VECTORCALL | Py_TPFLAGS_METHOD_DESCRIPTOR;
         t.tp_dealloc = Some(func_dealloc);
@@ -1013,6 +1014,7 @@ pub fn init_types() {
 
         let t = &mut *method_type();
         t.tp_name = c"method".as_ptr();
+        t.tp_doc = c"method(function, instance, /)\n--\n\nBind a callable to an instance.".as_ptr();
         t.tp_basicsize = std::mem::size_of::<PyMethodObject>() as isize;
         t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC | Py_TPFLAGS_HAVE_VECTORCALL;
         t.tp_dealloc = Some(method_dealloc);
@@ -1028,7 +1030,7 @@ pub fn init_types() {
         t.tp_descr_get = Some(method_descr_get);
         t.tp_new = Some(method_new);
         t.tp_getset = crate::getset_table![("__func__", m_func), ("__self__", m_self), ("__doc__", m_doc)];
-        t.tp_methods = crate::mdefs![("__reduce__", NOARGS, m_reduce)];
+        t.tp_methods = crate::mdefs![("__reduce__", NOARGS, m_reduce, "__reduce__($self, /)\n--\n\nHelper for pickle.")];
 
         for (tp, nm, get) in [
             (staticmethod_type(), c"staticmethod", sm_descr_get as unsafe extern "C" fn(_, _, _) -> _),
@@ -1036,6 +1038,11 @@ pub fn init_types() {
         ] {
             let t = &mut *tp;
             t.tp_name = nm.as_ptr();
+            t.tp_doc = if tp == staticmethod_type() {
+                c"staticmethod(function, /)\n--\n\nWrap a function so that it is not bound when looked up on a class or instance.".as_ptr()
+            } else {
+                c"classmethod(function, /)\n--\n\nWrap a function so that it receives the class as its first argument.".as_ptr()
+            };
             t.tp_basicsize = std::mem::size_of::<StaticOrClassMethod>() as isize;
             t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC | Py_TPFLAGS_BASETYPE;
             t.tp_dealloc = Some(sm_dealloc);
@@ -1066,6 +1073,7 @@ pub fn init_types() {
 
         let t = &mut *cell_type();
         t.tp_name = c"cell".as_ptr();
+        t.tp_doc = c"cell(contents=<unrepresentable>, /)\n--\n\nA box holding one variable shared between nested scopes.".as_ptr();
         t.tp_basicsize = std::mem::size_of::<PyCellObject>() as isize;
         t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC;
         t.tp_dealloc = Some(cell_dealloc);

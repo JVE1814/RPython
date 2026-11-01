@@ -978,7 +978,7 @@ pub fn init_module() -> PyResult {
             "reduce",
             FASTKW,
             functools_reduce,
-            "reduce($module, function, iterable, /, initial=<unrepresentable>)\n--\n\nApply a function of two arguments cumulatively to the items of an iterable, from left to right.\n\nThis effectively reduces the iterable to a single value.  If initial is present,\nit is placed before the items of the iterable in the calculation, and serves as\na default when the iterable is empty.\n\nFor example, reduce(lambda x, y: x+y, [1, 2, 3, 4, 5])\ncalculates ((((1 + 2) + 3) + 4) + 5)."
+            "reduce($module, function, iterable, /, initial=None)\n--\n\nApply a function of two arguments cumulatively to the items of an iterable, from left to right.\n\nThis effectively reduces the iterable to a single value.  If initial is present,\nit is placed before the items of the iterable in the calculation, and serves as\na default when the iterable is empty.\n\nFor example, reduce(lambda x, y: x+y, [1, 2, 3, 4, 5])\ncalculates ((((1 + 2) + 3) + 4) + 5)."
         ),
         ("cmp_to_key", FASTKW, functools_cmp_to_key, "cmp_to_key($module, /, mycmp)\n--\n\nConvert a cmp= function into a key= function.\n\n  mycmp\n    Function that compares two objects."),
     ];
