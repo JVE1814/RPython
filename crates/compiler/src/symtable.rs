@@ -879,7 +879,10 @@ impl Builder {
     /// Parameter annotations of a function: always creates the `__annotate__` block.
     fn visit_annotations(&mut self, s: &Stmt, a: &Arguments, returns: Option<&Expr>, fname: &str) -> R {
         let cur_kind = self.cur().kind;
-        let in_class = cur_kind == ScopeKind::Class;
+        // a generic method's annotations live inside its type-parameter block, which
+        // itself sees the class namespace
+        let in_class = cur_kind == ScopeKind::Class
+            || (cur_kind == ScopeKind::TypeParams && self.cur().can_see_class_scope);
         let future = self.flags & FUTURE_ANNOTATIONS != 0;
         self.enter_block("__annotate__", ScopeKind::Annotation, Some(key(s, TAG_ANN)), s.loc);
         self.cur_mut().function_name = Some(fname.to_string());

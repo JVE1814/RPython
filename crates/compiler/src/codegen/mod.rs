@@ -1091,7 +1091,14 @@ impl<'a> Compiler<'a> {
         }
         self.emit(Op::ReturnValue, 0);
         let code = self.exit_scope()?;
-        self.make_closure(code, 0)
+        self.make_format_function(code)
+    }
+
+    /// Push a function for an annotate/lazy-evaluation code object; its single
+    /// positional-only parameter `format` defaults to 1 (VALUE).
+    fn make_format_function(&mut self, code: CodeUnit) -> R {
+        self.load_const(Constant::Tuple(vec![Constant::Int(1)]));
+        self.make_closure(code, make_fn::DEFAULTS)
     }
 
     fn mangle_in_parent(&self, name: &str) -> String {
@@ -1267,7 +1274,7 @@ impl<'a> Compiler<'a> {
         self.emit(Op::BuildMap, anns.len() as u32);
         self.emit(Op::ReturnValue, 0);
         let code = self.exit_scope()?;
-        self.make_closure(code, 0)?;
+        self.make_format_function(code)?;
         Ok(true)
     }
 
@@ -1464,7 +1471,7 @@ impl<'a> Compiler<'a> {
         }
         self.emit(Op::ReturnValue, 0);
         let code = self.exit_scope()?;
-        self.make_closure(code, 0)
+        self.make_format_function(code)
     }
 
     pub fn compile_type_alias(&mut self, s: &'a Stmt, name: &'a Expr, tps: &'a [ast::TypeParam], value: &'a Expr) -> R {

@@ -1425,8 +1425,10 @@ impl<'a> Parser<'a> {
                     let colon = self.peek();
                     self.advance();
                     let m = self.p;
-                    if self.expression()?.is_some() {
-                        let msg = if t.ty == T::STAR { "cannot use bound with TypeVarTuple" } else { "cannot use bound with ParamSpec" };
+                    if let Some(bound) = self.expression()? {
+                        let what = if matches!(bound.node, ExprKind::Tuple { .. }) { "constraints" } else { "bound" };
+                        let kind = if t.ty == T::STAR { "TypeVarTuple" } else { "ParamSpec" };
+                        let msg = format!("cannot use {} with {}", what, kind);
                         let _ = m;
                         return Err(self.err_range(msg, Self::tok_loc(&colon), self.loc(m)));
                     }
