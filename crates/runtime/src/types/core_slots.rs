@@ -299,209 +299,6 @@ fn str_encode_m(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRe
     crate::modules::codecs_core::encode_str(o, enc, errs)
 }
 
-// ============================================================== float
-
-unsafe extern "C" fn float_repr(o: *mut PyObject) -> *mut PyObject {
-    unsafe { str::new_str(&rpy_numfmt::float_repr(float::float_value(&*o))).into_raw() }
-}
-unsafe extern "C" fn float_hash_slot(o: *mut PyObject) -> Py_hash_t {
-    unsafe { float::float_hash(&*o) }
-}
-fn to_double(o: &PyObject) -> PyResult<Option<f64>> {
-    if float::is_float(o) {
-        return Ok(Some(float::float_value(o)));
-    }
-    if int::is_int(o) {
-        return int::to_f64(o).map(Some);
-    }
-    Ok(None)
-}
-unsafe extern "C" fn float_richcompare(a: *mut PyObject, b: *mut PyObject, op: c_int) -> *mut PyObject {
-    unsafe {
-        let (a, b) = (&*a, &*b);
-        let x = float::float_value(a);
-        let r = if float::is_float(b) {
-            let y = float::float_value(b);
-            match op {
-                Py_LT => x < y,
-                Py_LE => x <= y,
-                Py_EQ => x == y,
-                Py_NE => x != y,
-                Py_GT => x > y,
-                _ => x >= y,
-            }
-        } else if int::is_int(b) {
-            if x.is_nan() {
-                op == Py_NE
-            } else if x.is_infinite() {
-                let c = if x > 0.0 { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less };
-                cmp_result(c, op)
-            } else {
-                let c = rpy_bigint::conv::cmp_f64(int_methods::iref(b), x).map(|c| c.reverse()).unwrap_or(std::cmp::Ordering::Equal);
-                cmp_result(c, op)
-            }
-        } else {
-            return ni();
-        };
-        bool_::new_bool(r).into_raw()
-    }
-}
-macro_rules! fbin {
-    ($name:ident, |$x:ident, $y:ident| $body:expr) => {
-        unsafe extern "C" fn $name(a: *mut PyObject, b: *mut PyObject) -> *mut PyObject {
-            unsafe {
-                let (a, b) = (&*a, &*b);
-                let $x = match to_double(a) {
-                    Ok(Some(v)) => v,
-                    Ok(None) => return ni(),
-                    Err(_) => return std::ptr::null_mut(),
-                };
-                let $y = match to_double(b) {
-                    Ok(Some(v)) => v,
-                    Ok(None) => return ni(),
-                    Err(_) => return std::ptr::null_mut(),
-                };
-                let r: PyResult = $body;
-                into_c(r)
-            }
-        }
-    };
-}
-fbin!(float_add, |x, y| Ok(float::new_float(x + y)));
-fbin!(float_sub, |x, y| Ok(float::new_float(x - y)));
-fbin!(float_mul, |x, y| Ok(float::new_float(x * y)));
-fbin!(float_div, |x, y| if y == 0.0 { Err(err!(ZeroDivisionError, "division by zero")) } else { Ok(float::new_float(x / y)) });
-fn float_floordiv_mod(x: f64, y: f64) -> PyResult<(f64, f64)> {
-    if y == 0.0 {
-        raise!(ZeroDivisionError, "division by zero");
-    }
-    let mut m = x % y;
-    let mut d = (x - m) / y;
-    if m != 0.0 {
-        if (y < 0.0) != (m < 0.0) {
-            m += y;
-            d -= 1.0;
-        }
-    } else {
-        m = 0.0f64.copysign(y);
-    }
-    let fd = if d != 0.0 {
-        let f = d.floor();
-        if d - f > 0.5 { f + 1.0 } else { f }
-    } else {
-        0.0f64.copysign(x / y)
-    };
-    Ok((fd, m))
-}
-fbin!(float_floordiv, |x, y| float_floordiv_mod(x, y).map(|(d, _)| float::new_float(d)));
-fbin!(float_mod, |x, y| float_floordiv_mod(x, y).map(|(_, m)| float::new_float(m)));
-fbin!(float_divmod, |x, y| float_floordiv_mod(x, y).map(|(d, m)| tuple::new_tuple(vec![float::new_float(d), float::new_float(m)])));
-unsafe extern "C" fn float_pow(a: *mut PyObject, b: *mut PyObject, m: *mut PyObject) -> *mut PyObject {
-    unsafe {
-        if !(*m).is(none::none()) {
-            return into_c(Err(err!(TypeError, "pow() 3rd argument not allowed unless all arguments are integers")));
-        }
-        let (a, b) = (&*a, &*b);
-        let x = match to_double(a) {
-            Ok(Some(v)) => v,
-            Ok(None) => return ni(),
-            Err(_) => return std::ptr::null_mut(),
-        };
-        let y = match to_double(b) {
-            Ok(Some(v)) => v,
-            Ok(None) => return ni(),
-            Err(_) => return std::ptr::null_mut(),
-        };
-        into_c(crate::types::float_math::float_pow(x, y))
-    }
-}
-unsafe extern "C" fn float_neg(a: *mut PyObject) -> *mut PyObject {
-    unsafe { float::new_float(-float::float_value(&*a)).into_raw() }
-}
-unsafe extern "C" fn float_pos(a: *mut PyObject) -> *mut PyObject {
-    unsafe { float::new_float(float::float_value(&*a)).into_raw() }
-}
-unsafe extern "C" fn float_abs(a: *mut PyObject) -> *mut PyObject {
-    unsafe { float::new_float(float::float_value(&*a).abs()).into_raw() }
-}
-unsafe extern "C" fn float_bool(a: *mut PyObject) -> c_int {
-    unsafe { (float::float_value(&*a) != 0.0) as c_int }
-}
-pub fn float_to_int(x: f64) -> PyResult {
-    if x.is_nan() {
-        raise!(ValueError, "cannot convert float NaN to integer");
-    }
-    if x.is_infinite() {
-        raise!(OverflowError, "cannot convert float infinity to integer");
-    }
-    if x.abs() < 9.0e18 {
-        return Ok(int::new_int(x.trunc() as i64));
-    }
-    match rpy_bigint::conv::from_f64(x) {
-        Ok(b) => Ok(int_methods::from_big(b)),
-        Err(e) => Err(int_methods::int_error(e)),
-    }
-}
-unsafe extern "C" fn float_int(a: *mut PyObject) -> *mut PyObject {
-    unsafe { into_c(float_to_int(float::float_value(&*a))) }
-}
-unsafe extern "C" fn float_float(a: *mut PyObject) -> *mut PyObject {
-    unsafe {
-        let a = &*a;
-        if float::is_float_exact(a) { a.to_ref().into_raw() } else { float::new_float(float::float_value(a)).into_raw() }
-    }
-}
-unsafe extern "C" fn float_new(tp: *mut PyTypeObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
-    unsafe {
-        let r = (|| -> PyResult {
-            if !kw.is_null() && dict::dict_len(&*kw) > 0 {
-                raise!(TypeError, "float() takes no keyword arguments");
-            }
-            let a = tuple::tuple_items(&*args);
-            if a.len() > 1 {
-                raise!(TypeError, "float expected at most 1 argument, got {}", a.len());
-            }
-            let v = match a.first() {
-                None => 0.0,
-                Some(x) => crate::types::float_math::number_float(x)?,
-            };
-            float::new_float_typed(tp, v)
-        })();
-        into_c(r)
-    }
-}
-fn float_format_m(o: &PyObject, spec: &PyObject) -> PyResult {
-    format_impl::format_float(float::float_value(o), spec, &tname(o))
-}
-fn float_is_integer(o: &PyObject) -> PyResult {
-    let x = float::float_value(o);
-    Ok(bool_::new_bool(x.is_finite() && x.fract() == 0.0))
-}
-fn float_trunc_m(o: &PyObject) -> PyResult {
-    float_to_int(float::float_value(o))
-}
-fn float_floor_m(o: &PyObject) -> PyResult {
-    float_to_int(float::float_value(o).floor())
-}
-fn float_ceil_m(o: &PyObject) -> PyResult {
-    float_to_int(float::float_value(o).ceil())
-}
-fn float_round_m(o: &PyObject, args: &[&PyObject]) -> PyResult {
-    crate::args::check_pos("__round__", args, 0, 1)?;
-    let x = float::float_value(o);
-    match args.first().filter(|a| !a.is(none::none())) {
-        None => {
-            let r = x.round();
-            let r = if (x - x.trunc()).abs() == 0.5 { 2.0 * (x / 2.0).round() } else { r };
-            float_to_int(r)
-        }
-        Some(n) => {
-            let n = ab::as_i64(n)?;
-            rpy_numfmt::float_round(x, n).map(float::new_float).map_err(format_impl::numfmt_error)
-        }
-    }
-}
-
 // ============================================================== tuple
 
 unsafe extern "C" fn tuple_repr(o: *mut PyObject) -> *mut PyObject {
@@ -1700,13 +1497,6 @@ fn bytes_decode_m(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> Py
     crate::modules::codecs_core::decode_object(o, enc, errs)
 }
 
-unsafe extern "C" fn complex_repr(o: *mut PyObject) -> *mut PyObject {
-    unsafe {
-        let c = complex::complex_value(&*o);
-        str::new_str(&rpy_numfmt::complex_repr(c.real, c.imag)).into_raw()
-    }
-}
-
 unsafe extern "C" fn slice_repr(o: *mut PyObject) -> *mut PyObject {
     unsafe {
         let (a, b, c) = slice::parts(&*o);
@@ -1758,7 +1548,6 @@ unsafe extern "C" fn slice_dealloc(o: *mut PyObject) {
 
 static mut STR_SEQ: PySequenceMethods = PySequenceMethods::ZERO;
 static mut STR_MAP: PyMappingMethods = PyMappingMethods::ZERO;
-static mut FLOAT_NUM: PyNumberMethods = PyNumberMethods::ZERO;
 static mut TUPLE_SEQ: PySequenceMethods = PySequenceMethods::ZERO;
 static mut TUPLE_MAP: PyMappingMethods = PyMappingMethods::ZERO;
 static mut LIST_SEQ: PySequenceMethods = PySequenceMethods::ZERO;
@@ -1815,42 +1604,6 @@ pub fn init_types() {
             ("encode", FASTKW, str_encode_m, "encode($self, /, encoding='utf-8', errors='strict')\n--\n\nEncode the string using the codec registered for encoding."),
         ];
         iter_type(&raw mut STR_ITER_TYPE, c"str_ascii_iterator", str_iter_next, simple_iter_dealloc, std::mem::size_of::<StrIter>());
-
-        // ---- float
-        let t = &mut *float::float_type();
-        t.tp_name = c"float".as_ptr();
-        t.tp_basicsize = std::mem::size_of::<PyFloatObject>() as isize;
-        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE;
-        t.tp_repr = Some(float_repr);
-        t.tp_hash = Some(float_hash_slot);
-        t.tp_richcompare = Some(float_richcompare);
-        t.tp_new = Some(float_new);
-        t.tp_getattro = Some(object_generic_getattro);
-        t.tp_doc = c"Convert a string or number to a floating-point number, if possible.".as_ptr();
-        let n = &mut *(&raw mut FLOAT_NUM);
-        n.nb_add = Some(float_add);
-        n.nb_subtract = Some(float_sub);
-        n.nb_multiply = Some(float_mul);
-        n.nb_true_divide = Some(float_div);
-        n.nb_floor_divide = Some(float_floordiv);
-        n.nb_remainder = Some(float_mod);
-        n.nb_divmod = Some(float_divmod);
-        n.nb_power = Some(float_pow);
-        n.nb_negative = Some(float_neg);
-        n.nb_positive = Some(float_pos);
-        n.nb_absolute = Some(float_abs);
-        n.nb_bool = Some(float_bool);
-        n.nb_int = Some(float_int);
-        n.nb_float = Some(float_float);
-        t.tp_as_number = n;
-        t.tp_methods = crate::mdefs![
-            ("__format__", O, float_format_m),
-            ("is_integer", NOARGS, float_is_integer),
-            ("__trunc__", NOARGS, float_trunc_m),
-            ("__floor__", NOARGS, float_floor_m),
-            ("__ceil__", NOARGS, float_ceil_m),
-            ("__round__", FAST, float_round_m),
-        ];
 
         // ---- tuple
         let t = &mut *tuple::tuple_type();
@@ -2039,14 +1792,6 @@ pub fn init_types() {
         t.tp_name = c"bytearray".as_ptr();
         t.tp_basicsize = std::mem::size_of::<PyByteArrayObject>() as isize;
         t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE;
-        t.tp_getattro = Some(object_generic_getattro);
-
-        // ---- complex
-        let t = &mut *complex::complex_type();
-        t.tp_name = c"complex".as_ptr();
-        t.tp_basicsize = std::mem::size_of::<PyComplexObject>() as isize;
-        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE;
-        t.tp_repr = Some(complex_repr);
         t.tp_getattro = Some(object_generic_getattro);
 
         // ---- slice

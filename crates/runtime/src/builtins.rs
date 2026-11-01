@@ -716,6 +716,7 @@ pub fn init() -> PyResult<PyRef> {
         ("vars", FAST, b_vars, "vars([object]) -> dictionary\n\nWithout arguments, equivalent to locals().\nWith an argument, equivalent to object.__dict__."),
     ];
     add_methods_to_dict(&d, methods, Some(&m))?;
+    crate::modules::builtins_numbers::install(&d, &m)?;
     if let Some(f) = dict::get_item_rs(&d, "__import__") {
         IMPORT_FN.store(f.as_ptr(), Release);
     }

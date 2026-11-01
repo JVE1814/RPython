@@ -19,3 +19,4 @@ pub mod reprlib_guard;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
 pub fn register_all() {}
+pub mod builtins_numbers;
