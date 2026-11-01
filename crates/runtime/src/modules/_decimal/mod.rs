@@ -39,14 +39,14 @@ pub fn init_module() -> PyResult {
     py_ctx::init_state()?;
     let m = crate::types::module::new_module("_decimal")?;
     let d = crate::types::module::module_dict(&m);
-    crate::types::dict::set_item_str(&d, "__doc__", &crate::types::str::new_str("C decimal arithmetic module"))?;
+    crate::types::dict::set_item_str(&d, "__doc__", &crate::types::str::new_str("Rust implementation of decimal arithmetic (accelerator for the decimal module)."))?;
     crate::builtins::add_methods_to_dict(
         &d,
         crate::mdefs![
-            ("getcontext", NOARGS, py_ctx::getcontext, "getcontext($module, /)\n--\n\nGet the current default context."),
-            ("setcontext", O, py_ctx::setcontext, "setcontext($module, context, /)\n--\n\nSet a new default context."),
-            ("localcontext", FASTKW, py_ctx::localcontext, "localcontext($module, /, ctx=None, **kwargs)\n--\n\nReturn a context manager that will set the default context to a copy of ctx\non entry to the with-statement and restore the previous default context when\nexiting the with-statement. If no context is specified, a copy of the current\ndefault context is used.\n"),
-            ("IEEEContext", O, py_ctx::ieee_context, "IEEEContext($module, bits, /)\n--\n\nReturn a context object initialized to the proper values for one of the\nIEEE interchange formats.  The argument must be a multiple of 32 and less\nthan IEEE_CONTEXT_MAX_BITS.\n"),
+            ("getcontext", NOARGS, py_ctx::getcontext, "getcontext($module, /)\n--\n\nReturn the context of the current thread."),
+            ("setcontext", O, py_ctx::setcontext, "setcontext($module, context, /)\n--\n\nMake the given context the current one (templates are copied)."),
+            ("localcontext", FASTKW, py_ctx::localcontext, "localcontext($module, /, ctx=None, **kwargs)\n--\n\nContext manager that installs a copy of ctx (or of the current context),\nwith any keyword overrides applied, and restores the previous context on exit."),
+            ("IEEEContext", O, py_ctx::ieee_context, "IEEEContext($module, bits, /)\n--\n\nContext for the IEEE 754 interchange format with the given bit width\n(a multiple of 32, at most IEEE_CONTEXT_MAX_BITS)."),
         ],
         Some(&m),
     )?;

@@ -449,7 +449,7 @@ pub fn round_from_obj(v: &PyObject) -> PyResult<Round> {
     }
     raise!(
         TypeError,
-        "valid values for rounding are:\n  [ROUND_CEILING, ROUND_FLOOR, ROUND_UP, ROUND_DOWN,\n   ROUND_HALF_UP, ROUND_HALF_DOWN, ROUND_HALF_EVEN,\n   ROUND_05UP]"
+        "rounding must be one of the ROUND_* string constants"
     );
 }
 
@@ -714,7 +714,7 @@ fn ctx_radix(_o: &PyObject) -> PyResult {
 fn ctx_unsafe_setprec(o: &PyObject, v: &PyObject) -> PyResult {
     let x = int_arg(v)?;
     if !(1..=MAX_PREC).contains(&x) {
-        raise!(ValueError, "valid range for unsafe prec is [1, 1070000000]");
+        raise!(ValueError, "prec out of range");
     }
     cobj_mut(o).prec = x;
     Ok(none::none_ref())
@@ -722,7 +722,7 @@ fn ctx_unsafe_setprec(o: &PyObject, v: &PyObject) -> PyResult {
 fn ctx_unsafe_setemin(o: &PyObject, v: &PyObject) -> PyResult {
     let x = int_arg(v)?;
     if !(MIN_EMIN..=0).contains(&x) {
-        raise!(ValueError, "valid range for unsafe emin is [-1070000000, 0]");
+        raise!(ValueError, "Emin out of range");
     }
     cobj_mut(o).emin = x;
     Ok(none::none_ref())
@@ -730,7 +730,7 @@ fn ctx_unsafe_setemin(o: &PyObject, v: &PyObject) -> PyResult {
 fn ctx_unsafe_setemax(o: &PyObject, v: &PyObject) -> PyResult {
     let x = int_arg(v)?;
     if !(0..=MAX_EMAX).contains(&x) {
-        raise!(ValueError, "valid range for unsafe emax is [0, 1070000000]");
+        raise!(ValueError, "Emax out of range");
     }
     cobj_mut(o).emax = x;
     Ok(none::none_ref())
@@ -1086,7 +1086,7 @@ pub fn init_types() -> PyResult<()> {
         t.tp_getattro = Some(object_generic_getattro);
         t.tp_setattro = Some(object_generic_setattro);
         let _ = &raw const CTX_DOC;
-        t.tp_doc = c"Context(prec=None, rounding=None, Emin=None, Emax=None, capitals=None, clamp=None, flags=None, traps=None)\n--\n\nThe context affects almost all operations and controls rounding,\nOver/Underflow, raising of exceptions and much more.  A new context\ncan be constructed as follows:\n\n    >>> c = Context(prec=28, Emin=-425000000, Emax=425000000,\n    ...             rounding=ROUND_HALF_EVEN, capitals=1, clamp=1,\n    ...             traps=[InvalidOperation, DivisionByZero, Overflow],\n    ...             flags=[])\n    >>>\n\n".as_ptr();
+        t.tp_doc = c"Context(prec=None, rounding=None, Emin=None, Emax=None, capitals=None, clamp=None, flags=None, traps=None)\n--\n\nArithmetic settings: precision, rounding mode, exponent range, exponent\nclamping and the output case of the exponent letter, together with the\nsticky status flags and the set of signals that raise (traps).  Arguments\nleft as None are taken from DefaultContext.".as_ptr();
         t.tp_getset = crate::getset_table![
             ("prec", g_prec, s_prec),
             ("Emax", g_emax, s_emax),
@@ -1099,12 +1099,12 @@ pub fn init_types() -> PyResult<()> {
         ];
         let mut methods = super::py_dec::context_methods();
         methods.extend(vec![
-            crate::methods::def("Etiny", crate::methods::noargs(ctx_etiny), METH_NOARGS, "Etiny($self, /)\n--\n\nReturn a value equal to Emin - prec + 1, which is the minimum exponent value\nfor subnormal results.  When underflow occurs, the exponent is set to Etiny.\n"),
-            crate::methods::def("Etop", crate::methods::noargs(ctx_etop), METH_NOARGS, "Etop($self, /)\n--\n\nReturn a value equal to Emax - prec + 1.  This is the maximum exponent\nif the _clamp field of the context is set to 1 (IEEE clamp mode).  Etop()\nmust not be negative.\n"),
-            crate::methods::def("radix", crate::methods::noargs(ctx_radix), METH_NOARGS, "radix($self, /)\n--\n\nReturn 10.\n"),
-            crate::methods::def("clear_flags", crate::methods::noargs(ctx_clear_flags), METH_NOARGS, "clear_flags($self, /)\n--\n\nReset all flags to False.\n"),
-            crate::methods::def("clear_traps", crate::methods::noargs(ctx_clear_traps), METH_NOARGS, "clear_traps($self, /)\n--\n\nSet all traps to False.\n"),
-            crate::methods::def("copy", crate::methods::noargs(ctx_copy), METH_NOARGS, "copy($self, /)\n--\n\nReturn a duplicate of the context with all flags cleared.\n"),
+            crate::methods::def("Etiny", crate::methods::noargs(ctx_etiny), METH_NOARGS, "Etiny($self, /)\n--\n\nSmallest exponent of a subnormal number: Emin - prec + 1."),
+            crate::methods::def("Etop", crate::methods::noargs(ctx_etop), METH_NOARGS, "Etop($self, /)\n--\n\nLargest exponent of a clamped number: Emax - prec + 1."),
+            crate::methods::def("radix", crate::methods::noargs(ctx_radix), METH_NOARGS, "radix($self, /)\n--\n\nDecimal(10)."),
+            crate::methods::def("clear_flags", crate::methods::noargs(ctx_clear_flags), METH_NOARGS, "clear_flags($self, /)\n--\n\nSet every flag to False."),
+            crate::methods::def("clear_traps", crate::methods::noargs(ctx_clear_traps), METH_NOARGS, "clear_traps($self, /)\n--\n\nSet every trap to False."),
+            crate::methods::def("copy", crate::methods::noargs(ctx_copy), METH_NOARGS, "copy($self, /)\n--\n\nA new context with the same settings, flags and traps."),
             crate::methods::def("__copy__", crate::methods::noargs(ctx_copy), METH_NOARGS, ""),
             crate::methods::def("__reduce__", crate::methods::noargs(ctx_reduce), METH_NOARGS, ""),
             crate::methods::def("_unsafe_setprec", crate::methods::o(ctx_unsafe_setprec), METH_O, ""),
@@ -1151,7 +1151,7 @@ pub fn init_types() -> PyResult<()> {
         t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_DISALLOW_INSTANTIATION;
         t.tp_dealloc = Some(mgr_dealloc);
         t.tp_getattro = Some(object_generic_getattro);
-        t.tp_doc = c"Context manager class to support localcontext().".as_ptr();
+        t.tp_doc = c"Object returned by localcontext(); installs a context for a with-block.".as_ptr();
         t.tp_methods = crate::mdefs![
             ("__enter__", NOARGS, mgr_enter),
             ("__exit__", FAST, mgr_exit),
@@ -1179,20 +1179,20 @@ pub fn init_state() -> PyResult<()> {
     let arith = type_ref(ex::ArithmeticError());
     let zde = type_ref(ex::ZeroDivisionError());
     let te = type_ref(ex::TypeError());
-    let de = make_exc("DecimalException", vec![arith], "Base exception class.\n\nUsed exceptions derive from this.\nIf an exception derives from another exception besides this (such as\nUnderflow (Inexact, Rounded, Subnormal)) that indicates that it is only\ncalled if the others are present.  This isn't actually used for\nanything, though.\n")?;
-    let clamped = make_exc("Clamped", vec![de.clone()], "Exponent of a 0 changed to fit bounds.\n")?;
-    let inv = make_exc("InvalidOperation", vec![de.clone()], "An invalid operation was performed.\n")?;
-    let conv = make_exc("ConversionSyntax", vec![inv.clone()], "Trying to convert badly formed string.\n")?;
-    let dbz = make_exc("DivisionByZero", vec![de.clone(), zde.clone()], "Division by 0.\n")?;
-    let dimp = make_exc("DivisionImpossible", vec![inv.clone()], "Cannot perform the division adequately.\n")?;
-    let dund = make_exc("DivisionUndefined", vec![inv.clone(), zde], "Undefined result of division.\n")?;
-    let inexact = make_exc("Inexact", vec![de.clone()], "Had to round, losing information.\n")?;
-    let ictx = make_exc("InvalidContext", vec![inv.clone()], "Invalid context.  Unknown rounding, for example.\n")?;
-    let rounded = make_exc("Rounded", vec![de.clone()], "Number got rounded (not  necessarily changed during rounding).\n")?;
-    let subn = make_exc("Subnormal", vec![de.clone()], "Exponent < Emin before rounding.\n")?;
-    let ovf = make_exc("Overflow", vec![inexact.clone(), rounded.clone()], "Numerical overflow.\n")?;
-    let unf = make_exc("Underflow", vec![inexact.clone(), rounded.clone(), subn.clone()], "Numerical underflow with result rounded to 0.\n")?;
-    let fop = make_exc("FloatOperation", vec![de.clone(), te], "Enable stricter semantics for mixing floats and Decimals.\n")?;
+    let de = make_exc("DecimalException", vec![arith], "Root of the decimal signal hierarchy; derives from ArithmeticError.")?;
+    let clamped = make_exc("Clamped", vec![de.clone()], "Signal: an exponent was adjusted to fit the context limits.")?;
+    let inv = make_exc("InvalidOperation", vec![de.clone()], "Signal: the operation has no meaningful result (the result is NaN).")?;
+    let conv = make_exc("ConversionSyntax", vec![inv.clone()], "Condition (a kind of InvalidOperation): a string is not a valid number.")?;
+    let dbz = make_exc("DivisionByZero", vec![de.clone(), zde.clone()], "Signal: a finite nonzero number was divided by zero.")?;
+    let dimp = make_exc("DivisionImpossible", vec![inv.clone()], "Condition (a kind of InvalidOperation): an integer quotient does not fit the precision.")?;
+    let dund = make_exc("DivisionUndefined", vec![inv.clone(), zde], "Condition (a kind of InvalidOperation): zero divided by zero.")?;
+    let inexact = make_exc("Inexact", vec![de.clone()], "Signal: the result was rounded and some nonzero digits were lost.")?;
+    let ictx = make_exc("InvalidContext", vec![inv.clone()], "Condition (a kind of InvalidOperation): the context settings are unusable.")?;
+    let rounded = make_exc("Rounded", vec![de.clone()], "Signal: digits were removed from the result (possibly only zeros).")?;
+    let subn = make_exc("Subnormal", vec![de.clone()], "Signal: the result's adjusted exponent is below Emin.")?;
+    let ovf = make_exc("Overflow", vec![inexact.clone(), rounded.clone()], "Signal: the result's magnitude exceeds the largest finite number of the context.")?;
+    let unf = make_exc("Underflow", vec![inexact.clone(), rounded.clone(), subn.clone()], "Signal: a subnormal result was also inexact.")?;
+    let fop = make_exc("FloatOperation", vec![de.clone(), te], "Signal: a float was mixed with Decimals (construction or ordering comparison).")?;
     let round_str: Vec<PyRef> = Round::ALL.iter().map(|r| pystr::intern_str(r.name())).collect();
     let default_ctx = new_context(28, Round::HalfEven, -999999, 999999, 1, 0, 0, IEEE_INVALID | DIVISION_BY_ZERO | OVERFLOW)?;
     let basic_ctx = new_context(9, Round::HalfUp, -999999, 999999, 1, 0, 0, IEEE_INVALID | DIVISION_BY_ZERO | OVERFLOW | UNDERFLOW | CLAMPED)?;

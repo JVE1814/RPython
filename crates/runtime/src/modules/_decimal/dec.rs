@@ -477,63 +477,67 @@ pub fn parse(s: &[u8]) -> Option<Dec> {
 
 /// to-scientific-string / to-engineering-string.
 pub fn to_string(d: &Dec, eng: bool, capitals: bool) -> String {
-    let mut out = String::new();
-    if d.neg {
-        out.push('-');
-    }
+    let sign = if d.neg { "-" } else { "" };
     match d.kind {
-        Kind::Inf => {
-            out.push_str("Infinity");
-            return out;
-        }
+        Kind::Inf => return format!("{sign}Infinity"),
         Kind::NaN | Kind::SNaN => {
-            if d.kind == Kind::SNaN {
-                out.push('s');
-            }
-            out.push_str("NaN");
-            if !d.coef.is_empty() {
-                out.push_str(&nat::to_string(&d.coef));
-            }
-            return out;
+            let s = if d.kind == Kind::SNaN { "s" } else { "" };
+            let payload = if d.coef.is_empty() { String::new() } else { nat::to_string(&d.coef) };
+            return format!("{sign}{s}NaN{payload}");
         }
         Kind::Finite => {}
     }
     let digits = nat::to_string(&d.coef);
-    let nd = digits.len() as i128;
+    let n = digits.len() as i128;
     let exp = d.exp as i128;
-    let leftdigits = exp + nd; // digits to the left of the point in plain notation
-    let dotplace: i128 = if exp <= 0 && leftdigits > -6 {
-        leftdigits
-    } else if !eng {
-        1
+    let adj = exp + n - 1;
+    let mut body = String::with_capacity(digits.len() + 8);
+    // Plain notation: no exponent needed and not too many leading zeros.
+    if exp <= 0 && adj >= -6 {
+        let int_len = n + exp; // digits in front of the point
+        if exp == 0 {
+            body.push_str(&digits);
+        } else if int_len > 0 {
+            body.push_str(&digits[..int_len as usize]);
+            body.push('.');
+            body.push_str(&digits[int_len as usize..]);
+        } else {
+            body.push_str("0.");
+            body.extend(std::iter::repeat_n('0', (-int_len) as usize));
+            body.push_str(&digits);
+        }
+        return format!("{sign}{body}");
+    }
+    // Exponential notation: `lead` digits in front of the point, exponent `shown`.
+    let (lead, shown, zero_frac): (i128, i128, i128) = if !eng {
+        (1, adj, 0)
     } else if d.coef.is_empty() {
-        (leftdigits + 1).rem_euclid(3) - 1
+        // a zero keeps its exponent's value: raise the exponent to a multiple of
+        // three and show the difference as zeros after the point
+        let up = (3 - exp.rem_euclid(3)) % 3;
+        (1, exp + up, up)
     } else {
-        (leftdigits - 1).rem_euclid(3) + 1
+        let e3 = adj.div_euclid(3) * 3;
+        (adj - e3 + 1, e3, 0)
     };
-    if dotplace <= 0 {
-        out.push_str("0.");
-        for _ in 0..(-dotplace) {
-            out.push('0');
-        }
-        out.push_str(&digits);
-    } else if dotplace >= nd {
-        out.push_str(&digits);
-        for _ in 0..(dotplace - nd) {
-            out.push('0');
-        }
+    if lead >= n {
+        body.push_str(&digits);
+        body.extend(std::iter::repeat_n('0', (lead - n) as usize));
     } else {
-        out.push_str(&digits[..dotplace as usize]);
-        out.push('.');
-        out.push_str(&digits[dotplace as usize..]);
+        body.push_str(&digits[..lead as usize]);
+        body.push('.');
+        body.push_str(&digits[lead as usize..]);
     }
-    if leftdigits != dotplace {
-        out.push(if capitals { 'E' } else { 'e' });
-        let e = leftdigits - dotplace;
-        if e >= 0 {
-            out.push('+');
+    if zero_frac > 0 {
+        body.push('.');
+        body.extend(std::iter::repeat_n('0', zero_frac as usize));
+    }
+    if shown != 0 {
+        body.push(if capitals { 'E' } else { 'e' });
+        if shown > 0 {
+            body.push('+');
         }
-        out.push_str(&e.to_string());
+        body.push_str(&shown.to_string());
     }
-    out
+    format!("{sign}{body}")
 }

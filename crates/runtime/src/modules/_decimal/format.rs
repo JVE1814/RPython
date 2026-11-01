@@ -145,17 +145,16 @@ pub fn parse_spec(spec: &str, allow_upper_n: bool) -> Result<Spec, String> {
     Ok(s)
 }
 
-/// Round finite d to n significant digits.
 pub fn round_sig(d: &Dec, n: usize, round: Round) -> Dec {
-    if d.is_zero() || !d.is_finite() {
+    if !d.is_finite() || d.is_zero() {
         return d.clone();
     }
-    let adj = d.adjusted() as i128;
-    let e = (adj + 1 - n as i128) as i64;
-    let (r, _) = rescale_raw(d, e, round);
-    if r.adjusted() as i128 != adj {
-        let e2 = (r.adjusted() as i128 + 1 - n as i128) as i64;
-        return rescale_raw(&r, e2, round).0;
+    let target = d.adjusted() as i128 - n as i128 + 1;
+    let (mut r, _) = rescale_raw(d, target as i64, round);
+    // rounding up 99..9 yields 10..0 with one digit too many; that digit is a zero
+    if nat::digits(&r.coef) as usize > n {
+        r.coef = nat::shr_trunc(&r.coef, 1);
+        r.exp += 1;
     }
     r
 }
@@ -167,79 +166,84 @@ fn rescale(d: &Dec, exp: i64, round: Round) -> Dec {
     rescale_raw(d, exp, round).0
 }
 
-fn group_lengths(grouping: &[u32]) -> Vec<Option<usize>> {
-    // Some(n): group of n; None: rest ungrouped. Produces a finite prefix; the last
-    // entry repeats if the list ends with 0 or ends normally.
-    let mut v = Vec::new();
-    for (i, &g) in grouping.iter().enumerate() {
-        if g == 0 {
-            if i > 0 {
-                v.push(Some(usize::MAX)); // marker: repeat previous
-            }
-            return v;
-        }
-        if g >= CHAR_MAX {
-            v.push(None);
-            return v;
-        }
-        v.push(Some(g as usize));
-    }
-    if !v.is_empty() {
-        v.push(Some(usize::MAX));
-    }
-    v
-}
-
-/// Insert separators into the integer digits, zero-padding to min_width.
-fn insert_sep(digits: &str, sep: &str, grouping: &[u32], min_width: isize) -> String {
-    let mut digits: Vec<char> = digits.chars().collect();
-    let mut min_width = min_width;
-    let mut groups: Vec<String> = Vec::new();
-    let lengths = group_lengths(grouping);
-    let seplen = sep.chars().count() as isize;
-    let mut idx = 0;
-    let mut prev = 0usize;
-    let mut finished = false;
-    loop {
-        if idx >= lengths.len() {
-            break;
-        }
-        let gl = match lengths[idx] {
-            None => break,
-            Some(usize::MAX) => prev,
-            Some(n) => {
-                idx += 1;
-                n
+/// Group sizes (least significant first) for `n` integer digits under a
+/// localeconv()-style grouping: an entry >= CHAR_MAX ends grouping, 0 or the end
+/// of the list repeats the previous size; an empty list means no grouping.
+fn group_sizes(n: usize, grouping: &[u32]) -> Vec<usize> {
+    let mut sizes = Vec::new();
+    let mut remaining = n;
+    let mut repeat: Option<usize> = None;
+    let mut pos = 0;
+    let mut frozen = false;
+    while remaining > 0 {
+        let size = if frozen || pos >= grouping.len() {
+            repeat.unwrap_or(remaining)
+        } else {
+            let g = grouping[pos];
+            pos += 1;
+            if g >= CHAR_MAX {
+                repeat = None;
+                frozen = true;
+                remaining
+            } else if g == 0 {
+                frozen = true;
+                repeat.unwrap_or(remaining)
+            } else {
+                repeat = Some(g as usize);
+                g as usize
             }
         };
-        prev = gl;
-        let l = gl.min((digits.len() as isize).max(min_width).max(1) as usize);
-        let take = l.min(digits.len());
-        let tail: String = digits[digits.len() - take..].iter().collect();
-        let mut g = "0".repeat(l - take);
-        g.push_str(&tail);
-        groups.push(g);
-        digits.truncate(digits.len() - take);
-        min_width -= l as isize;
-        if digits.is_empty() && min_width <= 0 {
-            finished = true;
-            break;
-        }
-        min_width -= seplen;
+        let take = size.min(remaining).max(1);
+        sizes.push(take);
+        remaining -= take;
     }
-    if !finished {
-        let l = (digits.len() as isize).max(min_width).max(1) as usize;
-        let s: String = digits.iter().collect();
-        let mut g = "0".repeat(l - digits.len());
-        g.push_str(&s);
-        groups.push(g);
+    if sizes.is_empty() {
+        sizes.push(0);
     }
-    groups.reverse();
-    groups.join(sep)
+    sizes
 }
 
+fn grouped_len(n: usize, grouping: &[u32], seplen: usize) -> usize {
+    n + seplen * (group_sizes(n, grouping).len() - 1)
+}
+
+/// Integer digits with separators, left-padded with zeros so that the result
+/// is at least `min_width` characters long.
+fn group_int(digits: &str, sep: &str, grouping: &[u32], min_width: usize) -> String {
+    let seplen = sep.chars().count();
+    let n = digits.len();
+    let mut pad = 0usize;
+    if grouped_len(n, grouping, seplen) < min_width {
+        // smallest pad reaching the width (the length grows monotonically with pad)
+        let (mut lo, mut hi) = (1usize, min_width);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if grouped_len(n + mid, grouping, seplen) >= min_width {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        pad = lo;
+    }
+    let all: Vec<u8> = std::iter::repeat_n(b'0', pad).chain(digits.bytes()).collect();
+    if sep.is_empty() {
+        return String::from_utf8(all).unwrap();
+    }
+    let sizes = group_sizes(all.len(), grouping);
+    let mut parts: Vec<&str> = Vec::with_capacity(sizes.len());
+    let mut end = all.len();
+    for s in sizes {
+        parts.push(std::str::from_utf8(&all[end - s..end]).unwrap());
+        end -= s;
+    }
+    parts.reverse();
+    parts.join(sep)
+}
+
+/// Fraction digits with a separator after every third digit.
 fn group_frac(frac: &str, sep: char) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(frac.len() + frac.len() / 3);
     for (i, c) in frac.chars().enumerate() {
         if i > 0 && i % 3 == 0 {
             out.push(sep);
@@ -249,142 +253,142 @@ fn group_frac(frac: &str, sep: char) -> String {
     out
 }
 
-fn align(sign: &str, body: &str, s: &Spec) -> String {
-    let len = sign.chars().count() + body.chars().count();
-    let padn = s.width.saturating_sub(len);
-    let pad: String = std::iter::repeat_n(s.fill, padn).collect();
+fn pad_to_width(sign: &str, body: &str, s: &Spec) -> String {
+    let used = sign.chars().count() + body.chars().count();
+    let missing = s.width.saturating_sub(used);
+    let fill = |k: usize| -> String { std::iter::repeat_n(s.fill, k).collect() };
     match s.align {
-        '<' => format!("{sign}{body}{pad}"),
-        '=' => format!("{sign}{pad}{body}"),
-        '^' => {
-            let half = padn / 2;
-            let (a, b): (String, String) = (std::iter::repeat_n(s.fill, half).collect(), std::iter::repeat_n(s.fill, padn - half).collect());
-            format!("{a}{sign}{body}{b}")
-        }
-        _ => format!("{pad}{sign}{body}"),
+        '<' => format!("{sign}{body}{}", fill(missing)),
+        '=' => format!("{sign}{}{body}", fill(missing)),
+        '^' => format!("{}{sign}{body}{}", fill(missing / 2), fill(missing - missing / 2)),
+        _ => format!("{}{sign}{body}", fill(missing)),
     }
 }
 
-fn sign_str(neg: bool, s: &Spec) -> &'static str {
-    if neg {
-        "-"
-    } else {
-        match s.sign {
-            '+' => "+",
-            ' ' => " ",
-            _ => "",
-        }
+fn sign_text(neg: bool, s: &Spec) -> &'static str {
+    match (neg, s.sign) {
+        (true, _) => "-",
+        (false, '+') => "+",
+        (false, ' ') => " ",
+        _ => "",
     }
 }
 
 /// Format `d` according to the parsed spec. `locale` is required for type 'n'.
 pub fn format_dec(d: &Dec, spec: &Spec, capitals: bool, round: Round, locale: Option<&LocaleInfo>) -> String {
     let mut s = spec.clone();
-    let upper_n = s.ty == Some('N');
-    if upper_n {
+    let upper = s.ty == Some('N');
+    if upper {
         s.ty = Some('n');
     }
-    let r = format_inner(d, &mut s, capitals, round, locale);
-    if upper_n { r.to_uppercase() } else { r }
+    let out = format_inner(d, &s, capitals, round, locale);
+    if upper { out.to_uppercase() } else { out }
 }
 
-fn format_inner(d: &Dec, s: &mut Spec, capitals: bool, round: Round, locale: Option<&LocaleInfo>) -> String {
+/// Digits laid out as integer part, fraction part and optional exponent.
+struct Layout {
+    int: String,
+    frac: String,
+    exp: Option<i128>,
+}
+
+fn layout_fixed(digits: &str, exp: i128) -> Layout {
+    let n = digits.len() as i128;
+    if exp >= 0 {
+        let mut int = digits.to_string();
+        int.extend(std::iter::repeat_n('0', exp as usize));
+        return Layout { int, frac: String::new(), exp: None };
+    }
+    let k = n + exp;
+    if k > 0 {
+        Layout { int: digits[..k as usize].to_string(), frac: digits[k as usize..].to_string(), exp: None }
+    } else {
+        let mut frac: String = std::iter::repeat_n('0', (-k) as usize).collect();
+        frac.push_str(digits);
+        Layout { int: "0".into(), frac, exp: None }
+    }
+}
+
+fn layout_sci(digits: &str, adj: i128) -> Layout {
+    Layout { int: digits[..1].to_string(), frac: digits[1..].to_string(), exp: Some(adj) }
+}
+
+fn format_inner(d: &Dec, s: &Spec, capitals: bool, round: Round, locale: Option<&LocaleInfo>) -> String {
     if !d.is_finite() {
-        let sign = sign_str(d.neg, s);
         let mut body = to_string(&d.abs(), false, true);
         if s.ty == Some('%') {
             body.push('%');
         }
-        return align(sign, &body, s);
+        return pad_to_width(sign_text(d.neg, s), &body, s);
     }
     let ty = s.ty.unwrap_or(if capitals { 'G' } else { 'g' });
-    let (dp, tsep, grouping): (String, String, Vec<u32>) = if ty == 'n' {
-        let l = locale.cloned().unwrap_or(LocaleInfo { decimal_point: ".".into(), thousands_sep: "".into(), grouping: vec![] });
-        (l.decimal_point, l.thousands_sep, l.grouping)
-    } else {
-        match s.thousands_sep {
-            Some(c) => (".".into(), c.to_string(), vec![3, 0]),
-            None => (".".into(), "".into(), vec![]),
-        }
-    };
+    let fixed_kind = matches!(ty, 'f' | 'F' | '%');
     let mut x = d.clone();
     if ty == '%' {
         x.exp += 2;
     }
     if let Some(p) = s.precision {
-        match ty {
-            'e' | 'E' => x = round_sig(&x, p + 1, round),
-            'f' | 'F' | '%' => x = rescale(&x, -(p as i64), round),
-            'g' | 'G' | 'n' => {
-                if nat::digits(&x.coef) as usize > p {
-                    x = round_sig(&x, p, round);
-                }
-            }
-            _ => {}
-        }
+        x = match ty {
+            'e' | 'E' => round_sig(&x, p + 1, round),
+            'f' | 'F' | '%' => rescale(&x, -(p as i64), round),
+            _ if nat::digits(&x.coef) as usize > p => round_sig(&x, p, round),
+            _ => x,
+        };
     }
-    if x.is_zero() && x.exp > 0 && matches!(ty, 'f' | 'F' | '%') {
+    if fixed_kind && x.is_zero() && x.exp > 0 {
         x = rescale(&x, 0, round);
     }
-    let neg = if x.is_zero() && s.no_neg_0 { false } else { x.neg };
-    // a value that rounds to zero is a zero for the 'z' option too
-    let neg = if s.no_neg_0 && x.coef.is_empty() { false } else { neg };
-    let digits = if x.coef.is_empty() { "0".to_string() } else { nat::to_string(&x.coef) };
-    let nd = digits.len() as i128;
-    let leftdigits = x.exp as i128 + nd;
-    let dotplace: i128 = match ty {
-        'e' | 'E' => {
-            if x.is_zero() && s.precision.is_some() {
-                1 - s.precision.unwrap() as i128
-            } else {
-                1
+    let neg = x.neg && !(s.no_neg_0 && x.coef.is_empty());
+    let digits = nat::to_string(&x.coef);
+    let exp = x.exp as i128;
+    let adj = exp + digits.len() as i128 - 1;
+    let lay = match ty {
+        'e' | 'E' => match s.precision {
+            Some(p) if x.is_zero() => {
+                Layout { int: "0".into(), frac: "0".repeat(p), exp: Some(exp + p as i128) }
             }
-        }
-        'f' | 'F' | '%' => leftdigits,
+            _ => layout_sci(&digits, adj),
+        },
+        'f' | 'F' | '%' => layout_fixed(&digits, exp),
         _ => {
-            if x.exp <= 0 && leftdigits > -6 {
-                leftdigits
+            if exp <= 0 && adj >= -6 {
+                layout_fixed(&digits, exp)
             } else {
-                1
+                layout_sci(&digits, adj)
             }
         }
     };
-    let (intpart, fracpart) = if dotplace < 0 {
-        ("0".to_string(), format!("{}{}", "0".repeat((-dotplace) as usize), digits))
-    } else if dotplace > nd {
-        (format!("{}{}", digits, "0".repeat((dotplace - nd) as usize)), String::new())
+    let (point, tsep, grouping): (String, String, Vec<u32>) = if ty == 'n' {
+        let l = locale.cloned().unwrap_or(LocaleInfo { decimal_point: ".".into(), thousands_sep: "".into(), grouping: vec![] });
+        (l.decimal_point, l.thousands_sep, l.grouping)
+    } else if let Some(c) = s.thousands_sep {
+        (".".into(), c.to_string(), vec![3])
     } else {
-        let ip = &digits[..dotplace as usize];
-        (if ip.is_empty() { "0".to_string() } else { ip.to_string() }, digits[dotplace as usize..].to_string())
+        (".".into(), String::new(), vec![])
     };
-    let exp = leftdigits - dotplace;
-    let sign = sign_str(neg, s);
-    let mut frac = String::new();
-    if !fracpart.is_empty() || s.alt {
-        frac.push_str(&dp);
+    let mut tail = String::new();
+    if !lay.frac.is_empty() || s.alt {
+        tail.push_str(&point);
         match s.frac_sep {
-            Some(c) => frac.push_str(&group_frac(&fracpart, c)),
-            None => frac.push_str(&fracpart),
+            Some(c) => tail.push_str(&group_frac(&lay.frac, c)),
+            None => tail.push_str(&lay.frac),
         }
     }
-    if exp != 0 || matches!(ty, 'e' | 'E') {
-        let echar = match ty {
-            'E' | 'G' => 'E',
-            _ => 'e',
-        };
-        frac.push(echar);
-        frac.push_str(&format!("{}{}", if exp >= 0 { "+" } else { "-" }, exp.abs()));
+    if let Some(e) = lay.exp {
+        if e != 0 || matches!(ty, 'e' | 'E') {
+            tail.push(if matches!(ty, 'E' | 'G') { 'E' } else { 'e' });
+            tail.push(if e < 0 { '-' } else { '+' });
+            tail.push_str(&e.abs().to_string());
+        }
     }
     if ty == '%' {
-        frac.push('%');
+        tail.push('%');
     }
-    let min_width = if s.zeropad && s.fill == '0' && s.align == '=' {
-        s.width as isize - frac.chars().count() as isize - sign.len() as isize
-    } else {
-        0
-    };
-    let ip = insert_sep(&intpart, &tsep, &grouping, min_width);
-    align(sign, &format!("{ip}{frac}"), s)
+    let sign = sign_text(neg, s);
+    let zero_fill = s.zeropad && s.fill == '0' && s.align == '=';
+    let min_int = if zero_fill { s.width.saturating_sub(tail.chars().count() + sign.len()) } else { 0 };
+    let int = group_int(&lay.int, &tsep, &grouping, min_int);
+    pad_to_width(sign, &format!("{int}{tail}"), s)
 }
 
 #[cfg(test)]
