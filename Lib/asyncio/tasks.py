@@ -407,11 +407,16 @@ async def _cancel_and_wait(fut):
     finished = loop.create_future()
     notify = functools.partial(_release_waiter, finished)
     fut.add_done_callback(notify)
+    me = current_task(loop)
+    if me is not None:
+        futures.future_add_to_awaited_by(fut, me)
     try:
         fut.cancel()
         await finished
     finally:
         fut.remove_done_callback(notify)
+        if me is not None:
+            futures.future_discard_from_awaited_by(fut, me)
 
 
 async def wait_for(fut, timeout):
