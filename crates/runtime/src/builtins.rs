@@ -739,6 +739,7 @@ pub fn init() -> PyResult<PyRef> {
     for (n, t) in crate::types::builtin_types() {
         set(n, type_obj(t))?;
     }
+    crate::types::genericalias::register_late_class_getitems(&d);
     Ok(m)
 }
 
