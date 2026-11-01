@@ -109,6 +109,10 @@ _copy_atomic_types = frozenset({
     types.NotImplementedType, types.FunctionType, types.CodeType,
     weakref.ref, super,
 })
+try:
+    _copy_atomic_types |= {frozendict}
+except NameError:
+    pass
 _copy_builtin_containers = frozenset({list, dict, set, bytearray})
 
 
@@ -213,6 +217,25 @@ def _deepcopy_dict(x, memo, deepcopy=deepcopy):
         y[deepcopy(key, memo)] = deepcopy(value, memo)
     return y
 d[dict] = _deepcopy_dict
+
+
+try:
+    _frozendict = frozendict
+except NameError:
+    pass
+else:
+    def _deepcopy_frozendict(x, memo, deepcopy=deepcopy):
+        y = [(deepcopy(key, memo), deepcopy(value, memo))
+             for key, value in x.items()]
+        # Like tuples, frozendicts are not memoized before their items are
+        # copied: a recursive reference must be resolved through the memo.
+        try:
+            return memo[id(x)]
+        except KeyError:
+            pass
+        return type(x)(y)
+    d[_frozendict] = _deepcopy_frozendict
+    del _frozendict
 
 
 def _deepcopy_method(x, memo):  # Copy instance methods
