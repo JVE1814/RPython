@@ -382,20 +382,6 @@ impl ThreadState {
     }
 }
 
-/// Run a potentially blocking operation (syscall, lock wait, sleep) with the thread
-/// marked as Blocked so stop-the-world operations (GC safepoints) don't wait for it.
-/// On return the thread polls the safepoint before touching Python objects again.
-pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
-    let ts = current();
-    let prev = ts.mode.get();
-    ts.mode.set(ThreadMode::Blocked);
-    let r = f();
-    ts.mode.set(prev);
-    if prev == ThreadMode::InVm && ts.c.eval_breaker.load(std::sync::atomic::Ordering::Acquire) & EVAL_SAFEPOINT != 0 {
-        crate::gc::safepoint_poll(ts);
-    }
-    r
-}
 
 /// Thread mode readable from other threads (stop-the-world coordination).
 pub struct ModeCell(pub std::sync::atomic::AtomicU8);
@@ -411,5 +397,11 @@ impl ModeCell {
     #[inline]
     pub fn set(&self, m: ThreadMode) {
         self.0.store(m as u8, std::sync::atomic::Ordering::Release)
+    }
+    #[inline]
+    pub fn replace(&self, m: ThreadMode) -> ThreadMode {
+        let old = self.get();
+        self.set(m);
+        old
     }
 }

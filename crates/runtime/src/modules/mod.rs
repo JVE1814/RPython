@@ -7,17 +7,12 @@ pub mod sys;
 pub mod thread;
 pub mod traceback_util;
 pub mod warnings;
-pub mod _warnings;
 pub mod sys_full;
 pub mod sys_trace;
 pub mod traceback_print;
 pub mod ast_bridge;
 pub mod os_fspath;
 pub mod sys_trace_api;
-pub mod sys_structseq;
-pub mod sys_namespace;
-pub mod _thread;
-pub mod pymain;
 pub mod codecs_core;
 pub mod codecs_registry;
 pub mod reprlib_guard;
@@ -35,6 +30,12 @@ pub mod itertools;
 pub mod builtins_numbers;
 pub mod math;
 pub mod numbers_registry;
+pub mod cmath;
+pub mod _warnings;
+pub mod sys_structseq;
+pub mod sys_namespace;
+pub mod _thread;
+pub mod pymain;
 pub mod text_util;
 pub mod _sre;
 
@@ -45,10 +46,9 @@ pub fn register_all() {
     crate::import::register_builtin("_stat", stat_mod::init);
     crate::import::register_builtin("time", time::init);
     functional::register();
-}
     numbers_registry::register();
     crate::import::register_builtin("_warnings", _warnings::init_module);
     sys_full::register_system_modules();
-
     text_util::register();
     crate::import::register_builtin("_typing", crate::types::typevar::make_typing_module);
+}
