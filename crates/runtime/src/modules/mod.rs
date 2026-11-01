@@ -33,6 +33,7 @@ pub mod _abc;
 pub mod itertools;
 pub mod _collections;
 pub mod _types;
+pub mod _asyncio;
 pub mod _heapq;
 pub mod _bisect;
 pub mod atexit;
@@ -100,6 +101,7 @@ pub fn register_all() {
     text_util::register();
     crate::import::register_builtin("_typing", crate::types::typevar::make_typing_module);
     crate::import::register_builtin("_socket", _socket::init);
+    crate::import::register_builtin("_asyncio", _asyncio::init_module);
     crate::import::register_builtin("_posixsubprocess", _posixsubprocess::init);
     devtools::register();
     crate::import::register_builtin("_json", _json::init_module);
