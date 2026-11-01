@@ -270,4 +270,5 @@ pub fn register() {
     use crate::import::register_builtin;
     register_builtin("_sre", crate::modules::_sre::init_module);
     register_builtin("_codecs", crate::modules::_codecs::init_module);
+    register_builtin("unicodedata", crate::modules::unicodedata::init_module);
 }
