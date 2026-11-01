@@ -340,8 +340,17 @@ fn load_global(f: &Frame, nm: &PyObject) -> PyResult {
         if let Some(v) = dict::get_item_str(g, nm) {
             return Ok(v);
         }
-    } else if let Some(v) = dict::get_item(g, nm)? {
-        return Ok(v);
+    } else {
+        // dict subclass: go through __getitem__ (honours __missing__)
+        match ab::getitem(g, nm) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if !exc_matches(exc::KeyError()) {
+                    return Err(e);
+                }
+                clear_exc();
+            }
+        }
     }
     let b = f.builtins();
     if dict::is_dict_exact(b) {
