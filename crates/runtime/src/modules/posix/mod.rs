@@ -112,6 +112,10 @@ fn build_environ() -> PyResult {
     Ok(d)
 }
 
+fn os_create_environ(_m: &PyObject) -> PyResult {
+    build_environ()
+}
+
 // ------------------------------------------------------------------ sysconf & co.
 
 const SYSCONF_NAMES: &[(&str, i32)] = &[
@@ -344,6 +348,33 @@ fn os_path_normpath(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) ->
     } else {
         Ok(pystr::from_codepoints(&out))
     }
+}
+
+/// posix._path_splitroot_ex(p) -> (drive, root, tail)
+fn os_path_splitroot_ex(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
+    let [p] = kwparse::<1>("_path_splitroot_ex", &["p"], 0, 1, 0, args, kw)?;
+    let p = p.unwrap();
+    let p = if pystr::is_str(p) || bytes::is_bytes(p) { p.to_ref() } else { fspath(p)? };
+    let narrow = bytes::is_bytes(&p);
+    let n = if narrow { bytes::bytes_data(&p).len() } else { pystr::str_len(&p) };
+    let at = |i: usize| -> u32 {
+        if narrow { bytes::bytes_data(&p)[i] as u32 } else { pystr::str_data(&p).get(i) }
+    };
+    let slash = '/' as u32;
+    let rootlen = if n > 0 && at(0) == slash {
+        if n > 1 && at(1) == slash && !(n > 2 && at(2) == slash) { 2 } else { 1 }
+    } else {
+        0
+    };
+    let mk = |a: usize, b: usize| -> PyRef {
+        if narrow {
+            bytes::new_bytes(&bytes::bytes_data(&p)[a..b])
+        } else {
+            let cps: Vec<u32> = (a..b).map(|i| pystr::str_data(&p).get(i)).collect();
+            pystr::from_codepoints(&cps)
+        }
+    };
+    Ok(tuple::new_tuple(vec![mk(0, 0), mk(0, rootlen), mk(rootlen, n)]))
 }
 
 pub fn normpath_cps(p: &[u32]) -> Vec<u32> {
@@ -706,6 +737,8 @@ fn methods() -> *mut crate::ffi::PyMethodDef {
         ("fpathconf", FASTKW, os_fpathconf),
         ("pathconf", FASTKW, os_pathconf),
         ("_path_normpath", FASTKW, os_path_normpath),
+        ("_path_splitroot_ex", FASTKW, os_path_splitroot_ex),
+        ("_create_environ", NOARGS, os_create_environ),
     ]
 }
 
