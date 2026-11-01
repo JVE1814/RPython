@@ -1067,9 +1067,10 @@ unsafe extern "C" fn slot_tp_hash(s: *mut PyObject) -> Py_hash_t {
             let _ = err!(TypeError, "__hash__ method should return an integer");
             return -1;
         }
-        // a result that fits in Py_ssize_t is used as is; larger ints are hashed
+        // a result that fits in Py_hash_t is used as is; only larger ints are
+        // reduced with the int hash
         let h = match int::as_i64(&r) {
-            Some(v) => v as isize,
+            Some(v) => v as Py_hash_t,
             None => int::int_hash(&r),
         };
         if h == -1 { -2 } else { h }
