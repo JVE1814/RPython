@@ -277,7 +277,7 @@ fn name_error(f: &Frame, nm: &PyObject) -> PyErr {
     exc::name_error_with(exc::NameError(), &format!("name '{}' is not defined", s), nm)
 }
 
-fn unbound_local(f: &Frame, idx: usize) -> PyErr {
+pub(super) fn unbound_local(f: &Frame, idx: usize) -> PyErr {
     let d = crate::types::code::code_data(f.code());
     let nm = &d.localsplusnames[idx];
     let kind = d.localspluskinds[idx];
@@ -328,7 +328,7 @@ pub(super) fn load_global(f: &Frame, nm: &PyObject) -> PyResult {
     }
 }
 
-fn mapping_get(m: &PyObject, key: &PyObject) -> PyResult<Option<PyRef>> {
+pub(super) fn mapping_get(m: &PyObject, key: &PyObject) -> PyResult<Option<PyRef>> {
     if dict::is_dict_exact(m) {
         return dict::get_item(m, key);
     }
@@ -365,7 +365,7 @@ pub(super) fn load_method(o: &PyObject, nm: &PyObject) -> PyResult<(PyRef, Optio
     Ok((ab::getattr(o, nm)?, None))
 }
 
-fn unpack_sequence(seq: &PyObject, n: usize, out: &mut Vec<PyRef>) -> PyResult<()> {
+pub(super) fn unpack_sequence(seq: &PyObject, n: usize, out: &mut Vec<PyRef>) -> PyResult<()> {
     if tuple::is_tuple_exact(seq) || list::is_list_exact(seq) {
         let items: Vec<PyRef> = if tuple::is_tuple_exact(seq) { tuple::tuple_to_vec(seq) } else { list::list_to_vec(seq) };
         if items.len() != n {
@@ -403,7 +403,7 @@ fn unpack_sequence(seq: &PyObject, n: usize, out: &mut Vec<PyRef>) -> PyResult<(
     Ok(())
 }
 
-fn unpack_ex(seq: &PyObject, before: usize, after: usize) -> PyResult<Vec<PyRef>> {
+pub(super) fn unpack_ex(seq: &PyObject, before: usize, after: usize) -> PyResult<Vec<PyRef>> {
     let it = match ab::get_iter(seq) {
         Ok(it) => it,
         Err(e) => {
@@ -495,7 +495,7 @@ fn import_from(module: &PyObject, nm: &PyObject) -> PyResult {
     crate::import::cannot_import_name(module, &pkgname, nm)
 }
 
-fn format_value(v: &PyObject, spec: Option<&PyObject>) -> PyResult {
+pub(super) fn format_value(v: &PyObject, spec: Option<&PyObject>) -> PyResult {
     match spec {
         None => {
             if pystr::is_str_exact(v) {
@@ -508,7 +508,7 @@ fn format_value(v: &PyObject, spec: Option<&PyObject>) -> PyResult {
     }
 }
 
-fn call_intrinsic1(ts: &ThreadState, f: &mut Frame, which: u32, v: PyRef) -> PyResult {
+pub(super) fn call_intrinsic1(ts: &ThreadState, f: &mut Frame, which: u32, v: PyRef) -> PyResult {
     let which: Intrinsic1 = unsafe { std::mem::transmute(which as u8) };
     match which {
         Intrinsic1::Print => {
@@ -564,7 +564,7 @@ fn call_intrinsic1(ts: &ThreadState, f: &mut Frame, which: u32, v: PyRef) -> PyR
     }
 }
 
-fn call_intrinsic2(f: &mut Frame, which: u32, a: PyRef, b: PyRef) -> PyResult {
+pub(super) fn call_intrinsic2(f: &mut Frame, which: u32, a: PyRef, b: PyRef) -> PyResult {
     let which: Intrinsic2 = unsafe { std::mem::transmute(which as u8) };
     let _ = f;
     match which {
@@ -653,6 +653,15 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
         if !pending_err {
             // ---------------------------------------------------------- dispatch loop
             let result: PyResult<Option<Exit>> = (|| -> PyResult<Option<Exit>> {
+                // jit workstream: run compiled code (tier 1) from here if available
+                if !tracing {
+                    match super::jit::try_run(ts, f, cd, pc) {
+                        super::jit::Run::NotRun => {}
+                        super::jit::Run::Return(v) => return Ok(Some(Exit::Return(v))),
+                        super::jit::Run::Error => return Err(PyErr),
+                        super::jit::Run::Deopt(npc) => pc = npc,
+                    }
+                }
                 let mut ext: u32 = 0;
                 loop {
                     let w = unsafe { *code.get_unchecked(pc) };
@@ -1172,6 +1181,11 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                                 if eb != 0 {
                                     handle_eval_breaker(ts)?;
                                 }
+                                // jit workstream: on-stack replacement into compiled code
+                                if !tracing && super::jit::osr_check(f, cd, arg as usize) {
+                                    pc = arg as usize;
+                                    return Ok(None);
+                                }
                             }
                             pc = arg as usize;
                         }
@@ -1673,7 +1687,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                     }
                     return Ok(exit);
                 }
-                Ok(None) => unreachable!(),
+                Ok(None) => continue 'outer, // jit: re-dispatch (OSR entry)
                 Err(_) => {}
             }
         }
@@ -1740,12 +1754,12 @@ impl ReraiseMarker {
     }
 }
 
-fn is_sequence_like(o: &PyObject) -> bool {
+pub(super) fn is_sequence_like(o: &PyObject) -> bool {
     let sq = o.ty().tp_as_sequence;
     !sq.is_null() && unsafe { (*sq).sq_item.is_some() }
 }
 
-fn func_desc(o: &PyObject) -> String {
+pub(super) fn func_desc(o: &PyObject) -> String {
     if funcobject::is_function(o) {
         let q = funcobject::func(o).func_qualname;
         return format!("{}()", pystr::to_string_lossy(unsafe { &*q }));

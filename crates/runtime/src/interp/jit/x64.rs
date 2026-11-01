@@ -314,6 +314,11 @@ impl Asm {
     pub fn add_mi(&mut self, m: M, i: i32) {
         self.alu_mi(0, m, i, true)
     }
+    /// lock add qword [m], imm32
+    pub fn lock_add_mi(&mut self, m: M, i: i32) {
+        self.b(0xf0);
+        self.alu_mi(0, m, i, true)
+    }
     /// add dword [m], imm32
     pub fn add32_mi(&mut self, m: M, i: i32) {
         self.alu_mi(0, m, i, false)
