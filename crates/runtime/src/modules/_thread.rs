@@ -1065,7 +1065,13 @@ unsafe extern "C" fn local_getattro(op: *mut PyObject, name: *mut PyObject) -> *
         let n = &*name;
         let r = (|| -> PyResult {
             let d = local_dict(o)?;
-            if pystr::is_str(n) && pystr::str_eq_ascii(n, "__dict__") {
+            let is_dict_name = if pystr::is_str(n) {
+                pystr::str_eq_ascii(n, "__dict__")
+            } else {
+                // compared like any object (the name check comes first)
+                ab::rich_compare_bool(n, &pystr::new_str("__dict__"), crate::ffi::Py_EQ)?
+            };
+            if is_dict_name {
                 return Ok(d);
             }
             match crate::types::typeobject::generic_getattr_opt(o, n, Some(&d))? {
@@ -1081,7 +1087,13 @@ unsafe extern "C" fn local_setattro(op: *mut PyObject, name: *mut PyObject, v: *
         let o = &*op;
         let n = &*name;
         let r = (|| -> PyResult<()> {
-            if pystr::is_str(n) && pystr::str_eq_ascii(n, "__dict__") {
+            let is_dict_name = if pystr::is_str(n) {
+                pystr::str_eq_ascii(n, "__dict__")
+            } else {
+                // compared like any object (the name check comes first)
+                ab::rich_compare_bool(n, &pystr::new_str("__dict__"), crate::ffi::Py_EQ)?
+            };
+            if is_dict_name {
                 raise!(AttributeError, "'{}' object attribute '__dict__' is read-only", tname(o));
             }
             let d = local_dict(o)?;
