@@ -20,6 +20,7 @@ pub mod fncommon;
 pub mod functional;
 pub mod _operator;
 pub mod _functools;
+pub mod _abc;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
 pub fn register_all() {
