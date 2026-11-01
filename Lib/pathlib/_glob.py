@@ -16,75 +16,66 @@ def has_magic(part):
     return any(c in _SPECIAL for c in part)
 
 
+def _bracket(part, start, sep_class):
+    """Parse a '[...]' class beginning at part[start] (the '[').
+
+    Returns (regex, next_index), or None if the bracket is not closed (it
+    is then matched literally)."""
+    i = start + 1
+    negate = i < len(part) and part[i] == '!'
+    if negate:
+        i += 1
+    items = []
+    first = True
+    while i < len(part) and (part[i] != ']' or first):
+        first = False
+        lo = part[i]
+        if i + 2 < len(part) and part[i + 1] == '-' and part[i + 2] != ']':
+            hi = part[i + 2]
+            if lo <= hi:   # reversed ranges match nothing
+                items.append(re.escape(lo) + '-' + re.escape(hi))
+            i += 3
+        else:
+            items.append(re.escape(lo))
+            i += 1
+    if i >= len(part):
+        return None
+    if not items:
+        body = '(?!)' if not negate else f'[^{sep_class}]'
+    else:
+        inner = ''.join(items)
+        body = f'[^{sep_class}{inner}]' if negate else f'(?![{sep_class}])[{inner}]'
+    return body, i + 1
+
+
 def _translate_segment(part, sep_class):
-    """Regex source for one path segment (no separators)."""
+    """Regex source for one path segment: '*' and '?' never match a
+    separator, '[...]' and '[!...]' are character classes."""
     if part == '*':
         return f'[^{sep_class}]+'
     out = []
-    i, n = 0, len(part)
-    while i < n:
+    i = 0
+    while i < len(part):
         c = part[i]
-        i += 1
         if c == '*':
-            # collapse runs of '*'
-            while i < n and part[i] == '*':
+            while i < len(part) and part[i] == '*':
                 i += 1
             out.append(f'[^{sep_class}]*')
-        elif c == '?':
+            continue
+        if c == '?':
             out.append(f'[^{sep_class}]')
         elif c == '[':
-            j = i
-            if j < n and part[j] == '!':
-                j += 1
-            if j < n and part[j] == ']':
-                j += 1
-            while j < n and part[j] != ']':
-                j += 1
-            if j >= n:
-                out.append('\\[')
-            else:
-                stuff = part[i:j]
-                if '-' not in stuff:
-                    stuff = stuff.replace('\\', r'\\')
-                else:
-                    chunks = []
-                    k = i + 2 if part[i] == '!' else i + 1
-                    lo = i
-                    while True:
-                        k = part.find('-', k, j)
-                        if k < 0:
-                            break
-                        chunks.append(part[lo:k])
-                        lo = k + 1
-                        k = k + 3
-                    chunk = part[lo:j]
-                    if chunk:
-                        chunks.append(chunk)
-                    else:
-                        chunks[-1] += '-'
-                    # Remove empty ranges -- invalid in RE.
-                    for k in range(len(chunks) - 1, 0, -1):
-                        if chunks[k - 1][-1] > chunks[k][0]:
-                            chunks[k - 1] = chunks[k - 1][:-1] + chunks[k][1:]
-                            del chunks[k]
-                    stuff = '-'.join(s.replace('\\', r'\\').replace('-', r'\-')
-                                     for s in chunks)
-                stuff = re.sub(r'([&~|])', r'\\\1', stuff)
-                i = j + 1
-                if not stuff:
-                    out.append('(?!)')
-                elif stuff == '!':
-                    out.append('.')
-                else:
-                    if stuff[0] == '!':
-                        stuff = '^' + stuff[1:]
-                    elif stuff[0] in ('^', '['):
-                        stuff = '\\' + stuff
-                    # never match a separator
-                    out.append(f'(?![{sep_class}])[{stuff}]')
+            parsed = _bracket(part, i, sep_class)
+            if parsed is not None:
+                out.append(parsed[0])
+                i = parsed[1]
+                continue
+            out.append(re.escape(c))
         else:
             out.append(re.escape(c))
+        i += 1
     return ''.join(out)
+
 
 
 def translate(pattern, seps):
