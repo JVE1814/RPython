@@ -247,6 +247,9 @@ fn set_field(slot: &mut *mut PyObject, v: Option<&PyObject>) {
 fn get_field(p: *mut PyObject) -> PyRef {
     unsafe { if p.is_null() { none::none_ref() } else { PyRef::from_borrowed(p) } }
 }
+fn get_field_opt(p: *mut PyObject) -> Option<PyRef> {
+    if p.is_null() { None } else { Some(unsafe { PyRef::from_borrowed(p) }) }
+}
 
 /// Instantiate `tp(*args)` (fast path for builtin exception types).
 pub fn make_exception(tp: *mut PyTypeObject, args: &[PyRef]) -> PyResult {
@@ -813,9 +816,22 @@ unsafe extern "C" fn unicode_error_str(op: *mut PyObject) -> *mut PyObject {
             return pystr::new_str("").into_raw();
         }
         let r = (|| -> PyResult<String> {
+            // str() of reason/encoding may run code that mutates the exception: compute
+            // them first, then re-validate the object
             let reason = pystr::to_string_lossy(&*ab::str(&get_field(e.reason))?);
-            let obj = &*e.object;
-            if o.is_type(UnicodeDecodeError()) || is_subtype(o.type_ptr(), UnicodeDecodeError()) {
+            let is_decode = o.is_type(UnicodeDecodeError()) || is_subtype(o.type_ptr(), UnicodeDecodeError());
+            let is_enc = o.is_type(UnicodeEncodeError()) || is_subtype(o.type_ptr(), UnicodeEncodeError());
+            let enc_s = if is_decode || is_enc { Some(pystr::to_string_lossy(&*ab::str(&get_field(e.encoding))?)) } else { None };
+            let e = &*(op as *mut UnicodeErrorExc);
+            let obj_ref = match get_field_opt(e.object) {
+                Some(x) if (is_decode && crate::types::bytes::bytes_like_data(&x).is_some()) || (!is_decode && pystr::is_str(&x)) => x,
+                _ => crate::raise!(TypeError, "{} attribute must be {}", "object", if is_decode { "bytes" } else { "unicode" }),
+            };
+            let obj = &*obj_ref;
+            let get_field = |p: *mut PyObject| -> PyRef {
+                if p == e.encoding && enc_s.is_some() { pystr::new_str(enc_s.as_ref().unwrap()) } else { get_field(p) }
+            };
+            if is_decode {
                 let enc = pystr::to_string_lossy(&*ab::str(&get_field(e.encoding))?);
                 let bytes = crate::types::bytes::bytes_like_data(obj).unwrap_or_default();
                 if e.start >= 0 && (e.start as usize) < bytes.len() && e.end == e.start + 1 {

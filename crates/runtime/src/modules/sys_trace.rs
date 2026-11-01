@@ -270,7 +270,11 @@ pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
     let lasti = f.lasti;
     let key = f as *mut Frame as usize;
     let prev = LAST.with(|l| l.borrow_mut().insert(key, lasti)).unwrap_or(u32::MAX);
-    let line = crate::types::code::line_for_instr(f.code(), lasti as usize).map(|l| l as i32).unwrap_or(-1);
+    // instructions without a line number (artificial cleanup code) never start a line
+    let line = match crate::types::code::code_data(f.code()).locations.get(lasti as usize) {
+        Some(l) if l.lineno != 0 => l.lineno as i32,
+        _ => -1,
+    };
     // A line event fires on the first instruction of a line (entered by falling
     // through or by a jump, including a backward jump to the same line); never on
     // RESUME (the `def` line) and not when resuming in the middle of a line.
