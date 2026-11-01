@@ -1083,9 +1083,22 @@ unsafe extern "C" fn slot_tp_call(s: *mut PyObject, args: *mut PyObject, kw: *mu
             Some(f) => f,
             None => return into_c(Err(err!(TypeError, "'{}' object is not callable", type_name(s.ty())))),
         };
+        let kw = if kw.is_null() { None } else { Some(&*kw) };
+        let ft = f.ty();
+        if ft.tp_flags & Py_TPFLAGS_METHOD_DESCRIPTOR == 0 {
+            // not a method: bind through __get__ if it has one, else call it as is
+            // (a builtin function stored as __call__ does not receive the instance)
+            let bound = match ft.tp_descr_get {
+                Some(g) => match from_c(g(f.as_ptr(), s.as_ptr(), s.type_ptr() as *mut PyObject)) {
+                    Ok(b) => b,
+                    Err(e) => return into_c(Err(e)),
+                },
+                None => f.clone(),
+            };
+            return into_c(ab::call_with_kwargs_dict(&bound, tuple::tuple_items(&*args), kw));
+        }
         let mut v: Vec<&PyObject> = vec![s];
         v.extend(tuple::tuple_items(&*args).iter().copied());
-        let kw = if kw.is_null() { None } else { Some(&*kw) };
         into_c(ab::call_with_kwargs_dict(&f, &v, kw))
     }
 }
