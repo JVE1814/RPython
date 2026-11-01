@@ -170,10 +170,14 @@ duplicate keys), "'elif' ..." is parser-level (done). Also "invalid syntax. Did 
   positional-only parameters (8), match (10), except* (11), type parameters/`type` (12).
   Other version-dependent behaviour (e.g. PEP 701 f-string rules for < 3.12) is not emulated.
 * The tokenize-module stream is produced from the full source (no incremental readline).
-* Recursion/stack safety: the recursive descent is bounded by a stack budget
-  (`ParseOptions.max_stack_bytes`, default 1 MiB, checked against the real stack pointer) and
-  6000 levels, raising `ErrorKind::MemoryError` "Parser stack overflowed - Python source too
-  complex to parse" (CPython: MemoryError). Constructs parsed iteratively but producing deep
+* Recursion/stack safety: nesting is limited to 6000 recursion levels (like CPython's
+  MAXSTACK), raising `ErrorKind::MemoryError` "Parser stack overflowed - Python source too
+  complex to parse" (CPython: MemoryError). The parser uses at most
+  `ParseOptions.max_stack_bytes` (default 256 KiB, measured with the real stack pointer) of the
+  caller's stack; deeper recursion transparently continues on scoped helper threads with 16 MiB
+  stacks (`grow_stack`, default on), so e.g. 200 nested brackets (~5 KB of stack per level)
+  parse fine even on small thread stacks. UnicodeHooks may therefore be called from a helper
+  thread. Constructs parsed iteratively but producing deep
   ASTs (trailer chains `a()()()...`, binary-operator chains, `elif` chains) are limited to 5000
   and raise `ErrorKind::RecursionError` "maximum recursion depth exceeded during compilation"
   (CPython raises RecursionError for these in ast2obj/the compiler). Brackets: 200 (tokenizer).
