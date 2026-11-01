@@ -533,37 +533,8 @@ fn source_arg(o: &PyObject, fname: &str) -> PyResult<Vec<u8>> {
 }
 
 fn b_compile(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
-    static P: Params = Params::new(
-        "compile",
-        &["source", "filename", "mode", "flags", "dont_inherit", "optimize", "_feature_version"],
-        0,
-        3,
-    );
-    let [src, fname, mode, flags, _dont_inherit, optimize, _fv] = args::parse::<7>(&P, args, kw)?;
-    let fname = crate::modules::os_fspath::fsdecode(fname.unwrap())?;
-    let mode_s = pystr::to_string_lossy(mode.unwrap());
-    let mode = match crate::compile::Mode::from_str(&mode_s) {
-        Some(m) => m,
-        None => raise!(ValueError, "compile() mode must be 'exec', 'eval', 'single' or 'func_type'"),
-    };
-    let flags = match flags {
-        Some(f) => ab::as_i64(f)? as u32,
-        None => 0,
-    };
-    let optimize = match optimize {
-        Some(o) => ab::as_i64(o)? as i32,
-        None => -1,
-    };
-    let src = src.unwrap();
-    if flags & rpy_compiler::cf::PYCF_ONLY_AST != 0 || crate::modules::ast_bridge::is_ast_node(src) {
-        return crate::modules::ast_bridge::compile_with_ast(src, &fname, mode, flags, optimize, match _fv { Some(v) if !v.is(none::none()) => { let x = ab::as_i64(v)?; if x >= 0 { Some(x as u32) } else { None } } _ => None });
-    }
-    if mode == crate::compile::Mode::FuncType {
-        raise!(ValueError, "compile() mode 'func_type' requires flag PyCF_ONLY_AST");
-    }
-    let b = source_arg(src, "compile")?;
-    let c = crate::compile::compile_bytes(&b, &fname, mode, flags, optimize)?;
-    Ok(c.code)
+    // compile() is implemented in modules/ast_bridge.rs (ast workstream).
+    crate::modules::ast_bridge::builtin_compile(args, kw)
 }
 
 fn exec_or_eval(args: &[&PyObject], kw: Option<&PyObject>, is_eval: bool) -> PyResult {
@@ -685,7 +656,7 @@ pub fn init() -> PyResult<PyRef> {
         ("ascii", O, b_ascii, "ascii($module, obj, /)\n--\n\nReturn an ASCII-only representation of an object."),
         ("callable", O, b_callable, "callable($module, obj, /)\n--\n\nReturn whether the object is callable (i.e., some kind of function)."),
         ("chr", O, b_chr, "chr($module, i, /)\n--\n\nReturn a Unicode string of one character with ordinal i; 0 <= i <= 0x10ffff."),
-        ("compile", FASTKW, b_compile, "compile($module, /, source, filename, mode, flags=0,\n        dont_inherit=False, optimize=-1, *, _feature_version=-1)\n--\n\nCompile source into a code object that can be executed by exec() or eval()."),
+        ("compile", FASTKW, b_compile, "compile($module, /, source, filename, mode, flags=0,\n        dont_inherit=False, optimize=-1, *, module=None,\n        _feature_version=-1)\n--\n\nCompile source into a code object that can be executed by exec() or eval()."),
         ("delattr", FAST, b_delattr, "delattr($module, obj, name, /)\n--\n\nDeletes the named attribute from the given object."),
         ("dir", FAST, b_dir, "Show attributes of an object."),
         ("divmod", FAST, b_divmod, "divmod($module, x, y, /)\n--\n\nReturn the tuple (x//y, x%y).  Invariant: div*y + mod == x."),
@@ -729,7 +700,7 @@ pub fn init() -> PyResult<PyRef> {
     set("False", bool_::false_obj())?;
     set("__debug__", &bool_::new_bool(crate::modules::sys::optimize_flag() == 0))?;
     for (n, t) in crate::types::exceptions::all_exception_types() {
-        if n.starts_with('_') {
+        if n.starts_with('_') && n != "_IncompleteInputError" {
             continue;
         }
         set(n, type_obj(t))?;

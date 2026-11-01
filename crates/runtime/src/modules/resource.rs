@@ -184,29 +184,29 @@ fn r_getpagesize(_m: &PyObject) -> PyResult {
 }
 
 static RUSAGE_FIELDS: &[Field] = &[
-    Field::new("ru_utime", "user time used"),
-    Field::new("ru_stime", "system time used"),
-    Field::new("ru_maxrss", "max. resident set size"),
-    Field::new("ru_ixrss", "shared memory size"),
-    Field::new("ru_idrss", "unshared data size"),
-    Field::new("ru_isrss", "unshared stack size"),
-    Field::new("ru_minflt", "page faults not requiring I/O"),
-    Field::new("ru_majflt", "page faults requiring I/O"),
-    Field::new("ru_nswap", "number of swap outs"),
-    Field::new("ru_inblock", "block input operations"),
-    Field::new("ru_oublock", "block output operations"),
-    Field::new("ru_msgsnd", "IPC messages sent"),
-    Field::new("ru_msgrcv", "IPC messages received"),
-    Field::new("ru_nsignals", "signals received"),
-    Field::new("ru_nvcsw", "voluntary context switches"),
-    Field::new("ru_nivcsw", "involuntary context switches"),
+    Field::new("ru_utime", "CPU time in user mode (seconds)"),
+    Field::new("ru_stime", "CPU time in kernel mode (seconds)"),
+    Field::new("ru_maxrss", "peak resident set size"),
+    Field::new("ru_ixrss", "integral shared memory size"),
+    Field::new("ru_idrss", "integral unshared data size"),
+    Field::new("ru_isrss", "integral unshared stack size"),
+    Field::new("ru_minflt", "minor page faults"),
+    Field::new("ru_majflt", "major page faults"),
+    Field::new("ru_nswap", "swaps"),
+    Field::new("ru_inblock", "file system reads"),
+    Field::new("ru_oublock", "file system writes"),
+    Field::new("ru_msgsnd", "messages sent"),
+    Field::new("ru_msgrcv", "messages received"),
+    Field::new("ru_nsignals", "signals delivered"),
+    Field::new("ru_nvcsw", "voluntary context switches (waits)"),
+    Field::new("ru_nivcsw", "involuntary context switches (preemptions)"),
 ];
 
 pub fn init() -> PyResult {
     if RUSAGE_TYPE.load(Ordering::Acquire).is_null() {
         let t = structseq::new_type(&Desc {
             name: "resource.struct_rusage",
-            doc: "struct_rusage: Result from getrusage.\n\nThis object may be accessed either as a tuple of\n    (utime,stime,maxrss,ixrss,idrss,isrss,minflt,majflt,\n    nswap,inblock,oublock,msgsnd,msgrcv,nsignals,nvcsw,nivcsw)\nor via the attributes ru_utime, ru_stime, ru_maxrss, and so on.",
+            doc: "struct_rusage: resource usage as returned by getrusage().\n\nA 16-tuple whose fields are also available as attributes ru_utime,\nru_stime, ru_maxrss, ... ru_nivcsw; the two times are floats in seconds.",
             fields: RUSAGE_FIELDS,
             n_in_sequence: 16,
         })?;

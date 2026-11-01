@@ -267,7 +267,7 @@ pub fn attribute_error_for(o: &PyObject, name: &PyObject) -> PyErr {
     let msg = if is_type(o) {
         format!(
             "type object '{}' has no attribute '{}'",
-            type_name(unsafe { &*as_type(o) }),
+            unsafe { CStr::from_ptr((*as_type(o)).tp_name).to_string_lossy() },
             pystr::to_string_lossy(name)
         )
     } else {
@@ -695,7 +695,8 @@ unsafe fn add_methods(tp: *mut PyTypeObject) -> PyResult<()> {
             let descr = if (*m).ml_flags & METH_CLASS != 0 {
                 crate::types::descr::new_classmethod_descr(tp, m)
             } else if (*m).ml_flags & METH_STATIC != 0 {
-                let f = crate::types::cfunction::new_cfunction(m, None, None);
+                let owner = if is_heap_type(tp) { None } else { Some(type_ref(tp)) };
+                let f = crate::types::cfunction::new_cfunction(m, owner, None);
                 crate::types::funcobject::new_staticmethod(f)
             } else {
                 crate::types::descr::new_method_descr(tp, m)

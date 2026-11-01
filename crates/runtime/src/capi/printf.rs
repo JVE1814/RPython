@@ -240,7 +240,7 @@ pub unsafe fn format_v(fmt: *const c_char, ap: &mut VaList) -> PyResult {
                     out.push_str(&s);
                 }
                 b'c' => {
-                    if lm != 0 {
+                    if lm != 0 || width.is_some() || prec.is_some() {
                         return Err(invalid(&f[start..i]));
                     }
                     let v: c_int = ap.next_arg::<c_int>();

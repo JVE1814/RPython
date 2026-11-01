@@ -626,7 +626,23 @@ fn m_doc(o: &PyObject) -> PyResult {
 fn m_reduce(o: &PyObject) -> PyResult {
     let (f, s) = method_parts(o);
     let getattr = crate::builtins::builtin("getattr")?;
-    let nm = ab::getattr(f, name!("__name__"))?;
+    let mut nm = ab::getattr(f, name!("__name__"))?;
+    // A private method is reachable through getattr() only under its
+    // mangled name; the defining class is the next-to-last qualname part.
+    if let Some(n) = pystr::to_string_strict(&nm) {
+        if n.starts_with("__") && !n.ends_with("__") {
+            if let Ok(Some(q)) = ab::getattr_opt(f, name!("__qualname__")) {
+                let q = pystr::to_string_lossy(&q);
+                let parts: Vec<&str> = q.split('.').collect();
+                if parts.len() >= 2 {
+                    let owner = parts[parts.len() - 2].trim_start_matches('_');
+                    if !owner.is_empty() && owner != "<locals>" {
+                        nm = pystr::new_str(&format!("_{}{}", owner, n));
+                    }
+                }
+            }
+        }
+    }
     Ok(tuple::new_tuple(vec![getattr, tuple::new_tuple(vec![s.to_ref(), nm])]))
 }
 unsafe extern "C" fn method_new(_tp: *mut PyTypeObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
