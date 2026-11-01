@@ -44,9 +44,17 @@ pub mod _thread;
 pub mod pymain;
 pub mod text_util;
 pub mod _sre;
+pub mod _codecs;
+pub mod codec_impl;
+pub mod codec_charmap;
+pub mod _struct;
+pub mod binascii;
+pub mod _random;
+pub mod _imp;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
 pub fn register_all() {
+    crate::import::register_builtin("_string", crate::types::str_methods::init_string_module);
     crate::import::register_builtin("posix", posix::init);
     crate::import::register_builtin("errno", errno::init);
     crate::import::register_builtin("_stat", stat_mod::init);
