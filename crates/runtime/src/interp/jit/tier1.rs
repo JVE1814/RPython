@@ -62,6 +62,46 @@ const E_B: i32 = offset_of!(crate::interp::cache::Entry, b) as i32;
 const E_C: i32 = offset_of!(crate::interp::cache::Entry, c) as i32;
 const E_KIND: i32 = offset_of!(crate::interp::cache::Entry, kind) as i32;
 
+const LIST_SIZE: i32 = offset_of!(PyVarObject, ob_size) as i32;
+const LIST_ITEMS: i32 = offset_of!(PyListObject, ob_item) as i32;
+const TUPLE_ITEMS: i32 = offset_of!(PyTupleObject, ob_item) as i32;
+
+/// The range/list/tuple iterator structs are private to their modules; the inline
+/// ForIter paths assume (index or start, seq or step, len) at offsets 32/40/48.
+/// Verify that once on real objects and fall back to the helper otherwise.
+fn iter_layout_ok() -> bool {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OK.get_or_init(|| unsafe {
+        let rd = |o: &PyObject, off: usize| *((o.as_ptr() as *const u8).add(off) as *const i64);
+        let r = match crate::types::range::new_range_i64(5, 100, 3) {
+            Ok(r) => r,
+            Err(_) => {
+                crate::errors::clear_exc();
+                return false;
+            }
+        };
+        let ri = match crate::abstract_::get_iter(&r) {
+            Ok(i) => i,
+            Err(_) => {
+                crate::errors::clear_exc();
+                return false;
+            }
+        };
+        let range_ok = ri.is_type(&raw mut crate::types::range::PyRangeIter_Type) && rd(&ri, 32) == 5 && rd(&ri, 40) == 3 && rd(&ri, 48) == 32;
+        let l = crate::types::list::new_list(vec![crate::types::int::new_int(7)]);
+        let li = crate::abstract_::get_iter(&l).ok();
+        let list_ok = li.as_ref().is_some_and(|i| {
+            i.is_type(&raw mut crate::types::list::PyListIter_Type) && rd(i, 32) == 0 && rd(i, 40) == l.as_ptr() as i64
+        });
+        let t = crate::types::tuple::new_tuple(vec![crate::types::int::new_int(7)]);
+        let ti = crate::abstract_::get_iter(&t).ok();
+        let tuple_ok = ti.as_ref().is_some_and(|i| {
+            i.is_type(&raw mut crate::types::tuple::PyTupleIter_Type) && rd(i, 32) == 0 && rd(i, 40) == t.as_ptr() as i64
+        });
+        range_ok && list_ok && tuple_ok
+    })
+}
+
 /// Layout facts about Rust-owned structures, probed at run time (Vec field order is
 /// not specified by Rust).
 struct Layout {
@@ -592,16 +632,7 @@ impl<'a> Gen<'a> {
             Op::UnpackSequence => self.helper_sp(&ins, d, addr!(h::h_unpack_sequence), Some(arg as i64), None, d - 1),
             Op::UnpackEx => self.helper_sp(&ins, d, addr!(h::h_unpack_ex), Some(arg as i64), None, d - 1),
             Op::GetIter => self.helper_sp(&ins, d, addr!(h::h_get_iter), None, None, d - 1),
-            Op::ForIter => {
-                let t = self.ilabel[self.an.index_of[arg as usize] as usize];
-                self.set_lasti(pc);
-                self.lea_sp(Rdi, d);
-                self.call(addr!(h::h_for_iter));
-                let err = self.error_label(pc, d);
-                self.a.cmp_ri(Rax, 1);
-                self.a.jcc(Cc::E, t);
-                self.a.jcc(Cc::A, err);
-            }
+            Op::ForIter => self.for_iter(&ins, d),
             Op::Call => self.helper_sp(&ins, d, addr!(h::h_call), Some(arg as i64), Some(0), d - arg as i32 - 2),
             Op::CallKw => self.helper_sp(&ins, d, addr!(h::h_call), Some(arg as i64), Some(1), d - arg as i32 - 3),
             Op::CallFunctionEx => self.helper_sp(&ins, d, addr!(h::h_call_ex), None, None, d - 4),
@@ -643,6 +674,82 @@ impl<'a> Gen<'a> {
             _ => self.deopt(ins.start, d),
         }
         Ok(())
+    }
+
+    // ------------------------------------------------------------ iteration
+
+    /// ForIter with inline fast paths for range, list and tuple iterators; anything
+    /// else (and exhaustion) goes through the helper.
+    fn for_iter(&mut self, ins: &Instr, d: i32) {
+        let t = self.ilabel[self.an.index_of[ins.arg as usize] as usize];
+        let generic = self.a.label();
+        let pushed = self.a.label();
+        if iter_layout_ok() {
+            let it = self.slot(d - 1);
+            let out = self.slot(d);
+            let not_range = self.a.label();
+            let not_list = self.a.label();
+            self.a.load(Rax, it);
+            // range iterator: start/step/len are i64 at 32/40/48
+            self.a.mov_ri(Rcx, (&raw mut crate::types::range::PyRangeIter_Type) as i64);
+            self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
+            self.a.jcc(Cc::NE, not_range);
+            self.a.cmp_mi(M(Rax, 48), 0);
+            self.a.jcc(Cc::LE, generic);
+            self.a.add_mi(M(Rax, 48), -1);
+            self.a.load(Rdi, M(Rax, 32));
+            self.a.load(Rcx, M(Rax, 40));
+            self.a.lea(Rdx, M(Rdi, 0));
+            self.a.add_rr(Rdx, Rcx);
+            self.a.store(M(Rax, 32), Rdx);
+            self.a.call_label(self.rt_box_int);
+            self.a.store(out, Rax);
+            self.a.jmp(pushed);
+            // list iterator: index at 32, seq at 40; list size at 32, items at 40
+            self.a.bind(not_range);
+            self.a.mov_ri(Rcx, (&raw mut crate::types::list::PyListIter_Type) as i64);
+            self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
+            self.a.jcc(Cc::NE, not_list);
+            self.a.load(Rdx, M(Rax, 40));
+            self.a.test_rr(Rdx, Rdx);
+            self.a.jcc(Cc::E, generic);
+            self.a.load(Rcx, M(Rax, 32));
+            self.a.test_rr(Rcx, Rcx);
+            self.a.jcc(Cc::S, generic);
+            self.a.cmp_rm(Rcx, M(Rdx, LIST_SIZE));
+            self.a.jcc(Cc::GE, generic);
+            self.a.load(Rsi, M(Rdx, LIST_ITEMS));
+            self.a.load_idx(Rsi, Rsi, Rcx, 8, 0);
+            self.a.add_mi(M(Rax, 32), 1);
+            self.incref(Rsi);
+            self.a.store(out, Rsi);
+            self.a.jmp(pushed);
+            // tuple iterator: index at 32, seq at 40; tuple size at 32, items inline
+            self.a.bind(not_list);
+            self.a.mov_ri(Rcx, (&raw mut crate::types::tuple::PyTupleIter_Type) as i64);
+            self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
+            self.a.jcc(Cc::NE, generic);
+            self.a.load(Rdx, M(Rax, 40));
+            self.a.test_rr(Rdx, Rdx);
+            self.a.jcc(Cc::E, generic);
+            self.a.load(Rcx, M(Rax, 32));
+            self.a.cmp_rm(Rcx, M(Rdx, LIST_SIZE));
+            self.a.jcc(Cc::GE, generic);
+            self.a.load_idx(Rsi, Rdx, Rcx, 8, TUPLE_ITEMS);
+            self.a.add_mi(M(Rax, 32), 1);
+            self.incref(Rsi);
+            self.a.store(out, Rsi);
+            self.a.jmp(pushed);
+        }
+        self.a.bind(generic);
+        self.set_lasti(ins.pc);
+        self.lea_sp(Rdi, d);
+        self.call(addr!(h::h_for_iter));
+        let err = self.error_label(ins.pc, d);
+        self.a.cmp_ri(Rax, 1);
+        self.a.jcc(Cc::E, t);
+        self.a.jcc(Cc::A, err);
+        self.a.bind(pushed);
     }
 
     // ------------------------------------------------------------ inline caches
