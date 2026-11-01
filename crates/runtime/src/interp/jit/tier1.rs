@@ -33,6 +33,8 @@ use std::mem::offset_of;
 pub const ST_RETURN: u32 = 0;
 pub const ST_ERROR: u32 = 1;
 pub const ST_DEOPT: u32 = 2;
+pub const ST_YIELD: u32 = 3;
+const YIELD_FROM_SEND: i32 = offset_of!(Frame, yield_from_send) as i32;
 
 const LASTI: i32 = offset_of!(Frame, lasti) as i32;
 const NEXT_INSTR: i32 = offset_of!(Frame, next_instr) as i32;
@@ -61,6 +63,46 @@ const E_A: i32 = offset_of!(crate::interp::cache::Entry, a) as i32;
 const E_B: i32 = offset_of!(crate::interp::cache::Entry, b) as i32;
 const E_C: i32 = offset_of!(crate::interp::cache::Entry, c) as i32;
 const E_KIND: i32 = offset_of!(crate::interp::cache::Entry, kind) as i32;
+
+const LIST_SIZE: i32 = offset_of!(PyVarObject, ob_size) as i32;
+const LIST_ITEMS: i32 = offset_of!(PyListObject, ob_item) as i32;
+const TUPLE_ITEMS: i32 = offset_of!(PyTupleObject, ob_item) as i32;
+
+/// The range/list/tuple iterator structs are private to their modules; the inline
+/// ForIter paths assume (index or start, seq or step, len) at offsets 32/40/48.
+/// Verify that once on real objects and fall back to the helper otherwise.
+fn iter_layout_ok() -> bool {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OK.get_or_init(|| unsafe {
+        let rd = |o: &PyObject, off: usize| *((o.as_ptr() as *const u8).add(off) as *const i64);
+        let r = match crate::types::range::new_range_i64(5, 100, 3) {
+            Ok(r) => r,
+            Err(_) => {
+                crate::errors::clear_exc();
+                return false;
+            }
+        };
+        let ri = match crate::abstract_::get_iter(&r) {
+            Ok(i) => i,
+            Err(_) => {
+                crate::errors::clear_exc();
+                return false;
+            }
+        };
+        let range_ok = ri.is_type(&raw mut crate::types::range::PyRangeIter_Type) && rd(&ri, 32) == 5 && rd(&ri, 40) == 3 && rd(&ri, 48) == 32;
+        let l = crate::types::list::new_list(vec![crate::types::int::new_int(7)]);
+        let li = crate::abstract_::get_iter(&l).ok();
+        let list_ok = li.as_ref().is_some_and(|i| {
+            i.is_type(&raw mut crate::types::list::PyListIter_Type) && rd(i, 32) == 0 && rd(i, 40) == l.as_ptr() as i64
+        });
+        let t = crate::types::tuple::new_tuple(vec![crate::types::int::new_int(7)]);
+        let ti = crate::abstract_::get_iter(&t).ok();
+        let tuple_ok = ti.as_ref().is_some_and(|i| {
+            i.is_type(&raw mut crate::types::tuple::PyTupleIter_Type) && rd(i, 32) == 0 && rd(i, 40) == t.as_ptr() as i64
+        });
+        range_ok && list_ok && tuple_ok
+    })
+}
 
 /// Layout facts about Rust-owned structures, probed at run time (Vec field order is
 /// not specified by Rust).
@@ -112,6 +154,7 @@ struct Gen<'a> {
     rt_box_int: Label,
     rt_box_float: Label,
     rt_free_num: Label,
+    flags: u32,
 }
 
 fn fnaddr<T>(f: T) -> usize
@@ -384,6 +427,36 @@ impl<'a> Gen<'a> {
                 self.a.mov_ri(Rax, ST_RETURN as i64);
                 self.a.jmp(self.exit);
             }
+            Op::Send => {
+                let t = self.ilabel[self.an.index_of[arg as usize] as usize];
+                self.set_lasti(pc);
+                self.lea_sp(Rdi, d);
+                self.call(addr!(h::h_send));
+                let err = self.error_label(pc, d - 1);
+                self.a.cmp_ri(Rax, 1);
+                self.a.jcc(Cc::E, t);
+                self.a.jcc(Cc::A, err);
+            }
+            Op::GetYieldFromIter => {
+                let flags = self.flags as i64;
+                self.helper_sp(&ins, d, addr!(h::h_get_yield_from_iter), Some(flags), None, d - 1);
+            }
+            Op::YieldValue => {
+                // suspend: the interpreter resumes the generator at the next instruction
+                // (an entry point of this code) and pushes the sent value there
+                let next = self.an.instrs.get(i + 1).map_or(ins.pc + 1, |n| n.start);
+                let send = if i > 0 && self.an.instrs[i - 1].op == Op::Send { self.an.instrs[i - 1].pc as i32 } else { -1 };
+                let m = self.slot(d - 1);
+                self.a.load(Rax, m);
+                self.a.load(Rcx, M(Rsp, 0));
+                self.a.store(M(Rcx, 0), Rax);
+                self.a.store32_i(M(Rbx, LASTI), pc as i32);
+                self.a.store32_i(M(Rbx, NEXT_INSTR), next as i32);
+                self.a.store32_i(M(Rbx, YIELD_FROM_SEND), send);
+                self.a.store_i(M(Rbx, STACK_TOP), self.nlp + d - 1);
+                self.a.mov_ri(Rax, ST_YIELD as i64);
+                self.a.jmp(self.exit);
+            }
             Op::Jump => {
                 let t = self.an.index_of[arg as usize] as usize;
                 if arg <= ins.start {
@@ -566,7 +639,7 @@ impl<'a> Gen<'a> {
                 self.helper_sp(&ins, d, addr!(h::h_unary), Some(which), None, d - 1);
                 self.a.bind(done);
             }
-            Op::BinarySubscr => self.helper_sp(&ins, d, addr!(h::h_binary_subscr), None, None, d - 2),
+            Op::BinarySubscr => self.binary_subscr(&ins, d),
             Op::StoreSubscr => self.helper_sp(&ins, d, addr!(h::h_store_subscr), None, None, d - 3),
             Op::DeleteSubscr => self.helper_sp(&ins, d, addr!(h::h_delete_subscr), None, None, d - 2),
             Op::BinarySlice => self.helper_sp(&ins, d, addr!(h::h_binary_slice), None, None, d - 3),
@@ -592,16 +665,7 @@ impl<'a> Gen<'a> {
             Op::UnpackSequence => self.helper_sp(&ins, d, addr!(h::h_unpack_sequence), Some(arg as i64), None, d - 1),
             Op::UnpackEx => self.helper_sp(&ins, d, addr!(h::h_unpack_ex), Some(arg as i64), None, d - 1),
             Op::GetIter => self.helper_sp(&ins, d, addr!(h::h_get_iter), None, None, d - 1),
-            Op::ForIter => {
-                let t = self.ilabel[self.an.index_of[arg as usize] as usize];
-                self.set_lasti(pc);
-                self.lea_sp(Rdi, d);
-                self.call(addr!(h::h_for_iter));
-                let err = self.error_label(pc, d);
-                self.a.cmp_ri(Rax, 1);
-                self.a.jcc(Cc::E, t);
-                self.a.jcc(Cc::A, err);
-            }
+            Op::ForIter => self.for_iter(&ins, d),
             Op::Call => self.helper_sp(&ins, d, addr!(h::h_call), Some(arg as i64), Some(0), d - arg as i32 - 2),
             Op::CallKw => self.helper_sp(&ins, d, addr!(h::h_call), Some(arg as i64), Some(1), d - arg as i32 - 3),
             Op::CallFunctionEx => self.helper_sp(&ins, d, addr!(h::h_call_ex), None, None, d - 4),
@@ -643,6 +707,129 @@ impl<'a> Gen<'a> {
             _ => self.deopt(ins.start, d),
         }
         Ok(())
+    }
+
+    /// BinarySubscr with inline list[int] / tuple[int] (compact int index).
+    fn binary_subscr(&mut self, ins: &Instr, d: i32) {
+        let (mc, mk) = (self.slot(d - 2), self.slot(d - 1));
+        let slow = self.a.label();
+        let done = self.a.label();
+        let not_list = self.a.label();
+        let got = self.a.label();
+        self.a.load(Rax, mc);
+        self.a.load(Rcx, mk);
+        self.compact_int(Rcx, Rsi, Rdx, slow);
+        for (tp, is_list) in [(crate::types::list::list_type() as i64, true), (crate::types::tuple::tuple_type() as i64, false)] {
+            if !is_list {
+                self.a.bind(not_list);
+            }
+            self.a.mov_ri(Rdx, tp);
+            self.a.cmp_rm(Rdx, M(Rax, OB_TYPE));
+            self.a.jcc(Cc::NE, if is_list { not_list } else { slow });
+            self.a.load(Rdx, M(Rax, LIST_SIZE));
+            let pos = self.a.label();
+            self.a.test_rr(Rsi, Rsi);
+            self.a.jcc(Cc::NS, pos);
+            self.a.add_rr(Rsi, Rdx);
+            self.a.bind(pos);
+            self.a.cmp_rr(Rsi, Rdx);
+            self.a.jcc(Cc::AE, slow);
+            if is_list {
+                self.a.load(Rdx, M(Rax, LIST_ITEMS));
+                self.a.load_idx(Rdi, Rdx, Rsi, 8, 0);
+                self.a.jmp(got);
+            } else {
+                self.a.load_idx(Rdi, Rax, Rsi, 8, TUPLE_ITEMS);
+            }
+        }
+        self.a.bind(got);
+        self.incref(Rdi);
+        self.a.mov_rr(R14, Rdi);
+        self.a.load(Rax, mc);
+        self.decref(Rax);
+        self.a.load(Rax, mk);
+        self.decref(Rax);
+        self.a.store(mc, R14);
+        self.a.jmp(done);
+        self.a.bind(slow);
+        self.helper_sp(ins, d, addr!(h::h_binary_subscr), None, None, d - 2);
+        self.a.bind(done);
+    }
+
+    // ------------------------------------------------------------ iteration
+
+    /// ForIter with inline fast paths for range, list and tuple iterators; anything
+    /// else (and exhaustion) goes through the helper.
+    fn for_iter(&mut self, ins: &Instr, d: i32) {
+        let t = self.ilabel[self.an.index_of[ins.arg as usize] as usize];
+        let generic = self.a.label();
+        let pushed = self.a.label();
+        if iter_layout_ok() {
+            let it = self.slot(d - 1);
+            let out = self.slot(d);
+            let not_range = self.a.label();
+            let not_list = self.a.label();
+            self.a.load(Rax, it);
+            // range iterator: start/step/len are i64 at 32/40/48
+            self.a.mov_ri(Rcx, (&raw mut crate::types::range::PyRangeIter_Type) as i64);
+            self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
+            self.a.jcc(Cc::NE, not_range);
+            self.a.cmp_mi(M(Rax, 48), 0);
+            self.a.jcc(Cc::LE, generic);
+            self.a.add_mi(M(Rax, 48), -1);
+            self.a.load(Rdi, M(Rax, 32));
+            self.a.load(Rcx, M(Rax, 40));
+            self.a.lea(Rdx, M(Rdi, 0));
+            self.a.add_rr(Rdx, Rcx);
+            self.a.store(M(Rax, 32), Rdx);
+            self.a.call_label(self.rt_box_int);
+            self.a.store(out, Rax);
+            self.a.jmp(pushed);
+            // list iterator: index at 32, seq at 40; list size at 32, items at 40
+            self.a.bind(not_range);
+            self.a.mov_ri(Rcx, (&raw mut crate::types::list::PyListIter_Type) as i64);
+            self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
+            self.a.jcc(Cc::NE, not_list);
+            self.a.load(Rdx, M(Rax, 40));
+            self.a.test_rr(Rdx, Rdx);
+            self.a.jcc(Cc::E, generic);
+            self.a.load(Rcx, M(Rax, 32));
+            self.a.test_rr(Rcx, Rcx);
+            self.a.jcc(Cc::S, generic);
+            self.a.cmp_rm(Rcx, M(Rdx, LIST_SIZE));
+            self.a.jcc(Cc::GE, generic);
+            self.a.load(Rsi, M(Rdx, LIST_ITEMS));
+            self.a.load_idx(Rsi, Rsi, Rcx, 8, 0);
+            self.a.add_mi(M(Rax, 32), 1);
+            self.incref(Rsi);
+            self.a.store(out, Rsi);
+            self.a.jmp(pushed);
+            // tuple iterator: index at 32, seq at 40; tuple size at 32, items inline
+            self.a.bind(not_list);
+            self.a.mov_ri(Rcx, (&raw mut crate::types::tuple::PyTupleIter_Type) as i64);
+            self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
+            self.a.jcc(Cc::NE, generic);
+            self.a.load(Rdx, M(Rax, 40));
+            self.a.test_rr(Rdx, Rdx);
+            self.a.jcc(Cc::E, generic);
+            self.a.load(Rcx, M(Rax, 32));
+            self.a.cmp_rm(Rcx, M(Rdx, LIST_SIZE));
+            self.a.jcc(Cc::GE, generic);
+            self.a.load_idx(Rsi, Rdx, Rcx, 8, TUPLE_ITEMS);
+            self.a.add_mi(M(Rax, 32), 1);
+            self.incref(Rsi);
+            self.a.store(out, Rsi);
+            self.a.jmp(pushed);
+        }
+        self.a.bind(generic);
+        self.set_lasti(ins.pc);
+        self.lea_sp(Rdi, d);
+        self.call(addr!(h::h_for_iter));
+        let err = self.error_label(ins.pc, d);
+        self.a.cmp_ri(Rax, 1);
+        self.a.jcc(Cc::E, t);
+        self.a.jcc(Cc::A, err);
+        self.a.bind(pushed);
     }
 
     // ------------------------------------------------------------ inline caches
@@ -899,8 +1086,11 @@ impl<'a> Gen<'a> {
             op,
             Add | InplaceAdd | Subtract | InplaceSubtract | Multiply | InplaceMultiply | And | InplaceAnd | Or | InplaceOr | Xor | InplaceXor
         );
-        let float_ok = matches!(op, Add | InplaceAdd | Subtract | InplaceSubtract | Multiply | InplaceMultiply);
-        if !int_ok {
+        let float_ok = matches!(
+            op,
+            Add | InplaceAdd | Subtract | InplaceSubtract | Multiply | InplaceMultiply | TrueDivide | InplaceTrueDivide
+        );
+        if !int_ok && !float_ok {
             self.helper_sp(ins, d, addr!(h::h_binary_op), Some(ins.arg as i64), None, d - 2);
             return Ok(());
         }
@@ -911,32 +1101,59 @@ impl<'a> Gen<'a> {
         let done = self.a.label();
         self.a.load(Rax, ma);
         self.a.load(Rcx, mb);
-        self.compact_int(Rax, Rdi, Rdx, not_int);
-        self.compact_int(Rcx, Rsi, Rdx, slow);
-        match op {
-            Add | InplaceAdd => self.a.add_rr(Rdi, Rsi),
-            Subtract | InplaceSubtract => self.a.sub_rr(Rdi, Rsi),
-            Multiply | InplaceMultiply => self.a.imul_rr(Rdi, Rsi),
-            And | InplaceAnd => self.a.and_rr(Rdi, Rsi),
-            Or | InplaceOr => self.a.or_rr(Rdi, Rsi),
-            _ => self.a.xor_rr(Rdi, Rsi),
+        if int_ok {
+            self.compact_int(Rax, Rdi, Rdx, not_int);
+            self.compact_int(Rcx, Rsi, Rdx, not_int);
+            match op {
+                Add | InplaceAdd => self.a.add_rr(Rdi, Rsi),
+                Subtract | InplaceSubtract => self.a.sub_rr(Rdi, Rsi),
+                Multiply | InplaceMultiply => self.a.imul_rr(Rdi, Rsi),
+                And | InplaceAnd => self.a.and_rr(Rdi, Rsi),
+                Or | InplaceOr => self.a.or_rr(Rdi, Rsi),
+                _ => self.a.xor_rr(Rdi, Rsi),
+            }
+            self.a.call_label(self.rt_box_int);
+            self.a.jmp(have_result);
         }
-        self.a.call_label(self.rt_box_int);
-        self.a.jmp(have_result);
         self.a.bind(not_int);
         if float_ok {
+            // operands: exact float, or compact int converted exactly (|v| < 2**30);
+            // int x int only for true division (the int path handled the rest)
             let ft = crate::types::float::float_type() as i64;
-            self.a.mov_ri(Rdx, ft);
-            self.a.cmp_rm(Rdx, M(Rax, OB_TYPE));
-            self.a.jcc(Cc::NE, slow);
-            self.a.cmp_rm(Rdx, M(Rcx, OB_TYPE));
-            self.a.jcc(Cc::NE, slow);
-            self.a.movsd_load(XMM0, M(Rax, FVAL));
-            self.a.movsd_load(XMM1, M(Rcx, FVAL));
+            let both_int = self.a.label();
+            self.a.mov_ri(R8, 0);
+            for (obj, x) in [(Rax, XMM0), (Rcx, XMM1)] {
+                let is_float = self.a.label();
+                let next = self.a.label();
+                self.a.mov_ri(Rdx, ft);
+                self.a.cmp_rm(Rdx, M(obj, OB_TYPE));
+                self.a.jcc(Cc::E, is_float);
+                self.compact_int(obj, Rdi, Rdx, slow);
+                self.a.cvtsi2sd(x, Rdi);
+                self.a.jmp(next);
+                self.a.bind(is_float);
+                self.a.movsd_load(x, M(obj, FVAL));
+                self.a.mov_ri(R8, 1);
+                self.a.bind(next);
+            }
+            if !matches!(op, TrueDivide | InplaceTrueDivide) {
+                // int x int with these ops is the int path's business (it overflowed
+                // its checks, e.g. not compact): only mixed/float operands here
+                self.a.test_rr(R8, R8);
+                self.a.jcc(Cc::E, slow);
+            }
+            let _ = both_int;
             match op {
                 Add | InplaceAdd => self.a.addsd(XMM0, XMM1),
                 Subtract | InplaceSubtract => self.a.subsd(XMM0, XMM1),
-                _ => self.a.mulsd(XMM0, XMM1),
+                Multiply | InplaceMultiply => self.a.mulsd(XMM0, XMM1),
+                _ => {
+                    // division by zero raises: leave to the helper
+                    self.a.xorpd(XMM2, XMM2);
+                    self.a.ucomisd(XMM1, XMM2);
+                    self.a.jcc(Cc::E, slow); // also taken for NaN (ZF=1): helper handles it
+                    self.a.divsd(XMM0, XMM1);
+                }
             }
             self.a.call_label(self.rt_box_float);
             self.a.jmp(have_result);
@@ -974,12 +1191,55 @@ impl<'a> Gen<'a> {
         let (ma, mb) = (self.slot(d - 2), self.slot(d - 1));
         let slow = self.a.label();
         let decide = self.a.label();
+        let not_int = self.a.label();
+        let release = self.a.label();
         self.a.load(Rax, ma);
         self.a.load(Rcx, mb);
-        self.compact_int(Rax, Rdi, Rdx, slow);
+        self.compact_int(Rax, Rdi, Rdx, not_int);
         self.compact_int(Rcx, Rsi, Rdx, slow);
         self.a.cmp_rr(Rdi, Rsi);
         self.a.setcc(cc, R14);
+        self.a.jmp(release);
+        // float x float (IEEE semantics: comparisons with NaN are false, != is true)
+        self.a.bind(not_int);
+        self.a.mov_ri(Rdx, crate::types::float::float_type() as i64);
+        self.a.cmp_rm(Rdx, M(Rax, OB_TYPE));
+        self.a.jcc(Cc::NE, slow);
+        self.a.cmp_rm(Rdx, M(Rcx, OB_TYPE));
+        self.a.jcc(Cc::NE, slow);
+        self.a.movsd_load(XMM0, M(Rax, FVAL));
+        self.a.movsd_load(XMM1, M(Rcx, FVAL));
+        match cop {
+            Py_LT => {
+                self.a.ucomisd(XMM1, XMM0);
+                self.a.setcc(Cc::A, R14);
+            }
+            Py_LE => {
+                self.a.ucomisd(XMM1, XMM0);
+                self.a.setcc(Cc::AE, R14);
+            }
+            Py_GT => {
+                self.a.ucomisd(XMM0, XMM1);
+                self.a.setcc(Cc::A, R14);
+            }
+            Py_GE => {
+                self.a.ucomisd(XMM0, XMM1);
+                self.a.setcc(Cc::AE, R14);
+            }
+            Py_EQ => {
+                self.a.ucomisd(XMM0, XMM1);
+                self.a.setcc(Cc::E, R14);
+                self.a.setcc(Cc::NP, Rdx);
+                self.a.and_rr(R14, Rdx);
+            }
+            _ => {
+                self.a.ucomisd(XMM0, XMM1);
+                self.a.setcc(Cc::NE, R14);
+                self.a.setcc(Cc::P, Rdx);
+                self.a.or_rr(R14, Rdx);
+            }
+        }
+        self.a.bind(release);
         // operands: release (compact ints are mostly immortal small ints)
         self.a.load(Rax, ma);
         self.decref(Rax);
@@ -1120,13 +1380,13 @@ fn emit_routines(a: &mut Asm, box_int: Label, box_float: Label, free_num: Label)
 }
 
 /// Compile a code object. Err: not compilable (stays in the interpreter).
-pub fn compile(cd: &CodeData, nlocalsplus: usize, tables: &crate::interp::cache::Tables) -> Result<Output, String> {
+pub fn compile(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crate::interp::cache::Tables) -> Result<Output, String> {
     let an = super::analysis::analyze(&cd.code, &cd.exception_table)?;
     let mut a = Asm::new();
     let ilabel: Vec<Label> = (0..an.instrs.len()).map(|_| a.label()).collect();
     let exit = a.label();
     let (rt_box_int, rt_box_float, rt_free_num) = (a.label(), a.label(), a.label());
-    let mut g = Gen { a, nlp: nlocalsplus as i32, an: &an, cd, tables, ilabel, exit, stubs: Vec::new(), rt_box_int, rt_box_float, rt_free_num };
+    let mut g = Gen { a, nlp: nlocalsplus as i32, an: &an, cd, tables, ilabel, exit, stubs: Vec::new(), rt_box_int, rt_box_float, rt_free_num, flags };
 
     // prologue
     g.a.push(Rbp);

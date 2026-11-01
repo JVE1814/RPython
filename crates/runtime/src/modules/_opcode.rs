@@ -273,19 +273,11 @@ fn m_stack_effect(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> P
         Some(op) => op,
         None => raise!(ValueError, "invalid opcode or oparg"),
     };
+    // the argument is optional for every opcode (missing means 0) and
+    // ignored by those that take none
     let arg = match oparg {
-        Some(a) if !a.is(none::none()) => {
-            if !has_arg(op) {
-                raise!(ValueError, "stack_effect: opcode does not permit oparg but oparg was specified");
-            }
-            ab::as_i64(a)? as u32
-        }
-        _ => {
-            if has_arg(op) {
-                raise!(ValueError, "stack_effect: opcode requires oparg but oparg was not specified");
-            }
-            0
-        }
+        Some(a) if !a.is(none::none()) => ab::as_i64(a)? as u32,
+        _ => 0,
     };
     let jump = match jump {
         Some(j) if !j.is(none::none()) => Some(ab::is_true(j)?),
