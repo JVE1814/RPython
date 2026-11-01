@@ -32,3 +32,23 @@ tools/           bash/Rust tooling: test runner, benchmark harness
 
 ## Next steps
 See PROGRESS.md.
+
+## Workstreams (branches `worktree-agent-<id>`, briefs follow AGENT_BRIEF.md)
+Finished & merged: parser, compiler, str, bytes, numbers.
+Running (wave 1): containers (list/tuple/dict/set/range/enumerate/zip/map/property/weakref/
+frozendict), osio (posix/_io/time/os/io/stat/errno), functional (_functools/_collections/
+itertools/_operator/_abc/functools/collections/enum/dataclasses/contextlib/types/copyreg-ish),
+text (_sre/re/codecs/unicodedata/textwrap/string helpers/locale/difflib/shlex/glob/fnmatch),
+harness (unittest/traceback/_warnings/argparse/logging/inspect/tempfile/shutil/test-support
+deps), system (sys/threads/_thread/signal/gc/faulthandler/importlib/pymain/platform/sysconfig/
+queue/tracemalloc), lang (except*/ExceptionGroup/asyncgen/typing/_typing/GenericAlias/
+annotationlib), capi (exported C API, extension loading, _testcapi, numpy), jit (inline
+caches/specialisation/JIT tiers).
+Running (wave 2): ast (_ast/ast/tokenize/symtable/codeop), data (copy/pickle/json/datetime/
+array/csv/calendar/pprint/string/zoneinfo/configparser/dbm), compress (zlib/bz2/lzma/zstd/
+hashlib/hmac/base64/gzip/zipfile/tarfile/zipimport/uuid/secrets), net (_socket/select/
+selectors/asyncio/_contextvars/subprocess?/urllib/http/ipaddress/socketserver).
+Unassigned (wave 3): decimal; email/xml(pyexpat)/html/mailbox/mimetypes; pathlib/pwd/grp/
+resource/termios/tty/pty/getpass/fcntl/mmap/marshal/py_compile/compileall/getopt/trace/pdb/
+bdb/profile/cProfile/pstats/timeit/doctest; ctypes/_ctypes; multiprocessing/concurrent;
+sqlite3 (own SQLite? decide); curses/readline/_pyrepl; no-GIL thread-safety audit.
