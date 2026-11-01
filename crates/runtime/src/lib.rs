@@ -63,7 +63,6 @@ pub fn initialize(cfg: &Config) -> PyResult<()> {
     let _ = sys;
     modules::signal::init_signals();
     // sys.path: script dir is added by the caller; then PYTHONPATH and the stdlib
-    let stdlib = modules::sys_full::stdlib_dir();
     let path = modules::sys::get_sys_attr("path").unwrap();
     if !ignore_env {
         if let Ok(pp) = std::env::var("PYTHONPATH") {
@@ -72,7 +71,9 @@ pub fn initialize(cfg: &Config) -> PyResult<()> {
             }
         }
     }
-    types::list::append(&path, types::str::new_str(&stdlib));
+    for entry in modules::sys_full::default_search_path() {
+        types::list::append(&path, types::str::new_str(&entry));
+    }
     modules::sys_full::post_init()?;
     modules::sys::init_stdio();
     Ok(())
