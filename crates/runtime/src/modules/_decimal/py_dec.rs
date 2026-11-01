@@ -1113,6 +1113,7 @@ fn m_format(o: &PyObject, a: &[&PyObject]) -> PyResult {
         if !dict::is_dict(a[1]) {
             raise!(TypeError, "optional argument must be a dict");
         }
+        locale_from_dict(a[1])?;
         Some(a[1])
     } else {
         None
@@ -1422,7 +1423,7 @@ pub fn init_types() -> PyResult<()> {
         let t = &mut *decimal_type();
         t.tp_name = c"decimal.Decimal".as_ptr();
         t.tp_basicsize = std::mem::size_of::<DecObj>() as isize;
-        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE;
+        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_IMMUTABLETYPE;
         t.tp_new = Some(dec_new);
         t.tp_dealloc = Some(dec_dealloc);
         t.tp_alloc = Some(generic_alloc);
