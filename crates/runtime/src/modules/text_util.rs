@@ -272,4 +272,5 @@ pub fn register() {
     register_builtin("_codecs", crate::modules::_codecs::init_module);
     register_builtin("unicodedata", crate::modules::unicodedata::init_module);
     register_builtin("_string", crate::modules::_string::init_module);
+    register_builtin("_tokenize", crate::modules::_tokenize::init_module);
 }
