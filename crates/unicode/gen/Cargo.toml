@@ -1,0 +1,14 @@
+[package]
+name = "rpy-unicode-gen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone: this generator is not part of the main workspace and is only
+# run manually to regenerate crates/unicode/src/tables/*.rs.
+[workspace]
+
+[dependencies]
+
+[profile.dev]
+opt-level = 2
