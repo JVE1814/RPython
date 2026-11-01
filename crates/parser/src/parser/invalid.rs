@@ -30,6 +30,8 @@ impl<'a> Parser<'a> {
         r
     }
 
+    #[cold]
+    #[inline(never)]
     pub(crate) fn invalid_expression(&mut self) -> Result<(), PErr> {
         let start = self.p;
         let t = self.peek();
@@ -185,6 +187,8 @@ impl<'a> Parser<'a> {
         Ok(r?.is_some())
     }
 
+    #[cold]
+    #[inline(never)]
     pub(crate) fn invalid_legacy_expression(&mut self) -> Result<(), PErr> {
         let start = self.p;
         let t = self.peek();
@@ -205,6 +209,8 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    #[cold]
+    #[inline(never)]
     pub(crate) fn invalid_named_expression(&mut self) -> Result<(), PErr> {
         let start = self.p;
         // a=expression ':=' expression
@@ -284,6 +290,8 @@ impl<'a> Parser<'a> {
     }
 
     /// invalid_assignment (tried after the valid assignment alternatives failed).
+    #[cold]
+    #[inline(never)]
     pub(crate) fn invalid_assignment(&mut self) -> Result<(), PErr> {
         let start = self.p;
         // a=invalid_ann_assign_target ':' expression
@@ -443,6 +451,8 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    #[cold]
+    #[inline(never)]
     pub(crate) fn invalid_group(&mut self) -> Result<(), PErr> {
         let start = self.p;
         if self.eat(T::LPAR).is_none() {
@@ -472,6 +482,8 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    #[cold]
+    #[inline(never)]
     pub(crate) fn invalid_double_starred_kvpairs(&mut self) -> Result<(), PErr> {
         let start = self.p;
         if self.eat(T::LBRACE).is_none() {
@@ -486,6 +498,8 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    #[cold]
+    #[inline(never)]
     fn invalid_kvpairs_inner(&mut self) -> Result<(), PErr> {
         let mut first = true;
         loop {
@@ -536,6 +550,8 @@ impl<'a> Parser<'a> {
     }
 
     /// invalid_kwarg at an argument position.
+    #[cold]
+    #[inline(never)]
     pub(crate) fn invalid_kwarg(&mut self, istart: usize) -> Result<(), PErr> {
         self.p = istart;
         let t = self.peek();
@@ -590,6 +606,8 @@ impl<'a> Parser<'a> {
     }
 
     /// invalid_arguments, procedurally. `lpar` is the index of '('.
+    #[cold]
+    #[inline(never)]
     pub(crate) fn invalid_arguments_at(&mut self, lpar: usize) -> Result<(), PErr> {
         let save_inv = self.invalid;
         self.invalid = false;
@@ -598,6 +616,8 @@ impl<'a> Parser<'a> {
         r
     }
 
+    #[cold]
+    #[inline(never)]
     fn invalid_arguments_inner(&mut self, lpar: usize) -> Result<(), PErr> {
         #[derive(Clone)]
         struct Item {
@@ -715,6 +735,8 @@ impl<'a> Parser<'a> {
     }
 
     /// invalid_import (second pass). `self.p` is at 'import'/'from'.
+    #[cold]
+    #[inline(never)]
     pub(crate) fn invalid_import(&mut self, lazy: bool) -> Result<(), PErr> {
         let start = self.p;
         let t = self.peek();
@@ -772,6 +794,8 @@ impl<'a> Parser<'a> {
 
     /// After 'as' failed to be followed by a NAME: "cannot use X as import target".
     /// `m` is the index of the 'as' token.
+    #[cold]
+    #[inline(never)]
     pub(crate) fn invalid_import_as_target(&mut self, m: usize) -> Result<(), PErr> {
         self.p = m + 1;
         let save = self.invalid;
