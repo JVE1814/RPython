@@ -42,6 +42,7 @@ pub mod _codecs;
 pub mod codec_impl;
 pub mod codec_charmap;
 pub mod unicodedata;
+pub mod _string;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
 pub fn register_all() {
