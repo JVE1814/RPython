@@ -214,16 +214,6 @@ impl Scope {
             self.symbols.push(Symbol { name: name.to_string(), flags, scope: SymScope::Unknown });
         }
     }
-    fn remove_symbol(&mut self, name: &str) {
-        if let Some(i) = self.index.remove(name) {
-            self.symbols.remove(i);
-            for v in self.index.values_mut() {
-                if *v > i {
-                    *v -= 1;
-                }
-            }
-        }
-    }
     /// Function-like scopes use fast locals.
     pub fn is_function_like(&self) -> bool {
         matches!(
