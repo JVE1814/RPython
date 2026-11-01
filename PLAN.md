@@ -48,7 +48,8 @@ Running (wave 2): ast (_ast/ast/tokenize/symtable/codeop), data (copy/pickle/jso
 array/csv/calendar/pprint/string/zoneinfo/configparser/dbm), compress (zlib/bz2/lzma/zstd/
 hashlib/hmac/base64/gzip/zipfile/tarfile/zipimport/uuid/secrets), net (_socket/select/
 selectors/asyncio/_contextvars/subprocess?/urllib/http/ipaddress/socketserver).
-Unassigned (wave 3): decimal; email/xml(pyexpat)/html/mailbox/mimetypes; pathlib/pwd/grp/
+Running (wave 3): decimal (_decimal/_pydecimal), devtools (marshal/pathlib/pwd/grp/resource/termios/fcntl/mmap/dis/opcode/pdb/profile/doctest/timeit/runpy/pkgutil/site...).
+Unassigned: email/xml(pyexpat)/html/mailbox/mimetypes; pathlib/pwd/grp/
 resource/termios/tty/pty/getpass/fcntl/mmap/marshal/py_compile/compileall/getopt/trace/pdb/
 bdb/profile/cProfile/pstats/timeit/doctest; ctypes/_ctypes; multiprocessing/concurrent;
 sqlite3 (own SQLite? decide); curses/readline/_pyrepl; no-GIL thread-safety audit.
