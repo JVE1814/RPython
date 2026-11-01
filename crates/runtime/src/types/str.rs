@@ -145,6 +145,11 @@ pub fn ascii_str(o: &PyObject) -> Option<&str> {
 
 /// Allocate an uninitialised compact string of `len` chars with the given maximum char.
 pub fn alloc_str(len: usize, maxchar: u32) -> PyRef {
+    try_alloc_str(len, maxchar).expect("out of memory allocating str")
+}
+
+/// Like `alloc_str`, but returns None when the allocation fails.
+pub fn try_alloc_str(len: usize, maxchar: u32) -> Option<PyRef> {
     let (kind, ascii) = if maxchar < 0x80 {
         (1u32, true)
     } else if maxchar < 0x100 {
@@ -159,7 +164,7 @@ pub fn alloc_str(len: usize, maxchar: u32) -> PyRef {
     unsafe {
         let op = alloc::alloc_object(str_type(), size);
         if op.is_null() {
-            panic!("out of memory allocating str");
+            return None;
         }
         let a = &mut *(op as *mut PyASCIIObject);
         a.length = len as isize;
@@ -170,7 +175,7 @@ pub fn alloc_str(len: usize, maxchar: u32) -> PyRef {
             c.utf8_length = 0;
             c.utf8 = std::ptr::null_mut();
         }
-        PyRef::from_raw(op)
+        Some(PyRef::from_raw(op))
     }
 }
 
