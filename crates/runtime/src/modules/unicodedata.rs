@@ -243,7 +243,7 @@ fn u_iter_graphemes(_slf: &PyObject, args: &[&PyObject]) -> PyResult {
         None => len,
     };
     unsafe {
-        let op = crate::alloc::alloc_object(&raw mut GITER_TYPE, std::mem::size_of::<GraphemeIter>());
+        let op = crate::modules::fncommon::alloc(&raw mut GITER_TYPE)?;
         let g = &mut *(op as *mut GraphemeIter);
         g.string = o.to_ref().into_raw();
         g.pos = start.min(end);
@@ -255,14 +255,17 @@ fn u_iter_graphemes(_slf: &PyObject, args: &[&PyObject]) -> PyResult {
 unsafe extern "C" fn giter_next(o: *mut PyObject) -> *mut PyObject {
     unsafe {
         let g = &mut *(o as *mut GraphemeIter);
-        if g.pos >= g.end {
+        if g.pos >= g.end || g.string.is_null() {
             return std::ptr::null_mut();
         }
         let d = pystr::str_data(&*g.string);
         let start = g.pos;
         let next = rpy_unicode::next_grapheme_break_by(|i| d.get(i), start, g.end);
         g.pos = next;
-        let op = crate::alloc::alloc_object(&raw mut SEGMENT_TYPE, std::mem::size_of::<SegmentObj>());
+        let op = match crate::modules::fncommon::alloc(&raw mut SEGMENT_TYPE) {
+            Ok(op) => op,
+            Err(_) => return std::ptr::null_mut(),
+        };
         let sg = &mut *(op as *mut SegmentObj);
         sg.string = (*g.string).to_ref().into_raw();
         sg.start = start;
@@ -277,15 +280,37 @@ unsafe extern "C" fn self_iter(o: *mut PyObject) -> *mut PyObject {
 
 unsafe extern "C" fn giter_dealloc(o: *mut PyObject) {
     unsafe {
-        xdecref((*(o as *mut GraphemeIter)).string);
-        crate::alloc::free_object(o);
+        crate::gc::untrack(o);
+        crate::modules::fncommon::clear_field(&raw mut (*(o as *mut GraphemeIter)).string);
+        crate::modules::fncommon::free(o);
     }
+}
+
+// Both object kinds only reference their string; they take part in GC so that
+// cycles through a str subclass instance can be collected.
+unsafe extern "C" fn giter_traverse(o: *mut PyObject, v: visitproc, arg: *mut std::ffi::c_void) -> std::ffi::c_int {
+    unsafe { crate::modules::fncommon::visit((*(o as *mut GraphemeIter)).string, v, arg) }
+}
+
+unsafe extern "C" fn giter_clear(o: *mut PyObject) -> std::ffi::c_int {
+    unsafe { crate::modules::fncommon::clear_field(&raw mut (*(o as *mut GraphemeIter)).string) };
+    0
+}
+
+unsafe extern "C" fn segment_traverse(o: *mut PyObject, v: visitproc, arg: *mut std::ffi::c_void) -> std::ffi::c_int {
+    unsafe { crate::modules::fncommon::visit((*(o as *mut SegmentObj)).string, v, arg) }
+}
+
+unsafe extern "C" fn segment_clear(o: *mut PyObject) -> std::ffi::c_int {
+    unsafe { crate::modules::fncommon::clear_field(&raw mut (*(o as *mut SegmentObj)).string) };
+    0
 }
 
 unsafe extern "C" fn segment_dealloc(o: *mut PyObject) {
     unsafe {
-        xdecref((*(o as *mut SegmentObj)).string);
-        crate::alloc::free_object(o);
+        crate::gc::untrack(o);
+        crate::modules::fncommon::clear_field(&raw mut (*(o as *mut SegmentObj)).string);
+        crate::modules::fncommon::free(o);
     }
 }
 
@@ -296,6 +321,9 @@ fn seg(o: &PyObject) -> &SegmentObj {
 unsafe extern "C" fn segment_str(o: *mut PyObject) -> *mut PyObject {
     unsafe {
         let sg = seg(&*o);
+        if sg.string.is_null() {
+            return pystr::new_str("").into_raw();
+        }
         tu::substr(&*sg.string, sg.start, sg.end).into_raw()
     }
 }
@@ -358,7 +386,11 @@ fn init_types() -> PyResult<()> {
         let t = &mut *(&raw mut GITER_TYPE);
         t.tp_name = c"unicodedata.GraphemeBreakIterator".as_ptr();
         t.tp_basicsize = std::mem::size_of::<GraphemeIter>() as isize;
-        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_DISALLOW_INSTANTIATION;
+        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_DISALLOW_INSTANTIATION | Py_TPFLAGS_HAVE_GC;
+        t.tp_alloc = Some(crate::types::typeobject::generic_alloc);
+        t.tp_free = Some(crate::types::typeobject::generic_free);
+        t.tp_traverse = Some(giter_traverse);
+        t.tp_clear = Some(giter_clear);
         t.tp_dealloc = Some(giter_dealloc);
         t.tp_iter = Some(self_iter);
         t.tp_iternext = Some(giter_next);
@@ -366,7 +398,11 @@ fn init_types() -> PyResult<()> {
         let t = &mut *(&raw mut SEGMENT_TYPE);
         t.tp_name = c"unicodedata.Segment".as_ptr();
         t.tp_basicsize = std::mem::size_of::<SegmentObj>() as isize;
-        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_DISALLOW_INSTANTIATION;
+        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_DISALLOW_INSTANTIATION | Py_TPFLAGS_HAVE_GC;
+        t.tp_alloc = Some(crate::types::typeobject::generic_alloc);
+        t.tp_free = Some(crate::types::typeobject::generic_free);
+        t.tp_traverse = Some(segment_traverse);
+        t.tp_clear = Some(segment_clear);
         t.tp_dealloc = Some(segment_dealloc);
         t.tp_str = Some(segment_str);
         t.tp_repr = Some(segment_repr);
