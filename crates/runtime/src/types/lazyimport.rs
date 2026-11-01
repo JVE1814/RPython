@@ -466,7 +466,7 @@ fn lookup_attr(v: &PyObject, attr: &PyObject) -> PyResult {
             let r = match pkgname {
                 Some(pn) => crate::import::cannot_import_name(v, &pn, attr),
                 None => Err(crate::import::import_error_with(
-                    &format!("cannot import name '{}' from <unknown module name>", pystr::to_string_lossy(attr)),
+                    &format!("cannot import name '{}' from '<unknown module name>' (unknown location)", pystr::to_string_lossy(attr)),
                     None,
                     None,
                     Some(attr),

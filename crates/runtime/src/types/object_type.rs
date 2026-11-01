@@ -1273,7 +1273,7 @@ fn shared_subtype_descr(which: usize) -> PyRef {
 fn subtype_get_dict(o: &PyObject) -> PyResult {
     if is_type(o) {
         // classes: the type's own __dict__ (a read-only proxy)
-        return generic_getattr(o, name!("__dict__"));
+        return type_get_dict(o);
     }
     match instance_dict(o) {
         Some(d) => Ok(d),

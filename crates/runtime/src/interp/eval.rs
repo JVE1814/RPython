@@ -501,7 +501,7 @@ fn import_from(module: &PyObject, nm: &PyObject) -> PyResult {
         Some(n) if pystr::is_str(&n) => n,
         _ => {
             return Err(crate::import::import_error_with(
-                &format!("cannot import name '{}' from <unknown module name>", pystr::to_string_lossy(nm)),
+                &format!("cannot import name '{}' from '<unknown module name>' (unknown location)", pystr::to_string_lossy(nm)),
                 None,
                 None,
                 Some(nm),
