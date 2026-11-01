@@ -14,3 +14,4 @@ rpy-parser = { path = "../parser" }
 rpy-unicode = { path = "../unicode" }
 rpy-sre = { path = "../sre" }
 rpy-compiler = { path = "../compiler" }
+rpy-compress = { path = "../compress" }

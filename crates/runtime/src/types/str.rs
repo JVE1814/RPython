@@ -551,8 +551,26 @@ impl StrBuilder {
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// The keys are already well-mixed str hashes.
+#[derive(Default)]
+struct IdentityHasher(u64);
+impl std::hash::Hasher for IdentityHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(8) ^ b as u64;
+        }
+    }
+    fn write_isize(&mut self, v: isize) {
+        self.0 = v as u64;
+    }
+}
+
 struct InternTable {
-    map: HashMap<Vec<u32>, usize>,
+    // keyed on the (cached) str hash; buckets hold the interned objects (no key copies)
+    map: HashMap<isize, Vec<usize>, std::hash::BuildHasherDefault<IdentityHasher>>,
 }
 static INTERNED: Mutex<Option<InternTable>> = Mutex::new(None);
 
@@ -564,10 +582,10 @@ pub fn intern(s: PyRef) -> PyRef {
     if ascii_obj(&s).state & 0xff != 0 {
         return s;
     }
-    let key: Vec<u32> = str_data(&s).to_vec();
+    let key = str_hash(&s);
     let mut g = INTERNED.lock().unwrap();
-    let t = g.get_or_insert_with(|| InternTable { map: HashMap::new() });
-    if let Some(&p) = t.map.get(&key) {
+    let t = g.get_or_insert_with(|| InternTable { map: HashMap::default() });
+    if let Some(&p) = t.map.get(&key).and_then(|b| b.iter().find(|&&p| str_eq(unsafe { &*(p as *mut PyObject) }, &s))) {
         return unsafe { PyRef::from_borrowed(p as *mut PyObject) };
     }
     unsafe {
@@ -575,7 +593,7 @@ pub fn intern(s: PyRef) -> PyRef {
         make_immortal(s.as_ptr());
         (*(s.as_ptr() as *mut PyASCIIObject)).state |= 2; // SSTATE_INTERNED_IMMORTAL
     }
-    t.map.insert(key, s.as_ptr() as usize);
+    t.map.entry(key).or_default().push(s.as_ptr() as usize);
     s
 }
 
