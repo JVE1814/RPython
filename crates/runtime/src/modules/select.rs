@@ -603,7 +603,7 @@ pub fn init() -> PyResult {
         t.tp_alloc = Some(generic_alloc);
         t.tp_dealloc = Some(epoll_dealloc);
         t.tp_getattro = Some(object_generic_getattro);
-        t.tp_doc = c"select.epoll(sizehint=-1, flags=0)\n\nReturns an epolling object\n\n  sizehint\n    The expected number of events to be registered.  It must be positive,\n    or -1 to use the default.  It is only used on older systems where\n    epoll_create1() is not available; otherwise it has no effect (though its\n    value is still checked).\n  flags\n    Deprecated and completely ignored.  However, when supplied, its value\n    must be 0 or select.EPOLL_CLOEXEC, otherwise OSError is raised.".as_ptr();
+        t.tp_doc = c"epoll(sizehint=-1, flags=0)\n--\n\nAn edge- and level-triggered I/O event notification object.\n\nsizehint is only a hint for old kernels (positive, or -1 for the default);\nflags is ignored but must be 0 or EPOLL_CLOEXEC.".as_ptr();
         t.tp_methods = crate::mdefs![
             ("close", NOARGS, epoll_close, "close($self, /)\n--\n\nClose the epoll control file descriptor.\n\nFurther operations on the epoll object will raise an exception."),
             ("fileno", NOARGS, epoll_fileno, "fileno($self, /)\n--\n\nReturn the epoll control file descriptor."),

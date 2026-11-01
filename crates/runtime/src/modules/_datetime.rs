@@ -589,6 +589,32 @@ fn run_in(ns: &PyObject, src: &str, filename: &str) -> PyResult<()> {
 
 static NS: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
 
+const DATETIME_TEXT_SIGNATURES: &str = r#"
+def _with_text_signature(cls, name, sig):
+    attr = cls.__dict__[name]
+    wrapped = isinstance(attr, classmethod)
+    fn = attr.__func__ if wrapped else attr
+    new = type(fn)(fn.__code__, fn.__globals__, fn.__name__, fn.__defaults__, fn.__closure__)
+    new.__kwdefaults__ = fn.__kwdefaults__
+    new.__qualname__ = fn.__qualname__
+    new.__doc__ = fn.__doc__
+    new.__module__ = fn.__module__
+    new.__text_signature__ = sig
+    _set_class_attr(cls, name, classmethod(new) if wrapped else new)
+_with_text_signature(date, 'replace',
+    '($self, /, year=unchanged, month=unchanged, day=unchanged)')
+_with_text_signature(time, 'replace',
+    '($self, /, hour=unchanged, minute=unchanged, second=unchanged,\n'
+    '        microsecond=unchanged, tzinfo=unchanged, *, fold=unchanged)')
+_with_text_signature(datetime, 'replace',
+    '($self, /, year=unchanged, month=unchanged, day=unchanged,\n'
+    '        hour=unchanged, minute=unchanged, second=unchanged,\n'
+    '        microsecond=unchanged, tzinfo=unchanged, *, fold=unchanged)')
+_with_text_signature(datetime, 'combine',
+    '($type, /, date, time, tzinfo=<unrepresentable>)')
+del _with_text_signature
+"#;
+
 fn build_namespace() -> PyResult<()> {
     let ns = dict::new_dict();
     dict::set_item_str(&ns, "__name__", &pystr::new_str("datetime"))?;
@@ -612,36 +638,16 @@ fn build_namespace() -> PyResult<()> {
     for (name, tp) in pairs {
         dict::set_item_str(&ns, name, &type_ref(tp))?;
     }
-    // The copied pure methods whose defaults mean "keep the current value"
-    // advertise that through a text signature inspect cannot evaluate, as the
-    // C implementation does.
-    for (tp, meth, sig) in [
-        (date_type(), "replace", "($self, /, year=unchanged, month=unchanged, day=unchanged)"),
-        (
-            time_type(),
-            "replace",
-            "($self, /, hour=unchanged, minute=unchanged, second=unchanged,\n        microsecond=unchanged, tzinfo=unchanged, *, fold=unchanged)",
-        ),
-        (
-            datetime_type(),
-            "replace",
-            "($self, /, year=unchanged, month=unchanged, day=unchanged,\n        hour=unchanged, minute=unchanged, second=unchanged,\n        microsecond=unchanged, tzinfo=unchanged, *, fold=unchanged)",
-        ),
-        (datetime_type(), "combine", "($type, /, date, time, tzinfo=<unrepresentable>)"),
-    ] {
-        if let Some(f) = dict::get_item_rs(type_dict(tp), meth) {
-            let f = match ab::getattr_opt(&f, crate::name!("__func__"))? {
-                Some(inner) => inner,
-                None => f,
-            };
-            ab::setattr(&f, &pystr::new_str("__text_signature__"), &pystr::new_str(sig))?;
-        }
-    }
     crate::builtins::add_methods_to_dict(
         &ns,
         mdefs![("_set_class_attr", FAST, m_set_class_attr, "Store a class attribute on a datetime type.")],
         None,
     )?;
+    // The copied pure methods whose defaults mean "keep the current value"
+    // advertise that through a text signature inspect cannot evaluate, as the
+    // C implementation does.  They get private copies so that aliases such as
+    // __replace__ keep their ordinary signature.
+    run_in(&ns, DATETIME_TEXT_SIGNATURES, "<_datetime signatures>")?;
     for (slot, name) in [
         (&H_DELTA, "_timedelta_fields"),
         (&H_DATE, "_date_new_args"),

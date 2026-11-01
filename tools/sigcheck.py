@@ -115,7 +115,7 @@ ALIASES = {
     '_weakref': 'weakref', '_datetime': 'datetime', '_collections': 'collections',
     '_functools': 'functools', '_warnings': 'warnings', '_struct': 'struct',
     '_operator': 'operator', '_locale': 'locale', 'posix': 'os', '_stat': 'stat',
-    '_codecs': 'codecs', '_tracemalloc': 'tracemalloc', '_tokenize': 'tokenize',
+    '_codecs': 'codecs', '_tracemalloc': 'tracemalloc',
     '_symtable': 'symtable', '_abc': 'abc', '_sre': 're',
 }
 
