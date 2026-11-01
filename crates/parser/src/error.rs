@@ -8,6 +8,13 @@ pub enum ErrorKind {
     Syntax,
     Indentation,
     Tab,
+    /// "incomplete input" with PyCF_ALLOW_INCOMPLETE_INPUT (CPython raises
+    /// `_IncompleteInputError`, a SyntaxError subclass).
+    IncompleteInput,
+    /// "Parser stack overflowed - Python source too complex to parse" (CPython: MemoryError).
+    MemoryError,
+    /// AST too deep for the compiler (CPython: RecursionError).
+    RecursionError,
 }
 
 impl ErrorKind {
@@ -16,6 +23,9 @@ impl ErrorKind {
             ErrorKind::Syntax => "SyntaxError",
             ErrorKind::Indentation => "IndentationError",
             ErrorKind::Tab => "TabError",
+            ErrorKind::IncompleteInput => "_IncompleteInputError",
+            ErrorKind::MemoryError => "MemoryError",
+            ErrorKind::RecursionError => "RecursionError",
         }
     }
 }

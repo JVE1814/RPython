@@ -214,16 +214,6 @@ impl Scope {
             self.symbols.push(Symbol { name: name.to_string(), flags, scope: SymScope::Unknown });
         }
     }
-    fn remove_symbol(&mut self, name: &str) {
-        if let Some(i) = self.index.remove(name) {
-            self.symbols.remove(i);
-            for v in self.index.values_mut() {
-                if *v > i {
-                    *v -= 1;
-                }
-            }
-        }
-    }
     /// Function-like scopes use fast locals.
     pub fn is_function_like(&self) -> bool {
         matches!(
@@ -361,6 +351,8 @@ impl Builder {
         }
         let _ = pk;
         sc.private = self.private.clone();
+        // a block nested in a comprehension iterable inherits the restriction on walrus
+        sc.comp_iter_expr = self.scopes[prev].comp_iter_expr;
         self.scopes.push(sc);
         self.scopes[prev].children.push(id);
         if let Some(k) = k {
@@ -1638,6 +1630,10 @@ impl<'a> Analyzer<'a> {
                 Some(flags) => {
                     if flags & DEF_BOUND != 0 && parent_kind != ScopeKind::Class && !self.is_free_in_any_child(comp, &s.name) {
                         comp_free.remove(&s.name);
+                    }
+                    // a load in the comprehension of the parent's variable counts as a use
+                    if parent_kind != ScopeKind::Class && scope == SymScope::Free && only_flags & USE != 0 {
+                        self.scopes[sid].set_symbol(&s.name, flags | USE);
                     }
                 }
             }
