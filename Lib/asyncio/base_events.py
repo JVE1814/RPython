@@ -320,6 +320,8 @@ class Server(events.AbstractServer):
         except exceptions.CancelledError:
             try:
                 self.close()
+                # being cancelled means shutting down: drop the clients too
+                self.close_clients()
                 await self.wait_closed()
             finally:
                 raise
@@ -552,7 +554,7 @@ class BaseEventLoop(events.AbstractEventLoop):
 
     def set_default_executor(self, executor):
         if not isinstance(executor, _thread_pool_class()):
-            raise TypeError('executor must be ThreadPoolExecutor')
+            raise TypeError('executor must be ThreadPoolExecutor instance')
         self._default_executor = executor
 
     # ------------------------------------------------------------ running
@@ -1013,7 +1015,10 @@ class BaseEventLoop(events.AbstractEventLoop):
             raise
         except:
             if sock is not None:
-                sock.close()
+                try:
+                    sock.close()
+                except OSError:
+                    pass    # keep the original error
             raise
         finally:
             exceptions = my_exceptions = None
@@ -1077,11 +1082,11 @@ class BaseEventLoop(events.AbstractEventLoop):
                     except OSError:
                         continue
             else:
-                sock, _, _ = await staggered.staggered_race(
+                sock = (await staggered.staggered_race(
                     (lambda info=info: self._connect_sock(errors, info,
                                                           laddr_infos)
                      for info in infos),
-                    happy_eyeballs_delay, loop=self)
+                    happy_eyeballs_delay, loop=self))[0]
 
             if sock is None:
                 flat = [exc for group in errors for exc in group]
@@ -1107,10 +1112,15 @@ class BaseEventLoop(events.AbstractEventLoop):
                 raise ValueError(
                     f'A Stream Socket was expected, got {sock!r}')
 
-        transport, protocol = await self._create_connection_transport(
-            sock, protocol_factory, ssl, server_hostname,
-            ssl_handshake_timeout=ssl_handshake_timeout,
-            ssl_shutdown_timeout=ssl_shutdown_timeout)
+        try:
+            transport, protocol = await self._create_connection_transport(
+                sock, protocol_factory, ssl, server_hostname,
+                ssl_handshake_timeout=ssl_handshake_timeout,
+                ssl_shutdown_timeout=ssl_shutdown_timeout)
+        except:
+            # no transport owns the socket: do not leak it
+            sock.close()
+            raise
         if self._debug:
             logger.debug("%r connected to %s:%r: (%r, %r)",
                          transport.get_extra_info('socket'), host, port,

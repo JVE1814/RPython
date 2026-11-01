@@ -885,6 +885,8 @@ class _SelectorSocketTransport(_SelectorTransport):
         self._loop._remove_writer(self._sock_fd)
         if self._empty_waiter is not None:
             self._empty_waiter.set_result(None)
+        if self._conn_lost:
+            return      # e.g. closed by resume_writing(): already scheduled
         if self._closing:
             self._call_connection_lost(None)
         elif self._eof:
