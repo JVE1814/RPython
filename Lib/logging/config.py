@@ -257,7 +257,9 @@ class ConvertingList(list, _ConvertingMixin):
     """list whose items are converted when read."""
 
     def __getitem__(self, key):
-        return self.convert_with_key(key, list.__getitem__(self, key))
+        # Index a plain copy: configuration lists are short, and this
+        # avoids depending on list.__getitem__ being called unbound.
+        return self.convert_with_key(key, list.copy(self)[key])
 
     def pop(self, idx=-1):
         return self.convert(list.pop(self, idx))
@@ -795,13 +797,11 @@ def listen(port=DEFAULT_LOGGING_CONFIG_PORT, verify=None):
             try:
                 server = self.rcvr(port=self.port, handler=self.hdlr,
                                    ready=self.ready, verify=self.verify)
-            except BaseException:
-                # Unblock whoever waits for the server to come up.
+                if self.port == 0:
+                    self.port = server.server_address[1]
+            finally:
+                # Unblock whoever waits for the server, even on failure.
                 self.ready.set()
-                raise
-            if self.port == 0:
-                self.port = server.server_address[1]
-            self.ready.set()
             global _listener
             with logging._lock:
                 _listener = server
