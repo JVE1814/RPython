@@ -179,18 +179,18 @@ pub fn init_pwd() -> PyResult {
     if PASSWD_TYPE.load(Ordering::Acquire).is_null() {
         let t = structseq::new_type(&Desc {
             name: "pwd.struct_passwd",
-            doc: "pwd.struct_passwd: Results from getpw*() routines.\n\nThis object may be accessed either as a tuple of\n  (pw_name,pw_passwd,pw_uid,pw_gid,pw_gecos,pw_dir,pw_shell)\nor via the object attributes as named in the above tuple.",
+            doc: "pwd.struct_passwd: an entry of the password database.\n\nA 7-tuple (pw_name, pw_passwd, pw_uid, pw_gid, pw_gecos, pw_dir, pw_shell)\nwhose fields are also available as attributes.",
             fields: PASSWD_FIELDS,
             n_in_sequence: 7,
         })?;
         PASSWD_TYPE.store(t, Ordering::Release);
     }
     let methods = mdefs![
-        ("getpwuid", O, pwd_getpwuid, "getpwuid($module, uidobj, /)\n--\n\nReturn the password database entry for the given numeric user ID.\n\nSee `help(pwd)` for more on password database entries."),
-        ("getpwnam", O, pwd_getpwnam, "getpwnam($module, name, /)\n--\n\nReturn the password database entry for the given user name.\n\nSee `help(pwd)` for more on password database entries."),
-        ("getpwall", NOARGS, pwd_getpwall, "getpwall($module, /)\n--\n\nReturn a list of all available password database entries, in arbitrary order.\n\nSee help(pwd) for more on password database entries."),
+        ("getpwuid", O, pwd_getpwuid, "getpwuid($module, uidobj, /)\n--\n\nLook up the password database entry of a numeric user id (KeyError if absent)."),
+        ("getpwnam", O, pwd_getpwnam, "getpwnam($module, name, /)\n--\n\nLook up the password database entry of a user name (KeyError if absent)."),
+        ("getpwall", NOARGS, pwd_getpwall, "getpwall($module, /)\n--\n\nReturn all password database entries as a list (in no particular order)."),
     ];
-    let (m, d) = crate::modules::fncommon::new_module("pwd", methods, Some("This module provides access to the Unix password database.\nIt is available on all Unix versions.\n\nPassword database entries are reported as 7-tuples containing the following\nitems from the password database (see `<pwd.h>'), in order:\npw_name, pw_passwd, pw_uid, pw_gid, pw_gecos, pw_dir, pw_shell.\nThe uid and gid items are integers, all others are strings. An\nexception is raised if the entry asked for cannot be found."))?;
+    let (m, d) = crate::modules::fncommon::new_module("pwd", methods, Some("Read access to the Unix password database (see <pwd.h>).\n\nEntries are struct_passwd tuples; the uid and gid are ints and the other\nfields strings. Lookups of unknown users raise KeyError."))?;
     dict::set_item_str(&d, "struct_passwd", &type_ref(PASSWD_TYPE.load(Ordering::Acquire)))?;
     Ok(m)
 }
@@ -285,18 +285,18 @@ pub fn init_grp() -> PyResult {
     if GROUP_TYPE.load(Ordering::Acquire).is_null() {
         let t = structseq::new_type(&Desc {
             name: "grp.struct_group",
-            doc: "grp.struct_group: Results from getgr*() routines.\n\nThis object may be accessed either as a tuple of\n  (gr_name,gr_passwd,gr_gid,gr_mem)\nor via the object attributes as named in the above tuple.\n",
+            doc: "grp.struct_group: an entry of the group database.\n\nA 4-tuple (gr_name, gr_passwd, gr_gid, gr_mem) whose fields are also\navailable as attributes; gr_mem is a list of member user names.",
             fields: GROUP_FIELDS,
             n_in_sequence: 4,
         })?;
         GROUP_TYPE.store(t, Ordering::Release);
     }
     let methods = mdefs![
-        ("getgrgid", FASTKW, grp_getgrgid, "getgrgid($module, /, id)\n--\n\nReturn the group database entry for the given numeric group ID.\n\nIf id is not valid, raise KeyError."),
-        ("getgrnam", FASTKW, grp_getgrnam, "getgrnam($module, /, name)\n--\n\nReturn the group database entry for the given group name.\n\nIf name is not valid, raise KeyError."),
-        ("getgrall", NOARGS, grp_getgrall, "getgrall($module, /)\n--\n\nReturn a list of all available group entries, in arbitrary order.\n\nAn entry whose name starts with '+' or '-' represents an instruction\nto use YP/NIS and may not be accessible via getgrnam or getgrgid."),
+        ("getgrgid", FASTKW, grp_getgrgid, "getgrgid($module, /, id)\n--\n\nLook up the group database entry of a numeric group id (KeyError if absent)."),
+        ("getgrnam", FASTKW, grp_getgrnam, "getgrnam($module, /, name)\n--\n\nLook up the group database entry of a group name (KeyError if absent)."),
+        ("getgrall", NOARGS, grp_getgrall, "getgrall($module, /)\n--\n\nReturn all group database entries as a list (in no particular order)."),
     ];
-    let (m, d) = crate::modules::fncommon::new_module("grp", methods, Some("Access to the Unix group database.\n\nGroup entries are reported as 4-tuples containing the following fields\nfrom the group database, in order:\n\n  gr_name   - name of the group\n  gr_passwd - group password (encrypted); often empty\n  gr_gid    - numeric ID of the group\n  gr_mem    - list of members\n\nThe gid is an integer, name and password are strings.  (Note that most\nusers are not explicitly listed as members of the groups they are in\naccording to the password database.  Check both databases to get\ncomplete membership information.)"))?;
+    let (m, d) = crate::modules::fncommon::new_module("grp", methods, Some("Read access to the Unix group database (see <grp.h>).\n\nEntries are struct_group tuples. Lookups of unknown groups raise KeyError.\nUsers are often not listed as members of their primary group."))?;
     dict::set_item_str(&d, "struct_group", &type_ref(GROUP_TYPE.load(Ordering::Acquire)))?;
     Ok(m)
 }

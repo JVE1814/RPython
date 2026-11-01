@@ -132,12 +132,12 @@ fn s_log_upto(_m: &PyObject, pri: &PyObject) -> PyResult {
 
 pub fn init_syslog() -> PyResult {
     let methods = mdefs![
-        ("openlog", FASTKW, s_openlog, "openlog($module, /, ident=<unrepresentable>, logoption=0,\n        facility=LOG_USER)\n--\n\nSet logging options of subsequent syslog() calls."),
-        ("closelog", NOARGS, s_closelog, "closelog($module, /)\n--\n\nReset the syslog module values and call the system library closelog()."),
+        ("openlog", FASTKW, s_openlog, "openlog($module, /, ident=<unrepresentable>, logoption=0,\n        facility=LOG_USER)\n--\n\nConfigure the identity, options and facility used by later syslog() calls."),
+        ("closelog", NOARGS, s_closelog, "closelog($module, /)\n--\n\nClose the connection to the system logger and forget the openlog() settings."),
         ("syslog", FAST, s_syslog, "syslog([priority=LOG_INFO,] message)\nSend the string message to the system logger."),
-        ("setlogmask", O, s_setlogmask, "setlogmask($module, maskpri, /)\n--\n\nSet the priority mask to maskpri and return the previous mask value."),
-        ("LOG_MASK", O, s_log_mask, "LOG_MASK($module, pri, /)\n--\n\nCalculates the mask for the individual priority pri."),
-        ("LOG_UPTO", O, s_log_upto, "LOG_UPTO($module, pri, /)\n--\n\nCalculates the mask for all priorities up to and including pri."),
+        ("setlogmask", O, s_setlogmask, "setlogmask($module, maskpri, /)\n--\n\nSet the priority mask and return the previous one."),
+        ("LOG_MASK", O, s_log_mask, "LOG_MASK($module, pri, /)\n--\n\nMask bit for the single priority pri."),
+        ("LOG_UPTO", O, s_log_upto, "LOG_UPTO($module, pri, /)\n--\n\nMask covering all priorities up to and including pri."),
     ];
     let (m, d) = crate::modules::fncommon::new_module("syslog", methods, None)?;
     let consts: &[(&str, i64)] = &[
@@ -209,8 +209,8 @@ fn shm_unlink(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRes
 
 pub fn init_posixshmem() -> PyResult {
     let methods = mdefs![
-        ("shm_open", FASTKW, shm_open, "shm_open($module, /, path, flags, mode=511)\n--\n\nOpen a shared memory object.  Returns a file descriptor (integer)."),
-        ("shm_unlink", FASTKW, shm_unlink, "shm_unlink($module, /, path)\n--\n\nRemove a shared memory object (similar to unlink()).\n\nRemove a shared memory object name, and, once all processes  have  unmapped\nthe object, de-allocates and destroys the contents of the associated memory\nregion."),
+        ("shm_open", FASTKW, shm_open, "shm_open($module, /, path, flags, mode=511)\n--\n\nOpen (or create) a POSIX shared memory object and return its file descriptor."),
+        ("shm_unlink", FASTKW, shm_unlink, "shm_unlink($module, /, path)\n--\n\nRemove the name of a POSIX shared memory object."),
     ];
     let (m, _d) = crate::modules::fncommon::new_module("_posixshmem", methods, None)?;
     Ok(m)
