@@ -90,6 +90,30 @@ impl V {
         r
     }
     fn stmt_inner(&mut self, s: &Stmt) -> R {
+        let empty = |b: &[Stmt], what: &str| -> R {
+            if b.is_empty() {
+                Err(CompileError::other(ErrorKind::ValueError, format!("empty body on {}", what)))
+            } else {
+                Ok(())
+            }
+        };
+        match &s.node {
+            StmtKind::FunctionDef(f) => empty(&f.body, "FunctionDef")?,
+            StmtKind::AsyncFunctionDef(f) => empty(&f.body, "AsyncFunctionDef")?,
+            StmtKind::ClassDef { body, .. } => empty(body, "ClassDef")?,
+            StmtKind::For(f) => empty(&f.body, "For")?,
+            StmtKind::AsyncFor(f) => empty(&f.body, "AsyncFor")?,
+            StmtKind::While { body, .. } => empty(body, "While")?,
+            StmtKind::If { body, .. } => empty(body, "If")?,
+            StmtKind::With(w) => empty(&w.body, "With")?,
+            StmtKind::AsyncWith(w) => empty(&w.body, "AsyncWith")?,
+            StmtKind::Try(t) => empty(&t.body, "Try")?,
+            StmtKind::TryStar(t) => empty(&t.body, "TryStar")?,
+            StmtKind::Match { cases, .. } if cases.is_empty() => {
+                return Err(CompileError::other(ErrorKind::ValueError, "empty cases on Match"))
+            }
+            _ => {}
+        }
         match &s.node {
             StmtKind::FunctionDef(f) | StmtKind::AsyncFunctionDef(f) => {
                 for d in &f.decorator_list {
@@ -224,6 +248,23 @@ impl V {
         r
     }
     fn expr_inner(&mut self, e: &Expr) -> R {
+        let verr = |m: &str| Err(CompileError::other(ErrorKind::ValueError, m.to_string()));
+        match &e.node {
+            ExprKind::BoolOp { values, .. } if values.len() < 2 => return verr("BoolOp with less than 2 values"),
+            ExprKind::Compare { comparators, .. } if comparators.is_empty() => return verr("Compare with no comparators"),
+            ExprKind::Compare { ops, comparators, .. } if ops.len() != comparators.len() => {
+                return verr("Compare has a different number of comparators and operands")
+            }
+            ExprKind::Dict { keys, values } if keys.len() != values.len() => {
+                return verr("Dict doesn't have the same number of keys as values")
+            }
+            ExprKind::ListComp { generators, .. } | ExprKind::SetComp { generators, .. } | ExprKind::GeneratorExp { generators, .. } | ExprKind::DictComp { generators, .. }
+                if generators.is_empty() =>
+            {
+                return verr("comprehension with no generators")
+            }
+            _ => {}
+        }
         match &e.node {
             ExprKind::BoolOp { values, .. } => values.iter().try_for_each(|x| self.expr(x)),
             ExprKind::NamedExpr { target, value } => {
