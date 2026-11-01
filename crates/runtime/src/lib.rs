@@ -22,6 +22,7 @@ pub mod methods;
 pub mod modules;
 pub mod object;
 pub mod threads;
+pub mod tlab;
 pub mod types;
 
 use errors::*;

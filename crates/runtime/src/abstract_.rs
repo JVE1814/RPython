@@ -148,7 +148,7 @@ fn check_result(callable: &PyObject, r: *mut PyObject) -> *mut PyObject {
         if !err_occurred() {
             let _ = err!(SystemError, "{} returned NULL without setting an exception", repr_for_error(callable));
         }
-    } else if err_occurred() {
+    } else if cfg!(debug_assertions) && err_occurred() {
         unsafe { decref(r) };
         let cause = take_exc();
         let _ = err!(SystemError, "{} returned a result with an exception set", repr_for_error(callable));

@@ -19,7 +19,7 @@ pub struct Frame {
     pub next_instr: u32,
     pub nlocalsplus: usize,
     /// localsplus followed by the value stack.
-    pub slots: Box<[*mut PyObject]>,
+    pub slots: Vec<*mut PyObject>,
     pub stack_top: usize,
     /// Lazily created PyFrameObject (borrowed back-pointer; the frame object owns itself).
     pub frame_obj: *mut PyObject,
@@ -52,7 +52,31 @@ impl Frame {
         let cd = crate::types::code::code(code);
         let nlp = cd.obj.co_nlocalsplus as usize;
         let total = nlp + cd.obj.co_stacksize as usize + 1;
-        let slots = vec![std::ptr::null_mut::<PyObject>(); total].into_boxed_slice();
+        if let Some(mut f) = POOL.with(|p| p.borrow_mut().pop()) {
+            f.slots.clear();
+            f.slots.resize(total, std::ptr::null_mut());
+            f.code = code.to_ref().into_raw();
+            f.func = func.map_or(std::ptr::null_mut(), |f| f.to_ref().into_raw());
+            f.globals = globals.to_ref().into_raw();
+            f.builtins = builtins.to_ref().into_raw();
+            f.locals = locals.map_or(std::ptr::null_mut(), |l| l.to_ref().into_raw());
+            f.prev = std::ptr::null_mut();
+            f.lasti = 0;
+            f.next_instr = 0;
+            f.nlocalsplus = nlp;
+            f.stack_top = nlp;
+            f.frame_obj = std::ptr::null_mut();
+            f.generator = std::ptr::null_mut();
+            f.state = FrameState::Created;
+            f.trace_line = -1;
+            f.f_trace = std::ptr::null_mut();
+            f.f_trace_lines = true;
+            f.f_trace_opcodes = false;
+            f.yield_from_send = -1;
+            f.unwind_pc = -1;
+            return f;
+        }
+        let slots = vec![std::ptr::null_mut::<PyObject>(); total];
         Box::new(Frame {
             code: code.to_ref().into_raw(),
             func: func.map_or(std::ptr::null_mut(), |f| f.to_ref().into_raw()),
@@ -114,8 +138,12 @@ impl Frame {
     }
 }
 
-impl Drop for Frame {
-    fn drop(&mut self) {
+impl Frame {
+    /// Release all references held by the frame (idempotent).
+    pub fn release(&mut self) {
+        if self.code.is_null() {
+            return;
+        }
         if !self.frame_obj.is_null() {
             unsafe {
                 let fo = self.frame_obj as *mut crate::types::frameobject::PyFrameObject;
@@ -133,5 +161,35 @@ impl Drop for Frame {
             xdecref(self.locals);
             xdecref(self.f_trace);
         }
+        self.code = std::ptr::null_mut();
+        self.func = std::ptr::null_mut();
+        self.globals = std::ptr::null_mut();
+        self.builtins = std::ptr::null_mut();
+        self.locals = std::ptr::null_mut();
+        self.f_trace = std::ptr::null_mut();
     }
+}
+
+impl Drop for Frame {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+thread_local! {
+    static POOL: std::cell::RefCell<Vec<Box<Frame>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Return a finished frame to the per-thread pool.
+pub fn recycle(mut f: Box<Frame>) {
+    f.release();
+    if f.slots.capacity() > 4096 {
+        return;
+    }
+    let _ = POOL.try_with(|p| {
+        let mut p = p.borrow_mut();
+        if p.len() < 128 {
+            p.push(f);
+        }
+    });
 }
