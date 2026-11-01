@@ -243,6 +243,9 @@ impl<'a> Parser<'a> {
     /// Returns the (flattened) values.
     fn fstring(&mut self, tstring: bool) -> R<Vec<Expr>> {
         let start_tok = self.advance();
+        if tstring {
+            self.check_version(14, "t-strings are")?;
+        }
         let raw = parse_prefix(self.text(&start_tok)).raw;
         let (mid, end) = if tstring { (T::TSTRING_MIDDLE, T::TSTRING_END) } else { (T::FSTRING_MIDDLE, T::FSTRING_END) };
         let mut values = Vec::new();

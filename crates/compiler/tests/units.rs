@@ -321,3 +321,25 @@ fn extended_arg() {
     let c = comp(&src);
     assert_eq!(c.locations.len(), c.code.len());
 }
+
+#[test]
+fn percent_format_folding() {
+    let mut m = parse_src("'%s' % (a,)\n'%-5r|%%|%.2a' % (b, c)\n'%d' % (d,)\n", Mode::Exec);
+    rpy_compiler::optimize_ast(&mut m, 1, 0).unwrap();
+    let d = format!("{:?}", m);
+    assert!(d.contains("JoinedStr"));
+    assert!(d.matches("FormattedValue").count() == 3, "{}", d);
+    assert!(d.contains("BinOp")); // %d stays
+    let c = comp("x = '%s=%r' % (a, b)\n");
+    assert!(has(&c, Op::FormatSimple) && has(&c, Op::BuildString));
+}
+
+#[test]
+fn unused_consts_removed() {
+    let c = comp("l = lambda: 'this is the only const'\n");
+    assert_eq!(find_code(&c, "<lambda>").unwrap().consts, vec![s("this is the only const")]);
+    let c = comp("def f():\n    'doc'\n    return 42\n");
+    assert_eq!(find_code(&c, "f").unwrap().consts, vec![s("doc"), Constant::Int(42)]);
+    let c = comp("def f():\n    if True:\n        return 'used'\n    else:\n        return 'unused'\n");
+    assert!(!find_code(&c, "f").unwrap().consts.contains(&s("unused")));
+}

@@ -31,12 +31,16 @@ struct Folder<'w> {
     depth: u32,
     max_depth: u32,
     ctx: Vec<Ctx>,
+    /// `from __future__ import annotations`: annotations are unparsed later and must keep
+    /// their source form (no folding).
+    string_annotations: bool,
 }
 
 type R = Result<(), CompileError>;
 
-pub fn fold_module(m: &mut Mod, optimize: i32, _future: u32, warnings: &mut Vec<Warning>, max_depth: u32) -> R {
-    let mut f = Folder { optimize, full: true, warnings: Some(warnings), depth: 0, max_depth, ctx: Vec::new() };
+pub fn fold_module(m: &mut Mod, optimize: i32, future: u32, warnings: &mut Vec<Warning>, max_depth: u32) -> R {
+    let string_annotations = future & crate::cf::CO_FUTURE_ANNOTATIONS != 0;
+    let mut f = Folder { optimize, full: true, warnings: Some(warnings), depth: 0, max_depth, ctx: Vec::new(), string_annotations };
     f.fold_mod(m)
 }
 
@@ -44,7 +48,7 @@ pub fn optimize_ast(m: &mut Mod, optimize: i32, _flags: u32) -> R {
     if optimize <= 0 {
         return Ok(());
     }
-    let mut f = Folder { optimize, full: false, warnings: None, depth: 0, max_depth: crate::DEFAULT_MAX_DEPTH, ctx: Vec::new() };
+    let mut f = Folder { optimize, full: false, warnings: None, depth: 0, max_depth: crate::DEFAULT_MAX_DEPTH, ctx: Vec::new(), string_annotations: false };
     f.fold_mod(m)?;
     if optimize >= 2 {
         strip_docstrings_mod(m);
@@ -553,6 +557,18 @@ impl<'w> Folder<'w> {
         r
     }
 
+    fn fold_annotation(&mut self, e: &mut Expr) -> R {
+        if self.string_annotations {
+            let full = self.full;
+            self.full = false;
+            let r = self.fold_expr(e);
+            self.full = full;
+            r
+        } else {
+            self.fold_expr(e)
+        }
+    }
+
     fn fold_args(&mut self, a: &mut Arguments) -> R {
         for d in a.defaults.iter_mut() {
             self.fold_expr(d)?;
@@ -562,12 +578,12 @@ impl<'w> Folder<'w> {
         }
         for arg in a.posonlyargs.iter_mut().chain(a.args.iter_mut()).chain(a.kwonlyargs.iter_mut()) {
             if let Some(ann) = &mut arg.annotation {
-                self.fold_expr(ann)?;
+                self.fold_annotation(ann)?;
             }
         }
         for arg in a.vararg.iter_mut().chain(a.kwarg.iter_mut()) {
             if let Some(ann) = &mut arg.annotation {
-                self.fold_expr(ann)?;
+                self.fold_annotation(ann)?;
             }
         }
         Ok(())
@@ -626,6 +642,7 @@ impl<'w> Folder<'w> {
 
     fn fold_stmt_inner(&mut self, s: &mut Stmt) -> R {
         let loc = s.loc;
+        let is_async_for = matches!(s.node, StmtKind::AsyncFor(_));
         match &mut s.node {
             StmtKind::FunctionDef(f) | StmtKind::AsyncFunctionDef(f) => {
                 for d in f.decorator_list.iter_mut() {
@@ -634,7 +651,7 @@ impl<'w> Folder<'w> {
                 self.fold_type_params(&mut f.type_params)?;
                 self.fold_args(&mut f.args)?;
                 if let Some(r) = &mut f.returns {
-                    self.fold_expr(r)?;
+                    self.fold_annotation(r)?;
                 }
                 self.fold_function_body(&mut f.body)?;
             }
@@ -681,17 +698,13 @@ impl<'w> Folder<'w> {
             }
             StmtKind::AnnAssign { target, annotation, value, .. } => {
                 self.fold_expr(target)?;
-                self.fold_expr(annotation)?;
+                self.fold_annotation(annotation)?;
                 if let Some(v) = value {
                     self.fold_expr(v)?;
                 }
             }
             StmtKind::For(f) | StmtKind::AsyncFor(f) => {
-                let is_async = matches!(s.node, StmtKind::AsyncFor(_));
-                let f = match &mut s.node {
-                    StmtKind::For(f) | StmtKind::AsyncFor(f) => f,
-                    _ => unreachable!(),
-                };
+                let is_async = is_async_for;
                 self.fold_expr(&mut f.target)?;
                 if is_async {
                     self.fold_expr(&mut f.iter)?;
@@ -985,6 +998,13 @@ impl<'w> Folder<'w> {
                         }
                     }
                 }
+                if replace.is_none() && *op == Operator::Mod {
+                    if let (Some(Constant::Str(fmt)), ExprKind::Tuple { elts, ctx: ExprContext::Load }) = (as_const(left), &right.node) {
+                        if elts.len() <= MAX_COLLECTION_SIZE && !elts.iter().any(|x| matches!(x.node, ExprKind::Starred { .. })) {
+                            replace = optimize_format(fmt, elts, loc);
+                        }
+                    }
+                }
             }
             ExprKind::UnaryOp { op, operand } => {
                 self.fold_expr(operand)?;
@@ -1104,4 +1124,105 @@ impl<'w> Folder<'w> {
         }
         Ok(())
     }
+}
+
+/// `'%s %r' % (a, b)` -> `f'{a!s} {b!r}'` (CPython's optimize_format): only %s/%r/%a with
+/// optional flags `-`, width and precision; any other unit leaves the expression unchanged.
+fn optimize_format(fmt: &PyStr, elts: &[Expr], loc: Loc) -> Option<Expr> {
+    let f: Vec<u32> = fmt.code_points().collect();
+    let pct = '%' as u32;
+    let n = f.len();
+    let mut pos = 0;
+    let mut cnt = 0;
+    let mut seq: Vec<Expr> = Vec::new();
+    loop {
+        // literal part (%% -> %)
+        let mut lit = PyStr::new();
+        while pos < n {
+            if f[pos] == pct {
+                if pos + 1 < n && f[pos + 1] == pct {
+                    lit.push_code_point(pct);
+                    pos += 2;
+                    continue;
+                }
+                break;
+            }
+            lit.push_code_point(f[pos]);
+            pos += 1;
+        }
+        if !lit.is_empty() {
+            seq.push(mk_const(Constant::Str(lit), loc));
+        }
+        if pos >= n {
+            break;
+        }
+        if cnt >= elts.len() {
+            return None;
+        }
+        pos += 1; // '%'
+        let next = |pos: &mut usize| -> Option<u32> {
+            if *pos >= n {
+                return None;
+            }
+            *pos += 1;
+            Some(f[*pos - 1])
+        };
+        let mut ljust = false;
+        let mut ch;
+        loop {
+            ch = next(&mut pos)?;
+            match char::from_u32(ch) {
+                Some('-') => ljust = true,
+                Some('+') | Some(' ') | Some('#') | Some('0') => {}
+                _ => break,
+            }
+        }
+        let mut width: i64 = -1;
+        if (('0' as u32)..=('9' as u32)).contains(&ch) {
+            width = 0;
+            while (('0' as u32)..=('9' as u32)).contains(&ch) {
+                width = width * 10 + (ch - '0' as u32) as i64;
+                if width > i32::MAX as i64 / 10 {
+                    return None;
+                }
+                ch = next(&mut pos)?;
+            }
+        }
+        let mut prec: i64 = -1;
+        if ch == '.' as u32 {
+            ch = next(&mut pos)?;
+            prec = 0;
+            while (('0' as u32)..=('9' as u32)).contains(&ch) {
+                prec = prec * 10 + (ch - '0' as u32) as i64;
+                if prec > i32::MAX as i64 / 10 {
+                    return None;
+                }
+                ch = next(&mut pos)?;
+            }
+        }
+        let conv = match char::from_u32(ch) {
+            Some(c @ ('s' | 'r' | 'a')) => c as i32,
+            _ => return None,
+        };
+        let mut spec = String::new();
+        if !ljust && width > 0 {
+            spec.push('>');
+        }
+        if width >= 0 {
+            spec.push_str(&width.to_string());
+        }
+        if prec >= 0 {
+            spec.push('.');
+            spec.push_str(&prec.to_string());
+        }
+        let arg = elts[cnt].clone();
+        cnt += 1;
+        let aloc = arg.loc;
+        let format_spec = if spec.is_empty() { None } else { Some(Box::new(mk_const(Constant::Str(PyStr::from(spec)), aloc))) };
+        seq.push(Expr::new(ExprKind::FormattedValue { value: Box::new(arg), conversion: conv, format_spec }, aloc));
+    }
+    if cnt < elts.len() {
+        return None;
+    }
+    Some(Expr::new(ExprKind::JoinedStr { values: seq }, loc))
 }
