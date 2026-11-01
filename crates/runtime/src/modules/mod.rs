@@ -31,6 +31,8 @@ pub mod _collections;
 pub mod _types;
 pub mod _heapq;
 pub mod _bisect;
+pub mod atexit;
+pub mod _contextvars;
 pub mod builtins_numbers;
 pub mod math;
 pub mod numbers_registry;
