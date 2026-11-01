@@ -18,4 +18,6 @@ pub mod codecs_registry;
 pub mod reprlib_guard;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
-pub fn register_all() {}
+pub fn register_all() {
+    crate::import::register_builtin("_string", crate::types::str_methods::init_string_module);
+}

@@ -1815,6 +1815,31 @@ pub fn ready_types() -> PyResult<()> {
     Ok(())
 }
 
+// ================================================================== _string module
+// (CPython defines `_string` next to the str type.)
+
+fn m_formatter_parser(_m: &PyObject, s: &PyObject) -> PyResult {
+    formatter_parser(s)
+}
+fn m_formatter_field_name_split(_m: &PyObject, s: &PyObject) -> PyResult {
+    formatter_field_name_split(s)
+}
+
+pub fn init_string_module() -> PyResult {
+    let m = crate::types::module::new_module("_string")?;
+    let d = crate::types::module::module_dict(&m);
+    dict::set_item_str(&d, "__doc__", &pystr::new_str("string helper module"))?;
+    crate::builtins::add_methods_to_dict(
+        &d,
+        crate::mdefs![
+            ("formatter_parser", O, m_formatter_parser, "formatter_parser($module, format_string, /)\n--\n\nparse the argument as a format string"),
+            ("formatter_field_name_split", O, m_formatter_field_name_split, "formatter_field_name_split($module, field_name, /)\n--\n\nsplit the argument as a field name"),
+        ],
+        Some(&m),
+    )?;
+    Ok(m)
+}
+
 #[allow(dead_code)]
 fn _unit_check<T: Unit>() {}
 #[allow(dead_code)]
