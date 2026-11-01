@@ -199,7 +199,20 @@ fn set_options(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         Some(v) => v,
         None => raise!(AttributeError, "cannot delete attribute"),
     };
-    let new = crate::ctypes::int_mask(v)?;
+    if !rpy_runtime::types::int::is_int(v) {
+        raise!(TypeError, "options must be an int, not {}", tname(v));
+    }
+    let neg = unsafe { capi::PyObject_RichCompareBool(v.as_ptr(), new_int(0).as_ptr(), 0) };
+    if neg < 0 {
+        return Err(PyErr);
+    }
+    if neg == 1 {
+        raise!(ValueError, "options must be a non-negative integer");
+    }
+    let new = unsafe { capi::PyLong_AsUnsignedLongLong(v.as_ptr()) };
+    if new == u64::MAX && err_occurred() {
+        return Err(PyErr);
+    }
     let c = ctx(o).ctx;
     let cur = sl!(SSL_CTX_get_options(c));
     let clear = cur & !new;
@@ -456,7 +469,14 @@ unsafe extern "C" fn servername_cb(ssl: *mut c_void, al: *mut c_int, _arg: *mut 
                 Some(cb) => cb.clone(),
                 None => return 0,
             };
-            let owner = super::socket::owner_or_self(&*sock);
+            // a dead owner (SSLObject/SSLSocket collected) fails the handshake
+            let owner = match super::socket::live_owner(&*sock) {
+                Some(w) => w,
+                None => {
+                    *al = 80; // internal_error
+                    return 2;
+                }
+            };
             let name = sl!(SSL_get_servername(ssl, 0));
             let name_obj = if name.is_null() {
                 none()
@@ -624,6 +644,9 @@ fn password_bytes(v: &PyObject, from_callback: bool) -> PyResult<Vec<u8>> {
 unsafe extern "C" fn password_cb(buf: *mut c_char, size: c_int, _rw: c_int, userdata: *mut c_void) -> c_int {
     unsafe {
         let info = &mut *(userdata as *mut PwInfo);
+        if info.error {
+            return -1;
+        }
         let g = crate::gil::ensure();
         let r = (|| -> PyResult<Vec<u8>> {
             if let Some(cb) = &info.callable {
@@ -722,6 +745,11 @@ fn m_load_cert_chain(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) ->
     let keypath = path_cstring(keyobj)?;
     unsafe { *libc::__errno_location() = 0 };
     let r = sl!(SSL_CTX_use_PrivateKey_file(c, keypath.as_ptr(), 1));
+    if info.error {
+        restore();
+        cr!(ERR_clear_error());
+        return Err(PyErr);
+    }
     if r != 1 {
         restore();
         if info.error {
@@ -756,6 +784,20 @@ fn add_cadata(c: *mut c_void, data: &[u8], pem: bool) -> PyResult<()> {
             }
         };
         if x.is_null() {
+            if loaded > 0 {
+                // trailing data that is not a certificate is an error, but running out of
+                // PEM blocks is the normal end
+                let trailing = if pem {
+                    let e = cr!(ERR_peek_last_error()) as u64;
+                    e != 0 && !(err_get_lib(e) == 9 && err_get_reason(e) == 108)
+                } else {
+                    der_pos != der_end
+                };
+                if trailing {
+                    cr!(BIO_free(bio));
+                    return Err(raise_from_queue(None, "cadata contains invalid data"));
+                }
+            }
             break;
         }
         let r = cr!(X509_STORE_add_cert(store, x));

@@ -51,7 +51,7 @@ _enum_from_ssl(_IntFlag, 'VerifyFlags', 'VERIFY_')
 _enum_from_ssl(_IntEnum, 'VerifyMode', 'CERT_')
 
 PROTOCOL_SSLv23 = _SSLMethod.PROTOCOL_SSLv23 = _SSLMethod.PROTOCOL_TLS
-_PROTOCOL_NAMES = {member.value: name
+_PROTOCOL_NAMES = {member: name
                    for name, member in _SSLMethod.__members__.items()}
 
 

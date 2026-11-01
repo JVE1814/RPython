@@ -71,6 +71,14 @@ fn deref_weak(w: &PyObject) -> Option<PyRef> {
     }
 }
 
+/// The owner if it is still alive (or the _SSLSocket itself when it has no owner).
+pub fn live_owner(o: &PyObject) -> Option<PyRef> {
+    match &ss(o).owner {
+        Some(w) => deref_weak(w),
+        None => Some(o.to_ref()),
+    }
+}
+
 /// The owner object (SSLSocket/SSLObject) or the _SSLSocket itself.
 pub fn owner_or_self(o: &PyObject) -> PyRef {
     match &ss(o).owner {
