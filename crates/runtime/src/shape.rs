@@ -550,7 +550,7 @@ pub fn materialize(o: &PyObject) -> bool {
         if w.load(Acquire) as usize != p {
             return true; // someone else materialised
         }
-        let sh = (*v).shape.swap(std::ptr::null_mut(), AcqRel);
+        let sh = (*v).shape.load(Acquire);
         if !sh.is_null() {
             for (i, &k) in (*sh).keys().iter().enumerate() {
                 let val = (*v).slot(i).load(Acquire);
@@ -560,7 +560,11 @@ pub fn materialize(o: &PyObject) -> bool {
                 }
             }
         }
+        // publish the dict before retiring the shape: a lock-free reader that finds the
+        // shape gone falls back to the dict path and must find the dict there (otherwise
+        // it would see neither and report the attribute missing)
         w.store(d.into_raw(), Release);
+        (*v).shape.store(std::ptr::null_mut(), Release);
         // the dict took its own references; drop the values' ones (deferred: lock-free
         // readers may still be looking at the values area)
         if !sh.is_null() {
