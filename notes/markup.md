@@ -42,17 +42,22 @@ Branch: `worktree-agent-a76d7c540a0506f43`.
 
 | test | result |
 |---|---|
-| test_pyexpat | 72/89 ok; 17 = CJK codecs missing (test_unsupported_encodings), test_exception (needs C-level traceback frame "pyexpat.c"), MalformedInputTest.test1 (fixed in engine, pending rebuild check) |
-| test_xml_etree / _c | 228/238 ok; 16 CJK codecs; test_qname (runtime hash bug, below); XMLPullParser deferral + error position (fixed in engine, pending rebuild check) |
+| test_pyexpat | 73/89 ok (15 skipped); 16 errors = CJK codecs missing (test_unsupported_encodings subtests); test_exception fails (wants a synthetic traceback frame for "Modules/pyexpat.c"; pyexpat's Python frames show instead) |
+| test_xml_etree | 233/238 ok; 17 errors = CJK codecs (test_encoding subtests) + test_qname (runtime hash bug, below) |
+| test_xml_etree_c | same as test_xml_etree (Python implementation); 18 accelerator-only tests skip ("requires _elementtree") |
 | test_minidom | 133/133 |
-| test_pulldom | 11/11 |
+| test_pulldom | 11/11 (3 expected failures) |
 | test_sax | 192/192 (needs urllib from the web workstream) |
 | test_xml_dom_minicompat | 11/11 |
-| test_xml_dom_xmlbuilder | blocked: test imports http.client + test_httplib (needs `array`) |
+| test_xml_dom_xmlbuilder | not runnable yet: imports http.client and test_httplib (needs `array` + http) |
 | test_email (package) | 1803/1814; rest = CJK codecs (8) + codec-name DeprecationWarning (2, runtime) + gb2312 |
-| test_html, test_htmlparser | pass (see earlier runs) |
+| test_html / test_htmlparser | 2/2, 68/68 (htmlparser takes ~40 s: some test is slow, not investigated) |
 | test_optparse | 155/155 (translation snapshot test skipped: no Tools/i18n) |
-| test_quopri, test_mimetypes, test_tomllib | pass where dependencies exist (tomllib needs datetime) |
+| test_mailbox | 386/386 |
+| test_smtplib | 85/85 |
+| test_poplib | 74 run, OK, 51 skipped (no ssl module) |
+| test_ftplib | 96 run, OK, 49 skipped (no ssl, no IPv6) |
+| test_quopri / test_mimetypes / test_tomllib | 11/11, 43/46 (3 skipped), 19/19 |
 
 ## Bugs found outside this workstream (not fixed here)
 
@@ -70,5 +75,8 @@ Branch: `worktree-agent-a76d7c540a0506f43`.
 ## Missing
 
 * `_elementtree` Rust accelerator.
-* mailbox, smtplib, imaplib, poplib, ftplib, xmlrpc (see final report for the
-  current state).
+* `imaplib`, `xmlrpc` (client and server) not written.
+* `webbrowser` comes from the devtools workstream (already in core); not
+  duplicated here.  `nntplib` skipped as instructed.
+* SSL paths in smtplib/poplib/ftplib (SMTP_SSL, POP3_SSL, FTP_TLS) are
+  written but untested (no `ssl` module yet).
