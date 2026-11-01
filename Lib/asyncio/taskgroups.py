@@ -28,6 +28,7 @@ class TaskGroup:
         self._errors = []
         self._base_error = None
         self._all_done = None   # future resolved when _tasks empties
+        self._cancel_on_enter = False
 
     def __repr__(self):
         words = ['<TaskGroup']
@@ -51,6 +52,8 @@ class TaskGroup:
             raise RuntimeError(
                 f'TaskGroup {self!r} cannot determine the parent task')
         self._entered = True
+        if self._cancel_on_enter:
+            self._cancel_parent()
         return self
 
     async def __aexit__(self, et, exc, tb):
@@ -86,8 +89,10 @@ class TaskGroup:
                 await self._all_done
             except exceptions.CancelledError as again:
                 # the parent was cancelled while we wait for the children
+                # keep the most recent cancellation (it may carry a
+                # message from an outside caller)
+                cancellation = again
                 if not self._aborting:
-                    cancellation = again
                     self._abort()
             self._all_done = None
 
@@ -101,16 +106,20 @@ class TaskGroup:
             # we were the only one asking for the parent's cancellation
             cancellation = None
 
+        if (et is not None and issubclass(et, GeneratorExit) and
+                not self._errors):
+            return None     # closing an async generator: let it propagate
+        if et is not None and not body_cancelled:
+            self._errors.append(exc)
+
         try:
             if cancellation is not None and not self._errors:
                 raise cancellation
         finally:
-            cancellation = None
-
-        if et is not None and not body_cancelled:
-            self._errors.append(exc)
+            exc = cancellation = None
         if not self._errors:
-            return None
+            # a cancellation caused by the group itself ends here
+            return True if body_cancelled else None
         if self._parent_task.cancelling():
             # keep an external cancellation request pending
             self._parent_task.uncancel()
@@ -141,10 +150,35 @@ class TaskGroup:
         # failure goes through _on_task_done like any other
         self._tasks.add(task)
         task.add_done_callback(self._on_task_done)
+        if self._aborting and not task.done():
+            # an eagerly started task cancelled the group before it was
+            # registered here
+            task.cancel()
         try:
             return task
         finally:
             del task
+
+    def _cancel_parent(self):
+        self._abort()
+        if not self._parent_cancel_requested:
+            self._parent_cancel_requested = True
+            self._parent_task.cancel()
+
+    def cancel(self):
+        """Cancel the group: its tasks and the body of the "async with"
+        block are cancelled, and the block exits without an error (unless
+        tasks failed).  Calling it again or after the block is harmless."""
+        if self._aborting:
+            return
+        if not self._entered:
+            self._cancel_on_enter = True
+            return
+        if self._exiting:
+            if self._tasks:
+                self._abort()   # the body is done: only stop the children
+            return
+        self._cancel_parent()
 
     def _abort(self):
         self._aborting = True

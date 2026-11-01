@@ -34,6 +34,9 @@ def _coroutine_frames(coro):
     """Frames of a suspended coroutine chain, innermost first."""
     frames = []
     while coro is not None:
+        code = getattr(coro, "gi_code", None)
+        if code is not None and code.co_name == "__await__":
+            break   # a future's own await machinery is not a user frame
         frame = (getattr(coro, 'cr_frame', None) or
                  getattr(coro, 'gi_frame', None) or
                  getattr(coro, 'ag_frame', None))

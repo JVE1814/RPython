@@ -526,7 +526,7 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
         if self.at_kw(Kw::Import) {
-            // gh-150459: `from . lazy import x` warning
+            // `from . lazy import x` probably meant `lazy from . import x`: warn
             if !lazy && level > 0 && module.as_deref() == Some("lazy") && self.p == mstart + 1 {
                 let lt = self.tok_at(mstart);
                 if let Some(d) = last_dot_end {
@@ -1425,8 +1425,10 @@ impl<'a> Parser<'a> {
                     let colon = self.peek();
                     self.advance();
                     let m = self.p;
-                    if self.expression()?.is_some() {
-                        let msg = if t.ty == T::STAR { "cannot use bound with TypeVarTuple" } else { "cannot use bound with ParamSpec" };
+                    if let Some(bound) = self.expression()? {
+                        let what = if matches!(bound.node, ExprKind::Tuple { .. }) { "constraints" } else { "bound" };
+                        let kind = if t.ty == T::STAR { "TypeVarTuple" } else { "ParamSpec" };
+                        let msg = format!("cannot use {} with {}", what, kind);
                         let _ = m;
                         return Err(self.err_range(msg, Self::tok_loc(&colon), self.loc(m)));
                     }

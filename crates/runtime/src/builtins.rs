@@ -592,7 +592,14 @@ fn exec_or_eval(args: &[&PyObject], kw: Option<&PyObject>, is_eval: bool) -> PyR
             b.drain(..i);
         }
         let mode = if is_eval { crate::compile::Mode::Eval } else { crate::compile::Mode::Exec };
-        crate::compile::compile_bytes(&b, "<string>", mode, 0, -1)?.code
+        let flags = crate::modules::ast_bridge::inherited_future_flags();
+        if pystr::is_str(src) {
+            // str source: an encoding declaration is ignored (the text is already decoded)
+            let text = String::from_utf8(b).unwrap_or_default();
+            crate::compile::compile_str(&text, "<string>", mode, flags, -1)?.code
+        } else {
+            crate::compile::compile_bytes(&b, "<string>", mode, flags, -1)?.code
+        }
     };
     let nfree = crate::types::code::code(&code).nfreevars();
     if !is_eval {

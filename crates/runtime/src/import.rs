@@ -166,7 +166,27 @@ pub fn install_importlib(stdlib: &str) -> PyResult<()> {
         return Ok(());
     }
     EXTERNAL_INSTALLED.store(true, std::sync::atomic::Ordering::Release);
+    install_zipimport_hook();
     Ok(())
+}
+
+/// Put `zipimport.zipimporter` first in sys.path_hooks (as CPython does at startup);
+/// failures only disable importing from ZIP archives.
+fn install_zipimport_hook() {
+    let r = (|| -> PyResult<()> {
+        let zi = import_absolute("zipimport")?;
+        let hook = ab::getattr_str(&zi, "zipimporter")?;
+        if let Some(hooks) = crate::modules::sys::get_sys_attr("path_hooks") {
+            list::insert(&hooks, 0, hook);
+        }
+        Ok(())
+    })();
+    if r.is_err() {
+        let _ = take_exc();
+        if crate::modules::sys_full::config().verbose > 0 {
+            crate::modules::sys::write_stderr("# can't import zipimport\n");
+        }
+    }
 }
 
 pub fn importlib_active() -> bool {

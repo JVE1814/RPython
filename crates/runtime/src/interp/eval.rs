@@ -1608,6 +1608,10 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             let level = popref!(f);
                             let nm = &cd.names[(arg & 0x7fffff) as usize];
                             let locals = if f.locals.is_null() { none::none_ref() } else { unsafe { (*f.locals).to_ref() } };
+                            if arg & (1 << 23) != 0 && !locals.is(f.globals()) {
+                                // `lazy import` compiled by exec() inside a function or class body
+                                raise!(SyntaxError, "lazy import is only allowed at module level");
+                            }
                             let m = crate::import::import_name_from_frame(f.globals(), &locals, nm, &fromlist, &level, f.builtins())?;
                             push!(f, m.into_raw());
                         }
