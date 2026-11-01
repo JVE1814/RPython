@@ -84,7 +84,14 @@ def dispatch(c, id, methodname, args=(), kwds={}):
     kind, result = c.recv()
     if kind == '#RETURN':
         return result
-    raise convert_to_error(kind, result)
+    error = convert_to_error(kind, result)
+    # no local may keep the exception alive (exception -> traceback ->
+    # this frame -> exception)
+    del result
+    try:
+        raise error
+    finally:
+        del error
 
 
 def convert_to_error(kind, result):
@@ -734,7 +741,12 @@ class BaseProxy(object):
             conn = self._Client(token.address, authkey=self._authkey)
             dispatch(conn, None, 'decref', (token.id,))
             return proxy
-        raise convert_to_error(kind, result)
+        error = convert_to_error(kind, result)
+        del result
+        try:
+            raise error
+        finally:
+            del error
 
     def _getvalue(self):
         """A copy of the referent."""
@@ -1113,7 +1125,7 @@ class DictProxy(_BaseDictProxy):
 collections.abc.MutableMapping.register(_BaseDictProxy)
 
 _BaseSetProxy = MakeProxyType('_BaseSetProxy', (
-    '__and__', '__contains__', '__iand__', '__ior__', '__isub__', '__iter__',
+    '__and__', '__contains__', '__iand__', '__ior__', '__isub__',
     '__ixor__', '__len__', '__or__', '__rand__', '__ror__', '__rsub__',
     '__rxor__', '__sub__', '__xor__', '__ge__', '__gt__', '__le__', '__lt__',
     'add', 'clear', 'copy', 'difference', 'difference_update', 'discard',
@@ -1121,12 +1133,11 @@ _BaseSetProxy = MakeProxyType('_BaseSetProxy', (
     'issuperset', 'pop', 'remove', 'symmetric_difference',
     'symmetric_difference_update', 'union', 'update',
     ))
-_BaseSetProxy._method_to_typeid_ = {
-    '__iter__': 'Iterator',
-    }
-
-
 class SetProxy(_BaseSetProxy):
+    def __iter__(self):
+        # iterate over a snapshot (works in processes without the manager)
+        return iter(self._callmethod('copy'))
+
     def __ior__(self, value):
         self._callmethod('__ior__', (value,))
         return self

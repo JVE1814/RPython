@@ -124,7 +124,7 @@ def get_preparation_data(name):
         sys_argv=sys.argv,
         orig_dir=process.ORIGINAL_DIR,
         dir=os.getcwd(),
-        start_method=get_start_method(),
+        start_method=get_start_method(allow_none=True),
         )
 
     # How should the child recreate the main module?
