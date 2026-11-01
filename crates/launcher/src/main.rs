@@ -74,7 +74,7 @@ const HELP_X: &str = "The following implementation-specific options are availabl
 -X gil=[0|1]: enable (1) or disable (0) the GIL
 -X importtime[=2]: show how long each import takes
 -X int_max_str_digits=N: limit the size of int<->str conversions
--X lazy_imports=[all|none|normal]: control lazy imports
+-X lazy_imports=[all|normal]: control lazy imports
 -X no_debug_ranges: don't include extra location information in code objects
 -X pycache_prefix=PATH: write .pyc files to a parallel tree under PATH
 -X tracemalloc[=N]: trace Python memory allocations
@@ -90,6 +90,46 @@ fn usage_error(msg: &str) -> ! {
     eprint!("{}\n{}", msg, USAGE.replace("{prog}", &prog_name()));
     eprintln!("Try `python -h' for more information.");
     std::process::exit(2);
+}
+
+/// Lexically normalised absolute form of `p` (like os.path.abspath).
+fn abspath(p: &std::path::Path) -> String {
+    let base = if p.is_absolute() { std::path::PathBuf::new() } else { std::env::current_dir().unwrap_or_default() };
+    let mut parts: Vec<String> = Vec::new();
+    for c in base.join(p).components() {
+        match c {
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            std::path::Component::Normal(s) => parts.push(s.to_string_lossy().into_owned()),
+            _ => {}
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+
+/// Read `<argv[0]>._pth` if present: (sys.path entries, `import site` requested).
+fn underpth_paths() -> Option<(Vec<String>, bool)> {
+    let exe = std::env::args().next()?;
+    if !exe.contains('/') {
+        return None;
+    }
+    let text = std::fs::read_to_string(format!("{}._pth", exe)).ok()?;
+    let dir = std::path::Path::new(&exe).parent().map(|d| d.to_path_buf()).unwrap_or_default();
+    let mut paths = Vec::new();
+    let mut site = false;
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line == "import site" {
+            site = true;
+            continue;
+        }
+        paths.push(abspath(&dir.join(line)));
+    }
+    Some((paths, site))
 }
 
 fn fatal(msg: &str) -> ! {
@@ -316,7 +356,10 @@ fn real_main() -> i32 {
         cfg.faulthandler = true;
     }
     if let Some(v) = env(&cfg, "PYTHONTRACEMALLOC") {
-        cfg.tracemalloc = v.parse().unwrap_or(1);
+        cfg.tracemalloc = match v.parse::<i64>() {
+            Ok(n) if (0..=65535).contains(&n) => n as i32,
+            _ => fatal("PYTHONTRACEMALLOC: invalid number of frames"),
+        };
     }
     if let Some(v) = env(&cfg, "PYTHONUTF8") {
         cfg.utf8_mode = if v == "0" { 0 } else { 1 };
@@ -337,8 +380,9 @@ fn real_main() -> i32 {
     if let Some(v) = env(&cfg, "PYTHON_LAZY_IMPORTS") {
         cfg.lazy_imports = match v.as_str() {
             "all" => 1,
-            "none" => 0,
-            _ => -1,
+            "normal" => 0,
+            "" => -1,
+            _ => fatal("PYTHON_LAZY_IMPORTS: invalid value; expected 'all' or 'normal'"),
         };
     }
     if let Some(v) = env(&cfg, "PYTHON_THREAD_INHERIT_CONTEXT") {
@@ -363,7 +407,7 @@ fn real_main() -> i32 {
                 cfg.tracemalloc = match v {
                     None => 1,
                     Some(s) => match s.parse::<i32>() {
-                        Ok(n) if n >= 1 => n,
+                        Ok(n) if (1..=65535).contains(&n) => n,
                         _ => fatal("-X tracemalloc=NFRAME: invalid number of frames"),
                     },
                 }
@@ -380,9 +424,8 @@ fn real_main() -> i32 {
             "lazy_imports" => {
                 cfg.lazy_imports = match v {
                     Some("all") => 1,
-                    Some("none") => 0,
-                    Some("normal") => -1,
-                    _ => fatal("-X lazy_imports: invalid value; must be 'all', 'none', or 'normal'"),
+                    Some("normal") => 0,
+                    _ => fatal("-X lazy_imports: invalid value; expected 'all' or 'normal'"),
                 }
             }
             "thread_inherit_context" => cfg.thread_inherit_context = if v == Some("0") { 0 } else { 1 },
@@ -441,11 +484,21 @@ fn real_main() -> i32 {
     if matches!(mode, RunMode::Repl) {
         cfg.interactive = cfg.interactive.max(1);
     }
+    // `<executable>._pth`: fixed sys.path, no environment paths, site only on request
+    let pth_paths = underpth_paths();
+    if let Some((_, import_site)) = &pth_paths {
+        cfg.safe_path = true;
+        cfg.no_user_site = 1;
+        if !import_site {
+            cfg.no_site = 1;
+        }
+    }
     let inspect = cfg.inspect > 0;
     let quiet = cfg.quiet != 0;
     let safe_path = cfg.safe_path;
     let opt = cfg.optimize;
-    let rcfg = rpy_runtime::Config { argv, hash_seed: seed, optimize: opt, sys: cfg };
+    let rcfg = rpy_runtime::Config { argv, hash_seed: seed, optimize: opt, sys: cfg, pth_paths: pth_paths.map(|p| p.0) };
+    rpy_bindings::register();
     if rpy_runtime::initialize(&rcfg).is_err() {
         eprintln!("Fatal Python error: initialization failed");
         rpy_runtime::print_exception_and_clear();

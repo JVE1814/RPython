@@ -14,7 +14,7 @@ _FINISHED = 'FINISHED'
 def isfuture(obj):
     """True for asyncio futures and Future-compatible objects (classes
     defining _asyncio_future_blocking)."""
-    if not hasattr(type(obj), '_asyncio_future_blocking'):
+    if not hasattr(obj.__class__, "_asyncio_future_blocking"):
         return False
     return obj._asyncio_future_blocking is not None
 

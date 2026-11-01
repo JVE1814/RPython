@@ -135,3 +135,5 @@ pub fn optimize_ast(module: &mut ast::Mod, optimize: i32, flags: u32) -> Result<
 pub fn validate_ast(module: &ast::Mod) -> Result<(), CompileError> {
     validate::validate_positions(module)
 }
+
+include!(concat!(env!("OUT_DIR"), "/bytecode_hash.rs"));

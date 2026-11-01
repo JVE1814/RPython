@@ -3,6 +3,7 @@
 pub mod cache;
 pub mod eval;
 pub mod frame;
+pub mod jump;
 pub mod jit;
 pub mod specialize;
 

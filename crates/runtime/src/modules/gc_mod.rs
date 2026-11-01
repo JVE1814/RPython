@@ -71,7 +71,14 @@ pub fn collect_with_callbacks(generation: i64) -> usize {
     }
     run_callbacks("start", generation, 0, 0);
     let before_unc = crate::gc::UNCOLLECTABLE.load(Relaxed);
+    let before = gc_totals();
     let n = crate::gc::collect();
+    if generation < 2 {
+        let after = gc_totals();
+        for i in 0..4 {
+            YOUNG[generation as usize][i].fetch_add(after[i].saturating_sub(before[i]), Relaxed);
+        }
+    }
     let unc = crate::gc::UNCOLLECTABLE.load(Relaxed).saturating_sub(before_unc);
     run_callbacks("stop", generation, n, unc);
     COLLECTING.store(false, Release);
@@ -106,6 +113,7 @@ fn gc_set_threshold(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     crate::args::check_pos("set_threshold", args, 1, 3)?;
     let t0 = ab::as_i64(args[0])?;
     crate::gc::THRESHOLD.store(t0.max(0) as usize, Relaxed);
+    crate::gc_support::USER_THRESHOLD.store(true, Relaxed);
     if t0 == 0 {
         // a zero threshold disables automatic collection
     }
@@ -156,7 +164,7 @@ unsafe extern "C" fn collect_visit(o: *mut PyObject, arg: *mut c_void) -> c_int 
 fn referents_of(o: &PyObject) -> Vec<usize> {
     let mut v: Vec<usize> = Vec::new();
     unsafe {
-        if crate::alloc::type_is_gc(o.type_ptr()) && crate::gc::is_tracked(o) || crate::types::typeobject::is_type(o) {
+        if crate::alloc::type_is_gc(o.type_ptr()) || crate::types::typeobject::is_type(o) {
             if let Some(t) = (*o.type_ptr()).tp_traverse {
                 t(o.as_ptr(), Some(collect_visit), &mut v as *mut Vec<usize> as *mut c_void);
             }
@@ -213,14 +221,19 @@ fn gc_get_stats(_m: &PyObject) -> PyResult {
     let mut v = Vec::new();
     for g in 0..3 {
         let d = dict::new_dict();
-        let (c, n, u) = if g == 2 {
-            (crate::gc::COLLECTIONS.load(Relaxed), crate::gc::COLLECTED.load(Relaxed), crate::gc::UNCOLLECTABLE.load(Relaxed))
+        let tot = gc_totals();
+        let s: [usize; 4] = if g == 2 {
+            std::array::from_fn(|i| tot[i].saturating_sub(YOUNG[0][i].load(Relaxed) + YOUNG[1][i].load(Relaxed)))
         } else {
-            (0, 0, 0)
+            std::array::from_fn(|i| YOUNG[g][i].load(Relaxed))
         };
+        let (c, n, u) = (s[0], s[1], if g == 2 { crate::gc::UNCOLLECTABLE.load(Relaxed) } else { 0 });
         dict::set_item_str(&d, "collections", &int::new_int(c as i64))?;
         dict::set_item_str(&d, "collected", &int::new_int(n as i64))?;
         dict::set_item_str(&d, "uncollectable", &int::new_int(u as i64))?;
+        let (cand, dur) = (s[2], s[3]);
+        dict::set_item_str(&d, "candidates", &int::new_int(cand as i64))?;
+        dict::set_item_str(&d, "duration", &crate::types::float::new_float(dur as f64 / 1e9))?;
         v.push(d);
     }
     Ok(list::new_list(v))
@@ -265,4 +278,28 @@ pub fn init_module() -> PyResult {
         dict::set_item_str(&d, k, &int::new_int(v))?;
     }
     Ok(m)
+}
+
+/// Per-generation statistics of explicit young collections (gc.collect(0/1)):
+/// [collections, collected, candidates, duration_ns]. Generation 2 reports the
+/// collector's totals minus these.
+static YOUNG: [[AtomicUsize; 4]; 2] = [const { [const { AtomicUsize::new(0) }; 4] }; 2];
+
+fn gc_totals() -> [usize; 4] {
+    [
+        crate::gc::COLLECTIONS.load(Relaxed),
+        crate::gc::COLLECTED.load(Relaxed),
+        crate::gc_support::CANDIDATES.load(Relaxed),
+        crate::gc_support::DURATION_NS.load(Relaxed),
+    ]
+}
+
+/// Current gc.set_debug() flags (used by the collector for DEBUG_SAVEALL).
+pub fn debug_flags() -> i64 {
+    DEBUG.load(Relaxed)
+}
+
+/// The gc.garbage list.
+pub fn garbage_list() -> PyRef {
+    module_list(&GARBAGE)
 }

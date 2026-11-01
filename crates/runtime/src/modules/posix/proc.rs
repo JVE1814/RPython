@@ -648,20 +648,48 @@ pub fn run_after_fork_child() {
 }
 
 pub fn os_fork(_m: &PyObject) -> PyResult {
+    let (pid, _) = fork_with("fork", || {
+        let pid = unsafe { libc::fork() };
+        (pid as i64, -1)
+    })?;
+    Ok(i(pid))
+}
+
+/// os.forkpty(): fork with the child attached to a new pseudo-terminal.
+/// Returns (pid, master_fd).
+pub fn os_forkpty(_m: &PyObject) -> PyResult {
+    let (pid, fd) = fork_with("forkpty", || {
+        let mut master: libc::c_int = -1;
+        let pid = unsafe { libc::forkpty(&mut master, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()) };
+        (pid as i64, master)
+    })?;
+    Ok(tuple::new_tuple(vec![i(pid), i(fd as i64)]))
+}
+
+/// The fork protocol shared by fork() and forkpty(): Python before-hooks,
+/// runtime preparation (see crate::fork), the fork itself, runtime fix-up,
+/// Python after-hooks, and in the parent the multi-threaded fork warning.
+fn fork_with(name: &str, f: impl FnOnce() -> (i64, libc::c_int)) -> PyResult<(i64, libc::c_int)> {
     run_before_fork();
-    let pid = unsafe { libc::fork() };
+    let st = crate::fork::prepare();
+    let others = st.other_threads;
+    let (pid, fd) = f();
     if pid < 0 {
         let e = errno();
+        crate::fork::parent(st);
         run_after_fork_parent();
         return Err(crate::types::exceptions::os_error_from_errno(e, None, None));
     }
     if pid == 0 {
+        crate::fork::child(st);
         crate::modules::posix::after_fork_child_hook();
         run_after_fork_child();
     } else {
+        crate::fork::parent(st);
         run_after_fork_parent();
+        crate::fork::warn_about_threads(others, name)?;
     }
-    Ok(i(pid as i64))
+    Ok((pid, fd))
 }
 
 /// Encode a sequence of str/bytes/PathLike into C strings.

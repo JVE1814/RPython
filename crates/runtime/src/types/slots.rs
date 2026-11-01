@@ -582,7 +582,6 @@ pub fn add_operators(tp: *mut PyTypeObject) -> PyResult<()> {
     Ok(())
 }
 
-/// For a new heap type: set every slot from the dunders found along the MRO.
 /// Slot setup for a class just created by `type_new` (after `type_ready`).
 /// perf-runtime (startup): with a single base, every slot whose dunder names do not
 /// appear in the class's own dict was just inherited from the (already fixed-up) base
@@ -635,7 +634,7 @@ pub fn fixup_slots_new_type(tp: *mut PyTypeObject) {
     fixup_slots(tp);
 }
 
-/// Recompute every slot of `tp` from its MRO.
+/// For a new heap type: set every slot from the dunders found along the MRO.
 pub fn fixup_slots(tp: *mut PyTypeObject) {
     let mut done: Vec<Slot> = Vec::new();
     for sd in SLOTDEFS.iter() {
@@ -1136,10 +1135,8 @@ unsafe extern "C" fn slot_tp_call(s: *mut PyObject, args: *mut PyObject, kw: *mu
             Some(f) => f,
             None => return into_c(Err(err!(TypeError, "'{}' object is not callable", type_name(s.ty())))),
         };
-        let mut v: Vec<&PyObject> = vec![s];
-        v.extend(tuple::tuple_items(&*args).iter().copied());
         let kw = if kw.is_null() { None } else { Some(&*kw) };
-        into_c(ab::call_with_kwargs_dict(&f, &v, kw))
+        into_c(call_bound_kw(&f, s, tuple::tuple_items(&*args), kw))
     }
 }
 unsafe extern "C" fn slot_tp_getattr_hook(s: *mut PyObject, nm: *mut PyObject) -> *mut PyObject {
@@ -1186,6 +1183,26 @@ unsafe extern "C" fn slot_tp_richcompare(s: *mut PyObject, o: *mut PyObject, op:
     unsafe {
         let s = &*s;
         let nm = pystr::intern_str(RICHCMP_NAMES[op as usize]);
+        // a descriptor whose __get__ fails makes the comparison NotImplemented
+        if let Some(f) = lookup(s.type_ptr(), &nm) {
+            if !crate::types::funcobject::is_function(&f) {
+                if let Some(get) = f.ty().tp_descr_get {
+                    if f.ty().tp_flags & Py_TPFLAGS_METHOD_DESCRIPTOR == 0 {
+                        let bound = get(f.as_ptr(), s.as_ptr(), s.type_ptr() as *mut PyObject);
+                        if bound.is_null() {
+                            // an AttributeError from __get__ means "no such method"
+                            if !exc_matches(crate::types::exceptions::AttributeError()) {
+                                return std::ptr::null_mut();
+                            }
+                            clear_exc();
+                            return crate::types::none::not_implemented().to_ref().into_raw();
+                        }
+                        let bound = PyRef::from_raw(bound);
+                        return into_c(ab::call(&bound, &[&*o]));
+                    }
+                }
+            }
+        }
         match call_special(s, &nm, &[&*o]) {
             Ok(Some(r)) => r.into_raw(),
             Ok(None) => crate::types::none::not_implemented().to_ref().into_raw(),
@@ -1236,6 +1253,25 @@ unsafe extern "C" fn slot_tp_descr_set(s: *mut PyObject, obj: *mut PyObject, v: 
         if r.is_ok() { 0 } else { -1 }
     }
 }
+/// Call the special method `f` found on the type of `s` with `args`/`kw`: plain
+/// functions and method descriptors get `s` prepended, other descriptors are bound
+/// through `__get__` first (whose errors propagate), anything else is called as is.
+fn call_bound_kw(f: &PyObject, s: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
+    let ft = f.ty();
+    if ft.tp_flags & Py_TPFLAGS_METHOD_DESCRIPTOR == 0 {
+        return match ft.tp_descr_get {
+            Some(g) => {
+                let bound = unsafe { from_c(g(f.as_ptr(), s.as_ptr(), s.type_ptr() as *mut PyObject))? };
+                ab::call_with_kwargs_dict(&bound, args, kw)
+            }
+            None => ab::call_with_kwargs_dict(f, args, kw),
+        };
+    }
+    let mut v: Vec<&PyObject> = Vec::with_capacity(args.len() + 1);
+    v.push(s);
+    v.extend_from_slice(args);
+    ab::call_with_kwargs_dict(f, &v, kw)
+}
 pub unsafe extern "C" fn slot_tp_init(s: *mut PyObject, args: *mut PyObject, kw: *mut PyObject) -> c_int {
     unsafe {
         let s = &*s;
@@ -1243,10 +1279,8 @@ pub unsafe extern "C" fn slot_tp_init(s: *mut PyObject, args: *mut PyObject, kw:
             Some(f) => f,
             None => return 0,
         };
-        let mut v: Vec<&PyObject> = vec![s];
-        v.extend(tuple::tuple_items(&*args).iter().copied());
         let kw = if kw.is_null() { None } else { Some(&*kw) };
-        match ab::call_with_kwargs_dict(&f, &v, kw) {
+        match call_bound_kw(&f, s, tuple::tuple_items(&*args), kw) {
             Ok(r) => {
                 if !r.is(none::none()) {
                     let _ = err!(TypeError, "__init__() should return None, not '{}'", type_name(r.ty()));

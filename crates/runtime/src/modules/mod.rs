@@ -33,6 +33,7 @@ pub mod _abc;
 pub mod itertools;
 pub mod _collections;
 pub mod _types;
+pub mod _asyncio;
 pub mod _heapq;
 pub mod _bisect;
 pub mod atexit;
@@ -80,11 +81,18 @@ pub mod zlib;
 pub mod hashes;
 pub mod _decimal;
 pub mod _bz2;
+pub mod _lzma;
+pub mod _zstd;
+pub mod _uuid;
 pub mod pyexpat;
 pub mod _pickle;
+pub mod tty;
 pub mod array;
 pub mod _datetime;
+pub mod _tracemalloc;
 pub mod _csv;
+pub mod _multiprocessing;
+pub mod testinternalcapi;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
 pub fn register_all() {
@@ -105,14 +113,21 @@ pub fn register_all() {
     text_util::register();
     crate::import::register_builtin("_typing", crate::types::typevar::make_typing_module);
     crate::import::register_builtin("_socket", _socket::init);
+    crate::import::register_builtin("_asyncio", _asyncio::init_module);
     crate::import::register_builtin("_posixsubprocess", _posixsubprocess::init);
     devtools::register();
     crate::import::register_builtin("_json", _json::init_module);
     compress_common::register();
     _decimal::register();
     crate::import::register_builtin("_expat_engine", pyexpat::init);
+    crate::import::register_builtin("pyexpat", pyexpat::xmlparser::init);
     crate::import::register_builtin("_pickle", _pickle::init_module);
+    tty::register();
     crate::import::register_builtin("array", array::init_module);
     crate::import::register_builtin("_datetime", _datetime::init_module);
+    crate::import::register_builtin("_tracemalloc", _tracemalloc::init_module);
     crate::import::register_builtin("_csv", _csv::init_module);
+    crate::import::register_builtin("_multiprocessing", _multiprocessing::init);
+    crate::import::register_builtin("_testinternalcapi", testinternalcapi::init);
+    crate::import::register_builtin("_suggestions", suggestions::init_module);
 }

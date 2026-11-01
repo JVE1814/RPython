@@ -74,9 +74,62 @@ their next poll (`eval::handle_eval_breaker`); threads in native/blocked mode co
 quiescent; exiting threads hand pending batches to an orphan list. Single-threaded
 processes never defer. API: `qsbr::decref_deferred(p)`, `qsbr::free_deferred(p, f)`.
 
+Dict: replaced values, removed keys/values and `clear()` contents go through
+`qsbr::decref_deferred` (immediate while single-threaded). Not yet done: deferring
+the free of the dict *data block* on resize (master's new storage layout) and list item
+arrays — lock-free readers of those can still race a resize.
+Semantics note: with >1 attached thread, finalizers of retired objects run a few
+eval-breaker polls later (CPython frees immediately and delays only memory reuse; that
+needs allocator support — see next steps).
+
 ## GC counters — `gc.rs`
 Tracked/allocation counters are per-thread deltas published in batches of 32 (two
 global atomic RMWs per tracked object before).
 
-## Measurements
-See the table at the end (filled in as work lands).
+## Startup
+* `slots::fixup_slots_new_type` (used by `type_new`): with a single base only the slots
+  named in the class's own dict are recomputed (the rest were inherited by
+  `type_ready`); `fixup_slots` (full) stays for `__bases__` assignment / _datetime.
+* `methods::leak_cstr`: method/member/getset names and docs bump-allocated from
+  64 KiB chunks instead of one malloc each.
+
+## Bug fixes on the way
+* subtype_dealloc released the old type when `__del__` assigned `__class__`
+  (test_descr.test_set_class segfault; master fixed it the same way concurrently).
+
+## Measurements (callgrind instructions, whole process; machine load ~40 on 4 cores,
+so wall-clock numbers are indicative only)
+| metric | before (master 28f7ac8) | after | CPython default | CPython ft |
+|---|---|---|---|---|
+| `-c pass` | 46.0M | 44.4M (merged build) | 40.5M | 51.0M |
+| `-S -c pass` | 20.8M | 20.7M | 27.7M | 34.1M |
+| fib(25) | 224.7M | 194.6M | 164.9M | – |
+| 50k `P(i,i,i)` instances | 391.7M | 233.7M | – | – |
+| objs.py 200k instances: peak RSS | 102.8 MB | 49.3 MB | 35.9 MB | 42.1 MB |
+| objs.py wall (ms) | 1904 | 299–900 | 338 | 692 |
+| `-c pass` peak RSS | 15.5 MB | 15.7 MB | 9.2 MB | 10.8 MB |
+Merged build: t_shapes.py OK (JIT on/off/threshold 0), t_threads.py OK.
+
+
+Spec smoke (tools/bench/perf/smoke.sh, before → after shapes): identical results except
+test_gc 20 → 17 failures; test_descr crashed in both (fixed since); test_class /
+test_capi / test_pickle / test_threading do not import on this master (missing
+_testinternalcapi / http / SIGINT handling) — not a usable signal yet.
+Own tests: tools/bench/perf/t_shapes.py OK (JIT on/off/threshold 0);
+tools/bench/perf/t_threads.py failed before the dict-deferral change (use-after-free
+of dict values read lock-free by the inline caches) — re-check after the merge build.
+
+## Next steps
+1. Re-run quick.sh / smoke.sh on the merged build; fix anything t_threads.py shows.
+2. Keep inline values after `__dict__` access (dict view over the values) so
+   `self.__dict__.update(kw)` objects stay fast (CPython semantics of has_inline_values).
+3. Tier-1 inline code for StoreAttr / METHOD_SHADOWABLE on values-mode objects; shape-id
+   guards for jit2's tier 2.
+4. D6 for storage: defer freeing dict data blocks and list item arrays on resize; better:
+   allocator-level delayed reuse of freed blocks while multi-threaded + try-incref
+   readers (immediate finalization semantics like CPython ft).
+5. Scaling: GC list spin lock + per-object track/untrack atomics; shared refcounts on
+   functions/code/types from non-owner threads (deferred refcounting for those).
+6. Startup: snapshot of post-bootstrap state or frozen stdlib code; lazy type readying.
+7. RSS: `-c pass` RssFile 10.7 MB vs 6.1 MB (binary text pages touched) and RssAnon
+   6.5 MB vs 3.3 MB.

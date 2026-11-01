@@ -469,8 +469,7 @@ pub unsafe extern "C" fn subtype_dealloc(op: *mut PyObject) {
                 return; // resurrected
             }
         }
-        // __del__ may have assigned __class__: the instance now owns a reference to
-        // the new type, which is the one to release below
+        // __del__ may have assigned __class__: use the current type from here on
         let tp = (*op).type_ptr();
         crate::gc::untrack(op);
         // clear weakrefs
@@ -646,6 +645,15 @@ pub fn type_ready(tp: *mut PyTypeObject) -> PyResult<()> {
         crate::types::slots::add_operators(tp)?;
         // MRO
         mro_internal(tp)?;
+        // static types are immutable (no attribute assignment from Python)
+        if (*tp).tp_flags & Py_TPFLAGS_HEAPTYPE == 0 {
+            (*tp).tp_flags |= Py_TPFLAGS_IMMUTABLETYPE;
+        }
+        // a static type deriving directly from object without its own tp_new cannot be
+        // instantiated from Python (it does not inherit object.__new__)
+        if (*tp).tp_flags & Py_TPFLAGS_HEAPTYPE == 0 && base == object_type() && (*tp).tp_new.is_none() && tp != object_type() {
+            (*tp).tp_flags |= Py_TPFLAGS_DISALLOW_INSTANTIATION;
+        }
         // inheritance
         if !base.is_null() {
             inherit_special(tp, base);

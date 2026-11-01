@@ -1,0 +1,63 @@
+# Activation script for POSIX shells (bash, zsh, dash, ksh).
+#
+#   source <venv>/bin/activate      (or: . <venv>/bin/activate)
+#
+# puts the environment's bin directory first on PATH and sets VIRTUAL_ENV.
+# Run "deactivate" to undo.  This file must be sourced, not executed.
+# It is safe under "set -euo pipefail".
+
+if [ "${BASH_SOURCE-}" = "$0" ]; then
+    echo "activate must be sourced, e.g.: source $0" >&2
+    exit 33
+fi
+
+deactivate () {
+    if [ "${_VENV_SAVED_PATH+set}" = set ]; then
+        PATH=$_VENV_SAVED_PATH
+        export PATH
+        unset _VENV_SAVED_PATH
+    fi
+    if [ "${_VENV_SAVED_PYTHONHOME+set}" = set ]; then
+        PYTHONHOME=$_VENV_SAVED_PYTHONHOME
+        export PYTHONHOME
+        unset _VENV_SAVED_PYTHONHOME
+    fi
+    if [ "${_VENV_SAVED_PS1+set}" = set ]; then
+        PS1=$_VENV_SAVED_PS1
+        export PS1
+        unset _VENV_SAVED_PS1
+    fi
+    unset VIRTUAL_ENV VIRTUAL_ENV_PROMPT
+    # Commands may have been looked up in the environment's bin directory.
+    hash -r 2>/dev/null || true
+    if [ "${1-}" != nondestructive ]; then
+        unset -f deactivate
+    fi
+}
+
+# Leave any environment that is currently active.
+deactivate nondestructive
+
+VIRTUAL_ENV=__VENV_DIR__
+export VIRTUAL_ENV
+
+_VENV_SAVED_PATH=$PATH
+PATH="$VIRTUAL_ENV/"__VENV_BIN_NAME__":$PATH"
+export PATH
+
+VIRTUAL_ENV_PROMPT=__VENV_PROMPT__
+export VIRTUAL_ENV_PROMPT
+
+# A PYTHONHOME would point the environment's interpreter elsewhere.
+if [ "${PYTHONHOME+set}" = set ]; then
+    _VENV_SAVED_PYTHONHOME=$PYTHONHOME
+    unset PYTHONHOME
+fi
+
+if [ -z "${VIRTUAL_ENV_DISABLE_PROMPT-}" ]; then
+    _VENV_SAVED_PS1=${PS1-}
+    PS1="($VIRTUAL_ENV_PROMPT) ${PS1-}"
+    export PS1
+fi
+
+hash -r 2>/dev/null || true

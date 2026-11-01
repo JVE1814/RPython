@@ -681,14 +681,26 @@ pub fn new_staticmethod(f: PyRef) -> PyRef {
     unsafe {
         let op = crate::types::typeobject::generic_alloc(staticmethod_type(), 0);
         sm(&*op).callable = f.into_raw();
-        PyRef::from_raw(op)
+        let r = PyRef::from_raw(op);
+        // copy __name__ etc. like the constructor does
+        let c = (*sm(&r).callable).to_ref();
+        if copy_wrapped_attrs(&r, &c).is_err() {
+            clear_exc();
+        }
+        r
     }
 }
 pub fn new_classmethod(f: PyRef) -> PyRef {
     unsafe {
         let op = crate::types::typeobject::generic_alloc(classmethod_type(), 0);
         sm(&*op).callable = f.into_raw();
-        PyRef::from_raw(op)
+        let r = PyRef::from_raw(op);
+        // copy __name__ etc. like the constructor does
+        let c = (*sm(&r).callable).to_ref();
+        if copy_wrapped_attrs(&r, &c).is_err() {
+            clear_exc();
+        }
+        r
     }
 }
 pub fn sm_callable(o: &PyObject) -> Option<&PyObject> {
@@ -738,7 +750,6 @@ fn copy_wrapped_attrs(o: &PyObject, f: &PyObject) -> PyResult<()> {
             dict::set_item(&d, &k, &v)?;
         }
     }
-    dict::set_item(&d, name!("__wrapped__"), f)?;
     Ok(())
 }
 fn f_dict_of(o: &PyObject) -> PyRef {
