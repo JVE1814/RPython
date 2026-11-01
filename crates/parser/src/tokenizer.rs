@@ -93,6 +93,7 @@ pub struct Lexer<'a> {
     modes: Vec<FMode>,
     fields: Vec<Field>,
     opts: LexOptions,
+    #[allow(dead_code)]
     eof: bool,
     /// The source did not end with a newline; a virtual one exists at `src.len()`.
     implicit_newline: bool,
@@ -100,6 +101,7 @@ pub struct Lexer<'a> {
     pub warnings: Vec<Warning>,
     /// Count of tokens emitted on the current logical line (to suppress NEWLINE after blank).
     line_has_tokens: bool,
+    #[allow(dead_code)]
     done: bool,
     /// set once an ENDMARKER has been produced
     finished: bool,
@@ -1238,7 +1240,7 @@ impl<'a> Lexer<'a> {
             // middle
             let mut end_quote_size = 0u8;
             let mut unicode_escape = false;
-            let mut content_end: Option<usize>; // exclusive end of token text
+            let content_end: Option<usize>; // exclusive end of token text
             loop {
                 // fast path over ordinary characters
                 {
@@ -1644,6 +1646,7 @@ impl<'a> Lexer<'a> {
     }
 }
 
+#[allow(dead_code)]
 fn is_valid_identifier(s: &str, hooks: &UnicodeHooks) -> bool {
     let mut first = true;
     for ch in s.chars() {

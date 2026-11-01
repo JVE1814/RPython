@@ -139,6 +139,10 @@ pub(crate) struct Parser<'a> {
     /// lazy-import / misc state
     pub(crate) in_lambda: usize,
     pub(crate) no_genexp_arg: bool,
+    /// first pass: top-level statement start -> end token index
+    top_ok: std::collections::HashMap<usize, usize>,
+    /// furthest token index fetched by the first pass
+    first_fail: usize,
     /// Tokens that had a type comment consumed etc. (unused)
     pub(crate) type_ignores: Vec<TypeIgnore>,
 }
@@ -208,6 +212,8 @@ impl<'a> Parser<'a> {
             fstring_depth: 0,
             in_lambda: 0,
             no_genexp_arg: false,
+            top_ok: std::collections::HashMap::new(),
+            first_fail: usize::MAX,
             type_ignores,
         }
     }
@@ -336,6 +342,7 @@ impl<'a> Parser<'a> {
     pub(crate) fn tok_loc(t: &Token) -> Loc {
         Loc { lineno: t.lineno as i32, col_offset: t.col, end_lineno: t.end_lineno as i32, end_col_offset: t.end_col }
     }
+    #[allow(dead_code)]
     pub(crate) fn span(a: Loc, b: Loc) -> Loc {
         Loc { lineno: a.lineno, col_offset: a.col_offset, end_lineno: b.end_lineno, end_col_offset: b.end_col_offset }
     }
@@ -441,6 +448,7 @@ impl<'a> Parser<'a> {
             }
         }
         let last_fill = self.fill;
+        self.first_fail = last_fill.saturating_sub(1);
         let last_token = self.toks[last_fill.max(1) - 1];
         // Second pass with invalid rules.
         self.p = 0;
@@ -531,18 +539,42 @@ impl<'a> Parser<'a> {
     }
 
     fn file_rule(&mut self) -> R<Mod> {
-        let body = if self.at(TokenType::ENDMARKER) { Vec::new() } else {
-            match self.statements()? {
-                Some(b) => b,
-                None => return Ok(None),
+        // statements+ ENDMARKER, written out so that the second pass can skip the invalid_*
+        // rules for top-level statements that already parsed in the first pass and end
+        // before the first-pass failure point (a big speedup for errors late in large files).
+        let mut body = Vec::new();
+        loop {
+            if self.at(TokenType::ENDMARKER) {
+                break;
             }
-        };
+            let m = self.p;
+            let fast = self.invalid && self.top_ok.get(&m).map(|&e| e < self.first_fail).unwrap_or(false);
+            let save = self.invalid;
+            if fast {
+                self.invalid = false;
+            }
+            let r = self.statement();
+            self.invalid = save;
+            match r? {
+                Some(mut s) => {
+                    if !self.invalid {
+                        self.top_ok.insert(m, self.p);
+                    }
+                    body.append(&mut s);
+                }
+                None => {
+                    self.p = m;
+                    break;
+                }
+            }
+        }
         if !self.at(TokenType::ENDMARKER) {
             return Ok(None);
         }
         let type_ignores = std::mem::take(&mut self.type_ignores);
         Ok(Some(Mod::Module { body, type_ignores }))
     }
+
 
     fn eval_rule(&mut self) -> R<Mod> {
         let Some(e) = self.expressions()? else { return Ok(None) };

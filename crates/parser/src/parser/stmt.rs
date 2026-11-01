@@ -44,7 +44,7 @@ impl<'a> Parser<'a> {
     }
 
     /// statement: compound_stmt | simple_stmts
-    fn statement(&mut self) -> R<Vec<Stmt>> {
+    pub(crate) fn statement(&mut self) -> R<Vec<Stmt>> {
         let m = self.p;
         if let Some(s) = self.compound_stmt()? {
             return Ok(Some(vec![s]));
