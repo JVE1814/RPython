@@ -192,10 +192,9 @@ pub unsafe extern "C" fn dict_clear_slot(op: *mut PyObject) -> std::ffi::c_int {
 
 /// Look up `key` with precomputed `hash`. Returns the entry index.
 pub fn lookup_index(d: &PyObject, key: &PyObject, hash: isize) -> PyResult<Option<usize>> {
-    let t = table(d);
     let str_key = crate::types::str::is_str_exact(key);
     'restart: loop {
-        let t: &DictTable = t;
+        let t: &DictTable = table(d);
         let mask = t.mask();
         let mut perturb = hash as usize;
         let mut i = (hash as usize) & mask;
@@ -353,15 +352,8 @@ pub fn remove_at(d: &PyObject, ix: usize, h: isize) -> (*mut PyObject, *mut PyOb
     t.used -= 1;
     t.version = crate::interp::cache::next_dict_version();
     set_used(d, t.used);
-    // Trim trailing holes so popitem/ordering stays cheap.
-    while let Some(last) = t.entries.last() {
-        if last.key.is_null() && t.entries.len() > 0 {
-            // can't simply pop: indices may reference it as DUMMY only, safe to drop
-            t.entries.pop();
-        } else {
-            break;
-        }
-    }
+    // Holes stay in `entries` until the next rebuild: the DUMMY index slots must
+    // keep counting towards the load factor or probing can run out of EMPTY slots.
     (e.key, e.value)
 }
 
