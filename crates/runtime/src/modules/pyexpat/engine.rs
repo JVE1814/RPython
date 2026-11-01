@@ -544,6 +544,7 @@ impl Engine {
     }
 
     fn run(&mut self) {
+        let run_start = self.pos;
         if let Err((code, idx)) = self.decode() {
             self.fail(code, idx);
             return;
@@ -586,7 +587,8 @@ impl Engine {
                             continue;
                         }
                     }
-                    if self.pos < self.buf.len() || !self.raw.is_empty() {
+                    if self.pos == run_start && (self.pos < self.buf.len() || !self.raw.is_empty()) {
+                        // like Expat, defer only after an attempt that consumed nothing
                         self.last_partial = self.buf.len() - self.pos + self.raw.len();
                     } else {
                         self.last_partial = 0;
@@ -616,6 +618,8 @@ impl Engine {
 
     fn at_eof(&mut self) {
         if !self.raw.is_empty() {
+            // a CR held back for CRLF folding still counts as a line end
+            self.flush_cr(true);
             let p = self.buf.len();
             let code = if matches!(self.enc, Enc::Utf16Le | Enc::Utf16Be) { E_UNCLOSED_TOKEN } else { E_PARTIAL_CHAR };
             self.fail(code, p);
@@ -1228,6 +1232,28 @@ impl Engine {
         if c != '<' {
             if !is_xml_char(c) {
                 return Err((E_INVALID_TOKEN, i));
+            }
+            if is_name_char(c) {
+                // a name token: Expat only recognises it once it is
+                // terminated; an unexpected terminator is an invalid token
+                let mut k = i + 1;
+                loop {
+                    match self.ch(k) {
+                        None => {
+                            if !self.final_ {
+                                return Ok(false);
+                            }
+                            break;
+                        }
+                        Some(t) if is_name_char(t) => k += 1,
+                        Some(t) => {
+                            if !matches!(t, '>' | ')' | ',' | '|' | '[' | '%' | ' ' | '\t' | '\n' | '\r') {
+                                return Err((E_INVALID_TOKEN, k));
+                            }
+                            break;
+                        }
+                    }
+                }
             }
             if self.state == State::Epilog {
                 return Err((E_JUNK_AFTER_DOC_ELEMENT, i));
