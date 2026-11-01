@@ -8,6 +8,7 @@ pub mod thread;
 pub mod traceback_util;
 pub mod warnings;
 pub mod _ast;
+pub mod _opcode;
 pub mod sys_full;
 pub mod sys_trace;
 pub mod traceback_print;
@@ -50,6 +51,7 @@ pub fn register_all() {
     numbers_registry::register();
     crate::import::register_builtin("_warnings", _warnings::init_module);
     crate::import::register_builtin("_ast", _ast::init_module);
+    crate::import::register_builtin("_opcode", _opcode::init_module);
     sys_full::register_system_modules();
     text_util::register();
     crate::import::register_builtin("_typing", crate::types::typevar::make_typing_module);
