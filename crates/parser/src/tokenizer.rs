@@ -680,6 +680,22 @@ impl<'a> Lexer<'a> {
     // ------------------------------------------------------------------ names
 
     fn lex_name_or_string(&mut self, start: usize, slineno: u32, scol: i32) -> Result<Token, LexError> {
+        // Fast path: scan an ASCII identifier; only if it is directly followed by a quote can it
+        // be a string prefix.
+        {
+            let b = self.b;
+            let mut i = self.pos;
+            while i < b.len() && ID_CHAR[b[i] as usize] {
+                i += 1;
+            }
+            let next = if i < b.len() { b[i] } else { b'\n' };
+            if next != b'\'' && next != b'"' && next < 128 {
+                self.pos = i;
+                let mut t = self.mk(TokenType::NAME, start, slineno, scol);
+                t.kw = classify_name(&b[start..i]);
+                return Ok(t);
+            }
+        }
         // string prefix?
         let (mut saw_b, mut saw_r, mut saw_u, mut saw_f, mut saw_t) = (false, false, false, false, false);
         let mut dup = false;
@@ -1447,12 +1463,20 @@ impl<'a> Lexer<'a> {
     fn lex_operator(&mut self, start: usize, slineno: u32, scol: i32) -> Result<Token, LexError> {
         use TokenType::*;
         let c = self.b[self.pos];
+        if c == b',' {
+            self.pos += 1;
+            return Ok(self.mk(COMMA, start, slineno, scol));
+        }
         let c2 = self.peek_at(1);
-        let c3 = self.peek_at(2);
+        let c3 = if matches!(c, b'*' | b'/' | b'<' | b'>') { self.peek_at(2) } else { -1 };
         // f-string field handling for ':' and closing brackets
-        let in_field = match (self.modes.len(), self.fields.last()) {
-            (n, Some(f)) if n > 0 && f.mode == n - 1 && !f.in_spec => Some(*f),
-            _ => None,
+        let in_field = if self.modes.is_empty() {
+            None
+        } else {
+            match (self.modes.len(), self.fields.last()) {
+                (n, Some(f)) if f.mode == n - 1 && !f.in_spec => Some(*f),
+                _ => None,
+            }
         };
         if let Some(f) = in_field {
             if c == b':' && self.parens.len() == f.depth {
