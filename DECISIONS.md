@@ -155,3 +155,12 @@ the baselines are rebuilt (build2.sh) after installing the distro packages libzs
 tk-dev. libmpdec is not packaged on this OS and building it from downloaded source was not
 permitted here, so the baseline still lacks _decimal (it uses _pydecimal); decimal-related
 comparisons are reported with that caveat. Suite baselines are re-run after the rebuild.
+
+## D22 — Machine capacity and measurement policy
+The machine has 4 CPUs and 15 GB RAM; with 12-14 agents building/testing concurrently the load
+average sits at ~40. Consequences: (1) while development is parallel, performance work uses
+callgrind instruction counts (and cache/branch-miss counts) as the primary metric; wall-clock
+numbers are only indicative; (2) final benchmark, startup, peak-memory and multi-core scaling
+measurements for REPORT.md/PROGRESS.md are taken on a quiet machine (no agents running, cores
+pinned) against both baselines; (3) concurrency is capped at ~8-10 agents from now on, and
+finished agents' target dirs are deleted promptly (disk: ~14-18 GB free).
