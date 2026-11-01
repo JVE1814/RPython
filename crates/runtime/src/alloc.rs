@@ -24,6 +24,8 @@ pub const GC_BIT_MANAGED: u8 = 0x40;
 pub const GC_BIT_LARGE: u8 = 0x20;
 pub const GC_BIT_TRACKED: u8 = 0x01;
 pub const GC_BIT_FINALIZED: u8 = 0x02;
+/// The managed __dict__ was replaced or deleted (no "inline values" any more).
+pub const GC_BIT_DICT_DETACHED: u8 = 0x10;
 
 #[inline]
 pub fn type_is_gc(tp: *const PyTypeObject) -> bool {

@@ -29,20 +29,49 @@ pub fn find_builtin(name: &str) -> Option<ModInit> {
     BUILTIN_MODULES.lock().unwrap().iter().find(|(n, _)| *n == name).map(|(_, f)| *f)
 }
 
-/// Builtin module objects already created (so re-imports return the same object).
+/// Builtin module objects already created, held by weak reference: a re-import
+/// returns the same object while it is alive, but a module dropped from
+/// sys.modules (and otherwise unreferenced) can be collected and is then
+/// initialised afresh by the next import.
 static BUILTIN_OBJECTS: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
 
-pub fn note_builtin_module(name: &str, m: &PyObject) {
-    let mut g = BUILTIN_OBJECTS.lock().unwrap();
-    if !g.iter().any(|(n, _)| n == name) {
-        g.push((name.to_string(), m.to_ref().into_raw() as usize));
+fn builtin_entry(name: &str) -> Option<PyRef> {
+    let wr = BUILTIN_OBJECTS.lock().unwrap().iter().find(|(n, _)| n == name).map(|(_, p)| unsafe { PyRef::from_borrowed(*p as *mut PyObject) })?;
+    if crate::types::weakref::is_weakref(&wr) {
+        crate::types::weakref::get_object(&wr).filter(|o| !o.is(crate::types::none::none()))
+    } else {
+        Some(wr)
     }
 }
+
+pub fn note_builtin_module(name: &str, m: &PyObject) {
+    if builtin_entry(name).is_some_and(|o| o.is(m)) {
+        return;
+    }
+    // modules support weak references; anything else is kept alive
+    let held = match crate::types::weakref::new_ref(crate::types::weakref::ref_type(), m, None) {
+        Ok(w) => w,
+        Err(_) => {
+            crate::errors::clear_exc();
+            m.to_ref()
+        }
+    };
+    let mut g = BUILTIN_OBJECTS.lock().unwrap();
+    let old = match g.iter_mut().find(|(n, _)| n == name) {
+        Some(e) => std::mem::replace(&mut e.1, held.into_raw() as usize),
+        None => {
+            g.push((name.to_string(), held.into_raw() as usize));
+            0
+        }
+    };
+    drop(g);
+    unsafe { crate::object::xdecref(old as *mut PyObject) };
+}
 pub fn is_builtin_module_object(m: &PyObject, name: &str) -> bool {
-    BUILTIN_OBJECTS.lock().unwrap().iter().any(|(n, p)| n == name && *p == m.as_ptr() as usize)
+    builtin_entry(name).is_some_and(|o| o.is(m))
 }
 fn cached_builtin(name: &str) -> Option<PyRef> {
-    BUILTIN_OBJECTS.lock().unwrap().iter().find(|(n, _)| n == name).map(|(_, p)| unsafe { PyRef::from_borrowed(*p as *mut PyObject) })
+    builtin_entry(name)
 }
 
 /// The importlib bootstrap module once installed.
@@ -752,4 +781,9 @@ pub fn load_source(abs: &str, file: &std::path::Path, pkg_dir: Option<&std::path
 #[allow(dead_code)]
 fn _t(_: &PyObject) -> PyRef {
     tuple::empty_tuple()
+}
+
+/// Resolve a relative module name (`level` > 0) against `globals` (PEP 328 rules).
+pub fn resolve_relative(nm: &str, globals: Option<&PyObject>, level: i64) -> PyResult<String> {
+    resolve_name(nm, globals, level)
 }

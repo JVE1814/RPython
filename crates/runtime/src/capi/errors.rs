@@ -224,7 +224,15 @@ pub unsafe extern "C" fn PyErr_NormalizeException(t: *mut *mut PyObject, v: *mut
 
 pub(crate) fn given_matches(given: &PyObject, exc_: &PyObject) -> bool {
     if tuple::is_tuple(exc_) {
-        return tuple::tuple_items(exc_).iter().any(|e| given_matches(given, e));
+        // nested tuples recurse: a RecursionError is reported as unraisable (core-runtime)
+        let ts = crate::threads::current();
+        if crate::interp::enter_recursive_call(ts, " in PyErr_GivenExceptionMatches").is_err() {
+            crate::modules::sys_full::write_unraisable(None, None);
+            return false;
+        }
+        let r = tuple::tuple_items(exc_).iter().any(|e| given_matches(given, e));
+        crate::interp::leave_recursive_call(ts);
+        return r;
     }
     let g = if exc::is_exception_instance(given) { typeobject::type_obj(given.type_ptr()) } else { given };
     if is_exc_class(g) && is_exc_class(exc_) {

@@ -153,6 +153,9 @@ pub fn init_stdio() {
 }
 
 fn create_stdio(fd: i32, write: bool, name: &str, errors: &str, unbuffered: bool, force_line: bool) -> PyResult<PyRef> {
+    // PYTHONIOENCODING=encoding[:errors] (errors do not apply to stderr)
+    let (enc, errs) = io_encoding();
+    let errors: &str = if fd != 2 { errs.as_deref().unwrap_or(errors) } else { errors };
     use crate::abstract_ as ab;
     use crate::types::bool_;
     // closed / invalid descriptor -> None
@@ -186,7 +189,7 @@ fn create_stdio(fd: i32, write: bool, name: &str, errors: &str, unbuffered: bool
         &tw,
         &[
             &buffered,
-            &pystr::new_str("utf-8"),
+            &pystr::new_str(enc.as_deref().unwrap_or("utf-8")),
             &pystr::new_str(errors),
             &pystr::new_str("\n"),
             &bool_::new_bool(line_buffering),
@@ -196,6 +199,19 @@ fn create_stdio(fd: i32, write: bool, name: &str, errors: &str, unbuffered: bool
     )?;
     ab::setattr(&text, crate::name!("mode"), &pystr::new_str(if write { "w" } else { "r" }))?;
     Ok(text)
+}
+
+/// PYTHONIOENCODING split into (encoding, errors); empty parts are None.
+fn io_encoding() -> (Option<String>, Option<String>) {
+    if crate::modules::sys_full::config().ignore_environment != 0 {
+        return (None, None);
+    }
+    let Ok(v) = std::env::var("PYTHONIOENCODING") else { return (None, None) };
+    let (e, r) = match v.split_once(':') {
+        Some((e, r)) => (e.to_string(), Some(r.to_string())),
+        None => (v.clone(), None),
+    };
+    (if e.is_empty() { None } else { Some(e) }, r.filter(|r| !r.is_empty()))
 }
 
 fn init_stdio_impl() -> PyResult<()> {

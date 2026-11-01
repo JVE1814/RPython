@@ -572,22 +572,8 @@ impl<'w> Folder<'w> {
     }
 
     fn fold_body(&mut self, body: &mut [Stmt]) -> R {
-        // A leading expression that only *folds* to a string (`"a" + "b"`) must not
-        // become a docstring: keep it unfolded.
-        let lead_was_str = match body.first().map(|s| &s.node) {
-            Some(StmtKind::Expr { value }) => matches!(value.node, ExprKind::Constant { value: Constant::Str(_), .. }),
-            _ => true,
-        };
-        let original = if lead_was_str { None } else { body.first().cloned() };
         for s in body.iter_mut() {
             self.fold_stmt(s)?;
-        }
-        if let (Some(orig), Some(first)) = (original, body.first_mut()) {
-            if let StmtKind::Expr { value } = &first.node {
-                if matches!(value.node, ExprKind::Constant { value: Constant::Str(_), .. }) {
-                    *first = orig;
-                }
-            }
         }
         Ok(())
     }
@@ -914,16 +900,18 @@ impl<'w> Folder<'w> {
 
     fn check_compare(&mut self, e: &Expr) {
         if let ExprKind::Compare { left, ops, comparators } = &e.node {
-            let is_arg = |x: &Expr| -> bool {
+            fn is_arg(x: &Expr) -> bool {
                 match &x.node {
                     ExprKind::Constant { value, .. } => {
                         matches!(value, Constant::None | Constant::Bool(_) | Constant::Ellipsis)
                     }
-                    // a tuple display of constants is a literal too
-                    ExprKind::Tuple { elts, .. } => !elts.iter().all(|x| matches!(x.node, ExprKind::Constant { .. })),
+                    // a tuple display of constants is a (folded) tuple literal
+                    ExprKind::Tuple { elts, .. } => {
+                        !elts.iter().all(|e| matches!(e.node, ExprKind::Constant { .. }) || (matches!(e.node, ExprKind::Tuple { .. }) && !is_arg(e)))
+                    }
                     _ => true,
                 }
-            };
+            }
             let mut left_ok = is_arg(left);
             let mut left_expr: &Expr = left;
             for (op, right) in ops.iter().zip(comparators.iter()) {

@@ -81,7 +81,7 @@ fn dis_one(code: &CodeUnit, out: &mut String) {
             | Op::LoadMethod | Op::StoreAttr | Op::DeleteAttr | Op::ImportFrom | Op::LoadFromDictOrGlobals => {
                 code.names.get(arg as usize).cloned().unwrap_or_default()
             }
-            Op::ImportName => code.names.get((arg & 0x7f_ffff) as usize).cloned().unwrap_or_default() + if arg >> 23 != 0 { " (lazy)" } else { "" },
+            Op::ImportName => code.names.get((arg & 0x7f_ffff) as usize).cloned().unwrap_or_default() + if (arg >> 23) & 1 != 0 { " (lazy)" } else { "" },
             Op::LoadSuperAttr => code.names.get((arg >> 2) as usize).cloned().unwrap_or_default(),
             Op::LoadFast | Op::LoadFastCheck | Op::LoadFastAndClear | Op::StoreFast | Op::DeleteFast | Op::LoadDeref
             | Op::StoreDeref | Op::DeleteDeref | Op::MakeCell | Op::LoadFromDictOrDeref => {

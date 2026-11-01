@@ -825,7 +825,8 @@ impl<'a> Compiler<'a> {
             self.load_const(Constant::Int(0));
             self.load_none();
             let i = self.u().add_name(&a.name);
-            self.emit(Op::ImportName, i | if lazy { 1 << 23 } else { 0 });
+            let bits = self.import_lazy_bits(lazy);
+            self.emit(Op::ImportName, i | bits);
             match &a.asname {
                 Some(asname) => {
                     if let Some(dot) = a.name.find('.') {
@@ -851,6 +852,26 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
+    /// ImportName flag bits: 1<<23 = `lazy` keyword; 1<<24 = the import may become lazy
+    /// implicitly (module level, outside try/except/finally handlers), which the
+    /// runtime decides from the lazy-imports mode and `__lazy_modules__`.
+    fn import_lazy_bits(&self, lazy: bool) -> u32 {
+        let u = self.ur();
+        let eligible = u.kind == super::UnitKind::Module
+            && !u.fblocks.iter().any(|b| {
+                matches!(
+                    b.kind,
+                    super::FbKind::TryExcept
+                        | super::FbKind::FinallyTry
+                        | super::FbKind::FinallyEnd
+                        | super::FbKind::HandlerCleanup
+                        | super::FbKind::ExceptionHandler
+                        | super::FbKind::ExceptionGroupHandler
+                )
+            });
+        (if lazy { 1 << 23 } else { 0 }) | (if eligible { 1 << 24 } else { 0 })
+    }
+
     fn store_import_name(&mut self, name: &str, loc: Loc) -> R {
         if name == "__debug__" {
             return Err(self.error("cannot assign to __debug__", loc));
@@ -864,8 +885,10 @@ impl<'a> Compiler<'a> {
         let fromlist: Vec<Constant> = names.iter().map(|a| str_const(&a.name)).collect();
         self.load_const(Constant::Tuple(fromlist));
         let i = self.u().add_name(module.unwrap_or(""));
-        self.emit(Op::ImportName, i | if lazy { 1 << 23 } else { 0 });
-        if names.len() == 1 && names[0].name == "*" {
+        let star = names.len() == 1 && names[0].name == "*";
+        let bits = if star { if lazy { 1 << 23 } else { 0 } } else { self.import_lazy_bits(lazy) };
+        self.emit(Op::ImportName, i | bits);
+        if star {
             self.emit(Op::CallIntrinsic1, Intrinsic1::ImportStar as u32);
             self.emit(Op::PopTop, 0);
             return Ok(());
