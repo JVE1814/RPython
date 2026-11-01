@@ -1,33 +1,31 @@
-"""Parser for command line options.
+"""Command line option parsing in the style of Unix getopt().
 
-This module helps scripts to parse the command line arguments in
-sys.argv.  It supports the same conventions as the Unix getopt()
-function (including the special meanings of arguments of the form `-'
-and `--').  Long options similar to those supported by GNU software
-may be used as well via an optional third argument.  This module
-provides two functions and an exception:
+getopt(args, shortopts, longopts=[])     options must precede operands
+gnu_getopt(args, shortopts, longopts=[]) options and operands may mix
+GetoptError (alias: error)               raised for invalid command lines
 
-getopt() -- Parse command line options
-gnu_getopt() -- Like getopt(), but allow option and non-option arguments
-to be intermixed.
-GetoptError -- exception (class) raised with 'opt' attribute, which is the
-option involved with the exception.
+Short option specs are letters; a letter followed by ':' takes a required
+argument and by '::' an optional one.  Long option specs are names; a
+trailing '=' means a required argument and '=?' an optional one.  Long
+options may be abbreviated to any unique prefix.
 """
-
-__all__ = ["GetoptError", "error", "getopt", "gnu_getopt"]
 
 import os
 
+__all__ = ["GetoptError", "error", "getopt", "gnu_getopt"]
 
-def _(message):
+
+def _(text):
+    # Messages are translatable when gettext is available.
     try:
         from gettext import gettext
     except ImportError:
-        return message
-    return gettext(message)
+        return text
+    return gettext(text)
 
 
 class GetoptError(Exception):
+    """Invalid command line; .msg is the message, .opt the option name."""
     opt = ''
     msg = ''
 
@@ -40,186 +38,172 @@ class GetoptError(Exception):
         return self.msg
 
 
-error = GetoptError  # backward compatibility
+error = GetoptError
+
+# Argument requirements as reported by short_has_arg()/long_has_args().
+_REQUIRED = True
+_NONE = False
+_OPTIONAL = '?'
+
+
+def _as_list(longopts):
+    if isinstance(longopts, str):
+        return [longopts]
+    return list(longopts)
 
 
 def getopt(args, shortopts, longopts=[]):
-    """getopt(args, options[, long_options]) -> opts, args
+    """Parse the option list `args` (normally sys.argv[1:]).
 
-    Parses command line options and parameter list.  args is the
-    argument list to be parsed, without the leading reference to the
-    running program.  Typically, this means "sys.argv[1:]".  shortopts
-    is the string of option letters that the script wants to
-    recognize, with options that require an argument followed by a
-    colon and options that accept an optional argument followed by
-    two colons (i.e., the same format that Unix getopt() uses).  If
-    specified, longopts is a list of strings with the names of the
-    long options which should be supported.  The leading '--'
-    characters should not be included in the option name.  Options
-    which require an argument should be followed by an equal sign
-    ('=').  Options which accept an optional argument should be
-    followed by an equal sign and question mark ('=?').
-
-    The return value consists of two elements: the first is a list of
-    (option, value) pairs; the second is the list of program arguments
-    left after the option list was stripped (this is a trailing slice
-    of the first argument).  Each option-and-value pair returned has
-    the option as its first element, prefixed with a hyphen (e.g.,
-    '-x'), and the option argument as its second element, or an empty
-    string if the option has no argument.  The options occur in the
-    list in the same order in which they were found, thus allowing
-    multiple occurrences.  Long and short options may be mixed.
+    Returns (options, operands): options is a list of (name, value) pairs
+    with names such as '-x' or '--name' and value '' when there is no
+    argument; operands are the remaining arguments.  Parsing stops at the
+    first operand or after '--'.
     """
-    opts = []
-    if isinstance(longopts, str):
-        longopts = [longopts]
-    else:
-        longopts = list(longopts)
-    while args and args[0].startswith('-') and args[0] != '-':
-        if args[0] == '--':
-            args = args[1:]
+    longopts = _as_list(longopts)
+    found = []
+    rest = list(args)
+    while rest:
+        arg = rest[0]
+        if arg == '--':
+            rest = rest[1:]
             break
-        if args[0].startswith('--'):
-            opts, args = do_longs(opts, args[0][2:], longopts, args[1:])
+        if not arg.startswith('-') or arg == '-':
+            break
+        if arg.startswith('--'):
+            found, rest = do_longs(found, arg[2:], longopts, rest[1:])
         else:
-            opts, args = do_shorts(opts, args[0][1:], shortopts, args[1:])
-    return opts, args
+            found, rest = do_shorts(found, arg[1:], shortopts, rest[1:])
+    return found, rest
 
 
 def gnu_getopt(args, shortopts, longopts=[]):
-    """getopt(args, options[, long_options]) -> opts, args
+    """Like getopt(), but operands and options may be interleaved.
 
-    This function works like getopt(), except that GNU style scanning
-    mode is used by default. This means that option and non-option
-    arguments may be intermixed. The getopt() function stops
-    processing options as soon as a non-option argument is
-    encountered.
-
-    If the first character of the option string is '+', or if the
-    environment variable POSIXLY_CORRECT is set, then option
-    processing stops as soon as a non-option argument is encountered.
-
-    If the first character of the option string is '-', non-option
-    arguments are returned in order, as pairs (None, [arg]).
+    A leading '+' in shortopts (or a set POSIXLY_CORRECT environment
+    variable) restores the getopt() behaviour of stopping at the first
+    operand.  A leading '-' keeps operands in place: each appears in the
+    option list as (None, [operand]).
     """
-    opts = []
-    prog_args = []
-    if isinstance(longopts, str):
-        longopts = [longopts]
-    else:
-        longopts = list(longopts)
-
-    return_in_order = False
-    if shortopts.startswith('-'):
+    longopts = _as_list(longopts)
+    in_order = stop_at_operand = False
+    if shortopts[:1] == '-':
+        in_order = True
         shortopts = shortopts[1:]
-        all_options_first = False
-        return_in_order = True
-    elif shortopts.startswith('+'):
+    elif shortopts[:1] == '+':
+        stop_at_operand = True
         shortopts = shortopts[1:]
-        all_options_first = True
     elif os.environ.get("POSIXLY_CORRECT"):
-        all_options_first = True
-    else:
-        all_options_first = False
+        stop_at_operand = True
 
-    while args:
-        arg = args[0]
+    found = []
+    operands = []
+    rest = list(args)
+    while rest:
+        arg = rest[0]
         if arg == '--':
-            prog_args += args[1:]
+            operands.extend(rest[1:])
             break
-        if arg[:2] == '--':
-            opts, args = do_longs(opts, arg[2:], longopts, args[1:])
-        elif arg[:1] == '-' and arg != '-':
-            opts, args = do_shorts(opts, arg[1:], shortopts, args[1:])
+        if arg.startswith('--'):
+            found, rest = do_longs(found, arg[2:], longopts, rest[1:])
+            continue
+        if arg.startswith('-') and arg != '-':
+            found, rest = do_shorts(found, arg[1:], shortopts, rest[1:])
+            continue
+        # an operand
+        if stop_at_operand:
+            operands.extend(rest)
+            break
+        if in_order:
+            found.append((None, [arg]))
         else:
-            if all_options_first:
-                prog_args += args
-                break
-            elif return_in_order:
-                opts.append((None, [arg]))
-            else:
-                prog_args.append(arg)
-            args = args[1:]
-
-    return opts, prog_args
+            operands.append(arg)
+        rest = rest[1:]
+    return found, operands
 
 
 def do_longs(opts, opt, longopts, args):
-    if '=' in opt:
-        i = opt.index('=')
-        opt, optarg = opt[:i], opt[i + 1:]
-    else:
-        optarg = None
-
-    has_arg, opt = long_has_args(opt, longopts)
-    if has_arg is True:
-        if optarg is None:
+    """Handle one '--name[=value]' argument (without the dashes)."""
+    name, sep, value = opt.partition('=')
+    if not sep:
+        value = None
+    needs, name = long_has_args(name, longopts)
+    if needs is _REQUIRED:
+        if value is None:
             if not args:
-                raise GetoptError(_('option --%s requires argument') % opt, opt)
-            optarg, args = args[0], args[1:]
-    elif has_arg == '?':
-        if optarg is None:
-            optarg = ''
-    elif optarg is not None:
-        raise GetoptError(_('option --%s must not have an argument') % opt, opt)
-    opts.append(('--' + opt, optarg or ''))
+                raise GetoptError(_('option --%s requires argument') % name, name)
+            value, args = args[0], args[1:]
+    elif needs == _OPTIONAL:
+        if value is None:
+            value = ''
+    elif value is not None:
+        raise GetoptError(_('option --%s must not have an argument') % name, name)
+    opts.append(('--' + name, value or ''))
     return opts, args
 
 
 def long_has_args(opt, longopts):
-    """Return (has_arg, full_option_name) for the long option `opt`.
+    """Look up a (possibly abbreviated) long option.
 
-    has_arg is True (argument required), False (no argument) or '?'
-    (optional argument).  Unique prefixes of option names are accepted.
+    Returns (requirement, full_name) with requirement True (required
+    argument), False (no argument) or '?' (optional argument).
     """
-    possibilities = [o for o in longopts if o.startswith(opt)]
-    if not possibilities:
+    # An exact spelling wins over abbreviations.
+    for suffix, requirement in (('', _NONE), ('=', _REQUIRED), ('=?', _OPTIONAL)):
+        if opt + suffix in longopts:
+            return requirement, opt
+    candidates = [spec for spec in longopts if spec.startswith(opt)]
+    if not candidates:
         raise GetoptError(_('option --%s not recognized') % opt, opt)
-    # exact matches win over prefix matches
-    if opt in possibilities:
-        return False, opt
-    if opt + '=' in possibilities:
-        return True, opt
-    if opt + '=?' in possibilities:
-        return '?', opt
-    if len(possibilities) > 1:
+    if len(candidates) > 1:
         raise GetoptError(_('option --%s not a unique prefix') % opt, opt)
-    assert len(possibilities) == 1
-    unique_match = possibilities[0]
-    if unique_match.endswith('=?'):
-        return '?', unique_match[:-2]
-    has_arg = unique_match.endswith('=')
-    if has_arg:
-        unique_match = unique_match[:-1]
-    return has_arg, unique_match
+    spec = candidates[0]
+    if spec.endswith('=?'):
+        return _OPTIONAL, spec[:-2]
+    if spec.endswith('='):
+        return _REQUIRED, spec[:-1]
+    return _NONE, spec
 
 
 def do_shorts(opts, optstring, shortopts, args):
-    while optstring != '':
-        opt, optstring = optstring[0], optstring[1:]
-        has_arg = short_has_arg(opt, shortopts)
-        if has_arg is True:
-            if optstring == '':
+    """Handle one cluster of short options such as '-abc' (without '-')."""
+    pos = 0
+    while pos < len(optstring):
+        letter = optstring[pos]
+        pos += 1
+        needs = short_has_arg(letter, shortopts)
+        if needs is _REQUIRED:
+            if pos == len(optstring):
                 if not args:
-                    raise GetoptError(_('option -%s requires argument') % opt, opt)
-                optstring, args = args[0], args[1:]
-            optarg, optstring = optstring, ''
-        elif has_arg == '?':
-            optarg, optstring = optstring, ''
+                    raise GetoptError(_('option -%s requires argument') % letter,
+                                      letter)
+                value, args = args[0], args[1:]
+            else:
+                value = optstring[pos:]
+            pos = len(optstring)
+        elif needs == _OPTIONAL:
+            value = optstring[pos:]
+            pos = len(optstring)
         else:
-            optarg = ''
-        opts.append(('-' + opt, optarg))
+            value = ''
+        opts.append(('-' + letter, value))
     return opts, args
 
 
 def short_has_arg(opt, shortopts):
-    """Return True if the short option takes an argument, '?' if the
-    argument is optional, False otherwise."""
-    for i in range(len(shortopts)):
-        if opt == shortopts[i] != ':':
-            if shortopts.startswith('::', i + 1):
-                return '?'
-            return shortopts.startswith(':', i + 1)
+    """Return True, False or '?' for the argument requirement of letter
+    `opt` according to `shortopts`."""
+    index = 0
+    while index < len(shortopts):
+        letter = shortopts[index]
+        colons = 0
+        while index + 1 + colons < len(shortopts) and shortopts[index + 1 + colons] == ':':
+            colons += 1
+        if letter == opt and letter != ':':
+            if colons >= 2:
+                return _OPTIONAL
+            return colons == 1
+        index += 1 + colons if letter != ':' else 1
     raise GetoptError(_('option -%s not recognized') % opt, opt)
 
 
