@@ -14,7 +14,16 @@ use std::sync::{Mutex, MutexGuard};
 
 /// Register every module of the compress workstream.
 pub fn register() {
-    crate::import::register_builtin("zlib", crate::modules::zlib::init_module);
+    use crate::import::register_builtin as reg;
+    use crate::modules::hashes;
+    reg("zlib", crate::modules::zlib::init_module);
+    reg("_md5", hashes::init_md5);
+    reg("_sha1", hashes::init_sha1);
+    reg("_sha2", hashes::init_sha2);
+    reg("_sha3", hashes::init_sha3);
+    reg("_blake2", hashes::init_blake2);
+    reg("_hashlib", hashes::init_hashlib);
+    reg("_hmac", hashes::init_hmac);
 }
 
 /// Object layout: header + pointer to the boxed, mutex-protected Rust state.

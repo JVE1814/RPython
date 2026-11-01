@@ -51,6 +51,7 @@ pub mod _heapq;
 pub mod _bisect;
 pub mod compress_common;
 pub mod zlib;
+pub mod hashes;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
 pub fn register_all() {

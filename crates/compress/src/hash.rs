@@ -9,6 +9,10 @@ pub trait Digest: Send {
     fn digest_size(&self) -> usize;
     fn block_size(&self) -> usize;
     fn box_clone(&self) -> Box<dyn Digest>;
+    /// Extendable output (SHAKE): `n` bytes from a finalized copy.
+    fn xof(&self, _n: usize) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// Buffers partial blocks for Merkle-Damgard style hashes.
@@ -616,6 +620,9 @@ impl Digest for Sha3 {
     }
     fn digest(&self) -> Vec<u8> {
         self.squeeze(self.out)
+    }
+    fn xof(&self, n: usize) -> Option<Vec<u8>> {
+        if self.out == 0 { Some(self.squeeze(n)) } else { None }
     }
     fn digest_size(&self) -> usize {
         self.out
