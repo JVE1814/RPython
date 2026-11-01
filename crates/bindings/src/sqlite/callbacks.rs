@@ -16,9 +16,9 @@ unsafe extern "C" fn destroy_ctx(p: *mut c_void) {
         return;
     }
     unsafe {
-        let g = capi::PyGILState_Ensure();
+        let g = crate::gil::ensure();
         drop(Box::from_raw(p as *mut CbCtx));
-        capi::PyGILState_Release(g);
+        crate::gil::release(g);
     }
 }
 
@@ -122,7 +122,7 @@ fn function_error(ctx: *mut Ctx, callable: &PyObject, msg: &str) {
 
 unsafe extern "C" fn func_callback(ctx: *mut Ctx, argc: c_int, argv: *mut *mut Value) {
     unsafe {
-        let g = capi::PyGILState_Ensure();
+        let g = crate::gil::ensure();
         let callable = ctx_callable(sq!(sqlite3_user_data(ctx)));
         let r = args_to_py(argc, argv).and_then(|a| {
             let refs: Vec<&PyObject> = a.iter().map(|x| &**x).collect();
@@ -135,7 +135,7 @@ unsafe extern "C" fn func_callback(ctx: *mut Ctx, argc: c_int, argv: *mut *mut V
         if !ok {
             function_error(ctx, &callable, "user-defined function raised exception");
         }
-        capi::PyGILState_Release(g);
+        crate::gil::release(g);
     }
 }
 
@@ -257,7 +257,7 @@ unsafe fn call_method_of(ctx: *mut Ctx, cls: &PyObject, inst: *mut PyObject, met
 
 unsafe extern "C" fn agg_step(ctx: *mut Ctx, argc: c_int, argv: *mut *mut Value) {
     unsafe {
-        let g = capi::PyGILState_Ensure();
+        let g = crate::gil::ensure();
         let cls = ctx_callable(sq!(sqlite3_user_data(ctx)));
         if let Ok(inst) = get_or_create_instance(ctx, &cls) {
             match args_to_py(argc, argv) {
@@ -267,13 +267,13 @@ unsafe extern "C" fn agg_step(ctx: *mut Ctx, argc: c_int, argv: *mut *mut Value)
                 Err(_) => function_error(ctx, &cls, "user-defined aggregate's 'step' method raised error"),
             }
         }
-        capi::PyGILState_Release(g);
+        crate::gil::release(g);
     }
 }
 
 unsafe extern "C" fn agg_final(ctx: *mut Ctx) {
     unsafe {
-        let g = capi::PyGILState_Ensure();
+        let g = crate::gil::ensure();
         let cls = ctx_callable(sq!(sqlite3_user_data(ctx)));
         if let Some(slot) = aggregate_instance(ctx, false) {
             let inst = *slot;
@@ -292,7 +292,7 @@ unsafe extern "C" fn agg_final(ctx: *mut Ctx) {
                 decref(inst);
             }
         }
-        capi::PyGILState_Release(g);
+        crate::gil::release(g);
     }
 }
 
@@ -326,7 +326,7 @@ unsafe extern "C" fn win_inverse(ctx: *mut Ctx, argc: c_int, argv: *mut *mut Val
 
 unsafe fn win_step_inverse(ctx: *mut Ctx, argc: c_int, argv: *mut *mut Value, meth: &str) {
     unsafe {
-        let g = capi::PyGILState_Ensure();
+        let g = crate::gil::ensure();
         let cls = ctx_callable(sq!(sqlite3_user_data(ctx)));
         if let Ok(inst) = get_or_create_instance_win(ctx, &cls) {
             match args_to_py(argc, argv) {
@@ -336,7 +336,7 @@ unsafe fn win_step_inverse(ctx: *mut Ctx, argc: c_int, argv: *mut *mut Value, me
                 Err(_) => function_error(ctx, &cls, &format!("'{}' method raised error", meth)),
             }
         }
-        capi::PyGILState_Release(g);
+        crate::gil::release(g);
     }
 }
 
@@ -361,7 +361,7 @@ unsafe fn get_or_create_instance_win(ctx: *mut Ctx, cls: &PyObject) -> Result<*m
 
 unsafe extern "C" fn win_value(ctx: *mut Ctx) {
     unsafe {
-        let g = capi::PyGILState_Ensure();
+        let g = crate::gil::ensure();
         let cls = ctx_callable(sq!(sqlite3_user_data(ctx)));
         if let Ok(inst) = get_or_create_instance_win(ctx, &cls) {
             if let Some(r) = call_method_of(ctx, &cls, inst, "value", &[], "aggregate's") {
@@ -370,7 +370,7 @@ unsafe extern "C" fn win_value(ctx: *mut Ctx) {
                 }
             }
         }
-        capi::PyGILState_Release(g);
+        crate::gil::release(g);
     }
 }
 
@@ -411,7 +411,7 @@ pub fn create_window_function(o: &PyObject, args: &[&PyObject], kw: Option<&PyOb
 
 unsafe extern "C" fn collation_cb(app: *mut c_void, l1: c_int, s1: *const c_void, l2: c_int, s2: *const c_void) -> c_int {
     unsafe {
-        let g = capi::PyGILState_Ensure();
+        let g = crate::gil::ensure();
         let callable = ctx_callable(app);
         let r = (|| -> PyResult<c_int> {
             let a = from_c(capi::PyUnicode_FromStringAndSize(s1 as *const c_char, l1 as isize))?;
@@ -436,7 +436,7 @@ unsafe extern "C" fn collation_cb(app: *mut c_void, l1: c_int, s1: *const c_void
                 0
             }
         };
-        capi::PyGILState_Release(g);
+        crate::gil::release(g);
         out
     }
 }
@@ -473,7 +473,7 @@ fn opt_str(p: *const c_char) -> PyRef {
 
 unsafe extern "C" fn authorizer_cb(app: *mut c_void, action: c_int, a1: *const c_char, a2: *const c_char, a3: *const c_char, a4: *const c_char) -> c_int {
     unsafe {
-        let g = capi::PyGILState_Ensure();
+        let g = crate::gil::ensure();
         let callable = (&*(app as *mut PyObject)).to_ref();
         let r = call(&callable, &[&new_int(action as i64), &opt_str(a1), &opt_str(a2), &opt_str(a3), &opt_str(a4)]);
         let rc = match r {
@@ -495,14 +495,14 @@ unsafe extern "C" fn authorizer_cb(app: *mut c_void, action: c_int, a1: *const c
                 1
             }
         };
-        capi::PyGILState_Release(g);
+        crate::gil::release(g);
         rc
     }
 }
 
 unsafe extern "C" fn progress_cb(app: *mut c_void) -> c_int {
     unsafe {
-        let g = capi::PyGILState_Ensure();
+        let g = crate::gil::ensure();
         let callable = (&*(app as *mut PyObject)).to_ref();
         let rc = match call(&callable, &[]) {
             Ok(v) => match rpy_runtime::abstract_::is_true(&v) {
@@ -517,14 +517,14 @@ unsafe extern "C" fn progress_cb(app: *mut c_void) -> c_int {
                 1
             }
         };
-        capi::PyGILState_Release(g);
+        crate::gil::release(g);
         rc
     }
 }
 
 unsafe extern "C" fn trace_cb(_ty: c_uint, app: *mut c_void, stmt: *mut c_void, _x: *mut c_void) -> c_int {
     unsafe {
-        let g = capi::PyGILState_Ensure();
+        let g = crate::gil::ensure();
         let callable = (&*(app as *mut PyObject)).to_ref();
         let expanded = sq!(sqlite3_expanded_sql(stmt));
         let text = if expanded.is_null() {
@@ -540,7 +540,7 @@ unsafe extern "C" fn trace_cb(_ty: c_uint, app: *mut c_void, stmt: *mut c_void, 
         if call(&callable, &[&new_str(&text)]).is_err() {
             report_callback_error(Some(&callable));
         }
-        capi::PyGILState_Release(g);
+        crate::gil::release(g);
         0
     }
 }
@@ -701,9 +701,9 @@ pub fn backup(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResu
     let mut rc;
     loop {
         rc = unsafe {
-            let ts = capi::PyEval_SaveThread();
+            let ts = crate::gil::save();
             let r = (lib().sqlite3_backup_step.unwrap())(bck, pages);
-            capi::PyEval_RestoreThread(ts);
+            crate::gil::restore(ts);
             r
         };
         if let Some(p) = progress {
@@ -716,9 +716,9 @@ pub fn backup(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResu
         }
         if rc == SQLITE_BUSY || rc == SQLITE_LOCKED {
             unsafe {
-                let ts = capi::PyEval_SaveThread();
+                let ts = crate::gil::save();
                 (lib().sqlite3_sleep.unwrap())(sleep_ms);
-                capi::PyEval_RestoreThread(ts);
+                crate::gil::restore(ts);
             }
         }
         if !(rc == SQLITE_OK || rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {

@@ -721,9 +721,9 @@ pub fn callproc(
         }
     } else {
         unsafe {
-            let ts = capi::PyEval_SaveThread();
+            let ts = crate::gil::save();
             do_call();
-            capi::PyEval_RestoreThread(ts);
+            crate::gil::restore(ts);
         }
         if err_occurred() {
             // an exception from a callback is reported as unraisable; nothing pending here
@@ -1080,7 +1080,7 @@ fn alloc_callback(callable: &PyObject, argtypes: &PyObject, restype: Option<&PyO
 
 unsafe extern "C" fn closure_fn(_cif: *mut FfiCif, resp: *mut c_void, args: *mut *mut c_void, user: *mut c_void) {
     unsafe {
-        let g = capi::PyGILState_Ensure();
+        let g = crate::gil::ensure();
         let obj = &*(user as *mut PyObject);
         let th = thunk_ref(obj);
         let use_errno = th.flags & FUNCFLAG_USE_ERRNO != 0;
@@ -1096,7 +1096,7 @@ unsafe extern "C" fn closure_fn(_cif: *mut FfiCif, resp: *mut c_void, args: *mut
             let old = CTYPES_ERRNO.with(|c| c.replace(e));
             *libc::__errno_location() = old;
         }
-        capi::PyGILState_Release(g);
+        crate::gil::release(g);
     }
 }
 

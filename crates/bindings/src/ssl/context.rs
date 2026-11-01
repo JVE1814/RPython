@@ -113,7 +113,7 @@ fn ctx_new_impl(tp: *mut PyTypeObject, a: &fc::VcArgs) -> PyResult {
     )?;
     sl!(SSL_CTX_set_ex_data(c, CTX_EX_INDEX, obj.as_ptr() as *mut c_void));
     // defaults
-    let opts: u64 = (0x8000_0850u64 & !(1 << 11)) | (1 << 25) | (1 << 17) | (1 << 22);
+    let opts: u64 = 0x8000_0850u64 | (1 << 25) | (1 << 17) | (1 << 22);
     sl!(SSL_CTX_set_options(c, opts));
     set_verify_mode_raw(&obj, if is_client { 2 } else { 0 })?;
     let ciphers = CString::new("@SECLEVEL=2:ECDH+AESGCM:ECDH+CHACHA20:ECDH+AES:DHE+AES:!aNULL:!eNULL:!aDSS:!SHA1:!AESCCM").unwrap();
@@ -284,7 +284,6 @@ fn set_proto_version(o: &PyObject, v: Option<&PyObject>, max: bool) -> PyResult<
         _ => raise!(ValueError, "Unsupported TLS/SSL version 0x{:x}", n),
     };
     let cmd = if max { SSL_CTRL_SET_MAX_PROTO_VERSION } else { SSL_CTRL_SET_MIN_PROTO_VERSION };
-    let val = if n == -2 && !max { 0x300 } else { val };
     if sl!(SSL_CTX_ctrl(c.ctx, cmd, val as c_long, std::ptr::null_mut())) == 0 {
         raise!(ValueError, "Unsupported protocol version 0x{:x}", n);
     }
@@ -350,7 +349,7 @@ fn get_sni(o: &PyObject) -> PyResult {
 
 fn set_sni(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     let c = ctx(o);
-    if c.protocol == 0x10 {
+    if c.protocol == 0x10 && v.map_or(false, |x| !is_none(x)) {
         raise!(ValueError, "sni_callback cannot be set on TLS_CLIENT context");
     }
     match v {
@@ -415,11 +414,11 @@ fn set_keylog(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
 
 unsafe extern "C" fn keylog_cb(ssl: *mut c_void, line: *const c_char) {
     unsafe {
-        let g = capi::PyGILState_Ensure();
-        let c = sl!(SSL_get_SSL_CTX(ssl));
-        let o = sl!(SSL_CTX_get_ex_data(c, CTX_EX_INDEX)) as *mut PyObject;
-        if !o.is_null() {
-            if let Some(f) = &ctx(&*o).keylog_filename {
+        let g = crate::gil::ensure();
+        let sock = sl!(SSL_get_ex_data(ssl, super::socket::SSL_EX_INDEX)) as *mut PyObject;
+        if !sock.is_null() {
+            let ctxref = super::socket::ss(&*sock).context.clone();
+            if let Some(f) = &ctx(&ctxref).keylog_filename {
                 if let Ok(p) = rpy_runtime::modules::posix::path::fspath(f) {
                     let path = if is_bytes(&p) { String::from_utf8_lossy(bytes::bytes_data(&p)).into_owned() } else { str_of(&p) };
                     use std::io::Write;
@@ -432,28 +431,26 @@ unsafe extern "C" fn keylog_cb(ssl: *mut c_void, line: *const c_char) {
                 }
             }
         }
-        capi::PyGILState_Release(g);
+        crate::gil::release(g);
     }
 }
 
 /// SNI: call `sni_callback(sslobject, server_name, context)`.
 unsafe extern "C" fn servername_cb(ssl: *mut c_void, al: *mut c_int, _arg: *mut c_void) -> c_int {
     unsafe {
-        let g = capi::PyGILState_Ensure();
+        let g = crate::gil::ensure();
         let r = (|| -> c_int {
-            let c = sl!(SSL_get_SSL_CTX(ssl));
-            let o = sl!(SSL_CTX_get_ex_data(c, CTX_EX_INDEX)) as *mut PyObject;
-            if o.is_null() {
-                return 0;
-            }
-            let cb = match &ctx(&*o).sni_callback {
-                Some(cb) => cb.clone(),
-                None => return 0,
-            };
+            // the context is reached through the socket, which holds a strong reference
             let sock = sl!(SSL_get_ex_data(ssl, super::socket::SSL_EX_INDEX)) as *mut PyObject;
             if sock.is_null() {
                 return 0;
             }
+            let ctxref = super::socket::ss(&*sock).context.clone();
+            let o = ctxref.as_ptr();
+            let cb = match &ctx(&*o).sni_callback {
+                Some(cb) => cb.clone(),
+                None => return 0,
+            };
             let owner = super::socket::owner_or_self(&*sock);
             let name = sl!(SSL_get_servername(ssl, 0));
             let name_obj = if name.is_null() {
@@ -494,7 +491,7 @@ unsafe extern "C" fn servername_cb(ssl: *mut c_void, al: *mut c_int, _arg: *mut 
                 }
             }
         })();
-        capi::PyGILState_Release(g);
+        crate::gil::release(g);
         r
     }
 }
@@ -622,7 +619,7 @@ fn password_bytes(v: &PyObject, from_callback: bool) -> PyResult<Vec<u8>> {
 unsafe extern "C" fn password_cb(buf: *mut c_char, size: c_int, _rw: c_int, userdata: *mut c_void) -> c_int {
     unsafe {
         let info = &mut *(userdata as *mut PwInfo);
-        let g = capi::PyGILState_Ensure();
+        let g = crate::gil::ensure();
         let r = (|| -> PyResult<Vec<u8>> {
             if let Some(cb) = &info.callable {
                 let v = call(cb, &[])?;
@@ -646,7 +643,7 @@ unsafe extern "C" fn password_cb(buf: *mut c_char, size: c_int, _rw: c_int, user
                 -1
             }
         };
-        capi::PyGILState_Release(g);
+        crate::gil::release(g);
         out
     }
 }
@@ -975,6 +972,41 @@ fn m_session_stats(o: &PyObject) -> PyResult {
     Ok(d)
 }
 
+fn ctrl_str(o: &PyObject, cmd: c_int, s: &PyObject, what: &str) -> PyResult {
+    if !is_str(s) {
+        raise!(TypeError, "{}() argument must be str, not {}", what, tname(s));
+    }
+    let c = cstring(&str_of(s));
+    if sl!(SSL_CTX_ctrl(ctx(o).ctx, cmd, 0, c.as_ptr() as *mut c_void)) != 1 {
+        return Err(raise_from_queue(None, &format!("{} failed", what)));
+    }
+    Ok(none())
+}
+
+fn m_set_ciphersuites(o: &PyObject, s: &PyObject) -> PyResult {
+    if !is_str(s) {
+        raise!(TypeError, "set_ciphersuites() argument must be str, not {}", tname(s));
+    }
+    let c = cstring(&str_of(s));
+    if sl!(SSL_CTX_set_ciphersuites(ctx(o).ctx, c.as_ptr())) == 0 {
+        cr!(ERR_clear_error());
+        return Err(raise_simple(&st().ssl_error, 0, "No cipher suite can be selected."));
+    }
+    Ok(none())
+}
+
+fn m_set_groups(o: &PyObject, s: &PyObject) -> PyResult {
+    ctrl_str(o, SSL_CTRL_SET_GROUPS_LIST, s, "set_groups")
+}
+
+fn m_set_client_sigalgs(o: &PyObject, s: &PyObject) -> PyResult {
+    ctrl_str(o, 102, s, "set_client_sigalgs")
+}
+
+fn m_set_server_sigalgs(o: &PyObject, s: &PyObject) -> PyResult {
+    ctrl_str(o, 98, s, "set_server_sigalgs")
+}
+
 fn m_psk_unsupported(_o: &PyObject, _args: &[&PyObject], _kw: Option<&PyObject>) -> PyResult {
     raise!(NotImplementedError, "TLS-PSK is not supported by this build")
 }
@@ -1020,6 +1052,10 @@ pub fn init_type() -> PyResult<()> {
             ("_wrap_socket", FASTKW, m_wrap_socket),
             ("_wrap_bio", FASTKW, m_wrap_bio),
             ("set_ciphers", O, m_set_ciphers),
+            ("set_ciphersuites", O, m_set_ciphersuites),
+            ("set_groups", O, m_set_groups),
+            ("set_client_sigalgs", O, m_set_client_sigalgs),
+            ("set_server_sigalgs", O, m_set_server_sigalgs),
             ("get_ciphers", NOARGS, m_get_ciphers),
             ("_set_alpn_protocols", O, m_set_alpn_protocols),
             ("load_cert_chain", FASTKW, m_load_cert_chain),

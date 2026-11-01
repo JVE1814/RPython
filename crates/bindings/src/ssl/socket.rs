@@ -337,10 +337,10 @@ fn run_io(o: &PyObject, what: &str, mut op: impl FnMut(*mut c_void) -> c_int) ->
     loop {
         cr!(ERR_clear_error());
         unsafe { *libc::__errno_location() = 0 };
-        let ts = unsafe { capi::PyEval_SaveThread() };
+        let ts = crate::gil::save();
         let ret = op(ssl);
         let err = if ret > 0 { SSL_ERROR_NONE } else { sl!(SSL_get_error(ssl, ret)) };
-        unsafe { capi::PyEval_RestoreThread(ts) };
+        crate::gil::restore(ts);
         if unsafe { capi::PyErr_CheckSignals() } < 0 {
             return Err(PyErr);
         }
@@ -529,10 +529,15 @@ fn m_shared_ciphers(o: &PyObject) -> PyResult {
     if sk.is_null() {
         return Ok(none());
     }
+    let mine = sl!(SSL_get_ciphers(ss(o).ssl));
+    let ours: Vec<*mut c_void> = if mine.is_null() { Vec::new() } else { (0..cr!(OPENSSL_sk_num(mine))).map(|i| cr!(OPENSSL_sk_value(mine, i))).collect() };
     let n = cr!(OPENSSL_sk_num(sk));
     let mut v = Vec::new();
     for i in 0..n {
-        v.push(cipher_tuple(cr!(OPENSSL_sk_value(sk, i))));
+        let c = cr!(OPENSSL_sk_value(sk, i));
+        if ours.iter().any(|&x| sl!(SSL_CIPHER_get_id(x)) == sl!(SSL_CIPHER_get_id(c))) {
+            v.push(cipher_tuple(c));
+        }
     }
     Ok(rpy_runtime::types::list::new_list(v))
 }
@@ -556,6 +561,15 @@ fn m_selected_alpn(o: &PyObject) -> PyResult {
         return Ok(none());
     }
     Ok(new_str(&String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(p, n as usize) })))
+}
+
+fn m_group(o: &PyObject) -> PyResult {
+    let id = sl!(SSL_ctrl(ss(o).ssl, 134, 0, std::ptr::null_mut()));
+    if id <= 0 {
+        return Ok(none());
+    }
+    let n = sl!(SSL_group_to_name(ss(o).ssl, id as c_int));
+    if n.is_null() { Ok(none()) } else { Ok(new_str(&cstr(n))) }
 }
 
 fn m_compression(_o: &PyObject) -> PyResult {
@@ -596,10 +610,10 @@ fn m_shutdown(o: &PyObject) -> PyResult {
     let mut zeros = 0;
     loop {
         cr!(ERR_clear_error());
-        let ts = unsafe { capi::PyEval_SaveThread() };
+        let ts = crate::gil::save();
         let ret = sl!(SSL_shutdown(ssl));
         let err = if ret < 0 { sl!(SSL_get_error(ssl, ret)) } else { SSL_ERROR_NONE };
-        unsafe { capi::PyEval_RestoreThread(ts) };
+        crate::gil::restore(ts);
         if ret > 0 {
             break;
         }
@@ -635,6 +649,7 @@ fn g_context(o: &PyObject) -> PyResult {
 
 fn s_context(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     let v = match v {
+        None => raise!(AttributeError, "cannot delete attribute"),
         Some(v) if is_context(v) => v,
         _ => raise!(TypeError, "The value must be a SSLContext"),
     };
@@ -660,6 +675,9 @@ fn g_owner(o: &PyObject) -> PyResult {
 }
 
 fn s_owner(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
+    if v.is_none() {
+        raise!(AttributeError, "cannot delete attribute");
+    }
     ss(o).owner = match v {
         Some(v) if !is_none(v) => Some(weakref(v)?),
         _ => None,
@@ -711,7 +729,7 @@ fn g_false(_o: &PyObject) -> PyResult {
 
 pub unsafe extern "C" fn msg_cb(write_p: c_int, version: c_int, content_type: c_int, buf: *const c_void, len: usize, ssl: *mut c_void, _arg: *mut c_void) {
     unsafe {
-        let g = capi::PyGILState_Ensure();
+        let g = crate::gil::ensure();
         let sock = sl!(SSL_get_ex_data(ssl, SSL_EX_INDEX)) as *mut PyObject;
         if !sock.is_null() {
             let s = ss(&*sock);
@@ -738,7 +756,7 @@ pub unsafe extern "C" fn msg_cb(write_p: c_int, version: c_int, content_type: c_
                 }
             }
         }
-        capi::PyGILState_Release(g);
+        crate::gil::release(g);
     }
 }
 
@@ -759,6 +777,7 @@ pub fn init_type() -> PyResult<()> {
             ("version", NOARGS, m_version),
             ("selected_alpn_protocol", NOARGS, m_selected_alpn),
             ("compression", NOARGS, m_compression),
+            ("group", NOARGS, m_group),
             ("get_channel_binding", FASTKW, m_get_channel_binding),
             ("verify_client_post_handshake", NOARGS, m_verify_client_post_handshake),
             ("shutdown", NOARGS, m_shutdown),

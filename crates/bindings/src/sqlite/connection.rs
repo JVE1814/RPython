@@ -240,9 +240,9 @@ pub fn prepare(c: &mut Conn, sql_obj: &PyObject) -> PyResult {
     let mut tail: *const std::ffi::c_char = std::ptr::null();
     let db = c.db;
     let rc = unsafe {
-        let ts = capi::PyEval_SaveThread();
+        let ts = crate::gil::save();
         let rc = (lib().sqlite3_prepare_v2.unwrap())(db, csql.as_ptr(), (sql.len() + 1) as c_int, &mut st, &mut tail);
-        capi::PyEval_RestoreThread(ts);
+        crate::gil::restore(ts);
         rc
     };
     if rc != SQLITE_OK {
@@ -296,9 +296,9 @@ pub fn exec_simple(c: &mut Conn, sql: &str) -> PyResult<()> {
     let db = c.db;
     let st = stmt.st;
     let rc = unsafe {
-        let ts = capi::PyEval_SaveThread();
+        let ts = crate::gil::save();
         let rc = (lib().sqlite3_step.unwrap())(st);
-        capi::PyEval_RestoreThread(ts);
+        crate::gil::restore(ts);
         rc
     };
     if rc != SQLITE_DONE && rc != SQLITE_ROW {
@@ -446,12 +446,12 @@ fn conn_init_impl(o: &PyObject, a: &fc::VcArgs) -> PyResult<()> {
     }
     let mut db: *mut Db = std::ptr::null_mut();
     let rc = unsafe {
-        let ts = capi::PyEval_SaveThread();
+        let ts = crate::gil::save();
         let rc = (lib().sqlite3_open_v2.unwrap())(cpath.as_ptr(), &mut db, flags, std::ptr::null());
         if rc == SQLITE_OK {
             (lib().sqlite3_busy_timeout.unwrap())(db, (timeout * 1000.0) as c_int);
         }
-        capi::PyEval_RestoreThread(ts);
+        crate::gil::restore(ts);
         rc
     };
     if db.is_null() {
@@ -783,9 +783,9 @@ fn m_serialize(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRes
     };
     let mut size: i64 = 0;
     let data = unsafe {
-        let ts = capi::PyEval_SaveThread();
+        let ts = crate::gil::save();
         let d = (lib().sqlite3_serialize.unwrap())(c.db, name.as_ptr(), &mut size, 0);
-        capi::PyEval_RestoreThread(ts);
+        crate::gil::restore(ts);
         d
     };
     if data.is_null() {
@@ -821,7 +821,7 @@ fn m_deserialize(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyR
     }
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, size) };
     let rc = unsafe {
-        let ts = capi::PyEval_SaveThread();
+        let ts = crate::gil::save();
         let rc = (lib().sqlite3_deserialize.unwrap())(
             c.db,
             name.as_ptr(),
@@ -830,7 +830,7 @@ fn m_deserialize(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyR
             size as i64,
             SQLITE_DESERIALIZE_FREEONCLOSE | SQLITE_DESERIALIZE_RESIZEABLE,
         );
-        capi::PyEval_RestoreThread(ts);
+        crate::gil::restore(ts);
         rc
     };
     if rc != SQLITE_OK {

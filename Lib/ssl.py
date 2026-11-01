@@ -26,7 +26,7 @@ from _ssl import RAND_status, RAND_add, RAND_bytes
 from _ssl import (HAS_SNI, HAS_ECDH, HAS_NPN, HAS_ALPN,
                   HAS_NEVER_CHECK_COMMON_NAME, HAS_SSLv2, HAS_SSLv3,
                   HAS_TLSv1, HAS_TLSv1_1, HAS_TLSv1_2, HAS_TLSv1_3,
-                  HAS_PSK, HAS_PHA)
+                  HAS_PSK, HAS_PSK_TLS13, HAS_PHA)
 from _ssl import _DEFAULT_CIPHERS, _OPENSSL_API_VERSION
 
 import socket as _socket
@@ -526,6 +526,15 @@ class SSLObject(_ChainMixin):
     @classmethod
     def _create(cls, incoming, outgoing, server_side=False,
                 server_hostname=None, session=None, context=None):
+        if server_side:
+            if server_hostname:
+                raise ValueError("server_hostname can only be specified "
+                                 "in client mode")
+            if session is not None:
+                raise ValueError("session can only be specified in "
+                                 "client mode")
+        if context.check_hostname and not server_hostname:
+            raise ValueError("check_hostname requires server_hostname")
         obj = cls.__new__(cls)
         obj._sslobj = context._wrap_bio(
             incoming, outgoing, server_side=server_side,
@@ -584,6 +593,10 @@ class SSLObject(_ChainMixin):
     def compression(self):
         """Compression in use (always None with OpenSSL 3 defaults)."""
         return self._sslobj.compression()
+
+    def group(self):
+        """Name of the negotiated key exchange group, or None."""
+        return self._sslobj.group()
 
     def pending(self):
         """Number of decrypted bytes ready to be read."""
@@ -791,6 +804,9 @@ class SSLSocket(_ChainMixin, socket):
 
     def version(self):
         return None if self._sslobj is None else self._sslobj.version()
+
+    def group(self):
+        return None if self._sslobj is None else self._sslobj.group()
 
     def pending(self):
         return 0 if self._sslobj is None else self._sslobj.pending()

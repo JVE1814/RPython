@@ -87,9 +87,9 @@ pub fn reset_statement(s: &PyObject) {
     if stmt.in_use && !stmt.st.is_null() {
         let st = stmt.st;
         unsafe {
-            let ts = capi::PyEval_SaveThread();
+            let ts = crate::gil::save();
             (lib().sqlite3_reset.unwrap())(st);
-            capi::PyEval_RestoreThread(ts);
+            crate::gil::restore(ts);
         }
     }
     stmt.in_use = false;
@@ -97,9 +97,9 @@ pub fn reset_statement(s: &PyObject) {
 
 fn step(st: *mut Stmt) -> c_int {
     unsafe {
-        let ts = capi::PyEval_SaveThread();
+        let ts = crate::gil::save();
         let rc = (lib().sqlite3_step.unwrap())(st);
-        capi::PyEval_RestoreThread(ts);
+        crate::gil::restore(ts);
         rc
     }
 }
@@ -473,9 +473,9 @@ pub fn executescript_impl(o: &PyObject, script: &PyObject) -> PyResult<()> {
             let mut st: *mut Stmt = std::ptr::null_mut();
             let mut tail: *const std::ffi::c_char = std::ptr::null();
             let rc = unsafe {
-                let ts = capi::PyEval_SaveThread();
+                let ts = crate::gil::save();
                 let rc = (lib().sqlite3_prepare_v2.unwrap())(db, p, -1, &mut st, &mut tail);
-                capi::PyEval_RestoreThread(ts);
+                crate::gil::restore(ts);
                 rc
             };
             if rc != SQLITE_OK {

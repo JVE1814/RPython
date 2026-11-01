@@ -14,6 +14,7 @@ macro_rules! cs {
 pub mod capi;
 pub mod ctypes;
 pub mod dl;
+pub mod gil;
 pub mod sqlite;
 pub mod ssl;
 

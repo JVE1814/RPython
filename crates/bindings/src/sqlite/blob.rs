@@ -47,9 +47,9 @@ pub fn close_blob(o: &PyObject) {
         let p = b.blob;
         b.blob = std::ptr::null_mut();
         unsafe {
-            let ts = capi::PyEval_SaveThread();
+            let ts = crate::gil::save();
             (lib().sqlite3_blob_close.unwrap())(p);
-            capi::PyEval_RestoreThread(ts);
+            crate::gil::restore(ts);
         }
     }
 }
@@ -81,9 +81,9 @@ fn read_at(b: &BlobObj, offset: i64, n: i64) -> PyResult<Vec<u8>> {
     }
     let blob = b.blob;
     let rc = unsafe {
-        let ts = capi::PyEval_SaveThread();
+        let ts = crate::gil::save();
         let rc = (lib().sqlite3_blob_read.unwrap())(blob, buf.as_mut_ptr() as *mut c_void, n as c_int, offset as c_int);
-        capi::PyEval_RestoreThread(ts);
+        crate::gil::restore(ts);
         rc
     };
     if rc != SQLITE_OK {
@@ -98,9 +98,9 @@ fn write_at(b: &BlobObj, offset: i64, data: &[u8]) -> PyResult<()> {
     }
     let blob = b.blob;
     let rc = unsafe {
-        let ts = capi::PyEval_SaveThread();
+        let ts = crate::gil::save();
         let rc = (lib().sqlite3_blob_write.unwrap())(blob, data.as_ptr() as *const c_void, data.len() as c_int, offset as c_int);
-        capi::PyEval_RestoreThread(ts);
+        crate::gil::restore(ts);
         rc
     };
     if rc != SQLITE_OK {
@@ -141,9 +141,9 @@ pub fn blobopen(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRe
     let mut blob: *mut Blob = std::ptr::null_mut();
     let db = c.db;
     let rc = unsafe {
-        let ts = capi::PyEval_SaveThread();
+        let ts = crate::gil::save();
         let rc = (lib().sqlite3_blob_open.unwrap())(db, name.as_ptr(), table.as_ptr(), column.as_ptr(), row, (!readonly) as c_int, &mut blob);
-        capi::PyEval_RestoreThread(ts);
+        crate::gil::restore(ts);
         rc
     };
     if rc != SQLITE_OK {

@@ -216,7 +216,7 @@ crate::dyn_lib!(LibSsl, ["libssl.so.3", "libssl.so"], {
     fn SSL_SESSION_get_ticket_lifetime_hint(s: P) -> c_ulong;
     fn SSL_SESSION_is_resumable(s: P) -> c_int;
     fn SSL_select_next_proto(out: *mut *mut c_uchar, outlen: *mut c_uchar, srv: *const c_uchar, srvlen: c_uint, cli: *const c_uchar, clilen: c_uint) -> c_int;
-    fn SSL_CTX_set1_groups_list_dummy() -> c_int;
+    fn SSL_group_to_name(s: P, id: c_int) -> *const c_char;
 });
 
 pub fn crypto() -> &'static LibCrypto {
