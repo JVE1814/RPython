@@ -158,7 +158,7 @@ def get_original_bases(cls, /):
         ) from None
 
 
-class DynamicClassAttribute(property):
+class DynamicClassAttribute:
     """Route attribute access on a class to __getattr__.
 
     Instance access works like a property; access through the class raises
