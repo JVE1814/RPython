@@ -49,6 +49,11 @@
 - site.py is imported at start-up unless -S; if that import fails the error is only reported with -v
   (CPython would abort) so a partially available stdlib stays usable.
 - Monitoring/settrace offsets are `lasti * 4` (consistent with `frame.f_lasti`).
+- Fixed a dict bug in `types/dict.rs::remove_at` (owned by the core workstream): trimming trailing
+  holes let insert/delete cycles fill the index table with DUMMY markers, so looking up a missing key
+  never terminated (hash-seed dependent hangs in importlib). Holes are now kept until a rebuild;
+  `pop_last` (popitem) scans past holes, which makes repeated popitem O(n) per call — the dict owner
+  may want a dummy counter instead.
 - Fixed a type-system bug in `types/slots.rs::add_operators`: heap types with multiple bases got
   slot wrappers for slots inherited from non-primary bases (infinite recursion, e.g. `__init__`).
 
