@@ -617,7 +617,9 @@ fn sys_getsizeof(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> Py
             if n < 0 {
                 raise!(ValueError, "__sizeof__() should return >= 0");
             }
-            let extra = if crate::alloc::type_is_gc(o.type_ptr()) { crate::alloc::GC_HEAD as i64 } else { 0 };
+            // like the free-threaded build: no GC header is reported (ours is internal),
+            // only the managed __dict__/__weakref__ pre-header
+            let extra = if unsafe { (*o.type_ptr()).tp_flags } & crate::ffi::Py_TPFLAGS_PREHEADER != 0 { crate::alloc::MANAGED as i64 } else { 0 };
             Ok(int::new_int(n + extra))
         }
         Ok(None) => match default {

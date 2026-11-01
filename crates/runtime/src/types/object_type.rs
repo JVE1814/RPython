@@ -996,7 +996,9 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
     if winner != meta {
         unsafe {
             if (*winner).tp_new != Some(type_new_slot) {
-                let f = (*winner).tp_new.unwrap();
+                let Some(f) = (*winner).tp_new else {
+                    raise!(TypeError, "cannot create '{}' instances", type_name(&*winner));
+                };
                 let kwp = kw.map_or(std::ptr::null_mut(), |k| k.as_ptr());
                 return from_c(f(winner, args.as_ptr(), kwp));
             }

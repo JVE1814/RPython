@@ -334,7 +334,14 @@ fn b_vars(_m: &PyObject, args: &[&PyObject]) -> PyResult {
 fn b_dir(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     args::check_pos("dir", args, 0, 1)?;
     if args.is_empty() {
-        let l = list::new_list(dict::keys_vec(&*b_locals(_m)?));
+        let loc = b_locals(_m)?;
+        // locals may be any mapping (exec/eval with a custom locals object)
+        let l = if dict::is_dict_exact(&loc) {
+            list::new_list(dict::keys_vec(&loc))
+        } else {
+            let keys = ab::call_method_str(&loc, "keys", &[])?;
+            list::new_list(ab::collect_iterable(&keys)?)
+        };
         crate::types::list_methods::sort_list(&l, None, false)?;
         return Ok(l);
     }
