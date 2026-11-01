@@ -441,7 +441,11 @@ fn s_setstate(o: &PyObject, st: &PyObject) -> PyResult {
     if !tuple::is_tuple(st) || tuple::tuple_len(st) < 4 {
         raise!(TypeError, "{}.__setstate__ argument should be 4-tuple, got {}", crate::types::typeobject::type_name(o.ty()), tname(st));
     }
-    state(o)?;
+    // like __init__, this may run on an object created by __new__ alone
+    // (unpickling), so an uninitialized object is fine here
+    if sio(o).closed {
+        raise!(ValueError, "I/O operation on closed file");
+    }
     let items = tuple::tuple_items(st);
     let value = items[0];
     if !pystr::is_str(value) {
@@ -464,7 +468,9 @@ fn s_setstate(o: &PyObject, st: &PyObject) -> PyResult {
     new.buf = str_cps(value);
     new.pos = pos as usize;
     let s = sio(o);
-    unsafe { drop(Box::from_raw(s.st)) };
+    if !s.st.is_null() {
+        unsafe { drop(Box::from_raw(s.st)) };
+    }
     s.st = Box::into_raw(Box::new(new));
     if dict::is_dict(d) {
         if let Some(own) = crate::types::typeobject::instance_dict(o) {

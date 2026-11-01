@@ -329,8 +329,26 @@ pub fn parse_mod(src: Source, o: &Opts) -> PyResult<(rpy_parser::ast::Mod, Strin
     }
     match out.result {
         Ok(m) => Ok((m, text.into_owned())),
-        Err(e) => Err(parse_error(&e, o.filename)),
+        Err(e) => {
+            let err = parse_error(&e, o.filename);
+            attach_source_metadata(&text);
+            Err(err)
+        }
     }
+}
+
+/// Give the pending SyntaxError the whole source as `_metadata` (start line,
+/// offset, source), which the traceback module uses to look for misspelt
+/// keywords even when the source is not in a file (e.g. `-c`).
+fn attach_source_metadata(text: &str) {
+    let Some(exc) = take_exc() else { return };
+    if crate::types::typeobject::isinstance_exact_or_sub(&exc, crate::types::exceptions::SyntaxError()) {
+        let meta = tuple::new_tuple(vec![int::new_int(0), int::new_int(0), pystr::new_str(text)]);
+        if crate::abstract_::setattr(&exc, &pystr::new_str("_metadata"), &meta).is_err() {
+            clear_exc();
+        }
+    }
+    set_exc(exc);
 }
 
 /// Full pipeline: source -> code object.

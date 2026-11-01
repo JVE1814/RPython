@@ -1,4 +1,4 @@
-"""Running tests"""
+"""Text-based test runner and its result class."""
 
 import sys
 import time
@@ -14,32 +14,36 @@ __unittest = True
 
 
 class _WritelnDecorator(object):
-    """Used to decorate file-like objects with a handy 'writeln' method"""
+    """Wraps a stream, adding writeln()."""
+
     def __init__(self, stream):
         self.stream = stream
 
     def __getattr__(self, attr):
         if attr in ('stream', '__getstate__'):
+            # not delegated: keeps pickling/copying from recursing
             raise AttributeError(attr)
         return getattr(self.stream, attr)
 
     def writeln(self, arg=None):
         if arg:
             self.write(arg)
-        self.write('\n')  # text-mode streams translate to \r\n if needed
+        self.write('\n')
 
 
 class TextTestResult(result.TestResult):
-    """A test result class that can print formatted text results to a stream.
+    """A test result that reports progress to a stream: one character per
+    test (verbosity 1) or one line per test (verbosity 2 and up).
 
     Used by TextTestRunner.
     """
+
     separator1 = '=' * 70
     separator2 = '-' * 70
 
     def __init__(self, stream, descriptions, verbosity, *, durations=None):
-        """Construct a TextTestResult. Subclasses should accept **kwargs
-        to ensure compatibility as the interface changes."""
+        """*stream* receives the progress output; *descriptions* adds the
+        first docstring line to test names."""
         super(TextTestResult, self).__init__(stream, descriptions, verbosity)
         self.stream = stream
         self.showAll = verbosity > 1
@@ -50,150 +54,118 @@ class TextTestResult(result.TestResult):
         self.durations = durations
 
     def getDescription(self, test):
-        doc_first_line = test.shortDescription()
-        if self.descriptions and doc_first_line:
-            return '\n'.join((str(test), doc_first_line))
-        else:
-            return str(test)
+        first_line = test.shortDescription()
+        if self.descriptions and first_line:
+            return '\n'.join((str(test), first_line))
+        return str(test)
 
     def startTest(self, test):
         super(TextTestResult, self).startTest(test)
         if self.showAll:
             self.stream.write(self.getDescription(test))
-            self.stream.write(" ... ")
+            self.stream.write(' ... ')
             self.stream.flush()
             self._newline = False
 
     def _write_status(self, test, status):
-        is_subtest = isinstance(test, _SubTest)
-        if is_subtest or self._newline:
+        # Subtest outcomes get their own indented line; a test whose line
+        # has already been completed (e.g. by a subtest) is described again.
+        subtest = isinstance(test, _SubTest)
+        if subtest or self._newline:
             if not self._newline:
                 self.stream.writeln()
-            if is_subtest:
-                self.stream.write("  ")
+            if subtest:
+                self.stream.write('  ')
             self.stream.write(self.getDescription(test))
-            self.stream.write(" ... ")
+            self.stream.write(' ... ')
         self.stream.writeln(status)
         self.stream.flush()
         self._newline = True
 
+    def _report(self, test, word, letter, color):
+        theme = self._theme
+        if self.showAll:
+            self._write_status(test, f'{color}{word}{theme.reset}')
+        elif self.dots:
+            self.stream.write(f'{color}{letter}{theme.reset}')
+            self.stream.flush()
+
     def addSubTest(self, test, subtest, err):
         if err is not None:
-            t = self._theme
-            if self.showAll:
-                if issubclass(err[0], subtest.failureException):
-                    self._write_status(subtest, f"{t.fail}FAIL{t.reset}")
-                else:
-                    self._write_status(subtest, f"{t.fail}ERROR{t.reset}")
-            elif self.dots:
-                if issubclass(err[0], subtest.failureException):
-                    self.stream.write(f"{t.fail}F{t.reset}")
-                else:
-                    self.stream.write(f"{t.fail}E{t.reset}")
-                self.stream.flush()
+            if issubclass(err[0], subtest.failureException):
+                self._report(subtest, 'FAIL', 'F', self._theme.fail)
+            else:
+                self._report(subtest, 'ERROR', 'E', self._theme.fail)
         super(TextTestResult, self).addSubTest(test, subtest, err)
 
     def addSuccess(self, test):
         super(TextTestResult, self).addSuccess(test)
-        t = self._theme
-        if self.showAll:
-            self._write_status(test, f"{t.passed}ok{t.reset}")
-        elif self.dots:
-            self.stream.write(f"{t.passed}.{t.reset}")
-            self.stream.flush()
+        self._report(test, 'ok', '.', self._theme.passed)
 
     def addError(self, test, err):
         super(TextTestResult, self).addError(test, err)
-        t = self._theme
-        if self.showAll:
-            self._write_status(test, f"{t.fail}ERROR{t.reset}")
-        elif self.dots:
-            self.stream.write(f"{t.fail}E{t.reset}")
-            self.stream.flush()
+        self._report(test, 'ERROR', 'E', self._theme.fail)
 
     def addFailure(self, test, err):
         super(TextTestResult, self).addFailure(test, err)
-        t = self._theme
-        if self.showAll:
-            self._write_status(test, f"{t.fail}FAIL{t.reset}")
-        elif self.dots:
-            self.stream.write(f"{t.fail}F{t.reset}")
-            self.stream.flush()
+        self._report(test, 'FAIL', 'F', self._theme.fail)
 
     def addSkip(self, test, reason):
         super(TextTestResult, self).addSkip(test, reason)
-        t = self._theme
+        theme = self._theme
         if self.showAll:
-            self._write_status(test, f"{t.warn}skipped{t.reset} {reason!r}")
+            self._write_status(test, f'{theme.warn}skipped{theme.reset} '
+                                     f'{reason!r}')
         elif self.dots:
-            self.stream.write(f"{t.warn}s{t.reset}")
+            self.stream.write(f'{theme.warn}s{theme.reset}')
             self.stream.flush()
 
     def addExpectedFailure(self, test, err):
         super(TextTestResult, self).addExpectedFailure(test, err)
-        t = self._theme
-        if self.showAll:
-            self.stream.writeln(f"{t.warn}expected failure{t.reset}")
-            self.stream.flush()
-        elif self.dots:
-            self.stream.write(f"{t.warn}x{t.reset}")
-            self.stream.flush()
+        self._report(test, 'expected failure', 'x', self._theme.warn)
 
     def addUnexpectedSuccess(self, test):
         super(TextTestResult, self).addUnexpectedSuccess(test)
-        t = self._theme
-        if self.showAll:
-            self.stream.writeln(f"{t.fail}unexpected success{t.reset}")
-            self.stream.flush()
-        elif self.dots:
-            self.stream.write(f"{t.fail}u{t.reset}")
-            self.stream.flush()
+        self._report(test, 'unexpected success', 'u', self._theme.fail)
 
     def printErrors(self):
-        t = self._theme
+        theme = self._theme
         if self.dots or self.showAll:
             self.stream.writeln()
             self.stream.flush()
-        self.printErrorList(f"{t.fail}ERROR{t.reset}", self.errors)
-        self.printErrorList(f"{t.fail}FAIL{t.reset}", self.failures)
-        unexpectedSuccesses = getattr(self, "unexpectedSuccesses", ())
-        if unexpectedSuccesses:
+        self.printErrorList(f'{theme.fail}ERROR{theme.reset}', self.errors)
+        self.printErrorList(f'{theme.fail}FAIL{theme.reset}', self.failures)
+        unexpected = getattr(self, 'unexpectedSuccesses', ())
+        if unexpected:
             self.stream.writeln(self.separator1)
-            for test in unexpectedSuccesses:
+            for test in unexpected:
                 self.stream.writeln(
-                    f"{t.fail}UNEXPECTED SUCCESS{t.fail_info}: "
-                    f"{self.getDescription(test)}{t.reset}"
-                )
+                    f'{theme.fail}UNEXPECTED SUCCESS{theme.fail_info}: '
+                    f'{self.getDescription(test)}{theme.reset}')
             self.stream.flush()
 
     def printErrorList(self, flavour, errors):
-        t = self._theme
+        theme = self._theme
         for test, err in errors:
             self.stream.writeln(self.separator1)
-            self.stream.writeln(
-                f"{flavour}{t.fail_info}: {self.getDescription(test)}{t.reset}"
-            )
+            self.stream.writeln(f'{flavour}{theme.fail_info}: '
+                                f'{self.getDescription(test)}{theme.reset}')
             self.stream.writeln(self.separator2)
-            self.stream.writeln("%s" % err)
+            self.stream.writeln('%s' % err)
             self.stream.flush()
 
 
 class TextTestRunner(object):
-    """A test runner class that displays results in textual form.
+    """Runs tests and reports the results to a stream (default stderr):
+    progress while running, then the errors and a summary."""
 
-    It prints out the names of tests as they are run, errors as they
-    occur, and a summary of the results at the end of the test run.
-    """
     resultclass = TextTestResult
 
     def __init__(self, stream=None, descriptions=True, verbosity=1,
-                 failfast=False, buffer=False, resultclass=None, warnings=None,
-                 *, tb_locals=False, durations=None):
-        """Construct a TextTestRunner.
-
-        Subclasses should accept **kwargs to ensure compatibility as the
-        interface changes.
-        """
+                 failfast=False, buffer=False, resultclass=None,
+                 warnings=None, *, tb_locals=False, durations=None):
+        """The options are copied onto the result object at run time
+        (failfast, buffer, tb_locals) or used for reporting."""
         if stream is None:
             stream = sys.stderr
         self.stream = _WritelnDecorator(stream)
@@ -212,34 +184,34 @@ class TextTestRunner(object):
             return self.resultclass(self.stream, self.descriptions,
                                     self.verbosity, durations=self.durations)
         except TypeError:
-            # didn't accept the durations argument
+            # a result class that does not know about durations
             return self.resultclass(self.stream, self.descriptions,
                                     self.verbosity)
 
     def _printDurations(self, result):
         if not result.collectedDurations:
             return
-        ls = sorted(result.collectedDurations, key=lambda x: x[1],
-                    reverse=True)
+        slowest = sorted(result.collectedDurations, key=lambda item: item[1],
+                         reverse=True)
         if self.durations > 0:
-            ls = ls[:self.durations]
-        self.stream.writeln("Slowest test durations")
+            slowest = slowest[:self.durations]
+        self.stream.writeln('Slowest test durations')
         if hasattr(result, 'separator2'):
             self.stream.writeln(result.separator2)
         hidden = False
-        for test, elapsed in ls:
+        for test, elapsed in slowest:
             if self.verbosity < 2 and elapsed < 0.001:
                 hidden = True
                 continue
-            self.stream.writeln("%-10s %s" % ("%.3fs" % elapsed, test))
+            self.stream.writeln('%-10s %s' % ('%.3fs' % elapsed, test))
         if hidden:
-            self.stream.writeln("\n(durations < 0.001s were hidden; "
-                                "use -v to show these durations)")
+            self.stream.writeln('\n(durations < 0.001s were hidden; use -v '
+                                'to show these durations)')
         else:
-            self.stream.writeln("")
+            self.stream.writeln('')
 
     def run(self, test):
-        "Run the given test case or test suite."
+        """Run *test* (a case or suite) and report on the stream."""
         result = self._makeResult()
         registerResult(result)
         result.failfast = self.failfast
@@ -247,67 +219,64 @@ class TextTestRunner(object):
         result.tb_locals = self.tb_locals
         with warnings.catch_warnings():
             if self.warnings:
-                # if self.warnings is set, use it to filter all the warnings
+                # an explicit warnings action applies to everything
                 warnings.simplefilter(self.warnings)
-            start_time = time.perf_counter()
-            startTestRun = getattr(result, 'startTestRun', None)
-            if startTestRun is not None:
-                startTestRun()
+            started = time.perf_counter()
+            start_run = getattr(result, 'startTestRun', None)
+            if start_run is not None:
+                start_run()
             try:
                 test(result)
             finally:
-                stopTestRun = getattr(result, 'stopTestRun', None)
-                if stopTestRun is not None:
-                    stopTestRun()
-            stop_time = time.perf_counter()
-        time_taken = stop_time - start_time
+                stop_run = getattr(result, 'stopTestRun', None)
+                if stop_run is not None:
+                    stop_run()
+            elapsed = time.perf_counter() - started
+
         result.printErrors()
         if self.durations is not None:
             self._printDurations(result)
-
         if hasattr(result, 'separator2'):
             self.stream.writeln(result.separator2)
-
         run = result.testsRun
-        self.stream.writeln("Ran %d test%s in %.3fs" %
-                            (run, run != 1 and "s" or "", time_taken))
+        self.stream.writeln('Ran %d test%s in %.3fs' %
+                            (run, 's' if run != 1 else '', elapsed))
         self.stream.writeln()
-
-        expected_fails = unexpected_successes = skipped = 0
-        try:
-            results = map(len, (result.expectedFailures,
-                                result.unexpectedSuccesses,
-                                result.skipped))
-        except AttributeError:
-            pass
-        else:
-            expected_fails, unexpected_successes, skipped = results
-
-        infos = []
-        t = get_theme(tty_file=self.stream).unittest
-
-        if not result.wasSuccessful():
-            self.stream.write(f"{t.fail_info}FAILED{t.reset}")
-            failed, errored = len(result.failures), len(result.errors)
-            if failed:
-                infos.append(f"{t.fail_info}failures={failed}{t.reset}")
-            if errored:
-                infos.append(f"{t.fail_info}errors={errored}{t.reset}")
-        elif run == 0 and not skipped:
-            self.stream.write(f"{t.warn}NO TESTS RAN{t.reset}")
-        else:
-            self.stream.write(f"{t.passed}OK{t.reset}")
-        if skipped:
-            infos.append(f"{t.warn}skipped={skipped}{t.reset}")
-        if expected_fails:
-            infos.append(f"{t.warn}expected failures={expected_fails}{t.reset}")
-        if unexpected_successes:
-            infos.append(
-                f"{t.fail}unexpected successes={unexpected_successes}{t.reset}"
-            )
-        if infos:
-            self.stream.writeln(" (%s)" % (", ".join(infos),))
-        else:
-            self.stream.write("\n")
+        self._write_summary(result, run)
         self.stream.flush()
         return result
+
+    def _write_summary(self, result, run):
+        try:
+            expected_fails = len(result.expectedFailures)
+            unexpected = len(result.unexpectedSuccesses)
+            skipped = len(result.skipped)
+        except AttributeError:
+            expected_fails = unexpected = skipped = 0
+        theme = get_theme(tty_file=self.stream).unittest
+        details = []
+        if not result.wasSuccessful():
+            self.stream.write(f'{theme.fail_info}FAILED{theme.reset}')
+            failed, errored = len(result.failures), len(result.errors)
+            if failed:
+                details.append(f'{theme.fail_info}failures={failed}'
+                               f'{theme.reset}')
+            if errored:
+                details.append(f'{theme.fail_info}errors={errored}'
+                               f'{theme.reset}')
+        elif run == 0 and not skipped:
+            self.stream.write(f'{theme.warn}NO TESTS RAN{theme.reset}')
+        else:
+            self.stream.write(f'{theme.passed}OK{theme.reset}')
+        if skipped:
+            details.append(f'{theme.warn}skipped={skipped}{theme.reset}')
+        if expected_fails:
+            details.append(f'{theme.warn}expected failures={expected_fails}'
+                           f'{theme.reset}')
+        if unexpected:
+            details.append(f'{theme.fail}unexpected successes={unexpected}'
+                           f'{theme.reset}')
+        if details:
+            self.stream.writeln(' (%s)' % (', '.join(details),))
+        else:
+            self.stream.write('\n')
