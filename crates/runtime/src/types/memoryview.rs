@@ -1651,9 +1651,7 @@ fn m_from_flags(_cls: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> P
 }
 
 fn m_class_getitem(cls: &PyObject, arg: &PyObject) -> PyResult {
-    let types = crate::import::import_absolute("types")?;
-    let ga = ab::getattr_str(&types, "GenericAlias")?;
-    ab::call(&ga, &[cls, arg])
+    crate::types::genericalias::new_generic_alias(cls, arg)
 }
 
 // ====================================================================== attributes
