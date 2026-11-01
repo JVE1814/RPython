@@ -1086,8 +1086,11 @@ impl<'a> Gen<'a> {
             op,
             Add | InplaceAdd | Subtract | InplaceSubtract | Multiply | InplaceMultiply | And | InplaceAnd | Or | InplaceOr | Xor | InplaceXor
         );
-        let float_ok = matches!(op, Add | InplaceAdd | Subtract | InplaceSubtract | Multiply | InplaceMultiply);
-        if !int_ok {
+        let float_ok = matches!(
+            op,
+            Add | InplaceAdd | Subtract | InplaceSubtract | Multiply | InplaceMultiply | TrueDivide | InplaceTrueDivide
+        );
+        if !int_ok && !float_ok {
             self.helper_sp(ins, d, addr!(h::h_binary_op), Some(ins.arg as i64), None, d - 2);
             return Ok(());
         }
@@ -1098,32 +1101,59 @@ impl<'a> Gen<'a> {
         let done = self.a.label();
         self.a.load(Rax, ma);
         self.a.load(Rcx, mb);
-        self.compact_int(Rax, Rdi, Rdx, not_int);
-        self.compact_int(Rcx, Rsi, Rdx, slow);
-        match op {
-            Add | InplaceAdd => self.a.add_rr(Rdi, Rsi),
-            Subtract | InplaceSubtract => self.a.sub_rr(Rdi, Rsi),
-            Multiply | InplaceMultiply => self.a.imul_rr(Rdi, Rsi),
-            And | InplaceAnd => self.a.and_rr(Rdi, Rsi),
-            Or | InplaceOr => self.a.or_rr(Rdi, Rsi),
-            _ => self.a.xor_rr(Rdi, Rsi),
+        if int_ok {
+            self.compact_int(Rax, Rdi, Rdx, not_int);
+            self.compact_int(Rcx, Rsi, Rdx, not_int);
+            match op {
+                Add | InplaceAdd => self.a.add_rr(Rdi, Rsi),
+                Subtract | InplaceSubtract => self.a.sub_rr(Rdi, Rsi),
+                Multiply | InplaceMultiply => self.a.imul_rr(Rdi, Rsi),
+                And | InplaceAnd => self.a.and_rr(Rdi, Rsi),
+                Or | InplaceOr => self.a.or_rr(Rdi, Rsi),
+                _ => self.a.xor_rr(Rdi, Rsi),
+            }
+            self.a.call_label(self.rt_box_int);
+            self.a.jmp(have_result);
         }
-        self.a.call_label(self.rt_box_int);
-        self.a.jmp(have_result);
         self.a.bind(not_int);
         if float_ok {
+            // operands: exact float, or compact int converted exactly (|v| < 2**30);
+            // int x int only for true division (the int path handled the rest)
             let ft = crate::types::float::float_type() as i64;
-            self.a.mov_ri(Rdx, ft);
-            self.a.cmp_rm(Rdx, M(Rax, OB_TYPE));
-            self.a.jcc(Cc::NE, slow);
-            self.a.cmp_rm(Rdx, M(Rcx, OB_TYPE));
-            self.a.jcc(Cc::NE, slow);
-            self.a.movsd_load(XMM0, M(Rax, FVAL));
-            self.a.movsd_load(XMM1, M(Rcx, FVAL));
+            let both_int = self.a.label();
+            self.a.mov_ri(R8, 0);
+            for (obj, x) in [(Rax, XMM0), (Rcx, XMM1)] {
+                let is_float = self.a.label();
+                let next = self.a.label();
+                self.a.mov_ri(Rdx, ft);
+                self.a.cmp_rm(Rdx, M(obj, OB_TYPE));
+                self.a.jcc(Cc::E, is_float);
+                self.compact_int(obj, Rdi, Rdx, slow);
+                self.a.cvtsi2sd(x, Rdi);
+                self.a.jmp(next);
+                self.a.bind(is_float);
+                self.a.movsd_load(x, M(obj, FVAL));
+                self.a.mov_ri(R8, 1);
+                self.a.bind(next);
+            }
+            if !matches!(op, TrueDivide | InplaceTrueDivide) {
+                // int x int with these ops is the int path's business (it overflowed
+                // its checks, e.g. not compact): only mixed/float operands here
+                self.a.test_rr(R8, R8);
+                self.a.jcc(Cc::E, slow);
+            }
+            let _ = both_int;
             match op {
                 Add | InplaceAdd => self.a.addsd(XMM0, XMM1),
                 Subtract | InplaceSubtract => self.a.subsd(XMM0, XMM1),
-                _ => self.a.mulsd(XMM0, XMM1),
+                Multiply | InplaceMultiply => self.a.mulsd(XMM0, XMM1),
+                _ => {
+                    // division by zero raises: leave to the helper
+                    self.a.xorpd(XMM2, XMM2);
+                    self.a.ucomisd(XMM1, XMM2);
+                    self.a.jcc(Cc::E, slow); // also taken for NaN (ZF=1): helper handles it
+                    self.a.divsd(XMM0, XMM1);
+                }
             }
             self.a.call_label(self.rt_box_float);
             self.a.jmp(have_result);

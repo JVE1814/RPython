@@ -93,3 +93,19 @@ def fcmp(vals):
 for _ in range(120):
     r = fcmp([1.5, float('nan'), -0.0, 0.0, float('inf'), 3, -2, 2 ** 70])
 print(r)
+
+def mixed(vals):
+    out = []
+    for a in vals:
+        for b in vals:
+            try:
+                out.append((a + b, a - b, a * b, a / b))
+            except ZeroDivisionError as e:
+                out.append(str(e))
+            except TypeError as e:
+                out.append('TE')
+    return out
+
+for _ in range(120):
+    r = mixed([0, 1, -7, 3.5, 0.0, -0.0, float('nan'), float('inf'), 2 ** 31, 2 ** 70, True, 1 << 29])
+print(r)
