@@ -681,77 +681,85 @@ pub unsafe extern "C" fn PyMember_SetOne(obj: *mut c_char, m: *mut PyMemberDef, 
 }
 
 // ---------------------------------------------------------------- weak references
+// Backed by types::weakref. A NULL argument is a SystemError; any other
+// non-weakref argument is a TypeError (PyWeakref_GetObject: SystemError).
 
-unsafe fn weakref_mod() -> PyResult {
-    crate::import::import_absolute("_weakref")
-}
+use crate::types::weakref as wref;
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyWeakref_NewRef(o: *mut PyObject, cb: *mut PyObject) -> *mut PyObject {
     unsafe {
-        ret((|| -> PyResult {
-            let w = weakref_mod()?;
-            let r = ab::getattr_str(&w, "ref")?;
-            match opt(cb) {
-                Some(c) if !none::is_none(c) => ab::call(&r, &[&*o, c]),
-                _ => ab::call(&r, &[&*o]),
-            }
-        })())
+        match nn(o) {
+            Ok(o) => ret(wref::new_ref(wref::ref_type(), o, opt(cb))),
+            Err(_) => std::ptr::null_mut(),
+        }
     }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyWeakref_NewProxy(o: *mut PyObject, cb: *mut PyObject) -> *mut PyObject {
     unsafe {
-        ret((|| -> PyResult {
-            let w = weakref_mod()?;
-            let r = ab::getattr_str(&w, "proxy")?;
-            match opt(cb) {
-                Some(c) if !none::is_none(c) => ab::call(&r, &[&*o, c]),
-                _ => ab::call(&r, &[&*o]),
-            }
-        })())
+        match nn(o) {
+            Ok(o) => ret(wref::new_proxy(o, opt(cb))),
+            Err(_) => std::ptr::null_mut(),
+        }
     }
 }
-unsafe fn is_weakref(o: &PyObject) -> bool {
+/// The weakref behind `r`, or an error (SystemError for NULL, TypeError otherwise).
+unsafe fn weakref_arg<'a>(r: *mut PyObject) -> PyResult<&'a PyObject> {
     unsafe {
-        match weakref_mod().and_then(|w| ab::getattr_str(&w, "ReferenceType")) {
-            Ok(t) => to::is_type(&t) && to::is_subtype(o.type_ptr(), to::as_type(&t)),
-            Err(_) => {
-                clear_exc();
-                false
-            }
+        let r = nn(r)?;
+        if !wref::is_weakref(r) {
+            return Err(type_error(&format!("expected a weakref, got {}", tname(r))));
         }
+        Ok(r)
     }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyWeakref_GetRef(r: *mut PyObject, out: *mut *mut PyObject) -> c_int {
     unsafe {
         *out = std::ptr::null_mut();
-        if r.is_null() || !is_weakref(&*r) {
-            let _ = type_error("expected a weakref");
-            return -1;
-        }
-        match ab::call(&*r, &[]) {
-            Ok(v) if none::is_none(&v) => 0,
-            Ok(v) => {
+        let Ok(r) = weakref_arg(r) else { return -1 };
+        match wref::get_object(r) {
+            Some(v) => {
                 *out = v.into_raw();
                 1
             }
-            Err(_) => -1,
+            None => 0,
         }
     }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyWeakref_IsDead(r: *mut PyObject) -> c_int {
     unsafe {
-        if r.is_null() || !is_weakref(&*r) {
-            let _ = type_error(&format!("expected a weakref, got {}", if r.is_null() { "NULL".into() } else { tname(&*r) }));
-            return -1;
-        }
-        match ab::call(&*r, &[]) {
-            Ok(v) => none::is_none(&v) as c_int,
+        match weakref_arg(r) {
+            Ok(r) => wref::is_dead(r) as c_int,
             Err(_) => -1,
         }
     }
+}
+/// For the deprecated borrowed-reference getter (compat.rs).
+pub(crate) unsafe fn weakref_get_borrowed(r: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        if r.is_null() || !wref::is_weakref(&*r) {
+            return null_arg_or_bad_internal(r);
+        }
+        match wref::get_object(&*r) {
+            // the referent is kept alive by its other references (legacy API contract)
+            Some(v) => {
+                let p = v.as_ptr();
+                drop(v);
+                p
+            }
+            None => none::none().as_ptr(),
+        }
+    }
+}
+unsafe fn null_arg_or_bad_internal(r: *mut PyObject) -> *mut PyObject {
+    if r.is_null() {
+        return null_arg();
+    }
+    let _ = bad_internal();
+    std::ptr::null_mut()
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _PyWeakref_ClearRef(_r: *mut PyObject) {}
@@ -838,22 +846,6 @@ pub unsafe extern "C" fn Py_GenericAlias(origin: *mut PyObject, args: *mut PyObj
             let types = crate::import::import_absolute("types")?;
             let ga = ab::getattr_str(&types, "GenericAlias")?;
             ab::call(&ga, &[&*origin, &*args])
-        })())
-    }
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PySentinel_New(name: *const c_char, module: *const c_char) -> *mut PyObject {
-    unsafe {
-        ret((|| -> PyResult {
-            let b = crate::builtins::builtins_module();
-            let s = ab::getattr_str(&b, "sentinel")?;
-            let n = cstr_obj(name)?;
-            if module.is_null() {
-                ab::call(&s, &[&n])
-            } else {
-                let kwn = tuple::new_tuple(vec![pystr::new_str("module_name")]);
-                ab::call_kw(&s, &[&n, &*(cstr_obj(module)?)], Some(&kwn))
-            }
         })())
     }
 }

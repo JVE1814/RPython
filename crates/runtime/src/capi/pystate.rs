@@ -271,6 +271,7 @@ pub unsafe extern "C" fn PyGILState_Check() -> c_int {
 pub unsafe extern "C" fn PyEval_SaveThread() -> *mut c_void {
     unsafe {
         let ts = ts_ptr();
+        super::pythread::suspend_all(ts);
         (*ts).mode.set(ThreadMode::InNative);
         threads::set_current(std::ptr::null_mut());
         ts as *mut c_void
@@ -282,6 +283,8 @@ pub unsafe extern "C" fn PyEval_RestoreThread(ts: *mut c_void) {
         if ts.is_null() {
             super::refcount::fatal("PyEval_RestoreThread: NULL thread state");
         }
+        // re-take suspended critical sections while still detached (may block)
+        super::pythread::resume_top(ts as *mut ThreadState);
         attach(ts as *mut ThreadState);
         // safepoint/handshake poll on re-entering the VM
         crate::gc::safepoint_poll(&*(ts as *mut ThreadState));
@@ -295,6 +298,7 @@ pub unsafe extern "C" fn PyEval_AcquireThread(ts: *mut c_void) {
 pub unsafe extern "C" fn PyEval_ReleaseThread(ts: *mut c_void) {
     unsafe {
         if !ts.is_null() {
+            super::pythread::suspend_all(ts as *mut ThreadState);
             (*(ts as *mut ThreadState)).mode.set(ThreadMode::InNative);
         }
         threads::set_current(std::ptr::null_mut());

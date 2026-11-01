@@ -406,7 +406,12 @@ pub unsafe extern "C" fn PySet_Size(o: *mut PyObject) -> Py_ssize_t {
 pub unsafe extern "C" fn PySet_Contains(o: *mut PyObject, k: *mut PyObject) -> c_int {
     unsafe {
         let Ok(s) = chk_anyset(o) else { return -1 };
-        ret_b(set::set_contains(s, &*k))
+        // unlike `k in s`, the C API does not retry an unhashable set as a frozenset
+        let Some(k) = opt(k) else {
+            null_arg();
+            return -1;
+        };
+        ret_b(ab::hash(k).and_then(|h| set::contains_entry(s, k, h)))
     }
 }
 #[unsafe(no_mangle)]

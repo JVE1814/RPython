@@ -43,7 +43,6 @@ placeholder_types!(
     (PyODictValues_Type, "odict_values"),
     (PyODict_Type, "collections.OrderedDict"),
     (PyPickleBuffer_Type, "pickle.PickleBuffer"),
-    (PySentinel_Type, "sentinel"),
     (PyStdPrinter_Type, "stderrprinter"),
 );
 
