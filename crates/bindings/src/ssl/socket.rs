@@ -20,6 +20,8 @@ pub struct SslSock {
     pub server_hostname: Option<PyRef>,
     pub owner: Option<PyRef>,
     pub shutdown_seen_zero: bool,
+    /// an EOF error was reported; later I/O reports it again
+    pub got_eof: bool,
     pub pending_exc: Option<PyRef>,
 }
 
@@ -207,6 +209,7 @@ pub fn new_sslsocket(
             server_hostname,
             owner: owner_weak,
             shutdown_seen_zero: false,
+            got_eof: false,
             pending_exc: None,
         },
     )?;
@@ -280,6 +283,12 @@ fn set_err_simple_type(t: *mut PyTypeObject, msg: &str) -> PyErr {
     rpy_runtime::errors::new_err(t, msg)
 }
 
+/// SSLEOFError; remembered so that later operations fail the same way.
+fn eof_err(o: &PyObject) -> PyErr {
+    ss(o).got_eof = true;
+    raise_simple(&st().eof_error, 8, "EOF occurred in violation of protocol (_ssl.c:1000)")
+}
+
 /// Raise the Python exception for an SSL_get_error() result.
 fn raise_ssl_err(o: &PyObject, ret: c_int, err: c_int) -> PyErr {
     let s = st();
@@ -299,7 +308,7 @@ fn raise_ssl_err(o: &PyObject, ret: c_int, err: c_int) -> PyErr {
             if e == 0 {
                 let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 if ret == 0 || ss(o).sock.as_ref().map_or(false, |w| deref_weak(w).is_none()) {
-                    return raise_simple(&s.eof_error, 8, "EOF occurred in violation of protocol (_ssl.c:1000)");
+                    return eof_err(o);
                 }
                 if ret == -1 && errno != 0 {
                     cr!(ERR_clear_error());
@@ -315,7 +324,7 @@ fn raise_ssl_err(o: &PyObject, ret: c_int, err: c_int) -> PyErr {
             cr!(ERR_clear_error());
             // unexpected EOF while reading
             if err_get_lib(e) == 20 && err_get_reason(e) == 294 {
-                return raise_simple(&s.eof_error, 8, "EOF occurred in violation of protocol (_ssl.c:1000)");
+                return eof_err(o);
             }
             // certificate verification failed
             if err_get_lib(e) == 20 && err_get_reason(e) == 134 {
@@ -340,6 +349,9 @@ fn raise_ssl_err(o: &PyObject, ret: c_int, err: c_int) -> PyErr {
 
 /// Run an OpenSSL operation with the socket's blocking/timeout semantics.
 fn run_io(o: &PyObject, what: &str, mut op: impl FnMut(*mut c_void) -> c_int) -> PyResult<c_int> {
+    if ss(o).got_eof {
+        return Err(eof_err(o));
+    }
     let (sock, timeout) = sock_info(o)?;
     let ssl = ss(o).ssl;
     loop {
@@ -502,17 +514,21 @@ fn m_get_verified_chain(o: &PyObject) -> PyResult {
 fn m_get_unverified_chain(o: &PyObject) -> PyResult {
     let s = ss(o);
     let sk = sl!(SSL_get_peer_cert_chain(s.ssl));
-    if sk.is_null() {
-        return Ok(none());
-    }
     if s.server_side {
-        // the server-side chain does not include the peer certificate itself
+        // the server-side chain does not include the peer certificate itself; a resumed
+        // session only remembers the peer certificate
         let x = sl!(SSL_get1_peer_certificate(s.ssl));
+        if sk.is_null() && x.is_null() {
+            return Ok(none());
+        }
         let r = chain_to_list(sk, if x.is_null() { None } else { Some(x) });
         if !x.is_null() {
             cr!(X509_free(x));
         }
         return r;
+    }
+    if sk.is_null() {
+        return Ok(none());
     }
     chain_to_list(sk, None)
 }
@@ -794,6 +810,8 @@ pub fn init_type() -> PyResult<()> {
             ("read", FAST, m_read),
             ("write", O, m_write),
             ("pending", NOARGS, m_pending),
+            ("uses_ktls_for_send", NOARGS, g_false),
+            ("uses_ktls_for_recv", NOARGS, g_false),
             ("getpeercert", FAST, m_getpeercert),
             ("get_verified_chain", NOARGS, m_get_verified_chain),
             ("get_unverified_chain", NOARGS, m_get_unverified_chain),
@@ -814,8 +832,6 @@ pub fn init_type() -> PyResult<()> {
             ("owner", g_owner, s_owner),
             ("session", g_session, set_session),
             ("session_reused", g_session_reused),
-            ("uses_ktls_for_send", g_false),
-            ("uses_ktls_for_recv", g_false),
         ];
         rpy_runtime::types::typeobject::type_ready(t)?;
     }

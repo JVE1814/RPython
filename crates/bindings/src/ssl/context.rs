@@ -414,6 +414,9 @@ fn get_keylog(o: &PyObject) -> PyResult {
 
 fn set_keylog(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     let c = ctx(o);
+    if v.is_none() {
+        raise!(AttributeError, "keylog_filename cannot be deleted");
+    }
     match v {
         Some(v) if !is_none(v) => {
             // the file must be writable; lines are appended on every key event
