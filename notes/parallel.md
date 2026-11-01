@@ -48,7 +48,22 @@
   raised signal) when faulthandler was disabled.
 - `_thread.interrupt_main()` in the main thread runs the handler immediately.
 - `python -c` code is dedented (3.14).
-- `_multiprocessing.SemLock`: owner/count updates ordered for threads sharing one SemLock.
+- `_multiprocessing.SemLock`: owner/count updates ordered for threads sharing one SemLock;
+  a SemLock rebuilt from a raw (name-less) handle does not sem_close it.
+- `time.sleep` checks pending signals before sleeping (a SIGINT that arrived just before the
+  call was otherwise only handled after the full sleep).
+- the thread that survives fork gets its new native id.
+
+## Known open issues
+- test_threading: finalization tests (daemon threads / locals / `__del__` at interpreter exit)
+  fail — the runtime does not run module teardown/finalizers at shutdown like CPython;
+  test_print_exception_gh_102056 hangs (KeyboardInterrupt from interrupt_main is lost during
+  RecursionError-handler recursion — interpreter issue); test_lazy_import: `os` imports
+  `warnings` at startup (the `_collections_abc.ByteString` deprecation).
+- One run of test_multiprocessing_forkserver.test_manager aborted with glibc "corrupted size vs.
+  prev_size" inside sem_open; the borrowed-handle sem_close fix above is the suspected cause
+  (not re-verified at the time of writing).
+- InterpreterPoolExecutor / concurrent.interpreters: no subinterpreters in the runtime.
 
 ## Gaps outside this workstream that block tests
 - `array` (data branch), `xmlrpc` (managers' xmlrpclib serializer tests), `zipimport` and
