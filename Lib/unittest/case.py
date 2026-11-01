@@ -287,6 +287,16 @@ class _AssertRaisesContext(_AssertRaisesBaseContext):
     __class_getitem__ = classmethod(types.GenericAlias)
 
 
+class _SearchMatcher:
+    """Message matcher for a warnings filter using re.search semantics."""
+
+    def __init__(self, regex):
+        self.regex = regex
+
+    def match(self, text):
+        return self.regex.search(text)
+
+
 class _AssertWarnsContext(_AssertRaisesBaseContext):
     """Context manager used by assertWarns and assertWarnsRegex."""
 
@@ -301,15 +311,24 @@ class _AssertWarnsContext(_AssertRaisesBaseContext):
                 module.__warningregistry__ = {}
         self.warnings_manager = warnings.catch_warnings(record=True)
         self.warnings = self.warnings_manager.__enter__()
-        warnings.simplefilter('always', self.expected)
+        if self.expected_regex is None:
+            warnings.simplefilter('always', self.expected)
+        else:
+            # Only the warnings we look for bypass the existing filters;
+            # the others (e.g. once-per-location ones) behave as usual.
+            warnings._add_filter('always', _SearchMatcher(self.expected_regex),
+                                 self.expected, None, 0, append=False)
         return self
 
     def __exit__(self, exc_type, exc_value, tb):
         self.warnings_manager.__exit__(exc_type, exc_value, tb)
-        # Warnings of other categories went through the normal filters
+        # Warnings we were not looking for went through the normal filters
         # already; show them now as they would have been shown without us.
+        regex = self.expected_regex
         for record in self.warnings:
-            if not isinstance(record.message, self.expected):
+            wanted = isinstance(record.message, self.expected) and (
+                regex is None or regex.search(str(record.message)))
+            if not wanted:
                 warnings._showwarnmsg(record)
         if exc_type is not None:
             return
