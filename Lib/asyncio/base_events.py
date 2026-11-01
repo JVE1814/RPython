@@ -8,7 +8,7 @@ sendfile and error reporting.
 
 import collections
 import collections.abc
-import concurrent.futures
+
 import errno
 import heapq
 import itertools
@@ -142,6 +142,12 @@ def _run_until_complete_cb(fut):
             # run_forever() is already unwinding
             return
     futures._get_loop(fut).stop()
+
+
+def _thread_pool_class():
+    # concurrent.futures is only needed once an executor is used
+    import concurrent.futures
+    return concurrent.futures.ThreadPoolExecutor
 
 
 def _set_nodelay(sock):
@@ -539,13 +545,13 @@ class BaseEventLoop(events.AbstractEventLoop):
             executor = self._default_executor
             self._check_default_executor()
             if executor is None:
-                executor = concurrent.futures.ThreadPoolExecutor(
+                executor = _thread_pool_class()(
                     thread_name_prefix='asyncio')
                 self._default_executor = executor
         return futures.wrap_future(executor.submit(func, *args), loop=self)
 
     def set_default_executor(self, executor):
-        if not isinstance(executor, concurrent.futures.ThreadPoolExecutor):
+        if not isinstance(executor, _thread_pool_class()):
             raise TypeError('executor must be ThreadPoolExecutor')
         self._default_executor = executor
 
