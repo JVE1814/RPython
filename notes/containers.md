@@ -52,9 +52,13 @@ all-float keys; during sort the list is empty with `allocated == -1`
 the managed pre-header slot (`Py_TPFLAGS_MANAGED_WEAKREF`); `type` objects use
 `tp_weaklist` (set in `weakref::ready`). Basic ref/proxy reuse, callbacks run after all
 refs are cleared, errors go to the unraisable hook.
-**For the GC workstream:** `weakref::clear_weakrefs_for_gc(&garbage)` clears weakrefs to
-all garbage first and only runs callbacks of weakrefs that are not themselves garbage
-(CPython semantics); `gc.rs` currently calls `clear_weakrefs` per object.
+**For the GC workstream:** CPython's collector (1) clears the weakrefs *that have
+callbacks* to all garbage before running finalizers, calling only the callbacks of
+weakrefs that are not themselves garbage, and (2) clears the remaining weakrefs after
+finalizers, before tp_clear (test_weakref.test_clearing_weakrefs_in_gc). Use
+`weakref::clear_weakrefs_for_gc(&garbage, true)` before finalizers and
+`weakref::clear_weakrefs_for_gc(&garbage, false)` before tp_clear; `gc.rs` currently
+calls `clear_weakrefs` per object after finalizers.
 
 ## Observed problems in other areas (not fixed here)
 * `gc::track` increments `ALLOCS_SINCE` but deallocation never decrements it, so every

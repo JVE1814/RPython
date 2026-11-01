@@ -367,7 +367,9 @@ pub unsafe fn clear_weakrefs_at(o: *mut PyObject, list: *mut *mut PyObject) {
 /// Cycle-collector variant: clear the weakrefs to every object in `garbage`
 /// first, then run the callbacks of those weakrefs that are not themselves
 /// garbage (the callbacks of garbage weakrefs are dropped, as in CPython).
-pub unsafe fn clear_weakrefs_for_gc(garbage: &[*mut PyObject]) {
+/// With `callbacks_only`, only weakrefs that have a callback are cleared (the GC
+/// does this before running finalizers; plain weakrefs are cleared afterwards).
+pub unsafe fn clear_weakrefs_for_gc(garbage: &[*mut PyObject], callbacks_only: bool) {
     unsafe {
         let set: std::collections::HashSet<usize> = garbage.iter().map(|&p| p as usize).collect();
         let mut pending: Vec<(PyRef, PyRef)> = Vec::new();
@@ -380,12 +382,14 @@ pub unsafe fn clear_weakrefs_for_gc(garbage: &[*mut PyObject]) {
                     continue;
                 }
                 let mut r = head(list);
-                *list = std::ptr::null_mut();
                 while !r.is_null() {
                     let next = (*r).wr_next;
+                    if callbacks_only && (*r).wr_callback.is_null() {
+                        r = next;
+                        continue;
+                    }
+                    unlink(r);
                     (*r).wr_object = none::none().as_ptr();
-                    (*r).wr_prev = std::ptr::null_mut();
-                    (*r).wr_next = std::ptr::null_mut();
                     let cb = std::mem::replace(&mut (*r).wr_callback, std::ptr::null_mut());
                     if !cb.is_null() {
                         let ro = r as *mut PyObject;
