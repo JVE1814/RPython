@@ -3,4 +3,5 @@
 pub fn register() {
     use crate::import::register_builtin;
     register_builtin("_operator", super::_operator::init_module);
+    register_builtin("_functools", super::_functools::init_module);
 }

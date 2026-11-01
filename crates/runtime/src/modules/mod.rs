@@ -19,6 +19,7 @@ pub mod reprlib_guard;
 pub mod fncommon;
 pub mod functional;
 pub mod _operator;
+pub mod _functools;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
 pub fn register_all() {

@@ -743,6 +743,7 @@ fn init_types() -> PyResult<()> {
         (*t).tp_methods = mdefs![("__reduce__", NOARGS, |o: &PyObject| methodcaller_reduce(o))];
         for t in [attrgetter_type(), itemgetter_type(), methodcaller_type()] {
             crate::types::typeobject::type_ready(t)?;
+            crate::types::typeobject::type_dict_set(t, "__text_signature__", &pystr::new_str("(obj, /)"));
         }
     }
     Ok(())
