@@ -143,6 +143,56 @@ impl Asm {
             _ => {}
         }
     }
+    /// ModRM+SIB for [base + index*scale + disp32]
+    fn modrm_sib(&mut self, reg: u8, base: R, index: R, scale: u8, disp: i32) {
+        let ss = match scale {
+            1 => 0,
+            2 => 1,
+            4 => 2,
+            _ => 3,
+        };
+        self.b(0x80 | (reg & 7) << 3 | 4);
+        self.b(ss << 6 | ((index as u8) & 7) << 3 | (base as u8 & 7));
+        self.d32(disp);
+    }
+    /// mov r64, [base + index*scale + disp]
+    pub fn load_idx(&mut self, dst: R, base: R, index: R, scale: u8, disp: i32) {
+        self.rex(true, dst as u8, index as u8, base as u8, false);
+        self.b(0x8b);
+        self.modrm_sib(dst as u8, base, index, scale, disp);
+    }
+    /// mov [base + index*scale + disp], r64
+    pub fn store_idx(&mut self, base: R, index: R, scale: u8, disp: i32, src: R) {
+        self.rex(true, src as u8, index as u8, base as u8, false);
+        self.b(0x89);
+        self.modrm_sib(src as u8, base, index, scale, disp);
+    }
+    /// cmp dword [base + index*scale + disp], imm32
+    pub fn cmp32_idx_i(&mut self, base: R, index: R, scale: u8, disp: i32, imm: i32) {
+        self.rex(false, 0, index as u8, base as u8, false);
+        self.b(0x81);
+        self.modrm_sib(7, base, index, scale, disp);
+        self.d32(imm);
+    }
+    /// add dword [base + index*scale + disp], imm32
+    pub fn add32_idx_i(&mut self, base: R, index: R, scale: u8, disp: i32, imm: i32) {
+        self.rex(false, 0, index as u8, base as u8, false);
+        self.b(0x81);
+        self.modrm_sib(0, base, index, scale, disp);
+        self.d32(imm);
+    }
+    /// jmp to an absolute address (via rax)
+    pub fn jmp_abs(&mut self, addr: usize) {
+        self.mov_ri(Rax, addr as i64);
+        self.jmp_r(Rax);
+    }
+    /// call a label (near, rel32)
+    pub fn call_label(&mut self, l: Label) {
+        self.b(0xe8);
+        self.fixups.push((self.pos(), l));
+        self.d32(0);
+    }
+
     fn modrm_reg(&mut self, reg: u8, rm: u8) {
         self.b(0xc0 | (reg & 7) << 3 | (rm & 7));
     }
@@ -568,5 +618,11 @@ mod tests {
         a.buf.clear();
         a.setcc(Cc::E, Rsi);
         assert_eq!(a.buf, [0x40, 0x0f, 0x94, 0xc6, 0x40, 0x0f, 0xb6, 0xf6]);
+        a.buf.clear();
+        a.load_idx(Rax, Rdx, Rcx, 8, 16);
+        assert_eq!(a.buf, [0x48, 0x8b, 0x84, 0xca, 0x10, 0, 0, 0]);
+        a.buf.clear();
+        a.load_idx(R9, R13, R10, 4, 0);
+        assert_eq!(a.buf, [0x4f, 0x8b, 0x8c, 0x95, 0, 0, 0, 0]);
     }
 }

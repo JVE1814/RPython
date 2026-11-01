@@ -150,6 +150,7 @@ fn run(ts: &ThreadState, f: &mut Frame, c: &Compiled, pc: usize) -> Run {
         Some(&o) if o != u32::MAX => o,
         _ => return Run::NotRun,
     };
+    crate::tlab::ensure_registered();
     let entry: EntryFn = unsafe { std::mem::transmute(c.addr) };
     let mut out: *mut PyObject = std::ptr::null_mut();
     let st = unsafe { entry(f, f.slots.as_mut_ptr(), ts, c.addr + off as usize, &mut out) };
@@ -214,6 +215,7 @@ fn call_compiled(func: &PyObject, code: &PyObject, cd: &CodeData, c: &Compiled, 
     frame.prev = prev;
     ts.frame.set(&mut *frame as *mut Frame);
     frame.state = FrameState::Executing;
+    crate::tlab::ensure_registered();
     let entry: EntryFn = unsafe { std::mem::transmute(c.addr) };
     let mut out: *mut PyObject = std::ptr::null_mut();
     let fp: *mut Frame = &mut *frame;
@@ -270,6 +272,10 @@ fn compile(f: &Frame, cd: &CodeData) -> bool {
             });
             match addr {
                 Some(addr) => {
+                    if let Ok(dir) = std::env::var("RPYTHON_JIT_DUMP") {
+                        let nm = crate::types::str::to_string_lossy(&cd.co_qualname);
+                        let _ = std::fs::write(format!("{}/{}.{:x}.bin", dir, nm, addr), code);
+                    }
                     if dbg {
                         eprintln!(
                             "[jit] tier1 {} ({} instrs -> {} bytes)",

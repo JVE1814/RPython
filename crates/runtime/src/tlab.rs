@@ -292,3 +292,41 @@ pub fn free_small(p: *mut u8) {
         }
     }
 }
+
+/// Layout of the per-thread cache for JIT-generated inline allocation/free (jit
+/// workstream). `tls_offset` is the cache address minus the thread pointer (fs:0);
+/// it is the same for every thread (static TLS of the executable).
+pub struct JitLayout {
+    pub tls_offset: isize,
+    pub heads: usize,
+    pub counts: usize,
+    pub page_class: usize,
+    pub limit: usize,
+}
+
+pub fn jit_layout() -> JitLayout {
+    JitLayout {
+        tls_offset: (&raw const TC) as isize - crate::object::thread_id() as isize,
+        heads: std::mem::offset_of!(ThreadCache, heads),
+        counts: std::mem::offset_of!(ThreadCache, counts),
+        page_class: std::mem::offset_of!(PageHeader, class),
+        limit: CACHE_LIMIT,
+    }
+}
+
+/// Size class index for a small size.
+pub fn class_index(size: usize) -> usize {
+    CLASS_OF[(size + 15) / 16] as usize
+}
+
+/// Make sure this thread's cache returns its blocks at thread exit (JIT code pushes
+/// to the free lists directly).
+#[inline]
+pub fn ensure_registered() {
+    unsafe {
+        let tc = &mut *(&raw mut TC);
+        if !tc.registered {
+            register(tc);
+        }
+    }
+}

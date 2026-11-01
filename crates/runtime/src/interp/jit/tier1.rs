@@ -109,6 +109,9 @@ struct Gen<'a> {
     ilabel: Vec<Label>,
     exit: Label,
     stubs: Vec<Stub>,
+    rt_box_int: Label,
+    rt_box_float: Label,
+    rt_free_num: Label,
 }
 
 fn fnaddr<T>(f: T) -> usize
@@ -207,6 +210,7 @@ impl<'a> Gen<'a> {
         self.a.store32(M(r, OB_REF_LOCAL), R11);
         self.a.jcc(Cc::E, zero);
         self.a.bind(done);
+        let free_num = self.rt_free_num;
         self.stubs.push(Box::new(move |a: &mut Asm, _exit, _nlp| {
             a.bind(shared);
             a.mov_rr(Rdi, r);
@@ -214,7 +218,7 @@ impl<'a> Gen<'a> {
             a.jmp(done);
             a.bind(zero);
             a.mov_rr(Rdi, r);
-            a.call_abs(addr!(h::h_merge_zero));
+            a.call_label(free_num);
             a.jmp(done);
         }));
     }
@@ -914,7 +918,7 @@ impl<'a> Gen<'a> {
             Or | InplaceOr => self.a.or_rr(Rdi, Rsi),
             _ => self.a.xor_rr(Rdi, Rsi),
         }
-        self.call(addr!(h::h_new_int));
+        self.a.call_label(self.rt_box_int);
         self.a.jmp(have_result);
         self.a.bind(not_int);
         if float_ok {
@@ -931,7 +935,7 @@ impl<'a> Gen<'a> {
                 Subtract | InplaceSubtract => self.a.subsd(XMM0, XMM1),
                 _ => self.a.mulsd(XMM0, XMM1),
             }
-            self.call(addr!(h::h_new_float));
+            self.a.call_label(self.rt_box_float);
             self.a.jmp(have_result);
         } else {
             self.a.jmp(slow);
@@ -999,13 +1003,127 @@ impl<'a> Gen<'a> {
     }
 }
 
+/// Shared per-function routines (called with `call`, SysV-like clobbers):
+/// * box_int:   rdi = i64 value -> rax = new int object (small-int cache, inline
+///              TLAB allocation of 1-digit ints, else the runtime helper)
+/// * box_float: xmm0 = f64 -> rax = new float object
+/// * free_num:  rdi = object whose local refcount just dropped to zero: inline free
+///              for exact int/float, else the generic path.
+fn emit_routines(a: &mut Asm, box_int: Label, box_float: Label, free_num: Label) {
+    let tl = crate::tlab::jit_layout();
+    let tls = tl.tls_offset as i32;
+    let heads = tl.heads as i32;
+    let counts = tl.counts as i32;
+    let int_t = crate::types::int::int_type();
+    let float_t = crate::types::float::float_type();
+    let int_size = unsafe { ((*int_t).tp_basicsize as usize).max(LV_DIGIT as usize + 4) };
+    let ci = crate::tlab::class_index(int_size) as i32;
+    let cf = crate::tlab::class_index(std::mem::size_of::<PyFloatObject>()) as i32;
+    let small = crate::interp::specialize::small_int_table() as i64;
+
+    // header: tid, (flags,mutex,gc_bits)=0 + ref_local=1, ref_shared=0, type
+    let init_header = |a: &mut Asm, tp: i64| {
+        a.store(M(Rax, OB_TID), R15);
+        a.mov_ri(Rsi, 1i64 << 32);
+        a.store(M(Rax, 8), Rsi);
+        a.store_i(M(Rax, OB_REF_SHARED), 0);
+        a.mov_ri(Rsi, tp);
+        a.store(M(Rax, OB_TYPE), Rsi);
+    };
+    let pop_block = |a: &mut Asm, class: i32, empty: Label| {
+        a.lea(Rdx, M(R15, tls));
+        a.load(Rax, M(Rdx, heads + 8 * class));
+        a.test_rr(Rax, Rax);
+        a.jcc(Cc::E, empty);
+        a.load(Rsi, M(Rax, 0));
+        a.store(M(Rdx, heads + 8 * class), Rsi);
+        a.add32_mi(M(Rdx, counts + 4 * class), -1);
+    };
+
+    // ---- box_int
+    a.bind(box_int);
+    {
+        let big = a.label();
+        let helper = a.label();
+        a.lea(Rcx, M(Rdi, 5));
+        a.cmp_ri(Rcx, 1030);
+        a.jcc(Cc::A, big);
+        a.mov_ri(Rax, small);
+        a.load_idx(Rax, Rax, Rcx, 8, 0);
+        a.ret();
+        a.bind(big);
+        // rcx = |v|
+        a.mov_rr(Rcx, Rdi);
+        a.neg(Rcx);
+        a.cmov(Cc::S, Rcx, Rdi);
+        a.mov_ri(Rdx, 1 << 30);
+        a.cmp_rr(Rcx, Rdx);
+        a.jcc(Cc::AE, helper);
+        pop_block(a, ci, helper);
+        init_header(a, int_t as i64);
+        a.mov_ri(Rsi, 8);
+        a.mov_ri(Rdx, 10);
+        a.test_rr(Rdi, Rdi);
+        a.cmov(Cc::S, Rsi, Rdx);
+        a.store(M(Rax, LV_TAG), Rsi);
+        a.store32(M(Rax, LV_DIGIT), Rcx);
+        a.ret();
+        a.bind(helper);
+        a.jmp_abs(addr!(h::h_new_int));
+    }
+    // ---- box_float
+    a.bind(box_float);
+    {
+        let helper = a.label();
+        pop_block(a, cf, helper);
+        init_header(a, float_t as i64);
+        a.movsd_store(M(Rax, FVAL), XMM0);
+        a.ret();
+        a.bind(helper);
+        a.jmp_abs(addr!(h::h_new_float));
+    }
+    // ---- free_num
+    a.bind(free_num);
+    {
+        let generic = a.label();
+        let ok = a.label();
+        a.load(Rax, M(Rdi, OB_TYPE));
+        a.mov_ri(Rcx, int_t as i64);
+        a.cmp_rr(Rax, Rcx);
+        a.jcc(Cc::E, ok);
+        a.mov_ri(Rcx, float_t as i64);
+        a.cmp_rr(Rax, Rcx);
+        a.jcc(Cc::NE, generic);
+        a.bind(ok);
+        a.cmp_mi(M(Rdi, OB_REF_SHARED), 0);
+        a.jcc(Cc::NE, generic);
+        a.load8(Rax, M(Rdi, GC_BITS));
+        a.test_rr(Rax, Rax);
+        a.jcc(Cc::NE, generic);
+        a.mov_rr(Rax, Rdi);
+        a.and_ri(Rax, !(crate::tlab::PAGE as i32 - 1));
+        a.load32(Rax, M(Rax, tl.page_class as i32));
+        a.lea(Rdx, M(R15, tls));
+        a.cmp32_idx_i(Rdx, Rax, 4, counts, tl.limit as i32);
+        a.jcc(Cc::AE, generic);
+        a.load_idx(Rcx, Rdx, Rax, 8, heads);
+        a.store(M(Rdi, 0), Rcx);
+        a.store_idx(Rdx, Rax, 8, heads, Rdi);
+        a.add32_idx_i(Rdx, Rax, 4, counts, 1);
+        a.ret();
+        a.bind(generic);
+        a.jmp_abs(addr!(h::h_merge_zero));
+    }
+}
+
 /// Compile a code object. Err: not compilable (stays in the interpreter).
 pub fn compile(cd: &CodeData, nlocalsplus: usize, tables: &crate::interp::cache::Tables) -> Result<Output, String> {
     let an = super::analysis::analyze(&cd.code, &cd.exception_table)?;
     let mut a = Asm::new();
     let ilabel: Vec<Label> = (0..an.instrs.len()).map(|_| a.label()).collect();
     let exit = a.label();
-    let mut g = Gen { a, nlp: nlocalsplus as i32, an: &an, cd, tables, ilabel, exit, stubs: Vec::new() };
+    let (rt_box_int, rt_box_float, rt_free_num) = (a.label(), a.label(), a.label());
+    let mut g = Gen { a, nlp: nlocalsplus as i32, an: &an, cd, tables, ilabel, exit, stubs: Vec::new(), rt_box_int, rt_box_float, rt_free_num };
 
     // prologue
     g.a.push(Rbp);
@@ -1068,6 +1186,7 @@ pub fn compile(cd: &CodeData, nlocalsplus: usize, tables: &crate::interp::cache:
     while let Some(s) = g.stubs.pop() {
         s(&mut g.a, exit, nlp);
     }
+    emit_routines(&mut g.a, rt_box_int, rt_box_float, rt_free_num);
     g.a.resolve()?;
     Ok(Output { asm: g.a, entries })
 }
