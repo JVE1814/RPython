@@ -407,8 +407,20 @@ impl<'a> Parser<'a> {
                 if t.ty == T::LBRACE {
                     let m = self.p;
                     match self.replacement_field(tstring, raw)? {
-                        Some(mut v) => {
-                            spec.append(&mut v);
+                        Some(v) => {
+                            // adjacent literal text (e.g. the debug text of a nested
+                            // `{y=}`) is merged into one Constant, like CPython
+                            for e in v {
+                                if let (Some(Expr { node: ExprKind::Constant { value: Constant::Str(prev), .. }, loc: ploc }), ExprKind::Constant { value: Constant::Str(cur), .. }) =
+                                    (spec.last_mut(), &e.node)
+                                {
+                                    prev.push_pystr(cur);
+                                    ploc.end_lineno = e.loc.end_lineno;
+                                    ploc.end_col_offset = e.loc.end_col_offset;
+                                    continue;
+                                }
+                                spec.push(e);
+                            }
                             continue;
                         }
                         None => {

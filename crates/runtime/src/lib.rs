@@ -1,6 +1,8 @@
 //! rpy-runtime: the interpreter core (CPython 3.15 compatible object model and C ABI).
+#![feature(c_variadic)]
 #![allow(clippy::missing_safety_doc, clippy::new_without_default, static_mut_refs)]
 #![allow(unused_unsafe)]
+#![feature(thread_local)]
 
 #[macro_use]
 pub mod errors;
@@ -9,6 +11,7 @@ pub mod alloc;
 pub mod args;
 pub mod buffer;
 pub mod builtins;
+pub mod capi;
 pub mod capi_ext;
 pub mod compile;
 
