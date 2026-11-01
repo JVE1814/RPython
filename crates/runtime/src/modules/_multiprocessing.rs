@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering::*};
 
 const RECURSIVE_MUTEX: i32 = 0;
 const SEMAPHORE: i32 = 1;
+/// Largest semaphore value on Linux (glibc: INT_MAX).
+const SEM_VALUE_MAX: i32 = i32::MAX;
 
 #[repr(C)]
 struct SemLock {
@@ -103,7 +105,7 @@ fn semlock_new_impl(tp: *mut PyTypeObject, a: &fc::VcArgs) -> PyResult {
     if !pystr::is_str(&name) {
         raise!(TypeError, "SemLock() argument 'name' must be str, not {}", crate::types::typeobject::tname(&name));
     }
-    if value < 0 || value as u32 > libc::SEM_VALUE_MAX {
+    if value < 0 || value > SEM_VALUE_MAX {
         raise!(ValueError, "invalid value");
     }
     let cname = name_cstring(&name)?;
@@ -371,7 +373,7 @@ pub fn init() -> PyResult {
             ];
             crate::types::typeobject::type_ready(&raw mut SEMLOCK_TYPE)?;
             let td = crate::types::typeobject::type_dict(&raw mut SEMLOCK_TYPE);
-            dict::set_item_str(&td, "SEM_VALUE_MAX", &int::new_int(libc::SEM_VALUE_MAX as i64))?;
+            dict::set_item_str(&td, "SEM_VALUE_MAX", &int::new_int(SEM_VALUE_MAX as i64))?;
         }
     }
     let m = crate::types::module::new_module("_multiprocessing")?;
