@@ -565,7 +565,7 @@ pub fn power(x: &Dec, y: &Dec, ctx: &mut Ctx) -> Dec {
         let nd = nat::digits(&ex.coef) as i128;
         if nd <= prec {
             let pad = (prec + 1 - nd) as u64;
-            ex.coef = nat::shl(&ex.coef, pad);
+            ex.coef = nat::shl(&ex.coef, pad).into();
             ex.exp = ops::clamp_i64(ex.exp as i128 - pad as i128);
         }
         let mut c = ctx.clone();

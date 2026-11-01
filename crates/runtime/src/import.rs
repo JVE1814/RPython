@@ -54,6 +54,58 @@ static BOOTSTRAP: std::sync::atomic::AtomicPtr<PyObject> = std::sync::atomic::At
 /// True once the path-based finders (PathFinder) are installed.
 static EXTERNAL_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Code object of an importlib bootstrap module. Compiling it from source on every
+/// start dominated startup time, so the compiled code is cached next to the source
+/// (`__pycache__/<stem>.rpython-boot`, marshal format) keyed on the source size and
+/// mtime and on the interpreter executable's size and mtime (a rebuilt compiler
+/// invalidates it). Any problem with the cache falls back to compiling.
+fn bootstrap_code(src: &[u8], file: &str, display: &str) -> PyResult {
+    fn stamp(p: &std::path::Path) -> Option<(u64, u128)> {
+        let m = std::fs::metadata(p).ok()?;
+        let t = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+        Some((m.len(), t))
+    }
+    let path = std::path::Path::new(file);
+    let key = (|| {
+        let (sl, st) = stamp(path)?;
+        let (el, et) = stamp(&std::env::current_exe().ok()?)?;
+        Some(format!("rpython-boot v1 {} {} {} {} {}\n", sl, st, el, et, display))
+    })();
+    let cache = path.parent().map(|dir| {
+        let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        dir.join("__pycache__").join(format!("{}.rpython-boot", stem))
+    });
+    if let (Some(key), Some(cache)) = (&key, &cache) {
+        if let Ok(data) = std::fs::read(cache) {
+            if data.len() > key.len() && &data[..key.len()] == key.as_bytes() {
+                match crate::modules::marshal::loads_slice(&data[key.len()..], true) {
+                    Ok(c) if crate::types::code::is_code(&c) => return Ok(c),
+                    Ok(_) => {}
+                    Err(_) => clear_exc(),
+                }
+            }
+        }
+    }
+    let c = crate::compile::compile_bytes(src, display, crate::compile::Mode::Exec, 0, 0)?;
+    if let (Some(key), Some(cache)) = (&key, &cache) {
+        if let Ok(body) = crate::modules::marshal::dumps_vec(&c.code, 5, true) {
+            let mut out = key.clone().into_bytes();
+            out.extend_from_slice(&body);
+            if let Some(dir) = cache.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            // write atomically (another process may be reading)
+            let tmp = cache.with_extension(format!("tmp{}", std::process::id()));
+            if std::fs::write(&tmp, &out).is_ok() && std::fs::rename(&tmp, cache).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        } else {
+            clear_exc();
+        }
+    }
+    Ok(c.code)
+}
+
 fn exec_bootstrap_module(name: &str, file: &str, display: &str) -> PyResult {
     let src = match std::fs::read(file) {
         Ok(s) => s,
@@ -66,8 +118,8 @@ fn exec_bootstrap_module(name: &str, file: &str, display: &str) -> PyResult {
     dict::set_item_str(&d, "__builtins__", &crate::builtins::builtins_module())?;
     dict::set_item_str(&crate::modules::sys::modules_dict(), name, &m)?;
     let r = (|| -> PyResult<()> {
-        let c = crate::compile::compile_bytes(&src, display, crate::compile::Mode::Exec, 0, 0)?;
-        crate::interp::eval_code(&c.code, &d, Some(&d))?;
+        let code = bootstrap_code(&src, file, display)?;
+        crate::interp::eval_code(&code, &d, Some(&d))?;
         Ok(())
     })();
     if r.is_err() {

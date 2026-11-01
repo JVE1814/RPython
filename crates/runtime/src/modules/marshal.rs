@@ -924,6 +924,32 @@ fn u32s(b: &[u8]) -> Vec<u32> {
     b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
 }
 
+/// Number of items if `o` is a tuple of str, else None.
+fn str_count(o: &PyObject) -> Option<usize> {
+    if !tuple::is_tuple(o) {
+        return None;
+    }
+    let items = tuple::tuple_items(o);
+    if items.iter().all(|it| pystr::is_str(it)) { Some(items.len()) } else { None }
+}
+
+/// `no_debug_ranges` is fixed at startup (-X / environment): look it up once.
+fn no_debug_ranges_cached() -> bool {
+    static V: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+    match V.load(std::sync::atomic::Ordering::Relaxed) {
+        2 => {
+            let v = no_debug_ranges();
+            // sys may not be fully set up yet during bootstrap: only memoise once it is
+            if crate::modules::sys::get_sys_attr("_xoptions").is_some() {
+                V.store(v as u8, std::sync::atomic::Ordering::Relaxed);
+            }
+            v
+        }
+        x => x != 0,
+    }
+}
+
+#[allow(dead_code)]
 fn str_tuple(o: &PyObject) -> Option<Vec<String>> {
     if !tuple::is_tuple(o) {
         return None;
@@ -938,7 +964,15 @@ fn str_tuple(o: &PyObject) -> Option<Vec<String>> {
     Some(v)
 }
 
+thread_local! {
+    /// Set while `_loads_without_positions` runs.
+    static STRIP_COLUMNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn no_debug_ranges() -> bool {
+    if STRIP_COLUMNS.with(|c| c.get()) {
+        return true;
+    }
     // -X no_debug_ranges / PYTHONNODEBUGRANGES: drop column information on load.
     if std::env::var_os("PYTHONNODEBUGRANGES").map(|v| !v.is_empty()).unwrap_or(false) {
         return true;
@@ -973,17 +1007,17 @@ fn build_code(p: CodeParts) -> PyResult<PyRef> {
     if words.iter().any(|w| (w & 0xff) as usize >= bc::NUM_OPS) {
         return Err(invalid());
     }
-    let names = str_tuple(p.names).ok_or_else(invalid)?;
-    let lpnames = str_tuple(p.lpnames).ok_or_else(invalid)?;
+    let names = str_count(p.names).ok_or_else(invalid)?;
+    let lpnames = str_count(p.lpnames).ok_or_else(invalid)?;
     let kinds = bytes::bytes_data(p.lpkinds).to_vec();
-    if kinds.len() != lpnames.len() {
+    if kinds.len() != lpnames {
         return Err(invalid());
     }
     let lt = bytes::bytes_data(p.linetable);
     if lt.len() != words.len() * 16 {
         return Err(invalid());
     }
-    let strip_cols = no_debug_ranges();
+    let strip_cols = no_debug_ranges_cached();
     let locations: Vec<Location> = u32s(lt)
         .chunks_exact(4)
         .map(|c| {
@@ -1006,42 +1040,35 @@ fn build_code(p: CodeParts) -> PyResult<PyRef> {
     if exception_table.iter().any(|e| e.start > e.end || e.end > n || e.target >= n.max(1)) {
         return Err(invalid());
     }
-    let cu = CodeUnit {
-        name: pystr::to_string_lossy(p.name),
-        qualname: pystr::to_string_lossy(p.qualname),
-        filename: pystr::to_string_lossy(p.filename),
-        firstlineno: p.firstlineno as u32,
+    let _ = (names, lpnames);
+    // Build directly from the unmarshalled objects (constants keep their identity,
+    // names are interned in place: no round trip through Rust strings).
+    let intern_all = |t: &PyObject| -> Vec<PyRef> {
+        tuple::tuple_items(t)
+            .iter()
+            .map(|n| if pystr::is_str_exact(n) { pystr::intern(n.to_ref()) } else { pystr::intern_str(&pystr::to_string_lossy(n)) })
+            .collect()
+    };
+    let consts = if tuple::is_tuple_exact(p.consts) { p.consts.to_ref() } else { ab::sequence_tuple(p.consts)? };
+    let intern1 = |s: &PyObject| if pystr::is_str_exact(s) { pystr::intern(s.to_ref()) } else { pystr::intern_str(&pystr::to_string_lossy(s)) };
+    code_mod::new_code_from_parts(code_mod::CodeParts {
         argcount: p.argcount as u32,
         posonlyargcount: p.posonly as u32,
         kwonlyargcount: p.kwonly as u32,
         flags: p.flags as u32,
         stacksize: p.stacksize as u32,
+        firstlineno: p.firstlineno as u32,
         code: words,
         locations,
-        consts: Vec::new(),
-        names,
-        localsplusnames: lpnames,
-        localspluskinds: kinds,
         exception_table,
-    };
-    let filename = p.filename.to_ref();
-    let r = code_mod::new_code_from_unit(&cu, Some(&filename))?;
-    // Install the original objects (constants, names) so that identity is preserved.
-    unsafe {
-        let rc = &mut *(r.as_ptr() as *mut PyCodeObject);
-        let rd = &mut *rc.data;
-        let consts = if tuple::is_tuple_exact(p.consts) { p.consts.to_ref() } else { ab::sequence_tuple(p.consts)? };
-        rd.consts = tuple::tuple_to_vec(&consts);
-        let old = rc.co_consts;
-        rc.co_consts = consts.into_raw();
-        xdecref(old);
-        let interned_names: Vec<PyRef> = tuple::tuple_items(p.names).iter().map(|n| pystr::intern(n.to_ref())).collect();
-        rd.names = interned_names.clone();
-        let old = rc.co_names;
-        rc.co_names = tuple::new_tuple(interned_names).into_raw();
-        xdecref(old);
-    }
-    Ok(r)
+        kinds,
+        filename: p.filename.to_ref(),
+        consts: tuple::tuple_to_vec(&consts),
+        names: intern_all(p.names),
+        localsplusnames: intern_all(p.lpnames),
+        name: intern1(p.name),
+        qualname: intern1(p.qualname),
+    })
 }
 
 /// PyMarshal_ReadObjectFromString equivalent.
@@ -1119,6 +1146,16 @@ fn m_loads(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult
     loads_slice(&view, allow)
 }
 
+/// Private helper (used by doctest): loads() with column information removed from
+/// code objects, as under -X no_debug_ranges.
+fn m_loads_without_positions(_m: &PyObject, data: &PyObject) -> PyResult {
+    let bytes_data = crate::buffer::with_buffer(data, |b| b.to_vec())?;
+    STRIP_COLUMNS.with(|c| c.set(true));
+    let r = loads_slice(&bytes_data, true);
+    STRIP_COLUMNS.with(|c| c.set(false));
+    r
+}
+
 fn m_load(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
     static P: Params = Params::new("load", &["file", "allow_code"], 1, 1).kwonly(1);
     let [file, allow] = crate::args::parse::<2>(&P, args, kw)?;
@@ -1138,17 +1175,18 @@ fn m_load(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult 
 
 pub fn init() -> PyResult {
     let methods = mdefs![
-        ("dump", FASTKW, m_dump, "dump($module, value, file, version=version, /, *, allow_code=True)\n--\n\nWrite the value on the open file.\n\n  value\n    Must be a supported type.\n  file\n    Must be a writeable binary file.\n  version\n    Indicates the data format that dump should use.\n  allow_code\n    Allow to write code objects.\n\nIf the value has (or contains an object that has) an unsupported type, a\nValueError exception is raised - but garbage data will also be written\nto the file. The object will not be properly read back by load()."),
-        ("load", FASTKW, m_load, "load($module, file, /, *, allow_code=True)\n--\n\nRead one value from the open file and return it.\n\n  file\n    Must be readable binary file.\n  allow_code\n    Allow to load code objects.\n\nIf no valid value is read (e.g. because the data has a different Python\nversion's incompatible marshal format), raise EOFError, ValueError or\nTypeError.\n\nNote: If an object containing an unsupported type was marshalled with\ndump(), load() will substitute None for the unmarshallable type."),
-        ("dumps", FASTKW, m_dumps, "dumps($module, value, version=version, /, *, allow_code=True)\n--\n\nReturn the bytes object that would be written to a file by dump(value, file).\n\n  value\n    Must be a supported type.\n  version\n    Indicates the data format that dumps should use.\n  allow_code\n    Allow to write code objects.\n\nRaise a ValueError exception if value has (or contains an object that has) an\nunsupported type."),
-        ("loads", FASTKW, m_loads, "loads($module, bytes, /, *, allow_code=True)\n--\n\nConvert the bytes-like object to a value.\n\n  allow_code\n    Allow to load code objects.\n\nIf no valid value is found, raise EOFError, ValueError or TypeError.  Extra\nbytes in the input are ignored."),
+        ("dump", FASTKW, m_dump, "dump($module, value, file, version=version, /, *, allow_code=True)\n--\n\nSerialize value with the marshal format and write it to the binary file.\n\nversion selects the format version; allow_code=False rejects code objects.\nRaises ValueError for unsupported types (partial output may have been written)."),
+        ("load", FASTKW, m_load, "load($module, file, /, *, allow_code=True)\n--\n\nRead and return one marshalled value from the binary file.\n\nThe file is left positioned just after the value. allow_code=False rejects\ncode objects. Raises EOFError, ValueError or TypeError for bad data."),
+        ("dumps", FASTKW, m_dumps, "dumps($module, value, version=version, /, *, allow_code=True)\n--\n\nReturn value serialized with the marshal format as bytes.\n\nversion selects the format version; allow_code=False rejects code objects.\nRaises ValueError for unsupported types."),
+        ("_loads_without_positions", O, m_loads_without_positions, "Private: loads() dropping column positions of code objects."),
+        ("loads", FASTKW, m_loads, "loads($module, bytes, /, *, allow_code=True)\n--\n\nDeserialize one marshalled value from a bytes-like object.\n\nTrailing bytes are ignored. allow_code=False rejects code objects.\nRaises EOFError, ValueError or TypeError for bad data."),
     ];
     let (m, d) = crate::modules::fncommon::new_module("marshal", methods, Some(MODULE_DOC))?;
     dict::set_item_str(&d, "version", &int::new_int(VERSION as i64))?;
     Ok(m)
 }
 
-const MODULE_DOC: &str = "This module contains functions that can read and write Python values in\na binary format. The format is specific to Python, but independent of\nmachine architecture issues.\n\nNot all Python object types are supported; in general, only objects\nwhose value is independent from a particular invocation of Python can be\nwritten and read by this module. The following types are supported:\nNone, integers, floating-point numbers, strings, bytes, bytearrays,\ntuples, lists, sets, dictionaries, and code objects, where it\nshould be understood that tuples, lists and dictionaries are only\nsupported as long as the values contained therein are themselves\nsupported; and recursive lists and dictionaries should not be written\n(they will cause infinite loops).\n\nVariables:\n\nversion -- indicates the format that the module uses. Version 0 is the\n    historical format, version 1 shares interned strings and version 2\n    uses a binary format for floating-point numbers.\n    Version 3 shares common object references (New in version 3.4).\n\nFunctions:\n\ndump() -- write value to a file\nload() -- read value from a file\ndumps() -- marshal value as a bytes object\nloads() -- read value from a bytes-like object";
+const MODULE_DOC: &str = "Serialization of Python values in the internal marshal format.\n\nSupported: None, bool, int, float, complex, str, bytes and other\nbytes-like objects, tuple, list, dict, set, frozenset, frozendict, slice,\nEllipsis, StopIteration and code objects (with the containers holding only\nsupported values). The format is not meant for long-term storage or for\nexchange with other implementations.\n\nversion -- the default format version written by dump() and dumps()\n\ndump(), load() -- write a value to, or read a value from, a binary file\ndumps(), loads() -- the same for bytes objects";
 
 // ====================================================================== C API
 

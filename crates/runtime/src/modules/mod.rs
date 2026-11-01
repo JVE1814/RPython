@@ -80,6 +80,7 @@ pub mod hashes;
 pub mod _decimal;
 pub mod _bz2;
 pub mod _multiprocessing;
+pub mod _pickle;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
 pub fn register_all() {
@@ -106,4 +107,5 @@ pub fn register_all() {
     compress_common::register();
     _decimal::register();
     crate::import::register_builtin("_multiprocessing", _multiprocessing::init);
+    crate::import::register_builtin("_pickle", _pickle::init_module);
 }

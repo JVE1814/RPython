@@ -233,35 +233,65 @@ fn load_attr_hit(o: &PyObject, nm: &PyObject, e: &Entry) -> Option<PyResult<PyRe
         _ => None,
     }
 }
+/// A cache entry to (re)fill: an entry `a`-keyed on the same type tag if present,
+/// else an empty one, else round robin. None once the site exceeded its miss budget.
+type Fill = (u32, u64, u64, usize);
 
-/// LoadAttr through the instruction's cache entry.
-#[inline]
-pub fn load_attr(o: &PyObject, nm: &PyObject, e: &Entry) -> PyResult<PyRef> {
-    if let Some(r) = load_attr_hit(o, nm, e) {
-        return r;
+fn store_fill(es: &[Entry], f: Fill) {
+    let (k, a, b, c) = f;
+    let tagged = !matches!(k, kind::MODULE | kind::GLOBAL);
+    let mut victim: Option<&Entry> = None;
+    for e in es {
+        if let Some(s) = e.read() {
+            if tagged && s.kind != kind::EMPTY && !matches!(s.kind, kind::MODULE | kind::GLOBAL) && s.a == a {
+                victim = Some(e);
+                break;
+            }
+            if !tagged && s.kind == k {
+                victim = Some(e);
+                break;
+            }
+        }
     }
-    load_attr_miss(o, nm, e)
+    if victim.is_none() {
+        victim = es.iter().find(|e| e.read().is_some_and(|s| s.kind == kind::EMPTY));
+    }
+    let v = victim.unwrap_or_else(|| &es[(es[0].misses.load(std::sync::atomic::Ordering::Relaxed) as usize) % es.len()]);
+    v.write(k, a, b, c);
+}
+
+/// LoadAttr through the instruction's (polymorphic) cache entries.
+#[inline]
+pub fn load_attr(o: &PyObject, nm: &PyObject, es: &[Entry]) -> PyResult<PyRef> {
+    for e in es {
+        if let Some(r) = load_attr_hit(o, nm, e) {
+            return r;
+        }
+    }
+    load_attr_miss(o, nm, es)
 }
 
 #[cold]
-fn load_attr_miss(o: &PyObject, nm: &PyObject, e: &Entry) -> PyResult<PyRef> {
-    if e.note_miss() {
-        fill_load_attr(o, nm, e, false);
+fn load_attr_miss(o: &PyObject, nm: &PyObject, es: &[Entry]) -> PyResult<PyRef> {
+    if es[0].note_miss() {
+        if let Some(f) = fill_load_attr(o, nm, false) {
+            store_fill(es, f);
+        }
     }
     ab::getattr(o, nm)
 }
 
-/// Fill a LoadAttr/LoadMethod entry for receiver `o` (no Python code runs here).
-fn fill_load_attr(o: &PyObject, nm: &PyObject, e: &Entry, method: bool) {
+/// Compute a LoadAttr/LoadMethod entry for receiver `o` (no Python code runs here).
+fn fill_load_attr(o: &PyObject, nm: &PyObject, method: bool) -> Option<Fill> {
     let tp = o.type_ptr();
     let t = o.ty();
     if !pystr::is_str_exact(nm) {
-        return;
+        return None;
     }
     if generic_getattro(t) {
         let tag = cache::assign_type_tag(tp);
         if tag == 0 {
-            return;
+            return None;
         }
         let descr = lookup(tp, nm);
         let has_dict = type_has_dict(tp);
@@ -269,186 +299,204 @@ fn fill_load_attr(o: &PyObject, nm: &PyObject, e: &Entry, method: bool) {
             let dt = d.ty();
             if method && dt.tp_flags & Py_TPFLAGS_METHOD_DESCRIPTOR != 0 {
                 let k = if has_dict { kind::METHOD_SHADOWABLE } else { kind::METHOD };
-                e.write(k, tag as u64, 0, d.as_ptr() as usize);
-                return;
+                return Some((k, tag as u64, 0, d.as_ptr() as usize));
             }
             if dt.tp_descr_get.is_some() && dt.tp_descr_set.is_some() {
                 if let Some((off, tc)) = unsafe { member_offset(d, tp, false) } {
-                    e.write(kind::SLOT, tag as u64, tc as u64, off);
-                } else {
-                    e.write(kind::DATA_DESCR, tag as u64, 0, d.as_ptr() as usize);
+                    return Some((kind::SLOT, tag as u64, tc as u64, off));
                 }
-                return;
+                return Some((kind::DATA_DESCR, tag as u64, 0, d.as_ptr() as usize));
             }
         }
         if has_dict {
             // instance dict first, then the (non-data) class attribute if any
             let dp = instance_dict_ptr(o);
-            let in_dict = !dp.is_null() && dict::is_dict_exact(unsafe { &*dp }) && {
-                matches!(dict::lookup_index(unsafe { &*dp }, nm, pystr::str_hash(nm)), Ok(Some(_)))
+            let ix = if !dp.is_null() && dict::is_dict_exact(unsafe { &*dp }) {
+                match dict::lookup_index(unsafe { &*dp }, nm, pystr::str_hash(nm)) {
+                    Ok(Some(ix)) => Some(ix),
+                    _ => None,
+                }
+            } else {
+                None
             };
-            match &descr {
-                Some(d) if !in_dict => {
-                    e.write(kind::CLASS_ATTR_SHADOWABLE, tag as u64, 0, d.as_ptr() as usize);
-                }
-                _ => {
-                    e.write(kind::INSTANCE_DICT, tag as u64, u64::MAX, descr.as_ref().map_or(0, |d| d.as_ptr() as usize));
-                }
-            }
-            return;
+            return match (&descr, ix) {
+                (Some(d), None) => Some((kind::CLASS_ATTR_SHADOWABLE, tag as u64, 0, d.as_ptr() as usize)),
+                _ => Some((
+                    kind::INSTANCE_DICT,
+                    tag as u64,
+                    ix.map_or(u64::MAX, |i| i as u64),
+                    descr.as_ref().map_or(0, |d| d.as_ptr() as usize),
+                )),
+            };
         }
-        if let Some(d) = &descr {
-            e.write(kind::CLASS_ATTR, tag as u64, 0, d.as_ptr() as usize);
-        }
-        return;
+        return descr.map(|d| (kind::CLASS_ATTR, tag as u64, 0, d.as_ptr() as usize));
     }
     if o.is_type(module::module_type()) {
         if lookup(tp, nm).is_some() {
-            return;
+            return None;
         }
         let d = module::m(o).md_dict;
         if d.is_null() || !dict::is_dict_exact(unsafe { &*d }) {
-            return;
+            return None;
         }
         let dd = unsafe { &*d };
-        if let Some(v) = dict::get_item_str(dd, nm) {
-            e.write(kind::MODULE, dict::version(dd), d as u64, v.as_ptr() as usize);
-        }
-        return;
+        return dict::get_item_str(dd, nm).map(|v| (kind::MODULE, dict::version(dd), d as u64, v.as_ptr() as usize));
     }
     if o.is_type(type_type()) {
         // class attribute through a plain `type` metaclass
         if lookup(type_type(), nm).is_some() {
-            return;
+            return None;
         }
         let cls = as_type(o);
         let tag = cache::assign_type_tag(cls);
         if tag == 0 {
-            return;
+            return None;
         }
         if let Some(v) = lookup(cls, nm) {
             let plain = v.ty().tp_descr_get.is_none() || funcobject::is_function(&v);
             if plain {
-                e.write(kind::TYPE_ATTR, tag as u64, o.as_ptr() as u64, v.as_ptr() as usize);
+                return Some((kind::TYPE_ATTR, tag as u64, o.as_ptr() as u64, v.as_ptr() as usize));
             }
         }
     }
+    None
 }
 
 /// LoadMethod through the cache: (callable, Some(self)) for unbound method calls,
 /// (attribute, None) otherwise.
 #[inline]
-pub fn load_method(o: &PyObject, nm: &PyObject, e: &Entry) -> PyResult<(PyRef, Option<PyRef>)> {
-    if let Some(s) = e.read() {
-        let tp = o.type_ptr();
-        match s.kind {
-            kind::METHOD => {
-                if cache::type_tag(tp) as u64 == s.a {
-                    return Ok((unsafe { PyRef::from_borrowed(s.c as *mut PyObject) }, Some(o.to_ref())));
-                }
-            }
-            kind::METHOD_SHADOWABLE => {
-                if cache::type_tag(tp) as u64 == s.a {
-                    let d = instance_dict_ptr(o);
-                    if !d.is_null() && dict::dict_len(unsafe { &*d }) != 0 {
-                        if let Some(v) = dict_get_hinted(d, nm, u64::MAX, e) {
-                            return Ok((unsafe { PyRef::from_borrowed(v) }, None));
-                        }
+pub fn load_method(o: &PyObject, nm: &PyObject, es: &[Entry]) -> PyResult<(PyRef, Option<PyRef>)> {
+    let tp = o.type_ptr();
+    for e in es {
+        if let Some(s) = e.read() {
+            match s.kind {
+                kind::METHOD => {
+                    if cache::type_tag(tp) as u64 == s.a {
+                        return Ok((unsafe { PyRef::from_borrowed(s.c as *mut PyObject) }, Some(o.to_ref())));
                     }
-                    return Ok((unsafe { PyRef::from_borrowed(s.c as *mut PyObject) }, Some(o.to_ref())));
                 }
-            }
-            _ => {
-                if let Some(r) = load_attr_hit(o, nm, e) {
-                    return Ok((r?, None));
+                kind::METHOD_SHADOWABLE => {
+                    if cache::type_tag(tp) as u64 == s.a {
+                        let d = instance_dict_ptr(o);
+                        if !d.is_null() && dict::dict_len(unsafe { &*d }) != 0 {
+                            if let Some(v) = dict_get_hinted(d, nm, u64::MAX, e) {
+                                return Ok((unsafe { PyRef::from_borrowed(v) }, None));
+                            }
+                        }
+                        return Ok((unsafe { PyRef::from_borrowed(s.c as *mut PyObject) }, Some(o.to_ref())));
+                    }
+                }
+                kind::EMPTY => {}
+                _ => {
+                    if let Some(r) = load_attr_hit(o, nm, e) {
+                        return Ok((r?, None));
+                    }
                 }
             }
         }
     }
-    load_method_miss(o, nm, e)
+    load_method_miss(o, nm, es)
 }
 
 #[cold]
-fn load_method_miss(o: &PyObject, nm: &PyObject, e: &Entry) -> PyResult<(PyRef, Option<PyRef>)> {
-    if e.note_miss() {
-        fill_load_attr(o, nm, e, true);
+fn load_method_miss(o: &PyObject, nm: &PyObject, es: &[Entry]) -> PyResult<(PyRef, Option<PyRef>)> {
+    if es[0].note_miss() {
+        if let Some(f) = fill_load_attr(o, nm, true) {
+            store_fill(es, f);
+        }
     }
     super::eval::load_method(o, nm)
 }
 
 /// StoreAttr through the cache.
 #[inline]
-pub fn store_attr(o: &PyObject, nm: &PyObject, v: &PyObject, e: &Entry) -> PyResult<()> {
-    if let Some(s) = e.read() {
-        let tp = o.type_ptr();
-        if cache::type_tag(tp) as u64 == s.a {
-            match s.kind {
-                kind::INSTANCE_DICT => unsafe {
-                    let slot = dict_slot(o.as_ptr());
-                    if !slot.is_null() {
-                        if (*slot).is_null() {
-                            *slot = dict::new_dict().into_raw();
+pub fn store_attr(o: &PyObject, nm: &PyObject, v: &PyObject, es: &[Entry]) -> PyResult<()> {
+    let tp = o.type_ptr();
+    let tag = cache::type_tag(tp) as u64;
+    for e in es {
+        if let Some(s) = e.read() {
+            if tag == s.a && s.kind != kind::EMPTY {
+                match s.kind {
+                    kind::INSTANCE_DICT => unsafe {
+                        let slot = dict_slot(o.as_ptr());
+                        if !slot.is_null() {
+                            if (*slot).is_null() {
+                                *slot = dict::new_dict().into_raw();
+                            }
+                            return dict::set_item(&**slot, nm, v);
                         }
-                        return dict::set_item(&**slot, nm, v);
-                    }
-                },
-                kind::SLOT => unsafe {
-                    let p = (o.as_ptr() as *mut u8).add(s.c) as *mut *mut PyObject;
-                    let old = *p;
-                    *p = v.to_ref().into_raw();
-                    xdecref(old);
-                    return Ok(());
-                },
-                kind::DATA_DESCR => unsafe {
-                    let d = s.c as *mut PyObject;
-                    if let Some(set) = (*d).ty().tp_descr_set {
-                        let r = set(d, o.as_ptr(), v.as_ptr());
-                        return if r < 0 { Err(PyErr) } else { Ok(()) };
-                    }
-                },
-                _ => {}
+                    },
+                    kind::SLOT => unsafe {
+                        let p = (o.as_ptr() as *mut u8).add(s.c) as *mut *mut PyObject;
+                        let old = *p;
+                        *p = v.to_ref().into_raw();
+                        xdecref(old);
+                        return Ok(());
+                    },
+                    kind::DATA_DESCR => unsafe {
+                        let d = s.c as *mut PyObject;
+                        if let Some(set) = (*d).ty().tp_descr_set {
+                            let r = set(d, o.as_ptr(), v.as_ptr());
+                            return if r < 0 { Err(PyErr) } else { Ok(()) };
+                        }
+                    },
+                    _ => {}
+                }
             }
         }
     }
-    store_attr_miss(o, nm, v, e)
+    store_attr_miss(o, nm, v, es)
 }
 
 #[cold]
-fn store_attr_miss(o: &PyObject, nm: &PyObject, v: &PyObject, e: &Entry) -> PyResult<()> {
-    if e.note_miss() {
-        fill_store_attr(o, nm, e);
+fn store_attr_miss(o: &PyObject, nm: &PyObject, v: &PyObject, es: &[Entry]) -> PyResult<()> {
+    let r = ab::setattr(o, nm, v);
+    if r.is_ok() && es[0].note_miss() {
+        if let Some(f) = fill_store_attr(o, nm) {
+            store_fill(es, f);
+        }
     }
-    ab::setattr(o, nm, v)
+    r
 }
 
-fn fill_store_attr(o: &PyObject, nm: &PyObject, e: &Entry) {
+fn fill_store_attr(o: &PyObject, nm: &PyObject) -> Option<Fill> {
     let tp = o.type_ptr();
     let t = o.ty();
     if !pystr::is_str_exact(nm) || t.tp_setattro.map(|f| f as usize) != Some(object_generic_setattro as usize) {
-        return;
+        return None;
     }
     let tag = cache::assign_type_tag(tp);
     if tag == 0 {
-        return;
+        return None;
     }
+    // hint: where the attribute now lives in the instance dict
+    let hint = || {
+        let dp = instance_dict_ptr(o);
+        if !dp.is_null() && dict::is_dict_exact(unsafe { &*dp }) {
+            if let Ok(Some(ix)) = dict::lookup_index(unsafe { &*dp }, nm, pystr::str_hash(nm)) {
+                return ix as u64;
+            }
+        }
+        u64::MAX
+    };
     match lookup(tp, nm) {
         Some(d) => {
-            if let Some(_set) = d.ty().tp_descr_set {
+            if d.ty().tp_descr_set.is_some() {
                 if let Some((off, tc)) = unsafe { member_offset(&d, tp, true) } {
-                    e.write(kind::SLOT, tag as u64, tc as u64, off);
-                } else {
-                    e.write(kind::DATA_DESCR, tag as u64, 0, d.as_ptr() as usize);
+                    return Some((kind::SLOT, tag as u64, tc as u64, off));
                 }
-                return;
+                return Some((kind::DATA_DESCR, tag as u64, 0, d.as_ptr() as usize));
             }
             if type_has_dict(tp) {
-                e.write(kind::INSTANCE_DICT, tag as u64, 0, 0);
+                return Some((kind::INSTANCE_DICT, tag as u64, hint(), 0));
             }
+            None
         }
         None => {
             if type_has_dict(tp) {
-                e.write(kind::INSTANCE_DICT, tag as u64, 0, 0);
+                return Some((kind::INSTANCE_DICT, tag as u64, hint(), 0));
             }
+            None
         }
     }
 }

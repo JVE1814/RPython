@@ -105,6 +105,7 @@ fn run_script(path: &str, opts: &MainOptions) -> Outcome {
             insert_path0(path);
         }
         let r = (|| -> PyResult<()> {
+            main_module()?;
             let runpy = crate::import::import_absolute("runpy")?;
             let f = ab::getattr_str(&runpy, "_run_module_as_main")?;
             ab::call(&f, &[&pystr::new_str("__main__"), crate::types::bool_::false_obj()])?;

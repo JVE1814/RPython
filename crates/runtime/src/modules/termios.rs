@@ -278,16 +278,16 @@ pub fn init() -> PyResult {
         ERROR.store(e.into_raw(), Ordering::Release);
     }
     let methods = mdefs![
-        ("tcgetattr", O, t_tcgetattr, "tcgetattr($module, fd, /)\n--\n\nGet the tty attributes for file descriptor fd.\n\nReturns a list [iflag, oflag, cflag, lflag, ispeed, ospeed, cc]\nwhere cc is a list of the tty special characters (each a string of\nlength 1, except the items with indices VMIN and VTIME, which are\nintegers when these fields are defined).  The interpretation of the\nflags and the speeds as well as the indexing in the cc array must be\ndone using the symbolic constants defined in this module."),
-        ("tcsetattr", FAST, t_tcsetattr, "tcsetattr($module, fd, when, attributes, /)\n--\n\nSet the tty attributes for file descriptor fd.\n\nThe attributes to be set are taken from the attributes argument, which\nis a list like the one returned by tcgetattr(). The when argument\ndetermines when the attributes are changed: termios.TCSANOW to\nchange immediately, termios.TCSADRAIN to change after transmitting all\nqueued output, or termios.TCSAFLUSH to change after transmitting all\nqueued output and discarding all queued input."),
-        ("tcsendbreak", FAST, t_tcsendbreak, "tcsendbreak($module, fd, duration, /)\n--\n\nSend a break on file descriptor fd.\n\nA zero duration sends a break for 0.25-0.5 seconds; a nonzero duration\nhas a system dependent meaning."),
-        ("tcdrain", O, t_tcdrain, "tcdrain($module, fd, /)\n--\n\nWait until all output written to file descriptor fd has been transmitted."),
-        ("tcflush", FAST, t_tcflush, "tcflush($module, fd, queue, /)\n--\n\nDiscard queued data on file descriptor fd.\n\nThe queue selector specifies which queue: termios.TCIFLUSH for the input\nqueue, termios.TCOFLUSH for the output queue, or termios.TCIOFLUSH for\nboth queues."),
-        ("tcflow", FAST, t_tcflow, "tcflow($module, fd, action, /)\n--\n\nSuspend or resume input or output on file descriptor fd.\n\nThe action argument can be termios.TCOOFF to suspend output,\ntermios.TCOON to restart output, termios.TCIOFF to suspend input,\nor termios.TCION to restart input."),
-        ("tcgetwinsize", O, t_tcgetwinsize, "tcgetwinsize($module, fd, /)\n--\n\nGet the tty winsize for file descriptor fd.\n\nReturns a tuple (ws_row, ws_col)."),
-        ("tcsetwinsize", FAST, t_tcsetwinsize, "tcsetwinsize($module, fd, winsize, /)\n--\n\nSet the tty winsize for file descriptor fd.\n\nThe winsize to be set is taken from the winsize argument, which\nis a two-item tuple (ws_row, ws_col) like the one returned by tcgetwinsize()."),
+        ("tcgetattr", O, t_tcgetattr, "tcgetattr($module, fd, /)\n--\n\nReturn the terminal attributes of fd as a list\n[iflag, oflag, cflag, lflag, ispeed, ospeed, cc]; cc holds one-byte bytes\nobjects, or ints for VMIN and VTIME in non-canonical mode."),
+        ("tcsetattr", FAST, t_tcsetattr, "tcsetattr($module, fd, when, attributes, /)\n--\n\nSet the terminal attributes of fd from a list as returned by tcgetattr().\n\nwhen is TCSANOW, TCSADRAIN or TCSAFLUSH."),
+        ("tcsendbreak", FAST, t_tcsendbreak, "tcsendbreak($module, fd, duration, /)\n--\n\nTransmit a break on fd (duration 0 means the default length)."),
+        ("tcdrain", O, t_tcdrain, "tcdrain($module, fd, /)\n--\n\nBlock until all output written to fd has been transmitted."),
+        ("tcflush", FAST, t_tcflush, "tcflush($module, fd, queue, /)\n--\n\nDiscard pending terminal data: TCIFLUSH (input), TCOFLUSH (output) or TCIOFLUSH (both)."),
+        ("tcflow", FAST, t_tcflow, "tcflow($module, fd, action, /)\n--\n\nSuspend or restart terminal I/O: TCOOFF, TCOON, TCIOFF or TCION."),
+        ("tcgetwinsize", O, t_tcgetwinsize, "tcgetwinsize($module, fd, /)\n--\n\nReturn the window size of the terminal fd as (rows, columns)."),
+        ("tcsetwinsize", FAST, t_tcsetwinsize, "tcsetwinsize($module, fd, winsize, /)\n--\n\nSet the window size of the terminal fd from a (rows, columns) pair."),
     ];
-    let (m, d) = crate::modules::fncommon::new_module("termios", methods, Some("This module provides an interface to the Posix calls for tty I/O control.\nFor a complete description of these calls, see the Posix or Unix manual\npages. It is only available for those Unix versions that support Posix\ntermios style tty I/O control.\n\nAll functions in this module take a file descriptor fd as their first\nargument. This can be an integer file descriptor, such as returned by\nsys.stdin.fileno(), or a file object, such as sys.stdin itself."))?;
+    let (m, d) = crate::modules::fncommon::new_module("termios", methods, Some("POSIX terminal control (tcgetattr(), tcsetattr() and related calls).\n\nEvery function takes the terminal as a file descriptor or an object with\na fileno() method; the constants mirror the C header definitions."))?;
     dict::set_item_str(&d, "error", unsafe { &*ERROR.load(Ordering::Acquire) })?;
     for (n, v) in CONSTANTS {
         dict::set_item_str(&d, n, &int::new_int(*v))?;

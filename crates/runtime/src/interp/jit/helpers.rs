@@ -156,7 +156,7 @@ pub unsafe extern "C" fn h_load_global(f: *mut Frame, sp: *mut *mut PyObject, na
 pub unsafe extern "C" fn h_load_attr(sp: *mut *mut PyObject, name: *mut PyObject, e: *const Entry) -> u64 {
     unsafe {
         let o = take(sp.sub(1));
-        match specialize::load_attr(&o, &*name, &*e) {
+        match specialize::load_attr(&o, &*name, std::slice::from_raw_parts(e, crate::interp::cache::POLY)) {
             Ok(v) => {
                 put(sp.sub(1), v);
                 OK
@@ -169,7 +169,7 @@ pub unsafe extern "C" fn h_load_attr(sp: *mut *mut PyObject, name: *mut PyObject
 pub unsafe extern "C" fn h_load_method(sp: *mut *mut PyObject, name: *mut PyObject, e: *const Entry) -> u64 {
     unsafe {
         let o = take(sp.sub(1));
-        match specialize::load_method(&o, &*name, &*e) {
+        match specialize::load_method(&o, &*name, std::slice::from_raw_parts(e, crate::interp::cache::POLY)) {
             Ok((m, s)) => {
                 put(sp.sub(1), m);
                 *sp = s.map_or(std::ptr::null_mut(), |s| s.into_raw());
@@ -184,7 +184,7 @@ pub unsafe extern "C" fn h_store_attr(sp: *mut *mut PyObject, name: *mut PyObjec
     unsafe {
         let o = take(sp.sub(1));
         let v = take(sp.sub(2));
-        match specialize::store_attr(&o, &*name, &v, &*e) {
+        match specialize::store_attr(&o, &*name, &v, std::slice::from_raw_parts(e, crate::interp::cache::POLY)) {
             Ok(()) => OK,
             Err(_) => ERR,
         }
