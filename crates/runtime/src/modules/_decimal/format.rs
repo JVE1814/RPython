@@ -153,7 +153,7 @@ pub fn round_sig(d: &Dec, n: usize, round: Round) -> Dec {
     let (mut r, _) = rescale_raw(d, target as i64, round);
     // rounding up 99..9 yields 10..0 with one digit too many; that digit is a zero
     if nat::digits(&r.coef) as usize > n {
-        r.coef = nat::shr_trunc(&r.coef, 1);
+        r.coef = nat::shr_trunc(&r.coef, 1).into();
         r.exp += 1;
     }
     r

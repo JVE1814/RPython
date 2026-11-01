@@ -1,146 +1,64 @@
-"""Token constants (the numbering used by the Python tokenizer)."""
+"""Numeric codes of the token types produced by the Python tokenizer.
+
+Every token type is a module level integer constant (``NAME``, ``OP``, ...);
+``tok_name`` maps the codes back to names and ``EXACT_TOKEN_TYPES`` maps
+operator strings to their specific codes.
+"""
+
+# Token type names in code order: the code of a name is its position.
+_ORDERED_NAMES = (
+    'ENDMARKER', 'NAME', 'NUMBER', 'STRING', 'NEWLINE', 'INDENT', 'DEDENT',
+    'LPAR', 'RPAR', 'LSQB', 'RSQB', 'COLON', 'COMMA', 'SEMI', 'PLUS', 'MINUS',
+    'STAR', 'SLASH', 'VBAR', 'AMPER', 'LESS', 'GREATER', 'EQUAL', 'DOT',
+    'PERCENT', 'LBRACE', 'RBRACE', 'EQEQUAL', 'NOTEQUAL', 'LESSEQUAL',
+    'GREATEREQUAL', 'TILDE', 'CIRCUMFLEX', 'LEFTSHIFT', 'RIGHTSHIFT',
+    'DOUBLESTAR', 'PLUSEQUAL', 'MINEQUAL', 'STAREQUAL', 'SLASHEQUAL',
+    'PERCENTEQUAL', 'AMPEREQUAL', 'VBAREQUAL', 'CIRCUMFLEXEQUAL',
+    'LEFTSHIFTEQUAL', 'RIGHTSHIFTEQUAL', 'DOUBLESTAREQUAL', 'DOUBLESLASH',
+    'DOUBLESLASHEQUAL', 'AT', 'ATEQUAL', 'RARROW', 'ELLIPSIS', 'COLONEQUAL',
+    'EXCLAMATION', 'OP', 'TYPE_IGNORE', 'TYPE_COMMENT', 'SOFT_KEYWORD',
+    'FSTRING_START', 'FSTRING_MIDDLE', 'FSTRING_END',
+    'TSTRING_START', 'TSTRING_MIDDLE', 'TSTRING_END',
+    'COMMENT', 'NL',
+    # the last two are only produced by the tokenize module
+    'ERRORTOKEN', 'ENCODING',
+)
+
+# Operator spelling of the types between LPAR and EXCLAMATION.
+_OPERATORS = (
+    '(', ')', '[', ']', ':', ',', ';', '+', '-', '*', '/', '|', '&', '<',
+    '>', '=', '.', '%', '{', '}', '==', '!=', '<=', '>=', '~', '^', '<<',
+    '>>', '**', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=',
+    '>>=', '**=', '//', '//=', '@', '@=', '->', '...', ':=', '!',
+)
+
+tok_name = dict(enumerate(_ORDERED_NAMES))
+globals().update({name: code for code, name in tok_name.items()})
+
+N_TOKENS = len(_ORDERED_NAMES)
+NT_OFFSET = 256   # first non-terminal (grammar symbol) code
+tok_name[N_TOKENS] = 'N_TOKENS'
+tok_name[NT_OFFSET] = 'NT_OFFSET'
+
+_first_operator = _ORDERED_NAMES.index('LPAR')
+EXACT_TOKEN_TYPES = {spelling: _first_operator + i
+                     for i, spelling in enumerate(_OPERATORS)}
+del _first_operator
 
 __all__ = ['tok_name', 'ISTERMINAL', 'ISNONTERMINAL', 'ISEOF',
-           'EXACT_TOKEN_TYPES']
-
-ENDMARKER = 0
-NAME = 1
-NUMBER = 2
-STRING = 3
-NEWLINE = 4
-INDENT = 5
-DEDENT = 6
-LPAR = 7
-RPAR = 8
-LSQB = 9
-RSQB = 10
-COLON = 11
-COMMA = 12
-SEMI = 13
-PLUS = 14
-MINUS = 15
-STAR = 16
-SLASH = 17
-VBAR = 18
-AMPER = 19
-LESS = 20
-GREATER = 21
-EQUAL = 22
-DOT = 23
-PERCENT = 24
-LBRACE = 25
-RBRACE = 26
-EQEQUAL = 27
-NOTEQUAL = 28
-LESSEQUAL = 29
-GREATEREQUAL = 30
-TILDE = 31
-CIRCUMFLEX = 32
-LEFTSHIFT = 33
-RIGHTSHIFT = 34
-DOUBLESTAR = 35
-PLUSEQUAL = 36
-MINEQUAL = 37
-STAREQUAL = 38
-SLASHEQUAL = 39
-PERCENTEQUAL = 40
-AMPEREQUAL = 41
-VBAREQUAL = 42
-CIRCUMFLEXEQUAL = 43
-LEFTSHIFTEQUAL = 44
-RIGHTSHIFTEQUAL = 45
-DOUBLESTAREQUAL = 46
-DOUBLESLASH = 47
-DOUBLESLASHEQUAL = 48
-AT = 49
-ATEQUAL = 50
-RARROW = 51
-ELLIPSIS = 52
-COLONEQUAL = 53
-EXCLAMATION = 54
-OP = 55
-TYPE_IGNORE = 56
-TYPE_COMMENT = 57
-SOFT_KEYWORD = 58
-FSTRING_START = 59
-FSTRING_MIDDLE = 60
-FSTRING_END = 61
-TSTRING_START = 62
-TSTRING_MIDDLE = 63
-TSTRING_END = 64
-COMMENT = 65
-NL = 66
-# Produced only by the tokenize module
-ERRORTOKEN = 67
-ENCODING = 68
-N_TOKENS = 69
-# First non-terminal symbol number
-NT_OFFSET = 256
-
-tok_name = {value: name
-            for name, value in globals().items()
-            if isinstance(value, int) and not name.startswith('_')}
-__all__.extend(tok_name.values())
-
-EXACT_TOKEN_TYPES = {
-    '!': EXCLAMATION,
-    '!=': NOTEQUAL,
-    '%': PERCENT,
-    '%=': PERCENTEQUAL,
-    '&': AMPER,
-    '&=': AMPEREQUAL,
-    '(': LPAR,
-    ')': RPAR,
-    '*': STAR,
-    '**': DOUBLESTAR,
-    '**=': DOUBLESTAREQUAL,
-    '*=': STAREQUAL,
-    '+': PLUS,
-    '+=': PLUSEQUAL,
-    ',': COMMA,
-    '-': MINUS,
-    '-=': MINEQUAL,
-    '->': RARROW,
-    '.': DOT,
-    '...': ELLIPSIS,
-    '/': SLASH,
-    '//': DOUBLESLASH,
-    '//=': DOUBLESLASHEQUAL,
-    '/=': SLASHEQUAL,
-    ':': COLON,
-    ':=': COLONEQUAL,
-    ';': SEMI,
-    '<': LESS,
-    '<<': LEFTSHIFT,
-    '<<=': LEFTSHIFTEQUAL,
-    '<=': LESSEQUAL,
-    '=': EQUAL,
-    '==': EQEQUAL,
-    '>': GREATER,
-    '>=': GREATEREQUAL,
-    '>>': RIGHTSHIFT,
-    '>>=': RIGHTSHIFTEQUAL,
-    '@': AT,
-    '@=': ATEQUAL,
-    '[': LSQB,
-    ']': RSQB,
-    '^': CIRCUMFLEX,
-    '^=': CIRCUMFLEXEQUAL,
-    '{': LBRACE,
-    '|': VBAR,
-    '|=': VBAREQUAL,
-    '}': RBRACE,
-    '~': TILDE,
-}
+           'EXACT_TOKEN_TYPES'] + list(tok_name.values())
 
 
 def ISTERMINAL(x):
+    """True for token (terminal) codes."""
     return x < NT_OFFSET
 
 
 def ISNONTERMINAL(x):
+    """True for grammar symbol (non-terminal) codes."""
     return x >= NT_OFFSET
 
 
 def ISEOF(x):
+    """True for the end-of-input token."""
     return x == ENDMARKER

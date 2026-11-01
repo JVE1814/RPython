@@ -934,6 +934,8 @@ pub fn init_types() {
         t.tp_flags |= Py_TPFLAGS_HAVE_VECTORCALL | Py_TPFLAGS_METHOD_DESCRIPTOR;
 
         setup(classmethod_descr_type(), c"classmethod_descriptor", std::mem::size_of::<PyMethodDescrObject>());
+        // Unlike the other descriptors, classmethod descriptors cannot be pickled.
+        (*classmethod_descr_type()).tp_methods = std::ptr::null_mut();
         let t = &mut *classmethod_descr_type();
         t.tp_descr_get = Some(classmethod_descr_get);
         t.tp_call = Some(classmethod_descr_call);
