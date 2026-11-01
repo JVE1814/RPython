@@ -286,55 +286,19 @@ pub(crate) fn assemble(mut ir: Ir, info: UnitInfo) -> Result<CodeUnit, CompileEr
         }
     }
 
-    // ---- reachability
-    let nblocks = ir.blocks.len();
-    let order = std::mem::take(&mut ir.order);
-    let mut pos_in_order = vec![usize::MAX; nblocks];
-    for (p, &b) in order.iter().enumerate() {
-        pos_in_order[b as usize] = p;
-    }
-    let next_in_order = |b: Label| -> Option<Label> {
-        let p = pos_in_order[b as usize];
-        if p + 1 < order.len() {
-            Some(order[p + 1])
-        } else {
-            None
-        }
-    };
-    let mut reachable = vec![false; nblocks];
-    {
-        let mut stack = vec![order[0]];
-        reachable[order[0] as usize] = true;
-        while let Some(b) = stack.pop() {
-            let blk = &ir.blocks[b as usize];
-            let mut falls = true;
-            for i in &blk.instrs {
-                if i.target != NO_LABEL && !reachable[i.target as usize] {
-                    reachable[i.target as usize] = true;
-                    stack.push(i.target);
-                }
-                if is_terminal(i.op) {
-                    falls = false;
-                    break;
-                }
-            }
-            if falls {
-                if let Some(n) = next_in_order(b) {
-                    if !reachable[n as usize] {
-                        reachable[n as usize] = true;
-                        stack.push(n);
-                    }
-                }
-            }
-        }
-    }
+    // ---- reachability, jump threading, exit duplication
     // Truncate instructions after a terminal one (dead tail) in each block.
     for b in ir.blocks.iter_mut() {
         if let Some(p) = b.instrs.iter().position(|i| is_terminal(i.op)) {
             b.instrs.truncate(p + 1);
         }
     }
-    let order: Vec<Label> = order.into_iter().filter(|&b| reachable[b as usize]).collect();
+    let order = std::mem::take(&mut ir.order);
+    let mut order = filter_reachable(&ir, order);
+    thread_jumps(&mut ir, &order);
+    duplicate_exits_without_lineno(&mut ir, &mut order);
+    let order = filter_reachable(&ir, order);
+    let nblocks = ir.blocks.len();
     let mut pos_in_order = vec![usize::MAX; nblocks];
     for (p, &b) in order.iter().enumerate() {
         pos_in_order[b as usize] = p;
@@ -659,6 +623,37 @@ pub(crate) fn assemble(mut ir: Ir, info: UnitInfo) -> Result<CodeUnit, CompileEr
         }
     }
 
+    // ---- drop unused constants (keep consts[0] when it is the docstring)
+    let consts = {
+        let mut used = vec![false; info.consts.len()];
+        if info.flags & co::HAS_DOCSTRING != 0 && !used.is_empty() {
+            used[0] = true;
+        }
+        for f in &flat {
+            if f.op == Op::LoadConst {
+                if let Some(u) = used.get_mut(f.arg as usize) {
+                    *u = true;
+                }
+            }
+        }
+        let mut remap = vec![u32::MAX; info.consts.len()];
+        let mut out = Vec::with_capacity(info.consts.len());
+        for (i, c) in info.consts.iter().enumerate() {
+            if used[i] {
+                remap[i] = out.len() as u32;
+                out.push(c.clone());
+            }
+        }
+        for f in flat.iter_mut() {
+            if f.op == Op::LoadConst {
+                if let Some(&r) = remap.get(f.arg as usize) {
+                    f.arg = r;
+                }
+            }
+        }
+        out
+    };
+
     // ---- compute instruction indices with ExtendedArg prefixes
     for (b, s) in &flat_block_start {
         block_start[*b as usize] = *s as u32; // provisional (flat index)
@@ -764,7 +759,7 @@ pub(crate) fn assemble(mut ir: Ir, info: UnitInfo) -> Result<CodeUnit, CompileEr
         stacksize: maxdepth as u32,
         code,
         locations,
-        consts: info.consts,
+        consts,
         names: info.names,
         localsplusnames: names,
         localspluskinds: kinds,
@@ -863,4 +858,139 @@ mod tests {
     }
 
     const NO_LOC_T: Location = Location { lineno: 0, end_lineno: 0, col: u32::MAX, end_col: u32::MAX };
+}
+
+/// CPython's `duplicate_exits_without_lineno`: a small exit block (ending in ReturnValue)
+/// without any location that is reached by jumps gets one copy per jumping predecessor,
+/// carrying the location of the jump, so that the implicit `return None` reports the line of
+/// the code that reached it (matters for sys.settrace 'line'/'return' events).
+fn duplicate_exits_without_lineno(ir: &mut Ir, order: &mut Vec<Label>) {
+    let is_exit = |b: &Block| -> bool {
+        !b.instrs.is_empty()
+            && b.instrs.len() <= 4
+            && b.instrs.iter().all(|i| i.loc.lineno == 0)
+            && matches!(b.instrs.last().map(|i| i.op), Some(IOp::Op(Op::ReturnValue)))
+    };
+    let n = order.len();
+    let mut pos = vec![usize::MAX; ir.blocks.len()];
+    for (p, &b) in order.iter().enumerate() {
+        pos[b as usize] = p;
+    }
+    // skip over empty blocks (they fall through)
+    let orig_order: Vec<Label> = order.clone();
+    let resolve = |ir: &Ir, mut t: usize| -> usize {
+        let mut guard = 0;
+        while ir.blocks[t].instrs.is_empty() && pos[t] != usize::MAX && pos[t] + 1 < n && guard < n {
+            t = orig_order[pos[t] + 1] as usize;
+            guard += 1;
+        }
+        t
+    };
+    for p in 0..n {
+        let b = order[p] as usize;
+        let mut last_loc: Option<Location> = None;
+        for k in 0..ir.blocks[b].instrs.len() {
+            let i = ir.blocks[b].instrs[k];
+            if i.loc.lineno != 0 {
+                last_loc = Some(i.loc);
+            }
+            if i.target == NO_LABEL || matches!(i.op, IOp::SetupFinally | IOp::SetupCleanup | IOp::SetupWith | IOp::SetupYield) {
+                continue;
+            }
+            let t = resolve(ir, i.target as usize);
+            if !is_exit(&ir.blocks[t]) {
+                continue;
+            }
+            let loc = match last_loc {
+                Some(l) => l,
+                None => continue,
+            };
+            let mut copy = ir.blocks[t].clone();
+            for ci in copy.instrs.iter_mut() {
+                ci.loc = loc;
+            }
+            ir.blocks.push(copy);
+            let nl = (ir.blocks.len() - 1) as Label;
+            order.push(nl);
+            ir.blocks[b].instrs[k].target = nl;
+        }
+    }
+}
+
+/// Blocks reachable from the entry (following jumps, setup targets and fallthrough), in order.
+fn filter_reachable(ir: &Ir, order: Vec<Label>) -> Vec<Label> {
+    let nblocks = ir.blocks.len();
+    let mut pos = vec![usize::MAX; nblocks];
+    for (p, &b) in order.iter().enumerate() {
+        pos[b as usize] = p;
+    }
+    let mut reachable = vec![false; nblocks];
+    let mut stack = vec![order[0]];
+    reachable[order[0] as usize] = true;
+    while let Some(b) = stack.pop() {
+        let blk = &ir.blocks[b as usize];
+        let mut falls = true;
+        for i in &blk.instrs {
+            if i.target != NO_LABEL && !reachable[i.target as usize] {
+                reachable[i.target as usize] = true;
+                stack.push(i.target);
+            }
+            if is_terminal(i.op) {
+                falls = false;
+                break;
+            }
+        }
+        if falls {
+            let p = pos[b as usize];
+            if p + 1 < order.len() {
+                let n = order[p + 1];
+                if !reachable[n as usize] {
+                    reachable[n as usize] = true;
+                    stack.push(n);
+                }
+            }
+        }
+    }
+    order.into_iter().filter(|&b| reachable[b as usize]).collect()
+}
+
+/// Retarget jumps whose target (after skipping empty blocks) is an unconditional `Jump`
+/// without its own line number (or on the same line).
+fn thread_jumps(ir: &mut Ir, order: &[Label]) {
+    let mut pos = vec![usize::MAX; ir.blocks.len()];
+    for (p, &b) in order.iter().enumerate() {
+        pos[b as usize] = p;
+    }
+    let first_real = |ir: &Ir, mut t: usize| -> Option<(usize, Instr)> {
+        for _ in 0..order.len() {
+            if let Some(i) = ir.blocks[t].instrs.first() {
+                return Some((t, *i));
+            }
+            let p = pos[t];
+            if p == usize::MAX || p + 1 >= order.len() {
+                return None;
+            }
+            t = order[p + 1] as usize;
+        }
+        None
+    };
+    for &b in order {
+        for k in 0..ir.blocks[b as usize].instrs.len() {
+            let i = ir.blocks[b as usize].instrs[k];
+            let jumpy = matches!(i.op, IOp::Op(op) if op.is_jump() && !matches!(op, Op::ForIter | Op::Send));
+            if !jumpy || i.target == NO_LABEL {
+                continue;
+            }
+            let mut t = i.target;
+            for _ in 0..8 {
+                match first_real(ir, t as usize) {
+                    Some((_, j)) if j.op == IOp::Op(Op::Jump) && j.target != t && (j.loc.lineno == 0 || j.loc.lineno == i.loc.lineno) => {
+                        t = j.target;
+                    }
+                    _ => break,
+                }
+            }
+            ir.blocks[b as usize].instrs[k].target = t;
+        }
+    }
 }

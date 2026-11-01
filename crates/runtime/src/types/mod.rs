@@ -1,3 +1,8 @@
+pub mod genericalias;
+pub mod lang_util;
+pub mod structseq;
+pub mod bootstrap_builtins;
+pub mod complex_pow;
 pub mod asyncgen;
 pub mod bool_;
 pub mod bytearray;
@@ -41,7 +46,10 @@ pub mod format_impl;
 pub mod core_slots;
 pub mod dictview;
 pub mod float_math;
+pub mod float_methods;
+pub mod complex_methods;
 pub mod str_sub;
+pub mod str_methods;
 
 use crate::ffi::PyTypeObject;
 
@@ -81,6 +89,8 @@ pub fn init_all() -> crate::errors::PyResult<()> {
     none::init_types();
     int_methods::init_types();
     bool_::init_types();
+    float_methods::init_types();
+    complex_methods::init_types();
     core_slots::init_types();
     exceptions::init_types();
     code::init_types();
@@ -92,6 +102,7 @@ pub fn init_all() -> crate::errors::PyResult<()> {
     super_::init_types();
     dictview::init_types();
     bootstrap_builtins::init_types();
+    frameobject_proxy::init_types();
     use typeobject::type_ready;
     type_ready(typeobject::object_type())?;
     type_ready(typeobject::type_type())?;
@@ -140,8 +151,21 @@ pub fn init_all() -> crate::errors::PyResult<()> {
     exceptions::ready_all()?;
     dictview::ready()?;
     bootstrap_builtins::ready()?;
+    type_ready(frameobject_proxy::proxy_type())?;
+    str_methods::ready_types()?;
+    lang_init()?;
     Ok(())
 }
-pub mod complex_pow;
-pub mod bootstrap_builtins;
-pub mod structseq;
+
+/// Types of the "lang" workstream (GenericAlias, UnionType, typing objects, async gens).
+fn lang_init() -> crate::errors::PyResult<()> {
+    genericalias::init_types();
+    union::init_types();
+    typevar::init_types();
+    genericalias::ready()?;
+    union::ready()?;
+    typevar::ready()?;
+    asyncgen::init_types()?;
+    genericalias::register_builtin_class_getitems();
+    Ok(())
+}

@@ -48,6 +48,10 @@ pub struct ParseOptions {
     pub allow_incomplete_input: bool,
     /// PyCF_DONT_IMPLY_DEDENT ('single' mode): no implicit DEDENTs at a mid-line EOF.
     pub dont_imply_dedent: bool,
+    /// Stack budget for the recursive descent (bytes); deeper nesting raises
+    /// MemoryError("... too complex ..."). Default 1 MiB (about 700 nested lambdas or
+    /// 1300 unary operators); raise it when parsing on a thread with a big stack.
+    pub max_stack_bytes: usize,
     /// Unicode database hooks.
     pub hooks: UnicodeHooks,
     /// File name used in a few messages (e.g. "Non-UTF-8 code ... in file X").
@@ -66,6 +70,7 @@ impl Default for ParseOptions {
             barry_as_flufl: false,
             allow_incomplete_input: false,
             dont_imply_dedent: false,
+            max_stack_bytes: 1 << 20,
             hooks: UnicodeHooks::default(),
             filename: "<string>".to_string(),
             decode: None,
@@ -139,11 +144,20 @@ pub(crate) struct Parser<'a> {
     /// lazy-import / misc state
     pub(crate) in_lambda: usize,
     pub(crate) no_genexp_arg: bool,
+    /// first pass: top-level statement start -> end token index
+    top_ok: std::collections::HashMap<usize, usize>,
+    /// furthest token index fetched by the first pass
+    first_fail: usize,
+    stack_base: usize,
     /// Tokens that had a type comment consumed etc. (unused)
     pub(crate) type_ignores: Vec<TypeIgnore>,
 }
 
-const MAX_DEPTH: usize = 3000;
+/// Recursion limit of the parser (in addition to the stack budget, see
+/// `ParseOptions::max_stack_bytes`).
+const MAX_DEPTH: usize = 6000;
+/// Maximum length of iteratively parsed chains that produce nested ASTs.
+const MAX_CHAIN: usize = 5000;
 
 impl<'a> Parser<'a> {
     pub(crate) fn new(src: &'a str, opts: &'a ParseOptions) -> Parser<'a> {
@@ -208,6 +222,9 @@ impl<'a> Parser<'a> {
             fstring_depth: 0,
             in_lambda: 0,
             no_genexp_arg: false,
+            top_ok: std::collections::HashMap::new(),
+            first_fail: usize::MAX,
+            stack_base: 0,
             type_ignores,
         }
     }
@@ -336,6 +353,7 @@ impl<'a> Parser<'a> {
     pub(crate) fn tok_loc(t: &Token) -> Loc {
         Loc { lineno: t.lineno as i32, col_offset: t.col, end_lineno: t.end_lineno as i32, end_col_offset: t.end_col }
     }
+    #[allow(dead_code)]
     pub(crate) fn span(a: Loc, b: Loc) -> Loc {
         Loc { lineno: a.lineno, col_offset: a.col_offset, end_lineno: b.end_lineno, end_col_offset: b.end_col_offset }
     }
@@ -387,9 +405,24 @@ impl<'a> Parser<'a> {
 
     pub(crate) fn enter(&mut self) -> Result<(), PErr> {
         self.depth += 1;
-        if self.depth > MAX_DEPTH {
-            let t = self.peek();
-            return Err(self.error_at(ErrorKind::Syntax, "too many nested parentheses", t.lineno as i32, t.col, t.end_lineno as i32, t.end_col));
+        if self.depth > MAX_DEPTH || (self.depth & 7 == 0 && self.stack_used() > self.opts.max_stack_bytes) {
+            return Err(Box::new(SyntaxError { kind: ErrorKind::MemoryError, ..SyntaxError::simple("Parser stack overflowed - Python source too complex to parse") }));
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn stack_used(&self) -> usize {
+        let here = 0u8;
+        let addr = &here as *const u8 as usize;
+        self.stack_base.saturating_sub(addr)
+    }
+
+    /// Guard for constructs parsed iteratively that still build deeply nested ASTs (trailer
+    /// chains, binary operator chains, elif chains): consumers recurse over the AST.
+    pub(crate) fn check_chain(&self, n: usize) -> Result<(), PErr> {
+        if n > MAX_CHAIN {
+            return Err(Box::new(SyntaxError { kind: ErrorKind::RecursionError, ..SyntaxError::simple("maximum recursion depth exceeded during compilation") }));
         }
         Ok(())
     }
@@ -417,6 +450,8 @@ impl<'a> Parser<'a> {
     // ------------------------------------------------------------------ driver
 
     fn run(&mut self) -> Result<Mod, SyntaxError> {
+        let here = 0u8;
+        self.stack_base = &here as *const u8 as usize;
         // First pass.
         let r = self.start_rule();
         match r {
@@ -441,6 +476,7 @@ impl<'a> Parser<'a> {
             }
         }
         let last_fill = self.fill;
+        self.first_fail = last_fill.saturating_sub(1);
         let last_token = self.toks[last_fill.max(1) - 1];
         // Second pass with invalid rules.
         self.p = 0;
@@ -531,18 +567,42 @@ impl<'a> Parser<'a> {
     }
 
     fn file_rule(&mut self) -> R<Mod> {
-        let body = if self.at(TokenType::ENDMARKER) { Vec::new() } else {
-            match self.statements()? {
-                Some(b) => b,
-                None => return Ok(None),
+        // statements+ ENDMARKER, written out so that the second pass can skip the invalid_*
+        // rules for top-level statements that already parsed in the first pass and end
+        // before the first-pass failure point (a big speedup for errors late in large files).
+        let mut body = Vec::new();
+        loop {
+            if self.at(TokenType::ENDMARKER) {
+                break;
             }
-        };
+            let m = self.p;
+            let fast = self.invalid && self.top_ok.get(&m).map(|&e| e < self.first_fail).unwrap_or(false);
+            let save = self.invalid;
+            if fast {
+                self.invalid = false;
+            }
+            let r = self.statement();
+            self.invalid = save;
+            match r? {
+                Some(mut s) => {
+                    if !self.invalid {
+                        self.top_ok.insert(m, self.p);
+                    }
+                    body.append(&mut s);
+                }
+                None => {
+                    self.p = m;
+                    break;
+                }
+            }
+        }
         if !self.at(TokenType::ENDMARKER) {
             return Ok(None);
         }
         let type_ignores = std::mem::take(&mut self.type_ignores);
         Ok(Some(Mod::Module { body, type_ignores }))
     }
+
 
     fn eval_rule(&mut self) -> R<Mod> {
         let Some(e) = self.expressions()? else { return Ok(None) };
