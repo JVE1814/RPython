@@ -316,80 +316,8 @@ pub unsafe extern "C" fn PyObject_CopyData(dest: *mut PyObject, src: *mut PyObje
     }
 }
 
-// ---------------------------------------------------------------- raw memory exporter
+// ---------------------------------------------------------------- memoryview (types::memoryview)
 
-/// A tiny exporter object owning a `Py_buffer` description (used by
-/// PyMemoryView_FromMemory / FromBuffer): memoryview(exporter) re-exports it.
-#[repr(C)]
-struct RawBuffer {
-    ob_base: PyObject,
-    view: Py_buffer,
-    shape: [Py_ssize_t; 64],
-    strides: [Py_ssize_t; 64],
-    format: [u8; 64],
-}
-static mut RAWBUF_TYPE: PyTypeObject = PyTypeObject::ZERO;
-static mut RAWBUF_PROCS: PyBufferProcs = PyBufferProcs::ZERO;
-
-unsafe extern "C" fn rawbuf_get(o: *mut PyObject, view: *mut Py_buffer, flags: c_int) -> c_int {
-    unsafe {
-        let r = &mut *(o as *mut RawBuffer);
-        if flags & PYBUF_WRITABLE != 0 && r.view.readonly != 0 {
-            let _ = crate::err!(BufferError, "Object is not writable.");
-            return -1;
-        }
-        std::ptr::copy_nonoverlapping(&r.view, view, 1);
-        (*view).obj = o;
-        incref(o);
-        0
-    }
-}
-unsafe extern "C" fn rawbuf_dealloc(o: *mut PyObject) {
-    unsafe { crate::alloc::free_object(o) }
-}
-fn rawbuf_type() -> *mut PyTypeObject {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| unsafe {
-        let t = &mut *(&raw mut RAWBUF_TYPE);
-        t.tp_name = c"_capi_buffer".as_ptr();
-        t.tp_basicsize = std::mem::size_of::<RawBuffer>() as isize;
-        t.tp_flags = Py_TPFLAGS_DEFAULT;
-        t.tp_dealloc = Some(rawbuf_dealloc);
-        (*(&raw mut RAWBUF_PROCS)).bf_getbuffer = Some(rawbuf_get);
-        t.tp_as_buffer = &raw mut RAWBUF_PROCS;
-        let _ = crate::types::typeobject::type_ready(t);
-    });
-    &raw mut RAWBUF_TYPE
-}
-unsafe fn raw_exporter(src: &Py_buffer) -> PyRef {
-    unsafe {
-        let tp = rawbuf_type();
-        let op = crate::alloc::alloc_object(tp, std::mem::size_of::<RawBuffer>());
-        let r = &mut *(op as *mut RawBuffer);
-        std::ptr::copy_nonoverlapping(src, &mut r.view, 1);
-        r.view.obj = std::ptr::null_mut();
-        let nd = (src.ndim.max(0) as usize).min(64);
-        if !src.shape.is_null() {
-            std::ptr::copy_nonoverlapping(src.shape, r.shape.as_mut_ptr(), nd);
-            r.view.shape = r.shape.as_mut_ptr();
-        }
-        if !src.strides.is_null() {
-            std::ptr::copy_nonoverlapping(src.strides, r.strides.as_mut_ptr(), nd);
-            r.view.strides = r.strides.as_mut_ptr();
-        }
-        if !src.format.is_null() {
-            let f = CStr::from_ptr(src.format).to_bytes();
-            let n = f.len().min(63);
-            r.format[..n].copy_from_slice(&f[..n]);
-            r.view.format = r.format.as_mut_ptr() as *mut c_char;
-        }
-        PyRef::from_raw(op)
-    }
-}
-fn memoryview_type() -> PyResult {
-    let b = crate::builtins::builtins_module();
-    ab::getattr_str(&b, "memoryview")
-}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyMemoryView_FromObject(o: *mut PyObject) -> *mut PyObject {
     unsafe { ret(crate::types::memoryview::from_object(&*o)) }
