@@ -4,7 +4,11 @@ No dependencies. `build.rs` generates the 617-entry 128-bit power-of-ten table
 for Schubfach (it reuses `src/bignum.rs`).
 
 All errors are `NumFmtError { kind: ErrorKind::{ValueError, OverflowError,
-TypeError}, msg }`. The messages match CPython exactly unless noted below.
+TypeError, MemoryError}, msg }`. The messages match CPython exactly unless noted
+below. `MemoryError` (with an empty message) is returned when padding or
+precision would need more memory than can be reserved, for example
+`format(x, "9223372036854775807f")`, where CPython raises MemoryError.
+No function panics on user input.
 
 ## Float → string
 
@@ -62,10 +66,10 @@ TypeError}, msg }`. The messages match CPython exactly unless noted below.
   runtime resolves `*`; a negative `*` width sets `flags.left`).
   `PercentOpts::from_spec` covers the case with no `*`.
 * `percent_format_float(out, x, conv, &opts)` handles `e E f F g G`.
-* `percent_format_int(out, negative, digits, conv, &opts)` handles
+* `percent_format_int(out, negative, digits, conv, &opts) -> Result<()>` handles
   `d i u o x X`. It applies precision zero-padding, the `0o`/`0x`/`0X` prefixes
   for `#`, and the `0` flag.
-* `percent_format_str(out, s, conv, &opts)` and `percent_str_layout(len, conv, &opts)`
+* `percent_format_str(out, s, conv, &opts) -> Result<()>` and `percent_str_layout(len, conv, &opts)`
   handle `s r a c b`.
 * `percent_char_range_error(is_bytes)` returns the `%c` OverflowError text.
   The runtime builds the TypeError messages ("format argument 1: %x requires
