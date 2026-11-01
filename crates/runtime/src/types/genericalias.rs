@@ -576,8 +576,8 @@ unsafe extern "C" fn self_iter(o: *mut PyObject) -> *mut PyObject {
 }
 
 pub fn ready() -> PyResult<()> {
-    type_ready(ga_type())?;
-    type_ready(&raw mut GA_ITER_TYPE)?;
+    lu::ready_type(ga_type())?;
+    lu::ready_type(&raw mut GA_ITER_TYPE)?;
     Ok(())
 }
 

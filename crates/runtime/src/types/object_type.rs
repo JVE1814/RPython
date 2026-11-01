@@ -435,7 +435,7 @@ unsafe extern "C" fn type_setattro(op: *mut PyObject, nm: *mut PyObject, v: *mut
                 TypeError,
                 "cannot set '{}' attribute of immutable type '{}'",
                 pystr::to_string_lossy(&*nm),
-                type_name(&*tp)
+                std::ffi::CStr::from_ptr((*tp).tp_name).to_string_lossy()
             );
             return -1;
         }

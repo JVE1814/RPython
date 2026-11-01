@@ -599,6 +599,9 @@ pub fn type_ready(tp: *mut PyTypeObject) -> PyResult<()> {
         for b in tuple::tuple_items(&*mro).iter().skip(1) {
             inherit_slots(tp, as_type(b));
         }
+        if (*tp).tp_flags & Py_TPFLAGS_DISALLOW_INSTANTIATION != 0 {
+            (*tp).tp_new = None;
+        }
         // operator wrappers for slots (after inheritance so only own slots get wrappers)
         crate::types::slots::add_operators(tp)?;
         // __hash__ = None if __eq__ overridden without __hash__
