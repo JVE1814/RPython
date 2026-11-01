@@ -4,3 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+
+[dev-dependencies]
+# Real Unicode database for tests only (the library itself has no dependencies; the runtime
+# passes UnicodeHooks backed by this crate).
+rpy-unicode = { path = "../unicode" }

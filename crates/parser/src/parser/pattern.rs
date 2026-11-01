@@ -213,7 +213,7 @@ impl<'a> Parser<'a> {
         let start = self.p;
         let t = self.peek();
         match t.ty {
-            T::NUMBER | T::MINUS => {
+            T::NUMBER | T::MINUS | T::PLUS => {
                 if let Some(e) = self.literal_number()? {
                     return Ok(Some(Pattern { node: PatternKind::MatchValue { value: bx(e) }, loc: self.loc(start) }));
                 }
@@ -324,14 +324,20 @@ impl<'a> Parser<'a> {
     /// signed_number !('+'|'-') | complex_number
     fn literal_number(&mut self) -> R<Expr> {
         let start = self.p;
-        let neg = self.eat(T::MINUS).is_some();
+        let sign = if self.at(T::MINUS) || self.at(T::PLUS) { Some(self.advance().ty) } else { None };
+        let neg = sign.is_some();
         let Some(nt) = self.eat(T::NUMBER) else {
             self.p = start;
             return Ok(None);
         };
         let v = self.parse_number(&nt)?;
         let num = Expr::new(ExprKind::Constant { value: v, kind: None }, Self::tok_loc(&nt));
-        let real = if neg { Expr::new(ExprKind::UnaryOp { op: UnaryOp::USub, operand: bx(num) }, self.loc(start)) } else { num };
+        let real = if neg {
+            let op = if sign == Some(T::PLUS) { UnaryOp::UAdd } else { UnaryOp::USub };
+            Expr::new(ExprKind::UnaryOp { op, operand: bx(num) }, self.loc(start))
+        } else {
+            num
+        };
         if matches!(self.peek_ty(), T::PLUS | T::MINUS) {
             // complex_number: signed_real_number ('+'|'-') imaginary_number
             let op = if self.peek_ty() == T::PLUS { Operator::Add } else { Operator::Sub };
@@ -422,7 +428,7 @@ impl<'a> Parser<'a> {
     fn mapping_key(&mut self) -> R<Expr> {
         let t = self.peek();
         match t.ty {
-            T::NUMBER | T::MINUS => self.literal_number(),
+            T::NUMBER | T::MINUS | T::PLUS => self.literal_number(),
             T::STRING | T::FSTRING_START | T::TSTRING_START => self.strings(),
             T::NAME => match t.kw {
                 Kw::NoneKw | Kw::True | Kw::False => self.atom(),

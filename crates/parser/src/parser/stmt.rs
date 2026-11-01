@@ -78,10 +78,6 @@ impl<'a> Parser<'a> {
 
     fn simple_stmt(&mut self) -> R<Stmt> {
         let start = self.p;
-        if self.invalid {
-            self.invalid_assignment()?;
-            self.p = start;
-        }
         let t = self.peek();
         if t.ty == T::NAME {
             match t.kw {
@@ -122,7 +118,14 @@ impl<'a> Parser<'a> {
                 _ => {}
             }
         }
-        self.assignment_or_expr()
+        let r = self.assignment_or_expr()?;
+        if self.invalid && !matches!(r.as_ref().map(|s| &s.node), Some(StmtKind::Assign { .. } | StmtKind::AugAssign { .. } | StmtKind::AnnAssign { .. })) {
+            let end = self.p;
+            self.p = start;
+            self.invalid_assignment()?;
+            self.p = if r.is_some() { end } else { start };
+        }
+        Ok(r)
     }
 
     fn assignment_or_expr(&mut self) -> R<Stmt> {
@@ -502,7 +505,7 @@ impl<'a> Parser<'a> {
                 if !self.at(T::COMMA) {
                     break;
                 }
-                if !paren {
+                if !paren && !(self.peek_n(1).ty == T::NAME && !self.peek_n(1).kw.is_hard()) {
                     // import_from_as_names !','
                     if self.invalid {
                         let ct = self.peek();
