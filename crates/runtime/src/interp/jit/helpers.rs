@@ -724,6 +724,49 @@ pub unsafe extern "C" fn h_for_iter(sp: *mut *mut PyObject) -> u64 {
     }
 }
 
+/// Send: [recv, v] -> [recv, yielded] (0) | [result] (1, jump) | error (2, [recv])
+pub unsafe extern "C" fn h_send(sp: *mut *mut PyObject) -> u64 {
+    unsafe {
+        let v = take(sp.sub(1));
+        let recv = &**sp.sub(2);
+        match crate::types::genobject::send_to(recv, &v) {
+            Ok(crate::types::genobject::SendResult::Yield(r)) => {
+                put(sp.sub(1), r);
+                0
+            }
+            Ok(crate::types::genobject::SendResult::Return(r)) => {
+                decref(std::ptr::replace(sp.sub(2), std::ptr::null_mut()));
+                put(sp.sub(2), r);
+                1
+            }
+            Err(_) => 2,
+        }
+    }
+}
+
+/// GetYieldFromIter (code_flags: the frame's co_flags)
+pub unsafe extern "C" fn h_get_yield_from_iter(sp: *mut *mut PyObject, code_flags: u64) -> u64 {
+    unsafe {
+        let o = take(sp.sub(1));
+        let r = if crate::types::genobject::is_coroutine_exact(&o) {
+            if code_flags as u32 & (bc::co::COROUTINE | bc::co::ITERABLE_COROUTINE) == 0 {
+                let _ = err!(TypeError, "cannot 'yield from' a coroutine object in a non-coroutine generator");
+                return ERR;
+            }
+            o
+        } else if crate::types::genobject::is_generator_exact(&o) {
+            o
+        } else {
+            match ab::get_iter(&o) {
+                Ok(i) => i,
+                Err(_) => return ERR,
+            }
+        };
+        put(sp.sub(1), r);
+        OK
+    }
+}
+
 // ------------------------------------------------------------------ calls
 
 /// Call / CallKw: [callable, self_or_null, args..(, kwnames)] -> [result]

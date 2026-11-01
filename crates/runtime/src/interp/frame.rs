@@ -41,6 +41,19 @@ pub struct Frame {
     pub trace_event: u8,
     /// Instruction to continue at after a trace function set f_lineno, or -1.
     pub jump_to: i32,
+    /// globals/builtins are the function's (borrowed: the frame owns `func`, whose
+    /// __globals__/__builtins__ cannot be rebound), so no refcount traffic per call.
+    pub borrowed_gb: bool,
+}
+
+fn borrows_globals(func: Option<&PyObject>, globals: &PyObject, builtins: &PyObject) -> bool {
+    match func {
+        Some(fo) if crate::types::funcobject::is_function(fo) => {
+            let ff = crate::types::funcobject::func(fo);
+            ff.func_globals == globals.as_ptr() && ff.func_builtins == builtins.as_ptr()
+        }
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -62,8 +75,9 @@ impl Frame {
             f.slots.resize(total, std::ptr::null_mut());
             f.code = code.to_ref().into_raw();
             f.func = func.map_or(std::ptr::null_mut(), |f| f.to_ref().into_raw());
-            f.globals = globals.to_ref().into_raw();
-            f.builtins = builtins.to_ref().into_raw();
+            f.borrowed_gb = borrows_globals(func, globals, builtins);
+            f.globals = if f.borrowed_gb { globals.as_ptr() } else { globals.to_ref().into_raw() };
+            f.builtins = if f.borrowed_gb { builtins.as_ptr() } else { builtins.to_ref().into_raw() };
             f.locals = locals.map_or(std::ptr::null_mut(), |l| l.to_ref().into_raw());
             f.prev = std::ptr::null_mut();
             f.lasti = 0;
@@ -84,11 +98,13 @@ impl Frame {
             return f;
         }
         let slots = vec![std::ptr::null_mut::<PyObject>(); total];
+        let borrowed_gb = borrows_globals(func, globals, builtins);
         Box::new(Frame {
             code: code.to_ref().into_raw(),
             func: func.map_or(std::ptr::null_mut(), |f| f.to_ref().into_raw()),
-            globals: globals.to_ref().into_raw(),
-            builtins: builtins.to_ref().into_raw(),
+            globals: if borrowed_gb { globals.as_ptr() } else { globals.to_ref().into_raw() },
+            builtins: if borrowed_gb { builtins.as_ptr() } else { builtins.to_ref().into_raw() },
+            borrowed_gb,
             locals: locals.map_or(std::ptr::null_mut(), |l| l.to_ref().into_raw()),
             prev: std::ptr::null_mut(),
             lasti: 0,
@@ -165,8 +181,10 @@ impl Frame {
         unsafe {
             xdecref(self.code);
             xdecref(self.func);
-            xdecref(self.globals);
-            xdecref(self.builtins);
+            if !self.borrowed_gb {
+                xdecref(self.globals);
+                xdecref(self.builtins);
+            }
             xdecref(self.locals);
             xdecref(self.f_trace);
         }

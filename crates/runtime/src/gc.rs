@@ -76,6 +76,49 @@ fn with_list<R>(f: impl FnOnce(*mut GcHead) -> R) -> R {
     f(head)
 }
 
+/// Old generation: objects that survived a collection. New objects are tracked in
+/// the young list (`with_list`); young collections examine only the young list
+/// (references from old objects count as external, which is conservative), then
+/// promote the survivors. Full collections examine both lists.
+static OLD_HEAD: std::sync::atomic::AtomicPtr<GcHead> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static YOUNG_COLLECTIONS: AtomicUsize = AtomicUsize::new(0);
+/// Tracked objects right after the last full collection.
+static LAST_FULL_LIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// Run `f(young, old)` under the list lock.
+fn with_lists<R>(f: impl FnOnce(*mut GcHead, *mut GcHead) -> R) -> R {
+    with_list(|young| {
+        let mut old = OLD_HEAD.load(Relaxed);
+        if old.is_null() {
+            let b = Box::leak(Box::new(GcHead { next: std::ptr::null_mut(), prev: std::ptr::null_mut() }));
+            let p = b as *mut GcHead;
+            b.next = p;
+            b.prev = p;
+            old = p;
+            OLD_HEAD.store(old, Relaxed);
+        }
+        f(young, old)
+    })
+}
+
+/// Move every object of the young list to the end of the old list.
+fn promote_young() {
+    with_lists(|young, old| unsafe {
+        if (*young).next == young {
+            return;
+        }
+        let first = (*young).next;
+        let last = (*young).prev;
+        let old_last = (*old).prev;
+        (*old_last).next = first;
+        (*first).prev = old_last;
+        (*last).next = old;
+        (*old).prev = last;
+        (*young).next = young;
+        (*young).prev = young;
+    })
+}
+
 #[inline]
 pub unsafe fn track(op: *mut PyObject) {
     unsafe {
@@ -101,7 +144,13 @@ pub unsafe fn track(op: *mut PyObject) {
 }
 
 fn trigger_threshold() -> usize {
-    crate::gc_support::trigger_threshold(THRESHOLD.load(Relaxed), LAST_LIVE.load(Relaxed))
+    // young collection after THRESHOLD net new tracked objects; 0 disables
+    // automatic collection (gc.set_threshold(0))
+    let _ = LAST_LIVE.load(Relaxed);
+    match THRESHOLD.load(Relaxed) {
+        0 => usize::MAX,
+        t => t,
+    }
 }
 
 #[inline]
@@ -243,38 +292,52 @@ impl std::hash::Hasher for PtrHasher {
     }
 }
 
+/// Trial-deletion graph. Membership and the dense index of an object are stored in
+/// its GC pre-header while a collection runs (`prev` temporarily holds
+/// `index << 2 | 3`; real link pointers are 8-aligned, so the tag cannot collide),
+/// which avoids a hash map lookup per visited reference. The links are restored
+/// before returning. The graph is passed to the visitors through their `arg`.
 struct Graph {
     objs: Vec<*mut PyObject>,
-    index: HashMap<usize, usize, std::hash::BuildHasherDefault<PtrHasher>>,
+    saved_prev: Vec<*mut GcHead>,
     refs: Vec<isize>,
     reachable: Vec<bool>,
+    stack: Vec<usize>,
 }
 
-thread_local! {
-    static CUR: std::cell::Cell<*mut Graph> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+const GRAPH_TAG: usize = 3;
+
+#[inline(always)]
+unsafe fn graph_index(op: *mut PyObject) -> Option<usize> {
+    unsafe {
+        if op.is_null() || (*op).ob_gc_bits.load(Relaxed) & GC_BIT_TRACKED == 0 {
+            return None;
+        }
+        let p = (*gc_head(op)).prev as usize;
+        if p & GRAPH_TAG == GRAPH_TAG { Some(p >> 2) } else { None }
+    }
 }
 
-unsafe extern "C" fn visit_decref(op: *mut PyObject, _arg: *mut c_void) -> c_int {
-    CUR.with(|c| {
-        let g = unsafe { &mut *c.get() };
-        if let Some(&i) = g.index.get(&(op as usize)) {
+unsafe extern "C" fn visit_decref(op: *mut PyObject, arg: *mut c_void) -> c_int {
+    unsafe {
+        if let Some(i) = graph_index(op) {
+            let g = &mut *(arg as *mut Graph);
             g.refs[i] -= 1;
         }
-    });
+    }
     0
 }
 
 unsafe extern "C" fn visit_mark(op: *mut PyObject, arg: *mut c_void) -> c_int {
-    CUR.with(|c| {
-        let g = unsafe { &mut *c.get() };
-        if let Some(&i) = g.index.get(&(op as usize)) {
+    unsafe {
+        if let Some(i) = graph_index(op) {
+            let g = &mut *(arg as *mut Graph);
             if !g.reachable[i] {
                 g.reachable[i] = true;
-                let stack = unsafe { &mut *(arg as *mut Vec<usize>) };
-                stack.push(i);
+                g.stack.push(i);
             }
         }
-    });
+    }
     0
 }
 
@@ -287,42 +350,58 @@ unsafe fn traverse(op: *mut PyObject, visit: visitproc, arg: *mut c_void) {
     }
 }
 
-/// Compute the unreachable subset of `objs`.
+/// Compute the unreachable subset of `objs` (all tracked, no duplicates).
 unsafe fn find_unreachable(objs: Vec<*mut PyObject>) -> Vec<*mut PyObject> {
     unsafe {
+        let n = objs.len();
         let mut g = Graph {
-            index: objs.iter().enumerate().map(|(i, &o)| (o as usize, i)).collect(),
+            saved_prev: Vec::with_capacity(n),
             refs: objs.iter().map(|&o| total_refcnt(&*o)).collect(),
-            reachable: vec![false; objs.len()],
+            reachable: vec![false; n],
+            stack: Vec::new(),
             objs,
         };
-        CUR.with(|c| c.set(&mut g as *mut Graph));
-        for i in 0..g.objs.len() {
-            traverse(g.objs[i], Some(visit_decref), std::ptr::null_mut());
+        for (i, &o) in g.objs.iter().enumerate() {
+            let h = gc_head(o);
+            g.saved_prev.push((*h).prev);
+            (*h).prev = ((i << 2) | GRAPH_TAG) as *mut GcHead;
         }
-        let mut stack: Vec<usize> = Vec::new();
-        for i in 0..g.objs.len() {
+        let gp = &mut g as *mut Graph as *mut c_void;
+        for i in 0..n {
+            traverse(g.objs[i], Some(visit_decref), gp);
+        }
+        for i in 0..n {
             if g.refs[i] > 0 && !g.reachable[i] {
                 g.reachable[i] = true;
-                stack.push(i);
+                g.stack.push(i);
             }
         }
-        while let Some(i) = stack.pop() {
+        while let Some(i) = g.stack.pop() {
             let op = g.objs[i];
-            traverse(op, Some(visit_mark), &mut stack as *mut Vec<usize> as *mut c_void);
+            traverse(op, Some(visit_mark), gp);
         }
-        CUR.with(|c| c.set(std::ptr::null_mut()));
+        for (i, &o) in g.objs.iter().enumerate() {
+            (*gc_head(o)).prev = g.saved_prev[i];
+        }
         g.objs.iter().zip(g.reachable.iter()).filter(|(_, r)| !**r).map(|(o, _)| *o).collect()
     }
 }
 
 fn snapshot() -> Vec<*mut PyObject> {
-    with_list(|head| unsafe {
-        let mut v = Vec::with_capacity(TRACKED.load(Relaxed).max(0) as usize);
-        let mut h = (*head).next;
-        while h != head {
-            v.push((h as *mut u8).add(std::mem::size_of::<GcHead>()) as *mut PyObject);
-            h = (*h).next;
+    snapshot_gen(false)
+}
+
+/// Tracked objects of the young generation (young_only) or of both generations.
+fn snapshot_gen(young_only: bool) -> Vec<*mut PyObject> {
+    with_lists(|young, old| unsafe {
+        let mut v = Vec::with_capacity(if young_only { 1024 } else { TRACKED.load(Relaxed).max(0) as usize });
+        let lists: &[*mut GcHead] = if young_only { &[young] } else { &[young, old] };
+        for &head in lists {
+            let mut h = (*head).next;
+            while h != head {
+                v.push((h as *mut u8).add(std::mem::size_of::<GcHead>()) as *mut PyObject);
+                h = (*h).next;
+            }
         }
         v
     })
@@ -330,6 +409,10 @@ fn snapshot() -> Vec<*mut PyObject> {
 
 /// Run a full collection; returns the number of unreachable objects found.
 pub fn collect() -> usize {
+    collect_gen(false)
+}
+
+fn collect_gen(young_only: bool) -> usize {
     if COLLECTING.swap(true, AcqRel) {
         return 0;
     }
@@ -340,20 +423,27 @@ pub fn collect() -> usize {
         return 0;
     }
     let t0 = std::time::Instant::now();
-    let n = unsafe { collect_stopped() };
+    let n = unsafe { collect_stopped(young_only) };
+    promote_young();
     crate::gc_support::DURATION_NS.fetch_add((t0.elapsed().as_nanos() as usize).max(1), Relaxed);
     start_the_world();
     ALLOCS_SINCE.store(0, Relaxed);
     LAST_LIVE.store(TRACKED.load(Relaxed).max(0) as usize, Relaxed);
+    if young_only {
+        YOUNG_COLLECTIONS.fetch_add(1, Relaxed);
+    } else {
+        YOUNG_COLLECTIONS.store(0, Relaxed);
+        LAST_FULL_LIVE.store(TRACKED.load(Relaxed).max(0) as usize, Relaxed);
+    }
     COLLECTIONS.fetch_add(1, Relaxed);
     COLLECTING.store(false, Release);
     n
 }
 
-unsafe fn collect_stopped() -> usize {
+unsafe fn collect_stopped(young_only: bool) -> usize {
     unsafe {
         let saved_exc = crate::errors::take_exc();
-        let objs = snapshot();
+        let objs = snapshot_gen(young_only);
         crate::gc_support::CANDIDATES.fetch_add(objs.len(), Relaxed);
         let unreachable = find_unreachable(objs);
         if unreachable.is_empty() {
@@ -451,7 +541,11 @@ unsafe fn adjust(op: *mut PyObject, delta: isize) {
 pub fn maybe_collect(ts: &ThreadState) {
     ts.c.eval_breaker.fetch_and(!crate::threads::EVAL_GC, AcqRel);
     if ENABLED.load(Relaxed) && ALLOCS_SINCE.load(Relaxed) >= trigger_threshold() {
-        collect();
+        // full collection every 10 young ones, or when the heap grew by half since
+        // the last full collection (cyclic garbage that reached the old generation)
+        let tracked = TRACKED.load(Relaxed).max(0) as usize;
+        let full = YOUNG_COLLECTIONS.load(Relaxed) >= 10 && tracked > LAST_FULL_LIVE.load(Relaxed) + LAST_FULL_LIVE.load(Relaxed) / 2;
+        collect_gen(!full);
     }
 }
 

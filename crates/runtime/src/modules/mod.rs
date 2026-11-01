@@ -82,6 +82,8 @@ pub mod _decimal;
 pub mod _bz2;
 pub mod _pickle;
 pub mod testinternalcapi;
+pub mod array;
+pub mod _datetime;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
 pub fn register_all() {
@@ -109,4 +111,6 @@ pub fn register_all() {
     compress_common::register();
     _decimal::register();
     crate::import::register_builtin("_pickle", _pickle::init_module);
+    crate::import::register_builtin("array", array::init_module);
+    crate::import::register_builtin("_datetime", _datetime::init_module);
 }
