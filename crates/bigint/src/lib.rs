@@ -21,6 +21,8 @@ pub mod math;
 pub mod modpow;
 pub mod mul;
 pub mod nat;
+mod cpu;
+pub use cpu::{set_simd_limit, simd_limit};
 mod kern;
 mod ntt;
 pub mod ops;

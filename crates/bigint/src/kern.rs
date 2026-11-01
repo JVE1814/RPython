@@ -157,29 +157,7 @@ kernels!(add_n_avx2, sub_n_avx2, mul1_avx2, submul1_avx2, #[target_feature(enabl
 #[cfg(target_arch = "x86_64")]
 kernels!(add_n_avx512, sub_n_avx512, mul1_avx512, submul1_avx512, #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2")]);
 
-#[inline(always)]
-fn avx512() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        std::arch::is_x86_feature_detected!("avx512f") && std::arch::is_x86_feature_detected!("avx512bw") && std::arch::is_x86_feature_detected!("avx512vl")
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        false
-    }
-}
-
-#[inline(always)]
-fn avx2() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        std::arch::is_x86_feature_detected!("avx2")
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        false
-    }
-}
+use crate::cpu::{avx2, avx512};
 
 /// out[..n] = a + b for equal lengths n >= 2. Returns carry.
 #[inline]

@@ -214,19 +214,13 @@ enum Isa {
 }
 
 fn isa() -> Isa {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx512f")
-            && std::arch::is_x86_feature_detected!("avx512bw")
-            && std::arch::is_x86_feature_detected!("avx512vl")
-        {
-            return Isa::Avx512;
-        }
-        if std::arch::is_x86_feature_detected!("avx2") {
-            return Isa::Avx2;
-        }
+    if crate::cpu::avx512() {
+        Isa::Avx512
+    } else if crate::cpu::avx2() {
+        Isa::Avx2
+    } else {
+        Isa::Generic
     }
-    Isa::Generic
 }
 
 fn dif(isa: Isa, a: &mut [u32], tw: &[u32], pr: &Prime) {

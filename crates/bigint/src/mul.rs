@@ -144,18 +144,10 @@ macro_rules! basecase_impls {
 basecase_impls!(mul_basecase_generic, sqr_basecase_generic);
 #[cfg(target_arch = "x86_64")]
 basecase_impls!(mul_basecase_avx2, sqr_basecase_avx2, #[target_feature(enable = "avx2")]);
+#[cfg(target_arch = "x86_64")]
+basecase_impls!(mul_basecase_avx512, sqr_basecase_avx512, #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx2")]);
 
-#[inline]
-fn has_avx2() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        std::arch::is_x86_feature_detected!("avx2")
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        false
-    }
-}
+use crate::cpu::{avx2, avx512};
 
 /// Schoolbook product into `out[..a.len()+b.len()]`. Inputs nonempty.
 pub fn mul_basecase(out: &mut [u32], a: &[u32], b: &[u32]) {
@@ -176,7 +168,11 @@ pub fn mul_basecase(out: &mut [u32], a: &[u32], b: &[u32]) {
     };
     #[cfg(target_arch = "x86_64")]
     {
-        if has_avx2() {
+        if avx512() {
+            unsafe { mul_basecase_avx512(out, a, b, acc) };
+            return;
+        }
+        if avx2() {
             unsafe { mul_basecase_avx2(out, a, b, acc) };
             return;
         }
@@ -203,7 +199,11 @@ pub fn sqr_basecase(out: &mut [u32], a: &[u32]) {
     };
     #[cfg(target_arch = "x86_64")]
     {
-        if has_avx2() {
+        if avx512() {
+            unsafe { sqr_basecase_avx512(out, a, acc) };
+            return;
+        }
+        if avx2() {
             unsafe { sqr_basecase_avx2(out, a, acc) };
             return;
         }

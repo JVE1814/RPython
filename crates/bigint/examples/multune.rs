@@ -4,6 +4,7 @@ fn mag(seed: &mut u64, n: usize) -> Vec<u32> { (0..n).map(|_| { *seed ^= *seed <
 fn t<F: FnMut()>(mut f: F) -> f64 { f(); let mut it = 1; loop { let s = Instant::now(); for _ in 0..it { f(); } let e = s.elapsed().as_secs_f64(); if e > 0.01 { break; } it *= 2; } let mut best = f64::MAX; for _ in 0..5 { let s = Instant::now(); for _ in 0..it { f(); } best = best.min(s.elapsed().as_secs_f64() / it as f64 * 1e6); } best }
 fn main() {
     if let Ok(v) = std::env::var("MT") { let t: Vec<usize> = v.split(",").map(|x| x.parse().unwrap()).collect(); mul::set_thresholds(t[0], t[1], t[2], t[3], t[4]); }
+    if let Ok(v) = std::env::var("SIMD") { rpy_bigint::set_simd_limit(v.parse().unwrap()); }
     eprintln!("thresholds {:?}", mul::thresholds());
     let mut seed = 88172645463325252u64;
     let sizes: Vec<usize> = std::env::args().skip(1).map(|s| s.parse().unwrap()).collect();
