@@ -20,6 +20,15 @@ impl<'a> Compiler<'a> {
 
     fn compile_stmt_inner(&mut self, s: &'a Stmt) -> R {
         self.set_loc(s.loc);
+        let malformed = match &s.node {
+            StmtKind::Match { cases, .. } => cases.is_empty(),
+            StmtKind::With(w) | StmtKind::AsyncWith(w) => w.items.is_empty(),
+            StmtKind::Try(t) | StmtKind::TryStar(t) => t.handlers.is_empty() && t.finalbody.is_empty(),
+            _ => false,
+        };
+        if malformed {
+            return Err(CompileError::other(ErrorKind::ValueError, format!("malformed {} node", s.class_name())));
+        }
         match &s.node {
             StmtKind::FunctionDef(f) => self.compile_function_def(s, f, false),
             StmtKind::AsyncFunctionDef(f) => self.compile_function_def(s, f, true),

@@ -116,41 +116,7 @@ const BINOPS: [BinOp; 26] = [
 /// Fast paths for common binary operations on exact builtin types.
 #[inline(always)]
 fn binary_fast(op: BinOp, a: &PyObject, b: &PyObject) -> Option<PyRef> {
-    if int::is_int_exact(a) && int::is_int_exact(b) && int::is_compact(a) && int::is_compact(b) {
-        let x = int::compact_value(a);
-        let y = int::compact_value(b);
-        let r = match op {
-            BinOp::Add | BinOp::InplaceAdd => x + y,
-            BinOp::Subtract | BinOp::InplaceSubtract => x - y,
-            BinOp::Multiply | BinOp::InplaceMultiply => x * y,
-            BinOp::And | BinOp::InplaceAnd => x & y,
-            BinOp::Or | BinOp::InplaceOr => x | y,
-            BinOp::Xor | BinOp::InplaceXor => x ^ y,
-            BinOp::FloorDivide | BinOp::InplaceFloorDivide if y != 0 => x.div_euclid(y) - if y < 0 && x.rem_euclid(y) != 0 { 1 } else { 0 },
-            BinOp::Remainder | BinOp::InplaceRemainder if y != 0 => {
-                let r = x % y;
-                if r != 0 && ((r < 0) != (y < 0)) { r + y } else { r }
-            }
-            _ => return None,
-        };
-        return Some(int::new_int(r));
-    }
-    if float::is_float_exact(a) && float::is_float_exact(b) {
-        let x = float::float_value(a);
-        let y = float::float_value(b);
-        let r = match op {
-            BinOp::Add | BinOp::InplaceAdd => x + y,
-            BinOp::Subtract | BinOp::InplaceSubtract => x - y,
-            BinOp::Multiply | BinOp::InplaceMultiply => x * y,
-            BinOp::TrueDivide | BinOp::InplaceTrueDivide if y != 0.0 => x / y,
-            _ => return None,
-        };
-        return Some(float::new_float(r));
-    }
-    if pystr::is_str_exact(a) && pystr::is_str_exact(b) && matches!(op, BinOp::Add | BinOp::InplaceAdd) {
-        return Some(pystr::concat(a, b));
-    }
-    None
+    super::specialize::binary_fast(op, a, b) // jit workstream: fast paths live in specialize.rs
 }
 
 pub fn binary_op(op: BinOp, a: &PyObject, b: &PyObject) -> PyResult {
@@ -334,7 +300,7 @@ fn unbound_local(f: &Frame, idx: usize) -> PyErr {
 
 /// Look up a global name: globals then builtins.
 #[inline]
-fn load_global(f: &Frame, nm: &PyObject) -> PyResult {
+pub(super) fn load_global(f: &Frame, nm: &PyObject) -> PyResult {
     let g = f.globals();
     if dict::is_dict_exact(g) {
         if let Some(v) = dict::get_item_str(g, nm) {
@@ -388,7 +354,7 @@ fn mapping_get(m: &PyObject, key: &PyObject) -> PyResult<Option<PyRef>> {
     }
 }
 
-fn load_method(o: &PyObject, nm: &PyObject) -> PyResult<(PyRef, Option<PyRef>)> {
+pub(super) fn load_method(o: &PyObject, nm: &PyObject) -> PyResult<(PyRef, Option<PyRef>)> {
     let tp = o.ty();
     if tp.tp_getattro.map(|f| f as usize) == Some(object_generic_getattro as usize) {
         if let Some(d) = lookup(o.type_ptr(), nm) {
@@ -676,6 +642,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
     let code_obj: PyRef = f.code().to_ref();
     let cd = crate::types::code::code_data(&code_obj);
     let code: &[u32] = &cd.code;
+    let caches = cd.caches.tables(code); // jit workstream: inline caches / profiles
     let mut pc: usize = f.next_instr as usize;
     f.yield_from_send = -1;
     let tracing = crate::modules::sys::tracing_active();
@@ -882,7 +849,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                         }
                         Op::LoadGlobal => {
                             let nm = &cd.names[arg as usize];
-                            let v = load_global(f, nm)?;
+                            let v = super::specialize::load_global(f, nm, caches.entry(f.lasti as usize))?;
                             push!(f, v.into_raw());
                         }
                         Op::StoreGlobal => {
@@ -906,19 +873,19 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                         }
                         Op::LoadAttr => {
                             let o = popref!(f);
-                            let v = ab::getattr(&o, &cd.names[arg as usize])?;
+                            let v = super::specialize::load_attr(&o, &cd.names[arg as usize], caches.entry(f.lasti as usize))?;
                             push!(f, v.into_raw());
                         }
                         Op::LoadMethod => {
                             let o = popref!(f);
-                            let (m, s) = load_method(&o, &cd.names[arg as usize])?;
+                            let (m, s) = super::specialize::load_method(&o, &cd.names[arg as usize], caches.entry(f.lasti as usize))?;
                             push!(f, m.into_raw());
                             push!(f, s.map_or(std::ptr::null_mut(), |s| s.into_raw()));
                         }
                         Op::StoreAttr => {
                             let o = popref!(f);
                             let v = popref!(f);
-                            ab::setattr(&o, &cd.names[arg as usize], &v)?;
+                            super::specialize::store_attr(&o, &cd.names[arg as usize], &v, caches.entry(f.lasti as usize))?;
                         }
                         Op::DeleteAttr => {
                             let o = popref!(f);
@@ -982,16 +949,8 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             let b = popref!(f);
                             let a = popref!(f);
                             let cop = (arg & 15) as std::ffi::c_int;
-                            let r = if int::is_int_exact(&a) && int::is_int_exact(&b) && int::is_compact(&a) && int::is_compact(&b) {
-                                let (x, y) = (int::compact_value(&a), int::compact_value(&b));
-                                bool_::new_bool(match cop {
-                                    Py_LT => x < y,
-                                    Py_LE => x <= y,
-                                    Py_EQ => x == y,
-                                    Py_NE => x != y,
-                                    Py_GT => x > y,
-                                    _ => x >= y,
-                                })
+                            let r = if let Some(t) = super::specialize::compare_fast(cop, &a, &b) {
+                                bool_::new_bool(t)
                             } else {
                                 let r = ab::rich_compare(&a, &b, cop)?;
                                 if arg & 16 != 0 && !bool_::is_bool(&r) { bool_::new_bool(ab::is_true(&r)?) } else { r }

@@ -60,6 +60,9 @@ fn raw_obj_alloc(total: usize) -> (*mut u8, u8) {
 #[inline]
 pub unsafe fn alloc_object(tp: *mut PyTypeObject, size: usize) -> *mut PyObject {
     unsafe {
+        if (*tp).tp_flags & crate::ffi::Py_TPFLAGS_READY == 0 {
+            ready_lazily(tp);
+        }
         let (pre, bits) = preheader_for(tp);
         let (raw, large) = raw_obj_alloc(size + pre);
         if raw.is_null() {
@@ -175,6 +178,22 @@ pub unsafe extern "C" fn free_object_c(op: *mut PyObject) {
         free_object(op);
         if (*tp).tp_flags & Py_TPFLAGS_HEAPTYPE != 0 {
             crate::object::decref(tp as *mut PyObject);
+        }
+    }
+}
+
+/// Safety net for static types that were never passed to `type_ready` during startup:
+/// ready them the first time an instance is allocated (before the preheader layout is
+/// derived from their flags). Readying failures are reported as unraisable.
+#[cold]
+#[inline(never)]
+unsafe fn ready_lazily(tp: *mut PyTypeObject) {
+    unsafe {
+        if (*tp).tp_flags & crate::ffi::Py_TPFLAGS_READYING != 0 || (*tp).tp_name.is_null() {
+            return;
+        }
+        if crate::types::typeobject::type_ready(tp).is_err() {
+            crate::errors::clear_exc();
         }
     }
 }

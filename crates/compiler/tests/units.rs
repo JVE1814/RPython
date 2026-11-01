@@ -364,3 +364,46 @@ fn position_validation() {
     }
     compile(&m, &CompileOptions::new("<t>", Mode::Exec)).unwrap();
 }
+
+#[test]
+fn optimize_ast_docstrings() {
+    use rpy_parser::ast::*;
+    let mut m = parse_src("class A:\n    \"\"\"\n    Docstring\"\"\"\n", Mode::Exec);
+    rpy_compiler::optimize_ast(&mut m, 2, 0).unwrap();
+    if let Mod::Module { body, .. } = &m {
+        if let StmtKind::ClassDef { body, .. } = &body[0].node {
+            assert!(matches!(body[0].node, StmtKind::Pass));
+            assert_eq!(body[0].loc, Loc::new(2, 4, 2, 8));
+        } else {
+            panic!()
+        }
+    }
+    let mut m = parse_src("__debug__\n", Mode::Exec);
+    rpy_compiler::optimize_ast(&mut m, 1, 0).unwrap();
+    assert!(format!("{:?}", m).contains("Bool(false)"));
+}
+
+#[test]
+fn malformed_ast_no_panic() {
+    use rpy_parser::ast::*;
+    let mut m = parse_src("a and b\n[x for x in y]\nwith a: pass\n", Mode::Exec);
+    if let Mod::Module { body, .. } = &mut m {
+        if let StmtKind::Expr { value } = &mut body[0].node {
+            if let ExprKind::BoolOp { values, .. } = &mut value.node {
+                values.truncate(1);
+            }
+        }
+        if let StmtKind::Expr { value } = &mut body[1].node {
+            if let ExprKind::ListComp { generators, .. } = &mut value.node {
+                generators.clear();
+            }
+        }
+        if let StmtKind::With(w) = &mut body[2].node {
+            w.items.clear();
+        }
+    }
+    let e = rpy_compiler::validate_ast(&m).unwrap_err();
+    assert_eq!(e.msg, "BoolOp with less than 2 values");
+    let r = compile(&m, &CompileOptions::new("<t>", Mode::Exec));
+    assert!(r.is_err());
+}

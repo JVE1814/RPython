@@ -540,7 +540,7 @@ pub fn add_operators(tp: *mut PyTypeObject) -> PyResult<()> {
         }
         // only add if this type defines the slot itself (not identical to its base's)
         let base = unsafe { (*tp).tp_base };
-        if !base.is_null() && sd.slot.get(base) == f {
+        if !base.is_null() && sd.slot.get(base) == f && !is_heap_type(tp) {
             // inherited: the base's dict already exposes it
             if crate::types::typeobject::lookup(base, &nm).is_some() {
                 continue;
@@ -970,11 +970,12 @@ unsafe fn wrap_indexargfunc(s: &PyObject, a: &[&PyObject], kw: Option<&PyObject>
     let i = ab::index_as_ssize(a[0], Some(crate::types::exceptions::OverflowError()))?;
     unsafe { from_c(cast!(w, unsafe extern "C" fn(*mut PyObject, Py_ssize_t) -> *mut PyObject)(s.as_ptr(), i)) }
 }
-unsafe fn wrap_buffer(s: &PyObject, a: &[&PyObject], kw: Option<&PyObject>, _w: *mut c_void) -> PyResult {
+unsafe fn wrap_buffer(s: &PyObject, a: &[&PyObject], kw: Option<&PyObject>, w: *mut c_void) -> PyResult {
     no_kwargs(kw, "")?;
     check_nargs(a, 1, "")?;
-    let flags = ab::index_as_ssize(a[0], None)?;
-    crate::types::memoryview::memoryview_from_object_flags(s, flags as c_int)
+    let flags = ab::index_as_ssize(a[0], Some(crate::types::exceptions::OverflowError()))?;
+    let proc: getbufferproc = unsafe { cast!(w, getbufferproc) };
+    crate::types::memoryview::from_bufferproc(s, flags, proc)
 }
 unsafe fn wrap_releasebuffer(s: &PyObject, a: &[&PyObject], kw: Option<&PyObject>, _w: *mut c_void) -> PyResult {
     no_kwargs(kw, "")?;

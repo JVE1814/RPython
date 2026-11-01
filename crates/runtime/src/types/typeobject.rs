@@ -589,6 +589,9 @@ pub fn type_ready(tp: *mut PyTypeObject) -> PyResult<()> {
         add_methods(tp)?;
         add_members(tp)?;
         add_getsets(tp)?;
+        // operator wrappers for the slots this type defines itself (before inheritance,
+        // so inherited slots never shadow a base's dunder)
+        crate::types::slots::add_operators(tp)?;
         // MRO
         mro_internal(tp)?;
         // inheritance
@@ -602,8 +605,6 @@ pub fn type_ready(tp: *mut PyTypeObject) -> PyResult<()> {
         if (*tp).tp_flags & Py_TPFLAGS_DISALLOW_INSTANTIATION != 0 {
             (*tp).tp_new = None;
         }
-        // operator wrappers for slots (after inheritance so only own slots get wrappers)
-        crate::types::slots::add_operators(tp)?;
         // __hash__ = None if __eq__ overridden without __hash__
         let d = &*(*tp).tp_dict;
         if dict::get_item_str(d, name!("__hash__")).is_none() {

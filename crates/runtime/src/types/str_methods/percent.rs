@@ -45,6 +45,13 @@ impl ArgName {
 }
 
 impl<'a> Args<'a> {
+    fn need(&self, n: isize) -> PyResult<()> {
+        let remaining = if self.arglen < 0 { (self.argidx == -2) as isize } else { self.arglen - self.argidx };
+        if remaining < n {
+            raise!(TypeError, "not enough arguments for format string (got {})", if self.arglen < 0 { 1 } else { self.arglen });
+        }
+        Ok(())
+    }
     fn next(&mut self) -> PyResult<(PyRef, ArgName)> {
         let got = |s: &Self| if s.arglen < 0 { 1 } else { s.arglen };
         if self.argidx < self.arglen {
@@ -192,6 +199,7 @@ pub fn percent_format(fmt: &PyObject, args: &PyObject) -> PyResult {
                     // conversion character.
                     if !key_present(f, i) {
                         let (w, p) = count_stars(f, i);
+                        a.need(w as isize + p as isize + 1)?;
                         if w {
                             star_value(&mut a, true)?;
                         }
@@ -233,6 +241,10 @@ pub fn percent_format(fmt: &PyObject, args: &PyObject) -> PyResult {
                 }
                 let mut opts_w = None;
                 let mut opts_p = None;
+                let nstars = (spec.width == PercentNum::Star) as isize + (spec.precision == PercentNum::Star) as isize;
+                if nstars > 0 {
+                    a.need(nstars + 1)?;
+                }
                 if spec.width == PercentNum::Star {
                     opts_w = Some(star_value(&mut a, true)?.0);
                 }

@@ -95,10 +95,10 @@ thread_local! {
 fn new_page(d: &mut Depot, class: usize) -> Vec<usize> {
     if d.seg_cur + PAGE > d.seg_end {
         unsafe {
-            // over-allocate to guarantee PAGE alignment
+            // over-allocate to guarantee SEGMENT alignment (so `owns` is a bitmap lookup)
             let raw = libc::mmap(
                 std::ptr::null_mut(),
-                SEGMENT + PAGE,
+                2 * SEGMENT,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                 -1,
@@ -107,7 +107,16 @@ fn new_page(d: &mut Depot, class: usize) -> Vec<usize> {
             if raw == libc::MAP_FAILED {
                 return Vec::new();
             }
-            let start = (raw as usize + PAGE - 1) & !(PAGE - 1);
+            let start = (raw as usize + SEGMENT - 1) & !(SEGMENT - 1);
+            if start > raw as usize {
+                libc::munmap(raw, start - raw as usize);
+            }
+            let (tail, end) = (start + SEGMENT, raw as usize + 2 * SEGMENT);
+            if end > tail {
+                libc::munmap(tail as *mut libc::c_void, end - tail);
+            }
+            let g = start / SEGMENT;
+            SEGMENT_MAP[g / 64].fetch_or(1 << (g % 64), std::sync::atomic::Ordering::Release);
             d.seg_cur = start;
             d.seg_end = start + SEGMENT;
             d.segments.push(start);
@@ -216,4 +225,20 @@ pub fn free_small(p: *mut u8) {
         let mut g = DEPOT.lock().unwrap();
         g.get_or_insert_with(new_depot).batches[c].push(vec![p as usize]);
     }
+}
+
+/// One bit per SEGMENT-aligned 4 MiB granule of the 47-bit address space (4 MiB of
+/// lazily-zeroed BSS): set iff the granule is a tlab segment.
+static SEGMENT_MAP: [std::sync::atomic::AtomicU64; (1usize << 47) / SEGMENT / 64] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; (1usize << 47) / SEGMENT / 64];
+
+/// Does `p` point into memory managed by this allocator? (Used by PyObject_Free,
+/// which receives both tlab blocks and system-allocator blocks.)
+#[inline]
+pub fn owns(p: *const u8) -> bool {
+    let g = p as usize / SEGMENT;
+    if g >= (1usize << 47) / SEGMENT {
+        return false;
+    }
+    SEGMENT_MAP[g / 64].load(std::sync::atomic::Ordering::Acquire) & (1 << (g % 64)) != 0
 }
