@@ -540,6 +540,10 @@ class BaseSelectorEventLoop(base_events.BaseEventLoop):
         return await fut
 
     def _sock_accept(self, fut, sock):
+        if fut.done():
+            # cancelled while the readiness callback was queued: leave the
+            # pending connection for the next accept
+            return
         fd = sock.fileno()
         try:
             conn, address = sock.accept()

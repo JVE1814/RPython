@@ -261,7 +261,13 @@ class Future:
             raise _exceptions.InvalidStateError('Result is not ready.')
         self._fut_log_tb = False
         if self._fut_exc is not None:
-            raise self._fut_exc.with_traceback(self._fut_exc_tb)
+            # the frame must not keep the future alive via the traceback
+            exc, tb = self._fut_exc, self._fut_exc_tb
+            self = None
+            try:
+                raise exc.with_traceback(tb)
+            finally:
+                exc = tb = None
         return self._fut_result
 
     def exception(self):
@@ -352,7 +358,18 @@ class Future:
         self._check_init()
         if self._fut_state == _PENDING:
             self._fut_blocking = True
-            yield self
+            # while suspended, the frame holds the future only in 'fut',
+            # dropped when an exception is thrown in (the frame then ends
+            # up in that exception's traceback)
+            fut = self
+            self = None
+            try:
+                yield fut
+            except BaseException:
+                fut = None
+                raise
+            self = fut
+            fut = None
         if self._fut_state == _PENDING:
             raise RuntimeError("await wasn't used with future")
         if self._fut_state == _FINISHED and self._fut_exc is not None:
@@ -734,11 +751,29 @@ class Task(Future):
     def _task_wakeup(self, fut):
         from asyncio import futures
         futures.future_discard_from_awaited_by(fut, self)
+        if isinstance(fut, Future):
+            # read the outcome directly: raising it here would add this
+            # frame (and the future) to the exception's traceback
+            exc = None
+            if fut._fut_state == _CANCELLED:
+                exc = fut._make_cancelled_error()
+            elif fut._fut_exc is not None:
+                fut._fut_log_tb = False
+                exc = fut._fut_exc.with_traceback(fut._fut_exc_tb)
+            fut = None
+            if exc is None:
+                self._task_step_cb()
+            else:
+                self._task_step_cb(exc)
+            self = exc = None
+            return
         try:
             fut.result()
         except BaseException as exc:
+            fut = None
             self._task_step_cb(exc)
         else:
+            fut = None
             self._task_step_cb()
         self = None
 
