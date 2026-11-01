@@ -145,6 +145,14 @@ class BaseSubprocessTransport(transports.SubprocessTransport):
         except (SystemExit, KeyboardInterrupt):
             raise
         except BaseException as exc:
+            # the protocol never saw connection_made(): drop its queued
+            # calls and the pipes that were not connected, so that the
+            # transport can still finish (and wake _wait()) once the
+            # child is gone
+            self._setup_failed = True
+            self._pending_calls = None
+            for fd in [fd for fd, p in self._pipes.items() if p is None]:
+                del self._pipes[fd]
             if waiter is not None and not waiter.cancelled():
                 waiter.set_exception(exc)
         else:
@@ -175,10 +183,13 @@ class BaseSubprocessTransport(transports.SubprocessTransport):
             self._proc.returncode = returncode
         self._call(self._protocol.process_exited)
         self._try_finish()
+        # wait() returns once the child is gone, even if a pipe stays open
+        # (e.g. inherited by a grandchild)
+        self._wake_exit_waiters()
 
     async def _wait(self):
-        """Wait until the process exited and its pipes are closed."""
-        if self._returncode is not None and self._exit_waiters is None:
+        """Wait until the process exited; return its exit status."""
+        if self._returncode is not None:
             return self._returncode
         waiter = self._loop.create_future()
         self._exit_waiters.append(waiter)
@@ -193,14 +204,20 @@ class BaseSubprocessTransport(transports.SubprocessTransport):
             self._finished = True
             self._call(self._call_connection_lost, None)
 
+    def _wake_exit_waiters(self):
+        waiters, self._exit_waiters = self._exit_waiters, []
+        for waiter in waiters or ():
+            if not waiter.cancelled():
+                waiter.set_result(self._returncode)
+
+    _setup_failed = False
+
     def _call_connection_lost(self, exc):
         try:
-            self._protocol.connection_lost(exc)
+            if not self._setup_failed:
+                self._protocol.connection_lost(exc)
         finally:
-            waiters, self._exit_waiters = self._exit_waiters, None
-            for waiter in waiters:
-                if not waiter.cancelled():
-                    waiter.set_result(self._returncode)
+            self._wake_exit_waiters()
             self._loop = None
             self._proc = None
             self._protocol = None
