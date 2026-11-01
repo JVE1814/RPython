@@ -29,6 +29,98 @@ pub fn find_builtin(name: &str) -> Option<ModInit> {
     BUILTIN_MODULES.lock().unwrap().iter().find(|(n, _)| *n == name).map(|(_, f)| *f)
 }
 
+/// Builtin module objects already created (so re-imports return the same object).
+static BUILTIN_OBJECTS: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
+
+pub fn note_builtin_module(name: &str, m: &PyObject) {
+    let mut g = BUILTIN_OBJECTS.lock().unwrap();
+    if !g.iter().any(|(n, _)| n == name) {
+        g.push((name.to_string(), m.to_ref().into_raw() as usize));
+    }
+}
+pub fn is_builtin_module_object(m: &PyObject, name: &str) -> bool {
+    BUILTIN_OBJECTS.lock().unwrap().iter().any(|(n, p)| n == name && *p == m.as_ptr() as usize)
+}
+fn cached_builtin(name: &str) -> Option<PyRef> {
+    BUILTIN_OBJECTS.lock().unwrap().iter().find(|(n, _)| n == name).map(|(_, p)| unsafe { PyRef::from_borrowed(*p as *mut PyObject) })
+}
+
+/// The importlib bootstrap module once installed.
+pub fn bootstrap() -> Option<PyRef> {
+    let p = BOOTSTRAP.load(std::sync::atomic::Ordering::Acquire);
+    if p.is_null() { None } else { Some(unsafe { PyRef::from_borrowed(p) }) }
+}
+static BOOTSTRAP: std::sync::atomic::AtomicPtr<PyObject> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+/// True once the path-based finders (PathFinder) are installed.
+static EXTERNAL_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn exec_bootstrap_module(name: &str, file: &str, display: &str) -> PyResult {
+    let src = match std::fs::read(file) {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(crate::types::exceptions::os_error_from_errno(e.raw_os_error().unwrap_or(0), Some(&pystr::new_str(file)), None));
+        }
+    };
+    let m = module::new_module(name)?;
+    let d = module::module_dict(&m);
+    dict::set_item_str(&d, "__builtins__", &crate::builtins::builtins_module())?;
+    dict::set_item_str(&crate::modules::sys::modules_dict(), name, &m)?;
+    let r = (|| -> PyResult<()> {
+        let c = crate::compile::compile_bytes(&src, display, crate::compile::Mode::Exec, 0, 0)?;
+        crate::interp::eval_code(&c.code, &d, Some(&d))?;
+        Ok(())
+    })();
+    if r.is_err() {
+        let _ = dict::del_item(&crate::modules::sys::modules_dict(), &pystr::new_str(name));
+        return Err(PyErr);
+    }
+    Ok(m)
+}
+
+/// Install importlib as the import implementation (CPython's frozen
+/// `_frozen_importlib` / `_frozen_importlib_external`, loaded from Lib/importlib).
+pub fn install_importlib(stdlib: &str) -> PyResult<()> {
+    if std::env::var("RPYTHON_NO_IMPORTLIB").map(|v| !v.is_empty()).unwrap_or(false) {
+        return Ok(());
+    }
+    let bs_file = format!("{}/importlib/_bootstrap.py", stdlib);
+    if !std::path::Path::new(&bs_file).is_file() {
+        return Ok(());
+    }
+    let imp = import_absolute("_imp")?;
+    let bs = exec_bootstrap_module("_frozen_importlib", &bs_file, "<frozen importlib._bootstrap>")?;
+    let sys = crate::modules::sys::sys_module();
+    ab::call(&*ab::getattr_str(&bs, "_install")?, &[&sys, &imp])?;
+    BOOTSTRAP.store(bs.clone().into_raw(), std::sync::atomic::Ordering::Release);
+    let ext_file = format!("{}/importlib/_bootstrap_external.py", stdlib);
+    let r = (|| -> PyResult<()> {
+        exec_bootstrap_module("_frozen_importlib_external", &ext_file, "<frozen importlib._bootstrap_external>")?;
+        ab::call(&*ab::getattr_str(&bs, "_install_external_importers")?, &[])?;
+        Ok(())
+    })();
+    if r.is_err() {
+        let e = take_exc();
+        // fall back to the Rust import implementation entirely
+        BOOTSTRAP.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
+        if let Some(mp) = crate::modules::sys::get_sys_attr("meta_path") {
+            list::clear(&mp);
+        }
+        if crate::modules::sys_full::config().verbose > 0 {
+            crate::modules::sys::write_stderr("# could not install the path-based importers; using the builtin fallback\n");
+            if let Some(e) = e {
+                crate::modules::traceback_print::print_exception(&e);
+            }
+        }
+        return Ok(());
+    }
+    EXTERNAL_INSTALLED.store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+pub fn importlib_active() -> bool {
+    EXTERNAL_INSTALLED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 pub fn get_loaded_module(name: &str) -> Option<PyRef> {
     let m = crate::modules::sys::modules_dict();
     dict::get_item_rs(&m, name).filter(|m| !m.is(none::none()))
@@ -103,7 +195,7 @@ pub fn module_is_initializing(d: &PyObject) -> bool {
 pub fn module_repr(m: &PyObject) -> PyResult {
     let d = module::module_dict(m);
     // delegate to importlib if available
-    if let Some(bs) = get_loaded_module("importlib._bootstrap") {
+    if let Some(bs) = bootstrap() {
         if let Ok(f) = ab::getattr_str(&bs, "_module_repr") {
             return ab::call(&f, &[m]);
         }
@@ -273,6 +365,17 @@ pub fn import_module_level(nm: &PyObject, globals: Option<&PyObject>, fromlist: 
 }
 
 fn handle_fromlist(m: &PyObject, fromlist: &PyObject, modname: &str) -> PyResult<()> {
+    if let Some(bs) = bootstrap() {
+        if importlib_active() {
+            let f = ab::getattr_str(&bs, "_handle_fromlist")?;
+            let imp = crate::builtins::builtin("__import__")?;
+            ab::call(&f, &[m, fromlist, &imp]).map_err(|e| {
+                remove_importlib_frames();
+                e
+            })?;
+            return Ok(());
+        }
+    }
     for x in ab::collect_iterable(fromlist)? {
         if !pystr::is_str(&x) {
             raise!(TypeError, "Item in {}.__all__ must be str, not {}", modname, crate::types::typeobject::tname(&x));
@@ -310,11 +413,21 @@ static IMPORT_LOCKS: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
 
 /// Import a module by absolute dotted name.
 pub fn import_absolute(abs: &str) -> PyResult {
+    let active = importlib_active();
     if let Some(m) = get_loaded_module(abs) {
-        if module::is_module(&m) && module_is_initializing(&module::module_dict(&m)) {
-            // being initialized by this or another thread: return it (circular import)
+        // fast path: fully initialised module in sys.modules
+        if !active || !spec_initializing(&m) {
+            return Ok(m);
         }
-        return Ok(m);
+    }
+    if active {
+        let bs = bootstrap().unwrap();
+        let f = ab::getattr_str(&bs, "_find_and_load")?;
+        let imp = crate::builtins::builtin("__import__")?;
+        return ab::call(&f, &[&pystr::new_str(abs), &imp]).map_err(|e| {
+            remove_importlib_frames();
+            e
+        });
     }
     let modules = crate::modules::sys::modules_dict();
     if let Some(v) = dict::get_item_rs(&modules, abs) {
@@ -369,21 +482,104 @@ pub fn import_absolute(abs: &str) -> PyResult {
     Ok(get_loaded_module(abs).unwrap_or(m))
 }
 
-fn find_and_load(abs: &str, path: Option<&PyObject>) -> PyResult {
-    // 1. Python-level meta_path finders (importlib), if installed
-    if let Some(mp) = crate::modules::sys::get_sys_attr("meta_path") {
-        if list::is_list(&mp) && list::list_len(&mp) > 0 {
-            if let Some(bs) = get_loaded_module("importlib._bootstrap") {
-                let f = ab::getattr_str(&bs, "_find_and_load")?;
-                let imp = crate::builtins::builtin("__import__")?;
-                return ab::call(&f, &[&pystr::new_str(abs), &imp]);
+fn spec_initializing(m: &PyObject) -> bool {
+    if !module::is_module(m) {
+        return match ab::getattr_opt(m, name!("__spec__")) {
+            Ok(Some(s)) => !s.is(none::none()) && matches!(ab::getattr_opt(&s, name!("_initializing")), Ok(Some(v)) if v.is(crate::types::bool_::true_obj())),
+            _ => {
+                clear_exc();
+                false
             }
+        };
+    }
+    module_is_initializing(&module::module_dict(m))
+}
+
+fn tb_filename_and_name(tb: &PyObject) -> (String, String) {
+    let t = unsafe { &*(tb.as_ptr() as *const crate::types::traceback::PyTracebackObject) };
+    if t.tb_frame.is_null() {
+        return (String::new(), String::new());
+    }
+    match crate::types::frameobject::frame_of(unsafe { &*t.tb_frame }) {
+        Some(f) => {
+            let cd = crate::types::code::code_data(f.code());
+            (pystr::to_string_lossy(&cd.filename), pystr::to_string_lossy(&cd.co_name))
+        }
+        None => (String::new(), String::new()),
+    }
+}
+
+/// Strip importlib frames from the traceback of the current exception, as
+/// CPython does: always for ImportError, otherwise only chunks that end in
+/// `_call_with_frames_removed`.
+pub fn remove_importlib_frames() {
+    let e = match take_exc() {
+        Some(e) => e,
+        None => return,
+    };
+    if crate::modules::sys_full::config().verbose == 0 {
+        if let Some(tb) = crate::types::exceptions::exc_traceback(&e) {
+            let always = crate::types::typeobject::is_subtype(e.type_ptr(), crate::types::exceptions::ImportError());
+            let mut entries: Vec<PyRef> = Vec::new();
+            let mut cur = Some(tb);
+            while let Some(t) = cur {
+                let nx = unsafe { (*(t.as_ptr() as *const crate::types::traceback::PyTracebackObject)).tb_next };
+                entries.push(t);
+                cur = if nx.is_null() { None } else { Some(unsafe { PyRef::from_borrowed(nx) }) };
+            }
+            let mut keep = vec![true; entries.len()];
+            let mut chunk_start: Option<usize> = None;
+            for (i, t) in entries.iter().enumerate() {
+                let (file, name) = tb_filename_and_name(t);
+                let imp = file.starts_with("<frozen importlib._bootstrap");
+                if imp {
+                    if chunk_start.is_none() {
+                        chunk_start = Some(i);
+                    }
+                    if always || name == "_call_with_frames_removed" {
+                        for k in chunk_start.unwrap()..=i {
+                            keep[k] = false;
+                        }
+                        chunk_start = None;
+                    }
+                } else {
+                    chunk_start = None;
+                }
+            }
+            if keep.iter().any(|k| !k) {
+                let kept: Vec<&PyRef> = entries.iter().zip(keep.iter()).filter(|(_, k)| **k).map(|(t, _)| t).collect();
+                for w in 0..kept.len() {
+                    let t = kept[w].as_ptr() as *mut crate::types::traceback::PyTracebackObject;
+                    let nx = if w + 1 < kept.len() { kept[w + 1].to_ref().into_raw() } else { std::ptr::null_mut() };
+                    unsafe {
+                        let old = std::mem::replace(&mut (*t).tb_next, nx);
+                        xdecref(old);
+                    }
+                }
+                crate::types::exceptions::set_exc_traceback(&e, kept.first().map(|t| &***t));
+            }
+        }
+    }
+    set_exc(e);
+}
+
+fn find_and_load(abs: &str, path: Option<&PyObject>) -> PyResult {
+    // 1. importlib (only builtin modules until the path finders are installed)
+    if let Some(bs) = bootstrap() {
+        if importlib_active() || (path.is_none() && find_builtin(abs).is_some()) {
+            let f = ab::getattr_str(&bs, "_find_and_load")?;
+            let imp = crate::builtins::builtin("__import__")?;
+            return ab::call(&f, &[&pystr::new_str(abs), &imp]);
         }
     }
     // 2. builtin modules
     if path.is_none() {
         if let Some(init) = find_builtin(abs) {
-            let m = init()?;
+            let m = match cached_builtin(abs) {
+                Some(m) => m,
+                None => init()?,
+            };
+            note_builtin_module(abs, &m);
             let modules = crate::modules::sys::modules_dict();
             dict::set_item_str(&modules, abs, &m)?;
             return Ok(m);

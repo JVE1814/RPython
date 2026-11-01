@@ -17,6 +17,7 @@ pub mod sys_structseq;
 pub mod sys_namespace;
 pub mod _thread;
 pub mod pymain;
+pub mod _imp;
 pub mod codecs_core;
 pub mod codecs_registry;
 pub mod reprlib_guard;
