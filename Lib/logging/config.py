@@ -257,7 +257,9 @@ class ConvertingList(list, _ConvertingMixin):
     """list whose items are converted when read."""
 
     def __getitem__(self, key):
-        return self.convert_with_key(key, list.__getitem__(self, key))
+        # Index a plain copy: configuration lists are short, and this
+        # avoids depending on list.__getitem__ being called unbound.
+        return self.convert_with_key(key, list.copy(self)[key])
 
     def pop(self, idx=-1):
         return self.convert(list.pop(self, idx))
