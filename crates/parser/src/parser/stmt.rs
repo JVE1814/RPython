@@ -526,7 +526,7 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
         if self.at_kw(Kw::Import) {
-            // gh-150459: `from . lazy import x` warning
+            // `from . lazy import x` probably meant `lazy from . import x`: warn
             if !lazy && level > 0 && module.as_deref() == Some("lazy") && self.p == mstart + 1 {
                 let lt = self.tok_at(mstart);
                 if let Some(d) = last_dot_end {

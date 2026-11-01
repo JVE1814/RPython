@@ -55,7 +55,7 @@ impl<'a> Parser<'a> {
                     let looks_like_new_stmt = unclosed_at_eof && !in_fstring && b.loc.lineno > a.loc.end_lineno && self.at(T::EQUAL);
                     if is_legacy(&a).is_none() && !looks_like_new_stmt {
                         if level != 0 {
-                            // gh-142236: for implicit string concatenation point at the last string
+                            // for implicit string concatenation the error points at the last string
                             let mut aloc = a.loc;
                             if a_is_str {
                                 let mut i = start;
