@@ -171,6 +171,8 @@ aliases = {
     '949': 'cp949',
     'ms949': 'cp949',
     'uhc': 'cp949',
+    # the MIME label of Microsoft's Unified Hangul Code (email uses it for cp949)
+    'ks_c_5601_1987': 'cp949',
 
     '950': 'cp950',
     'ms950': 'cp950',
@@ -189,7 +191,6 @@ aliases = {
     'korean': 'euc_kr',
     'ksc5601': 'euc_kr',
     'ks_c_5601': 'euc_kr',
-    'ks_c_5601_1987': 'euc_kr',
     'ksx1001': 'euc_kr',
     'ks_x_1001': 'euc_kr',
 

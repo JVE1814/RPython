@@ -189,10 +189,20 @@ def set_text_content(msg, string, subtype="plain", charset='utf-8', cte=None,
                      disposition=None, filename=None, cid=None,
                      params=None, headers=None):
     _prepare_set(msg, 'text', subtype, headers)
-    cte, payload = _encode_text(string, charset, cte, msg.policy)
+    label = email.charset.ALIASES.get(charset, charset)
+    codec = charset
+    try:
+        cs = email.charset.Charset(charset)
+    except email.errors.CharsetError:
+        cs = None
+    if cs is not None and cs.get_output_charset() != cs.input_charset:
+        # Charsets that are converted for mail (e.g. EUC-JP and Shift_JIS
+        # are sent as ISO-2022-JP).
+        label = cs.get_output_charset()
+        codec = cs.output_codec or label
+    cte, payload = _encode_text(string, codec, cte, msg.policy)
     msg.set_payload(payload)
-    msg.set_param('charset', email.charset.ALIASES.get(charset, charset),
-                  replace=True)
+    msg.set_param('charset', label, replace=True)
     msg['Content-Transfer-Encoding'] = cte
     _finalize_set(msg, disposition, filename, cid, params)
 

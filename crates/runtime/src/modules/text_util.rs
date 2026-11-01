@@ -270,7 +270,23 @@ pub fn register() {
     use crate::import::register_builtin;
     register_builtin("_sre", crate::modules::_sre::init_module);
     register_builtin("_codecs", crate::modules::_codecs::init_module);
+    crate::modules::cjk::register();
     register_builtin("unicodedata", crate::modules::unicodedata::init_module);
     register_builtin("_tokenize", crate::modules::_tokenize::init_module);
     register_builtin("_locale", crate::modules::_locale::init_module);
+}
+
+/// Make sure the `unicodedata` module is imported (character-name lookups
+/// depend on it, as in CPython): false if it cannot be imported.
+pub fn ensure_unicodedata() -> bool {
+    if crate::import::get_loaded_module("unicodedata").is_some() {
+        return true;
+    }
+    match crate::import::import_absolute("unicodedata") {
+        Ok(_) => true,
+        Err(_) => {
+            crate::errors::clear_exc();
+            false
+        }
+    }
 }
