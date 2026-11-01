@@ -113,7 +113,7 @@ fn ctx_new_impl(tp: *mut PyTypeObject, a: &fc::VcArgs) -> PyResult {
     )?;
     sl!(SSL_CTX_set_ex_data(c, CTX_EX_INDEX, obj.as_ptr() as *mut c_void));
     // defaults
-    let opts: u64 = 0x8000_0850u64 | (1 << 25) | (1 << 17) | (1 << 22);
+    let opts: u64 = 0x8000_0850u64 | (1 << 25) | (1 << 17) | (1 << 22) | (1 << 20);
     sl!(SSL_CTX_set_options(c, opts));
     set_verify_mode_raw(&obj, if is_client { 2 } else { 0 })?;
     let ciphers = CString::new("@SECLEVEL=2:ECDH+AESGCM:ECDH+CHACHA20:ECDH+AES:DHE+AES:!aNULL:!eNULL:!aDSS:!SHA1:!AESCCM").unwrap();
@@ -279,6 +279,8 @@ fn set_proto_version(o: &PyObject, v: Option<&PyObject>, max: bool) -> PyResult<
         raise!(ValueError, "The context's protocol doesn't support modification of highest and lowest version.");
     }
     let val = match n {
+        -2 if max => 0x300,
+        -1 if !max => 0x304,
         -2 | -1 => 0,
         0x300 | 0x301 | 0x302 | 0x303 | 0x304 => n,
         _ => raise!(ValueError, "Unsupported TLS/SSL version 0x{:x}", n),
@@ -349,6 +351,9 @@ fn get_sni(o: &PyObject) -> PyResult {
 
 fn set_sni(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     let c = ctx(o);
+    if v.is_none() {
+        raise!(AttributeError, "cannot delete attribute");
+    }
     if c.protocol == 0x10 && v.map_or(false, |x| !is_none(x)) {
         raise!(ValueError, "sni_callback cannot be set on TLS_CLIENT context");
     }

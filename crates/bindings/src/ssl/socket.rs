@@ -117,7 +117,7 @@ pub fn new_sslsocket(
                 raise!(ValueError, "server_hostname cannot be an empty string or start with a leading dot.");
             }
             if b.contains(&0) {
-                raise!(ValueError, "server_hostname cannot contain null characters");
+                raise!(TypeError, "argument of type str must not contain null characters");
             }
             Some(b)
         }
