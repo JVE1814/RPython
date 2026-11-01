@@ -7,6 +7,7 @@ sendfile and error reporting.
 """
 
 import collections
+import contextvars
 import collections.abc
 
 import errno
@@ -238,6 +239,8 @@ class Server(events.AbstractServer):
         self._ssl_shutdown_timeout = ssl_shutdown_timeout
         self._serving = False
         self._serving_forever_fut = None
+        # connections are accepted in the context the server was made in
+        self._context = contextvars.copy_context()
 
     def __repr__(self):
         return f'<{type(self).__name__} sockets={self.sockets!r}>'
@@ -266,7 +269,7 @@ class Server(events.AbstractServer):
             self._loop._start_serving(
                 self._protocol_factory, sock, self._ssl_context, self,
                 self._backlog, self._ssl_handshake_timeout,
-                self._ssl_shutdown_timeout)
+                self._ssl_shutdown_timeout, self._context)
 
     def get_loop(self):
         return self._loop

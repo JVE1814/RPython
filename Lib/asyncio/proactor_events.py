@@ -767,7 +767,8 @@ class BaseProactorEventLoop(base_events.BaseEventLoop):
     def _start_serving(self, protocol_factory, sock,
                        sslcontext=None, server=None, backlog=100,
                        ssl_handshake_timeout=None,
-                       ssl_shutdown_timeout=None):
+                       ssl_shutdown_timeout=None,
+                       context=None):
 
         def accept_loop(f=None):
             try:
@@ -805,9 +806,9 @@ class BaseProactorEventLoop(base_events.BaseEventLoop):
                 sock.close()
             else:
                 self._accept_futures[sock.fileno()] = f
-                f.add_done_callback(accept_loop)
+                f.add_done_callback(accept_loop, context=context)
 
-        self.call_soon(accept_loop)
+        self.call_soon(accept_loop, context=context)
 
     def _process_events(self, event_list):
         pass    # completions arrive as future callbacks

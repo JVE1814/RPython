@@ -156,16 +156,20 @@ class BaseSelectorEventLoop(base_events.BaseEventLoop):
     def _start_serving(self, protocol_factory, sock,
                        sslcontext=None, server=None, backlog=100,
                        ssl_handshake_timeout=constants.SSL_HANDSHAKE_TIMEOUT,
-                       ssl_shutdown_timeout=constants.SSL_SHUTDOWN_TIMEOUT):
+                       ssl_shutdown_timeout=constants.SSL_SHUTDOWN_TIMEOUT,
+                       context=None):
+        # accepting runs in the server's context (captured at its creation)
         self._add_reader(sock.fileno(), self._accept_connection,
                          protocol_factory, sock, sslcontext, server, backlog,
-                         ssl_handshake_timeout, ssl_shutdown_timeout)
+                         ssl_handshake_timeout, ssl_shutdown_timeout, context,
+                         context=context)
 
     def _accept_connection(
             self, protocol_factory, sock,
             sslcontext=None, server=None, backlog=100,
             ssl_handshake_timeout=constants.SSL_HANDSHAKE_TIMEOUT,
-            ssl_shutdown_timeout=constants.SSL_SHUTDOWN_TIMEOUT):
+            ssl_shutdown_timeout=constants.SSL_SHUTDOWN_TIMEOUT,
+            context=None):
         # Accept up to backlog + 1 pending connections per wake-up.
         for _ in range(backlog + 1):
             try:
@@ -191,7 +195,8 @@ class BaseSelectorEventLoop(base_events.BaseEventLoop):
                 self.call_later(constants.ACCEPT_RETRY_DELAY,
                                 self._start_serving, protocol_factory, sock,
                                 sslcontext, server, backlog,
-                                ssl_handshake_timeout, ssl_shutdown_timeout)
+                                ssl_handshake_timeout, ssl_shutdown_timeout,
+                                context)
                 return
             else:
                 self.create_task(self._accept_connection2(

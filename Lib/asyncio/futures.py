@@ -285,16 +285,18 @@ def _chain_future(source, destination):
         else:
             _set_concurrent_future_state(target, origin)
 
+    # a callback may run in any thread: act directly when already running
+    # in the loop that owns the other side
     def on_destination_done(dest):
         if not dest.cancelled():
             return
-        if src_loop is None or src_loop is dst_loop:
+        if src_loop is None or src_loop is events._get_running_loop():
             source.cancel()
         else:
             src_loop.call_soon_threadsafe(source.cancel)
 
     def on_source_done(src):
-        if dst_loop is None or dst_loop is src_loop:
+        if dst_loop is None or dst_loop is events._get_running_loop():
             copy_into(destination, src)
         elif not dst_loop.is_closed():
             dst_loop.call_soon_threadsafe(copy_into, destination, src)
