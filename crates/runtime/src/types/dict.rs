@@ -353,15 +353,11 @@ pub fn remove_at(d: &PyObject, ix: usize, h: isize) -> (*mut PyObject, *mut PyOb
     t.used -= 1;
     t.version = crate::interp::cache::next_dict_version();
     set_used(d, t.used);
-    // Trim trailing holes so popitem/ordering stays cheap.
-    while let Some(last) = t.entries.last() {
-        if last.key.is_null() && t.entries.len() > 0 {
-            // can't simply pop: indices may reference it as DUMMY only, safe to drop
-            t.entries.pop();
-        } else {
-            break;
-        }
-    }
+    // Holes are kept in `entries`: they count towards the load factor in
+    // `usable()`, which is what eventually triggers a rebuild that clears the
+    // DUMMY index markers. (Trimming trailing holes here let repeated
+    // insert/delete cycles fill every index slot with DUMMY, after which a
+    // lookup of a missing key probed forever.)
     (e.key, e.value)
 }
 
