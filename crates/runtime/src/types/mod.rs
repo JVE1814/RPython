@@ -144,10 +144,24 @@ pub fn init_all() -> crate::errors::PyResult<()> {
     }
     exceptions::ready_all()?;
     dictview::ready()?;
+pub mod complex_pow;
+pub mod bootstrap_builtins;
+pub mod structseq;
+pub mod lang_util;
+pub mod genericalias;
     bootstrap_builtins::ready()?;
     type_ready(frameobject_proxy::proxy_type())?;
     Ok(())
 }
-pub mod complex_pow;
-pub mod bootstrap_builtins;
-pub mod structseq;
+    lang_init()?;
+
+/// Types of the "lang" workstream (GenericAlias, UnionType, typing objects, async gens).
+fn lang_init() -> crate::errors::PyResult<()> {
+    genericalias::init_types();
+    union::init_types();
+    typevar::init_types();
+    genericalias::ready()?;
+    union::ready()?;
+    typevar::ready()?;
+    asyncgen::init_types()?;
+    genericalias::register_builtin_class_getitems();

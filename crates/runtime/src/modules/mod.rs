@@ -51,3 +51,4 @@ pub fn register_all() {
     sys_full::register_system_modules();
 
     text_util::register();
+    crate::import::register_builtin("_typing", crate::types::typevar::make_typing_module);
