@@ -68,6 +68,27 @@ stub artefacts (mock/datetime/socket) and runtime gaps (builtins without
 `__text_signature__`, classmethod as metaclass `__call__` not bound,
 co_positions columns, REPL linecache).
 
+## Results after merging master (runtime 360218a)
+- test_tempfile now imports under the real regrtest: old files SUCCESS
+  (121 run, 10 skipped), new files SUCCESS (121 run, 10 skipped).
+- test_shutil / test_inspect / test_logging still fail at import on master
+  (tarfile, datetime, configparser missing).  Stub harness, failing
+  test instances old -> new: shutil 27 -> 10; inspect 74 -> 58 failing
+  methods (TestGetAsyncGenState excluded: real asyncio + harness clash);
+  logging 105 -> 35 (network/listener classes excluded).  No test that
+  passes with the old files fails with the new ones.
+- Smoke (real regrtest): test_bool, test_set, test_tuple, test_enumerate
+  all pass.
+- One stub-harness run of test_logging hung in HandlerTest.test_name under
+  heavy machine load (did not reproduce in a rerun nor standalone); worth
+  watching for a lock/GC interaction in the runtime.
+
+## Possible follow-up
+Some internals follow the observable algorithm very closely by necessity
+(getattr_static, classify_class_attrs, getcallargs error texts,
+BlockFinder's token rules).  They were written fresh, but a reviewer may
+want to give them a second independent pass.
+
 ## Measuring
 Because of the import failures, pass rates were measured with a local stub
 harness (not committed): unimportable modules are replaced by inert stubs so
