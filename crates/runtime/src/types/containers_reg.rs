@@ -26,6 +26,48 @@ pub fn init_types() {
     builtin_iters::init_types();
     property::init_types();
     weakref::init_types();
+    unsafe {
+        disallow_instantiation(&[
+            &raw mut dictview::PyDictKeys_Type,
+            &raw mut dictview::PyDictValues_Type,
+            &raw mut dictview::PyDictItems_Type,
+            &raw mut dictview::PyDictIterKey_Type,
+            &raw mut dictview::PyDictIterValue_Type,
+            &raw mut dictview::PyDictIterItem_Type,
+            &raw mut dictview::PyDictRevIterKey_Type,
+            &raw mut dictview::PyDictRevIterValue_Type,
+            &raw mut dictview::PyDictRevIterItem_Type,
+            &raw mut list::PyListIter_Type,
+            &raw mut list::PyListRevIter_Type,
+            &raw mut tuple::PyTupleIter_Type,
+            &raw mut set::PySetIter_Type,
+            &raw mut iterobject::PySeqIter_Type,
+            &raw mut iterobject::PyCallIter_Type,
+            &raw mut range::PyRangeIter_Type,
+            &raw mut range::PyLongRangeIter_Type,
+            &raw mut weakref::_PyWeakref_ProxyType,
+            &raw mut weakref::_PyWeakref_CallableProxyType,
+        ]);
+    }
+}
+
+/// `tp_new` for types that cannot be instantiated from Python.
+pub unsafe extern "C" fn no_new(tp: *mut PyTypeObject, _a: *mut PyObject, _k: *mut PyObject) -> *mut PyObject {
+    let _ = crate::errors::new_err(
+        crate::types::exceptions::TypeError(),
+        &format!("cannot create '{}' instances", typeobject::type_fqname(tp)),
+    );
+    std::ptr::null_mut()
+}
+
+/// Mark static types as not instantiable from Python.
+pub fn disallow_instantiation(types: &[*mut PyTypeObject]) {
+    for &t in types {
+        unsafe {
+            (*t).tp_new = Some(no_new);
+            (*t).tp_flags |= crate::ffi::Py_TPFLAGS_DISALLOW_INSTANTIATION;
+        }
+    }
 }
 
 /// Ready the types not readied by the generic list in `types::init_all`.
