@@ -1805,6 +1805,9 @@ pub fn handle_eval_breaker(ts: &ThreadState) -> PyResult<()> {
     if eb & crate::threads::EVAL_SAFEPOINT != 0 {
         crate::gc::safepoint_poll(ts);
     }
+    if eb & crate::threads::EVAL_GC != 0 {
+        crate::gc::maybe_collect(ts);
+    }
     if eb & crate::threads::EVAL_SIGNALS != 0 {
         crate::modules::signal::run_pending_handlers(ts)?;
     }
