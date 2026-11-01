@@ -52,7 +52,15 @@ Running (clean-room, D19): cleanroom-ut (unittest+mock/argparse/traceback), clea
 (inspect/logging+config/tempfile/shutil), cleanroom-lang (enum/dataclasses/contextlib/_collections_abc).
 Finished also: lang, functional, text, osio, containers, system, harness.
 Running (wave 3): decimal (_decimal/_pydecimal), devtools (marshal/pathlib/pwd/grp/resource/termios/fcntl/mmap/dis/opcode/pdb/profile/doctest/timeit/runpy/pkgutil/site...).
-Unassigned: _testinternalcapi/_testmultiphase/_testclinic re-implemented by us (spec lacks internal headers / generated clinic files); email/xml(pyexpat)/html/mailbox/mimetypes; pathlib/pwd/grp/
-resource/termios/tty/pty/getpass/fcntl/mmap/marshal/py_compile/compileall/getopt/trace/pdb/
-bdb/profile/cProfile/pstats/timeit/doctest; ctypes/_ctypes; multiprocessing/concurrent;
-sqlite3 (own SQLite? decide); curses/readline/_pyrepl; no-GIL thread-safety audit.
+Running (wave 4): compress2 (lzma/zstd/tarfile/zipimport/uuid; owns crates/compress), web
+(ipaddress/urllib/http/wsgiref/_asyncio; owns asyncio + net modules), parallel
+(concurrent.futures/multiprocessing/fork safety/threading), markup (pyexpat/xml/email/html/
+mailbox/mimetypes/smtplib.../tomllib/optparse).
+Finished also: capi (all 1208 C-API functions exported), compress (zlib/hashes/bz2/gzip/
+zipfile), net (_socket/select/subprocess/asyncio).
+Running (wave 5): bindings (_ssl/_sqlite3/_ctypes via system libs, D20), core-runtime (monitoring/settrace/gc/
+ slots bugs, lazy imports, list reclamation, _testinternalcapi/_testmultiphase, core test failures).
+Finished also: decimal (662/663 test_decimal), devtools.
+Unassigned: _testclinic re-implemented by us (spec lacks
+internal headers / generated clinic files); curses/_curses_panel/readline/_pyrepl (bind ncurses/
+readline, D20); _tkinter + tkinter (bind Tcl/Tk, D20 — the rebuilt baseline has Tk); _dbm/_gdbm; no-GIL thread-safety audit; startup time (jit owns perf).

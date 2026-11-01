@@ -83,6 +83,9 @@ pub struct ThreadState {
     pub recursion_depth: Cell<i32>,
     pub owner_tid: usize,
     pub reraise_flag: Cell<bool>,
+    /// (exception, traceback) addresses of the exception that last left a frame
+    /// unhandled; the receiving frame must not chain __context__ again.
+    pub propagated_exc: Cell<(usize, usize)>,
     pub headroom: Cell<bool>,
     pub stack_low: Cell<usize>,
     /// True while an OS thread is attached to this state.
@@ -148,6 +151,7 @@ pub fn new_thread_state() -> *mut ThreadState {
             recursion_depth: Cell::new(0),
             owner_tid: crate::object::thread_id(),
             reraise_flag: Cell::new(false),
+            propagated_exc: Cell::new((0, 0)),
             headroom: Cell::new(false),
             stack_low: Cell::new(compute_stack_low()),
             alive: std::sync::atomic::AtomicBool::new(true),

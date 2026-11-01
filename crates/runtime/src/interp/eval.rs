@@ -628,7 +628,11 @@ pub fn eval_frame(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyRe
     f.prev = prev;
     ts.frame.set(f as *mut Frame);
     f.state = FrameState::Executing;
-    let r = eval_inner(ts, f, throw);
+    // jit workstream: compiled code runs the activation directly when it can
+    let r = match super::jit::resume(ts, f, throw) {
+        Ok(r) => r,
+        Err(throw) => eval_inner(ts, f, throw),
+    };
     ts.frame.set(prev);
     f.prev = std::ptr::null_mut();
     match &r {
@@ -669,6 +673,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                         super::jit::Run::Return(v) => return Ok(Some(Exit::Return(v))),
                         super::jit::Run::Error => return Err(PyErr),
                         super::jit::Run::Deopt(npc) => pc = npc,
+                        super::jit::Run::Yield(v) => return Ok(Some(Exit::Yield(v))),
                     }
                 }
                 let mut ext: u32 = 0;
@@ -882,19 +887,19 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                         }
                         Op::LoadAttr => {
                             let o = popref!(f);
-                            let v = super::specialize::load_attr(&o, &cd.names[arg as usize], caches.entry(f.lasti as usize))?;
+                            let v = super::specialize::load_attr(&o, &cd.names[arg as usize], caches.poly(f.lasti as usize))?;
                             push!(f, v.into_raw());
                         }
                         Op::LoadMethod => {
                             let o = popref!(f);
-                            let (m, s) = super::specialize::load_method(&o, &cd.names[arg as usize], caches.entry(f.lasti as usize))?;
+                            let (m, s) = super::specialize::load_method(&o, &cd.names[arg as usize], caches.poly(f.lasti as usize))?;
                             push!(f, m.into_raw());
                             push!(f, s.map_or(std::ptr::null_mut(), |s| s.into_raw()));
                         }
                         Op::StoreAttr => {
                             let o = popref!(f);
                             let v = popref!(f);
-                            super::specialize::store_attr(&o, &cd.names[arg as usize], &v, caches.entry(f.lasti as usize))?;
+                            super::specialize::store_attr(&o, &cd.names[arg as usize], &v, caches.poly(f.lasti as usize))?;
                         }
                         Op::DeleteAttr => {
                             let o = popref!(f);
@@ -1711,8 +1716,13 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
             }
         };
         let reraise = ReraiseMarker::take(ts);
+        let propagated = ts.propagated_exc.replace((0, 0)) == exc_identity(&e);
         if !reraise {
-            chain_context(ts, &e);
+            // __context__ is attached where an exception is raised, not again in
+            // every frame it propagates through.
+            if !propagated {
+                chain_context(ts, &e);
+            }
             add_traceback(f, &e);
             if crate::modules::sys::tracing_active() {
                 if crate::modules::sys::trace_exception(ts, f, &e).is_err() {
@@ -1742,6 +1752,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
             }
             None => {
                 f.clear_stack();
+                ts.propagated_exc.set(exc_identity(&e));
                 set_exc(e);
                 if crate::modules::sys::tracing_active() {
                     let _ = crate::modules::sys::trace_unwind(ts, f);
@@ -1750,6 +1761,12 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
             }
         }
     }
+}
+
+/// Identity of an exception in flight: its address and its traceback's.
+fn exc_identity(e: &PyObject) -> (usize, usize) {
+    let tb = exc::exc_traceback(e).map_or(0, |t| t.as_ptr() as usize);
+    (e.as_ptr() as usize, tb)
 }
 
 /// Distinguishes a bare re-raise (no new traceback entry) from a fresh raise.

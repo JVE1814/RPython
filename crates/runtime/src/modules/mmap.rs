@@ -353,7 +353,7 @@ fn m_flush(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult 
         None => libc::MS_SYNC,
     };
     let m = check_valid(o)?;
-    let size = size.unwrap_or(m.size as isize);
+    let size = size.unwrap_or(m.size as isize - off);
     if size < 0 || off < 0 || (m.size as isize) - off < size {
         raise!(ValueError, "flush values out of range");
     }
@@ -432,7 +432,8 @@ fn m_read(o: &PyObject, args: &[&PyObject]) -> PyResult {
         Some(n) if n >= 0 && (n as usize) <= remaining => n as usize,
         _ => remaining,
     };
-    let r = bytes::new_bytes(&data(m)[m.pos..m.pos + n]);
+    let start = m.pos.min(m.size);
+    let r = bytes::new_bytes(&data(m)[start..start + n]);
     m.pos += n;
     Ok(r)
 }
@@ -450,7 +451,8 @@ fn m_read_byte(o: &PyObject) -> PyResult {
 fn m_readline(o: &PyObject) -> PyResult {
     let m = check_valid(o)?;
     let remaining = if m.pos < m.size { m.size - m.pos } else { 0 };
-    let d = &data(m)[m.pos..m.pos + remaining];
+    let start = m.pos.min(m.size);
+    let d = &data(m)[start..start + remaining];
     let n = match d.iter().position(|&b| b == b'\n') {
         Some(i) => i + 1,
         None => remaining,
@@ -673,7 +675,7 @@ fn subscript(o: &PyObject, item: &PyObject) -> PyResult {
                 raise!(IndexError, "mmap index out of range");
             }
             out.push(d[i as usize]);
-            i += step;
+            i = i.wrapping_add(step);
         }
         return Ok(bytes::new_bytes(&out));
     }
@@ -720,12 +722,12 @@ fn ass_subscript(o: &PyObject, item: &PyObject, value: Option<&PyObject>) -> PyR
             if i < 0 || i as usize >= d.len() {
                 raise!(IndexError, "mmap index out of range");
             }
-            i += step;
+            i = i.wrapping_add(step);
         }
         let mut i = start;
         for b in vb {
             d[i as usize] = b;
-            i += step;
+            i = i.wrapping_add(step);
         }
         return Ok(());
     }
@@ -815,7 +817,7 @@ fn init_types() -> PyResult<()> {
         bp.bf_getbuffer = Some(mmap_getbuffer);
         bp.bf_releasebuffer = Some(mmap_releasebuffer);
         (*t).tp_as_buffer = leak(bp);
-        (*t).tp_doc = c"Windows: mmap(fileno, length[, tagname[, access[, offset]]])\n\nMaps length bytes from the file specified by the file handle fileno,\nand returns a mmap object.  If length is larger than the current size\nof the file, the file is extended to contain length bytes.  If length\nis 0, the maximum length of the map is the current size of the file,\nexcept that if the file is empty Windows raises an exception (you cannot\ncreate an empty mapping on Windows).\n\nUnix: mmap(fileno, length[, flags[, prot[, access[, offset[, trackfd]]]]])\n\nMaps length bytes from the file specified by the file descriptor fileno,\nand returns a mmap object.  If length is 0, the maximum length of the map\nwill be the current size of the file when mmap is called.\nflags specifies the nature of the mapping. MAP_PRIVATE creates a\nprivate copy-on-write mapping, so changes to the contents of the mmap\nobject will be private to this process, and MAP_SHARED creates a mapping\nthat's shared with all other processes mapping the same areas of the file.\nThe default value is MAP_SHARED.\n\nTo map anonymous memory, pass -1 as the fileno (both versions).".as_ptr();
+        (*t).tp_doc = c"mmap(fileno, length, flags=MAP_SHARED, prot=PROT_WRITE|PROT_READ,\n     access=ACCESS_DEFAULT, offset=0, *, trackfd=True)\n\nMemory-map length bytes of the file open as fileno, starting at offset\n(a multiple of ALLOCATIONGRANULARITY). A length of 0 maps the rest of the\nfile. fileno -1 creates an anonymous mapping. Use either access\n(ACCESS_READ, ACCESS_WRITE, ACCESS_COPY) or flags and prot. The object\nsupports slicing, file-like reading and writing and the buffer protocol.".as_ptr();
         (*t).tp_methods = mdefs![
             ("close", NOARGS, m_close),
             ("find", FAST, m_find),
