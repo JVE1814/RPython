@@ -48,6 +48,9 @@ Running (wave 2): ast (_ast/ast/tokenize/symtable/codeop), data (copy/pickle/jso
 array/csv/calendar/pprint/string/zoneinfo/configparser/dbm), compress (zlib/bz2/lzma/zstd/
 hashlib/hmac/base64/gzip/zipfile/tarfile/zipimport/uuid/secrets), net (_socket/select/
 selectors/asyncio/_contextvars/subprocess?/urllib/http/ipaddress/socketserver).
+Running (clean-room, D19): cleanroom-ut (unittest+mock/argparse/traceback), cleanroom-sys
+(inspect/logging+config/tempfile/shutil), cleanroom-lang (enum/dataclasses/contextlib/_collections_abc).
+Finished also: lang, functional, text, osio, containers, system, harness.
 Running (wave 3): decimal (_decimal/_pydecimal), devtools (marshal/pathlib/pwd/grp/resource/termios/fcntl/mmap/dis/opcode/pdb/profile/doctest/timeit/runpy/pkgutil/site...).
 Unassigned: email/xml(pyexpat)/html/mailbox/mimetypes; pathlib/pwd/grp/
 resource/termios/tty/pty/getpass/fcntl/mmap/marshal/py_compile/compileall/getopt/trace/pdb/
