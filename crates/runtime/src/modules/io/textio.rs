@@ -45,11 +45,65 @@ fn builtin_codec(name: &str) -> Option<Builtin> {
 fn builtin_decode_errors_ok(e: &str) -> bool {
     matches!(e, "strict" | "ignore" | "replace" | "surrogateescape" | "backslashreplace")
 }
-fn builtin_encode_errors_ok(b: Builtin, e: &str) -> bool {
-    match b {
-        Builtin::Utf8 => matches!(e, "strict" | "ignore" | "replace" | "surrogateescape" | "surrogatepass"),
-        _ => matches!(e, "strict" | "ignore" | "replace" | "surrogateescape"),
+fn builtin_encode_errors_ok(_b: Builtin, e: &str) -> bool {
+    matches!(e, "strict" | "ignore" | "replace" | "surrogateescape" | "surrogatepass" | "backslashreplace" | "xmlcharrefreplace")
+}
+
+/// Encode with one of the standard error handlers.
+pub fn builtin_encode(kind: Builtin, errors: &str, s: &PyObject) -> PyResult<Vec<u8>> {
+    let limit: u32 = match kind {
+        Builtin::Utf8 => 0x110000,
+        Builtin::Latin1 => 0x100,
+        Builtin::Ascii => 0x80,
+    };
+    let data = pystr::str_data(s);
+    let n = data.len();
+    let mut out = Vec::with_capacity(n);
+    let ok = |c: u32| c < limit && !(kind == Builtin::Utf8 && (0xd800..0xe000).contains(&c));
+    let mut i = 0;
+    while i < n {
+        let c = data.get(i);
+        if ok(c) {
+            if kind == Builtin::Utf8 {
+                let mut b = [0u8; 4];
+                out.extend_from_slice(char::from_u32(c).unwrap().encode_utf8(&mut b).as_bytes());
+            } else {
+                out.push(c as u8);
+            }
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < n && !ok(data.get(j)) {
+            j += 1;
+        }
+        for k in i..j {
+            let c = data.get(k);
+            match errors {
+                "ignore" => {}
+                "replace" => out.push(b'?'),
+                "surrogateescape" if (0xdc80..0xdd00).contains(&c) => out.push((c - 0xdc00) as u8),
+                "surrogatepass" if kind == Builtin::Utf8 && (0xd800..0xe000).contains(&c) => {
+                    out.extend_from_slice(&[(0xe0 | (c >> 12)) as u8, (0x80 | ((c >> 6) & 0x3f)) as u8, (0x80 | (c & 0x3f)) as u8])
+                }
+                "backslashreplace" => {
+                    let t = if c < 0x100 { format!("\\x{:02x}", c) } else if c < 0x10000 { format!("\\u{:04x}", c) } else { format!("\\U{:08x}", c) };
+                    out.extend_from_slice(t.as_bytes());
+                }
+                "xmlcharrefreplace" => out.extend_from_slice(format!("&#{};", c).as_bytes()),
+                _ => {
+                    let reason = match kind {
+                        Builtin::Utf8 => "surrogates not allowed".to_string(),
+                        Builtin::Latin1 => "ordinal not in range(256)".to_string(),
+                        Builtin::Ascii => "ordinal not in range(128)".to_string(),
+                    };
+                    return Err(crate::types::exceptions::unicode_encode_error(codec_name(kind), s, i, j, &reason));
+                }
+            }
+        }
+        i = j;
     }
+    Ok(out)
 }
 
 fn codec_name(b: Builtin) -> &'static str {
@@ -280,9 +334,7 @@ impl Encoder {
     fn encode(&self, s: &PyObject) -> PyResult<PyRef> {
         match self {
             Encoder::Builtin { kind, errors } => {
-                let enc = pystr::new_str(codec_name(*kind));
-                let r = codecs_core::encode_str(s, Some(&enc), Some(errors))?;
-                Ok(r)
+                Ok(new_bytes(&builtin_encode(*kind, &pystr::to_string_lossy(errors), s)?))
             }
             Encoder::Py(e) => {
                 let r = call1(e, "encode", s)?;
@@ -359,9 +411,8 @@ fn state(o: &PyObject) -> PyResult<&mut State> {
 
 fn check_open(o: &PyObject) -> PyResult<&mut State> {
     let st = state(o)?;
-    let closed = if super::bufferedio::is_buffered(&st.buffer) && st.buffer.ty().tp_getattro == Some(crate::types::typeobject::object_generic_getattro) {
-        let c = ab::getattr(&st.buffer, crate::name!("closed"))?;
-        ab::is_true(&c)?
+    let closed = if let Some(c) = super::bufferedio::fast_closed(&st.buffer) {
+        c
     } else {
         let c = ab::getattr(&st.buffer, crate::name!("closed"))?;
         ab::is_true(&c)?

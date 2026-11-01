@@ -130,6 +130,78 @@ pub fn init_bootstrap_types() {
 }
 
 /// Create the sys module with the minimal attributes needed during startup.
+/// Replace the bootstrap writers by real io objects (TextIOWrapper over a buffered
+/// FileIO).  Keeps the bootstrap streams if `_io` cannot be set up.
+pub fn init_stdio() {
+    if let Err(_) = init_stdio_impl() {
+        if std::env::var_os("RPY_DEBUG_STDIO").is_some() {
+            crate::print_exception_and_clear();
+        }
+        clear_exc();
+    }
+}
+
+fn create_stdio(fd: i32, write: bool, name: &str, errors: &str, unbuffered: bool, force_line: bool) -> PyResult<PyRef> {
+    use crate::abstract_ as ab;
+    use crate::types::bool_;
+    // closed / invalid descriptor -> None
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return Ok(none::none_ref());
+    }
+    let io = crate::import::import_absolute("_io")?;
+    let mode = pystr::new_str(if write { "wb" } else { "rb" });
+    let fileio = ab::getattr_str(&io, "FileIO")?;
+    let kwn = tuple::new_tuple(vec![pystr::new_str("closefd")]);
+    let raw = ab::call_kw(&fileio, &[&crate::types::int::new_int(fd as i64), &mode, bool_::false_obj()], Some(&kwn))?;
+    let isatty = unsafe { libc::isatty(fd) } == 1;
+    let buffered = if unbuffered && write {
+        raw.clone()
+    } else {
+        let cls = ab::getattr_str(&io, if write { "BufferedWriter" } else { "BufferedReader" })?;
+        ab::call(&cls, &[&raw])?
+    };
+    ab::setattr(&raw, crate::name!("name"), &pystr::new_str(name))?;
+    let tw = ab::getattr_str(&io, "TextIOWrapper")?;
+    let line_buffering = !unbuffered && (isatty || force_line);
+    let write_through = unbuffered && write;
+    let kwn = tuple::new_tuple(vec![
+        pystr::new_str("encoding"),
+        pystr::new_str("errors"),
+        pystr::new_str("newline"),
+        pystr::new_str("line_buffering"),
+        pystr::new_str("write_through"),
+    ]);
+    let text = ab::call_kw(
+        &tw,
+        &[
+            &buffered,
+            &pystr::new_str("utf-8"),
+            &pystr::new_str(errors),
+            &pystr::new_str("\n"),
+            &bool_::new_bool(line_buffering),
+            &bool_::new_bool(write_through),
+        ],
+        Some(&kwn),
+    )?;
+    ab::setattr(&text, crate::name!("mode"), &pystr::new_str(if write { "w" } else { "r" }))?;
+    Ok(text)
+}
+
+fn init_stdio_impl() -> PyResult<()> {
+    let unbuffered = crate::modules::sys_full::config().unbuffered;
+    let stdin = create_stdio(0, false, "<stdin>", "surrogateescape", unbuffered, false)?;
+    let stdout = create_stdio(1, true, "<stdout>", "surrogateescape", unbuffered, false)?;
+    let stderr = create_stdio(2, true, "<stderr>", "backslashreplace", unbuffered, true)?;
+    let d = sys_dict();
+    dict::set_item_str(&d, "stdin", &stdin)?;
+    dict::set_item_str(&d, "__stdin__", &stdin)?;
+    dict::set_item_str(&d, "stdout", &stdout)?;
+    dict::set_item_str(&d, "__stdout__", &stdout)?;
+    dict::set_item_str(&d, "stderr", &stderr)?;
+    dict::set_item_str(&d, "__stderr__", &stderr)?;
+    Ok(())
+}
+
 pub fn create_sys_module(argv: &[String]) -> PyResult<PyRef> {
     let m = crate::types::module::new_module("sys")?;
     SYS_MODULE.store(m.clone().into_raw(), Release);

@@ -992,6 +992,23 @@ unsafe extern "C" fn buffered_repr(op: *mut PyObject) -> *mut PyObject {
     }
 }
 
+/// `closed` of an exact Buffered* over an exact FileIO, without attribute lookups.
+pub fn fast_closed(o: &PyObject) -> Option<bool> {
+    let t = o.type_ptr();
+    if t != bufreader_type() && t != bufwriter_type() && t != bufrandom_type() {
+        return None;
+    }
+    let b = bf(o);
+    if b.raw.is_null() {
+        return None;
+    }
+    let raw = unsafe { &*b.raw };
+    if !fileio::is_exact_fileio(raw) {
+        return None;
+    }
+    Some(fileio::fio(raw).fd < 0)
+}
+
 // ---------------------------------------------------------------- BufferedRWPair
 
 #[repr(C)]
