@@ -350,6 +350,40 @@ fn outcome_code(o: Outcome) -> i32 {
     }
 }
 
+/// The `-c` argument with the indentation shared by all non-blank lines
+/// removed (blank lines become empty), so indented snippets run as-is.
+fn dedent_command(c: &str) -> String {
+    let is_ws = |ch: char| ch == ' ' || ch == '\t';
+    let mut common: Option<&str> = None;
+    for line in c.split('\n') {
+        if line.chars().all(|ch| is_ws(ch) || ch == '\r') {
+            continue;
+        }
+        let indent = &line[..line.len() - line.trim_start_matches(is_ws).len()];
+        common = Some(match common {
+            None => indent,
+            Some(prev) => {
+                let n = prev.bytes().zip(indent.bytes()).take_while(|(a, b)| a == b).count();
+                &prev[..n]
+            }
+        });
+    }
+    let strip = common.unwrap_or("").len();
+    if strip == 0 && !c.split('\n').any(|l| !l.is_empty() && l.chars().all(|ch| is_ws(ch) || ch == '\r')) {
+        return c.to_string();
+    }
+    c.split('\n')
+        .map(|line| {
+            if line.chars().all(|ch| is_ws(ch) || ch == '\r') {
+                ""
+            } else {
+                &line[strip..]
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Run the main program and finalise. Returns the process exit status
 /// (or terminates the process itself for KeyboardInterrupt).
 pub fn run_main(opts: MainOptions) -> i32 {
@@ -362,7 +396,7 @@ pub fn run_main(opts: MainOptions) -> i32 {
             if !opts.safe_path {
                 insert_path0("");
             }
-            let mut src = c.clone().into_bytes();
+            let mut src = dedent_command(c).into_bytes();
             src.push(b'\n');
             outcome_code(run_code_in_main(&src, "<string>"))
         }

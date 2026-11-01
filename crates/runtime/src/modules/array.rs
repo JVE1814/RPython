@@ -1346,63 +1346,39 @@ fn m_reconstructor(_m: &PyObject, args: &[&PyObject]) -> PyResult {
 
 static INIT: std::sync::Once = std::sync::Once::new();
 
-const ARRAY_DOC: &str = r#"array(typecode [, initializer]) -> array
+const ARRAY_DOC: &str = r#"array(typecode[, initializer])
 
-Return a new array whose items are restricted by typecode, and
-initialized from the optional initializer value, which must be a list,
-string or iterable over elements of the appropriate type.
+A mutable sequence whose items all have one machine type, selected by
+typecode.  The optional initializer may be a list, a bytes-like object,
+a str (for character type codes) or any iterable of suitable items.
 
-Arrays represent basic values and behave very much like lists, except
-the type of objects stored in them is constrained. The type is specified
-at object creation time by using a type code, which is a single character.
-The following type codes are defined:
+Type codes, with the C type used and the smallest item size in bytes:
 
-    Type code   C Type             Python Type       Minimum size in bytes
-    'b'         signed integer     int               1
-    'B'         unsigned integer   int               1
-    'u'         Unicode character  str (see note)    2
-    'w'         Unicode character  str               4
-    'h'         signed integer     int               2
-    'H'         unsigned integer   int               2
-    'i'         signed integer     int               2
-    'I'         unsigned integer   int               2
-    'l'         signed integer     int               4
-    'L'         unsigned integer   int               4
-    'q'         signed integer     int               8
-    'Q'         unsigned integer   int               8
-    'e'         half float         float             2
-    'f'         floating-point     float             4
-    'd'         floating-point     float             8
-    'Zf'        float complex      complex           8
-    'Zd'        double complex     complex           16
+    'b'    signed char           int      1
+    'B'    unsigned char         int      1
+    'u'    wchar_t               str      2 (see note)
+    'w'    Py_UCS4               str      4
+    'h'    signed short          int      2
+    'H'    unsigned short        int      2
+    'i'    signed int            int      2
+    'I'    unsigned int          int      2
+    'l'    signed long           int      4
+    'L'    unsigned long         int      4
+    'q'    signed long long      int      8
+    'Q'    unsigned long long    int      8
+    'e'    16-bit float          float    2
+    'f'    float                 float    4
+    'd'    double                float    8
+    'Zf'   float complex         complex  8
+    'Zd'   double complex        complex  16
 
-NOTE: The 'u' typecode corresponds to Python's unicode character. On
-narrow builds this is 2-bytes on wide builds this is 4-bytes.  It is
-deprecated; use 'w' instead.
+Note: the size of 'u' depends on the platform's wchar_t; the type code
+is deprecated in favour of 'w'.
 
-Methods:
-
-append() -- append a new item to the end of the array
-buffer_info() -- return information giving the current memory info
-byteswap() -- byteswap all the items of the array
-count() -- return number of occurrences of an object
-extend() -- extend array by appending multiple elements from an iterable
-fromfile() -- read items from a file object
-fromlist() -- append items from the list
-frombytes() -- append items from the string
-index() -- return index of first occurrence of an object
-insert() -- insert a new item into the array at a provided position
-pop() -- remove and return item (default last)
-remove() -- remove first occurrence of an object
-reverse() -- reverse the order of the items in the array
-tofile() -- write all items to a file object
-tolist() -- return the array converted to an ordinary list
-tobytes() -- return the array converted to a string
-
-Attributes:
-
-typecode -- the typecode character used to create the array
-itemsize -- the length in bytes of one array item
+Besides the list-like operations, arrays convert to and from bytes
+(frombytes/tobytes), lists (fromlist/tolist), str (fromunicode/
+tounicode) and files (fromfile/tofile); typecode and itemsize describe
+the item type.
 "#;
 
 pub fn init_module() -> PyResult {
@@ -1447,29 +1423,29 @@ pub fn init_module() -> PyResult {
             let bp = Box::leak(Box::new(PyBufferProcs { bf_getbuffer: Some(array_getbuffer), bf_releasebuffer: Some(array_releasebuffer) }));
             t.tp_as_buffer = bp;
             t.tp_methods = mdefs![
-                ("append", O, m_append, "append($self, v, /)\n--\n\nAppend new value v to the end of the array."),
-                ("buffer_info", NOARGS, m_buffer_info, "buffer_info($self, /)\n--\n\nReturn a tuple (address, length) giving the current memory address and the length in items of the buffer used to hold array's contents."),
-                ("byteswap", NOARGS, m_byteswap, "byteswap($self, /)\n--\n\nByteswap all items of the array."),
-                ("clear", NOARGS, m_clear, "clear($self, /)\n--\n\nRemove all items from the array."),
-                ("__copy__", NOARGS, m_copy, "__copy__($self, /)\n--\n\nReturn a copy of the array."),
-                ("count", O, m_count, "count($self, v, /)\n--\n\nReturn number of occurrences of v in the array."),
-                ("__deepcopy__", O, m_deepcopy, "__deepcopy__($self, unused, /)\n--\n\nReturn a copy of the array."),
-                ("extend", O, m_extend, "extend($self, bb, /)\n--\n\nAppend items to the end of the array."),
-                ("frombytes", O, m_frombytes, "frombytes($self, buffer, /)\n--\n\nAppends items from the string, interpreting it as an array of machine values, as if it had been read from a file using the fromfile() method."),
-                ("fromfile", FAST, m_fromfile, "fromfile($self, f, n, /)\n--\n\nRead n objects from the file object f and append them to the end of the array."),
-                ("fromlist", O, m_fromlist, "fromlist($self, list, /)\n--\n\nAppend items to array from list."),
-                ("fromunicode", O, m_fromunicode, "fromunicode($self, ustr, /)\n--\n\nExtends this array with data from the unicode string ustr."),
-                ("index", FAST, m_index, "index($self, v, start=0, stop=sys.maxsize, /)\n--\n\nReturn index of first occurrence of v in the array."),
-                ("insert", FAST, m_insert, "insert($self, i, v, /)\n--\n\nInsert a new item v into the array before position i."),
-                ("pop", FAST, m_pop, "pop($self, i=-1, /)\n--\n\nReturn the i-th element and delete it from the array."),
-                ("__reduce_ex__", O, m_reduce_ex, "__reduce_ex__($self, value, /)\n--\n\nReturn state information for pickling."),
-                ("remove", O, m_remove, "remove($self, v, /)\n--\n\nRemove the first occurrence of v in the array."),
-                ("reverse", NOARGS, m_reverse, "reverse($self, /)\n--\n\nReverse the order of the items in the array."),
-                ("tofile", O, m_tofile, "tofile($self, f, /)\n--\n\nWrite all items (as machine values) to the file object f."),
-                ("tolist", NOARGS, m_tolist, "tolist($self, /)\n--\n\nConvert array to an ordinary list with the same items."),
-                ("tobytes", NOARGS, m_tobytes, "tobytes($self, /)\n--\n\nConvert the array to an array of machine values and return the bytes representation."),
-                ("tounicode", NOARGS, m_tounicode, "tounicode($self, /)\n--\n\nExtends this array with data from the unicode string ustr."),
-                ("__sizeof__", NOARGS, m_sizeof, "__sizeof__($self, /)\n--\n\nSize of the array in memory, in bytes."),
+                ("append", O, m_append, "append($self, v, /)\n--\n\nAdd v as the last item."),
+                ("buffer_info", NOARGS, m_buffer_info, "buffer_info($self, /)\n--\n\nReturn (address, number of items) of the storage; the address is only valid until the array is resized."),
+                ("byteswap", NOARGS, m_byteswap, "byteswap($self, /)\n--\n\nReverse the byte order of every item in place."),
+                ("clear", NOARGS, m_clear, "clear($self, /)\n--\n\nMake the array empty."),
+                ("__copy__", NOARGS, m_copy, "__copy__($self, /)\n--\n\nShallow copy of the array."),
+                ("count", O, m_count, "count($self, v, /)\n--\n\nHow many items equal v."),
+                ("__deepcopy__", O, m_deepcopy, "__deepcopy__($self, unused, /)\n--\n\nCopy of the array (items are plain values, so this equals a shallow copy)."),
+                ("extend", O, m_extend, "extend($self, bb, /)\n--\n\nAdd every item of the iterable (or array of the same type code) bb."),
+                ("frombytes", O, m_frombytes, "frombytes($self, buffer, /)\n--\n\nAdd items decoded from the raw machine representation in buffer."),
+                ("fromfile", FAST, m_fromfile, "fromfile($self, f, n, /)\n--\n\nRead n items in machine representation from file f and add them; EOFError if fewer are available (those are still added)."),
+                ("fromlist", O, m_fromlist, "fromlist($self, list, /)\n--\n\nAdd the items of a list; nothing is added if one of them has the wrong type."),
+                ("fromunicode", O, m_fromunicode, "fromunicode($self, ustr, /)\n--\n\nAdd the characters of str ustr (type codes u and w only)."),
+                ("index", FAST, m_index, "index($self, v, start=0, stop=sys.maxsize, /)\n--\n\nPosition of the first item equal to v within [start, stop); ValueError if absent."),
+                ("insert", FAST, m_insert, "insert($self, i, v, /)\n--\n\nPut v before position i."),
+                ("pop", FAST, m_pop, "pop($self, i=-1, /)\n--\n\nRemove and return the item at position i (the last one by default)."),
+                ("__reduce_ex__", O, m_reduce_ex, "__reduce_ex__($self, value, /)\n--\n\nPickling support."),
+                ("remove", O, m_remove, "remove($self, v, /)\n--\n\nDelete the first item equal to v; ValueError if absent."),
+                ("reverse", NOARGS, m_reverse, "reverse($self, /)\n--\n\nReverse the item order in place."),
+                ("tofile", O, m_tofile, "tofile($self, f, /)\n--\n\nWrite the items in machine representation to file f."),
+                ("tolist", NOARGS, m_tolist, "tolist($self, /)\n--\n\nThe items as a list."),
+                ("tobytes", NOARGS, m_tobytes, "tobytes($self, /)\n--\n\nThe items in machine representation, as bytes."),
+                ("tounicode", NOARGS, m_tounicode, "tounicode($self, /)\n--\n\nThe characters as a str (type codes u and w only)."),
+                ("__sizeof__", NOARGS, m_sizeof, "__sizeof__($self, /)\n--\n\nMemory used by the array object, in bytes."),
                 ("__class_getitem__", O, m_class_getitem, "See PEP 585"; METH_CLASS),
             ];
             t.tp_getset = crate::getset_table![
@@ -1488,8 +1464,8 @@ pub fn init_module() -> PyResult {
             t.tp_new = Some(iter_new);
             t.tp_getattro = Some(object_generic_getattro);
             t.tp_methods = mdefs![
-                ("__reduce__", NOARGS, iter_reduce, "Return state information for pickling."),
-                ("__setstate__", O, iter_setstate, "Set state information for unpickling."),
+                ("__reduce__", NOARGS, iter_reduce, "Pickling support."),
+                ("__setstate__", O, iter_setstate, "Restore the position when unpickling."),
             ];
             type_ready(iter_type())?;
             Ok(())
@@ -1498,14 +1474,14 @@ pub fn init_module() -> PyResult {
     res?;
     let m = crate::types::module::new_module("array")?;
     let d = crate::types::module::module_dict(&m);
-    dict::set_item_str(&d, "__doc__", &pystr::new_str("This module defines an object type which can efficiently represent\nan array of basic values: characters, integers, floating-point\nnumbers.  Arrays are sequence types and behave very much like lists,\nexcept that the type of objects stored in them is constrained.\n"))?;
+    dict::set_item_str(&d, "__doc__", &pystr::new_str("Typed arrays of numbers or characters with compact storage.\n"))?;
     dict::set_item_str(&d, "array", &type_ref(array_type()))?;
     dict::set_item_str(&d, "ArrayType", &type_ref(array_type()))?;
     let codes: Vec<PyRef> = CODES.iter().map(|c| pystr::new_str(c.code)).collect();
     dict::set_item_str(&d, "typecodes", &tuple::new_tuple(codes))?;
     crate::builtins::add_methods_to_dict(
         &d,
-        mdefs![("_array_reconstructor", FAST, m_reconstructor, "_array_reconstructor($module, arraytype, typecode, mformat_code, items, /)\n--\n\nInternal. Used for pickling support.")],
+        mdefs![("_array_reconstructor", FAST, m_reconstructor, "_array_reconstructor($module, arraytype, typecode, mformat_code, items, /)\n--\n\nRebuild an array from pickled data (internal).")],
         Some(&m),
     )?;
     // Register with the abstract base classes (fails loudly if they are gone).

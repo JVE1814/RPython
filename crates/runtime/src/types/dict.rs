@@ -82,6 +82,7 @@ fn lock_slow(m: &AtomicU8) {
 // ------------------------------------------------------------------ table
 
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub struct Entry {
     pub hash: isize,
     pub key: *mut PyObject,
@@ -92,17 +93,29 @@ const EMPTY: i32 = -1;
 const DUMMY: i32 = -2;
 const MIN_SIZE: usize = 8;
 
+/// Hash table storage. The header lives in a small-object (TLAB) block pointed to
+/// by `ma_keys`; the index array and the entry array share one data block
+/// (`[i32; size]` then `[Entry; cap]`), also from the TLAB when small. A fresh
+/// dict therefore costs two small-object allocations and no malloc.
+/// `entries_p` / `nentries` / `version` are read by JIT-generated code.
+#[repr(C)]
 pub struct DictTable {
-    indices: Vec<i32>,
-    /// Entries in insertion order; deleted entries have a NULL key (holes).
-    pub entries: Vec<Entry>,
-    /// Number of live entries.
-    used: usize,
-    /// Bumped on every change of the key structure (insert/delete/clear/resize).
+    /// Bumped on every change (insert/delete/value store/clear/resize).
     pub version: u64,
     /// Identity of the index layout: renewed on resize/clear (lookups that ran
     /// Python code restart only if this or the probed entry changed).
     layout: u64,
+    pub entries_p: *mut Entry,
+    /// Entries in insertion order (deleted entries have a NULL key): entries_p[..nentries]
+    pub nentries: usize,
+    indices_p: *mut i32,
+    /// number of index slots (power of two)
+    size: usize,
+    /// entry capacity
+    cap: usize,
+    /// Number of live entries.
+    used: usize,
+    data_bytes: usize,
 }
 
 /// A fresh, globally unique dict version stamp (the JIT's allocator). Every
@@ -125,22 +138,84 @@ fn size_for(min_usable: usize) -> usize {
     size
 }
 
+#[inline]
+fn raw_alloc(bytes: usize) -> *mut u8 {
+    if bytes <= crate::tlab::MAX_SMALL {
+        let p = crate::tlab::alloc_small(bytes);
+        if p.is_null() {
+            std::alloc::handle_alloc_error(std::alloc::Layout::from_size_align(bytes, 8).unwrap());
+        }
+        {
+            return p;
+        }
+    }
+    let p = unsafe { libc::malloc(bytes) as *mut u8 };
+    if p.is_null() {
+        std::alloc::handle_alloc_error(std::alloc::Layout::from_size_align(bytes, 8).unwrap());
+    }
+    p
+}
+#[inline]
+unsafe fn raw_free(p: *mut u8, bytes: usize) {
+    unsafe {
+        if bytes <= crate::tlab::MAX_SMALL {
+            crate::tlab::free_small(p);
+        } else {
+            libc::free(p as *mut libc::c_void);
+        }
+    }
+}
+
 impl DictTable {
+    /// A table with room for `cap` entries (data block allocated, header by value).
     pub fn new(cap: usize) -> DictTable {
         let size = size_for(cap);
-        DictTable { indices: vec![EMPTY; size], entries: Vec::with_capacity(cap.min(usable_for(size))), used: 0, version: next_version(), layout: next_version() }
+        let ecap = usable_for(size);
+        let ibytes = (size * 4 + 7) & !7;
+        let bytes = ibytes + ecap * std::mem::size_of::<Entry>();
+        let data = raw_alloc(bytes);
+        unsafe { std::ptr::write_bytes(data, 0xff, size * 4) };
+        DictTable {
+            version: next_version(),
+            layout: next_version(),
+            entries_p: unsafe { data.add(ibytes) as *mut Entry },
+            nentries: 0,
+            indices_p: data as *mut i32,
+            size,
+            cap: ecap,
+            used: 0,
+            data_bytes: bytes,
+        }
+    }
+    #[inline(always)]
+    fn indices(&self) -> &[i32] {
+        unsafe { std::slice::from_raw_parts(self.indices_p, self.size) }
+    }
+    #[inline(always)]
+    fn indices_mut(&mut self) -> &mut [i32] {
+        unsafe { std::slice::from_raw_parts_mut(self.indices_p, self.size) }
+    }
+    /// The entry array (insertion order, holes have a NULL key).
+    #[inline(always)]
+    pub fn entries(&self) -> &[Entry] {
+        unsafe { std::slice::from_raw_parts(self.entries_p, self.nentries) }
+    }
+    #[inline(always)]
+    pub fn entries_mut(&mut self) -> &mut [Entry] {
+        unsafe { std::slice::from_raw_parts_mut(self.entries_p, self.nentries) }
     }
     #[inline]
     fn mask(&self) -> usize {
-        self.indices.len() - 1
+        self.size - 1
     }
     #[inline]
     fn find_empty_slot(&self, hash: isize) -> usize {
         let mask = self.mask();
+        let idx = self.indices();
         let mut perturb = hash as usize;
         let mut i = (hash as usize) & mask;
         loop {
-            if self.indices[i] < 0 {
+            if idx[i] < 0 {
                 return i;
             }
             perturb >>= 5;
@@ -149,42 +224,58 @@ impl DictTable {
     }
     /// Rebuild with room for at least `min_usable` entries (compacts holes).
     fn resize(&mut self, min_usable: usize) {
-        let size = size_for(min_usable.max(self.used));
-        let mut live: Vec<Entry> = Vec::with_capacity(usable_for(size));
-        live.extend(self.entries.iter().copied().filter(|e| !e.key.is_null()));
-        self.indices = vec![EMPTY; size];
-        self.entries = live;
-        let mask = size - 1;
-        for (idx, e) in self.entries.iter().enumerate() {
-            let mut perturb = e.hash as usize;
-            let mut i = (e.hash as usize) & mask;
-            while self.indices[i] != EMPTY {
-                perturb >>= 5;
-                i = (i.wrapping_mul(5).wrapping_add(perturb).wrapping_add(1)) & mask;
+        let mut fresh = DictTable::new(min_usable.max(self.used));
+        {
+            let mask = fresh.size - 1;
+            let mut n = 0;
+            for e in self.entries().iter().filter(|e| !e.key.is_null()) {
+                unsafe { *fresh.entries_p.add(n) = *e };
+                let mut perturb = e.hash as usize;
+                let mut i = (e.hash as usize) & mask;
+                let idx = fresh.indices_mut();
+                while idx[i] != EMPTY {
+                    perturb >>= 5;
+                    i = (i.wrapping_mul(5).wrapping_add(perturb).wrapping_add(1)) & mask;
+                }
+                idx[i] = n as i32;
+                n += 1;
             }
-            self.indices[i] = idx as i32;
+            fresh.nentries = n;
+            fresh.used = n;
         }
+        // the old data block goes; the header (and `version`) stay in place
+        std::mem::swap(&mut self.entries_p, &mut fresh.entries_p);
+        std::mem::swap(&mut self.indices_p, &mut fresh.indices_p);
+        std::mem::swap(&mut self.size, &mut fresh.size);
+        std::mem::swap(&mut self.cap, &mut fresh.cap);
+        std::mem::swap(&mut self.data_bytes, &mut fresh.data_bytes);
+        self.nentries = fresh.nentries;
+        fresh.nentries = 0;
         self.version = next_version();
         self.layout = next_version();
+        drop(fresh);
     }
     #[inline]
     fn insert_new(&mut self, h: isize, key: *mut PyObject, value: *mut PyObject) {
-        if self.entries.len() >= usable_for(self.indices.len()) {
+        if self.nentries >= self.cap {
             self.resize(self.used * 3);
         }
         let slot = self.find_empty_slot(h);
-        self.indices[slot] = self.entries.len() as i32;
-        self.entries.push(Entry { hash: h, key, value });
+        let n = self.nentries;
+        self.indices_mut()[slot] = n as i32;
+        unsafe { *self.entries_p.add(n) = Entry { hash: h, key, value } };
+        self.nentries = n + 1;
         self.used += 1;
         self.version = next_version();
     }
     /// Find the index slot holding entry `ix` (which has hash `h`).
     fn slot_of(&self, ix: usize, h: isize) -> usize {
         let mask = self.mask();
+        let idx = self.indices();
         let mut perturb = h as usize;
         let mut i = (h as usize) & mask;
         loop {
-            if self.indices[i] == ix as i32 {
+            if idx[i] == ix as i32 {
                 return i;
             }
             perturb >>= 5;
@@ -193,11 +284,12 @@ impl DictTable {
     }
     /// Remove entry `ix`; returns the owned (key, value).
     fn remove(&mut self, ix: usize) -> (*mut PyObject, *mut PyObject) {
-        let e = self.entries[ix];
+        let e = self.entries()[ix];
         let s = self.slot_of(ix, e.hash);
-        self.indices[s] = DUMMY;
-        self.entries[ix].key = std::ptr::null_mut();
-        self.entries[ix].value = std::ptr::null_mut();
+        self.indices_mut()[s] = DUMMY;
+        let en = &mut self.entries_mut()[ix];
+        en.key = std::ptr::null_mut();
+        en.value = std::ptr::null_mut();
         self.used -= 1;
         self.version = next_version();
         (e.key, e.value)
@@ -206,7 +298,30 @@ impl DictTable {
         self.used
     }
     pub fn nentries(&self) -> usize {
-        self.entries.len()
+        self.nentries
+    }
+}
+
+impl Drop for DictTable {
+    fn drop(&mut self) {
+        if !self.indices_p.is_null() {
+            unsafe { raw_free(self.indices_p as *mut u8, self.data_bytes) };
+            self.indices_p = std::ptr::null_mut();
+        }
+    }
+}
+
+/// Allocate a table header (small-object block) holding `t`.
+fn alloc_table(t: DictTable) -> *mut DictTable {
+    let p = raw_alloc(std::mem::size_of::<DictTable>()) as *mut DictTable;
+    unsafe { std::ptr::write(p, t) };
+    p
+}
+/// Free a header allocated by `alloc_table` (and its data block).
+unsafe fn free_table(p: *mut DictTable) {
+    unsafe {
+        std::ptr::drop_in_place(p);
+        raw_free(p as *mut u8, std::mem::size_of::<DictTable>());
     }
 }
 
@@ -216,7 +331,7 @@ fn raw_table(d: &PyObject) -> *mut DictTable {
         let dp = d.as_ptr() as *mut PyDictObject;
         let mut t = (*dp).ma_keys as *mut DictTable;
         if t.is_null() {
-            t = Box::into_raw(Box::new(DictTable::new(0)));
+            t = alloc_table(DictTable::new(0));
             (*dp).ma_keys = t as *mut _;
         }
         t
@@ -256,7 +371,7 @@ pub fn new_dict_presized(n: usize) -> PyRef {
     unsafe {
         let op = alloc::alloc_object(dict_type(), std::mem::size_of::<PyDictObject>());
         let dp = op as *mut PyDictObject;
-        (*dp).ma_keys = Box::into_raw(Box::new(DictTable::new(n))) as *mut _;
+        (*dp).ma_keys = alloc_table(DictTable::new(n)) as *mut _;
         crate::gc::track(op);
         PyRef::from_raw(op)
     }
@@ -267,7 +382,7 @@ pub unsafe fn init_dict_storage(op: *mut PyObject) {
     unsafe {
         let dp = op as *mut PyDictObject;
         if (*dp).ma_keys.is_null() {
-            (*dp).ma_keys = Box::into_raw(Box::new(DictTable::new(0))) as *mut _;
+            (*dp).ma_keys = alloc_table(DictTable::new(0)) as *mut _;
         }
     }
 }
@@ -277,15 +392,16 @@ pub unsafe fn free_storage(op: *mut PyObject) {
     unsafe {
         let dp = op as *mut PyDictObject;
         if !(*dp).ma_keys.is_null() {
-            let t = Box::from_raw((*dp).ma_keys as *mut DictTable);
+            let t = (*dp).ma_keys as *mut DictTable;
             (*dp).ma_keys = std::ptr::null_mut();
             (*dp).ma_used = 0;
-            for e in t.entries.iter() {
+            for e in (*t).entries().iter() {
                 if !e.key.is_null() {
                     decref(e.key);
                     decref(e.value);
                 }
             }
+            free_table(t);
         }
     }
 }
@@ -307,7 +423,7 @@ pub unsafe extern "C" fn dict_traverse(op: *mut PyObject, visit: visitproc, arg:
         }
         let t = &*((*dp).ma_keys as *const DictTable);
         let f = visit.unwrap();
-        for e in t.entries.iter() {
+        for e in t.entries().iter() {
             if !e.key.is_null() {
                 let r = f(e.key, arg);
                 if r != 0 {
@@ -346,12 +462,12 @@ pub fn find(d: &PyObject, key: &PyObject, hash: isize) -> PyResult<(ObGuard, Fou
         let mut i = (hash as usize) & table(d).mask();
         loop {
             let t = table(d);
-            let ix = t.indices[i];
+            let ix = t.indices()[i];
             if ix == EMPTY {
                 return Ok((g, Found::Missing));
             }
             if ix >= 0 {
-                let e = t.entries[ix as usize];
+                let e = t.entries()[ix as usize];
                 if e.key == kp {
                     return Ok((g, Found::At(ix as usize)));
                 }
@@ -370,7 +486,7 @@ pub fn find(d: &PyObject, key: &PyObject, hash: isize) -> PyResult<(ObGuard, Fou
                         let eq = eq?;
                         g = ob_lock(d);
                         let t2 = table(d);
-                        if t2.layout != layout || t2.entries.get(ix as usize).map(|x| x.key) != Some(e.key) {
+                        if t2.layout != layout || t2.entries().get(ix as usize).map(|x| x.key) != Some(e.key) {
                             drop(g);
                             continue 'restart;
                         }
@@ -463,7 +579,7 @@ pub fn get_item(d: &PyObject, key: &PyObject) -> PyResult<Option<PyRef>> {
 pub fn get_item_hash(d: &PyObject, key: &PyObject, h: isize) -> PyResult<Option<PyRef>> {
     let (g, f) = find(d, key, h)?;
     let r = match f {
-        Found::At(ix) => Some(unsafe { PyRef::from_borrowed(table(d).entries[ix].value) }),
+        Found::At(ix) => Some(unsafe { PyRef::from_borrowed(table(d).entries()[ix].value) }),
         Found::Missing => None,
     };
     drop(g);
@@ -498,8 +614,8 @@ pub fn set_item_hash(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) -
     unsafe { incref(value.as_ptr()) };
     match f {
         Found::At(ix) => {
-            let old = t.entries[ix].value;
-            t.entries[ix].value = value.as_ptr();
+            let old = t.entries()[ix].value;
+            t.entries_mut()[ix].value = value.as_ptr();
             t.version = next_version();
             crate::interp::cache::on_dict_write(d); // jit
             drop(g);
@@ -538,7 +654,7 @@ pub fn setdefault_hash(d: &PyObject, key: &PyObject, h: isize, default: &PyObjec
     let (g, f) = find(d, key, h)?;
     let t = table(d);
     let r = match f {
-        Found::At(ix) => unsafe { PyRef::from_borrowed(t.entries[ix].value) },
+        Found::At(ix) => unsafe { PyRef::from_borrowed(t.entries()[ix].value) },
         Found::Missing => {
             unsafe {
                 incref(key.as_ptr());
@@ -600,7 +716,7 @@ pub fn remove_at(d: &PyObject, ix: usize, _h: isize) -> (*mut PyObject, *mut PyO
 pub fn clear(d: &PyObject) {
     let g = ob_lock(d);
     let t = table(d);
-    if t.used == 0 && t.entries.is_empty() {
+    if t.used == 0 && t.nentries == 0 {
         return;
     }
     let mut fresh = DictTable::new(0);
@@ -608,7 +724,7 @@ pub fn clear(d: &PyObject) {
     let old = std::mem::replace(t, fresh);
     set_used(d, 0);
     drop(g);
-    for e in old.entries.iter() {
+    for e in old.entries().iter() {
         if !e.key.is_null() {
             unsafe {
                 decref(e.key);
@@ -622,8 +738,8 @@ pub fn clear(d: &PyObject) {
 pub fn next_entry(d: &PyObject, pos: &mut usize) -> Option<(PyRef, PyRef)> {
     let _g = ob_lock(d);
     let t = table(d);
-    while *pos < t.entries.len() {
-        let e = t.entries[*pos];
+    while *pos < t.nentries {
+        let e = t.entries()[*pos];
         *pos += 1;
         if !e.key.is_null() {
             unsafe {
@@ -638,8 +754,8 @@ pub fn next_entry(d: &PyObject, pos: &mut usize) -> Option<(PyRef, PyRef)> {
 pub fn next_entry_hash(d: &PyObject, pos: &mut usize) -> Option<(PyRef, PyRef, isize)> {
     let _g = ob_lock(d);
     let t = table(d);
-    while *pos < t.entries.len() {
-        let e = t.entries[*pos];
+    while *pos < t.nentries {
+        let e = t.entries()[*pos];
         *pos += 1;
         if !e.key.is_null() {
             unsafe {
@@ -653,7 +769,7 @@ pub fn next_entry_hash(d: &PyObject, pos: &mut usize) -> Option<(PyRef, PyRef, i
 /// Number of entry slots (live + holes): the iteration bound.
 pub fn nentries(d: &PyObject) -> usize {
     let _g = ob_lock(d);
-    table(d).entries.len()
+    table(d).nentries
 }
 
 /// Snapshot of items (owned).
@@ -661,7 +777,7 @@ pub fn items_vec(d: &PyObject) -> Vec<(PyRef, PyRef)> {
     let _g = ob_lock(d);
     let t = table(d);
     let mut v = Vec::with_capacity(t.used);
-    for e in t.entries.iter() {
+    for e in t.entries().iter() {
         if !e.key.is_null() {
             unsafe { v.push((PyRef::from_borrowed(e.key), PyRef::from_borrowed(e.value))) };
         }
@@ -674,7 +790,7 @@ pub fn items_hash_vec(d: &PyObject) -> Vec<(PyRef, PyRef, isize)> {
     let _g = ob_lock(d);
     let t = table(d);
     let mut v = Vec::with_capacity(t.used);
-    for e in t.entries.iter() {
+    for e in t.entries().iter() {
         if !e.key.is_null() {
             unsafe { v.push((PyRef::from_borrowed(e.key), PyRef::from_borrowed(e.value), e.hash)) };
         }
@@ -686,7 +802,7 @@ pub fn keys_vec(d: &PyObject) -> Vec<PyRef> {
     let _g = ob_lock(d);
     let t = table(d);
     let mut v = Vec::with_capacity(t.used);
-    for e in t.entries.iter() {
+    for e in t.entries().iter() {
         if !e.key.is_null() {
             unsafe { v.push(PyRef::from_borrowed(e.key)) };
         }
@@ -698,7 +814,7 @@ pub fn values_vec(d: &PyObject) -> Vec<PyRef> {
     let _g = ob_lock(d);
     let t = table(d);
     let mut v = Vec::with_capacity(t.used);
-    for e in t.entries.iter() {
+    for e in t.entries().iter() {
         if !e.key.is_null() {
             unsafe { v.push(PyRef::from_borrowed(e.value)) };
         }
@@ -732,8 +848,8 @@ pub fn merge_dict(d: &PyObject, other: &PyObject, overwrite: bool) -> PyResult<(
         let g = ob_lock(d);
         let t = table(d);
         if t.used == 0 {
-            if t.indices.len() < size_for(items.len()) {
-                *t = DictTable { version: next_version(), ..DictTable::new(items.len()) };
+            if t.size < size_for(items.len()) {
+                *t = DictTable::new(items.len());
             }
             for (k, v, h) in items {
                 t.insert_new(h, k.into_raw(), v.into_raw());
@@ -783,19 +899,19 @@ pub fn version(d: &PyObject) -> u64 {
 pub fn pop_last(d: &PyObject) -> Option<(PyRef, PyRef)> {
     let g = ob_lock(d);
     let t = table(d);
-    let mut ix = t.entries.len();
+    let mut ix = t.nentries;
     while ix > 0 {
         ix -= 1;
-        let e = t.entries[ix];
+        let e = t.entries()[ix];
         if !e.key.is_null() {
             let (k, v) = t.remove(ix);
-            t.entries.truncate(ix);
+            t.nentries = ix;
             set_used(d, t.used);
             drop(g);
             return unsafe { Some((PyRef::from_raw(k), PyRef::from_raw(v))) };
         }
     }
-    t.entries.clear();
+    t.nentries = 0;
     None
 }
 
@@ -803,7 +919,7 @@ pub fn pop_last(d: &PyObject) -> Option<(PyRef, PyRef)> {
 pub fn entry_at(d: &PyObject, pos: usize) -> Option<(PyRef, PyRef)> {
     let _g = ob_lock(d);
     let t = table(d);
-    match t.entries.get(pos) {
+    match t.entries().get(pos) {
         Some(e) if !e.key.is_null() => unsafe { Some((PyRef::from_borrowed(e.key), PyRef::from_borrowed(e.value))) },
         _ => None,
     }
@@ -813,5 +929,5 @@ pub fn entry_at(d: &PyObject, pos: usize) -> Option<(PyRef, PyRef)> {
 pub fn table_sizeof(d: &PyObject) -> usize {
     let _g = ob_lock(d);
     let t = table(d);
-    t.indices.capacity() * 4 + t.entries.capacity() * std::mem::size_of::<Entry>()
+    t.data_bytes + std::mem::size_of::<DictTable>()
 }
