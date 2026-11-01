@@ -282,8 +282,7 @@ fn run_call_frame(ts: &ThreadState, mut frame: Box<Frame>, tramp: usize, target:
     ts.frame.set(prev);
     frame.prev = std::ptr::null_mut();
     if st == tier1::ST_RETURN {
-        frame.state = FrameState::Completed;
-        crate::interp::frame_finished(frame);
+        crate::interp::frame::recycle_call(frame);
         return Ok(unsafe { PyRef::from_raw(out) });
     }
     finish_in_interp(ts, frame, st)

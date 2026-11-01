@@ -378,6 +378,46 @@ pub fn recycle(mut f: Box<Frame>) {
     }
 }
 
+/// Recycle a `new_call` frame whose activation returned normally in compiled code:
+/// no frame object, locals mapping or trace function (else the general path). Only
+/// the slots and the fields compiled code changes are reset.
+#[inline]
+pub fn recycle_call(mut f: Box<Frame>) {
+    if !f.frame_obj.is_null() || !f.locals.is_null() || !f.f_trace.is_null() || f.owns_fc || !f.borrowed_gb {
+        f.state = FrameState::Completed;
+        crate::interp::frame_finished(f);
+        return;
+    }
+    unsafe {
+        let s = f.slots.as_mut_ptr();
+        let top = f.stack_top.max(f.nlocalsplus).min(f.slots.len());
+        for i in 0..top {
+            let p = *s.add(i);
+            if !p.is_null() {
+                *s.add(i) = std::ptr::null_mut();
+                decref(p);
+            }
+        }
+        f.stack_top = f.nlocalsplus;
+        f.code = std::ptr::null_mut();
+        f.func = std::ptr::null_mut();
+        f.globals = std::ptr::null_mut();
+        f.builtins = std::ptr::null_mut();
+        f.prev = std::ptr::null_mut();
+        f.lasti = 0;
+        f.next_instr = 0;
+        f.state = FrameState::Created;
+        f.t2_site = 0;
+        if f.slots.capacity() > 4096 {
+            return;
+        }
+        let pool = &mut *(&raw mut POOL);
+        if pool.len() < POOL_MAX {
+            pool.push(f);
+        }
+    }
+}
+
 /// Free the calling thread's pooled frames (thread exit).
 pub fn drain_pool() {
     unsafe {
