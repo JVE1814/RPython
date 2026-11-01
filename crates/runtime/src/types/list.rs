@@ -548,7 +548,7 @@ pub fn slice_items(items: &[&PyObject], start: isize, step: isize, n: isize) -> 
     v
 }
 
-fn list_getitem(o: &PyObject, k: &PyObject) -> PyResult {
+pub fn list_getitem(o: &PyObject, k: &PyObject) -> PyResult {
     if int::is_int_exact(k) && int::is_compact(k) {
         let mut i = int::compact_value(k) as isize;
         let _g = ob_lock(o);
@@ -585,7 +585,7 @@ fn list_getitem(o: &PyObject, k: &PyObject) -> PyResult {
     }
     raise!(TypeError, "list indices must be integers or slices, not {}", tname(k));
 }
-unsafe extern "C" fn list_subscript(o: *mut PyObject, k: *mut PyObject) -> *mut PyObject {
+pub unsafe extern "C" fn list_subscript(o: *mut PyObject, k: *mut PyObject) -> *mut PyObject {
     unsafe { into_c(list_getitem(&*o, &*k)) }
 }
 

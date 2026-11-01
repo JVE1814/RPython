@@ -160,6 +160,9 @@ pub(crate) struct Parser<'a> {
     segment: usize,
     /// Tokens that had a type comment consumed etc. (unused)
     pub(crate) type_ignores: Vec<TypeIgnore>,
+    /// A non-ASCII identifier that NFKC-normalizes to True/False/None (CPython raises
+    /// ValueError "identifier field can't represent ... constant").
+    pub(crate) bad_ident: std::cell::RefCell<Option<String>>,
 }
 
 /// Recursion limit of the parser (in addition to the stack budget, see
@@ -238,6 +241,7 @@ impl<'a> Parser<'a> {
             stack_base: 0,
             segment: 0,
             type_ignores,
+            bad_ident: std::cell::RefCell::new(None),
         }
     }
 
@@ -330,7 +334,11 @@ impl<'a> Parser<'a> {
         if s.is_ascii() {
             s.to_string()
         } else {
-            (self.opts.hooks.nfkc)(s)
+            let n = (self.opts.hooks.nfkc)(s);
+            if matches!(n.as_str(), "True" | "False" | "None") && self.bad_ident.borrow().is_none() {
+                *self.bad_ident.borrow_mut() = Some(n.clone());
+            }
+            n
         }
     }
 
@@ -517,6 +525,11 @@ impl<'a> Parser<'a> {
         let r = self.start_rule();
         match r {
             Ok(Some(m)) => {
+                if let Some(n) = self.bad_ident.borrow().clone() {
+                    let mut e = SyntaxError::simple(format!("identifier field can't represent '{}' constant", n));
+                    e.kind = ErrorKind::ValueError;
+                    return Err(e);
+                }
                 if self.opts.mode == Mode::Single && self.bad_single_statement() {
                     return Err(*self.err_last(ErrorKind::Syntax, "multiple statements found while compiling a single statement"));
                 }

@@ -42,16 +42,38 @@ pub static UNCOLLECTABLE: AtomicUsize = AtomicUsize::new(0);
 /// Size of the live set after the last collection (for adaptive triggering).
 static LAST_LIVE: AtomicUsize = AtomicUsize::new(0);
 
+/// Spin lock protecting the list (critical sections are a few pointer writes; a
+/// std Mutex cost a TLS poison check + futex word on every track/untrack).
+static LIST_LOCK: AtomicBool = AtomicBool::new(false);
+static LIST_HEAD: std::sync::atomic::AtomicPtr<GcHead> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+struct ListGuard;
+impl Drop for ListGuard {
+    fn drop(&mut self) {
+        LIST_LOCK.store(false, Release);
+    }
+}
+
+#[inline]
 fn with_list<R>(f: impl FnOnce(*mut GcHead) -> R) -> R {
-    let mut g = LIST.lock().unwrap_or_else(|e| e.into_inner());
-    let l = g.get_or_insert_with(|| {
-        let mut b = Box::new(List { head: GcHead { next: std::ptr::null_mut(), prev: std::ptr::null_mut() } });
-        let p = &mut b.head as *mut GcHead;
-        b.head.next = p;
-        b.head.prev = p;
-        b
-    });
-    f(&mut l.head as *mut GcHead)
+    while LIST_LOCK.compare_exchange_weak(false, true, Acquire, Relaxed).is_err() {
+        std::hint::spin_loop();
+    }
+    let _g = ListGuard;
+    let mut head = LIST_HEAD.load(Relaxed);
+    if head.is_null() {
+        let mut g = LIST.lock().unwrap_or_else(|e| e.into_inner());
+        let l = g.get_or_insert_with(|| {
+            let mut b = Box::new(List { head: GcHead { next: std::ptr::null_mut(), prev: std::ptr::null_mut() } });
+            let p = &mut b.head as *mut GcHead;
+            b.head.next = p;
+            b.head.prev = p;
+            b
+        });
+        head = &mut l.head as *mut GcHead;
+        LIST_HEAD.store(head, Relaxed);
+    }
+    f(head)
 }
 
 #[inline]
@@ -100,6 +122,9 @@ pub unsafe fn untrack(op: *mut PyObject) {
         });
         o.ob_gc_bits.fetch_and(!GC_BIT_TRACKED, Relaxed);
         TRACKED.fetch_sub(1, Relaxed);
+        // allocations minus deallocations (like CPython gen0 counts): short-lived
+        // objects do not trigger collections
+        let _ = ALLOCS_SINCE.fetch_update(Relaxed, Relaxed, |v| v.checked_sub(1));
     }
 }
 
@@ -203,9 +228,26 @@ fn total_refcnt(o: &PyObject) -> isize {
     local as isize + (o.ob_ref_shared.load(Relaxed) >> REF_SHARED_SHIFT)
 }
 
+/// Multiplicative hash for object addresses (SipHash dominated collection time).
+#[derive(Default)]
+struct PtrHasher(u64);
+impl std::hash::Hasher for PtrHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        }
+    }
+    fn write_usize(&mut self, v: usize) {
+        self.0 = ((v as u64) >> 4).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
 struct Graph {
     objs: Vec<*mut PyObject>,
-    index: HashMap<usize, usize>,
+    index: HashMap<usize, usize, std::hash::BuildHasherDefault<PtrHasher>>,
     refs: Vec<isize>,
     reachable: Vec<bool>,
 }

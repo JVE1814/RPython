@@ -213,14 +213,55 @@ pub unsafe fn explicit_merge(op: *mut PyObject) {
     }
 }
 
+/// Deallocation nesting depth beyond which GC objects are deferred (the "trashcan":
+/// freeing a deeply nested container must not recurse once per level on the C stack).
+const TRASHCAN_DEPTH: u32 = 64;
+
+thread_local! {
+    static DEALLOC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static TRASH: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 #[inline]
-pub unsafe fn dealloc(op: *mut PyObject) {
+unsafe fn call_dealloc(op: *mut PyObject) {
     unsafe {
         let tp = (*op).type_ptr();
         match (*tp).tp_dealloc {
             Some(f) => f(op),
             None => crate::alloc::free_object(op),
         }
+    }
+}
+
+#[inline]
+pub unsafe fn dealloc(op: *mut PyObject) {
+    unsafe {
+        let is_gc = (*(*op).type_ptr()).tp_flags & crate::ffi::Py_TPFLAGS_HAVE_GC != 0;
+        if !is_gc {
+            return call_dealloc(op);
+        }
+        let Ok(depth) = DEALLOC_DEPTH.try_with(|d| d.get()) else {
+            return call_dealloc(op); // thread is exiting
+        };
+        if depth >= TRASHCAN_DEPTH {
+            // defer: the outermost dealloc on this thread frees it
+            crate::gc::untrack(op);
+            TRASH.with(|t| t.borrow_mut().push(op as usize));
+            return;
+        }
+        DEALLOC_DEPTH.with(|d| d.set(depth + 1));
+        call_dealloc(op);
+        if depth == 0 {
+            // drain deferred objects (each may defer more)
+            loop {
+                let next = TRASH.with(|t| t.borrow_mut().pop());
+                match next {
+                    Some(p) => call_dealloc(p as *mut PyObject),
+                    None => break,
+                }
+            }
+        }
+        DEALLOC_DEPTH.with(|d| d.set(depth));
     }
 }
 

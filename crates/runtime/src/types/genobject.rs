@@ -41,6 +41,7 @@ pub static mut PyCoro_Type: PyTypeObject = PyTypeObject::ZERO;
 #[unsafe(no_mangle)]
 pub static mut PyAsyncGen_Type: PyTypeObject = PyTypeObject::ZERO;
 pub static mut CORO_WRAPPER_TYPE: PyTypeObject = PyTypeObject::ZERO;
+#[unsafe(export_name = "_PyAsyncGenASend_Type")]
 pub static mut ASYNC_GEN_ASEND_TYPE: PyTypeObject = PyTypeObject::ZERO;
 pub static mut ASYNC_GEN_ATHROW_TYPE: PyTypeObject = PyTypeObject::ZERO;
 pub static mut ASYNC_GEN_WRAPPED_TYPE: PyTypeObject = PyTypeObject::ZERO;
