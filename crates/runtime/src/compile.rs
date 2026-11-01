@@ -237,3 +237,19 @@ pub fn compile_ast(module: &rpy_parser::ast::Mod, filename: &str, mode: Mode, fl
 
 #[allow(dead_code)]
 fn _unused(_: &PyObject) {}
+
+/// Parse source bytes to a Rust AST (for `compile(..., PyCF_ONLY_AST)`), emitting
+/// parser warnings and raising SyntaxError like `compile_bytes`.
+pub fn parse_to_ast(src: &[u8], filename: &str, mode: Mode, flags: u32, feature_version: Option<u32>) -> PyResult<rpy_parser::ast::Mod> {
+    let popts = parse_options(mode, flags, feature_version);
+    let out = rpy_parser::parse_bytes(src, &popts);
+    let text = String::from_utf8_lossy(src).into_owned();
+    for w in &out.warnings {
+        let cat = format!("{:?}", w.category);
+        emit_warning(&cat, &w.msg, &w.error_msg, filename, w.lineno, w.col_offset + 1, source_line(&text, w.lineno).as_deref())?;
+    }
+    match out.result {
+        Ok(m) => Ok(m),
+        Err(e) => Err(parse_error(&e, filename)),
+    }
+}
