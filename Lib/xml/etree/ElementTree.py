@@ -16,7 +16,6 @@ __all__ = [
     "QName",
     "SubElement",
     "tostring", "tostringlist", "TreeBuilder",
-    "VERSION",
     "XML", "XMLID",
     "XMLParser", "XMLPullParser",
     "register_namespace",
@@ -123,17 +122,15 @@ class Element:
             raise TypeError('expected an Element, not %s' % type(e).__name__)
 
     def remove(self, subelement, /):
-        """Remove the first occurrence of *subelement* (compared by
-        identity first, then equality); ValueError if missing."""
-        for i, child in enumerate(self._children):
-            if child is subelement:
-                del self._children[i]
+        """Remove the first occurrence of *subelement*; ValueError if it is
+        not a child."""
+        children = self._children
+        for i, child in enumerate(children):
+            if child is subelement or child == subelement:
+                # comparisons may have mutated the list; never fail here
+                del children[i:i + 1]
                 return
-        for i, child in enumerate(self._children):
-            if child == subelement:
-                del self._children[i]
-                return
-        raise ValueError("Element.remove(x): element not found")
+        raise ValueError(f"{subelement!r} not in {self!r}")
 
     def find(self, path, namespaces=None):
         """The first matching subelement, or None."""
@@ -186,12 +183,14 @@ class Element:
         tag = self.tag
         if not isinstance(tag, str) and tag is not None:
             return
-        if self.text:
-            yield self.text
+        text = self.text
+        if text:
+            yield text
         for child in self:
             yield from child.itertext()
-            if child.tail:
-                yield child.tail
+            tail = child.tail
+            if tail:
+                yield tail
 
 
 def SubElement(parent, tag, /, attrib={}, **extra):
@@ -510,13 +509,17 @@ HTML_EMPTY = {"area", "base", "basefont", "br", "col", "embed", "frame", "hr",
               "track", "wbr"}
 
 
+_HTML_RAW_TEXT = {"script", "style", "xmp", "iframe", "noembed", "noframes",
+                  "plaintext"}
+
+
 def _serialize_html(write, elem, qnames, namespaces, **kwargs):
     tag = elem.tag
     text = elem.text
     if tag is Comment:
-        write("<!--%s-->" % _escape_cdata(text))
+        write("<!--%s-->" % text)
     elif tag is ProcessingInstruction:
-        write("<?%s?>" % _escape_cdata(text))
+        write("<?%s?>" % text)
     else:
         tag = qnames[tag]
         if tag is None:
@@ -543,15 +546,13 @@ def _serialize_html(write, elem, qnames, namespaces, **kwargs):
             write(">")
             ltag = tag.lower()
             if text:
-                if ltag in ("script", "style"):
-                    write(text)
-                elif ltag == "plaintext":
+                if ltag in _HTML_RAW_TEXT:
                     write(text)
                 else:
                     write(_escape_cdata(text))
             for e in elem:
                 _serialize_html(write, e, qnames, None)
-            if ltag not in HTML_EMPTY:
+            if ltag not in HTML_EMPTY and ltag != "plaintext":
                 write("</" + tag + ">")
     if elem.tail:
         write(_escape_cdata(elem.tail))
@@ -756,47 +757,52 @@ def iterparse(source, events=None, parser=None):
     and 'end-ns' (default: 'end' only).  The iterator has a 'root'
     attribute once parsing is complete and a close() method.
     """
-    pullparser = XMLPullParser(events=events, _parser=parser)
+    return _IterParseIterator(source, events, parser)
 
-    if not hasattr(source, "read"):
-        source = open(source, "rb")
-        close_source = True
-    else:
-        close_source = False
 
-    def iterator(source):
+class _IterParseIterator(collections.abc.Iterator):
+
+    def __init__(self, source, events, parser):
+        self._owns_source = not hasattr(source, "read")
+        if self._owns_source:
+            source = open(source, "rb")
+        self._source = source
+        self._pull = XMLPullParser(events=events, _parser=parser)
+        self._closed = False
+        self.root = None
+        self._gen = self._run()
+
+    def _run(self):
+        pull = self._pull
         try:
             while True:
-                yield from pullparser.read_events()
-                data = source.read(16 * 1024)
+                yield from pull.read_events()
+                data = self._source.read(16 * 1024)
                 if not data:
                     break
-                pullparser.feed(data)
-            root = pullparser._close_and_return_root()
-            yield from pullparser.read_events()
-            it.root = root
+                pull.feed(data)
+            root = pull._close_and_return_root()
+            yield from pull.read_events()
+            self.root = root
         finally:
-            if close_source:
-                source.close()
+            if self._owns_source:
+                self._source.close()
 
-    class IterParseIterator(collections.abc.Iterator):
-        __next__ = iterator(source).__next__
+    def __next__(self):
+        return next(self._gen)
 
-        def close(self):
-            if close_source:
-                source.close()
-            gen.close()
+    def close(self):
+        self._closed = True
+        self._gen.close()
+        if self._owns_source:
+            self._source.close()
 
-        def __del__(self):
-            if close_source and not source.closed:
-                warnings.warn(f"unclosed file {source!r}", ResourceWarning,
-                              stacklevel=2)
-                source.close()
-
-    gen = IterParseIterator.__next__.__self__
-    it = IterParseIterator()
-    it.root = None
-    return it
+    def __del__(self):
+        if self._owns_source and not self._closed:
+            name = getattr(self._source, 'name', self._source)
+            warnings.warn(f"unclosed iterparse iterator {name!r}",
+                          ResourceWarning, stacklevel=2)
+            self.close()
 
 
 class XMLPullParser:

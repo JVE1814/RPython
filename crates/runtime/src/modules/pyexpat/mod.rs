@@ -254,6 +254,12 @@ fn eng_position(o: &PyObject) -> PyResult {
     Ok(tuple::new_tuple(vec![int::new_int(l as i64), int::new_int(c as i64), int::new_int(b)]))
 }
 
+fn eng_force_encoding(o: &PyObject, name: &PyObject) -> PyResult {
+    let n = pystr::as_utf8(name)?.to_string();
+    engine_of(o)?.lock().unwrap().force_encoding(n);
+    Ok(none::none_ref())
+}
+
 fn eng_started(o: &PyObject) -> PyResult {
     Ok(bool_::new_bool(engine_of(o)?.lock().unwrap().is_started()))
 }
@@ -317,6 +323,7 @@ pub fn init() -> PyResult {
                 ("external", FASTKW, eng_external),
                 ("position", NOARGS, eng_position),
                 ("started", NOARGS, eng_started),
+                ("force_encoding", O, eng_force_encoding),
                 ("configure", FASTKW, eng_configure),
             ];
             crate::types::typeobject::type_ready(&raw mut ENGINE_TYPE)?;

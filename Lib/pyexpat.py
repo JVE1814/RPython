@@ -158,11 +158,11 @@ class xmlparser:
         if name == 'ErrorCode':
             return self._err[0]
         if name == 'ErrorLineNumber':
-            return self._err[1]
+            return self._line
         if name == 'ErrorColumnNumber':
-            return self._err[2]
+            return self._col
         if name == 'ErrorByteIndex':
-            return self._err[3]
+            return self._byte
         if name == 'CurrentLineNumber':
             return self._line
         if name == 'CurrentColumnNumber':
@@ -284,6 +284,9 @@ class xmlparser:
 
     def _raise_error(self, code, line, col, byte):
         object.__setattr__(self, '_err', (code, line, col, byte))
+        object.__setattr__(self, '_line', line)
+        object.__setattr__(self, '_col', col)
+        object.__setattr__(self, '_byte', byte)
         message = "%s: line %d, column %d" % (ErrorString(code), line, col)
         exc = ExpatError(message)
         exc.code = code
@@ -467,10 +470,8 @@ class xmlparser:
         if self._in_callback:
             raise RuntimeError("cannot call Parse() from within a handler")
         if isinstance(data, str):
-            if not self._engine.started() and self._is_root \
-                    and self._encoding is None:
-                object.__setattr__(self, '_engine',
-                                   _new_engine(self._ns_sep, 'utf-8'))
+            if not self._engine.started():
+                self._engine.force_encoding('utf-8')
             data = data.encode('utf-8', 'surrogatepass')
         else:
             data = memoryview(data).tobytes()

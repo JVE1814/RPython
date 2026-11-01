@@ -362,4 +362,5 @@ def findtext(elem, path, default=None, namespaces=None):
         elem = next(iterfind(elem, path, namespaces))
     except StopIteration:
         return default
-    return elem.text or ''
+    text = elem.text
+    return '' if text is None else text

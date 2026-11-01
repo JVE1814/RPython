@@ -422,6 +422,12 @@ impl Engine {
         e
     }
 
+    pub fn force_encoding(&mut self, name: String) {
+        if !self.started {
+            self.forced_encoding = Some(name);
+        }
+    }
+
     pub fn is_started(&self) -> bool {
         self.started
     }
@@ -516,6 +522,16 @@ impl Engine {
                 }
             }
         }
+        for (i, &v) in table.iter().enumerate() {
+            if v < 0x80 && v as usize != i {
+                let c = char::from_u32(v).unwrap();
+                if (v >= 0x20 && v < 0x7f) || c == '\t' || c == '\n' || c == '\r' {
+                    let p = self.pos;
+                    self.fail(E_UNKNOWN_ENCODING, p);
+                    return std::mem::take(&mut self.events);
+                }
+            }
+        }
         self.enc = Enc::Table(Arc::new(table));
         self.enc_resolved = true;
         self.run();
@@ -542,8 +558,7 @@ impl Engine {
                     if self.awaiting_encoding {
                         return;
                     }
-                    if !self.enc_resolved {
-                        // the XML declaration has been handled
+                    if !self.raw.is_empty() {
                         if let Err((code, idx)) = self.decode() {
                             self.fail(code, idx);
                             return;
@@ -561,6 +576,16 @@ impl Engine {
                     continue;
                 }
                 Ok(false) => {
+                    if !self.raw.is_empty() && self.enc_resolved && !self.awaiting_encoding {
+                        let before_len = self.buf.len();
+                        if let Err((code, idx)) = self.decode() {
+                            self.fail(code, idx);
+                            return;
+                        }
+                        if self.buf.len() > before_len {
+                            continue;
+                        }
+                    }
                     if self.pos < self.buf.len() || !self.raw.is_empty() {
                         self.last_partial = self.buf.len() - self.pos + self.raw.len();
                     } else {
@@ -592,7 +617,8 @@ impl Engine {
     fn at_eof(&mut self) {
         if !self.raw.is_empty() {
             let p = self.buf.len();
-            self.fail(E_PARTIAL_CHAR, p);
+            let code = if matches!(self.enc, Enc::Utf16Le | Enc::Utf16Be) { E_UNCLOSED_TOKEN } else { E_PARTIAL_CHAR };
+            self.fail(code, p);
             return;
         }
         let end = self.buf.len();
@@ -1085,6 +1111,10 @@ impl Engine {
         let end = match self.find_str(start, "?>") {
             Some(e) => e,
             None => {
+                if !self.enc_resolved && !self.raw.is_empty() {
+                    // non-ASCII text inside the declaration
+                    return Err((if self.is_external { E_TEXT_DECL } else { E_XML_DECL }, self.buf.len()));
+                }
                 if self.final_ {
                     return Err((E_UNCLOSED_TOKEN, start));
                 }
