@@ -534,12 +534,31 @@ pub fn add_operators(tp: *mut PyTypeObject) -> PyResult<()> {
         if dict::get_item_str(d, &nm).is_some() {
             continue;
         }
+        // A generic slot function only dispatches to a dunder found on the
+        // MRO; wrapping it would shadow that dunder and recurse forever.
+        if f == sd.slot.generic() {
+            continue;
+        }
         if sd.slot == Slot::TpHash && f == hash_not_implemented as *mut c_void {
             dict::set_item(d, &nm, none::none())?;
             continue;
         }
         // only add if this type defines the slot itself (not identical to its base's)
         let base = unsafe { (*tp).tp_base };
+        if is_heap_type(tp) {
+            // inherited from any base along the MRO (multiple inheritance copies
+            // slots from non-primary bases too): the base exposes the wrapper
+            let mro = unsafe { (*tp).tp_mro };
+            if !mro.is_null() {
+                let inherited = crate::types::tuple::tuple_items(unsafe { &*mro })
+                    .iter()
+                    .skip(1)
+                    .any(|b| sd.slot.get(crate::types::typeobject::as_type(b)) == f);
+                if inherited {
+                    continue;
+                }
+            }
+        }
         if !base.is_null() && sd.slot.get(base) == f && !is_heap_type(tp) {
             // inherited: the base's dict already exposes it
             if crate::types::typeobject::lookup(base, &nm).is_some() {

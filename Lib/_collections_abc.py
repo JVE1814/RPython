@@ -30,19 +30,27 @@ __name__ = "collections.abc"
 # ---------------------------------------------------------------------------
 # Concrete types of builtin iterators and views, registered below.
 
-bytes_iterator = type(iter(b''))
-bytearray_iterator = type(iter(bytearray()))
-dict_keyiterator = type(iter({}.keys()))
-dict_valueiterator = type(iter({}.values()))
-dict_itemiterator = type(iter({}.items()))
-list_iterator = type(iter([]))
-list_reverseiterator = type(iter(reversed([])))
-range_iterator = type(iter(range(0)))
-longrange_iterator = type(iter(range(1 << 1000)))
-set_iterator = type(iter(set()))
-str_iterator = type(iter(""))
-tuple_iterator = type(iter(()))
-zip_iterator = type(iter(zip()))
+def _iter_type(make):
+    # type(iter(make())); None if that object cannot be iterated (only
+    # possible while the runtime is incomplete).
+    try:
+        return type(iter(make()))
+    except (TypeError, OverflowError):
+        return None
+
+bytes_iterator = _iter_type(lambda: b'')
+bytearray_iterator = _iter_type(lambda: bytearray())
+dict_keyiterator = _iter_type(lambda: {}.keys())
+dict_valueiterator = _iter_type(lambda: {}.values())
+dict_itemiterator = _iter_type(lambda: {}.items())
+list_iterator = _iter_type(lambda: [])
+list_reverseiterator = _iter_type(lambda: reversed([]))
+range_iterator = _iter_type(lambda: range(0))
+longrange_iterator = _iter_type(lambda: range(1 << 1000))
+set_iterator = _iter_type(lambda: set())
+str_iterator = _iter_type(lambda: "")
+tuple_iterator = _iter_type(lambda: ())
+zip_iterator = _iter_type(lambda: zip())
 dict_keys = type({}.keys())
 dict_values = type({}.values())
 dict_items = type({}.items())
@@ -287,7 +295,8 @@ for _it in (bytes_iterator, bytearray_iterator, dict_keyiterator,
             dict_valueiterator, dict_itemiterator, list_iterator,
             list_reverseiterator, range_iterator, longrange_iterator,
             set_iterator, str_iterator, tuple_iterator, zip_iterator):
-    Iterator.register(_it)
+    if _it is not None:
+        Iterator.register(_it)
 del _it
 
 

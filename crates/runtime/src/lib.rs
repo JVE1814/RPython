@@ -71,6 +71,7 @@ pub fn initialize(cfg: &Config) -> PyResult<()> {
     }
     types::list::append(&path, types::str::new_str(&stdlib));
     modules::sys_full::post_init()?;
+    modules::sys::init_stdio();
     Ok(())
 }
 

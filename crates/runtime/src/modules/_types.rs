@@ -91,16 +91,13 @@ __all__ = [
 ]
 
 def _capsule_type():
-    try:
-        import _socket
-        return type(_socket.CAPI)
-    except (ImportError, AttributeError):
-        pass
-    try:
-        import _datetime
-        return type(_datetime.datetime_CAPI)
-    except (ImportError, AttributeError):
-        return None
+    # Only use a capsule from an already loaded module: importing extension
+    # modules here would be a side effect of `import types`.
+    for modname, attr in (('_socket', 'CAPI'), ('_datetime', 'datetime_CAPI')):
+        mod = _sys.modules.get(modname)
+        if mod is not None and hasattr(mod, attr):
+            return type(getattr(mod, attr))
+    return getattr(_sys, '_capsule_type', None)
 
 for _n in ('GenericAlias', 'UnionType'):
     if _n not in globals():
