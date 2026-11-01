@@ -1493,6 +1493,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             return Err(r);
                         }
                         Op::Reraise => {
+                            f.unwind_pc = (pc - 1) as i32;
                             let e = popref!(f);
                             if arg != 0 {
                                 // CPython restores frame->instr_ptr from lasti, but the handler
@@ -1741,7 +1742,9 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                 }
             }
         }
-        match find_handler(&code_obj, f.lasti) {
+        let lookup_pc = if f.unwind_pc >= 0 { f.unwind_pc as u32 } else { f.lasti };
+        f.unwind_pc = -1;
+        match find_handler(&code_obj, lookup_pc) {
             Some(h) => {
                 let depth = f.nlocalsplus + h.depth as usize;
                 while f.stack_top > depth {
@@ -1802,6 +1805,9 @@ pub fn handle_eval_breaker(ts: &ThreadState) -> PyResult<()> {
     }
     if eb & crate::threads::EVAL_SAFEPOINT != 0 {
         crate::gc::safepoint_poll(ts);
+    }
+    if eb & crate::threads::EVAL_GC != 0 {
+        crate::gc::maybe_collect(ts);
     }
     if eb & crate::threads::EVAL_SIGNALS != 0 {
         crate::modules::signal::run_pending_handlers(ts)?;

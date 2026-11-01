@@ -98,6 +98,12 @@ unsafe extern "C" fn frame_traverse(op: *mut PyObject, visit: visitproc, arg: *m
                 }
             }
         }
+        if !f.locals_snapshot.is_null() {
+            let r = v(f.locals_snapshot, arg);
+            if r != 0 {
+                return r;
+            }
+        }
         for p in [fr.func, fr.globals, fr.locals, fr.f_trace] {
             if !p.is_null() {
                 let r = v(p, arg);
@@ -247,6 +253,9 @@ pub fn locals_dict(f: &Frame) -> PyResult {
             unsafe { PyRef::from_borrowed(p) }
         };
         dict::set_item(&d, &cd.localsplusnames[i], &v)?;
+    }
+    if let Some(e) = crate::types::frameobject_proxy::extra_locals_of(f.frame_obj) {
+        dict::merge_dict(&d, &e, true)?;
     }
     Ok(d)
 }

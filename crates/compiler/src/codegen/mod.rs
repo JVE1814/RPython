@@ -436,10 +436,6 @@ impl<'a> Compiler<'a> {
         CompileError::syntax(msg, loc)
     }
 
-    pub fn warn(&mut self, msg: impl Into<String>, loc: Loc) {
-        self.warnings.push(Warning::syntax(msg, loc));
-    }
-
     pub fn enter_depth(&mut self) -> R {
         self.depth += 1;
         if self.depth > self.opts.max_depth {
@@ -715,6 +711,12 @@ impl<'a> Compiler<'a> {
     /// Emit a load/store/delete of `name`.
     pub fn nameop(&mut self, name: &str, ctx: ast::ExprContext) -> R {
         let mangled = self.mangle(name);
+        if name == "__debug__" && ctx != ast::ExprContext::Load {
+            let l = self.ur().loc;
+            let loc = Loc::new(l.lineno as i32, l.col as i32, l.end_lineno as i32, l.end_col as i32);
+            let what = if ctx == ast::ExprContext::Del { "cannot delete __debug__" } else { "cannot assign to __debug__" };
+            return Err(self.error(what, loc));
+        }
         if ctx == ast::ExprContext::Load && name == "__debug__" {
             self.load_const(Constant::Bool(self.optimize == 0));
             return Ok(());

@@ -679,3 +679,8 @@ pub fn init_types() -> PyResult<()> {
     }
     Ok(())
 }
+/// anext(it, default): awaitable that returns `default` on StopAsyncIteration (pending full impl).
+pub fn anext_with_default(aw: crate::object::PyRef, default: crate::object::PyRef) -> crate::errors::PyResult {
+    let _ = default;
+    Ok(aw)
+}
