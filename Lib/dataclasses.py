@@ -235,37 +235,33 @@ _ANNOTATION_HEAD = None      # compiled lazily: module-qualified name prefix
 
 
 def _annotation_head(text):
-    """Split the leading ``[module.]name`` out of a string annotation."""
+    """The leading dotted name of a string annotation, as a list of parts
+    (``"typing.ClassVar[int]"`` gives ``["typing", "ClassVar"]``)."""
     global _ANNOTATION_HEAD
     if _ANNOTATION_HEAD is None:
         import re
-        _ANNOTATION_HEAD = re.compile(r'^\s*(?:(\w+)\s*\.\s*)?(\w+)')
+        _ANNOTATION_HEAD = re.compile(r'^\s*(\w+(?:\s*\.\s*\w+)*)')
     found = _ANNOTATION_HEAD.match(text)
     if found is None:
         return None
-    return found.group(1), found.group(2)
+    return [part.strip() for part in found.group(1).split('.')]
 
 
 def _string_names(text, cls, module, test):
     """For a string annotation: does its leading name, resolved in the
-    namespace of the module defining *cls*, satisfy *test*?  A module
-    prefix only counts if it refers to *module* there."""
-    head = _annotation_head(text)
-    if head is None:
+    namespace of the module defining *cls* (following attributes for a
+    dotted name), satisfy *test*?"""
+    parts = _annotation_head(text)
+    if not parts:
         return False
-    prefix, name = head
     home = sys.modules.get(cls.__module__)
     if home is None:
         return False
-    if prefix is None:
-        # e.g. "ClassVar" after "from typing import ClassVar"
-        namespace = home.__dict__
-    elif home.__dict__.get(prefix) is module:
-        # e.g. "typing.ClassVar" after "import typing"
-        namespace = module.__dict__
-    else:
-        return False
-    return test(namespace.get(name), module)
+    # resolve e.g. "ClassVar", "typing.ClassVar" or "proxy.Nested.ClassVar"
+    value = home.__dict__.get(parts[0])
+    for part in parts[1:]:
+        value = getattr(value, part, None)
+    return test(value, module)
 
 
 def _is_classvar(annotation, typing):
@@ -494,6 +490,23 @@ def _hash_action(unsafe_hash, eq, frozen, has_explicit_hash, cls):
     return None
 
 
+def _own_annotations(cls):
+    """The annotations a class itself defines, in FORWARDREF format.
+
+    The class's annotate function is asked for FORWARDREF directly, so an
+    annotate function that can produce forward references without
+    evaluating everything (as make_dataclass() creates) is not forced
+    through the VALUE format first.
+    """
+    namespace = cls.__dict__
+    annotate = annotationlib.get_annotate_from_class_namespace(namespace)
+    if annotate is None or '__annotations__' in namespace:
+        return annotationlib.get_annotations(
+                cls, format=annotationlib.Format.FORWARDREF)
+    return dict(annotationlib.call_annotate_function(
+            annotate, annotationlib.Format.FORWARDREF, owner=cls))
+
+
 def _process_class(cls, init, repr, eq, order, unsafe_hash, frozen,
                    match_args, kw_only, slots, weakref_slot):
     fields = {}
@@ -519,8 +532,7 @@ def _process_class(cls, init, repr, eq, order, unsafe_hash, frozen,
             if getattr(base, _PARAMS).frozen:
                 frozen_bases += 1
 
-    own_annotations = annotationlib.get_annotations(
-            cls, format=annotationlib.Format.FORWARDREF)
+    own_annotations = _own_annotations(cls)
 
     own_fields = []
     kw_only_now = kw_only
@@ -768,6 +780,20 @@ def _class_cells_fixed(holder, old, new, seen):
         holder = getattr(holder, '__wrapped__', None)
 
 
+def _reown_forward_refs(annotation, old, new, seen):
+    # forward references in field types created for the replaced class
+    # must point at its successor (and not keep the old class alive)
+    if id(annotation) in seen:
+        return
+    seen.add(id(annotation))
+    if isinstance(annotation, annotationlib.ForwardRef):
+        if annotation.__owner__ is old:
+            annotation.__owner__ = new
+        return
+    for arg in getattr(annotation, '__args__', None) or ():
+        _reown_forward_refs(arg, old, new, seen)
+
+
 def _forget_old_namespace(new_cls, old_cls):
     # The compiler-generated annotate function of a class body keeps the
     # class namespace in a closure cell; where that is the old class's own
@@ -829,6 +855,8 @@ def _add_slots(cls, is_frozen, weakref_slot, fields):
     for value in new_cls.__dict__.values():
         _class_cells_fixed(value, cls, new_cls, seen)
     _forget_old_namespace(new_cls, cls)
+    for f in fields.values():
+        _reown_forward_refs(f.type, cls, new_cls, set())
     init = new_cls.__dict__.get('__init__')
     if init is not None:
         annotate = getattr(init, '__annotate__', None)
