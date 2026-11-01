@@ -17,7 +17,11 @@ pub fn getattr(o: &PyObject, nm: &PyObject) -> PyResult {
         if f as usize == object_generic_getattro as usize {
             return generic_getattr(o, nm);
         }
-        return unsafe { from_c(f(o.as_ptr(), nm.as_ptr())) };
+        let r = unsafe { from_c(f(o.as_ptr(), nm.as_ptr())) };
+        if r.is_err() {
+            crate::types::exceptions::fill_attribute_error_context(o, nm);
+        }
+        return r;
     }
     if let Some(f) = tp.tp_getattr {
         let s = pystr::as_utf8(nm)?;

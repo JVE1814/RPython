@@ -231,18 +231,26 @@ def _get_signature_object(func, as_instance, eat_self):
     Returns None when no signature can be determined.
     """
     if isinstance(func, type) and not as_instance:
-        # calling the class itself: inspect knows how to combine
-        # metaclass __call__, __new__ and __init__ (self already dropped)
-        eat_self = False
+        # calling the class runs __init__ (whose self is not passed)
+        try:
+            func = func.__init__
+        except AttributeError:
+            return None
+        eat_self = True
     elif isinstance(func, (classmethod, staticmethod)):
         if isinstance(func, classmethod):
             eat_self = True
         func = func.__func__
-    elif not isinstance(func, FunctionTypes + (MethodType, _partial)):
+    elif isinstance(func, MethodType):
+        # already bound: self is not part of the signature
+        eat_self = False
+    elif not isinstance(func, FunctionTypes + (_partial,)):
         try:
             func = func.__call__
         except AttributeError:
             return None
+        if isinstance(func, MethodType):
+            eat_self = False
     try:
         sig = inspect.signature(
             func, annotation_format=_annotationlib.Format.FORWARDREF)
@@ -857,6 +865,14 @@ class NonCallableMock(Base):
         for key in ('_mock_parent', '_mock_new_parent', '_mock_name',
                     '_mock_new_name'):
             inner.__dict__[key] = None
+        on_type = _static_lookup(type(self), attribute)
+        if (_is_instance_mock(on_type) and hasattr(type(on_type), '__set__')
+                and attribute not in _all_magics):
+            # e.g. a PropertyMock installed on the type: assigning would
+            # call its setter, so only record the relationship
+            if _check_and_set_parent(self, mock, attribute, attribute):
+                self._mock_children[attribute] = mock
+            return
         setattr(self, attribute, mock)
 
     def mock_add_spec(self, spec, spec_set=False):

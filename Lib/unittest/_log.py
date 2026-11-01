@@ -1,17 +1,18 @@
+"""Support for TestCase.assertLogs() and assertNoLogs()."""
+
 import logging
 import collections
 
 from .case import _BaseTestCaseContext
 
+__unittest = True
 
-_LoggingWatcher = collections.namedtuple("_LoggingWatcher",
-                                         ["records", "output"])
+_LoggingWatcher = collections.namedtuple('_LoggingWatcher',
+                                         ['records', 'output'])
 
 
 class _CapturingHandler(logging.Handler):
-    """
-    A logging handler capturing all (raw and formatted) logging output.
-    """
+    """Handler collecting records and their formatted text."""
 
     def __init__(self):
         logging.Handler.__init__(self)
@@ -22,16 +23,16 @@ class _CapturingHandler(logging.Handler):
 
     def emit(self, record):
         self.watcher.records.append(record)
-        msg = self.format(record)
-        self.watcher.output.append(msg)
+        self.watcher.output.append(self.format(record))
 
 
 class _AssertLogsContext(_BaseTestCaseContext):
-    """A context manager for assertLogs() and assertNoLogs() """
+    """Temporarily replaces the handlers of a logger by a capturing one."""
 
-    LOGGING_FORMAT = "%(levelname)s:%(name)s:%(message)s"
+    LOGGING_FORMAT = '%(levelname)s:%(name)s:%(message)s'
 
-    def __init__(self, test_case, logger_name, level, no_logs, formatter=None):
+    def __init__(self, test_case, logger_name, level, no_logs,
+                 formatter=None):
         _BaseTestCaseContext.__init__(self, test_case)
         self.logger_name = logger_name
         if level:
@@ -44,13 +45,14 @@ class _AssertLogsContext(_BaseTestCaseContext):
 
     def __enter__(self):
         if isinstance(self.logger_name, logging.Logger):
-            logger = self.logger = self.logger_name
+            logger = self.logger_name
         else:
-            logger = self.logger = logging.getLogger(self.logger_name)
-        formatter = self.formatter or logging.Formatter(self.LOGGING_FORMAT)
+            logger = logging.getLogger(self.logger_name)
+        self.logger = logger
         handler = _CapturingHandler()
         handler.setLevel(self.level)
-        handler.setFormatter(formatter)
+        handler.setFormatter(self.formatter or
+                             logging.Formatter(self.LOGGING_FORMAT))
         self.watcher = handler.watcher
         self.old_handlers = logger.handlers[:]
         self.old_level = logger.level
@@ -59,30 +61,21 @@ class _AssertLogsContext(_BaseTestCaseContext):
         logger.setLevel(self.level)
         logger.propagate = False
         if self.no_logs:
-            return
+            return None
         return handler.watcher
 
     def __exit__(self, exc_type, exc_value, tb):
-        self.logger.handlers = self.old_handlers
-        self.logger.propagate = self.old_propagate
-        self.logger.setLevel(self.old_level)
-
+        logger = self.logger
+        logger.handlers = self.old_handlers
+        logger.propagate = self.old_propagate
+        logger.setLevel(self.old_level)
         if exc_type is not None:
-            # let unexpected exceptions pass through
             return False
-
         if self.no_logs:
-            # assertNoLogs
-            if len(self.watcher.records) > 0:
-                self._raiseFailure(
-                    "Unexpected logs found: {!r}".format(
-                        self.watcher.output
-                    )
-                )
-
-        else:
-            # assertLogs
-            if len(self.watcher.records) == 0:
-                self._raiseFailure(
-                    "no logs of level {} or higher triggered on {}"
-                    .format(logging.getLevelName(self.level), self.logger.name))
+            if self.watcher.records:
+                self._raiseFailure('Unexpected logs found: {!r}'.format(
+                    self.watcher.output))
+        elif not self.watcher.records:
+            self._raiseFailure(
+                'no logs of level {} or higher triggered on {}'.format(
+                    logging.getLevelName(self.level), logger.name))
