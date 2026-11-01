@@ -45,7 +45,45 @@ impl<'a> Parser<'a> {
                         && matches!(a.node, ExprKind::Constant { .. } | ExprKind::JoinedStr { .. } | ExprKind::TemplateStr { .. });
                     if is_legacy(&a).is_none() {
                         if level != 0 {
-                            return Err(self.err_range("invalid syntax. Perhaps you forgot a comma?", a.loc, b.loc));
+                            // gh-142236: for implicit string concatenation point at the last string
+                            let mut aloc = a.loc;
+                            if a_is_str {
+                                let mut i = start;
+                                let mut last = start;
+                                let mut pieces = 0;
+                                while i < bstart {
+                                    match self.toks[i].ty {
+                                        T::STRING => {
+                                            last = i;
+                                            pieces += 1;
+                                            i += 1;
+                                        }
+                                        T::FSTRING_START | T::TSTRING_START => {
+                                            last = i;
+                                            pieces += 1;
+                                            let mut d = 0;
+                                            while i < bstart {
+                                                match self.toks[i].ty {
+                                                    T::FSTRING_START | T::TSTRING_START => d += 1,
+                                                    T::FSTRING_END | T::TSTRING_END => d -= 1,
+                                                    _ => {}
+                                                }
+                                                i += 1;
+                                                if d == 0 {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                                if pieces > 1 {
+                                    let lt = self.toks[last];
+                                    aloc.lineno = lt.lineno as i32;
+                                    aloc.col_offset = lt.col;
+                                }
+                            }
+                            return Err(self.err_range("invalid syntax. Perhaps you forgot a comma?", aloc, b.loc));
                         }
                         if a_is_str && self.toks[bstart].ty == T::NAME {
                             return Err(self.err_range("invalid syntax. Is this intended to be part of the string?", a.loc, b.loc));
@@ -566,6 +604,7 @@ impl<'a> Parser<'a> {
         self.p = lpar + 1;
         let mut items: Vec<Item> = Vec::new();
         let mut comma_before: Option<Token> = None;
+        let mut followed_comma: Vec<bool> = Vec::new();
         loop {
             if self.at(T::RPAR) {
                 break;
@@ -614,8 +653,14 @@ impl<'a> Parser<'a> {
                 }
             }
             items.push(it);
+            while followed_comma.len() < items.len() - 1 {
+                followed_comma.push(false);
+            }
             match self.eat(T::COMMA) {
-                Some(c) => comma_before = Some(c),
+                Some(c) => {
+                    comma_before = Some(c);
+                    followed_comma.push(true);
+                }
                 None => break,
             }
         }
@@ -623,7 +668,7 @@ impl<'a> Parser<'a> {
         // genexp checks
         for (i, it) in items.iter().enumerate() {
             if let Some(end) = it.genexp_end {
-                if n > 1 {
+                if n > 1 || followed_comma.get(i).copied().unwrap_or(false) {
                     if i == 0 {
                         return Err(self.err_range("Generator expression must be parenthesized", it.loc, end));
                     }
@@ -727,7 +772,9 @@ impl<'a> Parser<'a> {
         let e = self.expression()?;
         self.invalid = save;
         if let Some(e) = e {
-            return Err(self.err_loc(format!("cannot use {} as import target", expr_name(&e)), e.loc));
+            if !matches!(e.node, ExprKind::Name { .. }) {
+                return Err(self.err_loc(format!("cannot use {} as import target", expr_name(&e)), e.loc));
+            }
         }
         self.p = m;
         Ok(())

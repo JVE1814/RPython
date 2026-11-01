@@ -261,7 +261,7 @@ impl<'a> Parser<'a> {
                             let eq = self.peek();
                             return Err(self.err_tok("var-positional parameter cannot have default value", &eq));
                         }
-                        self.p = pm;
+                        let _ = pm;
                     }
                 }
                 T::DOUBLESTAR => {

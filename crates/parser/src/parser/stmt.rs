@@ -332,8 +332,44 @@ impl<'a> Parser<'a> {
         Ok(None)
     }
 
+    /// invalid_assert_stmt: 'assert' [expression ','] a=expression ('=' | ':=') b=expression
+    fn invalid_assert_stmt(&mut self) -> Result<(), PErr> {
+        let start = self.p;
+        self.advance();
+        for _ in 0..2 {
+            let save = self.invalid;
+            self.invalid = false;
+            let a = self.expression()?;
+            self.invalid = save;
+            let Some(a) = a else { break };
+            let t = self.peek();
+            if t.ty == T::EQUAL || t.ty == T::COLONEQUAL {
+                self.advance();
+                let save = self.invalid;
+                self.invalid = false;
+                let b = self.expression()?;
+                self.invalid = save;
+                if let Some(b) = b {
+                    if t.ty == T::EQUAL {
+                        return Err(self.err_range(format!("cannot assign to {} here. Maybe you meant '==' instead of '='?", super::expr::expr_name(&a)), a.loc, b.loc));
+                    }
+                    return Err(self.err_range("cannot use named expression without parentheses here", a.loc, b.loc));
+                }
+                break;
+            }
+            if self.eat(T::COMMA).is_none() {
+                break;
+            }
+        }
+        self.p = start;
+        Ok(())
+    }
+
     fn assert_stmt(&mut self) -> R<Stmt> {
         let start = self.p;
+        if self.invalid {
+            self.invalid_assert_stmt()?;
+        }
         self.advance();
         let Some(test) = self.expression()? else {
             self.p = start;
@@ -415,13 +451,9 @@ impl<'a> Parser<'a> {
                 if self.at_kw(Kw::As) {
                     let m = self.p;
                     self.advance();
-                    match self.eat_name() {
-                        Some(n) => asname = Some(self.ident(&n)),
+                    match self.import_as_name(m)? {
+                        Some(n) => asname = Some(n),
                         None => {
-                            self.p = m;
-                            if self.invalid {
-                                self.invalid_import_as_target(m)?;
-                            }
                             self.p = start;
                             return Ok(None);
                         }
@@ -490,12 +522,9 @@ impl<'a> Parser<'a> {
                 if self.at_kw(Kw::As) {
                     let m = self.p;
                     self.advance();
-                    match self.eat_name() {
-                        Some(n) => asname = Some(self.ident(&n)),
+                    match self.import_as_name(m)? {
+                        Some(n) => asname = Some(n),
                         None => {
-                            if self.invalid {
-                                self.invalid_import_as_target(m)?;
-                            }
                             self.p = start;
                             return Ok(None);
                         }
@@ -524,7 +553,28 @@ impl<'a> Parser<'a> {
             }
             names
         };
+        if level == 0 && module.as_deref() == Some("__future__") && names.iter().any(|a| a.name == "barry_as_FLUFL") {
+            self.flufl = true;
+        }
         Ok(Some(Stmt::new(StmtKind::ImportFrom { module, names, level, is_lazy }, self.loc(start))))
+    }
+
+    /// The NAME after 'as' in an import (index `m` is the 'as' token); in the second pass
+    /// raises "cannot use X as import target" for other expressions.
+    fn import_as_name(&mut self, m: usize) -> R<String> {
+        if self.invalid {
+            let t = self.peek();
+            let n1 = self.peek_n(1).ty;
+            let good = t.ty == T::NAME && !t.kw.is_hard() && matches!(n1, T::COMMA | T::RPAR | T::NEWLINE | T::SEMI);
+            if !good {
+                self.invalid_import_as_target(m)?;
+                self.p = m + 1;
+            }
+        }
+        match self.eat_name() {
+            Some(n) => Ok(Some(self.ident(&n))),
+            None => Ok(None),
+        }
     }
 
     // ------------------------------------------------------------------ compound statements
@@ -828,7 +878,13 @@ impl<'a> Parser<'a> {
             }
         } else if self.at_kw(Kw::Else) {
             match self.else_block()? {
-                Some(b) => b,
+                Some(b) => {
+                    if self.invalid && self.at_kw(Kw::Elif) {
+                        let et = self.peek();
+                        return Err(self.err_tok("'elif' block follows an 'else' block", &et));
+                    }
+                    b
+                }
                 None => {
                     self.p = start;
                     return Ok(None);
@@ -961,8 +1017,60 @@ impl<'a> Parser<'a> {
         Ok(Some(WithItem { context_expr: e, optional_vars: None }))
     }
 
+    /// invalid_with_stmt: [ASYNC] 'with' ','.(expression ['as' star_target])+ NEWLINE
+    ///                  | [ASYNC] 'with' '(' ','.(expressions ['as' star_target])+ ','? ')' NEWLINE
+    fn invalid_with_stmt(&mut self) -> Result<(), PErr> {
+        let start = self.p;
+        self.eat_kw(Kw::Async);
+        self.advance(); // 'with'
+        let save = self.invalid;
+        self.invalid = false;
+        let after = self.p;
+        for paren in [false, true] {
+            self.p = after;
+            if paren && self.eat(T::LPAR).is_none() {
+                continue;
+            }
+            let mut ok = false;
+            loop {
+                let e = if paren { self.expressions()? } else { self.expression()? };
+                if e.is_none() {
+                    break;
+                }
+                ok = true;
+                if self.at_kw(Kw::As) {
+                    let m = self.p;
+                    self.advance();
+                    if self.star_target()?.is_none() {
+                        self.p = m;
+                    }
+                }
+                if self.eat(T::COMMA).is_none() {
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+            if paren && self.eat(T::RPAR).is_none() {
+                continue;
+            }
+            if self.at(T::NEWLINE) {
+                self.invalid = save;
+                self.peek();
+                return Err(self.err_last(ErrorKind::Syntax, "expected ':'"));
+            }
+        }
+        self.invalid = save;
+        self.p = start;
+        Ok(())
+    }
+
     fn with_stmt(&mut self) -> R<Stmt> {
         let start = self.p;
+        if self.invalid {
+            self.invalid_with_stmt()?;
+        }
         let is_async = self.eat_kw(Kw::Async).is_some();
         let wt = self.advance(); // 'with'
         let after_with = self.p;
@@ -1047,6 +1155,10 @@ impl<'a> Parser<'a> {
                 if s != is_star {
                     if self.invalid {
                         let et = self.peek();
+                        if is_star {
+                            let st = self.peek_n(1);
+                            return Err(self.err_range("cannot have both 'except' and 'except*' on the same 'try'", Self::tok_loc(&et), Self::tok_loc(&st)));
+                        }
                         return Err(self.err_tok("cannot have both 'except' and 'except*' on the same 'try'", &et));
                     }
                     self.p = start;
@@ -1125,6 +1237,22 @@ impl<'a> Parser<'a> {
         let mut name = None;
         if self.at_kw(Kw::As) {
             self.advance();
+            let simple = self.at_name() && matches!(self.peek_n(1).ty, T::COLON | T::NEWLINE);
+            if self.invalid && !simple {
+                // invalid_except_stmt: 'except' expression 'as' a=expression
+                let m = self.p;
+                let save = self.invalid;
+                self.invalid = false;
+                let a = self.expression()?;
+                self.invalid = save;
+                if let Some(a) = a {
+                    if !matches!(a.node, ExprKind::Name { .. }) {
+                        let kind = if is_star { "except*" } else { "except" };
+                        return Err(self.err_loc(format!("cannot use {} statement with {}", kind, super::expr::expr_name(&a)), a.loc));
+                    }
+                }
+                self.p = m;
+            }
             match self.eat_name() {
                 Some(n) => name = Some(self.ident(&n)),
                 None => {

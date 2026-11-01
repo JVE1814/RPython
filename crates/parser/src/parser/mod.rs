@@ -48,11 +48,25 @@ pub struct ParseOptions {
     pub allow_incomplete_input: bool,
     /// Unicode database hooks.
     pub hooks: UnicodeHooks,
+    /// File name used in a few messages (e.g. "Non-UTF-8 code ... in file X").
+    pub filename: String,
+    /// Decoder for declared source encodings not implemented natively (see
+    /// [`tokenizer::DecodeHook`]).
+    pub decode: Option<tokenizer::DecodeHook>,
 }
 
 impl Default for ParseOptions {
     fn default() -> Self {
-        ParseOptions { mode: Mode::Exec, type_comments: false, feature_version: None, barry_as_flufl: false, allow_incomplete_input: false, hooks: UnicodeHooks::default() }
+        ParseOptions {
+            mode: Mode::Exec,
+            type_comments: false,
+            feature_version: None,
+            barry_as_flufl: false,
+            allow_incomplete_input: false,
+            hooks: UnicodeHooks::default(),
+            filename: "<string>".to_string(),
+            decode: None,
+        }
     }
 }
 
@@ -85,7 +99,7 @@ pub fn parse(src: &str, opts: &ParseOptions) -> ParseOutput {
 
 /// Parse raw source bytes (handles BOM and PEP 263 encoding declarations).
 pub fn parse_bytes(src: &[u8], opts: &ParseOptions) -> ParseOutput {
-    match tokenizer::decode_source(src) {
+    match tokenizer::decode_source_with(src, opts.decode, &opts.filename) {
         Ok(s) => parse(&s, opts),
         Err(e) => ParseOutput { result: Err(e), warnings: Vec::new() },
     }

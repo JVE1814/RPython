@@ -330,6 +330,9 @@ impl<'a> Parser<'a> {
                             return Err(self.err_tok("with Barry as BDFL, use '<>' instead of '!='", &t));
                         }
                     } else if txt == "<>" {
+                        if self.invalid {
+                            return Err(self.err_tok("invalid syntax. Maybe you meant '!=' instead of '<>'?", &t));
+                        }
                         break;
                     }
                     CmpOp::NotEq
@@ -1046,6 +1049,15 @@ impl<'a> Parser<'a> {
             self.p = start;
             return Ok(None);
         }
+        if self.invalid && !matches!(self.peek_ty(), T::COMMA | T::RBRACE) && !self.at_comprehension_start() {
+            // dict failed; the set alternative parses a named_expression here
+            let m = self.p;
+            self.p = start;
+            self.invalid_double_starred_kvpairs()?;
+            self.p = start + 1;
+            self.invalid_named_expression()?;
+            self.p = m;
+        }
         self.set_rest(start, first)
     }
 
@@ -1148,27 +1160,19 @@ impl<'a> Parser<'a> {
             };
             self.advance(); // 'for'
             let tstart = self.p;
-            let Some(target) = self.star_targets()? else {
+            let target = self.star_targets()?;
+            if target.is_none() || !self.at_kw(Kw::In) {
                 if self.invalid {
                     self.p = tstart;
-                    self.invalid_for_target_tail(TargetsType::For)?;
-                }
-                self.p = m;
-                break;
-            };
-            if self.eat_kw(Kw::In).is_none() {
-                if self.invalid {
-                    // invalid_for_if_clause / invalid_for_target
+                    self.invalid_for_if_clause()?;
                     self.p = tstart;
                     self.invalid_for_target_tail(TargetsType::For)?;
-                    self.p = tstart;
-                    if self.star_targets()?.is_some() && !self.at_kw(Kw::In) {
-                        return Err(self.err_next("'in' expected after for-loop variables"));
-                    }
                 }
                 self.p = m;
                 break;
             }
+            let target = target.unwrap();
+            self.advance(); // 'in'
             // cut: after 'in' a failure fails the comprehension
             let Some(iter) = self.disjunction()? else {
                 self.p = m;
@@ -1192,6 +1196,31 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
         Ok(Some(v))
+    }
+
+    /// invalid_for_if_clause: 'async'? 'for' (bitwise_or (',' bitwise_or)* [',']) !'in'
+    /// (called right after 'for').
+    fn invalid_for_if_clause(&mut self) -> Result<(), PErr> {
+        let save = self.invalid;
+        self.invalid = false;
+        let mut any = false;
+        loop {
+            let m = self.p;
+            if self.bitwise_or()?.is_none() {
+                self.p = m;
+                break;
+            }
+            any = true;
+            if self.eat(T::COMMA).is_none() {
+                break;
+            }
+        }
+        self.invalid = save;
+        if any && !self.at_kw(Kw::In) {
+            self.peek();
+            return Err(self.err_last(ErrorKind::Syntax, "'in' expected after for-loop variables"));
+        }
+        Ok(())
     }
 
     // ================================================================ arguments
@@ -1220,8 +1249,12 @@ impl<'a> Parser<'a> {
                 if self.invalid && self.at(T::EQUAL) {
                     return Err(self.err_range("cannot assign to iterable argument unpacking", e.loc, e.loc));
                 }
-                if self.invalid && keywords.iter().any(|k| k.arg.is_none()) {
-                    return Err(self.err_loc("iterable argument unpacking follows keyword argument unpacking", e.loc));
+                if keywords.iter().any(|k| k.arg.is_none()) {
+                    if self.invalid {
+                        let comma = self.tok_at(istart - 1);
+                        return Err(self.err_tok("iterable argument unpacking follows keyword argument unpacking", &comma));
+                    }
+                    return Ok(None);
                 }
                 args.push(e);
             } else if t.ty == T::DOUBLESTAR {

@@ -98,6 +98,7 @@ pub struct Lexer<'a> {
     /// Pending token to be returned after a DEDENT etc (unused) / one-token pushback
     pushback: Option<Token>,
     eof_reads: u32,
+    empty_middle_done: bool,
 }
 
 #[inline]
@@ -141,6 +142,7 @@ impl<'a> Lexer<'a> {
             finished: false,
             pushback: None,
             eof_reads: 0,
+            empty_middle_done: false,
         }
     }
 
@@ -580,6 +582,9 @@ impl<'a> Lexer<'a> {
         self.next();
         if self.peek() < 0 {
             // EOF after continuation
+            if let Some(p) = self.parens.last() {
+                return Err(LexError::UnclosedParen(p.ch, p.lineno, p.col));
+            }
             return Err(LexError::Eof { lineno: self.lineno - 1, col: (self.pos - line_start_of(self.src, self.lineno - 1)) as i32 });
         }
         Ok(())
@@ -1141,12 +1146,33 @@ impl<'a> Lexer<'a> {
             let slineno = self.lineno;
             let scol = self.col_of(start);
             let c0 = self.peek();
-            // field start / spec end at the very beginning
-            if c0 == b'{' as i32 && (self.peek_at(1) != b'{' as i32 || in_spec) {
+            let c1 = self.peek_at(1);
+            // field start / spec end at the very beginning (CPython emits an empty
+            // FSTRING_MIDDLE before a brace it hands over to the regular mode, except for a
+            // plain field start)
+            if c0 == b'{' as i32 && c1 != b'{' as i32 {
+                self.empty_middle_done = false;
                 return self.open_field(start, slineno, scol).map(Some);
             }
-            if in_spec && c0 == b'}' as i32 {
-                return self.close_field(start, slineno, scol).map(Some);
+            let brace_handoff = (c0 == b'{' as i32 && in_spec) || (c0 == b'}' as i32 && (in_spec || c1 != b'}' as i32));
+            if brace_handoff {
+                if !self.empty_middle_done {
+                    self.empty_middle_done = true;
+                    let mut t = self.mk(mid_ty, start, slineno, scol);
+                    t.end = start as u32;
+                    t.end_lineno = slineno;
+                    t.end_col = scol;
+                    return Ok(Some(t));
+                }
+                self.empty_middle_done = false;
+                if c0 == b'{' as i32 {
+                    return self.open_field(start, slineno, scol).map(Some);
+                }
+                if in_spec {
+                    return self.close_field(start, slineno, scol).map(Some);
+                }
+                self.pos += 1;
+                return Err(self.err_here(format!("{}-string: single '}}' is not allowed", prefix)));
             }
             // end of string?
             let mut is_end = true;
@@ -1299,6 +1325,8 @@ impl<'a> Lexer<'a> {
             };
             // end position: compute from cend (may be before pos when braces were escaped)
             let t = self.fix_end(t, cend);
+            let nc = self.peek();
+            self.empty_middle_done = cend == self.pos && (nc == b'{' as i32 || nc == b'}' as i32);
             return Ok(Some(t));
         }
     }
@@ -1704,11 +1732,6 @@ pub fn detect_encoding(src: &[u8]) -> Result<DetectedEncoding, SyntaxError> {
                 e.lineno = idx as i32 + 1;
                 return Err(e);
             }
-            if !is_known_encoding(&norm) {
-                let mut e = SyntaxError::simple(format!("unknown encoding: {}", enc));
-                e.lineno = idx as i32 + 1;
-                return Err(e);
-            }
             return Ok(DetectedEncoding { encoding: norm, bom, lines_consumed: consumed, from_cookie: true });
         }
         // Only continue to the second line if the first is blank or a comment.
@@ -1724,6 +1747,7 @@ fn canonical(enc: &str) -> String {
     enc.to_ascii_lowercase().replace('_', "-")
 }
 
+#[allow(dead_code)]
 fn is_known_encoding(enc: &str) -> bool {
     let e = canonical(enc);
     matches!(
@@ -1737,70 +1761,169 @@ fn is_known_encoding(enc: &str) -> bool {
     ) || e.starts_with("iso8859") || e.starts_with("iso-8859") || e.starts_with("cp") || e.starts_with("latin")
 }
 
-/// Decode raw source bytes to a string: handles the UTF-8 BOM and PEP 263 declarations for
-/// utf-8, latin-1 / iso-8859-1, ascii, cp1252 and iso-8859-15. Other declared encodings can be
-/// handled by the runtime and passed to the parser as text; here they fall back to an error.
+/// Decoder hook for encodings the parser does not implement natively:
+/// `(encoding name, bytes) -> None` if the encoding is unknown, `Some(Err(message))` on a
+/// decoding error, `Some(Ok(text))` on success. The runtime passes one backed by `codecs`.
+pub type DecodeHook = fn(&str, &[u8]) -> Option<Result<String, String>>;
+
+/// Decode raw source bytes to a string: handles the UTF-8 BOM and PEP 263 declarations.
+/// Natively supported: utf-8, ascii, latin-1/iso-8859-1, iso-8859-2/-5/-7/-15, cp1251,
+/// cp1252, koi8-r. Other encodings go through `hook` (or fail with "unknown encoding").
 pub fn decode_source(src: &[u8]) -> Result<String, SyntaxError> {
+    decode_source_with(src, None, "<string>")
+}
+
+fn single_byte(data: &[u8], table: &[u16; 128]) -> Result<String, usize> {
+    let mut s = String::with_capacity(data.len());
+    for (i, &c) in data.iter().enumerate() {
+        if c < 0x80 {
+            s.push(c as char);
+        } else {
+            let u = table[(c - 0x80) as usize];
+            if u == 0xFFFF {
+                return Err(i);
+            }
+            s.push(char::from_u32(u as u32).unwrap());
+        }
+    }
+    Ok(s)
+}
+
+fn latin1_table(overrides: &[(u8, u16)]) -> [u16; 128] {
+    let mut t = [0u16; 128];
+    for (i, x) in t.iter_mut().enumerate() {
+        *x = 0x80 + i as u16;
+    }
+    for &(b, u) in overrides {
+        t[(b - 0x80) as usize] = u;
+    }
+    t
+}
+
+/// Location info for an undecodable byte at `off` of `data`: (lineno, 1-based char offset, line text).
+fn bad_byte_location(data: &[u8], off: usize) -> (i32, i32, String) {
+    let lineno = data[..off].iter().filter(|&&c| c == b'\n').count() as i32 + 1;
+    let ls = data[..off].iter().rposition(|&c| c == b'\n').map(|p| p + 1).unwrap_or(0);
+    let le = data[off..].iter().position(|&c| c == b'\n').map(|p| off + p).unwrap_or(data.len());
+    let col_chars = String::from_utf8_lossy(&data[ls..off]).chars().count() as i32;
+    let text = String::from_utf8_lossy(&data[ls..le]).into_owned();
+    (lineno, col_chars + 1, text)
+}
+
+/// `decode_source` with a fallback decoder and the file name used in error messages.
+pub fn decode_source_with(src: &[u8], hook: Option<DecodeHook>, filename: &str) -> Result<String, SyntaxError> {
     let det = detect_encoding(src)?;
     let data = if det.bom { &src[3..] } else { src };
     let enc = canonical(&det.encoding);
-    match enc.as_str() {
+    let codec_error = |what: &str, off: usize, reason: &str| -> SyntaxError {
+        let (lineno, offset, text) = bad_byte_location(data, off);
+        let mut e = SyntaxError::simple(format!("(unicode error) '{}' codec can't decode byte 0x{:02x} in position {}: {}", what, data[off], off, reason));
+        e.lineno = lineno;
+        e.offset = offset;
+        e.end_lineno = Some(lineno);
+        e.end_offset = Some(offset);
+        e.text = Some(text);
+        e
+    };
+    let r: Result<String, SyntaxError> = match enc.as_str() {
         "utf-8" | "utf8" | "u8" | "utf" | "cp65001" | "utf-8-sig" => match std::str::from_utf8(data) {
             Ok(s) => Ok(s.to_string()),
             Err(e) => {
                 let off = e.valid_up_to();
-                let lineno = data[..off].iter().filter(|&&c| c == b'\n').count() as i32 + 1;
-                let mut err = if det.from_cookie {
-                    SyntaxError::simple(format!("(unicode error) 'utf-8' codec can't decode byte 0x{:02x} in position {}: invalid start byte", data[off], off))
+                let (lineno, offset, text) = bad_byte_location(data, off);
+                let mut err = if det.from_cookie || det.bom {
+                    let reason = if e.error_len().is_none() { "unexpected end of data" } else if data[off] >= 0xC2 && data[off] <= 0xF4 { "invalid continuation byte" } else { "invalid start byte" };
+                    SyntaxError::simple(format!("(unicode error) 'utf-8' codec can't decode byte 0x{:02x} in position {}: {}", data[off], off, reason))
                 } else {
                     SyntaxError::simple(format!(
-                        "Non-UTF-8 code starting with '\\x{:02x}' in file <string> on line {}, but no encoding declared; see https://peps.python.org/pep-0263/ for details",
-                        data[off], lineno
+                        "Non-UTF-8 code starting with '\\x{:02x}' in file {} on line {}, but no encoding declared; see https://peps.python.org/pep-0263/ for details",
+                        data[off], filename, lineno
                     ))
                 };
                 err.lineno = lineno;
+                err.offset = offset;
+                err.end_lineno = Some(lineno);
+                err.end_offset = Some(offset);
+                err.text = Some(text);
                 Err(err)
             }
         },
         "iso-8859-1" | "latin-1" | "latin1" | "l1" | "iso8859-1" | "8859" | "cp819" | "latin" | "iso-ir-100" => {
             Ok(data.iter().map(|&c| c as char).collect())
         }
-        "ascii" | "us-ascii" | "646" => {
-            if let Some(p) = data.iter().position(|&c| c >= 128) {
-                let lineno = data[..p].iter().filter(|&&c| c == b'\n').count() as i32 + 1;
-                let mut err = SyntaxError::simple(format!(
-                    "(unicode error) 'ascii' codec can't decode byte 0x{:02x} in position {}: ordinal not in range(128)",
-                    data[p], p
-                ));
-                err.lineno = lineno;
-                return Err(err);
-            }
-            Ok(String::from_utf8(data.to_vec()).unwrap())
-        }
+        "ascii" | "us-ascii" | "646" => match data.iter().position(|&c| c >= 128) {
+            Some(p) => Err(codec_error("ascii", p, "ordinal not in range(128)")),
+            None => Ok(String::from_utf8(data.to_vec()).unwrap()),
+        },
         "cp1252" | "windows-1252" => Ok(data.iter().map(|&c| cp1252(c)).collect()),
-        "koi8-r" | "koi8r" => Ok(data.iter().map(|&c| if c < 0x80 { c as char } else { char::from_u32(KOI8R[(c - 0x80) as usize] as u32).unwrap() }).collect()),
-        "iso-8859-15" | "iso8859-15" | "latin-9" | "latin9" => Ok(data
-            .iter()
-            .map(|&c| match c {
-                0xA4 => '\u{20AC}',
-                0xA6 => '\u{0160}',
-                0xA8 => '\u{0161}',
-                0xB4 => '\u{017D}',
-                0xB8 => '\u{017E}',
-                0xBC => '\u{0152}',
-                0xBD => '\u{0153}',
-                0xBE => '\u{0178}',
-                _ => c as char,
-            })
-            .collect()),
-        _ => {
-            if data.is_ascii() {
-                return Ok(String::from_utf8(data.to_vec()).unwrap());
-            }
-            Err(SyntaxError::simple(format!("unsupported source encoding: {}", det.encoding)))
+        "koi8-r" | "koi8r" => single_byte(data, &KOI8R).map_err(|p| codec_error("koi8-r", p, "character maps to <undefined>")),
+        "cp1251" | "windows-1251" => single_byte(data, &CP1251).map_err(|p| codec_error("charmap", p, "character maps to <undefined>")),
+        "iso-8859-15" | "iso8859-15" | "latin-9" | "latin9" => {
+            let t = latin1_table(&[(0xA4, 0x20AC), (0xA6, 0x0160), (0xA8, 0x0161), (0xB4, 0x017D), (0xB8, 0x017E), (0xBC, 0x0152), (0xBD, 0x0153), (0xBE, 0x0178)]);
+            single_byte(data, &t).map_err(|p| codec_error("iso8859-15", p, "character maps to <undefined>"))
         }
-    }
+        "iso-8859-2" | "iso8859-2" | "latin2" | "latin-2" | "l2" => {
+            single_byte(data, &ISO8859_2).map_err(|p| codec_error("iso8859-2", p, "character maps to <undefined>"))
+        }
+        "iso-8859-5" | "iso8859-5" | "cyrillic" => {
+            let mut t = latin1_table(&[]);
+            for b in 0xA1u16..=0xFF {
+                t[(b - 0x80) as usize] = match b {
+                    0xAD => 0x00AD,
+                    0xF0 => 0x2116,
+                    0xFD => 0x00A7,
+                    _ => 0x0400 + (b - 0xA0),
+                };
+            }
+            single_byte(data, &t).map_err(|p| codec_error("iso8859-5", p, "character maps to <undefined>"))
+        }
+        "iso-8859-7" | "iso8859-7" | "greek" | "greek8" => {
+            let mut t = latin1_table(&[
+                (0xA1, 0x2018), (0xA2, 0x2019), (0xA4, 0x20AC), (0xA5, 0x20AF), (0xAA, 0x037A), (0xAE, 0xFFFF), (0xAF, 0x2015),
+                (0xB4, 0x0384), (0xB5, 0x0385), (0xB6, 0x0386), (0xB8, 0x0388), (0xB9, 0x0389), (0xBA, 0x038A), (0xBC, 0x038C),
+                (0xBE, 0x038E), (0xBF, 0x038F), (0xD2, 0xFFFF), (0xFF, 0xFFFF),
+            ]);
+            for b in 0xC0u16..=0xFE {
+                if b != 0xD2 {
+                    t[(b - 0x80) as usize] = 0x0390 + (b - 0xC0);
+                }
+            }
+            single_byte(data, &t).map_err(|p| codec_error("iso8859-7", p, "character maps to <undefined>"))
+        }
+        _ => match hook.and_then(|h| h(&det.encoding, data)) {
+            Some(Ok(s)) => Ok(s),
+            Some(Err(m)) => Err(SyntaxError::simple(format!("(unicode error) {}", m))),
+            None => {
+                let mut e = SyntaxError::simple(format!("unknown encoding: {}", det.encoding));
+                e.lineno = if det.lines_consumed > 0 { det.lines_consumed as i32 } else { 1 };
+                Err(e)
+            }
+        },
+    };
+    r
 }
+
+const CP1251: [u16; 128] = [
+    0x0402, 0x0403, 0x201A, 0x0453, 0x201E, 0x2026, 0x2020, 0x2021, 0x20AC, 0x2030, 0x0409, 0x2039, 0x040A, 0x040C, 0x040B, 0x040F,
+    0x0452, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0xFFFF, 0x2122, 0x0459, 0x203A, 0x045A, 0x045C, 0x045B, 0x045F,
+    0x00A0, 0x040E, 0x045E, 0x0408, 0x00A4, 0x0490, 0x00A6, 0x00A7, 0x0401, 0x00A9, 0x0404, 0x00AB, 0x00AC, 0x00AD, 0x00AE, 0x0407,
+    0x00B0, 0x00B1, 0x0406, 0x0456, 0x0491, 0x00B5, 0x00B6, 0x00B7, 0x0451, 0x2116, 0x0454, 0x00BB, 0x0458, 0x0405, 0x0455, 0x0457,
+    0x0410, 0x0411, 0x0412, 0x0413, 0x0414, 0x0415, 0x0416, 0x0417, 0x0418, 0x0419, 0x041A, 0x041B, 0x041C, 0x041D, 0x041E, 0x041F,
+    0x0420, 0x0421, 0x0422, 0x0423, 0x0424, 0x0425, 0x0426, 0x0427, 0x0428, 0x0429, 0x042A, 0x042B, 0x042C, 0x042D, 0x042E, 0x042F,
+    0x0430, 0x0431, 0x0432, 0x0433, 0x0434, 0x0435, 0x0436, 0x0437, 0x0438, 0x0439, 0x043A, 0x043B, 0x043C, 0x043D, 0x043E, 0x043F,
+    0x0440, 0x0441, 0x0442, 0x0443, 0x0444, 0x0445, 0x0446, 0x0447, 0x0448, 0x0449, 0x044A, 0x044B, 0x044C, 0x044D, 0x044E, 0x044F,
+];
+
+const ISO8859_2: [u16; 128] = [
+    0x0080, 0x0081, 0x0082, 0x0083, 0x0084, 0x0085, 0x0086, 0x0087, 0x0088, 0x0089, 0x008A, 0x008B, 0x008C, 0x008D, 0x008E, 0x008F,
+    0x0090, 0x0091, 0x0092, 0x0093, 0x0094, 0x0095, 0x0096, 0x0097, 0x0098, 0x0099, 0x009A, 0x009B, 0x009C, 0x009D, 0x009E, 0x009F,
+    0x00A0, 0x0104, 0x02D8, 0x0141, 0x00A4, 0x013D, 0x015A, 0x00A7, 0x00A8, 0x0160, 0x015E, 0x0164, 0x0179, 0x00AD, 0x017D, 0x017B,
+    0x00B0, 0x0105, 0x02DB, 0x0142, 0x00B4, 0x013E, 0x015B, 0x02C7, 0x00B8, 0x0161, 0x015F, 0x0165, 0x017A, 0x02DD, 0x017E, 0x017C,
+    0x0154, 0x00C1, 0x00C2, 0x0102, 0x00C4, 0x0139, 0x0106, 0x00C7, 0x010C, 0x00C9, 0x0118, 0x00CB, 0x011A, 0x00CD, 0x00CE, 0x010E,
+    0x0110, 0x0143, 0x0147, 0x00D3, 0x00D4, 0x0150, 0x00D6, 0x00D7, 0x0158, 0x016E, 0x00DA, 0x0170, 0x00DC, 0x00DD, 0x0162, 0x00DF,
+    0x0155, 0x00E1, 0x00E2, 0x0103, 0x00E4, 0x013A, 0x0107, 0x00E7, 0x010D, 0x00E9, 0x0119, 0x00EB, 0x011B, 0x00ED, 0x00EE, 0x010F,
+    0x0111, 0x0144, 0x0148, 0x00F3, 0x00F4, 0x0151, 0x00F6, 0x00F7, 0x0159, 0x016F, 0x00FA, 0x0171, 0x00FC, 0x00FD, 0x0163, 0x02D9,
+];
 
 fn cp1252(c: u8) -> char {
     const HI: [u16; 32] = [
