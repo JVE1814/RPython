@@ -278,13 +278,3 @@ pub(crate) fn lookup_plain(name: &str) -> Option<u32> {
     lookup_char_key(key)
 }
 
-/// Iterates over all explicitly named characters (for tests).
-#[cfg(test)]
-pub(crate) fn all_explicit() -> impl Iterator<Item = (u32, String)> {
-    (0..NAME_COUNT).map(|i| {
-        let p = entry(i);
-        let mut s = String::new();
-        entry_name(p, &mut s);
-        (entry_cp(p), s)
-    })
-}

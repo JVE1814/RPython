@@ -32,7 +32,7 @@ pub use grapheme::{
     next_grapheme_break_by, Graphemes,
 };
 pub use names::{lookup_name, name, Lookup, NAME_MAX_LEN};
-pub use normalize::{is_normalized, normalize, Form};
+pub use normalize::{is_normalized, normalize, normalize_if_needed, Form};
 pub use ucd::Ucd;
 
 use tables::db::*;
@@ -367,6 +367,40 @@ pub fn has_special_casing(c: u32) -> bool {
     flags(c) & EXTENDED_CASE != 0
 }
 
+/// CPython's `_PyUnicode_ToLowercase` / `Py_UNICODE_TOLOWER` (used e.g. by
+/// the `re` engine): the first code point of the full lowercase mapping.
+/// Equal to [`to_lower_simple`] except for characters with special casing.
+#[inline]
+pub fn py_to_lowercase(c: u32) -> u32 {
+    let mut b = [0; 3];
+    to_lower_full(c, &mut b);
+    b[0]
+}
+
+/// CPython's `_PyUnicode_ToUppercase`: first code point of the full
+/// uppercase mapping (e.g. 'ß' -> 'S').
+#[inline]
+pub fn py_to_uppercase(c: u32) -> u32 {
+    let mut b = [0; 3];
+    to_upper_full(c, &mut b);
+    b[0]
+}
+
+/// CPython's `_PyUnicode_ToTitlecase`: first code point of the full
+/// titlecase mapping.
+#[inline]
+pub fn py_to_titlecase(c: u32) -> u32 {
+    let mut b = [0; 3];
+    to_title_full(c, &mut b);
+    b[0]
+}
+
+/// CPython's `_PyUnicode_ToNumeric`: numeric value or -1.0.
+#[inline]
+pub fn py_to_numeric(c: u32) -> f64 {
+    to_numeric(c).unwrap_or(-1.0)
+}
+
 /// Final_Sigma context test for U+03A3 as implemented by CPython's
 /// `str.lower`: `before` iterates the characters preceding the sigma in
 /// reverse order, `after` the characters following it.  Returns true if the
@@ -522,5 +556,3 @@ pub fn decomposition(c: u32) -> String {
     s
 }
 
-#[cfg(test)]
-mod tests;

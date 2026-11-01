@@ -186,6 +186,11 @@ impl Ucd {
         normalize_impl(form, s, self == Ucd::V3_2_0)
     }
 
+    /// [`Ucd::normalize`] returning `None` if `s` is already normalized.
+    pub fn normalize_if_needed(self, form: Form, s: &[u32]) -> Option<Vec<u32>> {
+        crate::normalize::normalize_if_needed_impl(form, s, self == Ucd::V3_2_0)
+    }
+
     /// `is_normalized(form, unistr)`.
     pub fn is_normalized(self, form: Form, s: &[u32]) -> bool {
         is_normalized_impl(form, s, self == Ucd::V3_2_0)

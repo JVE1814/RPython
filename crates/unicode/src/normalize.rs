@@ -242,3 +242,22 @@ pub fn normalize(form: Form, s: &[u32]) -> Vec<u32> {
 pub fn is_normalized(form: Form, s: &[u32]) -> bool {
     is_normalized_impl(form, s, false)
 }
+
+pub(crate) fn normalize_if_needed_impl(form: Form, s: &[u32], v320: bool) -> Option<Vec<u32>> {
+    if !v320 && quick_check(form, s) == Qc::Yes {
+        return None;
+    }
+    let d = decompose(s, form.compat(), v320);
+    let r = if form.composed() { compose(d) } else { d };
+    if r == s {
+        None
+    } else {
+        Some(r)
+    }
+}
+
+/// Like [`normalize`] but returns `None` (no allocation in the common case)
+/// when `s` is already in normal form.
+pub fn normalize_if_needed(form: Form, s: &[u32]) -> Option<Vec<u32>> {
+    normalize_if_needed_impl(form, s, false)
+}
