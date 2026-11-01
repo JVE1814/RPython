@@ -20,6 +20,7 @@ pub struct ProxyObject {
     pub frame: *mut PyObject,
 }
 
+#[unsafe(export_name = "PyFrameLocalsProxy_Type")]
 pub static mut PROXY_TYPE: PyTypeObject = PyTypeObject::ZERO;
 pub fn proxy_type() -> *mut PyTypeObject {
     &raw mut PROXY_TYPE
