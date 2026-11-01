@@ -429,95 +429,54 @@ impl<'a> Parser<'a> {
         Ok(Some(Expr::new(ExprKind::Compare { left: bx(a), ops, comparators }, self.loc(start))))
     }
 
+    /// bitwise_or .. term: the six left-associative binary operator levels of the grammar,
+    /// implemented with precedence climbing (same trees and locations).
     pub(crate) fn bitwise_or(&mut self) -> R<Expr> {
-        let start = self.p;
-        let Some(mut a) = self.bitwise_xor()? else { return Ok(None) };
-        while self.at(T::VBAR) {
-            let m = self.p;
-            self.advance();
-            match self.bitwise_xor()? {
-                Some(b) => a = Expr::new(ExprKind::BinOp { left: bx(a), op: Operator::BitOr, right: bx(b) }, self.loc(start)),
-                None => {
-                    self.p = m;
-                    break;
-                }
-            }
-        }
-        Ok(Some(a))
+        self.binop_expr(1)
     }
 
-    fn bitwise_xor(&mut self) -> R<Expr> {
-        let start = self.p;
-        let Some(mut a) = self.bitwise_and()? else { return Ok(None) };
-        while self.at(T::CIRCUMFLEX) {
-            let m = self.p;
-            self.advance();
-            match self.bitwise_and()? {
-                Some(b) => a = Expr::new(ExprKind::BinOp { left: bx(a), op: Operator::BitXor, right: bx(b) }, self.loc(start)),
-                None => {
-                    self.p = m;
-                    break;
-                }
-            }
-        }
-        Ok(Some(a))
+    #[inline]
+    fn binop_info(ty: TokenType) -> Option<(u8, Operator)> {
+        Some(match ty {
+            T::VBAR => (1, Operator::BitOr),
+            T::CIRCUMFLEX => (2, Operator::BitXor),
+            T::AMPER => (3, Operator::BitAnd),
+            T::LEFTSHIFT => (4, Operator::LShift),
+            T::RIGHTSHIFT => (4, Operator::RShift),
+            T::PLUS => (5, Operator::Add),
+            T::MINUS => (5, Operator::Sub),
+            T::STAR => (6, Operator::Mult),
+            T::SLASH => (6, Operator::Div),
+            T::DOUBLESLASH => (6, Operator::FloorDiv),
+            T::PERCENT => (6, Operator::Mod),
+            T::AT => (6, Operator::MatMult),
+            _ => return None,
+        })
     }
 
-    fn bitwise_and(&mut self) -> R<Expr> {
+    fn binop_expr(&mut self, min_prec: u8) -> R<Expr> {
         let start = self.p;
-        let Some(mut a) = self.shift_expr()? else { return Ok(None) };
-        while self.at(T::AMPER) {
-            let m = self.p;
-            self.advance();
-            match self.shift_expr()? {
-                Some(b) => a = Expr::new(ExprKind::BinOp { left: bx(a), op: Operator::BitAnd, right: bx(b) }, self.loc(start)),
-                None => {
-                    self.p = m;
-                    break;
-                }
-            }
-        }
-        Ok(Some(a))
-    }
-
-    fn shift_expr(&mut self) -> R<Expr> {
-        let start = self.p;
-        let Some(mut a) = self.sum()? else { return Ok(None) };
+        let Some(mut left) = self.factor()? else { return Ok(None) };
         loop {
-            let op = match self.peek_ty() {
-                T::LEFTSHIFT => Operator::LShift,
-                T::RIGHTSHIFT => Operator::RShift,
-                _ => break,
-            };
-            let m = self.p;
-            self.advance();
-            match self.sum()? {
-                Some(b) => a = Expr::new(ExprKind::BinOp { left: bx(a), op, right: bx(b) }, self.loc(start)),
-                None => {
-                    self.p = m;
-                    break;
-                }
+            let Some((prec, op)) = Self::binop_info(self.peek_ty()) else { break };
+            if prec < min_prec {
+                break;
             }
-        }
-        Ok(Some(a))
-    }
-
-    fn sum(&mut self) -> R<Expr> {
-        let start = self.p;
-        let Some(mut a) = self.term()? else { return Ok(None) };
-        loop {
-            let op = match self.peek_ty() {
-                T::PLUS => Operator::Add,
-                T::MINUS => Operator::Sub,
-                _ => break,
-            };
             let m = self.p;
             self.advance();
-            match self.term()? {
-                Some(b) => a = Expr::new(ExprKind::BinOp { left: bx(a), op, right: bx(b) }, self.loc(start)),
+            let right = if prec == 6 {
+                self.factor()?
+            } else {
+                self.enter()?;
+                let r = self.binop_expr(prec + 1);
+                self.leave();
+                r?
+            };
+            match right {
+                Some(r) => left = Expr::new(ExprKind::BinOp { left: bx(left), op, right: bx(r) }, self.loc(start)),
                 None => {
                     self.p = m;
-                    if self.invalid {
+                    if self.invalid && prec >= 5 {
                         self.invalid_arithmetic()?;
                         self.p = m;
                     }
@@ -525,36 +484,7 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        Ok(Some(a))
-    }
-
-    fn term(&mut self) -> R<Expr> {
-        let start = self.p;
-        let Some(mut a) = self.factor()? else { return Ok(None) };
-        loop {
-            let op = match self.peek_ty() {
-                T::STAR => Operator::Mult,
-                T::SLASH => Operator::Div,
-                T::DOUBLESLASH => Operator::FloorDiv,
-                T::PERCENT => Operator::Mod,
-                T::AT => Operator::MatMult,
-                _ => break,
-            };
-            let m = self.p;
-            self.advance();
-            match self.factor()? {
-                Some(b) => a = Expr::new(ExprKind::BinOp { left: bx(a), op, right: bx(b) }, self.loc(start)),
-                None => {
-                    self.p = m;
-                    if self.invalid {
-                        self.invalid_arithmetic()?;
-                        self.p = m;
-                    }
-                    break;
-                }
-            }
-        }
-        Ok(Some(a))
+        Ok(Some(left))
     }
 
     /// `op 'not' inversion` after an arithmetic operator (current token is the operator).

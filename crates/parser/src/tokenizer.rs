@@ -63,7 +63,7 @@ struct Field {
 /// (reported by the parser as "'(' was never closed").
 #[derive(Clone, Debug)]
 pub enum LexError {
-    Syntax(SyntaxError),
+    Syntax(Box<SyntaxError>),
     /// EOF reached with open brackets; payload: (bracket, lineno, byte col).
     UnclosedParen(u8, u32, i32),
     /// Unexpected EOF (e.g. after a line continuation).
@@ -107,7 +107,7 @@ fn is_id_start_ascii(c: u8) -> bool {
 }
 #[inline]
 fn is_id_char_ascii(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'_'
+    ID_CHAR[c as usize]
 }
 #[inline]
 fn is_potential_identifier_char(c: u8) -> bool {
@@ -239,7 +239,7 @@ impl<'a> Lexer<'a> {
 
     /// Error at an explicit location (byte columns, end may be -1).
     fn err_at(&self, kind: ErrorKind, msg: String, lineno: u32, col: i32, end_lineno: u32, end_col: i32) -> LexError {
-        LexError::Syntax(make_error(self.src, kind, msg, lineno as i32, col, end_lineno as i32, end_col))
+        LexError::Syntax(Box::new(make_error(self.src, kind, msg, lineno as i32, col, end_lineno as i32, end_col)))
     }
 
     /// Error pointing at the last consumed character (like CPython's tokenizer errors).
@@ -256,7 +256,7 @@ impl<'a> Lexer<'a> {
         }
         e.end_offset = Some(e.offset);
         e.text = Some(lt);
-        LexError::Syntax(e)
+        LexError::Syntax(Box::new(e))
     }
 
     fn indent_error(&self, kind: ErrorKind, msg: &str) -> LexError {
@@ -268,7 +268,7 @@ impl<'a> Lexer<'a> {
         e.text = Some(line.clone());
         e.offset = byte_col_to_char_offset(&line, col);
         e.end_offset = Some(e.offset);
-        LexError::Syntax(e)
+        LexError::Syntax(Box::new(e))
     }
 
     fn warn(&mut self, msg: String, lineno: u32, col: i32, end_lineno: u32, end_col: i32) {
@@ -1051,6 +1051,22 @@ impl<'a> Lexer<'a> {
         let mut end_quote_size = 0;
         let mut has_escaped_quote = false;
         while end_quote_size != quote_size {
+            // fast path over ordinary characters
+            {
+                let b = self.b;
+                let mut i = self.pos;
+                while i < b.len() {
+                    let ch = b[i];
+                    if ch == quote || ch == b'\\' || ch == b'\n' || ch == b'\r' {
+                        break;
+                    }
+                    i += 1;
+                }
+                if i != self.pos {
+                    self.pos = i;
+                    end_quote_size = 0;
+                }
+            }
             let c = self.peek();
             if c < 0 || (quote_size == 1 && (c == b'\n' as i32 || c == b'\r' as i32)) {
                 let detected = if c < 0 { self.last_line_no() } else { self.lineno };
@@ -1101,7 +1117,7 @@ impl<'a> Lexer<'a> {
         let col = (start - line_start) as i32;
         let lt = line.trim_end_matches(['\n', '\r']).to_string();
         let off = byte_col_to_char_offset(&line, col);
-        LexError::Syntax(SyntaxError {
+        LexError::Syntax(Box::new(SyntaxError {
             kind: ErrorKind::Syntax,
             msg,
             lineno: slineno as i32,
@@ -1111,7 +1127,7 @@ impl<'a> Lexer<'a> {
             offset: off,
             end_offset: Some(off),
             text: Some(lt),
-        })
+        }))
     }
 
     fn lex_fstring_start(&mut self, start: usize, slineno: u32, scol: i32, raw: bool, tstring: bool) -> Result<Token, LexError> {
@@ -1195,6 +1211,22 @@ impl<'a> Lexer<'a> {
             let mut unicode_escape = false;
             let mut content_end: Option<usize>; // exclusive end of token text
             loop {
+                // fast path over ordinary characters
+                {
+                    let b = self.b;
+                    let mut i = self.pos;
+                    while i < b.len() {
+                        let ch = b[i];
+                        if ch == m.quote || ch == b'{' || ch == b'}' || ch == b'\\' || ch == b'\n' || ch == b'\r' {
+                            break;
+                        }
+                        i += 1;
+                    }
+                    if i != self.pos {
+                        self.pos = i;
+                        end_quote_size = 0;
+                    }
+                }
                 let c = self.peek();
                 if c < 0 || (m.quote_size == 1 && (c == b'\n' as i32 || c == b'\r' as i32)) {
                     if in_spec && c >= 0 {
@@ -2058,7 +2090,7 @@ fn raw_line_text(src: &str, lineno: u32) -> String {
 
 pub(crate) fn lex_error_to_syntax(src: &str, e: LexError) -> SyntaxError {
     match e {
-        LexError::Syntax(s) => s,
+        LexError::Syntax(s) => *s,
         LexError::UnclosedParen(ch, ln, col) => {
             make_error(src, ErrorKind::Syntax, format!("'{}' was never closed", ch as char), ln as i32, col, ln as i32, col + 1)
         }
@@ -2132,3 +2164,14 @@ const KOI8R: [u16; 128] = [
     0x042E, 0x0410, 0x0411, 0x0426, 0x0414, 0x0415, 0x0424, 0x0413, 0x0425, 0x0418, 0x0419, 0x041A, 0x041B, 0x041C, 0x041D, 0x041E,
     0x041F, 0x042F, 0x0420, 0x0421, 0x0422, 0x0423, 0x0416, 0x0412, 0x042C, 0x042B, 0x0417, 0x0428, 0x042D, 0x0429, 0x0427, 0x042A,
 ];
+
+static ID_CHAR: [bool; 256] = {
+    let mut t = [false; 256];
+    let mut i = 0;
+    while i < 256 {
+        let c = i as u8;
+        t[i] = c.is_ascii_alphanumeric() || c == b'_';
+        i += 1;
+    }
+    t
+};
