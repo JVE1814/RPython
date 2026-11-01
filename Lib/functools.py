@@ -209,13 +209,6 @@ def _warn_python_reduce_kwargs(py_reduce):
         return py_reduce(*args, **kwargs)
     return reduce
 
-reduce = _warn_python_reduce_kwargs(reduce)
-del _warn_python_reduce_kwargs
-
-try:
-    from _functools import reduce
-except ImportError:
-    pass
 
 
 # --------------------------------------------------------------------------
@@ -388,6 +381,15 @@ class partial:
 
 try:
     from _functools import partial, Placeholder, _PlaceholderType
+except ImportError:
+    pass
+
+# wraps() needs partial, so the Python reduce is wrapped only now.
+reduce = _warn_python_reduce_kwargs(reduce)
+del _warn_python_reduce_kwargs
+
+try:
+    from _functools import reduce
 except ImportError:
     pass
 

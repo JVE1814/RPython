@@ -27,6 +27,12 @@ pub mod _operator;
 pub mod _functools;
 pub mod _abc;
 pub mod itertools;
+pub mod _collections;
+pub mod _types;
+pub mod _heapq;
+pub mod _bisect;
+pub mod atexit;
+pub mod _contextvars;
 pub mod builtins_numbers;
 pub mod math;
 pub mod numbers_registry;
@@ -45,10 +51,6 @@ pub mod _struct;
 pub mod binascii;
 pub mod _random;
 pub mod _imp;
-pub mod _collections;
-pub mod _types;
-pub mod _heapq;
-pub mod _bisect;
 
 pub mod _weakref;
 
