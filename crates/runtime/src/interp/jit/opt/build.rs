@@ -1856,6 +1856,28 @@ impl<'a> B<'a> {
             self.template(i);
             return;
         };
+        if es.len() == 1 && es[0].kind == kind::TYPE_ATTR {
+            // attribute of a class object (b): guard identity + version tag
+            let s = es[0];
+            let snap = self.snap(i, SnapKind::Deopt);
+            let t = if let AV::Const(p) = self.peek(1) {
+                if p as u64 != s.b {
+                    self.template(i);
+                    return;
+                }
+                self.imm(p as i64)
+            } else {
+                let p = self.peek_ptr(1);
+                self.emit(Inst::Guard(Cond::Cmp(p, Opnd::I(s.b as i64), Cc::NE), snap));
+                p
+            };
+            self.emit(Inst::Guard(Cond::CmpMem32(Base::V(t), TP_TAG, s.a as u32 as i64, Cc::NE), snap));
+            let k = self.st.stack.len() - 1;
+            let a = self.pop();
+            self.discard(a, k);
+            self.push(AV::Const(s.c));
+            return;
+        }
         let ok = |s: &crate::interp::cache::Snapshot| match s.kind {
             kind::INSTANCE_DICT => s.b < (1 << 20),
             kind::SLOT => true,

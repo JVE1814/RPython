@@ -509,7 +509,8 @@ impl<'a> Gen<'a> {
                         let back = self.a.label();
                         let cnt = &self.cd.caches.t2_backedge as *const _ as i64;
                         self.a.mov_ri(R11, cnt);
-                        self.a.sub32_mi(M(R11, 0), 1);
+                        // (weighted by the loop length, like the interpreter's counter)
+                        self.a.sub32_mi(M(R11, 0), 1 + ((pc - arg) / 32) as i32);
                         self.a.jcc(Cc::L, stub);
                         self.a.bind(back);
                         self.stubs.push(Box::new(move |a: &mut Asm, _exit, _nlp| {

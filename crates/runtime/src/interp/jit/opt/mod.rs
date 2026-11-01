@@ -144,7 +144,7 @@ static CALLS: AtomicU32 = AtomicU32::new(1000);
 static BACKEDGES: AtomicU32 = AtomicU32::new(10000);
 static DEBUG: AtomicU8 = AtomicU8::new(0);
 /// deoptimisations after which code is discarded
-const DEOPT_LIMIT: u32 = 200;
+const DEOPT_LIMIT: u32 = 64;
 /// compilations per code object
 const MAX_TRIES: u8 = 4;
 
