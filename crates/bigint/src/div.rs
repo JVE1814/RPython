@@ -97,7 +97,7 @@ pub fn divrem(a: &[u32], b: &[u32]) -> (Vec<u32>, Vec<u32>) {
     if b.len() >= BZ_THRESHOLD && qlen >= BZ_THRESHOLD {
         return divrem_bz(a, b);
     }
-    if qlen + 8 < b.len() / 2 && qlen >= 16 && b.len() >= NEWTON_THRESHOLD {
+    if qlen >= 32 && b.len() >= 4 * qlen && b.len() >= 500 {
         return divrem_short_quotient(a, b);
     }
     let mut q = vec![0u32; qlen];

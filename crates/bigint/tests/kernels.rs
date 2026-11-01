@@ -222,3 +222,19 @@ fn reciprocal_bounds() {
         assert_eq!(div::divrem_large(&a, &b), div::divrem_knuth(&a, &b), "large {n}/{m}");
     }
 }
+
+#[test]
+fn short_quotient_shapes() {
+    let mut r = Rng::new(37);
+    for _ in 0..60 {
+        let m = 500 + r.below(2500) as usize;
+        let qlen = 32 + r.below((m / 4 - 32) as u64) as usize;
+        let b = patterned(&mut r, m);
+        let a = patterned(&mut r, m + qlen - 1);
+        assert_eq!(nat::divrem(&a, &b), div::divrem_knuth(&a, &b), "{}/{}", a.len(), m);
+        // exact multiple
+        let q = patterned(&mut r, qlen);
+        let p = nat::mul(&q, &b);
+        assert_eq!(nat::divrem(&p, &b), (q, vec![]));
+    }
+}
