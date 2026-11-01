@@ -154,6 +154,7 @@ struct Gen<'a> {
     rt_box_int: Label,
     rt_box_float: Label,
     rt_free_num: Label,
+    flags: u32,
 }
 
 fn fnaddr<T>(f: T) -> usize
@@ -425,6 +426,20 @@ impl<'a> Gen<'a> {
                 self.a.store_i(M(Rbx, STACK_TOP), self.nlp + d - 1);
                 self.a.mov_ri(Rax, ST_RETURN as i64);
                 self.a.jmp(self.exit);
+            }
+            Op::Send => {
+                let t = self.ilabel[self.an.index_of[arg as usize] as usize];
+                self.set_lasti(pc);
+                self.lea_sp(Rdi, d);
+                self.call(addr!(h::h_send));
+                let err = self.error_label(pc, d - 1);
+                self.a.cmp_ri(Rax, 1);
+                self.a.jcc(Cc::E, t);
+                self.a.jcc(Cc::A, err);
+            }
+            Op::GetYieldFromIter => {
+                let flags = self.flags as i64;
+                self.helper_sp(&ins, d, addr!(h::h_get_yield_from_iter), Some(flags), None, d - 1);
             }
             Op::YieldValue => {
                 // suspend: the interpreter resumes the generator at the next instruction
@@ -1245,13 +1260,13 @@ fn emit_routines(a: &mut Asm, box_int: Label, box_float: Label, free_num: Label)
 }
 
 /// Compile a code object. Err: not compilable (stays in the interpreter).
-pub fn compile(cd: &CodeData, nlocalsplus: usize, tables: &crate::interp::cache::Tables) -> Result<Output, String> {
+pub fn compile(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crate::interp::cache::Tables) -> Result<Output, String> {
     let an = super::analysis::analyze(&cd.code, &cd.exception_table)?;
     let mut a = Asm::new();
     let ilabel: Vec<Label> = (0..an.instrs.len()).map(|_| a.label()).collect();
     let exit = a.label();
     let (rt_box_int, rt_box_float, rt_free_num) = (a.label(), a.label(), a.label());
-    let mut g = Gen { a, nlp: nlocalsplus as i32, an: &an, cd, tables, ilabel, exit, stubs: Vec::new(), rt_box_int, rt_box_float, rt_free_num };
+    let mut g = Gen { a, nlp: nlocalsplus as i32, an: &an, cd, tables, ilabel, exit, stubs: Vec::new(), rt_box_int, rt_box_float, rt_free_num, flags };
 
     // prologue
     g.a.push(Rbp);

@@ -253,6 +253,46 @@ fn call_compiled(func: &PyObject, code: &PyObject, cd: &CodeData, c: &Compiled, 
     r
 }
 
+/// Resume/start a frame directly in compiled code, bypassing the interpreter prelude
+/// (used by eval_frame, e.g. for every generator resumption). Ok(result) if the
+/// activation finished (return or yield) in compiled code; Err(throw) if the
+/// interpreter must take over, with the exception to raise at f.next_instr - 1.
+#[inline]
+pub fn resume(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> Result<PyResult<crate::interp::Exit>, Option<PyRef>> {
+    if throw.is_some() {
+        return Err(throw);
+    }
+    let cd = crate::types::code::code_data(f.code());
+    let c = cd.caches.jit.load(Acquire);
+    if c.is_null() || crate::modules::sys::tracing_active() {
+        return Err(None);
+    }
+    let pc = f.next_instr as usize;
+    if pc == 0 {
+        cd.invocation_count.fetch_add(1, Relaxed);
+    }
+    f.yield_from_send = -1;
+    match run(ts, f, unsafe { &*c }, pc) {
+        Run::NotRun => Err(None),
+        Run::Return(v) => {
+            f.clear_stack();
+            Ok(Ok(crate::interp::Exit::Return(v)))
+        }
+        Run::Yield(v) => Ok(Ok(crate::interp::Exit::Yield(v))),
+        Run::Deopt(npc) => {
+            f.next_instr = npc as u32;
+            Err(None)
+        }
+        Run::Error => {
+            f.next_instr = f.lasti + 1;
+            match crate::errors::take_exc() {
+                Some(e) => Err(Some(e)),
+                None => Ok(Err(crate::errors::system_error("error return without exception set"))),
+            }
+        }
+    }
+}
+
 /// Compile the frame's code object (tier 1). Returns true if code is installed.
 #[cold]
 fn compile(f: &Frame, cd: &CodeData) -> bool {
@@ -266,7 +306,8 @@ fn compile(f: &Frame, cd: &CodeData) -> bool {
     let nlp = crate::types::code::code(f.code()).obj.co_nlocalsplus as usize;
     let tables = cd.caches.tables(&cd.code);
     let dbg = DEBUG.load(Relaxed) != 0;
-    match tier1::compile(cd, nlp, tables) {
+    let flags = crate::types::code::code(f.code()).flags();
+    match tier1::compile(cd, nlp, flags, tables) {
         Ok(out) => {
             let code = &out.asm.buf;
             let asm = &out.asm;
