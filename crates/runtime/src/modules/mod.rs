@@ -24,3 +24,4 @@ pub fn register_all() {
 pub mod builtins_numbers;
 pub mod math;
 pub mod numbers_registry;
+pub mod cmath;
