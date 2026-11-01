@@ -97,3 +97,12 @@ or skips than CPython"). They never run as part of our interpreter, tooling or t
 ## D16 — Test runner
 `tools/run_tests.sh PY OUTDIR [tests]` runs `PY -m test <module>` per module (from the spec's
 Lib/test package) with a timeout and records status + regrtest totals in results.tsv.
+
+## D17 — Small-object allocator
+`tlab.rs`: 64 KiB pages (in 4 MiB mmap'd segments), one size class per page (header holds the
+class), per-thread free-list caches with a global depot for batches (tcmalloc/HotSpot-TLAB
+style). Blocks are interchangeable between threads, so cross-thread frees are lock-free on
+the fast path. Objects > 2 KiB use the system allocator and are marked with ob_gc_bits 0x20.
+Frames are pooled per thread. fib(20): 48.2M -> 42.4M instructions (CPython: 51.1M total
+including its 39.6M startup; i.e. per-call work is still ~3x CPython's — the JIT tiers and
+inline caches are the planned fix).
