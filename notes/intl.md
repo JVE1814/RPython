@@ -60,8 +60,12 @@ ascending code order ("first code wins", which is what test_codecmaps checks).
 ## Other fixes in this workstream
 
 * Encoding names: str.encode/bytes.decode only take the fast paths for ASCII names;
-  names with lone surrogates go to the registry as objects (`_codecs::lookup_obj`,
-  DeprecationWarning, never cached) — test_email rfc2231 cases.
+  names with lone surrogates go through `_codecs::lookup_obj`: DeprecationWarning, then
+  LookupError (no UTF-8 form, so never a registered codec) — test_email rfc2231 and
+  encoded-word cases (CharsetError defect).
+* `ks_c_5601_1987` is an alias of cp949 (test_email requires `'갂'.encode('ks_c_5601-1987')`
+  to give the UHC bytes).  email.charset maps hz -> hz-gb-2312, big5hkscs -> big5-hkscs;
+  contentmanager sends euc-jp / shift_jis text as iso-2022-jp (CHARSETS conversion).
 * Source decoding (compile.rs `decode_hook`): registry lookup first (unknown -> "unknown
   encoding: X"), then the text-encoding check ("'hex_codec' is not a text encoding; ...")
   and the codec; decoding SyntaxErrors no longer carry a "(unicode error)" prefix; the
@@ -79,3 +83,20 @@ ascending code order ("first code wins", which is what test_codecmaps checks).
 
 test_codecmaps_* need `urllib` (open_urlresource) and skip without the `urlfetch` resource;
 with the reference files placed in a copy of Lib/test/data they all pass (verified).
+
+## Status (at pause)
+
+Passing locally: test_multibytecodec, test_codecencodings_{cn,hk,iso2022,jp,kr,tw}, test_codecs,
+test_charmapcodec, test_codeccallbacks, test_utf8source, test_source_encoding, test_py_compile
+(utf-7 cookie), test_unicode_file*, all test_codecmaps_* (with the mapping files in a copy of
+Lib/test/data and a stub urllib; real runs need the web workstream's urllib).
+Committed but not yet verified on a fresh build: unicodedata GC support (test_reference_loops),
+`ensure_unicodedata` (test_unicodedata_unload_reload / test_failed_import_during_compiling),
+the email charset fixes (6 test_email failures).
+
+## Next steps
+
+* Re-run test_email / test_unicodedata on a fresh build; test_subinterp needs _testcapi.
+* `_multibytecodec.__create_codec` is a stub; no GC traversal for the stream reader/writer
+  `stream` reference.
+* test_xml_etree XInclude errors (urllib) and test_pyexpat traceback depth are not codec issues.
