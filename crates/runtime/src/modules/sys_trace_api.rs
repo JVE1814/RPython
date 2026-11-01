@@ -16,3 +16,15 @@ pub fn setprofile(f: &PyObject) -> PyResult {
 pub fn getprofile() -> PyResult {
     Ok(none::none_ref())
 }
+pub fn settrace_all(f: &PyObject) -> PyResult {
+    settrace(f)
+}
+pub fn setprofile_all(f: &PyObject) -> PyResult {
+    setprofile(f)
+}
+pub fn call_tracing(f: &PyObject, args: &[&PyObject]) -> PyResult {
+    crate::abstract_::call(f, args)
+}
+pub fn install_monitoring(_d: &PyObject) -> PyResult<()> {
+    Ok(())
+}

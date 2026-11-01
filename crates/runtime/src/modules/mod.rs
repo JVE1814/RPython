@@ -14,6 +14,10 @@ pub mod traceback_print;
 pub mod ast_bridge;
 pub mod os_fspath;
 pub mod sys_trace_api;
+pub mod sys_structseq;
+pub mod sys_namespace;
+pub mod _thread;
+pub mod pymain;
 pub mod codecs_core;
 pub mod codecs_registry;
 pub mod reprlib_guard;
@@ -42,3 +46,4 @@ pub mod numbers_registry;
 }
     numbers_registry::register();
     crate::import::register_builtin("_warnings", _warnings::init_module);
+    sys_full::register_system_modules();
