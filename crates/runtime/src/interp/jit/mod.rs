@@ -185,7 +185,7 @@ fn run(ts: &ThreadState, f: &mut Frame, c: &Compiled, pc: usize) -> Run {
         tier1::ST_YIELD => Run::Yield(unsafe { PyRef::from_raw(out) }),
         _ => {
             if t2 {
-                opt::note_deopt(&cd.caches);
+                opt::note_deopt(&cd.caches, f);
             }
             Run::Deopt(f.next_instr as usize)
         }
@@ -293,7 +293,7 @@ fn run_call_frame(ts: &ThreadState, mut frame: Box<Frame>, tramp: usize, target:
 #[inline(never)]
 fn finish_in_interp(ts: &ThreadState, mut frame: Box<Frame>, st: u32) -> PyResult {
     if st == tier1::ST_DEOPT {
-        opt::note_deopt(&crate::types::code::code_data(frame.code()).caches);
+        opt::note_deopt(&crate::types::code::code_data(frame.code()).caches, &frame);
     }
     // let the interpreter finish this activation (unwinding or deopt)
     let throw = if st == tier1::ST_ERROR {

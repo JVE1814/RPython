@@ -323,6 +323,8 @@ impl<'a> Gen<'a> {
     /// Record the types of the stack operands at depths `da` and `db` (slow paths;
     /// clobbers caller-saved registers).
     fn prof_slow(&mut self, pc: u32, da: i32, db: Option<i32>) {
+        let skip = self.a.label();
+        self.prof_gate(skip);
         let p = self.prof_addr(pc);
         self.a.mov_ri(Rdi, p);
         let m = self.slot(da);
@@ -335,6 +337,16 @@ impl<'a> Gen<'a> {
             None => self.a.mov_ri(Rdx, 0),
         }
         self.call(addr!(h::h_prof));
+        self.a.bind(skip);
+    }
+
+    /// Jump to `skip` once slow-path profiling is off for this code (tier-2 code
+    /// installed; re-enabled when it is invalidated). Clobbers r11.
+    fn prof_gate(&mut self, skip: Label) {
+        let g = &self.cd.caches.t2_prof as *const _ as i64;
+        self.a.mov_ri(R11, g);
+        self.a.cmp8_mi(M(R11, 0), 0);
+        self.a.jcc(Cc::E, skip);
     }
 
     /// Load compact-int value of the object in `obj` into `out` or jump to `slow`.
@@ -922,11 +934,14 @@ impl<'a> Gen<'a> {
             self.a.jmp(pushed);
         }
         self.a.bind(generic);
+        let noprof = self.a.label();
+        self.prof_gate(noprof);
         let p = self.prof_addr(ins.pc);
         self.a.mov_ri(Rdi, p);
         let m = self.slot(d - 1);
         self.a.load(Rsi, m);
         self.call(addr!(h::h_prof_iter));
+        self.a.bind(noprof);
         self.set_lasti(ins.pc);
         self.lea_sp(Rdi, d);
         self.call(addr!(h::h_for_iter));

@@ -139,17 +139,16 @@ const MAX_TRIES: u8 = 4;
 
 #[cold]
 fn init() -> bool {
-    // tier 2 is opt-in for now (RPYTHON_JIT2=1 or a threshold): the spec smoke still
-    // crashes with it enabled, see notes/jit.md
-    let en = std::env::var("RPYTHON_JIT2").map(|v| v != "0").unwrap_or_else(|_| std::env::var("RPYTHON_JIT2_THRESHOLD").is_ok());
+    // on by default; RPYTHON_JIT2=0 disables tier 2 (RPYTHON_JIT=0 disables both tiers)
+    let en = std::env::var("RPYTHON_JIT2").map(|v| v != "0").unwrap_or(true);
     if let Ok(t) = std::env::var("RPYTHON_JIT2_THRESHOLD") {
         if let Ok(n) = t.parse::<u32>() {
             CALLS.store(n.max(1), Relaxed);
             BACKEDGES.store((n * 10).max(1), Relaxed);
         }
     }
-    if std::env::var("RPYTHON_JIT_DEBUG").map(|v| v != "0").unwrap_or(false) {
-        DEBUG.store(1, Relaxed);
+    if let Some(n) = std::env::var("RPYTHON_JIT_DEBUG").ok().and_then(|v| v.parse::<u8>().ok()) {
+        DEBUG.store(n, Relaxed);
     }
     ENABLED.store(en as u8, Relaxed);
     en
@@ -284,6 +283,7 @@ pub fn invalidate(cc: &CodeCaches) {
     }
     drop(retired);
     cc.t2_invalidations.fetch_add(1, Relaxed);
+    cc.t2_prof.store(1, Relaxed);
     // calls go back to tier 1 (or the interpreter)
     let j = cc.jit.load(Acquire);
     let t1 = if j.is_null() {
@@ -477,6 +477,7 @@ fn compile_locked(code: &PyObject, cd: &CodeData, globals: *mut PyObject, builti
     if entry_pc == 0 && cc.fast_argc_ok.load(Relaxed) {
         cc.fast_entry.store(target, Release);
     }
+    cc.t2_prof.store(0, Relaxed);
     Some(target)
 }
 
@@ -492,8 +493,9 @@ pub unsafe extern "C" fn h_backedge(f: *mut crate::interp::frame::Frame, header:
             return 0;
         }
         let code = f.code().to_ref();
-        // standard unit for later calls, OSR unit for this activation
-        if cc.opt.load(Acquire).is_null() && cd.invocation_count.load(Relaxed) > 1 {
+        // standard unit for later calls (a function with a hot loop may be called
+        // only a few times), OSR unit for this activation
+        if cc.opt.load(Acquire).is_null() {
             compile(&code, f.globals, f.builtins, 0);
         }
         compile(&code, f.globals, f.builtins, header as usize).unwrap_or(0)
@@ -503,7 +505,11 @@ pub unsafe extern "C" fn h_backedge(f: *mut crate::interp::frame::Frame, header:
 /// Status DEOPT came back from code entered at `pc`: count it against the tier-2
 /// code and discard that code if it keeps failing.
 #[inline]
-pub fn note_deopt(cc: &CodeCaches) {
+pub fn note_deopt(cc: &CodeCaches, f: &crate::interp::frame::Frame) {
+    if DEBUG.load(Relaxed) >= 2 {
+        let cd = crate::types::code::code_data(f.code());
+        eprintln!("[jit] tier2 deopt {} -> pc {}", crate::types::str::to_string_lossy(&cd.co_qualname), f.next_instr);
+    }
     for p in [&cc.opt, &cc.osr] {
         let o = p.load(Acquire);
         if !o.is_null() {

@@ -456,6 +456,9 @@ pub struct CodeCaches {
     pub t2_tries: AtomicU8,
     pub t2_busy: AtomicU8,
     pub t2_invalidations: AtomicU8,
+    /// tier-1 slow paths record type profiles while this is non-zero (off while
+    /// tier-2 code is installed)
+    pub t2_prof: AtomicU8,
     /// invalidated tier-2 code, freed with the code object
     pub t2_retired: std::sync::Mutex<Vec<usize>>,
 }
@@ -479,6 +482,7 @@ impl CodeCaches {
             t2_tries: AtomicU8::new(0),
             t2_busy: AtomicU8::new(0),
             t2_invalidations: AtomicU8::new(0),
+            t2_prof: AtomicU8::new(1),
             t2_retired: std::sync::Mutex::new(Vec::new()),
         }
     }
