@@ -79,6 +79,7 @@ pub mod zlib;
 pub mod hashes;
 pub mod _decimal;
 pub mod _bz2;
+pub mod pyexpat;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
 pub fn register_all() {
@@ -104,4 +105,5 @@ pub fn register_all() {
     crate::import::register_builtin("_json", _json::init_module);
     compress_common::register();
     _decimal::register();
+    crate::import::register_builtin("_expat_engine", pyexpat::init);
 }
