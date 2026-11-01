@@ -70,6 +70,10 @@ Finished also: jit (tier-0 caches, tier-1 baseline JIT, generational GC, startup
 Running (wave 8): stability (crashes, races, heap corruption, hangs; ASAN/TSAN).
 Finished also: bindings (_ctypes/_sqlite3/_ssl via dlopen; crates/bindings), parallel (concurrent.futures,
 multiprocessing, fork safety).
+Running (wave 9): tty2 (_pyrepl, _tkinter+tkinter, login_tty, locking), numpy (C-API fixes until numpy's own test
+suite passes; other cp315t wheels), docsig (__text_signature__ for all builtins).
+Finished also: tty (dbm/readline/curses), pkgtools (importlib.resources/metadata, ensurepip+pip 26.2.2, venv,
+zipapp, tracemalloc, sysconfig, pydoc). MILESTONE: pip installs numpy-2.5.4 cp315t wheel; import numpy works.
 Unassigned: _testclinic re-implemented by us (spec lacks
 internal headers / generated clinic files); subinterpreters (_interpreters/_interpqueues/_interpchannels,
 concurrent.interpreters, InterpreterPoolExecutor — CPython has them); no-GIL thread-safety audit; startup time (jit owns perf).
