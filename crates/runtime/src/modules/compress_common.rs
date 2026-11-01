@@ -24,6 +24,7 @@ pub fn register() {
     reg("_blake2", hashes::init_blake2);
     reg("_hashlib", hashes::init_hashlib);
     reg("_hmac", hashes::init_hmac);
+    reg("_bz2", crate::modules::_bz2::init_module);
 }
 
 /// Object layout: header + pointer to the boxed, mutex-protected Rust state.

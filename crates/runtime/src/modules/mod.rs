@@ -77,6 +77,7 @@ pub mod _json;
 pub mod compress_common;
 pub mod zlib;
 pub mod hashes;
+pub mod _bz2;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
 pub fn register_all() {
