@@ -2484,25 +2484,25 @@ def main():
     """Command-line interface: python -m tarfile ..."""
     import argparse
 
-    description = 'A simple command-line interface for tarfile module.'
+    description = 'List, test, extract or create tar archives.'
     parser = argparse.ArgumentParser(description=description, color=True)
     parser.add_argument('-v', '--verbose', action='store_true', default=False,
-                        help='Verbose output')
+                        help='print what is being done')
     parser.add_argument('--filter', metavar='<filtername>',
                         choices=_NAMED_FILTERS,
-                        help='Filter for extraction')
+                        help='extraction filter: fully_trusted, tar or data')
 
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('-l', '--list', metavar='<tarfile>',
-                       help='Show listing of a tarfile')
+                       help='list the members of an archive')
     group.add_argument('-e', '--extract', nargs='+',
                        metavar=('<tarfile>', '<output_dir>'),
-                       help='Extract tarfile into target dir')
+                       help='extract an archive (into the given directory)')
     group.add_argument('-c', '--create', nargs='+',
                        metavar=('<name>', '<file>'),
-                       help='Create tarfile from sources')
+                       help='create an archive from files and directories')
     group.add_argument('-t', '--test', metavar='<tarfile>',
-                       help='Test if a tarfile is valid')
+                       help='check that an archive can be read')
 
     args = parser.parse_args()
 

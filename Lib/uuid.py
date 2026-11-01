@@ -662,7 +662,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description="Generate a UUID using the selected UUID function.",
+        description="Print newly generated UUIDs.",
         color=True,
     )
     parser.add_argument("-u", "--uuid", choices=generators.keys(),
@@ -681,9 +681,8 @@ def main():
     if args.uuid in named:
         if not (args.namespace and args.name):
             parser.error(
-                "Incorrect number of arguments. "
-                f"{args.uuid} requires a namespace and a name. "
-                "Run 'python -m uuid -h' for more information."
+                "Incorrect number of arguments: "
+                f"{args.uuid} needs both --namespace and --name."
             )
         namespace = namespaces.get(args.namespace)
         if namespace is None:

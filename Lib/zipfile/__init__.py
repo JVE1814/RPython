@@ -1923,21 +1923,21 @@ def main(args=None):
     import argparse
 
     parser = argparse.ArgumentParser(
-        description='A simple command-line interface for zipfile module.',
+        description='List, test, extract or create ZIP archives.',
         color=True)
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument('-l', '--list', metavar='<zipfile>',
-                        help='Show listing of a zipfile')
+                        help='list the members of an archive')
     action.add_argument('-e', '--extract', nargs=2,
                         metavar=('<zipfile>', '<output_dir>'),
-                        help='Extract zipfile into target dir')
+                        help='extract an archive into a directory')
     action.add_argument('-c', '--create', nargs='+',
                         metavar=('<name>', '<file>'),
-                        help='Create zipfile from sources')
+                        help='create an archive from files and directories')
     action.add_argument('-t', '--test', metavar='<zipfile>',
-                        help='Test if a zipfile is valid')
+                        help='check the CRCs of all members')
     parser.add_argument('--metadata-encoding', metavar='<encoding>',
-                        help='Specify encoding of member names for -l, -e and -t')
+                        help='encoding of member names (for -l, -e and -t)')
     opts = parser.parse_args(args)
     encoding = opts.metadata_encoding
 
