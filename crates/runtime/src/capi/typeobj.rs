@@ -42,7 +42,9 @@ pub unsafe extern "C" fn PyType_Ready(tp: *mut PyTypeObject) -> c_int {
         if (*tp).tp_alloc.is_none() {
             (*tp).tp_alloc = Some(generic_alloc);
         }
+        let prev = to::SHARE_BASE_SUBSTRUCTS.with(|c| c.replace(true));
         let r = to::type_ready(tp);
+        to::SHARE_BASE_SUBSTRUCTS.with(|c| c.set(prev));
         if (*tp).tp_flags & Py_TPFLAGS_DISALLOW_INSTANTIATION != 0 {
             (*tp).tp_new = None;
             if !(*tp).tp_dict.is_null() {

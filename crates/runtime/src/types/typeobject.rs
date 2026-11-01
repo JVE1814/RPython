@@ -607,6 +607,12 @@ pub unsafe extern "C" fn subtype_clear(op: *mut PyObject) -> c_int {
 // ---------------------------------------------------------------- readiness
 
 /// Mark a static type as immortal and prepare it (PyType_Ready).
+thread_local! {
+    /// Set while PyType_Ready runs for an extension: static types readied then share their
+    /// base's number/async/sequence/mapping/buffer tables when they have none of their own.
+    pub static SHARE_BASE_SUBSTRUCTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub fn type_ready(tp: *mut PyTypeObject) -> PyResult<()> {
     unsafe {
         if (*tp).tp_flags & Py_TPFLAGS_READY != 0 {
@@ -661,6 +667,28 @@ pub fn type_ready(tp: *mut PyTypeObject) -> PyResult<()> {
         // inheritance
         if !base.is_null() {
             inherit_special(tp, base);
+            if (*tp).tp_flags & Py_TPFLAGS_HEAPTYPE == 0 && SHARE_BASE_SUBSTRUCTS.with(|c| c.get()) {
+                // an extension's static type without its own method tables uses its base's
+                // tables (the same structs), so slots of other MRO entries are not added
+                // (np.str_ keeps str's sq_repeat for `*` rather than numpy's generic multiply)
+                let t = &mut *tp;
+                let b = &*base;
+                if t.tp_as_number.is_null() {
+                    t.tp_as_number = b.tp_as_number;
+                }
+                if t.tp_as_async.is_null() {
+                    t.tp_as_async = b.tp_as_async;
+                }
+                if t.tp_as_sequence.is_null() {
+                    t.tp_as_sequence = b.tp_as_sequence;
+                }
+                if t.tp_as_mapping.is_null() {
+                    t.tp_as_mapping = b.tp_as_mapping;
+                }
+                if t.tp_as_buffer.is_null() {
+                    t.tp_as_buffer = b.tp_as_buffer;
+                }
+            }
         }
         let mro = (*tp).tp_mro;
         for b in tuple::tuple_items(&*mro).iter().skip(1) {
@@ -855,7 +883,18 @@ unsafe fn inherit_slots(tp: *mut PyTypeObject, base: *mut PyTypeObject) {
     unsafe {
         let t = &mut *tp;
         let b = &*base;
-        if !b.tp_as_number.is_null() {
+        // a table shared with tp_base (see type_ready) belongs to the base: never fill it
+        let tb = t.tp_base;
+        let shared = |own: *mut c_void, base_own: Option<*mut c_void>| -> bool {
+            !is_heap_type(tp) && !own.is_null() && base_own == Some(own)
+        };
+        let tbr = if tb.is_null() { None } else { Some(&*tb) };
+        let skip_num = shared(t.tp_as_number as *mut c_void, tbr.map(|x| x.tp_as_number as *mut c_void));
+        let skip_async = shared(t.tp_as_async as *mut c_void, tbr.map(|x| x.tp_as_async as *mut c_void));
+        let skip_seq = shared(t.tp_as_sequence as *mut c_void, tbr.map(|x| x.tp_as_sequence as *mut c_void));
+        let skip_map = shared(t.tp_as_mapping as *mut c_void, tbr.map(|x| x.tp_as_mapping as *mut c_void));
+        let skip_buf = shared(t.tp_as_buffer as *mut c_void, tbr.map(|x| x.tp_as_buffer as *mut c_void));
+        if !b.tp_as_number.is_null() && !skip_num {
             if t.tp_as_number.is_null() {
                 t.tp_as_number = Box::into_raw(Box::new(PyNumberMethods::ZERO));
             }
@@ -897,7 +936,7 @@ unsafe fn inherit_slots(tp: *mut PyTypeObject, base: *mut PyTypeObject) {
             copyslot!(tn, bn, nb_matrix_multiply);
             copyslot!(tn, bn, nb_inplace_matrix_multiply);
         }
-        if !b.tp_as_async.is_null() {
+        if !b.tp_as_async.is_null() && !skip_async {
             if t.tp_as_async.is_null() {
                 t.tp_as_async = Box::into_raw(Box::new(PyAsyncMethods::ZERO));
             }
@@ -908,7 +947,7 @@ unsafe fn inherit_slots(tp: *mut PyTypeObject, base: *mut PyTypeObject) {
             copyslot!(ta, ba, am_anext);
             copyslot!(ta, ba, am_send);
         }
-        if !b.tp_as_sequence.is_null() {
+        if !b.tp_as_sequence.is_null() && !skip_seq {
             if t.tp_as_sequence.is_null() {
                 t.tp_as_sequence = Box::into_raw(Box::new(PySequenceMethods::ZERO));
             }
@@ -923,7 +962,7 @@ unsafe fn inherit_slots(tp: *mut PyTypeObject, base: *mut PyTypeObject) {
             copyslot!(ts, bs, sq_inplace_concat);
             copyslot!(ts, bs, sq_inplace_repeat);
         }
-        if !b.tp_as_mapping.is_null() {
+        if !b.tp_as_mapping.is_null() && !skip_map {
             if t.tp_as_mapping.is_null() {
                 t.tp_as_mapping = Box::into_raw(Box::new(PyMappingMethods::ZERO));
             }
@@ -933,7 +972,7 @@ unsafe fn inherit_slots(tp: *mut PyTypeObject, base: *mut PyTypeObject) {
             copyslot!(tm, bm, mp_subscript);
             copyslot!(tm, bm, mp_ass_subscript);
         }
-        if !b.tp_as_buffer.is_null() {
+        if !b.tp_as_buffer.is_null() && !skip_buf {
             if t.tp_as_buffer.is_null() {
                 t.tp_as_buffer = Box::into_raw(Box::new(PyBufferProcs::ZERO));
             }
