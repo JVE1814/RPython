@@ -298,6 +298,11 @@ class ElementTree:
         try:
             if parser is None:
                 parser = XMLParser()
+                whole = getattr(parser, '_parse_whole', None)
+                if whole is not None:
+                    # the accelerated parser reads the file itself
+                    self._root = whole(source)
+                    return self._root
             while True:
                 data = source.read(65536)
                 if not data:

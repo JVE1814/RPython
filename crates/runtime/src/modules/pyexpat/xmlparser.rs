@@ -11,10 +11,9 @@ use crate::abstract_ as ab;
 use crate::errors::*;
 use crate::ffi::*;
 use crate::modules::compress_common::ExcCell;
-use crate::modules::fncommon::{self as fc, RObj, Trav};
+use crate::modules::fncommon::{self as fc, Trav};
 use crate::object::*;
 use crate::types::{bool_, dict, int, list, none, str as pystr, tuple};
-use crate::raise;
 use std::ffi::{CString, c_int, c_void};
 use std::sync::OnceLock;
 
@@ -860,7 +859,7 @@ unsafe extern "C" fn set_handler(s: *mut PyObject, v: *mut PyObject, closure: *m
 const F_BUFFER_TEXT: usize = 0;
 const F_NS_PREFIXES: usize = 1;
 const F_ORDERED: usize = 2;
-const F_SPECIFIED: usize = 3;
+
 
 unsafe extern "C" fn get_flag(s: *mut PyObject, closure: *mut c_void) -> *mut PyObject {
     unsafe {
