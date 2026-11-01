@@ -540,6 +540,20 @@ pub fn add_operators(tp: *mut PyTypeObject) -> PyResult<()> {
         }
         // only add if this type defines the slot itself (not identical to its base's)
         let base = unsafe { (*tp).tp_base };
+        if is_heap_type(tp) {
+            // inherited from any base along the MRO (multiple inheritance copies
+            // slots from non-primary bases too): the base exposes the wrapper
+            let mro = unsafe { (*tp).tp_mro };
+            if !mro.is_null() {
+                let inherited = crate::types::tuple::tuple_items(unsafe { &*mro })
+                    .iter()
+                    .skip(1)
+                    .any(|b| sd.slot.get(crate::types::typeobject::as_type(b)) == f);
+                if inherited {
+                    continue;
+                }
+            }
+        }
         if !base.is_null() && sd.slot.get(base) == f && !is_heap_type(tp) {
             // inherited: the base's dict already exposes it
             if crate::types::typeobject::lookup(base, &nm).is_some() {

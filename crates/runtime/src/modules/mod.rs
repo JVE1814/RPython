@@ -56,8 +56,12 @@ pub mod _struct;
 pub mod binascii;
 pub mod _random;
 pub mod _imp;
-
 pub mod _weakref;
+pub mod _queue;
+pub mod select;
+pub mod _posixsubprocess;
+pub mod gc_mod;
+pub mod faulthandler;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
 pub fn register_all() {

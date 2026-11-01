@@ -74,6 +74,9 @@ fn fdw_write(o: &PyObject, s: &PyObject) -> PyResult {
     write_fd(fd, text.as_bytes());
     Ok(crate::types::int::new_int(pystr::str_len(s) as i64))
 }
+fn fdw_fileno(o: &PyObject) -> PyResult {
+    Ok(crate::types::int::new_int(unsafe { (*(o.as_ptr() as *const FdWriter)).fd } as i64))
+}
 fn fdw_flush(_o: &PyObject) -> PyResult {
     Ok(none::none_ref())
 }
@@ -124,7 +127,7 @@ pub fn init_bootstrap_types() {
         t.tp_basicsize = std::mem::size_of::<FdWriter>() as isize;
         t.tp_flags = Py_TPFLAGS_DEFAULT;
         t.tp_getattro = Some(crate::types::typeobject::object_generic_getattro);
-        t.tp_methods = crate::mdefs![("write", O, fdw_write), ("flush", NOARGS, fdw_flush)];
+        t.tp_methods = crate::mdefs![("write", O, fdw_write), ("flush", NOARGS, fdw_flush), ("fileno", NOARGS, fdw_fileno)];
         let _ = crate::types::typeobject::type_ready(&raw mut FDWRITER_TYPE);
     }
 }
