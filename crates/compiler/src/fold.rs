@@ -69,7 +69,8 @@ fn strip_docstring(body: &mut Vec<Stmt>) {
     if let Some(first) = body.first() {
         if let StmtKind::Expr { value } = &first.node {
             if let ExprKind::Constant { value: Constant::Str(_), .. } = value.node {
-                let loc = first.loc;
+                let l = first.loc;
+                let loc = Loc::new(l.lineno, l.col_offset, l.lineno, l.col_offset + 4);
                 if body.len() == 1 {
                     body[0] = Stmt::new(StmtKind::Pass, loc);
                 } else {

@@ -364,3 +364,21 @@ fn position_validation() {
     }
     compile(&m, &CompileOptions::new("<t>", Mode::Exec)).unwrap();
 }
+
+#[test]
+fn optimize_ast_docstrings() {
+    use rpy_parser::ast::*;
+    let mut m = parse_src("class A:\n    \"\"\"\n    Docstring\"\"\"\n", Mode::Exec);
+    rpy_compiler::optimize_ast(&mut m, 2, 0).unwrap();
+    if let Mod::Module { body, .. } = &m {
+        if let StmtKind::ClassDef { body, .. } = &body[0].node {
+            assert!(matches!(body[0].node, StmtKind::Pass));
+            assert_eq!(body[0].loc, Loc::new(2, 4, 2, 8));
+        } else {
+            panic!()
+        }
+    }
+    let mut m = parse_src("__debug__\n", Mode::Exec);
+    rpy_compiler::optimize_ast(&mut m, 1, 0).unwrap();
+    assert!(format!("{:?}", m).contains("Bool(false)"));
+}
