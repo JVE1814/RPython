@@ -1,0 +1,11 @@
+[package]
+name = "gencodecs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone generator (not part of the main workspace): turns data/*.map into
+# the single-byte charmap codec modules of Lib/encodings.
+[workspace]
+
+[dependencies]

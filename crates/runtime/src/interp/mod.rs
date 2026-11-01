@@ -3,6 +3,8 @@
 pub mod cache;
 pub mod eval;
 pub mod frame;
+pub mod jit;
+pub mod specialize;
 
 use crate::errors::*;
 use crate::ffi::*;

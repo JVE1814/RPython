@@ -440,7 +440,65 @@ fn int_round(o: &PyObject, args: &[&PyObject]) -> PyResult {
     }
 }
 fn int_sizeof(o: &PyObject) -> PyResult {
-    Ok(new_int((std::mem::size_of::<PyLongObject>() + digits(o).len().saturating_sub(1) * 4) as i64))
+    Ok(new_int(o.ty().tp_basicsize as i64 + 4 * digits(o).len().max(1) as i64))
+}
+
+/// `byteorder` argument of to_bytes/from_bytes: Ok(true) for little-endian.
+fn byteorder_arg(fname: &str, b: Option<&PyObject>) -> PyResult<bool> {
+    match b {
+        None => Ok(false),
+        Some(b) => {
+            if !pystr::is_str(b) {
+                raise!(TypeError, "{}() argument 'byteorder' must be str, not {}", fname, tname(b));
+            }
+            if pystr::str_eq_ascii(b, "little") {
+                Ok(true)
+            } else if pystr::str_eq_ascii(b, "big") {
+                Ok(false)
+            } else {
+                raise!(ValueError, "byteorder must be either 'little' or 'big'");
+            }
+        }
+    }
+}
+
+/// PyObject_Bytes-like conversion used by int.from_bytes.
+fn bytes_of(b: &PyObject) -> PyResult<Vec<u8>> {
+    if crate::types::bytes::is_bytes(b) {
+        return Ok(crate::types::bytes::bytes_data(b).to_vec());
+    }
+    if let Some(f) = ab::lookup_special(b, crate::name!("__bytes__"))? {
+        let r = ab::call0(&f)?;
+        if !crate::types::bytes::is_bytes(&r) {
+            raise!(TypeError, "__bytes__ returned non-bytes (type {})", tname(&r));
+        }
+        return Ok(crate::types::bytes::bytes_data(&r).to_vec());
+    }
+    if let Some(d) = crate::types::bytes::bytes_like_data(b) {
+        return Ok(d);
+    }
+    if pystr::is_str(b) || is_int(b) {
+        raise!(TypeError, "cannot convert '{}' object to bytes", tname(b));
+    }
+    let it = match ab::get_iter(b) {
+        Ok(it) => it,
+        Err(_) => {
+            if exc_matches(crate::types::exceptions::TypeError()) {
+                clear_exc();
+                raise!(TypeError, "cannot convert '{}' object to bytes", tname(b));
+            }
+            return Err(PyErr);
+        }
+    };
+    let mut out = Vec::new();
+    while let Some(x) = ab::iter_next(&it)? {
+        let n = ab::index(&x)?;
+        match as_i64(&n) {
+            Some(v) if (0..256).contains(&v) => out.push(v as u8),
+            _ => raise!(ValueError, "bytes must be in range(0, 256)"),
+        }
+    }
+    Ok(out)
 }
 fn int_format(o: &PyObject, spec: &PyObject) -> PyResult {
     crate::types::format_impl::format_int(o, spec)
@@ -455,14 +513,7 @@ fn int_to_bytes(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRe
     if length < 0 {
         raise!(ValueError, "length argument must be non-negative");
     }
-    let little = match byteorder {
-        None => false,
-        Some(b) => match pystr::to_string_lossy(b).as_str() {
-            "little" => true,
-            "big" => false,
-            _ => raise!(ValueError, "byteorder must be either 'little' or 'big'"),
-        },
-    };
+    let little = byteorder_arg("to_bytes", byteorder)?;
     let signed = match signed {
         Some(s) => ab::is_true(s)?,
         None => false,
@@ -476,29 +527,8 @@ fn int_from_bytes(cls: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> 
     static P: crate::args::Params = crate::args::Params::new("from_bytes", &["bytes", "byteorder", "signed"], 0, 1).kwonly(1);
     let [b, byteorder, signed] = crate::args::parse::<3>(&P, args, kw)?;
     let b = b.unwrap();
-    let data = match crate::types::bytes::bytes_like_data(b) {
-        Some(d) => d,
-        None => {
-            let v = ab::collect_iterable(b)?;
-            let mut out = Vec::with_capacity(v.len());
-            for x in v {
-                let n = ab::as_i64(&x)?;
-                if !(0..256).contains(&n) {
-                    raise!(ValueError, "bytes must be in range(0, 256)");
-                }
-                out.push(n as u8);
-            }
-            out
-        }
-    };
-    let little = match byteorder {
-        None => false,
-        Some(b) => match pystr::to_string_lossy(b).as_str() {
-            "little" => true,
-            "big" => false,
-            _ => raise!(ValueError, "byteorder must be either 'little' or 'big'"),
-        },
-    };
+    let data = bytes_of(b)?;
+    let little = byteorder_arg("from_bytes", byteorder)?;
     let signed = match signed {
         Some(s) => ab::is_true(s)?,
         None => false,
