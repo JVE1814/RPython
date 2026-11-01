@@ -106,3 +106,10 @@ the fast path. Objects > 2 KiB use the system allocator and are marked with ob_g
 Frames are pooled per thread. fib(20): 48.2M -> 42.4M instructions (CPython: 51.1M total
 including its 39.6M startup; i.e. per-call work is still ~3x CPython's — the JIT tiers and
 inline caches are the planned fix).
+
+## D18 — C-variadic C-API functions
+The C API has variadic entry points (PyArg_ParseTuple*, Py_BuildValue, PyErr_Format,
+PyUnicode_FromFormat, PyObject_CallFunction*, ...). Stable Rust 1.97 cannot define C-variadic
+functions; we enable the unstable `c_variadic` feature on the stable toolchain via
+`RUSTC_BOOTSTRAP=1` (.cargo/config.toml [env]) rather than switching to nightly or writing
+assembly trampolines. Verified: a Rust `extern "C" fn f(n: i32, mut args: ...)` called from C.
