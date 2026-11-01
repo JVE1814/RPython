@@ -1067,7 +1067,12 @@ unsafe extern "C" fn slot_tp_hash(s: *mut PyObject) -> Py_hash_t {
             let _ = err!(TypeError, "__hash__ method should return an integer");
             return -1;
         }
-        let h = int::int_hash(&r);
+        // a result that fits in Py_hash_t is used as is; only larger ints are
+        // reduced with the int hash
+        let h = match int::as_i64(&r) {
+            Some(v) => v as Py_hash_t,
+            None => int::int_hash(&r),
+        };
         if h == -1 { -2 } else { h }
     }
 }
@@ -1294,30 +1299,43 @@ fn method_is_overloaded(left: *mut PyTypeObject, right: *mut PyTypeObject, nm: &
 
 /// Generic binary slot (SLOT1BINFULL).
 fn binary_slot(s: &PyObject, o: &PyObject, slot: Slot, dunder: &PyObject, rdunder: &PyObject) -> PyResult {
+    binary_slot_ex(s, o, slot, dunder, rdunder, None)
+}
+
+fn args<'a>(x: &'a PyObject, e: Option<&'a PyObject>) -> Vec<&'a PyObject> {
+    match e {
+        Some(m) => vec![x, m],
+        None => vec![x],
+    }
+}
+
+/// Binary-operator dispatch; `extra` is the modulus of three-argument pow (3.14+ also tries
+/// the reflected method for it).
+fn binary_slot_ex(s: &PyObject, o: &PyObject, slot: Slot, dunder: &PyObject, rdunder: &PyObject, extra: Option<&PyObject>) -> PyResult {
     let generic = slot.generic();
     let st = s.type_ptr();
     let ot = o.type_ptr();
     let do_other = st != ot && slot.get(ot) == generic;
     if slot.get(st) == generic {
         if do_other && is_subtype(ot, st) && method_is_overloaded(st, ot, rdunder) {
-            if let Some(r) = call_special(o, rdunder, &[s])? {
+            if let Some(r) = call_special(o, rdunder, &args(s, extra))? {
                 if !r.is(none::not_implemented()) {
                     return Ok(r);
                 }
             }
-            return match call_special(s, dunder, &[o])? {
+            return match call_special(s, dunder, &args(o, extra))? {
                 Some(r) => Ok(r),
                 None => Ok(none::not_implemented().to_ref()),
             };
         }
-        if let Some(r) = call_special(s, dunder, &[o])? {
+        if let Some(r) = call_special(s, dunder, &args(o, extra))? {
             if !r.is(none::not_implemented()) || st == ot {
                 return Ok(r);
             }
         }
     }
     if do_other {
-        if let Some(r) = call_special(o, rdunder, &[s])? {
+        if let Some(r) = call_special(o, rdunder, &args(s, extra))? {
             return Ok(r);
         }
     }
@@ -1352,15 +1370,8 @@ unsafe extern "C" fn slot_nb_power(s: *mut PyObject, o: *mut PyObject, m: *mut P
         if m.is_null() || (*m).is(none::none()) {
             return into_c(binary_slot(s, o, Slot::NbPower, name!("__pow__"), name!("__rpow__")));
         }
-        // three-argument pow only dispatches to the left operand
-        if Slot::NbPower.get(s.type_ptr()) == Slot::NbPower.generic() {
-            return match call_special(s, name!("__pow__"), &[o, &*m]) {
-                Ok(Some(r)) => r.into_raw(),
-                Ok(None) => none::not_implemented().to_ref().into_raw(),
-                Err(_) => std::ptr::null_mut(),
-            };
-        }
-        none::not_implemented().to_ref().into_raw()
+        // three-argument pow: since 3.14 the reflected __rpow__ is tried too
+        into_c(binary_slot_ex(s, o, Slot::NbPower, name!("__pow__"), name!("__rpow__"), Some(&*m)))
     }
 }
 
