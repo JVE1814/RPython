@@ -45,6 +45,16 @@ fn main() {
         }
     }
     let pt = t0.elapsed().as_secs_f64() / iters as f64;
+    let cpu1 = cpu_seconds();
+    let t1 = std::time::Instant::now();
+    for _ in 0..iters {
+        for f in &files {
+            let _ = parse(f, &opts).result.is_ok();
+        }
+    }
+    let wall = t1.elapsed().as_secs_f64() / iters as f64;
+    let cpu = (cpu_seconds() - cpu1) / iters as f64;
+    println!("parse (cpu time) {:.1} MB/s; wall {:.1} MB/s", bytes as f64 / 1e6 / cpu, bytes as f64 / 1e6 / wall);
     println!(
         "{} files ({} ok), {:.1} MB: tokenize {:.1} MB/s, parse {:.1} MB/s ({:.0} ms per pass)",
         files.len(),
@@ -54,4 +64,14 @@ fn main() {
         bytes as f64 / 1e6 / pt,
         pt * 1000.0
     );
+}
+
+/// user+system CPU seconds of this process (Linux /proc).
+fn cpu_seconds() -> f64 {
+    let s = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let rest = s.rsplit(')').next().unwrap_or("");
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    let ut: f64 = f.get(11).and_then(|x| x.parse().ok()).unwrap_or(0.0);
+    let st: f64 = f.get(12).and_then(|x| x.parse().ok()).unwrap_or(0.0);
+    (ut + st) / 100.0
 }
