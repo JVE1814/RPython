@@ -60,10 +60,13 @@ Owner of: `crates/parser` (bug fixes), `crates/compiler` (after the compiler aut
 * `types/int_methods.rs`: "Exceeds the limit (N digits)" messages.
 * `interp/eval.rs`: `lazy import` executed with locals != globals raises SyntaxError.
 
-## Test status (debug build, local stubs for missing pathlib/unittest.mock)
-test_ast 216/220 (4 failures are runtime issues, see below), test_unparse 81/81,
-test_type_comments 18/18 (1 skip), test_codeop 13/13, test_symtable 42/42,
-test_type_params 109 (only pickling/weakref runtime failures).
+## Test status (`python -m test`, release build, after merging master)
+test_ast 217/220 (3 runtime issues below), test_unparse 81/81, test_tokenize 132/132,
+test_symtable 42/42, test_codeop 13/13, test_type_comments 18/18 (1 skip), test_grammar 75/75,
+test_type_params: only pickling/weakref (runtime) failures, test_syntax 85/109 (the 24 failures are
+the "Did you mean 'X'?" keyword-typo hints, which belong to Lib/traceback.py),
+test_future_stmt 30/31 (REPL `-i` future persistence, pymain).  test_fstring/test_patma could not
+be imported yet (datetime/array missing).
 
 ## Known gaps / bugs
 * `b''` constants are not the empty-bytes singleton (bytes workstream).

@@ -298,3 +298,7 @@ parsing) takes ~3 s in release mode.
   (`can_see_class_scope` propagates from the type-parameter block).
 * A leading expression statement that only folds to a string is not a docstring.
 * Class docstrings are kept in 'single' (interactive) mode.
+* CO_MAXBLOCKS-style "too many statically nested blocks" limit; long displays/calls are
+  built incrementally (bounded stack size); `a and b or c` tests each operand once;
+  assert failures are located at the test expression; relative `from .__future__` is a
+  plain import; "is" literal warning for constant tuple displays.
