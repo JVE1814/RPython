@@ -31,12 +31,16 @@ struct Folder<'w> {
     depth: u32,
     max_depth: u32,
     ctx: Vec<Ctx>,
+    /// `from __future__ import annotations`: annotations are unparsed later and must keep
+    /// their source form (no folding).
+    string_annotations: bool,
 }
 
 type R = Result<(), CompileError>;
 
-pub fn fold_module(m: &mut Mod, optimize: i32, _future: u32, warnings: &mut Vec<Warning>, max_depth: u32) -> R {
-    let mut f = Folder { optimize, full: true, warnings: Some(warnings), depth: 0, max_depth, ctx: Vec::new() };
+pub fn fold_module(m: &mut Mod, optimize: i32, future: u32, warnings: &mut Vec<Warning>, max_depth: u32) -> R {
+    let string_annotations = future & crate::cf::CO_FUTURE_ANNOTATIONS != 0;
+    let mut f = Folder { optimize, full: true, warnings: Some(warnings), depth: 0, max_depth, ctx: Vec::new(), string_annotations };
     f.fold_mod(m)
 }
 
@@ -44,7 +48,7 @@ pub fn optimize_ast(m: &mut Mod, optimize: i32, _flags: u32) -> R {
     if optimize <= 0 {
         return Ok(());
     }
-    let mut f = Folder { optimize, full: false, warnings: None, depth: 0, max_depth: crate::DEFAULT_MAX_DEPTH, ctx: Vec::new() };
+    let mut f = Folder { optimize, full: false, warnings: None, depth: 0, max_depth: crate::DEFAULT_MAX_DEPTH, ctx: Vec::new(), string_annotations: false };
     f.fold_mod(m)?;
     if optimize >= 2 {
         strip_docstrings_mod(m);
@@ -553,6 +557,18 @@ impl<'w> Folder<'w> {
         r
     }
 
+    fn fold_annotation(&mut self, e: &mut Expr) -> R {
+        if self.string_annotations {
+            let full = self.full;
+            self.full = false;
+            let r = self.fold_expr(e);
+            self.full = full;
+            r
+        } else {
+            self.fold_expr(e)
+        }
+    }
+
     fn fold_args(&mut self, a: &mut Arguments) -> R {
         for d in a.defaults.iter_mut() {
             self.fold_expr(d)?;
@@ -562,12 +578,12 @@ impl<'w> Folder<'w> {
         }
         for arg in a.posonlyargs.iter_mut().chain(a.args.iter_mut()).chain(a.kwonlyargs.iter_mut()) {
             if let Some(ann) = &mut arg.annotation {
-                self.fold_expr(ann)?;
+                self.fold_annotation(ann)?;
             }
         }
         for arg in a.vararg.iter_mut().chain(a.kwarg.iter_mut()) {
             if let Some(ann) = &mut arg.annotation {
-                self.fold_expr(ann)?;
+                self.fold_annotation(ann)?;
             }
         }
         Ok(())
@@ -634,7 +650,7 @@ impl<'w> Folder<'w> {
                 self.fold_type_params(&mut f.type_params)?;
                 self.fold_args(&mut f.args)?;
                 if let Some(r) = &mut f.returns {
-                    self.fold_expr(r)?;
+                    self.fold_annotation(r)?;
                 }
                 self.fold_function_body(&mut f.body)?;
             }
@@ -681,7 +697,7 @@ impl<'w> Folder<'w> {
             }
             StmtKind::AnnAssign { target, annotation, value, .. } => {
                 self.fold_expr(target)?;
-                self.fold_expr(annotation)?;
+                self.fold_annotation(annotation)?;
                 if let Some(v) = value {
                     self.fold_expr(v)?;
                 }
