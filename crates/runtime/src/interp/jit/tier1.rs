@@ -119,15 +119,9 @@ struct Layout {
 fn layout() -> &'static Layout {
     static L: std::sync::OnceLock<Layout> = std::sync::OnceLock::new();
     L.get_or_init(|| {
-        let mut v: Vec<u64> = Vec::with_capacity(7);
-        v.extend_from_slice(&[1, 2, 3]);
-        let w: [usize; 3] = unsafe { std::mem::transmute_copy(&v) };
-        let pi = w.iter().position(|&x| x == v.as_ptr() as usize).unwrap();
-        let li = w.iter().position(|&x| x == 3).unwrap();
-        let eo = offset_of!(crate::types::dict::DictTable, entries) as i32;
         Layout {
-            entries_ptr: eo + 8 * pi as i32,
-            entries_len: eo + 8 * li as i32,
+            entries_ptr: offset_of!(crate::types::dict::DictTable, entries_p) as i32,
+            entries_len: offset_of!(crate::types::dict::DictTable, nentries) as i32,
             version: offset_of!(crate::types::dict::DictTable, version) as i32,
             entry_size: std::mem::size_of::<crate::types::dict::Entry>() as i32,
             entry_key: offset_of!(crate::types::dict::Entry, key) as i32,
