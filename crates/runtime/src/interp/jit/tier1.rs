@@ -689,11 +689,13 @@ impl<'a> Gen<'a> {
     fn attr_op(&mut self, ins: &Instr, d: i32, hf: usize, errd: i32) {
         use crate::interp::cache::kind;
         let pc = ins.pc as usize;
-        let e = self.tables.entry(pc);
-        let ep = e as *const _ as i64;
+        let es = self.tables.poly(pc);
+        let ep = es.as_ptr() as i64;
         let name = self.cd.names[ins.arg as usize].as_ptr() as i64;
-        let slow = self.a.label();
         let done = self.a.label();
+        // one guarded case per filled entry (polymorphic inline cache), then the helper
+        for e in es {
+        let slow = self.a.label();
         let snap = e.read();
         let mut inline = false;
         if let Some(s) = snap {
@@ -752,7 +754,7 @@ impl<'a> Gen<'a> {
                     self.a.mov_ri(Rcx, crate::types::module::module_type() as i64);
                     self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
                     self.a.jcc(Cc::NE, slow);
-                    self.a.mov_ri(Rcx, ep);
+                    self.a.mov_ri(Rcx, e as *const _ as i64);
                     self.a.load32(R8, M(Rcx, E_SEQ));
                     self.a.test_rr(R8, R8); // (low bit tested below)
                     self.a.mov_rr(R9, R8);
@@ -838,6 +840,7 @@ impl<'a> Gen<'a> {
             self.a.jmp(done);
         }
         self.a.bind(slow);
+        }
         self.helper_sp(ins, d, hf, Some(name), Some(ep), errd);
         self.a.bind(done);
     }

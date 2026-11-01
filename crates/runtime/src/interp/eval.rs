@@ -882,19 +882,19 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                         }
                         Op::LoadAttr => {
                             let o = popref!(f);
-                            let v = super::specialize::load_attr(&o, &cd.names[arg as usize], caches.entry(f.lasti as usize))?;
+                            let v = super::specialize::load_attr(&o, &cd.names[arg as usize], caches.poly(f.lasti as usize))?;
                             push!(f, v.into_raw());
                         }
                         Op::LoadMethod => {
                             let o = popref!(f);
-                            let (m, s) = super::specialize::load_method(&o, &cd.names[arg as usize], caches.entry(f.lasti as usize))?;
+                            let (m, s) = super::specialize::load_method(&o, &cd.names[arg as usize], caches.poly(f.lasti as usize))?;
                             push!(f, m.into_raw());
                             push!(f, s.map_or(std::ptr::null_mut(), |s| s.into_raw()));
                         }
                         Op::StoreAttr => {
                             let o = popref!(f);
                             let v = popref!(f);
-                            super::specialize::store_attr(&o, &cd.names[arg as usize], &v, caches.entry(f.lasti as usize))?;
+                            super::specialize::store_attr(&o, &cd.names[arg as usize], &v, caches.poly(f.lasti as usize))?;
                         }
                         Op::DeleteAttr => {
                             let o = popref!(f);
