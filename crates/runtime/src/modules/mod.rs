@@ -21,6 +21,12 @@ pub mod errno;
 pub mod posix;
 pub mod stat_mod;
 pub mod time;
+pub mod fncommon;
+pub mod functional;
+pub mod _operator;
+pub mod _functools;
+pub mod _abc;
+pub mod itertools;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
 pub fn register_all() {
@@ -28,4 +34,5 @@ pub fn register_all() {
     crate::import::register_builtin("errno", errno::init);
     crate::import::register_builtin("_stat", stat_mod::init);
     crate::import::register_builtin("time", time::init);
+    functional::register();
 }
