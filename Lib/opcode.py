@@ -1,7 +1,6 @@
 
-"""
-opcode module - potentially shared between dis and other modules which
-operate on bytecodes (e.g. peephole optimizers).
+"""Tables describing the interpreter's instruction set (names, numbers and
+argument kinds), for dis and other bytecode tools.
 
 This implementation's bytecode is its own (not CPython's): every instruction
 is one 32-bit little-endian word, the low 8 bits being the opcode and the
