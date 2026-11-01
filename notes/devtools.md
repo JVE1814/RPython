@@ -78,6 +78,8 @@ All Python files listed above are my own structure/wording; dis.py, site.py and 
 - slice objects: `==` not implemented (containers).
 - compile(): "unknown encoding: U7" (utf-7 coding cookie) — text/compiler.
 - os imports warnings eagerly (test_site.test_lazy_imports).
+- site is imported at start-up (sys_full::post_init) before sys.stderr is usable: output of
+  .pth import lines run during start-up is lost (test_site *_already_on_path tests).
 - Missing modules blocking spec tests: unittest.mock, array, urllib, multiprocessing,
   _testmultiphase (test_importlib.util), optparse.
 - pickle has no _pickle accelerator, so pickle.Pickler is the Python class
