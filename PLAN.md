@@ -67,5 +67,9 @@ Finished also: data, markup (XML engine from scratch, email 1803/1814), cleanroo
 Running (wave 7): jit2 (tier-2 optimizing JIT, deopt, tier-1 gaps), perf-runtime (inline attribute shapes,
 call path, memory, safe reclamation D6, multi-core scaling, startup).
 Finished also: jit (tier-0 caches, tier-1 baseline JIT, generational GC, startup 135M->45M).
+Running (wave 8): stability (crashes, races, heap corruption, hangs; ASAN/TSAN).
+Finished also: bindings (_ctypes/_sqlite3/_ssl via dlopen; crates/bindings), parallel (concurrent.futures,
+multiprocessing, fork safety).
 Unassigned: _testclinic re-implemented by us (spec lacks
-internal headers / generated clinic files); no-GIL thread-safety audit; startup time (jit owns perf).
+internal headers / generated clinic files); subinterpreters (_interpreters/_interpqueues/_interpchannels,
+concurrent.interpreters, InterpreterPoolExecutor — CPython has them); no-GIL thread-safety audit; startup time (jit owns perf).
