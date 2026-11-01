@@ -46,12 +46,11 @@ Files: `crates/runtime/src/modules/_decimal/` (Rust `_decimal`), `Lib/decimal.py
 
 ## Status
 * `python -m test -u decimal test_decimal`: 663 tests, all IBM decTest files pass for both
-  the C and the Py variant; remaining 2 problems are runtime bugs outside this workstream:
+  the C and the Py variant; the one remaining error is a runtime bug outside this workstream:
   - three-argument `pow(10, Decimal(2), 7)` (Py variant): the slot wrapper for Python
     classes does not pass the modulus to `__rpow__` (3.14+ behaviour).
-  - `check_disallow_instantiation(ContextManager)`: `tp_new_wrapper`'s "not safe" check
-    runs before the Py_TPFLAGS_DISALLOW_INSTANTIATION check, so the message differs.
-  (Running needed temporary stubs for `py_compile`/`doctest`, which are not in Lib yet.)
+  (Running needs a temporary `doctest` stub until doctest lands in Lib; with the stub the
+  doctest part of test_decimal is empty — our docstrings contain no examples.)
 * Benchmarks (pyperformance, our build): decimal_pi 1.4 s, decimal_factorial 0.8 s, telco
   0.045 s.  Both baselines in /opt/baseline were built without libmpdec (they fall back to
   _pydecimal: decimal_pi 19-20 s, telco 0.34 s, decimal_factorial fails on the int-str limit).
