@@ -236,8 +236,8 @@ pub unsafe extern "C" fn PyDict_Next(o: *mut PyObject, pos: *mut Py_ssize_t, key
         }
         let t = dict::table(&*o);
         let mut i = (*pos).max(0) as usize;
-        while i < t.entries.len() {
-            let e = t.entries[i];
+        while i < t.entries().len() {
+            let e = t.entries()[i];
             i += 1;
             if !e.key.is_null() {
                 *pos = i as Py_ssize_t;

@@ -959,7 +959,7 @@ pub fn init_module() -> PyResult {
     }
     let m = crate::types::module::new_module("_datetime")?;
     let d = crate::types::module::module_dict(&m);
-    dict::set_item_str(&d, "__doc__", &pystr::new_str("Fast implementation of the datetime module."))?;
+    dict::set_item_str(&d, "__doc__", &pystr::new_str("Native date and time types behind the datetime module."))?;
     for (name, tp) in [
         ("date", date_type()),
         ("datetime", datetime_type()),
