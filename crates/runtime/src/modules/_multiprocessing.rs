@@ -232,8 +232,9 @@ fn semlock_acquire(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> P
     if !wait_sem(s.handle, timeout)? {
         return Ok(bool_::new_bool(false));
     }
-    s.count.fetch_add(1, AcqRel);
+    // owner first: another thread must never see count > 0 with a stale owner
     s.last_tid.store(me(), Release);
+    s.count.fetch_add(1, AcqRel);
     Ok(bool_::new_bool(true))
 }
 
@@ -256,12 +257,15 @@ fn semlock_release(o: &PyObject) -> PyResult {
             raise!(ValueError, "semaphore or lock released too many times");
         }
     }
+    // Drop our acquisition before posting: once posted, another thread of
+    // this process may acquire (and count) immediately.
+    let dropped = s.count.fetch_update(AcqRel, Acquire, |c| if c > 0 { Some(c - 1) } else { None }).is_ok();
     if unsafe { libc::sem_post(s.handle) } < 0 {
-        return Err(os_err(errno()));
-    }
-    let c = s.count.load(Acquire);
-    if c > 0 {
-        s.count.store(c - 1, Release);
+        let e = errno();
+        if dropped {
+            s.count.fetch_add(1, AcqRel);
+        }
+        return Err(os_err(e));
     }
     Ok(none::none_ref())
 }
