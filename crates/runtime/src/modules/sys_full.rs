@@ -996,10 +996,12 @@ pub fn make_version_info() -> PyResult {
 pub fn register_system_modules() {
     crate::import::register_builtin("_thread", crate::modules::_thread::init_module);
     crate::import::register_builtin("_signal", crate::modules::signal::init_module);
+    crate::import::register_builtin("_imp", crate::modules::_imp::init_module);
 }
 
 /// Late initialisation (after sys and builtins exist).
 pub fn post_init() -> PyResult<()> {
+    crate::import::install_importlib(&stdlib_dir())?;
     Ok(())
 }
 
