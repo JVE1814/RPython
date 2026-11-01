@@ -142,7 +142,19 @@ pub fn isinstance_exact_or_sub(o: &PyObject, tp: *mut PyTypeObject) -> bool {
 }
 
 /// Look up `name` along the MRO (no descriptors invoked). `name` must be a str.
+/// Results are memoised in the global method cache keyed on the type version tag
+/// (jit workstream, interp/cache.rs).
 pub fn lookup(tp: *mut PyTypeObject, name: &PyObject) -> Option<PyRef> {
+    if let Some(r) = crate::interp::cache::mc_lookup(tp, name) {
+        return r;
+    }
+    let tag = crate::interp::cache::assign_type_tag(tp);
+    let r = lookup_uncached(tp, name);
+    crate::interp::cache::mc_store(tag, name, r.as_deref());
+    r
+}
+
+fn lookup_uncached(tp: *mut PyTypeObject, name: &PyObject) -> Option<PyRef> {
     unsafe {
         let mro = (*tp).tp_mro;
         if mro.is_null() {
@@ -255,7 +267,7 @@ pub fn attribute_error_for(o: &PyObject, name: &PyObject) -> PyErr {
     let msg = if is_type(o) {
         format!(
             "type object '{}' has no attribute '{}'",
-            type_name(unsafe { &*as_type(o) }),
+            unsafe { CStr::from_ptr((*as_type(o)).tp_name).to_string_lossy() },
             pystr::to_string_lossy(name)
         )
     } else {
@@ -630,6 +642,7 @@ pub fn type_ready(tp: *mut PyTypeObject) -> PyResult<()> {
             add_subclass(as_type(b), tp);
         }
         (*tp).tp_flags = ((*tp).tp_flags & !Py_TPFLAGS_READYING) | Py_TPFLAGS_READY;
+        crate::interp::cache::watch_type_dict(tp); // jit: dict writes invalidate caches
         Ok(())
     }
 }
@@ -682,7 +695,8 @@ unsafe fn add_methods(tp: *mut PyTypeObject) -> PyResult<()> {
             let descr = if (*m).ml_flags & METH_CLASS != 0 {
                 crate::types::descr::new_classmethod_descr(tp, m)
             } else if (*m).ml_flags & METH_STATIC != 0 {
-                let f = crate::types::cfunction::new_cfunction(m, None, None);
+                let owner = if is_heap_type(tp) { None } else { Some(type_ref(tp)) };
+                let f = crate::types::cfunction::new_cfunction(m, owner, None);
                 crate::types::funcobject::new_staticmethod(f)
             } else {
                 crate::types::descr::new_method_descr(tp, m)

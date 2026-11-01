@@ -13,6 +13,8 @@ pub struct FileIO {
     pub readable: bool,
     pub writable: bool,
     pub appending: bool,
+    /// opened with 'w' (truncating): reported as "wb"/"wb+"
+    pub truncating: bool,
     /// -1 unknown, 0 no, 1 yes
     pub seekable: i8,
     pub closefd: bool,
@@ -88,9 +90,9 @@ fn internal_close(f: &mut FileIO) -> PyResult<()> {
     Ok(())
 }
 
-fn parse_mode(mode: &str) -> PyResult<(bool, bool, bool, bool, bool)> {
-    // (created, readable, writable, appending, plus)
-    let (mut c, mut r, mut w, mut a, mut plus) = (false, false, false, false, false);
+fn parse_mode(mode: &str) -> PyResult<(bool, bool, bool, bool, bool, bool)> {
+    // (created, readable, writable, appending, plus, truncating)
+    let (mut c, mut r, mut w, mut a, mut plus, mut t) = (false, false, false, false, false, false);
     let mut rwa = false;
     let bad = || err!(ValueError, "Must have exactly one of create/read/write/append mode and at most one plus");
     for ch in mode.chars() {
@@ -106,7 +108,10 @@ fn parse_mode(mode: &str) -> PyResult<(bool, bool, bool, bool, bool)> {
                         w = true;
                     }
                     'r' => r = true,
-                    'w' => w = true,
+                    'w' => {
+                        w = true;
+                        t = true;
+                    }
                     _ => {
                         a = true;
                         w = true;
@@ -128,7 +133,7 @@ fn parse_mode(mode: &str) -> PyResult<(bool, bool, bool, bool, bool)> {
     if !rwa {
         return Err(bad());
     }
-    Ok((c, r, w, a, plus))
+    Ok((c, r, w, a, plus, t))
 }
 
 fn fileio_init_impl(o: &PyObject, file: &PyObject, mode: &str, closefd: bool, opener: Option<&PyObject>) -> PyResult<()> {
@@ -170,7 +175,7 @@ fn fileio_init_impl(o: &PyObject, file: &PyObject, mode: &str, closefd: bool, op
         }
         path = Some(std::ffi::CString::new(b).unwrap());
     }
-    let (created, readable, writable, appending, plus) = parse_mode(mode)?;
+    let (created, readable, writable, appending, plus, truncating) = parse_mode(mode)?;
     let mut flags = if readable && writable {
         libc::O_RDWR
     } else if readable {
@@ -182,7 +187,7 @@ fn fileio_init_impl(o: &PyObject, file: &PyObject, mode: &str, closefd: bool, op
         flags |= libc::O_EXCL | libc::O_CREAT;
     } else if appending {
         flags |= libc::O_APPEND | libc::O_CREAT;
-    } else if writable && !plus {
+    } else if truncating {
         flags |= libc::O_TRUNC | libc::O_CREAT;
     }
     let _ = plus;
@@ -191,6 +196,7 @@ fn fileio_init_impl(o: &PyObject, file: &PyObject, mode: &str, closefd: bool, op
     f.readable = readable;
     f.writable = writable;
     f.appending = appending;
+    f.truncating = truncating;
     f.seekable = -1;
     f.blksize = 0;
     let fd_is_own;
@@ -586,6 +592,8 @@ pub fn mode_string(f: &FileIO) -> &'static str {
         if f.readable { "xb+" } else { "xb" }
     } else if f.appending {
         if f.readable { "ab+" } else { "ab" }
+    } else if f.truncating {
+        if f.readable { "wb+" } else { "wb" }
     } else if f.readable {
         if f.writable { "rb+" } else { "rb" }
     } else {

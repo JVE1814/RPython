@@ -90,7 +90,10 @@ unsafe extern "C" fn cfunction_vectorcall(
         let all: &[*mut PyObject] = if nargs + nkw == 0 { &[] } else { std::slice::from_raw_parts(args, nargs + nkw) };
         let cls = if (*f).is_type(cmethod_type()) { (*(f as *mut PyCMethodObject)).mm_class } else { std::ptr::null_mut() };
         let fo = &*f;
-        into_c(crate::methods::call_methoddef((*ff).m_ml, (*ff).m_self, cls, all, kwnames, &|| cfunction_qualname(fo)))
+        // Static methods of builtin types keep their type as __self__ (for
+        // __qualname__ and pickling) but are called without a self.
+        let slf = if (*(*ff).m_ml).ml_flags & METH_STATIC != 0 && !(*ff).m_self.is_null() && is_type(&*(*ff).m_self) { std::ptr::null_mut() } else { (*ff).m_self };
+        into_c(crate::methods::call_methoddef((*ff).m_ml, slf, cls, all, kwnames, &|| cfunction_qualname(fo)))
     }
 }
 

@@ -575,6 +575,7 @@ struct StrIter {
     s: *mut PyObject,
 }
 static mut STR_ASCII_ITER_TYPE: PyTypeObject = PyTypeObject::ZERO;
+#[unsafe(export_name = "PyUnicodeIter_Type")]
 static mut STR_ITER_TYPE: PyTypeObject = PyTypeObject::ZERO;
 
 unsafe extern "C" fn str_iter(o: *mut PyObject) -> *mut PyObject {

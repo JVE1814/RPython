@@ -20,6 +20,9 @@ unsafe fn name_obj(s: *const c_char) -> PyResult {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_GetAttr(o: *mut PyObject, n: *mut PyObject) -> *mut PyObject {
     unsafe {
+        if o.is_null() || n.is_null() {
+            return null_arg();
+        }
         if !pystr::is_str(&*n) {
             let _ = type_error(&format!("attribute name must be string, not '{}'", tname(&*n)));
             return std::ptr::null_mut();
@@ -30,6 +33,9 @@ pub unsafe extern "C" fn PyObject_GetAttr(o: *mut PyObject, n: *mut PyObject) ->
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_GetAttrString(o: *mut PyObject, n: *const c_char) -> *mut PyObject {
     unsafe {
+        if o.is_null() || n.is_null() {
+            return null_arg();
+        }
         match name_obj(n) {
             Ok(nm) => ret(ab::getattr(&*o, &nm)),
             Err(_) => std::ptr::null_mut(),
@@ -110,11 +116,15 @@ fn write_unraisable_attr(what: &str) {
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_SetAttr(o: *mut PyObject, n: *mut PyObject, v: *mut PyObject) -> c_int {
-    unsafe { ret_i(ab::setattr_opt(&*o, &*n, opt(v))) }
+    unsafe { if o.is_null() || n.is_null() { null_arg(); return -1; } ret_i(ab::setattr_opt(&*o, &*n, opt(v))) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_SetAttrString(o: *mut PyObject, n: *const c_char, v: *mut PyObject) -> c_int {
     unsafe {
+        if o.is_null() || n.is_null() {
+            null_arg();
+            return -1;
+        }
         match name_obj(n) {
             Ok(nm) => ret_i(ab::setattr_opt(&*o, &nm, opt(v))),
             Err(_) => -1,
@@ -399,6 +409,9 @@ pub unsafe extern "C" fn PyObject_Type(o: *mut PyObject) -> *mut PyObject {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_Format(o: *mut PyObject, spec: *mut PyObject) -> *mut PyObject {
     unsafe {
+        if o.is_null() {
+            return null_arg();
+        }
         let s = if spec.is_null() { pystr::new_str("") } else { (*spec).to_ref() };
         ret(ab::format(&*o, &s))
     }
@@ -418,11 +431,11 @@ pub unsafe extern "C" fn PyObject_Dir(o: *mut PyObject) -> *mut PyObject {
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_IsInstance(inst: *mut PyObject, cls: *mut PyObject) -> c_int {
-    unsafe { ret_b(ab::isinstance(&*inst, &*cls)) }
+    unsafe { if inst.is_null() || cls.is_null() { null_arg(); return -1; } ret_b(ab::isinstance(&*inst, &*cls)) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_IsSubclass(d: *mut PyObject, cls: *mut PyObject) -> c_int {
-    unsafe { ret_b(ab::issubclass(&*d, &*cls)) }
+    unsafe { if d.is_null() || cls.is_null() { null_arg(); return -1; } ret_b(ab::issubclass(&*d, &*cls)) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyCallable_Check(o: *mut PyObject) -> c_int {
@@ -483,9 +496,9 @@ pub unsafe extern "C" fn _PyObject_FunctionStr(o: *mut PyObject) -> *mut PyObjec
             let m = ab::getattr_opt(&*o, crate::name!("__module__"))?;
             match m {
                 Some(m) if pystr::is_str(&m) && pystr::to_string_lossy(&m) != "builtins" => {
-                    Ok(pystr::new_str(&format!("{}.{}()", pystr::to_string_lossy(&m), pystr::to_string_lossy(&ab::str(&q)?))))
+                    Ok(pystr::new_str(&format!("{}.{}()", pystr::to_string_lossy(&m), pystr::to_string_lossy(&*(ab::str(&q)?)))))
                 }
-                _ => Ok(pystr::new_str(&format!("{}()", pystr::to_string_lossy(&ab::str(&q)?)))),
+                _ => Ok(pystr::new_str(&format!("{}()", pystr::to_string_lossy(&*(ab::str(&q)?))))),
             }
         })())
     }
@@ -630,6 +643,9 @@ pub unsafe extern "C" fn PyUnstable_IsImmortal(o: *mut PyObject) -> c_int {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_SetImmortal(o: *mut PyObject) -> c_int {
     unsafe {
+        if (*o).is_immortal() || pystr::is_str(&*o) {
+            return 0;
+        }
         make_immortal(o);
         1
     }
@@ -661,7 +677,11 @@ pub unsafe extern "C" fn PyUnstable_TryIncRef(o: *mut PyObject) -> c_int {
     }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyUnstable_EnableTryIncRef(_o: *mut PyObject) {}
+pub unsafe extern "C" fn PyUnstable_EnableTryIncRef(o: *mut PyObject) {
+    unsafe {
+        let _ = (*o).ob_ref_shared.compare_exchange(0, REF_MAYBE_WEAKREF, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_Object_EnableDeferredRefcount(_o: *mut PyObject) -> c_int {
     0

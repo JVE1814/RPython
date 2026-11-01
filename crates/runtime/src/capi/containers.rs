@@ -370,9 +370,18 @@ pub unsafe extern "C" fn PySet_New(it: *mut PyObject) -> *mut PyObject {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyFrozenSet_New(it: *mut PyObject) -> *mut PyObject {
     unsafe {
-        match opt(it) {
-            None => ret(set::new_frozenset_from_vec(Vec::new())),
-            Some(i) => ret(ab::call(type_obj(set::frozenset_type()), &[i])),
+        let r = match opt(it) {
+            None => set::new_frozenset_from_vec(Vec::new()),
+            Some(i) => ab::call(type_obj(set::frozenset_type()), &[i]),
+        };
+        match r {
+            Ok(s) => {
+                if !set::set_items(&s).iter().any(|x| crate::gc::is_tracked(x)) {
+                    crate::gc::untrack(s.as_ptr());
+                }
+                s.into_raw()
+            }
+            Err(_) => std::ptr::null_mut(),
         }
     }
 }
@@ -397,7 +406,12 @@ pub unsafe extern "C" fn PySet_Size(o: *mut PyObject) -> Py_ssize_t {
 pub unsafe extern "C" fn PySet_Contains(o: *mut PyObject, k: *mut PyObject) -> c_int {
     unsafe {
         let Ok(s) = chk_anyset(o) else { return -1 };
-        ret_b(ab::contains(s, &*k))
+        // unlike `k in s`, the C API does not retry an unhashable set as a frozenset
+        let Some(k) = opt(k) else {
+            null_arg();
+            return -1;
+        };
+        ret_b(ab::hash(k).and_then(|h| set::contains_entry(s, k, h)))
     }
 }
 #[unsafe(no_mangle)]
@@ -409,7 +423,13 @@ pub unsafe extern "C" fn PySet_Add(o: *mut PyObject, k: *mut PyObject) -> c_int 
             let _ = bad_internal();
             return -1;
         }
-        ret_i(set::set_add(s, &*k))
+        if set::set_add(s, &*k).is_err() {
+            return -1;
+        }
+        if set::is_frozenset(s) && crate::gc::is_tracked(&*k) {
+            crate::gc::track(o);
+        }
+        0
     }
 }
 #[unsafe(no_mangle)]
@@ -458,6 +478,9 @@ pub unsafe extern "C" fn _PySlice_FromIndices(start: Py_ssize_t, stop: Py_ssize_
 }
 fn clamp_index(v: &PyObject) -> PyResult<isize> {
     // like _PyEval_SliceIndex: clamp to [PY_SSIZE_T_MIN, PY_SSIZE_T_MAX]
+    if !ab::has_index(v) {
+        return Err(type_error("slice indices must be integers or None or have an __index__ method"));
+    }
     let i = ab::index(v)?;
     Ok(match int::as_i64(&i) {
         Some(x) => x as isize,
@@ -544,8 +567,8 @@ pub unsafe extern "C" fn PySlice_GetIndices(o: *mut PyObject, len: Py_ssize_t, s
             *step = 1;
         } else {
             match get(c) {
+                Some(0) | None => return -1,
                 Some(s) => *step = s,
-                None => return -1,
             }
         }
         if a.is(n) {
