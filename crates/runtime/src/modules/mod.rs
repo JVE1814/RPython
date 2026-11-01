@@ -27,3 +27,4 @@ pub mod numbers_registry;
 pub mod cmath;
 pub mod _struct;
 pub mod binascii;
+pub mod _random;

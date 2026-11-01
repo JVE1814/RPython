@@ -7,4 +7,5 @@ pub fn register() {
     register_builtin("cmath", super::cmath::init_cmath);
     register_builtin("_struct", super::_struct::init_module);
     register_builtin("binascii", super::binascii::init_module);
+    register_builtin("_random", super::_random::init_module);
 }
