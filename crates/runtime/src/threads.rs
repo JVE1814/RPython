@@ -85,6 +85,15 @@ pub struct ThreadState {
     pub reraise_flag: Cell<bool>,
     pub headroom: Cell<bool>,
     pub stack_low: Cell<usize>,
+    /// True while an OS thread is attached to this state.
+    pub alive: std::sync::atomic::AtomicBool,
+    /// Pending asynchronous exception (PyThreadState_SetAsyncExc), owned.
+    pub async_exc: std::sync::atomic::AtomicPtr<PyObject>,
+    /// Per-thread tracing state (sys.settrace / sys.setprofile), owned callables.
+    pub trace_func: Cell<*mut PyObject>,
+    pub profile_func: Cell<*mut PyObject>,
+    /// Re-entrancy guard while a trace/profile function runs.
+    pub tracing_depth: Cell<i32>,
     /// Set when the OS thread has finished (its state may linger in ALL_THREADS).
     pub exited: std::sync::atomic::AtomicBool,
 }
@@ -128,7 +137,10 @@ pub fn new_thread_state() -> *mut ThreadState {
         c.thread_id = libc::pthread_self() as c_ulong;
         c.native_thread_id = libc::gettid() as c_ulong;
         c.gilstate_counter = 1;
-        let ts = Box::into_raw(Box::new(ThreadState {
+        let limit = RECURSION_LIMIT.load(Relaxed) as i32;
+        c.py_recursion_limit = limit;
+        c.py_recursion_remaining = limit;
+        let st = ThreadState {
             c,
             mode: ModeCell(std::sync::atomic::AtomicU8::new(ThreadMode::InVm as u8)),
             merge_queue: Mutex::new(Vec::new()),
@@ -138,11 +150,99 @@ pub fn new_thread_state() -> *mut ThreadState {
             reraise_flag: Cell::new(false),
             headroom: Cell::new(false),
             stack_low: Cell::new(compute_stack_low()),
+            alive: std::sync::atomic::AtomicBool::new(true),
+            async_exc: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            trace_func: Cell::new(std::ptr::null_mut()),
+            profile_func: Cell::new(std::ptr::null_mut()),
+            tracing_depth: Cell::new(0),
             exited: std::sync::atomic::AtomicBool::new(false),
-        }));
+        };
+        // Reuse the memory of a dead thread state (pointers to thread states stay valid).
+        let recycled = FREE_STATES.lock().unwrap().pop();
+        let ts = match recycled {
+            Some(p) => {
+                let p = p as *mut ThreadState;
+                std::ptr::drop_in_place(p);
+                std::ptr::write(p, st);
+                p
+            }
+            None => Box::into_raw(Box::new(st)),
+        };
         (*ts).c.exc_info = &mut (*ts).c.exc_state;
         ALL_THREADS.lock().unwrap().push(ts as usize);
         ts
+    }
+}
+
+static FREE_STATES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static RECURSION_LIMIT: AtomicUsize = AtomicUsize::new(1000);
+/// pthread id of the main Python thread (0 = not yet known).
+pub static MAIN_THREAD_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MAIN_THREAD_STATE: std::sync::atomic::AtomicPtr<ThreadState> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Is the thread state attached to a running OS thread?
+pub fn is_live(ts: &ThreadState) -> bool {
+    ts.alive.load(Acquire)
+}
+
+/// Record the calling thread as the Python main thread.
+pub fn set_main_thread() {
+    let ts = current();
+    MAIN_THREAD_ID.store(ts.c.thread_id as u64, Release);
+    MAIN_THREAD_STATE.store(ts as *const ThreadState as *mut ThreadState, Release);
+}
+
+pub fn is_main_thread() -> bool {
+    let m = MAIN_THREAD_ID.load(Acquire);
+    m == 0 || m == unsafe { libc::pthread_self() } as u64
+}
+
+pub fn main_thread_state() -> Option<&'static ThreadState> {
+    let p = MAIN_THREAD_STATE.load(Acquire);
+    if p.is_null() { None } else { Some(unsafe { &*p }) }
+}
+
+/// Snapshot of the live thread states.
+pub fn live_threads() -> Vec<&'static ThreadState> {
+    ALL_THREADS.lock().unwrap().iter().map(|&t| unsafe { &*(t as *const ThreadState) }).filter(|t| is_live(t)).collect()
+}
+
+/// Detach and retire the calling thread's state (OS thread is about to exit).
+pub fn thread_exit() {
+    let p = current_ptr();
+    if p.is_null() {
+        return;
+    }
+    unsafe {
+        let ts = &*p;
+        process_merge_queue(ts);
+        // release owned per-thread objects
+        let e = std::mem::replace(&mut (*p).c.current_exception, std::ptr::null_mut());
+        crate::object::xdecref(e);
+        let a = ts.async_exc.swap(std::ptr::null_mut(), AcqRel);
+        crate::object::xdecref(a);
+        for cellp in [&ts.trace_func, &ts.profile_func] {
+            let f = cellp.replace(std::ptr::null_mut());
+            crate::object::xdecref(f);
+        }
+        for slot in [&raw mut (*p).c.async_gen_firstiter, &raw mut (*p).c.async_gen_finalizer, &raw mut (*p).c.context, &raw mut (*p).c.dict] {
+            let o = std::mem::replace(&mut *slot, std::ptr::null_mut());
+            crate::object::xdecref(o);
+        }
+        process_merge_queue(ts);
+        ts.alive.store(false, Release);
+        ts.exited.store(true, Release);
+        {
+            let mut all = ALL_THREADS.lock().unwrap();
+            all.retain(|&t| t != p as usize);
+        }
+        // objects still queued for this owner get merged by the next decref (owner gone)
+        let rest: Vec<usize> = std::mem::take(&mut *ts.merge_queue.lock().unwrap());
+        for op in rest {
+            crate::object::explicit_merge(op as *mut PyObject);
+        }
+        FREE_STATES.lock().unwrap().push(p as usize);
+        set_current(std::ptr::null_mut());
     }
 }
 
@@ -226,6 +326,7 @@ pub fn compute_stack_low() -> usize {
 }
 
 pub fn set_recursion_limit_all(n: i32) {
+    RECURSION_LIMIT.store(n as usize, Relaxed);
     let threads = ALL_THREADS.lock().unwrap();
     for &t in threads.iter() {
         let ts = unsafe { &mut *(t as *mut ThreadState) };
@@ -244,26 +345,43 @@ pub fn current_mut() -> *mut ThreadState {
     p
 }
 
+/// In a forked child only the calling thread survives: retire all other states.
+/// (Called from a pthread_atfork child handler; must not block.)
+pub fn after_fork_child() {
+    let me = current_ptr() as usize;
+    if let Ok(mut all) = ALL_THREADS.try_lock() {
+        for &t in all.iter() {
+            if t != me {
+                let ts = unsafe { &*(t as *const ThreadState) };
+                ts.alive.store(false, Relaxed);
+                ts.exited.store(true, Relaxed);
+            }
+        }
+        all.retain(|&t| t == me);
+    }
+    crate::modules::signal::after_fork_child();
+}
+
+/// Run `f` (a blocking native operation) with the thread in `Blocked` mode so that
+/// stop-the-world operations do not wait for it; polls the safepoint on return.
+#[inline]
+pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
+    let ts = current();
+    let prev = ts.mode.replace(ThreadMode::Blocked);
+    let r = f();
+    ts.mode.set(prev);
+    if prev == ThreadMode::InVm && ts.c.eval_breaker.load(Acquire) & EVAL_SAFEPOINT != 0 {
+        crate::gc::safepoint_poll(ts);
+    }
+    r
+}
+
 impl ThreadState {
     pub fn alive(&self) -> bool {
         !self.exited.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
-/// Run a potentially blocking operation (syscall, lock wait, sleep) with the thread
-/// marked as Blocked so stop-the-world operations (GC safepoints) don't wait for it.
-/// On return the thread polls the safepoint before touching Python objects again.
-pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
-    let ts = current();
-    let prev = ts.mode.get();
-    ts.mode.set(ThreadMode::Blocked);
-    let r = f();
-    ts.mode.set(prev);
-    if ts.c.eval_breaker.load(std::sync::atomic::Ordering::Acquire) & EVAL_SAFEPOINT != 0 {
-        crate::gc::safepoint_poll(ts);
-    }
-    r
-}
 
 /// Thread mode readable from other threads (stop-the-world coordination).
 pub struct ModeCell(pub std::sync::atomic::AtomicU8);
@@ -279,5 +397,11 @@ impl ModeCell {
     #[inline]
     pub fn set(&self, m: ThreadMode) {
         self.0.store(m as u8, std::sync::atomic::Ordering::Release)
+    }
+    #[inline]
+    pub fn replace(&self, m: ThreadMode) -> ThreadMode {
+        let old = self.get();
+        self.set(m);
+        old
     }
 }

@@ -7,7 +7,7 @@ use crate::types::*;
 
 /// `cls[item]` for builtin generic containers (PEP 585).
 pub fn generic_alias(cls: &PyObject, item: &PyObject) -> PyResult {
-    genericalias::generic_alias(cls, item)
+    genericalias::new_generic_alias(cls, item)
 }
 
 /// Fill the static type objects (before any type_ready).
@@ -26,7 +26,6 @@ pub fn init_types() {
     builtin_iters::init_types();
     property::init_types();
     weakref::init_types();
-    genericalias::init_types();
 }
 
 /// Ready the types not readied by the generic list in `types::init_all`.
@@ -44,7 +43,6 @@ pub fn ready() -> PyResult<()> {
     builtin_iters::ready()?;
     property::ready()?;
     weakref::ready()?;
-    genericalias::ready()?;
     Ok(())
 }
 

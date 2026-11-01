@@ -1,0 +1,29 @@
+[0, 2, 4, 6]
+[0, 2, 'done']
+[1, 2, 2, 4] {1: 2} {'a'}
+[2, 3]
+0 [1, 2, 3] 4
+[1] 10
+([2, 2], 5)
+3 s C C.m ()
+inner finally
+caught x
+finally runs
+1
+[-1, 2, -2, -3]
+enter
+exit <class 'KeyError'>
+after with
+enter
+exit None
+ret
+'nested'    7 x=10
+sys
+(1, 2, 3) (1, 2, 4)
+{'a': 1, 'b': 2} ['a', 'b', 'x', 'y'] ('a', 'b')
+True 2 e 6
+{'b': 2}
+while else 3
+42
+{'x': <class 'int'>}
+BA

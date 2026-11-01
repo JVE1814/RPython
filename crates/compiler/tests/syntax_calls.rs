@@ -188,6 +188,22 @@ fn syntax_error_calls() {
                 match compile(&m, &CompileOptions::new("<t>", cm)) {
                     Ok(_) => bad.push(format!("{}:{}: no error (expected {:?})\n{}", file, line, msg, src)),
                     Err(e) => {
+                        // positional checks (lineno=, offset=, end_lineno=, end_offset=)
+                        let call_end = { let mut d = 0i32; let mut q = at; let mut k = at; while k < b.len() { match b[k] { b'(' => d += 1, b')' => { d -= 1; if d == 0 { q = k; break; } } _ => {} } k += 1; } q };
+                        let tail = &text[j.min(call_end)..call_end];
+                        let kw = |name: &str| -> Option<i32> {
+                            let p = tail.find(&format!("{}=", name))?;
+                            if p > 0 && (tail.as_bytes()[p - 1].is_ascii_alphanumeric() || tail.as_bytes()[p - 1] == b'_') { return None; }
+                            let digits: String = tail[p + name.len() + 1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+                            digits.parse().ok()
+                        };
+                        let line_of = |n: i32| src.lines().nth((n - 1).max(0) as usize).map(|s| s.to_string());
+                        let (o, eo) = e.offsets(line_of(e.lineno).as_deref(), line_of(e.end_lineno).as_deref());
+                        for (name, got) in [("lineno", e.lineno), ("offset", o), ("end_lineno", e.end_lineno), ("end_offset", eo)] {
+                            if let Some(want) = kw(name) {
+                                if want != got { bad.push(format!("{}:{}: {} {} != expected {} ({:?})\n{}", file, line, name, got, want, e.msg, src)); }
+                            }
+                        }
                         if let Some(msg) = &msg {
                             if let Some(p) = regex_plain(msg) {
                                 if !e.msg.contains(&p) {
