@@ -75,6 +75,35 @@ All test_ctypes modules pass except:
   does not have yet — verified with a local stub). Not done: `SQLITE_KEYWORDS` (completion
   tests are skipped without readline anyway).
 
+## _ssl (crates/bindings/src/ssl, Lib/ssl.py)
+* Binds libssl.so.3/libcrypto.so.3 (OpenSSL 3.0.13 here). `_SSLContext` (protocols with the
+  deprecation warnings, options, verify_mode/flags, check_hostname, min/max version,
+  security_level, num_tickets, post_handshake_auth, sni_callback, keylog_filename,
+  `_msg_callback`, `_host_flags`, set_ciphers/get_ciphers, `_set_alpn_protocols`,
+  load_cert_chain incl. password str/bytes/callable, load_verify_locations incl. PEM/DER
+  cadata, load_dh_params, set_default_verify_paths, cert_store_stats, get_ca_certs,
+  set_ecdh_curve, session_stats, `_wrap_socket`, `_wrap_bio`), `_SSLSocket` (handshake, read
+  into buffer, write, pending, getpeercert dict/DER, verified/unverified chains as
+  `_ssl.Certificate`, cipher, shared_ciphers, version, ALPN, tls-unique channel binding,
+  post-handshake auth, shutdown, session get/set, session_reused), MemoryBIO, SSLSession,
+  Certificate, RAND_*, txt2obj/nid2obj, `_test_decode_cert` (subject/issuer RDNs,
+  serial, validity, subjectAltName incl. IP/DirName/RID, OCSP, caIssuers, CRL DPs),
+  get_default_verify_paths, constants, OPENSSL_VERSION*, exception hierarchy (immutable
+  types, `str()` = message, `library`/`reason` from the OpenSSL error queue, mnemonics
+  derived from the reason strings; SSLCertVerificationError with verify_code/message and
+  the hostname/IP mismatch texts).
+* Socket I/O uses the socket's fd (SSL_set_fd); timeouts and non-blocking mode follow the
+  Python socket's `gettimeout()` with poll(), the thread state is released around OpenSSL
+  calls and waits. SNI/keylog/msg callbacks re-attach with PyGILState_Ensure.
+* Lib/ssl.py is written from the documented API (enums via `_convert_`, SSLContext
+  properties, SSLSocket on socket.socket, SSLObject, create_default_context,
+  `_create_unverified_context`, DER/PEM helpers, cert_time_to_seconds, get_server_certificate).
+* Verified by hand: TLS 1.3 handshakes over MemoryBIO pairs and over socketpair() with a
+  server thread, verification errors, PEM/DH error attributes. test_ssl itself cannot be
+  loaded yet: it imports `http.client`/`urllib.request`, which master does not have.
+* Not implemented: TLS-PSK callbacks (HAS_PSK False, the setters raise NotImplementedError),
+  NPN (deprecated anyway), Windows certificate stores, kTLS, `_ssl.enum_*` (Windows).
+
 ## Decisions
 * B1: bindings live in their own crate registered by the launcher (fast rebuilds; no runtime
   changes needed besides the launcher line).
