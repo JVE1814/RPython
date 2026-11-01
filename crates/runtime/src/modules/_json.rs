@@ -1046,7 +1046,7 @@ pub fn init_module() -> PyResult {
         t.tp_call = Some(scanner_call);
         t.tp_alloc = Some(generic_alloc);
         t.tp_getattro = Some(object_generic_getattro);
-        t.tp_doc = c"JSON scanner object".as_ptr();
+        t.tp_doc = c"Callable decoding one JSON value at a given index, configured by a JSONDecoder.".as_ptr();
         if let Err(e) = type_ready(scanner_type()) {
             res = Err(e);
             return;
@@ -1066,13 +1066,13 @@ pub fn init_module() -> PyResult {
     res?;
     let m = crate::types::module::new_module("_json")?;
     let d = crate::types::module::module_dict(&m);
-    dict::set_item_str(&d, "__doc__", &pystr::new_str("json speedups\n"))?;
+    dict::set_item_str(&d, "__doc__", &pystr::new_str("Native accelerator behind the json package.\n"))?;
     crate::builtins::add_methods_to_dict(
         &d,
         mdefs![
-            ("scanstring", FASTKW, m_scanstring, "scanstring(string, end, strict=True) -> (string, end)\n\nScan the string s for a JSON string. End is the index of the\ncharacter in s after the quote that started the JSON string.\nUnescapes all valid JSON string escape sequences and raises ValueError\non attempt to decode an invalid string. If strict is False then literal\ncontrol characters are allowed in the string.\n\nReturns a tuple of the decoded string and the index of the character in s\nafter the end quote."),
-            ("encode_basestring_ascii", O, m_encode_basestring_ascii, "encode_basestring_ascii(string) -> string\n\nReturn an ASCII-only JSON representation of a Python string"),
-            ("encode_basestring", O, m_encode_basestring, "encode_basestring(string) -> string\n\nReturn a JSON representation of a Python string"),
+            ("scanstring", FASTKW, m_scanstring, "scanstring(string, end, strict=True)\n--\n\nDecode the JSON string literal whose opening quote is at string[end - 1].\nReturns (text, index after the closing quote); strict=False allows raw\ncontrol characters inside the literal."),
+            ("encode_basestring_ascii", O, m_encode_basestring_ascii, "encode_basestring_ascii(s, /)\n--\n\nJSON string literal for s using only ASCII characters."),
+            ("encode_basestring", O, m_encode_basestring, "encode_basestring(s, /)\n--\n\nJSON string literal for s (non-ASCII characters kept)."),
         ],
         Some(&m),
     )?;
