@@ -1,122 +1,132 @@
-"""Command-line tool to validate and pretty-print JSON
+"""Validate and pretty-print JSON from the command line.
 
-See `json.__main__` for a usage example (invocation as
-`python -m json.tool` is supported for backwards compatibility).
+    $ echo '{"a": [1, 2]}' | python -m json
+    {
+        "a": [
+            1,
+            2
+        ]
+    }
+
+Run ``python -m json -h`` for the options.
 """
 import argparse
+import errno
 import json
+import os
 import re
 import sys
-from _colorize import get_theme, can_colorize
 
+from _colorize import can_colorize, get_theme
 
-# The string we are colorizing is valid JSON,
-# so we can use a looser but simpler regex to match
-# the various parts, most notably strings and numbers,
-# where the regex given by the spec is much more complex.
-_color_pattern = re.compile(r'''
-    (?P<key>"(\\.|[^"\\])*")(?=:)           |
-    (?P<string>"(\\.|[^"\\])*")             |
-    (?P<number>NaN|-?Infinity|[0-9\-+.Ee]+) |
-    (?P<boolean>true|false)                 |
-    (?P<null>null)
+# one lexical token of already-serialised JSON; a string followed by ':' is
+# an object key
+_TOKEN = re.compile(r'''
+    (?P<key>"(?:[^"\\]|\\.)*")(?=[ \t\n\r]*:)
+  | (?P<string>"(?:[^"\\]|\\.)*")
+  | (?P<number>NaN|-?Infinity|-?[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)
+  | (?P<keyword>true|false|null)
 ''', re.VERBOSE)
 
-_group_to_theme_color = {
-    "key": "definition",
-    "string": "string",
-    "number": "number",
-    "boolean": "keyword",
-    "null": "keyword",
-}
+
+def _paint(text, syntax):
+    """Wrap the tokens of the JSON text in the theme's escape sequences."""
+    palette = {
+        'key': syntax.definition,
+        'string': syntax.string,
+        'number': syntax.number,
+        'keyword': syntax.keyword,
+    }
+
+    def recolour(match):
+        kind = match.lastgroup
+        return f'{palette[kind]}{match.group()}{syntax.reset}'
+
+    return _TOKEN.sub(recolour, text)
 
 
-def _colorize_json(json_str, theme):
-    def _replace_match_callback(match):
-        for group, color in _group_to_theme_color.items():
-            if m := match.group(group):
-                return f"{getattr(theme, color)}{m}{theme.reset}"
-        return match.group()
+def _build_parser():
+    parser = argparse.ArgumentParser(
+        prog='python -m json',
+        description='Validate JSON input and write it back pretty-printed.',
+        color=True)
+    parser.add_argument('infile', nargs='?', default=None,
+                        help='file to read (default: standard input)')
+    parser.add_argument('outfile', nargs='?', default=None,
+                        help='file to write (default: standard output); '
+                             'may be the same as infile')
+    parser.add_argument('--sort-keys', action='store_true',
+                        help='order object members by key')
+    parser.add_argument('--no-ensure-ascii', dest='ensure_ascii',
+                        action='store_false',
+                        help='write non-ASCII characters as they are')
+    parser.add_argument('--json-lines', action='store_true',
+                        help='treat every input line as a separate document')
+    layout = parser.add_mutually_exclusive_group()
+    layout.add_argument('--indent', type=int, default=4,
+                        help='spaces per nesting level (default: 4)')
+    layout.add_argument('--tab', dest='indent', action='store_const',
+                        const='\t', help='indent with one tab per level')
+    layout.add_argument('--no-indent', dest='indent', action='store_const',
+                        const=None, help='write each document on one line')
+    layout.add_argument('--compact', action='store_true',
+                        help='single line without optional whitespace')
+    return parser
 
-    return re.sub(_color_pattern, _replace_match_callback, json_str)
+
+def _read_documents(text, json_lines):
+    if json_lines:
+        return [json.loads(line) for line in text.splitlines()
+                if line.strip()]
+    return [json.loads(text)]
 
 
 def main():
-    description = ('A simple command line interface for json module '
-                   'to validate and pretty-print JSON objects.')
-    parser = argparse.ArgumentParser(description=description, color=True)
-    parser.add_argument('infile', nargs='?',
-                        help='a JSON file to be validated or pretty-printed; '
-                             'defaults to stdin',
-                        default='-')
-    parser.add_argument('outfile', nargs='?',
-                        help='write the output of infile to outfile',
-                        default=None)
-    parser.add_argument('--sort-keys', action='store_true', default=False,
-                        help='sort the output of dictionaries alphabetically by key')
-    parser.add_argument('--no-ensure-ascii', dest='ensure_ascii', action='store_false',
-                        help='disable escaping of non-ASCII characters')
-    parser.add_argument('--json-lines', action='store_true', default=False,
-                        help='parse input using the JSON Lines format. '
-                        'Use with --no-indent or --compact to produce valid JSON Lines output.')
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument('--indent', default=4, type=int,
-                       help='separate items with newlines and use this number '
-                       'of spaces for indentation')
-    group.add_argument('--tab', action='store_const', dest='indent',
-                       const='\t', help='separate items with newlines and use '
-                       'tabs for indentation')
-    group.add_argument('--no-indent', action='store_const', dest='indent',
-                       const=None,
-                       help='separate items with spaces rather than newlines')
-    group.add_argument('--compact', action='store_true',
-                       help='suppress all whitespace separation (most compact)')
-    options = parser.parse_args()
-
-    dump_args = {
-        'sort_keys': options.sort_keys,
-        'indent': options.indent,
-        'ensure_ascii': options.ensure_ascii,
-    }
+    options = _build_parser().parse_args()
+    dump_args = dict(sort_keys=options.sort_keys,
+                     ensure_ascii=options.ensure_ascii,
+                     indent=options.indent)
     if options.compact:
-        dump_args['indent'] = None
-        dump_args['separators'] = ',', ':'
+        dump_args.update(indent=None, separators=(',', ':'))
 
     try:
-        if options.infile == '-':
-            infile = sys.stdin
+        if options.infile is None or options.infile == '-':
+            text = sys.stdin.read()
         else:
-            infile = open(options.infile, encoding='utf-8')
-        try:
-            if options.json_lines:
-                objs = [json.loads(line) for line in infile]
-            else:
-                objs = (json.load(infile),)
-        finally:
-            if infile is not sys.stdin:
-                infile.close()
+            with open(options.infile, encoding='utf-8') as source:
+                text = source.read()
+        documents = _read_documents(text, options.json_lines)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(exc)
 
+    try:
         if options.outfile is None:
-            outfile = sys.stdout
+            target = sys.stdout
+            syntax = None
+            if can_colorize(file=target):
+                syntax = get_theme(tty_file=target).syntax
+            for document in documents:
+                rendered = json.dumps(document, **dump_args)
+                if syntax is not None:
+                    rendered = _paint(rendered, syntax)
+                target.write(rendered + '\n')
+            target.flush()
         else:
-            outfile = open(options.outfile, 'w', encoding='utf-8')
-        with outfile:
-            if can_colorize(file=outfile):
-                t = get_theme(tty_file=outfile).syntax
-                for obj in objs:
-                    json_str = json.dumps(obj, **dump_args)
-                    outfile.write(_colorize_json(json_str, t))
-                    outfile.write('\n')
-            else:
-                for obj in objs:
-                    json.dump(obj, outfile, **dump_args)
-                    outfile.write('\n')
-    except ValueError as e:
-        raise SystemExit(e)
+            with open(options.outfile, 'w', encoding='utf-8') as target:
+                for document in documents:
+                    json.dump(document, target, **dump_args)
+                    target.write("\n")
+    except BrokenPipeError:
+        raise
+    except OSError as exc:
+        raise SystemExit(exc)
 
 
 if __name__ == '__main__':
     try:
         main()
     except BrokenPipeError as exc:
-        raise SystemExit(exc.errno)
+        # nobody reads our output any more: silence the flush at exit
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        sys.exit(exc.errno)
