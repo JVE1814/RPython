@@ -608,6 +608,10 @@ pub fn type_ready(tp: *mut PyTypeObject) -> PyResult<()> {
         crate::types::slots::add_operators(tp)?;
         // MRO
         mro_internal(tp)?;
+        // static types are immutable (no attribute assignment from Python)
+        if (*tp).tp_flags & Py_TPFLAGS_HEAPTYPE == 0 {
+            (*tp).tp_flags |= Py_TPFLAGS_IMMUTABLETYPE;
+        }
         // a static type deriving directly from object without its own tp_new cannot be
         // instantiated from Python (it does not inherit object.__new__)
         if (*tp).tp_flags & Py_TPFLAGS_HEAPTYPE == 0 && base == object_type() && (*tp).tp_new.is_none() && tp != object_type() {

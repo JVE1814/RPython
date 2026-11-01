@@ -1785,7 +1785,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
         }
         pending_err = false;
         // ---------------------------------------------------------- exception unwinding
-        let e = match take_exc() {
+        let mut e = match take_exc() {
             Some(e) => e,
             None => {
                 let _ = err!(SystemError, "error return without exception set");
@@ -1803,17 +1803,16 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
             add_traceback(f, &e);
             if crate::modules::sys::tracing_active() {
                 if crate::modules::sys::trace_exception(ts, f, &e).is_err() {
-                    // tracer raised: replace exception
-                    let e2 = take_exc().unwrap();
-                    set_exc(e2);
-                    f.clear_stack();
-                    return Err(PyErr);
+                    // the tracer raised: its exception replaces the original one and
+                    // unwinding continues (cleanup handlers must still run)
+                    e = take_exc().unwrap();
+                    add_traceback(f, &e);
                 }
             }
         } else if crate::modules::sys::tracing_active() {
             if crate::modules::sys_trace::fire_exc_event(ts, f, crate::modules::sys_trace::RERAISE, &e).is_err() {
-                f.clear_stack();
-                return Err(PyErr);
+                e = take_exc().unwrap();
+                add_traceback(f, &e);
             }
         }
         let lookup_pc = if f.unwind_pc >= 0 { f.unwind_pc as u32 } else { f.lasti };
@@ -1831,8 +1830,8 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                 if crate::modules::sys::tracing_active()
                     && crate::modules::sys_trace::fire_exc_event(ts, f, crate::modules::sys_trace::EXCEPTION_HANDLED, &e).is_err()
                 {
-                    f.clear_stack();
-                    return Err(PyErr);
+                    e = take_exc().unwrap();
+                    add_traceback(f, &e);
                 }
                 push!(f, e.into_raw());
                 pc = h.target as usize;

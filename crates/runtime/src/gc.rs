@@ -101,25 +101,8 @@ pub unsafe fn track(op: *mut PyObject) {
 }
 
 fn trigger_threshold() -> usize {
-    // Like a generational heuristic: collect after THRESHOLD new objects, but also
-    // at least a quarter of the live set (amortises full collections). A threshold
-    // set explicitly with gc.set_threshold() is honoured as is; 0 disables
-    // automatic collection.
-    let t = THRESHOLD.load(Relaxed);
-    if t == 0 {
-        return usize::MAX;
-    }
-    if USER_THRESHOLD.load(Relaxed) {
-        return t;
-    }
-    t.max(LAST_LIVE.load(Relaxed) / 4)
+    crate::gc_support::trigger_threshold(THRESHOLD.load(Relaxed), LAST_LIVE.load(Relaxed))
 }
-
-/// gc.set_threshold() was called.
-pub static USER_THRESHOLD: AtomicBool = AtomicBool::new(false);
-/// Objects examined by collections (sum) and total time spent collecting.
-pub static CANDIDATES: AtomicUsize = AtomicUsize::new(0);
-pub static DURATION_NS: AtomicUsize = AtomicUsize::new(0);
 
 #[inline]
 pub unsafe fn untrack(op: *mut PyObject) {
@@ -358,7 +341,7 @@ pub fn collect() -> usize {
     }
     let t0 = std::time::Instant::now();
     let n = unsafe { collect_stopped() };
-    DURATION_NS.fetch_add((t0.elapsed().as_nanos() as usize).max(1), Relaxed);
+    crate::gc_support::DURATION_NS.fetch_add((t0.elapsed().as_nanos() as usize).max(1), Relaxed);
     start_the_world();
     ALLOCS_SINCE.store(0, Relaxed);
     LAST_LIVE.store(TRACKED.load(Relaxed).max(0) as usize, Relaxed);
@@ -371,7 +354,7 @@ unsafe fn collect_stopped() -> usize {
     unsafe {
         let saved_exc = crate::errors::take_exc();
         let objs = snapshot();
-        CANDIDATES.fetch_add(objs.len(), Relaxed);
+        crate::gc_support::CANDIDATES.fetch_add(objs.len(), Relaxed);
         let unreachable = find_unreachable(objs);
         if unreachable.is_empty() {
             if let Some(e) = saved_exc {
@@ -413,30 +396,9 @@ unsafe fn collect_stopped() -> usize {
         } else {
             garbage.clone()
         };
-        // Instance __dict__s are separate objects here but part of the instance in
-        // CPython's layout: they are not counted as collected objects.
-        let owned_dicts: std::collections::HashSet<usize> = {
-            to_clear
-                .iter()
-                .filter_map(|g| {
-                    let op = g.as_ptr();
-                    if crate::alloc::has_managed(op) {
-                        let d = *crate::alloc::managed_dict_slot(op);
-                        if !d.is_null() {
-                            return Some(d as usize);
-                        }
-                    }
-                    None
-                })
-                .collect()
-        };
-        let n = to_clear.iter().filter(|g| !owned_dicts.contains(&(g.as_ptr() as usize))).count();
-        // DEBUG_SAVEALL: keep the garbage in gc.garbage instead of freeing it
-        if crate::modules::gc_mod::debug_flags() & crate::modules::gc_mod::DEBUG_SAVEALL != 0 {
-            let gl = crate::modules::gc_mod::garbage_list();
-            for g in to_clear.iter().filter(|g| !owned_dicts.contains(&(g.as_ptr() as usize))) {
-                crate::types::list::append(&gl, g.clone());
-            }
+        let countable = crate::gc_support::countable(&to_clear);
+        let n = countable.len();
+        if crate::gc_support::save_all(&countable) {
             drop(to_clear);
             drop(garbage);
             COLLECTED.fetch_add(n, Relaxed);

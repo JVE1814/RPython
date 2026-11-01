@@ -671,6 +671,15 @@ fn type_set_bases(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         decref(old_bases);
         decref(old_base as *mut PyObject);
         crate::types::slots::fixup_slots(tp);
+        // inherited slots of all subclasses may come from the new bases
+        let mut todo = subclasses(tp);
+        let mut seen = std::collections::HashSet::new();
+        while let Some(sub) = todo.pop() {
+            if seen.insert(sub as usize) {
+                crate::types::slots::fixup_slots(sub);
+                todo.extend(subclasses(sub));
+            }
+        }
     }
     Ok(())
 }
@@ -1191,13 +1200,11 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
         (*tp).tp_alloc = Some(generic_alloc);
         (*tp).tp_free = Some(generic_free);
         if add_dict && (*tp).tp_flags & Py_TPFLAGS_MANAGED_DICT != 0 && dict::get_item_str(&dict, name!("__dict__")).is_none() {
-            let gs = subtype_getset_dict();
-            let descr = crate::types::descr::new_getset_descr(tp, gs);
+            let descr = shared_subtype_descr(0);
             dict::set_item(&dict, name!("__dict__"), &descr)?;
         }
         if (*tp).tp_flags & Py_TPFLAGS_MANAGED_WEAKREF != 0 && add_weak && dict::get_item_str(&dict, name!("__weakref__")).is_none() {
-            let gs = subtype_getset_weakref();
-            let descr = crate::types::descr::new_getset_descr(tp, gs);
+            let descr = shared_subtype_descr(1);
             dict::set_item(&dict, name!("__weakref__"), &descr)?;
         }
         // __firstlineno__ / __static_attributes__ are provided by the compiler in the namespace
@@ -1248,13 +1255,32 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
     }
 }
 
+/// The `__dict__` (0) / `__weakref__` (1) descriptors that classes add for their
+/// instances: one shared object each, owned by `object` (like CPython 3.15).
+fn shared_subtype_descr(which: usize) -> PyRef {
+    static P: [std::sync::OnceLock<usize>; 2] = [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+    let p = *P[which].get_or_init(|| {
+        let gs = if which == 0 { subtype_getset_dict() } else { subtype_getset_weakref() };
+        let d = crate::types::descr::new_getset_descr(object_type(), gs);
+        d.into_raw() as usize
+    });
+    unsafe { PyRef::from_borrowed(p as *mut PyObject) }
+}
+
 fn subtype_get_dict(o: &PyObject) -> PyResult {
+    if is_type(o) {
+        // classes: the type's own __dict__ (a read-only proxy)
+        return generic_getattr(o, name!("__dict__"));
+    }
     match instance_dict(o) {
         Some(d) => Ok(d),
         None => raise!(AttributeError, "This object has no __dict__"),
     }
 }
 fn subtype_set_dict(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
+    if is_type(o) {
+        raise!(AttributeError, "attribute '__dict__' of 'type' objects is not writable");
+    }
     unsafe {
         let slot = dict_slot(o.as_ptr());
         if slot.is_null() {
@@ -1274,6 +1300,9 @@ fn subtype_set_dict(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     Ok(())
 }
 fn subtype_get_weakref(o: &PyObject) -> PyResult {
+    if unsafe { crate::types::weakref::weaklist_slot(o.as_ptr()).is_null() } {
+        raise!(AttributeError, "This object has no __weakref__");
+    }
     match crate::types::weakref::first_weakref(o) {
         Some(w) => Ok(w),
         None => Ok(none::none_ref()),

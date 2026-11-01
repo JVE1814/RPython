@@ -255,7 +255,7 @@ pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
     let jumped = prev != u32::MAX && lasti != prev.wrapping_add(1);
     let new_line = line >= 0
         && !is_resume
-        && ((start && (line != f.trace_line || jumped)) || (jumped && (line != f.trace_line || lasti <= prev)));
+        && ((start && (line != f.trace_line || (jumped && lasti <= prev))) || (jumped && (line != f.trace_line || lasti <= prev)));
     if new_line {
         f.trace_line = line;
         if MON_ANY.load(Relaxed) & (1 << LINE) != 0 {

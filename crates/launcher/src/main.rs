@@ -92,6 +92,46 @@ fn usage_error(msg: &str) -> ! {
     std::process::exit(2);
 }
 
+/// Lexically normalised absolute form of `p` (like os.path.abspath).
+fn abspath(p: &std::path::Path) -> String {
+    let base = if p.is_absolute() { std::path::PathBuf::new() } else { std::env::current_dir().unwrap_or_default() };
+    let mut parts: Vec<String> = Vec::new();
+    for c in base.join(p).components() {
+        match c {
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            std::path::Component::Normal(s) => parts.push(s.to_string_lossy().into_owned()),
+            _ => {}
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+
+/// Read `<argv[0]>._pth` if present: (sys.path entries, `import site` requested).
+fn underpth_paths() -> Option<(Vec<String>, bool)> {
+    let exe = std::env::args().next()?;
+    if !exe.contains('/') {
+        return None;
+    }
+    let text = std::fs::read_to_string(format!("{}._pth", exe)).ok()?;
+    let dir = std::path::Path::new(&exe).parent().map(|d| d.to_path_buf()).unwrap_or_default();
+    let mut paths = Vec::new();
+    let mut site = false;
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line == "import site" {
+            site = true;
+            continue;
+        }
+        paths.push(abspath(&dir.join(line)));
+    }
+    Some((paths, site))
+}
+
 fn fatal(msg: &str) -> ! {
     eprintln!("Fatal Python error: {}", msg);
     std::process::exit(1);
@@ -441,11 +481,20 @@ fn real_main() -> i32 {
     if matches!(mode, RunMode::Repl) {
         cfg.interactive = cfg.interactive.max(1);
     }
+    // `<executable>._pth`: fixed sys.path, no environment paths, site only on request
+    let pth_paths = underpth_paths();
+    if let Some((_, import_site)) = &pth_paths {
+        cfg.safe_path = true;
+        cfg.no_user_site = 1;
+        if !import_site {
+            cfg.no_site = 1;
+        }
+    }
     let inspect = cfg.inspect > 0;
     let quiet = cfg.quiet != 0;
     let safe_path = cfg.safe_path;
     let opt = cfg.optimize;
-    let rcfg = rpy_runtime::Config { argv, hash_seed: seed, optimize: opt, sys: cfg };
+    let rcfg = rpy_runtime::Config { argv, hash_seed: seed, optimize: opt, sys: cfg, pth_paths: pth_paths.map(|p| p.0) };
     if rpy_runtime::initialize(&rcfg).is_err() {
         eprintln!("Fatal Python error: initialization failed");
         rpy_runtime::print_exception_and_clear();

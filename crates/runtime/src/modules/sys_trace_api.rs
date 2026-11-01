@@ -191,7 +191,6 @@ fn mon_register_callback(_m: &PyObject, args: &[&PyObject]) -> PyResult {
 fn mon_get_events(_m: &PyObject, t: &PyObject) -> PyResult {
     let tool = tool_arg(t)?;
     let m = MON.lock().unwrap();
-    check_in_use(&m, tool)?;
     Ok(int::new_int(m.global[tool] as i64))
 }
 fn mon_set_events(_m: &PyObject, args: &[&PyObject]) -> PyResult {
@@ -215,7 +214,6 @@ fn mon_get_local_events(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     let tool = tool_arg(args[0])?;
     let code = code_arg(args[1])?;
     let m = MON.lock().unwrap();
-    check_in_use(&m, tool)?;
     Ok(int::new_int(m.local.get(&code).map_or(0, |(_, l)| l[tool]) as i64))
 }
 fn mon_set_local_events(_m: &PyObject, args: &[&PyObject]) -> PyResult {

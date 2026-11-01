@@ -113,7 +113,7 @@ fn gc_set_threshold(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     crate::args::check_pos("set_threshold", args, 1, 3)?;
     let t0 = ab::as_i64(args[0])?;
     crate::gc::THRESHOLD.store(t0.max(0) as usize, Relaxed);
-    crate::gc::USER_THRESHOLD.store(true, Relaxed);
+    crate::gc_support::USER_THRESHOLD.store(true, Relaxed);
     if t0 == 0 {
         // a zero threshold disables automatic collection
     }
@@ -289,8 +289,8 @@ fn gc_totals() -> [usize; 4] {
     [
         crate::gc::COLLECTIONS.load(Relaxed),
         crate::gc::COLLECTED.load(Relaxed),
-        crate::gc::CANDIDATES.load(Relaxed),
-        crate::gc::DURATION_NS.load(Relaxed),
+        crate::gc_support::CANDIDATES.load(Relaxed),
+        crate::gc_support::DURATION_NS.load(Relaxed),
     ]
 }
 
