@@ -60,13 +60,55 @@ fn type_has_dict(tp: *mut PyTypeObject) -> bool {
     unsafe { (*tp).tp_dictoffset != 0 || (*tp).tp_flags & Py_TPFLAGS_MANAGED_DICT != 0 }
 }
 
-/// Instance dict of `o` (borrowed), if it exists.
+/// Instance dict of `o` (borrowed), if it exists. Null for objects keeping their
+/// attributes in inline values (perf-runtime `shape.rs`; see `instance_get_hinted`).
 #[inline(always)]
 fn instance_dict_ptr(o: &PyObject) -> *mut PyObject {
     unsafe {
-        let slot = dict_slot(o.as_ptr());
-        if slot.is_null() { std::ptr::null_mut() } else { *slot }
+        let slot = crate::types::typeobject::dict_slot_raw(o.as_ptr());
+        if slot.is_null() {
+            return std::ptr::null_mut();
+        }
+        let p = *slot;
+        if p as usize & 1 != 0 { std::ptr::null_mut() } else { p }
     }
+}
+
+/// Instance attribute `nm` of `o` (borrowed) from its inline values or its dict.
+/// `hint` is the index in the values / the dict's entries (refreshed on a miss
+/// unless it is u64::MAX).
+#[inline(always)]
+fn instance_get_hinted(o: &PyObject, nm: &PyObject, hint: u64, e: &Entry) -> Option<*mut PyObject> {
+    match crate::shape::get_hinted(o, nm.as_ptr(), hint) {
+        Some(Some((p, i))) => {
+            if i as u64 != hint && hint != u64::MAX {
+                e.set_hint(i as u64);
+            }
+            Some(p)
+        }
+        Some(None) => None,
+        None => {
+            let d = instance_dict_ptr(o);
+            if d.is_null() || (hint == u64::MAX && dict::dict_len(unsafe { &*d }) == 0) {
+                return None;
+            }
+            dict_get_hinted(d, nm, hint, e)
+        }
+    }
+}
+
+/// Index of `nm` in the inline values or the dict of `o` (fill-time hint).
+fn instance_index(o: &PyObject, nm: &PyObject) -> Option<usize> {
+    if let Some(r) = crate::shape::get_hinted(o, nm.as_ptr(), u64::MAX) {
+        return r.map(|(_, i)| i);
+    }
+    let dp = instance_dict_ptr(o);
+    if !dp.is_null() && dict::is_dict_exact(unsafe { &*dp }) {
+        if let Ok(Some(ix)) = dict::lookup_index(unsafe { &*dp }, nm, pystr::str_hash(nm)) {
+            return Some(ix);
+        }
+    }
+    None
 }
 
 /// Look `nm` up in dict `d` using (and refreshing) the entry-index hint.
@@ -164,11 +206,8 @@ fn load_attr_hit(o: &PyObject, nm: &PyObject, e: &Entry) -> Option<PyResult<PyRe
             if cache::type_tag(tp) as u64 != s.a {
                 return None;
             }
-            let d = instance_dict_ptr(o);
-            if !d.is_null() {
-                if let Some(v) = dict_get_hinted(d, nm, s.b, e) {
-                    return Some(Ok(unsafe { PyRef::from_borrowed(v) }));
-                }
+            if let Some(v) = instance_get_hinted(o, nm, s.b, e) {
+                return Some(Ok(unsafe { PyRef::from_borrowed(v) }));
             }
             if s.c != 0 {
                 return Some(bind(s.c as *mut PyObject, o));
@@ -206,11 +245,8 @@ fn load_attr_hit(o: &PyObject, nm: &PyObject, e: &Entry) -> Option<PyResult<PyRe
             if cache::type_tag(tp) as u64 != s.a {
                 return None;
             }
-            let d = instance_dict_ptr(o);
-            if !d.is_null() && dict::dict_len(unsafe { &*d }) != 0 {
-                if let Some(v) = dict_get_hinted(d, nm, u64::MAX, e) {
-                    return Some(Ok(unsafe { PyRef::from_borrowed(v) }));
-                }
+            if let Some(v) = instance_get_hinted(o, nm, u64::MAX, e) {
+                return Some(Ok(unsafe { PyRef::from_borrowed(v) }));
             }
             Some(bind(s.c as *mut PyObject, o))
         }
@@ -310,15 +346,7 @@ fn fill_load_attr(o: &PyObject, nm: &PyObject, method: bool) -> Option<Fill> {
         }
         if has_dict {
             // instance dict first, then the (non-data) class attribute if any
-            let dp = instance_dict_ptr(o);
-            let ix = if !dp.is_null() && dict::is_dict_exact(unsafe { &*dp }) {
-                match dict::lookup_index(unsafe { &*dp }, nm, pystr::str_hash(nm)) {
-                    Ok(Some(ix)) => Some(ix),
-                    _ => None,
-                }
-            } else {
-                None
-            };
+            let ix = instance_index(o, nm);
             return match (&descr, ix) {
                 (Some(d), None) => Some((kind::CLASS_ATTR_SHADOWABLE, tag as u64, 0, d.as_ptr() as usize)),
                 _ => Some((
@@ -377,11 +405,8 @@ pub fn load_method(o: &PyObject, nm: &PyObject, es: &[Entry]) -> PyResult<(PyRef
                 }
                 kind::METHOD_SHADOWABLE => {
                     if cache::type_tag(tp) as u64 == s.a {
-                        let d = instance_dict_ptr(o);
-                        if !d.is_null() && dict::dict_len(unsafe { &*d }) != 0 {
-                            if let Some(v) = dict_get_hinted(d, nm, u64::MAX, e) {
-                                return Ok((unsafe { PyRef::from_borrowed(v) }, None));
-                            }
+                        if let Some(v) = instance_get_hinted(o, nm, u64::MAX, e) {
+                            return Ok((unsafe { PyRef::from_borrowed(v) }, None));
                         }
                         return Ok((unsafe { PyRef::from_borrowed(s.c as *mut PyObject) }, Some(o.to_ref())));
                     }
@@ -418,6 +443,19 @@ pub fn store_attr(o: &PyObject, nm: &PyObject, v: &PyObject, es: &[Entry]) -> Py
             if tag == s.a && s.kind != kind::EMPTY {
                 match s.kind {
                     kind::INSTANCE_DICT => unsafe {
+                        if crate::shape::replace_hinted(o, nm.as_ptr(), s.b, v) {
+                            return Ok(());
+                        }
+                        match crate::shape::set_ix(o, nm, Some(v)) {
+                            (crate::shape::Set::Done, i) => {
+                                if i as u64 != s.b {
+                                    e.set_hint(i as u64);
+                                }
+                                return Ok(());
+                            }
+                            (crate::shape::Set::Missing, _) => {}
+                            (crate::shape::Set::NotValues, _) => {}
+                        }
                         let slot = dict_slot(o.as_ptr());
                         if !slot.is_null() {
                             if (*slot).is_null() {
@@ -470,15 +508,7 @@ fn fill_store_attr(o: &PyObject, nm: &PyObject) -> Option<Fill> {
         return None;
     }
     // hint: where the attribute now lives in the instance dict
-    let hint = || {
-        let dp = instance_dict_ptr(o);
-        if !dp.is_null() && dict::is_dict_exact(unsafe { &*dp }) {
-            if let Ok(Some(ix)) = dict::lookup_index(unsafe { &*dp }, nm, pystr::str_hash(nm)) {
-                return ix as u64;
-            }
-        }
-        u64::MAX
-    };
+    let hint = || instance_index(o, nm).map_or(u64::MAX, |i| i as u64);
     match lookup(tp, nm) {
         Some(d) => {
             if d.ty().tp_descr_set.is_some() {

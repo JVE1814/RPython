@@ -173,7 +173,12 @@ pub fn new_thread_state() -> *mut ThreadState {
             None => Box::into_raw(Box::new(st)),
         };
         (*ts).c.exc_info = &mut (*ts).c.exc_state;
-        ALL_THREADS.lock().unwrap().push(ts as usize);
+        let n = {
+            let mut all = ALL_THREADS.lock().unwrap();
+            all.push(ts as usize);
+            all.len()
+        };
+        crate::qsbr::note_threads(n);
         ts
     }
 }
@@ -234,11 +239,15 @@ pub fn thread_exit() {
             crate::object::xdecref(o);
         }
         process_merge_queue(ts);
+        crate::qsbr::thread_exit();
+        crate::interp::frame::drain_pool();
+        crate::gc::flush_thread_counts();
         ts.alive.store(false, Release);
         ts.exited.store(true, Release);
         {
             let mut all = ALL_THREADS.lock().unwrap();
             all.retain(|&t| t != p as usize);
+            crate::qsbr::note_threads(all.len());
         }
         // objects still queued for this owner get merged by the next decref (owner gone)
         let rest: Vec<usize> = std::mem::take(&mut *ts.merge_queue.lock().unwrap());
@@ -362,6 +371,7 @@ pub fn after_fork_child() {
             }
         }
         all.retain(|&t| t == me);
+        crate::qsbr::note_threads(all.len());
     }
     crate::modules::signal::after_fork_child();
 }

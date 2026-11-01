@@ -130,7 +130,11 @@ pub unsafe extern "C" fn PyThreadState_Clear(ts: *mut c_void) {
 pub unsafe extern "C" fn PyThreadState_Delete(ts: *mut c_void) {
     unsafe {
         PyThreadState_Clear(ts);
-        threads::ALL_THREADS.lock().unwrap().retain(|&t| t != ts as usize);
+        {
+            let mut all = threads::ALL_THREADS.lock().unwrap();
+            all.retain(|&t| t != ts as usize);
+            crate::qsbr::note_threads(all.len());
+        }
         // the memory is intentionally not freed: other threads may still hold pointers
     }
 }

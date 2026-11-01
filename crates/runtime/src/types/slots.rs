@@ -583,6 +583,59 @@ pub fn add_operators(tp: *mut PyTypeObject) -> PyResult<()> {
 }
 
 /// For a new heap type: set every slot from the dunders found along the MRO.
+/// Slot setup for a class just created by `type_new` (after `type_ready`).
+/// perf-runtime (startup): with a single base, every slot whose dunder names do not
+/// appear in the class's own dict was just inherited from the (already fixed-up) base
+/// by type_ready, so only the slots named in the dict need recomputing.
+pub fn fixup_slots_new_type(tp: *mut PyTypeObject) {
+    unsafe {
+        let bases = (*tp).tp_bases;
+        let d = (*tp).tp_dict;
+        if !bases.is_null() && tuple::tuple_len(&*bases) == 1 && !d.is_null() && dict::is_dict_exact(&*d) {
+            static BY_NAME: std::sync::OnceLock<std::collections::HashMap<usize, Vec<Slot>>> = std::sync::OnceLock::new();
+            let by_name = BY_NAME.get_or_init(|| {
+                let mut m: std::collections::HashMap<usize, Vec<Slot>> = std::collections::HashMap::new();
+                for sd in SLOTDEFS.iter() {
+                    let nm = pystr::intern_str(sd.name).into_raw() as usize; // immortal
+                    let e = m.entry(nm).or_default();
+                    if !e.contains(&sd.slot) {
+                        e.push(sd.slot);
+                    }
+                }
+                m
+            });
+            let mut todo: Vec<Slot> = Vec::new();
+            let mut fallback = false;
+            for k in dict::keys_vec(&*d) {
+                if !pystr::is_str_exact(&k) {
+                    if pystr::is_str(&k) {
+                        fallback = true; // str-subclass key: recompute everything
+                        break;
+                    }
+                    continue;
+                }
+                // a name without an interned twin cannot be a slot name
+                let Some(kp) = pystr::lookup_interned(&k) else { continue };
+                if let Some(slots) = by_name.get(&(kp as usize)) {
+                    for &s in slots {
+                        if !todo.contains(&s) {
+                            todo.push(s);
+                        }
+                    }
+                }
+            }
+            if !fallback {
+                for s in todo {
+                    update_one_slot(tp, s);
+                }
+                return;
+            }
+        }
+    }
+    fixup_slots(tp);
+}
+
+/// Recompute every slot of `tp` from its MRO.
 pub fn fixup_slots(tp: *mut PyTypeObject) {
     let mut done: Vec<Slot> = Vec::new();
     for sd in SLOTDEFS.iter() {
@@ -1183,7 +1236,7 @@ unsafe extern "C" fn slot_tp_descr_set(s: *mut PyObject, obj: *mut PyObject, v: 
         if r.is_ok() { 0 } else { -1 }
     }
 }
-unsafe extern "C" fn slot_tp_init(s: *mut PyObject, args: *mut PyObject, kw: *mut PyObject) -> c_int {
+pub unsafe extern "C" fn slot_tp_init(s: *mut PyObject, args: *mut PyObject, kw: *mut PyObject) -> c_int {
     unsafe {
         let s = &*s;
         let f = match lookup(s.type_ptr(), name!("__init__")) {

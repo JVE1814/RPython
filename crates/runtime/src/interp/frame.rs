@@ -39,6 +39,12 @@ pub struct Frame {
     /// globals/builtins are the function's (borrowed: the frame owns `func`, whose
     /// __globals__/__builtins__ cannot be rebound), so no refcount traffic per call.
     pub borrowed_gb: bool,
+    /// `code` and `func` are owned references. False for plain call frames
+    /// (`new_call`): the caller keeps the function alive for the duration of the call
+    /// and a replaced `__code__` is retired, not freed (funcobject.rs). Frames that
+    /// outlive their call (generators, frame objects) are switched to owned first
+    /// (`make_owned`).
+    pub owns_fc: bool,
 }
 
 fn borrows_globals(func: Option<&PyObject>, globals: &PyObject, builtins: &PyObject) -> bool {
@@ -61,15 +67,77 @@ pub enum FrameState {
 }
 
 impl Frame {
+    /// Frame for a plain call of Python function `func` (code/globals/builtins are the
+    /// function's): `code` and `func` are borrowed (see `owns_fc`). Recycled frames
+    /// come from a per-thread pool.
+    #[inline]
+    pub fn new_call(code: &PyObject, func: &PyObject, globals: &PyObject, builtins: &PyObject) -> Box<Frame> {
+        let cd = crate::types::code::code(code);
+        let nlp = cd.obj.co_nlocalsplus as usize;
+        let total = nlp + cd.obj.co_stacksize as usize + 1;
+        match unsafe { (*(&raw mut POOL)).pop() } {
+            Some(mut f) => {
+                unsafe { f.slots.set_len(0) };
+                f.slots.resize(total, std::ptr::null_mut());
+                f.code = code.as_ptr();
+                f.func = func.as_ptr();
+                f.owns_fc = false;
+                f.borrowed_gb = true;
+                f.globals = globals.as_ptr();
+                f.builtins = builtins.as_ptr();
+                f.nlocalsplus = nlp;
+                f.stack_top = nlp;
+                // everything else was reset by `release`
+                f
+            }
+            None => {
+                let mut f = Frame::new(code, Some(func), globals, builtins, None);
+                f.make_borrowed_call();
+                f
+            }
+        }
+    }
+
+    /// Convert a fresh `Frame::new` call frame to the borrowed form of `new_call`.
+    fn make_borrowed_call(&mut self) {
+        if self.owns_fc && self.borrowed_gb {
+            unsafe {
+                xdecref(self.code);
+                xdecref(self.func);
+            }
+            self.owns_fc = false;
+        } else {
+            self.make_owned();
+        }
+    }
+
+    /// Take owned references to `code` and `func` (the frame is about to outlive the
+    /// call that created it: generator, frame object).
+    #[inline]
+    pub fn make_owned(&mut self) {
+        if !self.owns_fc {
+            unsafe {
+                if !self.code.is_null() {
+                    incref(self.code);
+                }
+                if !self.func.is_null() {
+                    incref(self.func);
+                }
+            }
+            self.owns_fc = true;
+        }
+    }
+
     pub fn new(code: &PyObject, func: Option<&PyObject>, globals: &PyObject, builtins: &PyObject, locals: Option<&PyObject>) -> Box<Frame> {
         let cd = crate::types::code::code(code);
         let nlp = cd.obj.co_nlocalsplus as usize;
         let total = nlp + cd.obj.co_stacksize as usize + 1;
-        if let Some(mut f) = POOL.with(|p| p.borrow_mut().pop()) {
-            f.slots.clear();
+        if let Some(mut f) = unsafe { (*(&raw mut POOL)).pop() } {
+            unsafe { f.slots.set_len(0) };
             f.slots.resize(total, std::ptr::null_mut());
             f.code = code.to_ref().into_raw();
             f.func = func.map_or(std::ptr::null_mut(), |f| f.to_ref().into_raw());
+            f.owns_fc = true;
             f.borrowed_gb = borrows_globals(func, globals, builtins);
             f.globals = if f.borrowed_gb { globals.as_ptr() } else { globals.to_ref().into_raw() };
             f.builtins = if f.borrowed_gb { builtins.as_ptr() } else { builtins.to_ref().into_raw() };
@@ -98,6 +166,7 @@ impl Frame {
             globals: if borrowed_gb { globals.as_ptr() } else { globals.to_ref().into_raw() },
             builtins: if borrowed_gb { builtins.as_ptr() } else { builtins.to_ref().into_raw() },
             borrowed_gb,
+            owns_fc: true,
             locals: locals.map_or(std::ptr::null_mut(), |l| l.to_ref().into_raw()),
             prev: std::ptr::null_mut(),
             lasti: 0,
@@ -153,7 +222,6 @@ impl Frame {
         crate::types::code::line_for_instr(self.code(), self.lasti as usize).map(|l| l as i32).unwrap_or(-1)
     }
 }
-
 impl Frame {
     /// Release all references held by the frame (idempotent).
     pub fn release(&mut self) {
@@ -168,16 +236,34 @@ impl Frame {
                 decref(fo as *mut PyObject);
             }
         }
-        self.clear_locals();
+        // locals and value stack in one pass (perf-runtime)
         unsafe {
-            xdecref(self.code);
-            xdecref(self.func);
+            let p = self.slots.as_mut_ptr();
+            let top = self.stack_top.max(self.nlocalsplus).min(self.slots.len());
+            for i in 0..top {
+                let o = *p.add(i);
+                if !o.is_null() {
+                    *p.add(i) = std::ptr::null_mut();
+                    decref(o);
+                }
+            }
+        }
+        self.stack_top = self.nlocalsplus;
+        unsafe {
+            if self.owns_fc {
+                xdecref(self.code);
+                xdecref(self.func);
+            }
             if !self.borrowed_gb {
                 xdecref(self.globals);
                 xdecref(self.builtins);
             }
-            xdecref(self.locals);
-            xdecref(self.f_trace);
+            if !self.locals.is_null() {
+                decref(self.locals);
+            }
+            if !self.f_trace.is_null() {
+                decref(self.f_trace);
+            }
         }
         self.code = std::ptr::null_mut();
         self.func = std::ptr::null_mut();
@@ -185,6 +271,23 @@ impl Frame {
         self.builtins = std::ptr::null_mut();
         self.locals = std::ptr::null_mut();
         self.f_trace = std::ptr::null_mut();
+    }
+
+    /// Reset the bookkeeping fields of a released frame for reuse (`new_call` relies
+    /// on this).
+    #[inline]
+    fn reset(&mut self) {
+        self.prev = std::ptr::null_mut();
+        self.lasti = 0;
+        self.next_instr = 0;
+        self.frame_obj = std::ptr::null_mut();
+        self.generator = std::ptr::null_mut();
+        self.state = FrameState::Created;
+        self.trace_line = -1;
+        self.f_trace_lines = true;
+        self.f_trace_opcodes = false;
+        self.yield_from_send = -1;
+        self.unwind_pc = -1;
     }
 }
 
@@ -194,20 +297,32 @@ impl Drop for Frame {
     }
 }
 
-thread_local! {
-    static POOL: std::cell::RefCell<Vec<Box<Frame>>> = const { std::cell::RefCell::new(Vec::new()) };
-}
+/// Per-thread pool of released frames (plain `#[thread_local]`: no lazy-init check
+/// or RefCell on the call path). Drained by `drain_pool` when the thread exits.
+#[thread_local]
+static mut POOL: Vec<Box<Frame>> = Vec::new();
+const POOL_MAX: usize = 128;
 
 /// Return a finished frame to the per-thread pool.
+#[inline]
 pub fn recycle(mut f: Box<Frame>) {
     f.release();
     if f.slots.capacity() > 4096 {
         return;
     }
-    let _ = POOL.try_with(|p| {
-        let mut p = p.borrow_mut();
-        if p.len() < 128 {
-            p.push(f);
+    unsafe {
+        let pool = &mut *(&raw mut POOL);
+        if pool.len() < POOL_MAX {
+            f.reset();
+            pool.push(f);
         }
-    });
+    }
+}
+
+/// Free the calling thread's pooled frames (thread exit).
+pub fn drain_pool() {
+    unsafe {
+        let pool = std::mem::take(&mut *(&raw mut POOL));
+        drop(pool);
+    }
 }

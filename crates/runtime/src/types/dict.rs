@@ -153,7 +153,7 @@ impl DictTable {
         let mut live: Vec<Entry> = Vec::with_capacity(usable_for(size));
         live.extend(self.entries.iter().copied().filter(|e| !e.key.is_null()));
         self.indices = vec![EMPTY; size];
-        self.entries = live;
+        retire_entries(std::mem::replace(&mut self.entries, live));
         let mask = size - 1;
         for (idx, e) in self.entries.iter().enumerate() {
             let mut perturb = e.hash as usize;
@@ -174,6 +174,12 @@ impl DictTable {
         }
         let slot = self.find_empty_slot(h);
         self.indices[slot] = self.entries.len() as i32;
+        if self.entries.len() == self.entries.capacity() && crate::qsbr::multi_threaded() {
+            // grow by hand so the old buffer can be retired (lock-free readers)
+            let mut nv = Vec::with_capacity((self.entries.capacity() * 2).max(4));
+            nv.extend_from_slice(&self.entries);
+            retire_entries(std::mem::replace(&mut self.entries, nv));
+        }
         self.entries.push(Entry { hash: h, key, value });
         self.used += 1;
         self.version = next_version();
@@ -208,6 +214,25 @@ impl DictTable {
     pub fn nentries(&self) -> usize {
         self.entries.len()
     }
+}
+
+/// Release an entries buffer that lock-free readers (inline caches, JIT code) may
+/// still be scanning: deferred while other threads exist (perf-runtime, D6).
+fn retire_entries(v: Vec<Entry>) {
+    if v.capacity() == 0 || !crate::qsbr::multi_threaded() {
+        return;
+    }
+    unsafe fn free_vec(p: *mut u8) {
+        unsafe { drop(Box::from_raw(p as *mut Vec<Entry>)) }
+    }
+    unsafe { crate::qsbr::free_deferred(Box::into_raw(Box::new(v)) as *mut u8, free_vec) };
+}
+
+/// Release a value/key removed from a dict that lock-free readers may still be
+/// reading (perf-runtime, D6). Immediate decref while single-threaded.
+#[inline(always)]
+unsafe fn release_removed(p: *mut PyObject) {
+    unsafe { crate::qsbr::decref_deferred(p) }
 }
 
 #[inline(always)]
@@ -503,7 +528,7 @@ pub fn set_item_hash(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) -
             t.version = next_version();
             crate::interp::cache::on_dict_write(d); // jit
             drop(g);
-            unsafe { decref(old) };
+            unsafe { release_removed(old) };
         }
         Found::Missing => {
             unsafe { incref(key.as_ptr()) };
@@ -576,7 +601,12 @@ pub fn pop_item_hash(d: &PyObject, key: &PyObject, h: isize) -> PyResult<Option<
             set_used(d, t.used);
             drop(g);
             unsafe {
-                decref(k);
+                release_removed(k);
+                if crate::qsbr::multi_threaded() {
+                    // keep the value alive until racing lock-free readers are done
+                    incref(v);
+                    release_removed(v);
+                }
                 Ok(Some(PyRef::from_raw(v)))
             }
         }
@@ -611,11 +641,13 @@ pub fn clear(d: &PyObject) {
     for e in old.entries.iter() {
         if !e.key.is_null() {
             unsafe {
-                decref(e.key);
-                decref(e.value);
+                release_removed(e.key);
+                release_removed(e.value);
             }
         }
     }
+    let mut old = old;
+    retire_entries(std::mem::take(&mut old.entries));
 }
 
 /// Live entry at or after `*pos` (advances `pos` past it).

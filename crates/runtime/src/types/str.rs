@@ -597,6 +597,21 @@ pub fn intern(s: PyRef) -> PyRef {
     s
 }
 
+/// The interned instance equal to exact str `s`, without interning `s` itself
+/// (perf-runtime: attribute-name lookups against shapes).
+pub fn lookup_interned(s: &PyObject) -> Option<*mut PyObject> {
+    if is_interned(s) {
+        return Some(s.as_ptr());
+    }
+    if !is_str_exact(s) {
+        return None;
+    }
+    let key = str_hash(s);
+    let g = INTERNED.lock().unwrap();
+    let t = g.as_ref()?;
+    t.map.get(&key).and_then(|b| b.iter().find(|&&p| str_eq(unsafe { &*(p as *mut PyObject) }, s))).map(|&p| p as *mut PyObject)
+}
+
 pub fn intern_str(s: &str) -> PyRef {
     intern(new_str(s))
 }

@@ -470,7 +470,8 @@ unsafe extern "C" fn ref_dealloc(o: *mut PyObject) {
         let tp = (*o).type_ptr();
         if is_heap_type(tp) {
             // subclass instance: clear its own dict/weakrefs via subtype path
-            let slot = dict_slot(o);
+            crate::shape::clear_values(o, false);
+            let slot = crate::types::typeobject::dict_slot_raw(o);
             if !slot.is_null() && !(*slot).is_null() {
                 let d = std::mem::replace(&mut *slot, std::ptr::null_mut());
                 decref(d);

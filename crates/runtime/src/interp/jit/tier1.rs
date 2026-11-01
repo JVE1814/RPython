@@ -848,9 +848,39 @@ impl<'a> Gen<'a> {
         self.a.load(Rdx, M(obj, MANAGED_DICT));
         self.a.test_rr(Rdx, Rdx);
         self.a.jcc(Cc::E, null);
+        // inline values (perf-runtime shape.rs): tagged pointer, not a dict
+        self.a.mov_rr(Rsi, Rdx);
+        self.a.and_ri(Rsi, 1);
+        self.a.jcc(Cc::NE, slow);
         self.a.mov_ri(Rsi, crate::types::dict::dict_type() as i64);
         self.a.cmp_rm(Rsi, M(Rdx, OB_TYPE));
         self.a.jcc(Cc::NE, slow);
+    }
+    /// Inline values (perf-runtime `shape.rs`): rsi = borrowed value at index `hint` if
+    /// obj keeps its attributes inline and its shape has `name` there; jumps to
+    /// `notvalues` if obj is not in values mode, to `slow` otherwise. Clobbers rcx/rdx.
+    fn inline_values(&mut self, obj: R, hint: u64, name: i64, slow: Label, notvalues: Label) {
+        let (sh_off, vals_off, _id_off, len_off, keys_off) = crate::shape::jit_layout();
+        let h = hint as i32;
+        self.a.load8(Rdx, M(obj, GC_BITS));
+        self.a.and_ri(Rdx, crate::alloc::GC_BIT_MANAGED as i32);
+        self.a.jcc(Cc::E, notvalues);
+        self.a.load(Rdx, M(obj, MANAGED_DICT));
+        self.a.mov_rr(Rsi, Rdx);
+        self.a.and_ri(Rsi, 1);
+        self.a.jcc(Cc::E, notvalues);
+        self.a.load(Rcx, M(Rdx, sh_off - 1));
+        self.a.test_rr(Rcx, Rcx);
+        self.a.jcc(Cc::E, slow);
+        self.a.cmp32_mi(M(Rcx, len_off), h);
+        self.a.jcc(Cc::BE, slow);
+        self.a.load(Rcx, M(Rcx, keys_off));
+        self.a.mov_ri(Rsi, name);
+        self.a.cmp_rm(Rsi, M(Rcx, h * 8));
+        self.a.jcc(Cc::NE, slow);
+        self.a.load(Rsi, M(Rdx, vals_off - 1 + h * 8));
+        self.a.test_rr(Rsi, Rsi);
+        self.a.jcc(Cc::E, slow);
     }
     /// rsi = value at entry `hint` of the dict in rdx if its key is `name`, else slow.
     /// Clobbers rdx.
@@ -892,6 +922,13 @@ impl<'a> Gen<'a> {
                 (Op::LoadAttr, kind::INSTANCE_DICT) if s.b < (1 << 20) => {
                     self.a.load(Rax, obj);
                     self.guard_tag(Rax, tag, slow);
+                    let dict_path = self.a.label();
+                    self.inline_values(Rax, s.b, name, slow, dict_path);
+                    self.incref(Rsi);
+                    self.a.store(obj, Rsi);
+                    self.decref(Rax);
+                    self.a.jmp(done);
+                    self.a.bind(dict_path);
                     self.managed_dict(Rax, slow, slow);
                     if self.dict_hinted(s.b, name, slow) {
                         self.incref(Rsi);

@@ -244,7 +244,14 @@ fn f_set_code(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
             nfree
         );
     }
-    replace(&mut func(o).func_code, Some(v));
+    // perf-runtime: running call frames borrow their code object from the function
+    // (interp::frame, no refcount traffic per call), so the old code object must
+    // outlive any frame still executing it: it is retired instead of released.
+    let old = std::mem::replace(&mut func(o).func_code, v.to_ref().into_raw());
+    if !old.is_null() {
+        static RETIRED_CODE: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+        RETIRED_CODE.lock().unwrap().push(old as usize);
+    }
     func(o).func_version = FUNC_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
