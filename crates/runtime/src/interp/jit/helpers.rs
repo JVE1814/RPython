@@ -89,12 +89,14 @@ pub unsafe extern "C" fn h_dict_lacks(d: *mut PyObject, name: *mut PyObject) -> 
 /// (taking ownership of `v`): 0 done, 1 key not there (nothing consumed).
 pub unsafe extern "C" fn h_dict_replace(d: *mut PyObject, ix: u64, name: *mut PyObject, v: *mut PyObject) -> u64 {
     unsafe {
+        let g = dict::ob_lock(&*d);
         let t = dict::table(&*d);
         match t.entries.get_mut(ix as usize) {
             Some(e) if e.key == name => {
                 let old = std::mem::replace(&mut e.value, v);
                 t.version = crate::interp::cache::next_dict_version();
                 crate::interp::cache::on_dict_write(&*d);
+                drop(g);
                 decref(old);
                 0
             }

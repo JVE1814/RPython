@@ -139,9 +139,7 @@ impl<'a> Parser<'a> {
     /// pattern: as_pattern | or_pattern
     pub(crate) fn pattern(&mut self) -> R<Pattern> {
         let start = self.p;
-        self.enter()?;
-        let r = self.or_pattern();
-        self.leave();
+        let r = self.recurse(|p| p.or_pattern());
         let Some(p) = r? else { return Ok(None) };
         if self.at_kw(Kw::As) {
             let m = self.p;

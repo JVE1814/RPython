@@ -279,6 +279,11 @@ fn class_getitem(cls: &PyObject, arg: &PyObject) -> PyResult {
 
 pub fn setup_type(tp: *mut PyTypeObject, is_base: bool) {
     if !is_base {
+        // class ExceptionGroup(BaseExceptionGroup, Exception)
+        unsafe {
+            let bases = tuple::new_tuple(vec![type_ref(exc::BaseExceptionGroup()), type_ref(exc::Exception())]);
+            (*tp).tp_bases = bases.into_raw();
+        }
         return;
     }
     unsafe {
@@ -328,8 +333,11 @@ pub fn eg_match(e: &PyObject, t: &PyObject) -> PyResult<(PyRef, PyRef)> {
     }
     if is_exception_group(e) {
         let pair = ab::call_method(e, name!("split"), &[t])?;
-        if !tuple::is_tuple(&pair) || tuple::tuple_len(&pair) != 2 {
-            raise!(TypeError, "{}.split must return a 2-tuple, got {}", type_name(e.ty()), tname(&pair));
+        if !tuple::is_tuple(&pair) {
+            raise!(TypeError, "{}.split must return a tuple, not {}", type_name(e.ty()), tname(&pair));
+        }
+        if tuple::tuple_len(&pair) < 2 {
+            raise!(TypeError, "{}.split must return a 2-tuple, got tuple of size {}", type_name(e.ty()), tuple::tuple_len(&pair));
         }
         let m = tuple::tuple_get(&pair, 0).to_ref();
         let r = tuple::tuple_get(&pair, 1).to_ref();
@@ -404,6 +412,9 @@ pub fn prep_reraise_star(orig: &PyObject, excs: &PyObject) -> PyResult {
     }
     if let Some(r) = reraised_eg {
         raised.push(r);
+    }
+    if raised.len() == 1 {
+        return Ok(raised.pop().unwrap());
     }
     create_exception_group("", raised)
 }

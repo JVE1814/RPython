@@ -1,12 +1,13 @@
+pub mod complex_pow;
+pub mod namespace;
 pub mod genericalias;
 pub mod lang_util;
 pub mod structseq;
-pub mod bootstrap_builtins;
-pub mod complex_pow;
 pub mod asyncgen;
 pub mod bool_;
 pub mod bytearray;
 pub mod bytes;
+pub mod bytes_methods;
 pub mod cfunction;
 pub mod code;
 pub mod complex;
@@ -40,6 +41,7 @@ pub mod tuple;
 pub mod typeobject;
 pub mod typevar;
 pub mod union;
+pub mod sentinel;
 pub mod weakref;
 pub mod frameobject_proxy;
 pub mod format_impl;
@@ -65,6 +67,7 @@ pub fn builtin_types() -> Vec<(&'static str, *mut PyTypeObject)> {
         ("str", str::str_type()),
         ("bytes", bytes::bytes_type()),
         ("bytearray", bytearray::bytearray_type()),
+        ("memoryview", memoryview::memoryview_type()),
         ("tuple", tuple::tuple_type()),
         ("list", list::list_type()),
         ("dict", dict::dict_type()),
@@ -74,9 +77,10 @@ pub fn builtin_types() -> Vec<(&'static str, *mut PyTypeObject)> {
         ("staticmethod", funcobject::staticmethod_type()),
         ("classmethod", funcobject::classmethod_type()),
         ("super", super_::super_type()),
+        ("sentinel", sentinel::sentinel_type()),
     ]
     .into_iter()
-    .chain(bootstrap_builtins::types())
+    .chain(containers_reg::builtin_types())
     .collect()
 }
 
@@ -92,16 +96,18 @@ pub fn init_all() -> crate::errors::PyResult<()> {
     float_methods::init_types();
     complex_methods::init_types();
     core_slots::init_types();
+    bytes_methods::init_types();
+    bytearray::init_types();
+    memoryview::init_types();
     exceptions::init_types();
     code::init_types();
     module::init_types();
     frameobject::init_types();
     traceback::init_types();
     genobject::init_types();
-    iterobject::init_types();
     super_::init_types();
-    dictview::init_types();
-    bootstrap_builtins::init_types();
+    containers_reg::init_types();
+    sentinel::init_types();
     frameobject_proxy::init_types();
     use typeobject::type_ready;
     type_ready(typeobject::object_type())?;
@@ -149,9 +155,12 @@ pub fn init_all() -> crate::errors::PyResult<()> {
         type_ready(t)?;
     }
     exceptions::ready_all()?;
-    dictview::ready()?;
-    bootstrap_builtins::ready()?;
+    containers_reg::ready()?;
+    sentinel::ready()?;
     type_ready(frameobject_proxy::proxy_type())?;
+    bytes_methods::ready()?;
+    bytearray::ready()?;
+    memoryview::ready()?;
     str_methods::ready_types()?;
     lang_init()?;
     Ok(())
@@ -169,3 +178,9 @@ fn lang_init() -> crate::errors::PyResult<()> {
     genericalias::register_builtin_class_getitems();
     Ok(())
 }
+pub mod containers_reg;
+pub mod range;
+pub mod enumerate;
+pub mod builtin_iters;
+pub mod property;
+pub mod frozendict;

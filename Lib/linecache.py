@@ -157,8 +157,20 @@ def _find_cookie(line):
 
 
 def _read_lines(fullname):
-    with open(fullname, 'rb') as fp:
-        data = fp.read()
+    # Read with os-level calls: linecache is used while printing tracebacks,
+    # possibly before (or without) the io machinery being usable.
+    import os
+    fd = os.open(fullname, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1 << 16)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    data = b"".join(chunks)
     text = _decode_source(data)
     text = text.replace('\r\n', '\n').replace('\r', '\n')
     return _split_nl(text)
@@ -259,7 +271,7 @@ def updatecache(filename, module_globals=None):
         # otherwise try to lookup right now.
         lazy_entry = entry if entry is not None and len(entry) == 1 else None
         if lazy_entry is None:
-            lazy_entry = _make_lazycache_entry(filename, module_globals)
+            lazy_entry = _make_lazycache_entry(filename, module_globals, bless=True)
         if lazy_entry is not None:
             try:
                 data = lazy_entry[0]()
@@ -341,17 +353,28 @@ def _bless_my_loader(module_globals):
     return spec_loader
 
 
-def _make_lazycache_entry(filename, module_globals):
+def _make_lazycache_entry(filename, module_globals, bless=False):
     if not filename or (filename.startswith('<') and filename.endswith('>')):
         return None
     # Try for a __loader__, if available
     if module_globals and '__name__' in module_globals:
         spec = module_globals.get('__spec__')
         name = getattr(spec, 'name', None) or module_globals['__name__']
-        try:
-            loader = _bless_my_loader(module_globals)
-        except (ImportError, AttributeError, ValueError):
-            return None
+        if bless:
+            # Validate __loader__ against __spec__.loader (deprecation
+            # warnings for inconsistent module globals).
+            try:
+                loader = _bless_my_loader(module_globals)
+            except (AttributeError, ValueError) as exc:
+                import warnings
+                warnings.warn(str(exc), DeprecationWarning)
+                return None
+            except ImportError:
+                return None
+        else:
+            loader = getattr(spec, 'loader', None)
+            if loader is None:
+                loader = module_globals.get('__loader__')
         get_source = getattr(loader, 'get_source', None)
         if name and get_source:
             def get_lines(name=name, *args, **kwargs):
