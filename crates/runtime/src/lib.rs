@@ -40,6 +40,7 @@ pub fn initialize(cfg: &Config) -> PyResult<()> {
     let _ = threads::current();
     types::int::init_small_ints();
     types::init_all()?;
+    modules::register_all();
     modules::sys::init_bootstrap_types();
     let _b = builtins::init()?;
     let sys = modules::sys::create_sys_module(&cfg.argv)?;
@@ -48,7 +49,10 @@ pub fn initialize(cfg: &Config) -> PyResult<()> {
     let _ = sys;
     // sys.path: script dir is added by the caller; then the stdlib
     let prefix = modules::sys_full::prefix();
-    let stdlib = std::env::var("RPYTHON_STDLIB").unwrap_or_else(|_| format!("{}/lib/python3.15t", prefix));
+    let stdlib = std::env::var("RPYTHON_STDLIB").unwrap_or_else(|_| {
+        let p = format!("{}/lib/python3.15t", prefix);
+        if std::path::Path::new(&p).is_dir() { p } else { concat!(env!("CARGO_MANIFEST_DIR"), "/../../Lib").to_string() }
+    });
     let path = modules::sys::get_sys_attr("path").unwrap();
     if let Ok(pp) = std::env::var("PYTHONPATH") {
         for p in pp.split(':').filter(|p| !p.is_empty()) {
