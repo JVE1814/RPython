@@ -72,9 +72,9 @@ Owner of `crates/compress` (rpy-compress) and the compression/archive modules fr
   support in the runtime (our interpreter ignores it).
 - test_zipimport: all pass; test_zipimport_support: 3/5 — the remaining two fail inside
   doctest itself (doctest output/parsing differences), not in zipimport.
-- test_zipfile (core): passes except tests needing the `email` package and the
-  `shift_jis` codec (not in master yet; the module cannot even be imported without
-  shift_jis — checked with a local copy that substitutes utf-8).
+- test_zipfile (core): every test passes when run from a local copy; the spec module
+  itself cannot be imported yet because the `shift_jis` codec is missing in master
+  (the copy substitutes utf-8 for it; only its EncodedMetadataTests are then invalid).
 - test_zipfile64: skipped (resource).
 
 ## Known gaps / ideas
