@@ -21,8 +21,14 @@
 ## Regression suite
 Reference (CPython 3.15.2 free-threaded, this machine, tools/run_tests.sh):
 434 modules: 416 PASS, 18 FAIL; tests run 50,649, failures 24, skipped 3,371.
-(tools/baseline_ft_results.tsv). Default-build reference: running.
-Ours: regrtest not runnable yet (needs harness/system/osio/functional stdlib merges).
+(tools/baseline_ft_results.tsv). Default-build reference: 416 PASS, 18 FAIL; run 50,576, failures 24, skipped 3,353.
+
+Ours (tools/run_tests.sh, 434 modules):
+| run | rev | PASS | FAIL | CRASH | TIMEOUT | tests run | failures | skipped |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 48f4a4f | 74 | 350 | 9 | 1 | 2,907 | 271 | 312 |
+Run 1 top blockers: py_compile (230 modules; merged since), unittest.mock (57), doctest (24),
+array (24), socket (17), pathlib (16), http (14), multiprocessing, decimal, datetime, ntpath.
 
 ## Benchmarks (preliminary, noisy machine)
 | metric | ours | py-default | py-ft |
