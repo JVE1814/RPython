@@ -352,6 +352,44 @@ pub fn os_openpty(_m: &PyObject) -> PyResult {
     Ok(tuple::new_tuple(vec![int::new_int(master as i64), int::new_int(slave as i64)]))
 }
 
+/// os.login_tty(fd): make `fd` the controlling terminal and the standard
+/// streams of the calling process (in a new session), then close it.
+pub fn os_login_tty(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    crate::args::check_pos("login_tty", args, 1, 1)?;
+    let fd = c_int(args[0])?;
+    unsafe {
+        // become a session leader (fails harmlessly if we already are one)
+        libc::setsid();
+        if libc::ioctl(fd, libc::TIOCSCTTY as _, 0) < 0 {
+            return Err(os_err());
+        }
+        for target in 0..3 {
+            if fd != target && libc::dup2(fd, target) < 0 {
+                return Err(os_err());
+            }
+        }
+        if fd > 2 {
+            libc::close(fd);
+        }
+    }
+    ok_none()
+}
+
+/// posix._is_inputhook_installed(): whether PyOS_InputHook is set (e.g. by Tk).
+pub fn os_is_inputhook_installed(_m: &PyObject) -> PyResult {
+    Ok(bool_::new_bool(unsafe { (*(&raw const crate::capi::misc::PyOS_InputHook)).is_some() }))
+}
+
+/// posix._inputhook(): run PyOS_InputHook once (no-op when unset).
+pub fn os_inputhook(_m: &PyObject) -> PyResult {
+    let hook = unsafe { *(&raw const crate::capi::misc::PyOS_InputHook) };
+    let r = match hook {
+        Some(h) => unsafe { h() },
+        None => 0,
+    };
+    Ok(int::new_int(r as i64))
+}
+
 pub unsafe fn set_inheritable_fd(fd: i32, inheritable: bool) -> PyResult<()> {
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFD);
