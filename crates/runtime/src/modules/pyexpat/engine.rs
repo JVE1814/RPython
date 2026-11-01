@@ -863,9 +863,7 @@ impl Engine {
                 }
                 Enc::Utf16Le | Enc::Utf16Be => {
                     if i + 2 > n {
-                        if final_ {
-                            result = Err((E_PARTIAL_CHAR, self.buf.len()));
-                        }
+                        // a lone trailing byte is reported by at_eof
                         break;
                     }
                     let le = matches!(enc, Enc::Utf16Le);

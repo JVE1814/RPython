@@ -16,4 +16,11 @@ for b in html xml email tomllib xmlrpc _markupbase.py quopri.py mimetypes.py mai
          smtplib.py imaplib.py poplib.py ftplib.py optparse.py webbrowser.py; do
   if [ -e "$W/Lib/$b" ]; then rm -f "$OUT/$b"; ln -s "$W/Lib/$b" "$OUT/$b"; fi
 done
+# optional extra Lib dirs (other workstreams' worktrees) for missing modules
+for x in $EXTRA; do
+  for e in "$x"/*; do
+    b=$(basename "$e")
+    [ -e "$OUT/$b" ] || ln -s "$e" "$OUT/$b"
+  done
+done
 echo "overlay ready: $OUT"
