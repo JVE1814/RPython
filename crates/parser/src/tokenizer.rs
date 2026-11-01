@@ -22,11 +22,19 @@ pub struct LexOptions {
     /// Emit TYPE_COMMENT / TYPE_IGNORE tokens.
     pub type_comments: bool,
     pub hooks: UnicodeHooks,
+    /// Treat a missing final newline as present (CPython does this for 'exec' input and for
+    /// the tokenize module).
+    pub implicit_newline: bool,
+    /// 'single' input: at EOF in the middle of a line insert a NEWLINE (and, unless
+    /// `dont_imply_dedent`, the pending DEDENTs) like CPython's parser does.
+    pub single_input: bool,
+    /// PyCF_DONT_IMPLY_DEDENT
+    pub dont_imply_dedent: bool,
 }
 
 impl Default for LexOptions {
     fn default() -> Self {
-        LexOptions { extra_tokens: false, type_comments: false, hooks: UnicodeHooks::default() }
+        LexOptions { extra_tokens: false, type_comments: false, hooks: UnicodeHooks::default(), implicit_newline: true, single_input: false, dont_imply_dedent: false }
     }
 }
 
@@ -99,6 +107,12 @@ pub struct Lexer<'a> {
     pushback: Option<Token>,
     eof_reads: u32,
     empty_middle_done: bool,
+    inserted_newline: bool,
+    /// EOF has been read (tokens produced from now on are "end of source" tokens)
+    pub reached_eof: bool,
+    /// The tokenizer reached the end of the input (normally, or in an unterminated
+    /// string/bracket/continuation at EOF): CPython's E_EOF/E_EOFS/E_EOLS.
+    pub eof_error: bool,
 }
 
 #[inline]
@@ -118,7 +132,7 @@ impl<'a> Lexer<'a> {
     /// Create a lexer. In parser mode the source should already have newlines normalized
     /// (`\r\n` and `\r` -> `\n`); a missing final newline is handled implicitly.
     pub fn new(src: &'a str, opts: LexOptions) -> Lexer<'a> {
-        let implicit_newline = !src.is_empty() && !src.ends_with('\n') && !src.ends_with('\r');
+        let implicit_newline = opts.implicit_newline && !src.is_empty() && !src.ends_with('\n') && !src.ends_with('\r');
         Lexer {
             src,
             b: src.as_bytes(),
@@ -143,6 +157,9 @@ impl<'a> Lexer<'a> {
             pushback: None,
             eof_reads: 0,
             empty_middle_done: false,
+            inserted_newline: false,
+            reached_eof: false,
+            eof_error: false,
         }
     }
 
@@ -448,17 +465,24 @@ impl<'a> Lexer<'a> {
 
                 if c < 0 {
                     // EOF
+                    self.reached_eof = true;
                     if !self.parens.is_empty() {
                         let p = *self.parens.last().unwrap();
-                        if self.opts.extra_tokens {
-                            // tokenize module: no error for unclosed parens at EOF here
-                        }
+                        self.eof_error = true;
                         return Err(LexError::UnclosedParen(p.ch, p.lineno, p.col));
                     }
-                    if !self.modes.is_empty() {
-                        // EOF inside an f-string replacement field: handled as unclosed paren
+                    let mid_line = !self.b.is_empty() && !self.implicit_newline && !matches!(self.b.last(), Some(b'\n') | Some(b'\r'));
+                    if self.opts.single_input && mid_line && !self.inserted_newline {
+                        self.inserted_newline = true;
+                        if self.line_has_tokens {
+                            self.line_has_tokens = false;
+                            let p = self.b.len();
+                            let col = self.col_of(p);
+                            return Ok(Token { ty: TokenType::NEWLINE, kw: Kw::None, level: 0, start: p as u32, end: p as u32, lineno: self.lineno, col, end_lineno: self.lineno, end_col: col });
+                        }
                     }
-                    if self.indents.len() > 1 {
+                    let allow_dedent = !(mid_line && self.opts.dont_imply_dedent) && !(mid_line && !self.opts.single_input);
+                    if allow_dedent && self.indents.len() > 1 {
                         // emit dedents
                         self.indents.pop();
                         self.alt_indents.pop();
@@ -467,9 +491,11 @@ impl<'a> Lexer<'a> {
                         return Ok(Token { ty: TokenType::DEDENT, kw: Kw::None, level: self.parens.len() as u16, start: p as u32, end: p as u32, lineno: ln, col, end_lineno: ln, end_col: col });
                     }
                     self.finished = true;
+                    self.eof_error = true;
                     let p = self.b.len();
                     let ln = self.lineno;
-                    return Ok(Token { ty: TokenType::ENDMARKER, kw: Kw::None, level: self.parens.len() as u16, start: p as u32, end: p as u32, lineno: ln, col: 0, end_lineno: ln, end_col: 0 });
+                    let col = if mid_line { self.col_of(p) } else { 0 };
+                    return Ok(Token { ty: TokenType::ENDMARKER, kw: Kw::None, level: self.parens.len() as u16, start: p as u32, end: p as u32, lineno: ln, col, end_lineno: ln, end_col: col });
                 }
 
                 // newline
@@ -581,6 +607,7 @@ impl<'a> Lexer<'a> {
         self.next();
         if self.peek() < 0 {
             // EOF after continuation
+            self.eof_error = true;
             if let Some(p) = self.parens.last() {
                 return Err(LexError::UnclosedParen(p.ch, p.lineno, p.col));
             }
@@ -1069,6 +1096,9 @@ impl<'a> Lexer<'a> {
             let c = self.peek();
             if c < 0 || (quote_size == 1 && (c == b'\n' as i32 || c == b'\r' as i32)) {
                 let detected = if c < 0 { self.last_line_no() } else { self.lineno };
+                if c < 0 {
+                    self.eof_error = true;
+                }
                 // report at the string start
                 if !self.modes.is_empty() {
                     let m = *self.modes.last().unwrap();
@@ -1239,6 +1269,12 @@ impl<'a> Lexer<'a> {
                         ));
                     }
                     let detected = if c < 0 { self.last_line_no() } else { self.lineno };
+                    if c < 0 {
+                        self.eof_error = true;
+                    }
+                if c < 0 {
+                    self.eof_error = true;
+                }
                     let msg = if m.quote_size == 3 {
                         format!("unterminated triple-quoted {}-string literal (detected at line {})", prefix, detected)
                     } else {
@@ -2022,7 +2058,7 @@ impl<'a> TokenIter<'a> {
     /// `extra_tokens = true` gives the `tokenize.tokenize()`/`generate_tokens()` stream;
     /// false gives the raw C-tokenizer stream.
     pub fn new(src: &'a str, extra_tokens: bool, hooks: UnicodeHooks) -> TokenIter<'a> {
-        TokenIter { lexer: Lexer::new(src, LexOptions { extra_tokens, type_comments: false, hooks }), extra: extra_tokens, done: false }
+        TokenIter { lexer: Lexer::new(src, LexOptions { extra_tokens, type_comments: false, hooks, ..Default::default() }), extra: extra_tokens, done: false }
     }
 
     fn convert(&self, t: &Token) -> PyToken {

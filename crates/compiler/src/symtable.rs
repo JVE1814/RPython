@@ -1639,6 +1639,10 @@ impl<'a> Analyzer<'a> {
                     if flags & DEF_BOUND != 0 && parent_kind != ScopeKind::Class && !self.is_free_in_any_child(comp, &s.name) {
                         comp_free.remove(&s.name);
                     }
+                    // a load in the comprehension of the parent's variable counts as a use
+                    if parent_kind != ScopeKind::Class && scope == SymScope::Free && only_flags & USE != 0 {
+                        self.scopes[sid].set_symbol(&s.name, flags | USE);
+                    }
                 }
             }
         }
