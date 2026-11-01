@@ -150,6 +150,7 @@ impl<'a> Parser<'a> {
 
     /// `'*' expression` where the expression is a conditional: "invalid starred expression..."
     /// (also for '**'). `start` is the index of the star token.
+    #[inline(never)]
     pub(crate) fn invalid_starred_conditional(&mut self, start: usize) -> Result<(), PErr> {
         let m = self.p;
         self.p = start;
@@ -174,6 +175,7 @@ impl<'a> Parser<'a> {
 
     /// In the second pass: `**` at a position where only a dict display allows it.
     /// `what` describes the context ("list comprehension", "generator expression", ...).
+    #[inline(never)]
     fn invalid_double_star_elt(&mut self, ctx: &str) -> Result<(), PErr> {
         let start = self.p;
         if !self.at(T::DOUBLESTAR) {
@@ -239,9 +241,7 @@ impl<'a> Parser<'a> {
     // ================================================================ expression
 
     pub(crate) fn expression(&mut self) -> R<Expr> {
-        self.enter()?;
-        let r = self.expression_inner();
-        self.leave();
+        let r = self.recurse(|p| p.expression_inner());
         r
     }
 
@@ -273,6 +273,7 @@ impl<'a> Parser<'a> {
     }
 
     /// yield_expr: 'yield' 'from' expression | 'yield' [star_expressions]
+    #[inline(never)]
     pub(crate) fn yield_expr(&mut self) -> R<Expr> {
         let start = self.p;
         if self.eat_kw(Kw::Yield).is_none() {
@@ -350,9 +351,7 @@ impl<'a> Parser<'a> {
         let start = self.p;
         if self.at_kw(Kw::Not) {
             self.advance();
-            self.enter()?;
-            let r = self.inversion();
-            self.leave();
+            let r = self.recurse(|p| p.inversion());
             match r? {
                 Some(e) => return Ok(Some(Expr::new(ExprKind::UnaryOp { op: UnaryOp::Not, operand: bx(e) }, self.loc(start)))),
                 None => {
@@ -476,9 +475,7 @@ impl<'a> Parser<'a> {
             let right = if prec == 6 {
                 self.factor()?
             } else {
-                self.enter()?;
-                let r = self.binop_expr(prec + 1);
-                self.leave();
+                let r = self.recurse(|p| p.binop_expr(prec + 1));
                 r?
             };
             match right {
@@ -538,9 +535,7 @@ impl<'a> Parser<'a> {
     }
 
     fn factor_rec(&mut self) -> R<Expr> {
-        self.enter()?;
-        let r = self.factor();
-        self.leave();
+        let r = self.recurse(|p| p.factor());
         r
     }
 
@@ -649,6 +644,7 @@ impl<'a> Parser<'a> {
     }
 
     /// '(' ... ')' after a primary: either a bare generator expression argument or arguments.
+    #[inline(never)]
     fn call_trailer(&mut self, _start: usize) -> R<(Vec<Expr>, Vec<Keyword>)> {
         let allow_genexp = !std::mem::replace(&mut self.no_genexp_arg, false);
         let lpar = self.p;
@@ -656,9 +652,7 @@ impl<'a> Parser<'a> {
         if self.eat(T::RPAR).is_some() {
             return Ok(Some((Vec::new(), Vec::new())));
         }
-        self.enter()?;
-        let r = self.arguments_after_lpar(lpar, allow_genexp);
-        self.leave();
+        let r = self.recurse(|p| p.arguments_after_lpar(lpar, allow_genexp));
         let Some((args, kws)) = r? else { return Ok(None) };
         if self.eat(T::RPAR).is_none() {
             if self.invalid {
@@ -672,6 +666,7 @@ impl<'a> Parser<'a> {
     // ================================================================ slices
 
     /// slices: slice !',' | ','.(slice | starred_expression)+ [',']
+    #[inline(never)]
     fn slices(&mut self) -> R<Expr> {
         let start = self.p;
         let first = if self.at(T::STAR) { self.starred_expression()? } else { self.slice()? };
@@ -742,6 +737,7 @@ impl<'a> Parser<'a> {
     }
 
     /// starred_expression: '*' expression
+    #[inline(never)]
     pub(crate) fn starred_expression(&mut self) -> R<Expr> {
         let start = self.p;
         if self.eat(T::STAR).is_none() {
@@ -786,21 +782,15 @@ impl<'a> Parser<'a> {
             }
             T::STRING | T::FSTRING_START | T::TSTRING_START => self.strings(),
             T::LPAR => {
-                self.enter()?;
-                let r = self.paren_atom();
-                self.leave();
+                let r = self.recurse(|p| p.paren_atom());
                 r
             }
             T::LSQB => {
-                self.enter()?;
-                let r = self.list_atom();
-                self.leave();
+                let r = self.recurse(|p| p.list_atom());
                 r
             }
             T::LBRACE => {
-                self.enter()?;
-                let r = self.brace_atom();
-                self.leave();
+                let r = self.recurse(|p| p.brace_atom());
                 r
             }
             T::ELLIPSIS => {
@@ -813,6 +803,7 @@ impl<'a> Parser<'a> {
 
     /// Parse the element of a genexp / group: assignment_expression | expression !':='
     /// (plus PEP 798 starred element).
+    #[inline(never)]
     fn group_element(&mut self) -> R<Expr> {
         let t = self.peek();
         if t.ty == T::NAME && !t.kw.is_hard() && self.peek_n(1).ty == T::COLONEQUAL {
@@ -822,6 +813,7 @@ impl<'a> Parser<'a> {
     }
 
     /// '(' ... ')': tuple | group | genexp
+    #[inline(never)]
     fn paren_atom(&mut self) -> R<Expr> {
         let start = self.p;
         self.advance(); // '('
@@ -925,6 +917,7 @@ impl<'a> Parser<'a> {
     }
 
     /// '[' ... ']': list | listcomp
+    #[inline(never)]
     fn list_atom(&mut self) -> R<Expr> {
         let start = self.p;
         self.advance();
@@ -976,6 +969,7 @@ impl<'a> Parser<'a> {
     }
 
     /// '{' ... '}': dict | set | dictcomp | setcomp
+    #[inline(never)]
     fn brace_atom(&mut self) -> R<Expr> {
         let start = self.p;
         self.advance();
@@ -1086,6 +1080,7 @@ impl<'a> Parser<'a> {
         self.set_rest(start, first)
     }
 
+    #[inline(never)]
     fn set_rest(&mut self, start: usize, first: Expr) -> R<Expr> {
         if self.at_comprehension_start() {
             let Some(generators) = self.for_if_clauses()? else {
@@ -1122,6 +1117,7 @@ impl<'a> Parser<'a> {
         Ok(None)
     }
 
+    #[inline(never)]
     fn dict_rest(&mut self, start: usize, k: Option<Expr>, v: Expr) -> R<Expr> {
         let mut keys = vec![k];
         let mut values = vec![v];
@@ -1173,6 +1169,7 @@ impl<'a> Parser<'a> {
     // ================================================================ comprehensions
 
     /// for_if_clauses: for_if_clause+
+    #[inline(never)]
     pub(crate) fn for_if_clauses(&mut self) -> R<Vec<Comprehension>> {
         let mut v = Vec::new();
         while self.at_comprehension_start() {
@@ -1226,6 +1223,7 @@ impl<'a> Parser<'a> {
 
     /// invalid_for_if_clause: 'async'? 'for' (bitwise_or (',' bitwise_or)* [',']) !'in'
     /// (called right after 'for').
+    #[inline(never)]
     fn invalid_for_if_clause(&mut self) -> Result<(), PErr> {
         let save = self.invalid;
         self.invalid = false;
@@ -1253,6 +1251,7 @@ impl<'a> Parser<'a> {
 
     /// After '(' of a call: either a bare generator expression or argument list (the ')' is
     /// left for the caller).
+    #[inline(never)]
     fn arguments_after_lpar(&mut self, lpar: usize, allow_genexp: bool) -> R<(Vec<Expr>, Vec<Keyword>)> {
         let mut args: Vec<Expr> = Vec::new();
         let mut keywords: Vec<Keyword> = Vec::new();
@@ -1416,6 +1415,7 @@ impl<'a> Parser<'a> {
 
     // ================================================================ lambda
 
+    #[inline(never)]
     fn lambdef(&mut self) -> R<Expr> {
         let start = self.p;
         self.advance(); // 'lambda'
@@ -1453,12 +1453,13 @@ impl<'a> Parser<'a> {
         if s.contains('_') {
             self.check_version(6, "Underscores in numeric literals are")?;
         }
-        parse_number_literal(s).map_err(|m| self.err_tok(m, t))
+        parse_number_literal(s, self.opts.int_max_str_digits).map_err(|m| self.err_tok(m, t))
     }
 }
 
 /// Convert a NUMBER token text to a constant.
-pub fn parse_number_literal(s: &str) -> Result<Constant, String> {
+/// `max_digits`: sys.get_int_max_str_digits() (0 = unlimited) for decimal literals.
+pub fn parse_number_literal(s: &str, max_digits: usize) -> Result<Constant, String> {
     let clean: std::borrow::Cow<str> = if s.contains('_') { s.replace('_', "").into() } else { s.into() };
     let b = clean.as_bytes();
     let last = *b.last().unwrap();
@@ -1485,9 +1486,10 @@ pub fn parse_number_literal(s: &str) -> Result<Constant, String> {
         return Ok(Constant::Int(Int::Small(v)));
     }
     let t = clean.trim_start_matches('0');
-    if t.len() > 4300 {
+    if max_digits > 0 && t.len() > max_digits {
         return Err(format!(
-            "Exceeds the limit (4300 digits) for integer string conversion: value has {} digits; use sys.set_int_max_str_digits() to increase the limit - Consider hexadecimal for huge integer literals to avoid decimal conversion limits.",
+            "Exceeds the limit ({} digits) for integer string conversion: value has {} digits; use sys.set_int_max_str_digits() to increase the limit - Consider hexadecimal for huge integer literals to avoid decimal conversion limits.",
+            max_digits,
             t.len()
         ));
     }
