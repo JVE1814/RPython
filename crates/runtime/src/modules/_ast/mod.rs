@@ -520,7 +520,12 @@ fn init_ast_type() -> PyResult<()> {
 // ----------------------------------------------------------------------------------------
 
 fn asdl_doc(doc: &str) -> String {
-    doc.replace("?*", "*")
+    let d = doc.replace("?*", "*");
+    // simple sums (only fieldless constructors) are written on one line
+    if d.contains(" = ") && !d.contains('(') {
+        return d.replace("\n  | ", " | ");
+    }
+    d
 }
 
 fn build_state() -> PyResult<State> {

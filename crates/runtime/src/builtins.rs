@@ -700,7 +700,7 @@ pub fn init() -> PyResult<PyRef> {
     set("False", bool_::false_obj())?;
     set("__debug__", &bool_::new_bool(crate::modules::sys::optimize_flag() == 0))?;
     for (n, t) in crate::types::exceptions::all_exception_types() {
-        if n.starts_with('_') {
+        if n.starts_with('_') && n != "_IncompleteInputError" {
             continue;
         }
         set(n, type_obj(t))?;
