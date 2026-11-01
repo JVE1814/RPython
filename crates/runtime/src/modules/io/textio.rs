@@ -1023,7 +1023,7 @@ fn build_cookie(pos: i64, dec_flags: i64, bytes_to_feed: i64, need_eof: bool, ch
         return Ok(int::new_int(pos));
     }
     let mut r = int::new_int(pos);
-    for (v, sh) in [(dec_flags, 64), (bytes_to_feed, 128), (need_eof as i64, 192), (chars_to_skip, 256)] {
+    for (v, sh) in [(dec_flags, 64), (bytes_to_feed, 128), (chars_to_skip, 192), (need_eof as i64, 256)] {
         if v != 0 {
             let part = shl(int::new_int(v), sh)?;
             r = ab::binary_op(&r, &part, NbSlot::Or)?;
@@ -1049,7 +1049,7 @@ fn unpack_cookie(c: &PyObject) -> PyResult<(i64, i64, i64, bool, i64)> {
         };
         cur = ab::binary_op(&cur, &int::new_int(64), NbSlot::Rshift)?;
     }
-    Ok((parts[0], parts[1], parts[2], parts[3] != 0, parts[4]))
+    Ok((parts[0], parts[1], parts[2], parts[4] != 0, parts[3]))
 }
 
 fn t_tell(o: &PyObject) -> PyResult {
