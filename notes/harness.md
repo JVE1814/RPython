@@ -69,3 +69,13 @@ jump targets = 4*arg, exception table from `_opcode`), `symtable.py`,
   literal_eval round trips), dis, traceback fallback path, _symtable.
 * symtable: the compiler creates an `__annotate__` child scope even for functions
   without annotations (compiler behaviour).
+
+## Verified with private shims (io/enum/collections/functools/... stand-ins, not committed)
+* A unittest module with ok/fail/error/skip/subTest/expectedFailure runs under
+  `unittest.main()` with CPython-identical output (verbose and dots, carets in
+  tracebacks, "FAILED (failures=2, errors=1, skipped=1, expected failures=1)").
+* Runtime bugs found (not in my area): `dict::lookup_index` can loop forever
+  (seen intermittently during imports); `_abc._abc_register` gets a NULL type from
+  `_collections_abc`; `range(1 << 1000)` unsupported; master `functools` fails
+  (`partial` undefined); compiler gives `import x` statements the position of the name
+  only, so tracebacks show `^^^` under the module name where CPython shows none.
