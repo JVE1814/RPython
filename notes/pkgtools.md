@@ -16,7 +16,7 @@ test-observed names, messages and output formats match CPython.
 | zipapp | `Lib/zipapp.py` | test_zipapp 36/36 |
 | tracemalloc | `crates/runtime/src/modules/_tracemalloc.rs`, hooks in `alloc.rs` + `capi/mem.rs`, `Lib/tracemalloc.py`, launcher validation | test_tracemalloc 41 pass, 10 skipped (need `_testcapi`) |
 | sysconfig | `Lib/sysconfig/{__init__,__main__}.py`, `Lib/_sysconfig.py`, `Lib/_osx_support.py`, `Lib/config-3.15t-x86_64-linux-gnu/Makefile`, `Lib/_sysconfig_vars_t_linux_x86_64-linux-gnu.json`, `SOABI_PLATFORM` in `_sysconfigdata` | 36 pass; test_get_config_h_filename fails in the dev layout only (passes with tools/install.sh, which installs include/pyconfig.h) |
-| pydoc | `Lib/pydoc.py`, `Lib/pydoc_data/{__init__,topics,module_docs}.py` (own topic texts) | 105/119 pass (rest: runtime gaps below); test_enum's test_pydoc passes |
+| pydoc | `Lib/pydoc.py`, `Lib/pydoc_data/{__init__,topics,module_docs}.py` (own topic texts) | 100/119 pass, 5 skipped, 14 fail on runtime gaps listed below (needs urllib/http from the web branch to load); test_enum test_pydoc passes |
 
 ## Runtime changes (coordinate with core-runtime)
 
@@ -44,10 +44,10 @@ test-observed names, messages and output formats match CPython.
 
 Setup: `python3 -m venv /tmp/pk/venv1`, then `python -m ensurepip` and pip
 installs from locally downloaded wheels (no `ssl` in this build, so pip
-cannot reach PyPI itself).  Modules missing in master were borrowed for the
-experiment only from other worktrees (optparse, http/urllib, zipimport,
+cannot reach PyPI itself).  Modules still missing in master (after the 20:30 merge) were borrowed for the
+experiment only from other worktrees (http/urllib/ipaddress, zipimport,
 uuid/tarfile, concurrent) plus throw-away stubs (http.cookiejar, xmlrpc,
-csv) — none committed.
+and a sitecustomize working around blocker 2) — none committed.
 
 Result: pip 26.2.2 installs itself, `six`, `pytest` (+deps) and the
 `numpy-2.5.4-cp315-cp315t-manylinux_2_27_x86_64` wheel; `import numpy`,
