@@ -5,6 +5,11 @@ In-flight agents were asked to wrap up; their branches are merged into master as
 To resume: read PLAN.md (workstream table, unassigned list), notes/*.md (per-workstream status and next
 steps), DECISIONS.md D19-D22; integration happens in the /home/user/core worktree (branch `core`), pushed
 to origin claude/rpython-dev. Latest full-suite run: run 4 (208/434 modules pass, 23,987 tests).
+Known issue after the final merges: test_threading hangs (it failed without running tests in run 4); test_class has
+2 failures from inline-values semantics (notes/perf-runtime.md). Leftover processes from finished agents may still
+be running (killing them was not permitted in this environment).
+Not yet in spec: idlelib's own tests (Lib/idlelib/idle_test) are imported by test_idle but were not kept by the
+D2 extraction — revisit D2 for test_idle.
 
 ## Status (2026-11-01, day 1, night)
 - Spec pinned (CPython v3.15.2). Baselines built: /opt/baseline/py-default (PGO+LTO),
