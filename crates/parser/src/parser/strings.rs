@@ -20,6 +20,7 @@ fn is_empty_str_const(e: &Expr) -> bool {
 
 impl<'a> Parser<'a> {
     /// strings: (fstring | tstring | string)+
+    #[inline(never)]
     pub(crate) fn strings(&mut self) -> R<Expr> {
         let start = self.p;
         let mut pieces: Vec<Piece> = Vec::new();

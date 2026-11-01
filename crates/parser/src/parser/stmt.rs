@@ -644,9 +644,7 @@ impl<'a> Parser<'a> {
                 self.p = start;
                 return Ok(None);
             }
-            self.enter()?;
-            let r = self.statements();
-            self.leave();
+            let r = self.recurse(|p| p.statements());
             let Some(body) = r? else {
                 self.p = start;
                 return Ok(None);
