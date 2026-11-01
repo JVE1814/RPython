@@ -82,6 +82,7 @@ pub mod _decimal;
 pub mod _bz2;
 pub mod _lzma;
 pub mod _zstd;
+pub mod _uuid;
 pub mod _pickle;
 pub mod array;
 pub mod _datetime;
