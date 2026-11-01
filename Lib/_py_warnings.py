@@ -103,6 +103,9 @@ def _make_context_var():
 
 
 _warnings_context = _make_context_var() if _use_context else None
+if _warnings_context is None:
+    # context variables are unavailable: fall back to global state
+    _use_context = False
 
 
 def _get_context():

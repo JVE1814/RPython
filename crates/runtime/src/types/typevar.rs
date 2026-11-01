@@ -959,9 +959,12 @@ pub fn init_types() {
         static mut TA_NUM: PyNumberMethods = PyNumberMethods::ZERO;
         (*(&raw mut TA_NUM)).nb_or = Some(ta_or);
         tt.tp_as_number = &raw mut TA_NUM;
+        tt.tp_members = crate::member_table![
+            ("__name__", Py_T_OBJECT, lu::HEADER + TA_NAME * 8, Py_READONLY),
+            ("__qualname__", Py_T_OBJECT, lu::HEADER + TA_QUALNAME * 8, Py_READONLY),
+        ];
+        let _ = (ta_name, ta_qualname);
         tt.tp_getset = crate::getset_table![
-            ("__name__", ta_name),
-            ("__qualname__", ta_qualname),
             ("__module__", ta_module, ta_set_module),
             ("__type_params__", ta_type_params),
             ("__parameters__", ta_parameters),
@@ -1019,7 +1022,7 @@ pub fn ready() -> PyResult<()> {
         tp!(NODEFAULT_TYPE),
         tp!(CONSTEVAL_TYPE),
     ] {
-        type_ready(t)?;
+        lu::ready_type(t)?;
     }
     unsafe {
         let o = &raw mut NODEFAULT_OBJ;

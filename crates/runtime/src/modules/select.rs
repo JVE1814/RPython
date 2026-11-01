@@ -637,3 +637,8 @@ pub fn init() -> PyResult {
     )?;
     Ok(m)
 }
+
+/// Entry point used by the import registration in sys_full.
+pub fn init_module() -> PyResult {
+    init()
+}

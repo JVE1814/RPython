@@ -99,7 +99,7 @@ if _exists("_have_functions"):
     ])
     supports_fd.add(stat)
     if _exists("statvfs") and _exists("fstatvfs"):
-        supports_fd |= _capabilities([("HAVE_FSTATVFS", "statvfs")])
+        supports_fd.update(_capabilities([("HAVE_FSTATVFS", "statvfs")]))
     supports_follow_symlinks = _capabilities([
         ("HAVE_FACCESSAT", "access"), ("HAVE_FCHOWNAT", "chown"),
         ("HAVE_FSTATAT", "stat"), ("HAVE_LINKAT", "link"),

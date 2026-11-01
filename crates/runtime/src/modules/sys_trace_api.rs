@@ -1,30 +1,287 @@
-//! sys.settrace / setprofile API (pending real implementation).
+//! sys.settrace / sys.setprofile / sys.monitoring Python-level API.
+use crate::abstract_ as ab;
 use crate::errors::*;
 use crate::ffi::PyObject;
-use crate::types::none;
+use crate::modules::sys_trace::{self as st, EVENT_NAMES, MON, NTOOLS};
+use crate::object::*;
+use crate::raise;
+use crate::threads::ThreadState;
+use crate::types::{dict, int, none, str as pystr};
+use std::sync::atomic::Ordering::*;
+
+fn set_func(ts: &ThreadState, cell: &std::cell::Cell<*mut PyObject>, f: &PyObject) {
+    let nv = if f.is(none::none()) { std::ptr::null_mut() } else { f.to_ref().into_raw() };
+    let old = cell.replace(nv);
+    match (old.is_null(), nv.is_null()) {
+        (true, false) => {
+            st::TRACERS.fetch_add(1, AcqRel);
+        }
+        (false, true) => {
+            st::TRACERS.fetch_sub(1, AcqRel);
+        }
+        _ => {}
+    }
+    let _ = ts;
+    st::recompute_tracing();
+    unsafe { xdecref(old) };
+}
+
+fn get_func(cell: &std::cell::Cell<*mut PyObject>) -> PyRef {
+    let p = cell.get();
+    if p.is_null() { none::none_ref() } else { unsafe { PyRef::from_borrowed(p) } }
+}
+
 pub fn settrace(f: &PyObject) -> PyResult {
-    let _ = f;
+    crate::modules::sys_full::audit("sys.settrace", &[])?;
+    let ts = crate::threads::current();
+    set_func(ts, &ts.trace_func, f);
     Ok(none::none_ref())
 }
 pub fn gettrace() -> PyResult {
-    Ok(none::none_ref())
+    Ok(get_func(&crate::threads::current().trace_func))
 }
 pub fn setprofile(f: &PyObject) -> PyResult {
-    let _ = f;
+    crate::modules::sys_full::audit("sys.setprofile", &[])?;
+    let ts = crate::threads::current();
+    set_func(ts, &ts.profile_func, f);
     Ok(none::none_ref())
 }
 pub fn getprofile() -> PyResult {
-    Ok(none::none_ref())
+    Ok(get_func(&crate::threads::current().profile_func))
 }
 pub fn settrace_all(f: &PyObject) -> PyResult {
-    settrace(f)
+    crate::modules::sys_full::audit("sys.settrace", &[])?;
+    for ts in crate::threads::live_threads() {
+        set_func(ts, &ts.trace_func, f);
+    }
+    Ok(none::none_ref())
 }
 pub fn setprofile_all(f: &PyObject) -> PyResult {
-    setprofile(f)
+    crate::modules::sys_full::audit("sys.setprofile", &[])?;
+    for ts in crate::threads::live_threads() {
+        set_func(ts, &ts.profile_func, f);
+    }
+    Ok(none::none_ref())
 }
+/// sys.call_tracing: call func(*args) with tracing enabled even inside a tracer.
 pub fn call_tracing(f: &PyObject, args: &[&PyObject]) -> PyResult {
-    crate::abstract_::call(f, args)
+    let ts = crate::threads::current();
+    let saved = ts.tracing_depth.replace(0);
+    let r = ab::call(f, args);
+    ts.tracing_depth.set(saved);
+    r
 }
-pub fn install_monitoring(_d: &PyObject) -> PyResult<()> {
+
+// ------------------------------------------------------------------ sys.monitoring
+
+fn tool_arg(o: &PyObject) -> PyResult<usize> {
+    let n = ab::as_i64(o)?;
+    if !(0..NTOOLS as i64).contains(&n) {
+        raise!(ValueError, "invalid tool {} (must be between 0 and 5)", n);
+    }
+    Ok(n as usize)
+}
+fn check_in_use(m: &st::MonState, tool: usize) -> PyResult<()> {
+    if m.names[tool].is_none() {
+        raise!(ValueError, "tool {} is not in use", tool);
+    }
+    Ok(())
+}
+fn event_arg(o: &PyObject) -> PyResult<usize> {
+    let n = ab::as_i64(o)?;
+    if n <= 0 || n.count_ones() != 1 || (n.trailing_zeros() as usize) >= EVENT_NAMES.len() {
+        raise!(ValueError, "invalid event {}", n);
+    }
+    Ok(n.trailing_zeros() as usize)
+}
+fn event_set_arg(o: &PyObject, local: bool) -> PyResult<u32> {
+    let n = ab::as_i64(o)?;
+    let all = (1i64 << EVENT_NAMES.len()) - 1;
+    if n < 0 || n & !all != 0 {
+        raise!(ValueError, "invalid event set 0x{:x}", n);
+    }
+    let mut v = n as u32;
+    if local && v & !st::LOCAL_EVENTS_MASK != 0 {
+        raise!(ValueError, "invalid local event set 0x{:x}", n);
+    }
+    // BRANCH is an alias for BRANCH_LEFT|BRANCH_RIGHT
+    if v & (1 << 18) != 0 {
+        v = (v & !(1 << 18)) | (1 << 8) | (1 << 9);
+    }
+    Ok(v)
+}
+
+fn mon_use_tool_id(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    crate::args::check_pos("use_tool_id", args, 2, 2)?;
+    let tool = tool_arg(args[0])?;
+    if !pystr::is_str(args[1]) {
+        raise!(ValueError, "tool name must be a str");
+    }
+    let mut m = MON.lock().unwrap();
+    if m.names[tool].is_some() {
+        raise!(ValueError, "tool {} is already in use", tool);
+    }
+    m.names[tool] = Some(args[1].to_ref().into_raw() as usize);
+    Ok(none::none_ref())
+}
+fn clear_tool(m: &mut st::MonState, tool: usize) {
+    m.global[tool] = 0;
+    for ev in 0..EVENT_NAMES.len() {
+        let old = std::mem::replace(&mut m.callbacks[tool][ev], 0);
+        unsafe { xdecref(old as *mut PyObject) };
+    }
+    for (_, (_, l)) in m.local.iter_mut() {
+        l[tool] = 0;
+    }
+    m.disabled.retain(|(t, _, _, _)| *t != tool);
+    st::recompute_mon_any(m);
+}
+fn mon_clear_tool_id(_m: &PyObject, t: &PyObject) -> PyResult {
+    let tool = tool_arg(t)?;
+    let mut m = MON.lock().unwrap();
+    if m.names[tool].is_some() {
+        clear_tool(&mut m, tool);
+    }
+    Ok(none::none_ref())
+}
+fn mon_free_tool_id(_m: &PyObject, t: &PyObject) -> PyResult {
+    let tool = tool_arg(t)?;
+    let mut m = MON.lock().unwrap();
+    if m.names[tool].is_some() {
+        clear_tool(&mut m, tool);
+        if let Some(n) = m.names[tool].take() {
+            unsafe { decref(n as *mut PyObject) };
+        }
+    }
+    Ok(none::none_ref())
+}
+fn mon_get_tool(_m: &PyObject, t: &PyObject) -> PyResult {
+    let tool = tool_arg(t)?;
+    let m = MON.lock().unwrap();
+    Ok(match m.names[tool] {
+        Some(n) => unsafe { PyRef::from_borrowed(n as *mut PyObject) },
+        None => none::none_ref(),
+    })
+}
+fn mon_register_callback(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    crate::args::check_pos("register_callback", args, 3, 3)?;
+    let tool = tool_arg(args[0])?;
+    let ev = event_arg(args[1])?;
+    crate::modules::sys_full::audit("sys.monitoring.register_callback", &[args[2]])?;
+    let mut m = MON.lock().unwrap();
+    check_in_use(&m, tool)?;
+    let nv = if args[2].is(none::none()) { 0 } else { args[2].to_ref().into_raw() as usize };
+    let evs: Vec<usize> = if ev == 18 { vec![8, 9] } else { vec![ev] };
+    let mut old = 0usize;
+    for (i, e) in evs.iter().enumerate() {
+        let nvi = if i > 0 && nv != 0 { unsafe { incref(nv as *mut PyObject); nv } } else { nv };
+        let o = std::mem::replace(&mut m.callbacks[tool][*e], nvi);
+        if i == 0 {
+            old = o;
+        } else {
+            unsafe { xdecref(o as *mut PyObject) };
+        }
+    }
+    Ok(if old == 0 { none::none_ref() } else { unsafe { PyRef::from_raw(old as *mut PyObject) } })
+}
+fn mon_get_events(_m: &PyObject, t: &PyObject) -> PyResult {
+    let tool = tool_arg(t)?;
+    let m = MON.lock().unwrap();
+    check_in_use(&m, tool)?;
+    Ok(int::new_int(m.global[tool] as i64))
+}
+fn mon_set_events(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    crate::args::check_pos("set_events", args, 2, 2)?;
+    let tool = tool_arg(args[0])?;
+    let evs = event_set_arg(args[1], false)?;
+    let mut m = MON.lock().unwrap();
+    check_in_use(&m, tool)?;
+    m.global[tool] = evs;
+    st::recompute_mon_any(&m);
+    Ok(none::none_ref())
+}
+fn code_arg(o: &PyObject) -> PyResult<usize> {
+    if !crate::types::code::is_code(o) {
+        raise!(TypeError, "code must be a code object");
+    }
+    Ok(o.as_ptr() as usize)
+}
+fn mon_get_local_events(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    crate::args::check_pos("get_local_events", args, 2, 2)?;
+    let tool = tool_arg(args[0])?;
+    let code = code_arg(args[1])?;
+    let m = MON.lock().unwrap();
+    check_in_use(&m, tool)?;
+    Ok(int::new_int(m.local.get(&code).map_or(0, |(_, l)| l[tool]) as i64))
+}
+fn mon_set_local_events(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    crate::args::check_pos("set_local_events", args, 3, 3)?;
+    let tool = tool_arg(args[0])?;
+    let code = code_arg(args[1])?;
+    let evs = event_set_arg(args[2], true)?;
+    let mut m = MON.lock().unwrap();
+    check_in_use(&m, tool)?;
+    let entry = m.local.entry(code).or_insert_with(|| (args[1].to_ref().into_raw() as usize, [0; NTOOLS]));
+    entry.1[tool] = evs;
+    st::recompute_mon_any(&m);
+    Ok(none::none_ref())
+}
+fn mon_restart_events(_m: &PyObject) -> PyResult {
+    MON.lock().unwrap().disabled.clear();
+    Ok(none::none_ref())
+}
+fn mon_all_events(_m: &PyObject) -> PyResult {
+    let d = dict::new_dict();
+    let m = MON.lock().unwrap();
+    for (ev, name) in EVENT_NAMES.iter().enumerate() {
+        if ev == 18 {
+            continue;
+        }
+        let mut tools = 0i64;
+        for t in 0..NTOOLS {
+            if m.global[t] & (1 << ev) != 0 {
+                tools |= 1 << t;
+            }
+        }
+        if tools != 0 {
+            dict::set_item_str(&d, name, &int::new_int(tools))?;
+        }
+    }
+    Ok(d)
+}
+
+pub fn install_monitoring(d: &PyObject) -> PyResult<()> {
+    let m = crate::types::module::new_module("sys.monitoring")?;
+    let md = crate::types::module::module_dict(&m);
+    crate::builtins::add_methods_to_dict(
+        &md,
+        crate::mdefs![
+            ("use_tool_id", FAST, mon_use_tool_id),
+            ("clear_tool_id", O, mon_clear_tool_id),
+            ("free_tool_id", O, mon_free_tool_id),
+            ("get_tool", O, mon_get_tool),
+            ("register_callback", FAST, mon_register_callback),
+            ("get_events", O, mon_get_events),
+            ("set_events", FAST, mon_set_events),
+            ("get_local_events", FAST, mon_get_local_events),
+            ("set_local_events", FAST, mon_set_local_events),
+            ("restart_events", NOARGS, mon_restart_events),
+            ("_all_events", NOARGS, mon_all_events),
+        ],
+        Some(&m),
+    )?;
+    let mut items: Vec<(&str, PyRef)> = EVENT_NAMES.iter().enumerate().map(|(i, n)| (*n, int::new_int(1 << i))).collect();
+    items.push(("NO_EVENTS", int::new_int(0)));
+    let events = crate::modules::sys_namespace::new_namespace(&items)?;
+    dict::set_item_str(&md, "events", &events)?;
+    let obj = crate::types::typeobject::type_obj(crate::types::typeobject::object_type());
+    let disable = ab::call(obj, &[])?;
+    st::DISABLE_OBJ.store(disable.clone().into_raw(), Release);
+    dict::set_item_str(&md, "DISABLE", &disable)?;
+    dict::set_item_str(&md, "MISSING", &*ab::call(obj, &[])?)?;
+    for (k, v) in [("DEBUGGER_ID", 0), ("COVERAGE_ID", 1), ("PROFILER_ID", 2), ("OPTIMIZER_ID", 5)] {
+        dict::set_item_str(&md, k, &int::new_int(v))?;
+    }
+    dict::set_item_str(d, "monitoring", &m)?;
     Ok(())
 }

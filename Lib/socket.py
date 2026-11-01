@@ -24,7 +24,8 @@ EWOULDBLOCK = getattr(errno, 'EWOULDBLOCK', 11)
 
 __all__ = ["fromfd", "getfqdn", "create_connection", "create_server",
            "has_dualstack_ipv6", "AddressFamily", "SocketKind"]
-__all__.extend(os._get_exports_list(_socket))
+__all__.extend(getattr(_socket, "__all__", None) or
+               [n for n in dir(_socket) if n[0] != "_"])
 
 IntEnum._convert_('AddressFamily', __name__,
                   lambda C: C.isupper() and C.startswith('AF_'))
