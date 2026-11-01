@@ -90,6 +90,9 @@ pub unsafe extern "C" fn function_vectorcall(
 
 /// Call a Python function with vectorcall-style arguments.
 pub fn call_function(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwnames: Option<&PyObject>) -> PyResult {
+    if let Some(r) = jit::call_fast(func, args, nargs, kwnames) {
+        return r; // jit workstream: compiled callee, direct entry
+    }
     let f: &PyFunctionObject = funcobject::func(func);
     let co = unsafe { &*f.func_code };
     let mut frame = Frame::new(co, Some(func), unsafe { &*f.func_globals }, unsafe { &*f.func_builtins }, None);

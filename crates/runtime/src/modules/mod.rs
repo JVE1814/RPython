@@ -25,7 +25,6 @@ pub mod posix;
 pub mod stat_mod;
 pub mod time;
 pub mod io;
-pub mod posixsubprocess;
 pub mod fncommon;
 pub mod functional;
 pub mod _operator;
@@ -61,6 +60,7 @@ pub mod _random;
 pub mod _imp;
 pub mod _weakref;
 pub mod _queue;
+pub mod _socket;
 pub mod select;
 pub mod _posixsubprocess;
 pub mod gc_mod;
@@ -74,6 +74,12 @@ pub mod termios;
 pub mod syslog;
 pub mod mmap;
 pub mod _json;
+pub mod compress_common;
+pub mod zlib;
+pub mod hashes;
+pub mod _decimal;
+pub mod _bz2;
+pub mod _pickle;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
 pub fn register_all() {
@@ -84,7 +90,6 @@ pub fn register_all() {
     crate::import::register_builtin("_stat", stat_mod::init);
     crate::import::register_builtin("time", time::init);
     crate::import::register_builtin("_io", io::init);
-    crate::import::register_builtin("_posixsubprocess", posixsubprocess::init);
     functional::register();
     numbers_registry::register();
     crate::import::register_builtin("_warnings", _warnings::init_module);
@@ -94,6 +99,11 @@ pub fn register_all() {
     sys_full::register_system_modules();
     text_util::register();
     crate::import::register_builtin("_typing", crate::types::typevar::make_typing_module);
+    crate::import::register_builtin("_socket", _socket::init);
+    crate::import::register_builtin("_posixsubprocess", _posixsubprocess::init);
     devtools::register();
     crate::import::register_builtin("_json", _json::init_module);
+    compress_common::register();
+    _decimal::register();
+    crate::import::register_builtin("_pickle", _pickle::init_module);
 }

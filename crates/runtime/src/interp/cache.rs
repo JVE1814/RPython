@@ -90,6 +90,106 @@ pub fn assign_type_tag(tp: *mut PyTypeObject) -> u32 {
     }
 }
 
+// ------------------------------------------------------------------ type dict watching
+
+/// Mark `tp`'s dict as owned by `tp`: any later mutation of the dict (also by code
+/// that writes `tp_dict` directly instead of going through type.__setattr__) calls
+/// `type_modified(tp)`, invalidating every cache keyed on the type's version tag.
+/// The owner is stored in the dict's (otherwise unused) `_ma_watcher_tag` field.
+pub fn watch_type_dict(tp: *mut PyTypeObject) {
+    unsafe {
+        let d = (*tp).tp_dict;
+        if !d.is_null() && crate::types::dict::is_dict(&*d) {
+            (*(d as *mut PyDictObject))._ma_watcher_tag = tp as u64;
+        }
+    }
+}
+
+/// The type owning dict `d` is going away.
+pub fn unwatch_type_dict(tp: *mut PyTypeObject) {
+    unsafe {
+        let d = (*tp).tp_dict;
+        if !d.is_null() && (*(d as *mut PyDictObject))._ma_watcher_tag == tp as u64 {
+            (*(d as *mut PyDictObject))._ma_watcher_tag = 0;
+        }
+    }
+}
+
+/// Called by dict.rs after every mutation.
+#[inline(always)]
+pub fn on_dict_write(d: &PyObject) {
+    let tag = unsafe { (*(d.as_ptr() as *const PyDictObject))._ma_watcher_tag };
+    if tag != 0 {
+        type_dict_written(tag as *mut PyTypeObject);
+    }
+}
+
+#[cold]
+fn type_dict_written(tp: *mut PyTypeObject) {
+    crate::types::slots::type_modified(tp);
+}
+
+// ------------------------------------------------------------------ global method cache
+
+/// Global (type version tag, interned name) -> MRO lookup result cache, shared by all
+/// threads (CPython's type cache). Entries are seqlocked; the value is borrowed (kept
+/// alive by the type's dict while the tag is valid) and may be 0 for "not found".
+struct McEntry {
+    seq: AtomicU32,
+    tag: AtomicU32,
+    name: AtomicUsize,
+    value: AtomicUsize,
+}
+
+const MC_BITS: u32 = 12;
+const MC_SIZE: usize = 1 << MC_BITS;
+
+static MC: [McEntry; MC_SIZE] = [const {
+    McEntry { seq: AtomicU32::new(0), tag: AtomicU32::new(0), name: AtomicUsize::new(0), value: AtomicUsize::new(0) }
+}; MC_SIZE];
+
+#[inline(always)]
+fn mc_slot(tag: u32, name: usize) -> &'static McEntry {
+    let h = (tag as usize).wrapping_mul(0x9e37_79b9) ^ (name >> 4);
+    &MC[h & (MC_SIZE - 1)]
+}
+
+/// Cached MRO lookup: Some(result) on a hit.
+#[inline]
+pub fn mc_lookup(tp: *mut PyTypeObject, name: &PyObject) -> Option<Option<crate::object::PyRef>> {
+    let tag = type_tag(tp);
+    if tag == 0 {
+        return None;
+    }
+    let e = mc_slot(tag, name.as_ptr() as usize);
+    let s1 = e.seq.load(Acquire);
+    let t = e.tag.load(Relaxed);
+    let n = e.name.load(Relaxed);
+    let v = e.value.load(Relaxed);
+    std::sync::atomic::fence(Acquire);
+    if s1 & 1 != 0 || e.seq.load(Relaxed) != s1 || t != tag || n != name.as_ptr() as usize {
+        return None;
+    }
+    Some(if v == 0 { None } else { Some(unsafe { crate::object::PyRef::from_borrowed(v as *mut PyObject) }) })
+}
+
+/// Record a lookup result computed while the type had version tag `tag`.
+pub fn mc_store(tag: u32, name: &PyObject, value: Option<&PyObject>) {
+    if tag == 0 || !name.is_immortal() {
+        return;
+    }
+    let e = mc_slot(tag, name.as_ptr() as usize);
+    let s = e.seq.load(Relaxed);
+    if s & 1 != 0 || e.seq.compare_exchange(s, s + 1, Acquire, Relaxed).is_err() {
+        return;
+    }
+    std::sync::atomic::fence(Release);
+    e.tag.store(tag, Relaxed);
+    e.name.store(name.as_ptr() as usize, Relaxed);
+    e.value.store(value.map_or(0, |v| v.as_ptr() as usize), Relaxed);
+    e.seq.store(s + 2, Release);
+}
+
 // ------------------------------------------------------------------ cache entries
 
 /// Kinds of cache entries (`Entry::kind`).
@@ -241,8 +341,16 @@ pub struct Tables {
     pub profile: Box<[AtomicU8]>,
 }
 
-fn needs_entry(op: Op) -> bool {
-    matches!(op, Op::LoadGlobal | Op::LoadAttr | Op::LoadMethod | Op::StoreAttr)
+/// Number of cache entries per instruction: attribute sites are polymorphic (up to
+/// `POLY` receiver types), global loads have one entry.
+pub const POLY: usize = 4;
+
+fn entries_for(op: Op) -> u32 {
+    match op {
+        Op::LoadGlobal => 1,
+        Op::LoadAttr | Op::LoadMethod | Op::StoreAttr => POLY as u32,
+        _ => 0,
+    }
 }
 
 impl Tables {
@@ -251,9 +359,10 @@ impl Tables {
         let mut n = 0u32;
         for (pc, w) in code.iter().enumerate() {
             let op = Op::from_u8((*w & 0xff) as u8);
-            if needs_entry(op) {
+            let k = entries_for(op);
+            if k > 0 {
                 index[pc] = n;
-                n += 1;
+                n += k;
             }
         }
         let entries: Box<[Entry]> = (0..n).map(|_| Entry::new()).collect();
@@ -268,6 +377,15 @@ impl Tables {
             let i = *self.index.get_unchecked(pc);
             debug_assert!(i != u32::MAX);
             self.entries.get_unchecked(i as usize)
+        }
+    }
+
+    /// The `POLY` entries of an attribute instruction at `pc`.
+    #[inline(always)]
+    pub fn poly(&self, pc: usize) -> &[Entry] {
+        unsafe {
+            let i = *self.index.get_unchecked(pc) as usize;
+            self.entries.get_unchecked(i..i + POLY)
         }
     }
 

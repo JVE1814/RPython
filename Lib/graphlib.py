@@ -1,250 +1,149 @@
+"""Topological sorting of a graph of hashable nodes (graphlib)."""
+
 from types import GenericAlias
 
 __all__ = ["TopologicalSorter", "CycleError"]
 
-_NODE_OUT = -1
-_NODE_DONE = -2
-
-
-class _NodeInfo:
-    __slots__ = "node", "npredecessors", "successors"
-
-    def __init__(self, node):
-        # The node this class is augmenting.
-        self.node = node
-
-        # Number of predecessors, generally >= 0. When this value falls to 0,
-        # and is returned by get_ready(), this is set to _NODE_OUT and when the
-        # node is marked done by a call to done(), set to _NODE_DONE.
-        self.npredecessors = 0
-
-        # List of successor nodes. The list can contain duplicated elements as
-        # long as they're all reflected in the successor's npredecessors attribute.
-        self.successors = []
+# Per-node state: a non-negative number is the count of predecessors not
+# yet marked done; the two negative values mark nodes handed out by
+# get_ready() and nodes marked done().
+_HANDED_OUT = -1
+_FINISHED = -2
+_END = object()
 
 
 class CycleError(ValueError):
-    """Subclass of ValueError raised by TopologicalSorter.prepare if cycles
-    exist in the working graph.
+    """The graph contains a cycle.
 
-    If multiple cycles exist, only one undefined choice among them will be reported
-    and included in the exception. The detected cycle can be accessed via the second
-    element in the *args* attribute of the exception instance and consists in a list
-    of nodes, such that each node is, in the graph, an immediate predecessor of the
-    next node in the list. In the reported list, the first and the last node will be
-    the same, to make it clear that it is cyclic.
+    args[1] holds one such cycle as a list of nodes in which every node
+    precedes the next one; the first and last entries are the same node.
     """
-    pass
 
 
 class TopologicalSorter:
-    """Provides functionality to topologically sort a graph of hashable nodes"""
+    """Sorts a graph of hashable nodes topologically.
+
+    Nodes are added with add(node, *predecessors) (or via the optional
+    mapping passed to the constructor).  After prepare(), get_ready()
+    hands out nodes whose predecessors are all done and done() marks nodes
+    as processed; static_order() does all of this in one go.
+    """
 
     def __init__(self, graph=None):
-        self._node2info = {}
-        self._ready_nodes = None
-        self._npassedout = 0
-        self._nfinished = 0
-
+        self._pending = {}       # node -> state (see above)
+        self._followers = {}     # node -> list of nodes that depend on it
+        self._ready = None       # list of ready nodes once prepared
+        self._handed_out = 0
+        self._finished = 0
         if graph is not None:
             for node, predecessors in graph.items():
                 self.add(node, *predecessors)
 
-    def _get_nodeinfo(self, node):
-        result = self._node2info.get(node)
-        if result is None:
-            self._node2info[node] = result = _NodeInfo(node)
-        return result
+    def _register(self, node):
+        if node not in self._pending:
+            self._pending[node] = 0
+            self._followers[node] = []
 
     def add(self, node, *predecessors):
-        """Add a new node and its predecessors to the graph.
-
-        Both the *node* and all elements in *predecessors* must be hashable.
-
-        If called multiple times with the same node argument, the set of dependencies
-        will be the union of all dependencies passed in.
-
-        It is possible to add a node with no dependencies (*predecessors* is not provided)
-        as well as provide a dependency twice. If a node that has not been provided before
-        is included among *predecessors* it will be automatically added to the graph with
-        no predecessors of its own.
-
-        Raises ValueError if called after "prepare".
-        """
-        if self._ready_nodes is not None:
+        """Add `node` with the given predecessors (which are added as nodes
+        too).  Repeated calls accumulate dependencies.  Not allowed after
+        prepare()."""
+        if self._ready is not None:
             raise ValueError("Nodes cannot be added after a call to prepare()")
-
-        # Create the node -> predecessor edges
-        nodeinfo = self._get_nodeinfo(node)
-        nodeinfo.npredecessors += len(predecessors)
-
-        # Create the predecessor -> node edges
+        self._register(node)
         for pred in predecessors:
-            pred_info = self._get_nodeinfo(pred)
-            pred_info.successors.append(node)
+            self._register(pred)
+        self._pending[node] += len(predecessors)
+        for pred in predecessors:
+            self._followers[pred].append(node)
 
     def prepare(self):
-        """Mark the graph as finished and check for cycles in the graph.
+        """Freeze the graph and check it for cycles (CycleError).
 
-        If any cycle is detected, "CycleError" will be raised, but "get_ready" can
-        still be used to obtain as many nodes as possible until cycles block more
-        progress. After a call to this function, the graph cannot be modified and
-        therefore no more nodes can be added using "add".
-
-        Raise ValueError if nodes have already been passed out of the sorter.
-        """
-        if self._npassedout > 0:
+        get_ready() remains usable after a CycleError for the acyclic
+        part of the graph."""
+        if self._handed_out:
             raise ValueError("cannot prepare() after starting sort")
-
-        if self._ready_nodes is None:
-            self._ready_nodes = [i.node for i in self._node2info.values()
-                                 if i.npredecessors == 0]
-        # ready_nodes is set before we look for cycles on purpose:
-        # if the user wants to catch the CycleError, that's fine,
-        # they can continue using the instance to grab as many
-        # nodes as possible before cycles block more progress
+        if self._ready is None:
+            self._ready = [n for n, count in self._pending.items() if count == 0]
         cycle = self._find_cycle()
         if cycle:
             raise CycleError("nodes are in a cycle", cycle)
 
-    def get_ready(self):
-        """Return a tuple of all the nodes that are ready.
-
-        Initially it returns all nodes with no predecessors; once those are marked
-        as processed by calling "done", further calls will return all new nodes that
-        have all their predecessors already processed. Once no more progress can be made,
-        empty tuples are returned.
-
-        Raises ValueError if called without calling "prepare" previously.
-        """
-        if self._ready_nodes is None:
+    def _require_prepared(self):
+        if self._ready is None:
             raise ValueError("prepare() must be called first")
 
-        # Get the nodes that are ready and mark them
-        result = tuple(self._ready_nodes)
-        n2i = self._node2info
-        for node in result:
-            n2i[node].npredecessors = _NODE_OUT
-
-        # Clean the list of nodes that are ready and update
-        # the counter of nodes that we have returned.
-        self._ready_nodes.clear()
-        self._npassedout += len(result)
-
-        return result
+    def get_ready(self):
+        """Return a tuple of the nodes that can be processed now (possibly
+        empty)."""
+        self._require_prepared()
+        batch = tuple(self._ready)
+        for node in batch:
+            self._pending[node] = _HANDED_OUT
+        self._ready.clear()
+        self._handed_out += len(batch)
+        return batch
 
     def is_active(self):
-        """Return ``True`` if more progress can be made and ``False`` otherwise.
-
-        Progress can be made if cycles do not block the resolution and either there
-        are still nodes ready that haven't yet been returned by "get_ready" or the
-        number of nodes marked "done" is less than the number that have been returned
-        by "get_ready".
-
-        Raises ValueError if called without calling "prepare" previously.
-        """
-        if self._ready_nodes is None:
-            raise ValueError("prepare() must be called first")
-        return self._nfinished < self._npassedout or bool(self._ready_nodes)
+        """True while nodes remain to be handed out or marked done."""
+        self._require_prepared()
+        return self._finished < self._handed_out or bool(self._ready)
 
     def __bool__(self):
         return self.is_active()
 
     def done(self, *nodes):
-        """Marks a set of nodes returned by "get_ready" as processed.
-
-        This method unblocks any successor of each node in *nodes* for being returned
-        in the future by a call to "get_ready".
-
-        Raises ValueError if any node in *nodes* has already been marked as
-        processed by a previous call to this method, if a node was not added to the
-        graph by using "add" or if called without calling "prepare" previously or if
-        node has not yet been returned by "get_ready".
-        """
-
-        if self._ready_nodes is None:
-            raise ValueError("prepare() must be called first")
-
-        n2i = self._node2info
-
+        """Mark nodes returned by get_ready() as processed, which may make
+        their dependents ready."""
+        self._require_prepared()
         for node in nodes:
-
-            # Check if we know about this node (it was added previously using add()
-            if (nodeinfo := n2i.get(node)) is None:
+            if node not in self._pending:
                 raise ValueError(f"node {node!r} was not added using add()")
-
-            # If the node has not being returned (marked as ready) previously, inform the user.
-            stat = nodeinfo.npredecessors
-            if stat != _NODE_OUT:
-                if stat >= 0:
-                    raise ValueError(
-                        f"node {node!r} was not passed out (still not ready)"
-                    )
-                elif stat == _NODE_DONE:
-                    raise ValueError(f"node {node!r} was already marked done")
-                else:
-                    assert False, f"node {node!r}: unknown status {stat}"
-
-            # Mark the node as processed
-            nodeinfo.npredecessors = _NODE_DONE
-
-            # Go to all the successors and reduce the number of predecessors, collecting all the ones
-            # that are ready to be returned in the next get_ready() call.
-            for successor in nodeinfo.successors:
-                successor_info = n2i[successor]
-                successor_info.npredecessors -= 1
-                if successor_info.npredecessors == 0:
-                    self._ready_nodes.append(successor)
-            self._nfinished += 1
+            state = self._pending[node]
+            if state == _FINISHED:
+                raise ValueError(f"node {node!r} was already marked done")
+            if state != _HANDED_OUT:
+                raise ValueError(f"node {node!r} was not passed out (still not ready)")
+            self._pending[node] = _FINISHED
+            for follower in self._followers[node]:
+                self._pending[follower] -= 1
+                if self._pending[follower] == 0:
+                    self._ready.append(follower)
+            self._finished += 1
 
     def _find_cycle(self):
-        # Depth-first search over the successor edges; returns the first cycle
-        # found as a list whose first and last element are the same node.
-        n2i = self._node2info
-        path = []
-        iterators = []
-        seen = set()
-        on_path = {}
-
-        for start in n2i:
-            if start in seen:
+        # Iterative depth-first search along predecessor->follower edges.
+        visited = set()
+        for start in self._pending:
+            if start in visited:
                 continue
-            node = start
-            while True:
-                if node in seen:
-                    # A node already visited: a cycle if it is on the current path.
-                    if node in on_path:
-                        return path[on_path[node]:] + [node]
-                else:
-                    seen.add(node)
-                    iterators.append(iter(n2i[node].successors).__next__)
-                    on_path[node] = len(path)
-                    path.append(node)
-                # Advance to the next unexplored successor, backtracking as needed.
-                while path:
-                    try:
-                        node = iterators[-1]()
-                        break
-                    except StopIteration:
-                        del on_path[path.pop()]
-                        iterators.pop()
-                else:
-                    break
+            path = [start]
+            position = {start: 0}
+            iters = [iter(self._followers[start])]
+            visited.add(start)
+            while iters:
+                nxt = next(iters[-1], _END)
+                if nxt is _END:
+                    iters.pop()
+                    del position[path.pop()]
+                    continue
+                if nxt in position:
+                    return path[position[nxt]:] + [nxt]
+                if nxt in visited:
+                    continue
+                visited.add(nxt)
+                position[nxt] = len(path)
+                path.append(nxt)
+                iters.append(iter(self._followers[nxt]))
         return None
 
     def static_order(self):
-        """Returns an iterable of nodes in a topological order.
-
-        The particular order that is returned may depend on the specific
-        order in which the items were inserted in the graph.
-
-        Using this method does not require to call "prepare" or "done". If any
-        cycle is detected, :exc:`CycleError` will be raised.
-        """
+        """Yield all nodes in a topological order (raises CycleError)."""
         self.prepare()
         while self.is_active():
-            node_group = self.get_ready()
-            yield from node_group
-            self.done(*node_group)
+            batch = self.get_ready()
+            yield from batch
+            self.done(*batch)
 
     __class_getitem__ = classmethod(GenericAlias)

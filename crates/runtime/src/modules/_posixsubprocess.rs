@@ -1,167 +1,131 @@
-//! `_posixsubprocess.fork_exec`: fork a child, set up its file descriptors,
-//! process attributes and exec the program. Everything the child needs is
-//! prepared before fork(); the child only makes async-signal-safe calls
-//! (except for the optional preexec_fn).
+//! `_posixsubprocess`: fork_exec() used by subprocess.Popen on POSIX.
+//!
+//! Everything the child needs (argv, envp, executable candidates, fd lists)
+//! is converted before fork(); between fork() and exec() the child only uses
+//! async-signal-safe libc calls, unless a preexec_fn must run Python code.
+//! Errors in the child are reported to the parent through `errpipe_write`
+//! as "ExceptionName:hex_errno:message".
 
 use crate::abstract_ as ab;
 use crate::errors::*;
-use crate::ffi::PyObject;
+use crate::ffi::*;
 use crate::object::*;
 use crate::raise;
-use crate::types::{bytes, int, list, none, tuple};
-use std::ffi::CString;
-
-fn to_cstring_list(o: &PyObject, what: &str) -> PyResult<Vec<CString>> {
-    let items = ab::collect_iterable(o).map_err(|e| {
-        if exc_matches(crate::types::exceptions::TypeError()) {
-            clear_exc();
-            err!(TypeError, "expected a sequence for {}", what)
-        } else {
-            e
-        }
-    })?;
-    let mut out = Vec::with_capacity(items.len());
-    for it in items {
-        let b = fs_encode(&it)?;
-        if b.contains(&0) {
-            raise!(ValueError, "embedded null byte");
-        }
-        out.push(CString::new(b).unwrap());
-    }
-    Ok(out)
-}
-
-/// os.fsencode for str/bytes/PathLike.
-fn fs_encode(o: &PyObject) -> PyResult<Vec<u8>> {
-    if bytes::is_bytes(o) {
-        return Ok(bytes::bytes_data(o).to_vec());
-    }
-    if crate::types::str::is_str(o) {
-        // UTF-8 with surrogateescape
-        let d = crate::types::str::str_data(o);
-        let mut out = Vec::new();
-        for i in 0..d.len() {
-            let c = d.get(i);
-            if (0xdc80..0xdd00).contains(&c) {
-                out.push((c - 0xdc00) as u8);
-            } else if let Some(ch) = char::from_u32(c) {
-                let mut b = [0u8; 4];
-                out.extend_from_slice(ch.encode_utf8(&mut b).as_bytes());
-            } else {
-                return Err(crate::types::exceptions::unicode_encode_error("utf-8", o, i, i + 1, "surrogates not allowed"));
-            }
-        }
-        return Ok(out);
-    }
-    if let Some(f) = ab::lookup_special(o, crate::name!("__fspath__"))? {
-        let r = ab::call(&f, &[])?;
-        return fs_encode(&r);
-    }
-    raise!(TypeError, "expected str, bytes or os.PathLike object, not {}", crate::types::typeobject::tname(o))
-}
-
-fn int_arg(o: &PyObject) -> PyResult<i64> {
-    ab::as_i64(o)
-}
-
-fn optional_id(o: &PyObject) -> PyResult<Option<u32>> {
-    if o.is(none::none()) {
-        return Ok(None);
-    }
-    let v = ab::as_i64(o)?;
-    if v < 0 {
-        return Ok(None);
-    }
-    Ok(Some(v as u32))
-}
-
-fn write_all(fd: i32, mut b: &[u8]) {
-    while !b.is_empty() {
-        let n = unsafe { libc::write(fd, b.as_ptr() as *const libc::c_void, b.len()) };
-        if n <= 0 {
-            if n < 0 && unsafe { *libc::__errno_location() } == libc::EINTR {
-                continue;
-            }
-            return;
-        }
-        b = &b[n as usize..];
-    }
-}
-
-/// Format "OSError:<hex errno>:<msg>" into a fixed buffer without allocating.
-fn report_errno(fd: i32, e: i32, msg: &[u8]) {
-    let mut buf = [0u8; 64];
-    let mut n = 0;
-    for &c in b"OSError:" {
-        buf[n] = c;
-        n += 1;
-    }
-    let hex = b"0123456789abcdef";
-    let mut digits = [0u8; 16];
-    let mut k = 0;
-    let mut v = e as u32;
-    if v == 0 {
-        digits[0] = b'0';
-        k = 1;
-    }
-    while v > 0 {
-        digits[k] = hex[(v & 0xf) as usize];
-        v >>= 4;
-        k += 1;
-    }
-    while k > 0 {
-        k -= 1;
-        buf[n] = digits[k];
-        n += 1;
-    }
-    buf[n] = b':';
-    n += 1;
-    for &c in msg {
-        if n < buf.len() {
-            buf[n] = c;
-            n += 1;
-        }
-    }
-    write_all(fd, &buf[..n]);
-}
+use crate::types::typeobject::tname;
+use crate::types::{bytes, dict, int, list, none, str as pystr, tuple};
+use std::ffi::{c_int, CString};
 
 fn errno() -> i32 {
     unsafe { *libc::__errno_location() }
 }
 
-fn set_inheritable(fd: i32) -> bool {
-    unsafe {
-        let fl = libc::fcntl(fd, libc::F_GETFD);
-        if fl < 0 {
-            return false;
-        }
-        if fl & libc::FD_CLOEXEC != 0 {
-            return libc::fcntl(fd, libc::F_SETFD, fl & !libc::FD_CLOEXEC) == 0;
-        }
-        true
+/// PyUnicode_FSConverter: str/bytes/PathLike -> bytes without NUL.
+fn fs_convert(o: &PyObject) -> PyResult<CString> {
+    let p = crate::modules::posix::path::fspath(o)?;
+    let raw = if bytes::is_bytes(&p) {
+        bytes::bytes_data(&p).to_vec()
+    } else {
+        crate::modules::posix::path::fs_encode_str(&p)?
+    };
+    match CString::new(raw) {
+        Ok(c) => Ok(c),
+        Err(_) => raise!(ValueError, "embedded null byte"),
     }
 }
 
-fn close_fds_except(keep: &[i32]) {
+fn seq_items(o: &PyObject, what: &str) -> PyResult<Vec<PyRef>> {
+    if list::is_list(o) || tuple::is_tuple(o) {
+        return ab::collect_iterable(o);
+    }
+    match ab::sequence_list(o) {
+        Ok(l) => Ok(list::list_to_vec(&l)),
+        Err(e) => {
+            if exc_matches(crate::types::exceptions::TypeError()) {
+                clear_exc();
+                raise!(TypeError, "{}", what);
+            }
+            Err(e)
+        }
+    }
+}
+
+fn int_of(o: &PyObject) -> PyResult<i64> {
+    let v = ab::index(o)?;
+    match int::as_i64(&v) {
+        Some(x) => Ok(x),
+        None => raise!(OverflowError, "Python int too large to convert to C long"),
+    }
+}
+
+fn c_int_of(o: &PyObject) -> PyResult<c_int> {
+    crate::modules::posix::path::c_int(o)
+}
+
+fn id_of(o: &PyObject, what: &str) -> PyResult<u32> {
+    crate::modules::posix::path::id_arg(o, what)
+}
+
+/// Write the error report to the parent (async-signal-safe).
+unsafe fn report(fd: c_int, err: i32, msg: &[u8], exc_name: &[u8]) {
     unsafe {
-        // close every fd >= 3 not in keep (sorted)
-        let mut start = 3;
-        let mut kept: Vec<i32> = keep.iter().copied().filter(|&f| f >= 3).collect();
-        kept.push(i32::MAX);
-        for &k in &kept {
-            if start < k {
-                let end = if k == i32::MAX { u32::MAX } else { (k - 1) as u32 };
+        if err != 0 {
+            let _ = libc::write(fd, b"OSError:".as_ptr() as *const _, 8);
+            let mut buf = [0u8; 16];
+            let mut i = buf.len();
+            let mut e = err as u32;
+            while e != 0 && i > 0 {
+                i -= 1;
+                buf[i] = b"0123456789abcdef"[(e % 16) as usize];
+                e /= 16;
+            }
+            let _ = libc::write(fd, buf[i..].as_ptr() as *const _, buf.len() - i);
+            let _ = libc::write(fd, b":".as_ptr() as *const _, 1);
+            let _ = libc::write(fd, msg.as_ptr() as *const _, msg.len());
+        } else {
+            let _ = libc::write(fd, exc_name.as_ptr() as *const _, exc_name.len());
+            let _ = libc::write(fd, b":0:".as_ptr() as *const _, 3);
+            let _ = libc::write(fd, msg.as_ptr() as *const _, msg.len());
+        }
+    }
+}
+
+unsafe fn set_inheritable(fd: c_int, inheritable: bool) -> c_int {
+    unsafe {
+        let fl = libc::fcntl(fd, libc::F_GETFD);
+        if fl < 0 {
+            return -1;
+        }
+        let nfl = if inheritable { fl & !libc::FD_CLOEXEC } else { fl | libc::FD_CLOEXEC };
+        if nfl != fl {
+            return libc::fcntl(fd, libc::F_SETFD, nfl);
+        }
+        0
+    }
+}
+
+/// Close every fd >= 3 not in `keep` (sorted).
+unsafe fn close_open_fds(keep: &[c_int], maxfd: c_int) {
+    unsafe {
+        let mut start: c_int = 3;
+        let mut ranges: Vec<(c_int, c_int)> = Vec::new();
+        let _ = &mut ranges;
+        for &k in keep.iter().chain(std::iter::once(&c_int::MAX)) {
+            if k < start {
+                continue;
+            }
+            if k > start {
+                let end = if k == c_int::MAX { u32::MAX } else { (k - 1) as u32 };
                 let r = libc::syscall(libc::SYS_close_range, start as u32, end, 0u32);
                 if r != 0 {
-                    // fallback: close individually up to the soft limit
-                    let max = libc::sysconf(libc::_SC_OPEN_MAX).max(256) as i64;
-                    let hi = if k == i32::MAX { max } else { k as i64 };
-                    for fd in start as i64..hi {
-                        libc::close(fd as i32);
+                    let stop = if k == c_int::MAX { maxfd } else { k };
+                    let mut fd = start;
+                    while fd < stop {
+                        libc::close(fd);
+                        fd += 1;
                     }
                 }
             }
-            if k == i32::MAX {
+            if k == c_int::MAX {
                 break;
             }
             start = k + 1;
@@ -169,213 +133,302 @@ fn close_fds_except(keep: &[i32]) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn fork_exec(_m: &PyObject, args: &[&PyObject]) -> PyResult {
-    if args.len() < 22 || args.len() > 23 {
-        raise!(TypeError, "fork_exec() expected 22 arguments, got {}", args.len());
-    }
-    let argv_o = args[0];
-    let exe_o = args[1];
-    let close_fds = ab::is_true(args[2])?;
-    let keep_o = args[3];
-    let cwd_o = args[4];
-    let env_o = args[5];
-    let p2cread = int_arg(args[6])? as i32;
-    let p2cwrite = int_arg(args[7])? as i32;
-    let c2pread = int_arg(args[8])? as i32;
-    let mut c2pwrite = int_arg(args[9])? as i32;
-    let errread = int_arg(args[10])? as i32;
-    let mut errwrite = int_arg(args[11])? as i32;
-    let errpipe_read = int_arg(args[12])? as i32;
-    let errpipe_write = int_arg(args[13])? as i32;
-    let restore_signals = ab::is_true(args[14])?;
-    let call_setsid = ab::is_true(args[15])?;
-    let pgid_to_set = int_arg(args[16])?;
-    let gid = optional_id(args[17])?;
-    let extra_groups_o = args[18];
-    let uid = optional_id(args[19])?;
-    let child_umask = int_arg(args[20])?;
-    let preexec_fn = args[21];
+struct ChildArgs {
+    argv: Vec<CString>,
+    exec_list: Vec<CString>,
+    envp: Option<Vec<CString>>,
+    cwd: Option<CString>,
+    close_fds: bool,
+    keep: Vec<c_int>,
+    p2cread: c_int,
+    p2cwrite: c_int,
+    c2pread: c_int,
+    c2pwrite: c_int,
+    errread: c_int,
+    errwrite: c_int,
+    errpipe_read: c_int,
+    errpipe_write: c_int,
+    restore_signals: bool,
+    call_setsid: bool,
+    pgid_to_set: libc::pid_t,
+    gid: Option<libc::gid_t>,
+    extra_groups: Option<Vec<libc::gid_t>>,
+    uid: Option<libc::uid_t>,
+    child_umask: c_int,
+    preexec_fn: Option<PyRef>,
+    maxfd: c_int,
+}
 
-    if !tuple::is_tuple(keep_o) {
-        raise!(TypeError, "fds_to_keep must be a tuple");
+/// Runs in the child; never returns.
+unsafe fn child_exec(a: &ChildArgs, argv: &[*const libc::c_char], envp: Option<&[*const libc::c_char]>) -> ! {
+    unsafe {
+        let ew = a.errpipe_write;
+        macro_rules! fail {
+            ($msg:expr) => {{
+                let e = errno();
+                report(ew, e, $msg, b"OSError");
+                libc::_exit(255);
+            }};
+        }
+        for &fd in &a.keep {
+            if fd == ew {
+                continue;
+            }
+            if set_inheritable(fd, true) < 0 {
+                fail!(b"noexec");
+            }
+        }
+        for fd in [a.p2cwrite, a.c2pread, a.errread] {
+            if fd != -1 {
+                libc::close(fd);
+            }
+        }
+        libc::close(a.errpipe_read);
+
+        let mut c2pwrite = a.c2pwrite;
+        let mut errwrite = a.errwrite;
+        // make sure stdout/stderr targets are not overwritten by earlier dup2s
+        if c2pwrite == 0 {
+            c2pwrite = libc::dup(c2pwrite);
+            if c2pwrite < 0 || set_inheritable(c2pwrite, false) < 0 {
+                fail!(b"noexec");
+            }
+        }
+        while errwrite == 0 || errwrite == 1 {
+            errwrite = libc::dup(errwrite);
+            if errwrite < 0 || set_inheritable(errwrite, false) < 0 {
+                fail!(b"noexec");
+            }
+        }
+        for (src, dst) in [(a.p2cread, 0), (c2pwrite, 1), (errwrite, 2)] {
+            if src == dst {
+                if set_inheritable(src, true) < 0 {
+                    fail!(b"noexec");
+                }
+            } else if src != -1 {
+                if libc::dup2(src, dst) < 0 {
+                    fail!(b"noexec");
+                }
+            }
+        }
+        if let Some(cwd) = &a.cwd {
+            if libc::chdir(cwd.as_ptr()) < 0 {
+                fail!(b"noexec:chdir");
+            }
+        }
+        if a.child_umask >= 0 {
+            libc::umask(a.child_umask as libc::mode_t);
+        }
+        if a.restore_signals {
+            for sig in [libc::SIGPIPE, libc::SIGXFSZ] {
+                libc::signal(sig, libc::SIG_DFL);
+            }
+        }
+        if a.call_setsid && libc::setsid() < 0 {
+            fail!(b"noexec");
+        }
+        if a.pgid_to_set >= 0 && libc::setpgid(0, a.pgid_to_set) < 0 {
+            fail!(b"noexec");
+        }
+        if let Some(g) = &a.extra_groups {
+            if libc::setgroups(g.len(), g.as_ptr()) < 0 {
+                fail!(b"noexec");
+            }
+        }
+        if let Some(gid) = a.gid {
+            if libc::setregid(gid, gid) < 0 {
+                fail!(b"noexec");
+            }
+        }
+        if let Some(uid) = a.uid {
+            if libc::setreuid(uid, uid) < 0 {
+                fail!(b"noexec");
+            }
+        }
+        if let Some(f) = &a.preexec_fn {
+            match ab::call(f, &[]) {
+                Ok(_) => {}
+                Err(_) => {
+                    clear_exc();
+                    report(ew, 0, b"Exception occurred in preexec_fn.", b"SubprocessError");
+                    libc::_exit(255);
+                }
+            }
+        }
+        if a.close_fds {
+            close_open_fds(&a.keep, a.maxfd);
+        }
+        let mut saved = 0;
+        for exe in &a.exec_list {
+            match envp {
+                Some(e) => libc::execve(exe.as_ptr(), argv.as_ptr(), e.as_ptr()),
+                None => libc::execv(exe.as_ptr(), argv.as_ptr()),
+            };
+            let e = errno();
+            if e != libc::ENOENT && e != libc::ENOTDIR && saved == 0 {
+                saved = e;
+            }
+        }
+        let e = if saved != 0 { saved } else { errno() };
+        report(ew, e, b"", b"OSError");
+        libc::_exit(255);
     }
-    let mut keep: Vec<i32> = Vec::new();
-    let mut prev = -1i64;
-    for it in tuple::tuple_items(keep_o) {
-        let ok = int::is_int(it) && int::as_i64(it).map_or(false, |v| v >= 0 && v <= i32::MAX as i64 && v > prev);
+}
+
+fn f_fork_exec(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    if args.len() != 22 && args.len() != 23 {
+        raise!(TypeError, "fork_exec expected 22 arguments, got {}", args.len());
+    }
+    let argv: Vec<CString> = if none::is_none(args[0]) {
+        Vec::new()
+    } else {
+        if !(list::is_list(args[0]) || tuple::is_tuple(args[0])) {
+            raise!(TypeError, "argv must be a tuple or list, not {}", tname(args[0]));
+        }
+        let mut v = Vec::new();
+        for it in ab::collect_iterable(args[0])? {
+            v.push(fs_convert(&it)?);
+        }
+        v
+    };
+    let mut exec_list = Vec::new();
+    for it in seq_items(args[1], "executable_list must be a sequence")? {
+        exec_list.push(fs_convert(&it)?);
+    }
+    let close_fds = ab::is_true(args[2])?;
+    if !tuple::is_tuple(args[3]) {
+        raise!(TypeError, "fork_exec() argument 4 must be tuple, not {}", tname(args[3]));
+    }
+    let mut keep: Vec<c_int> = Vec::new();
+    let mut prev: i64 = -1;
+    for it in tuple::tuple_items(args[3]) {
+        let ok = int::is_int(it) && match int::as_i64(it) {
+            Some(v) => v >= 0 && v <= c_int::MAX as i64 && v > prev,
+            None => false,
+        };
         if !ok {
             raise!(ValueError, "bad value(s) in fds_to_keep");
         }
         prev = int::as_i64(it).unwrap();
-        keep.push(prev as i32);
+        keep.push(prev as c_int);
     }
-    let argv = if argv_o.is(none::none()) { None } else { Some(to_cstring_list(argv_o, "args")?) };
-    let exes = to_cstring_list(exe_o, "executable_list")?;
-    let cwd = if cwd_o.is(none::none()) {
+    let cwd = if none::is_none(args[4]) { None } else { Some(fs_convert(args[4])?) };
+    let envp: Option<Vec<CString>> = if none::is_none(args[5]) {
         None
     } else {
-        let b = fs_encode(cwd_o)?;
-        if b.contains(&0) {
-            raise!(ValueError, "embedded null byte");
-        }
-        Some(CString::new(b).unwrap())
-    };
-    let env = if env_o.is(none::none()) { None } else { Some(to_cstring_list(env_o, "env")?) };
-    let extra_groups: Option<Vec<libc::gid_t>> = if extra_groups_o.is(none::none()) {
-        None
-    } else {
-        if !list::is_list(extra_groups_o) {
-            raise!(TypeError, "setgroups argument must be a list");
-        }
         let mut v = Vec::new();
-        for g in list::list_items(extra_groups_o) {
-            v.push(ab::as_i64(g)? as libc::gid_t);
+        for it in seq_items(args[5], "env must be a sequence")? {
+            v.push(fs_convert(&it)?);
         }
         Some(v)
     };
-    let has_preexec = !preexec_fn.is(none::none());
-    if has_preexec && !ab::is_callable(preexec_fn) {
-        raise!(TypeError, "preexec_fn must be callable");
-    }
+    let p2cread = c_int_of(args[6])?;
+    let p2cwrite = c_int_of(args[7])?;
+    let c2pread = c_int_of(args[8])?;
+    let c2pwrite = c_int_of(args[9])?;
+    let errread = c_int_of(args[10])?;
+    let errwrite = c_int_of(args[11])?;
+    let errpipe_read = c_int_of(args[12])?;
+    let errpipe_write = c_int_of(args[13])?;
+    let restore_signals = ab::is_true(args[14])?;
+    let call_setsid = ab::is_true(args[15])?;
+    let pgid_to_set = int_of(args[16])? as libc::pid_t;
+    let gid = if none::is_none(args[17]) { None } else { Some(id_of(args[17], "gid")?) };
+    let extra_groups = if none::is_none(args[18]) {
+        None
+    } else {
+        if !list::is_list(args[18]) {
+            raise!(TypeError, "extra_groups must be a list");
+        }
+        let mut v = Vec::new();
+        for g in ab::collect_iterable(args[18])? {
+            v.push(id_of(&g, "gid")?);
+        }
+        Some(v)
+    };
+    let uid = if none::is_none(args[19]) { None } else { Some(id_of(args[19], "uid")?) };
+    let child_umask = c_int_of(args[20])?;
+    let preexec_fn = if none::is_none(args[21]) { None } else { Some(args[21].to_ref()) };
 
-    // NULL-terminated pointer arrays (built before fork)
-    let argv_ptrs: Option<Vec<*const libc::c_char>> =
-        argv.as_ref().map(|a| a.iter().map(|s| s.as_ptr()).chain(std::iter::once(std::ptr::null())).collect());
-    let env_ptrs: Option<Vec<*const libc::c_char>> =
-        env.as_ref().map(|a| a.iter().map(|s| s.as_ptr()).chain(std::iter::once(std::ptr::null())).collect());
+    crate::modules::sys_full::audit(
+        "_posixsubprocess.fork_exec",
+        &[args[0], args[1], args[4], args[5]],
+    )?;
 
+    let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    let maxfd = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0 && rl.rlim_cur != libc::RLIM_INFINITY {
+        (rl.rlim_cur.min(1 << 20)) as c_int
+    } else {
+        256
+    };
+    let ca = ChildArgs {
+        argv,
+        exec_list,
+        envp,
+        cwd,
+        close_fds,
+        keep,
+        p2cread,
+        p2cwrite,
+        c2pread,
+        c2pwrite,
+        errread,
+        errwrite,
+        errpipe_read,
+        errpipe_write,
+        restore_signals,
+        call_setsid,
+        pgid_to_set,
+        gid,
+        extra_groups,
+        uid,
+        child_umask,
+        preexec_fn,
+        maxfd,
+    };
+    let mut argv_p: Vec<*const libc::c_char> = ca.argv.iter().map(|c| c.as_ptr()).collect();
+    argv_p.push(std::ptr::null());
+    let envp_p: Option<Vec<*const libc::c_char>> = ca.envp.as_ref().map(|v| {
+        let mut p: Vec<*const libc::c_char> = v.iter().map(|c| c.as_ptr()).collect();
+        p.push(std::ptr::null());
+        p
+    });
+
+    let has_preexec = ca.preexec_fn.is_some();
     if has_preexec {
         crate::modules::posix::proc::run_before_fork();
     }
     let pid = unsafe { libc::fork() };
     if pid == 0 {
-        // ---------------- child
-        unsafe {
-            if has_preexec {
-                crate::modules::posix::after_fork_child_hook();
-                crate::modules::posix::proc::run_after_fork_child();
-            }
-            for fd in [p2cwrite, c2pread, errread] {
-                if fd != -1 {
-                    libc::close(fd);
-                }
-            }
-            if errpipe_read != -1 {
-                libc::close(errpipe_read);
-            }
-            // make sure the std fds are not clobbered by the dup2 calls below
-            if c2pwrite == 0 {
-                c2pwrite = libc::dup(c2pwrite);
-                if c2pwrite < 0 || !set_inheritable(c2pwrite) {
-                    report_errno(errpipe_write, errno(), b"noexec");
-                    libc::_exit(255);
-                }
-            }
-            while errwrite == 0 || errwrite == 1 {
-                errwrite = libc::dup(errwrite);
-                if errwrite < 0 || !set_inheritable(errwrite) {
-                    report_errno(errpipe_write, errno(), b"noexec");
-                    libc::_exit(255);
-                }
-            }
-            for (fd, target) in [(p2cread, 0), (c2pwrite, 1), (errwrite, 2)] {
-                if fd == target {
-                    if !set_inheritable(fd) {
-                        report_errno(errpipe_write, errno(), b"noexec");
-                        libc::_exit(255);
-                    }
-                } else if fd != -1 && libc::dup2(fd, target) < 0 {
-                    report_errno(errpipe_write, errno(), b"noexec");
-                    libc::_exit(255);
-                }
-            }
-            if let Some(c) = &cwd {
-                if libc::chdir(c.as_ptr()) < 0 {
-                    report_errno(errpipe_write, errno(), b"noexec:chdir");
-                    libc::_exit(255);
-                }
-            }
-            if child_umask >= 0 {
-                libc::umask(child_umask as libc::mode_t);
-            }
-            if restore_signals {
-                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-                libc::signal(libc::SIGXFSZ, libc::SIG_DFL);
-            }
-            if call_setsid && libc::setsid() < 0 {
-                report_errno(errpipe_write, errno(), b"noexec");
-                libc::_exit(255);
-            }
-            if pgid_to_set >= 0 && libc::setpgid(0, pgid_to_set as libc::pid_t) < 0 {
-                report_errno(errpipe_write, errno(), b"noexec");
-                libc::_exit(255);
-            }
-            if let Some(g) = &extra_groups {
-                if libc::setgroups(g.len(), g.as_ptr()) < 0 {
-                    report_errno(errpipe_write, errno(), b"noexec");
-                    libc::_exit(255);
-                }
-            }
-            if let Some(g) = gid {
-                if libc::setregid(g, g) < 0 {
-                    report_errno(errpipe_write, errno(), b"noexec");
-                    libc::_exit(255);
-                }
-            }
-            if let Some(u) = uid {
-                if libc::setreuid(u, u) < 0 {
-                    report_errno(errpipe_write, errno(), b"noexec");
-                    libc::_exit(255);
-                }
-            }
-            if has_preexec {
-                if ab::call(preexec_fn, &[]).is_err() {
-                    clear_exc();
-                    write_all(errpipe_write, b"SubprocessError:0:Exception occurred in preexec_fn.");
-                    libc::_exit(255);
-                }
-            }
-            if close_fds {
-                let mut k = keep.clone();
-                k.push(errpipe_write);
-                k.sort();
-                close_fds_except(&k);
-            }
-            let mut saved = 0;
-            if let Some(av) = &argv_ptrs {
-                for exe in &exes {
-                    match &env_ptrs {
-                        Some(ep) => libc::execve(exe.as_ptr(), av.as_ptr(), ep.as_ptr()),
-                        None => libc::execv(exe.as_ptr(), av.as_ptr()),
-                    };
-                    let e = errno();
-                    if e != libc::ENOENT && e != libc::ENOTDIR && saved == 0 {
-                        saved = e;
-                    }
-                }
-            }
-            let e = if saved != 0 { saved } else { errno() };
-            report_errno(errpipe_write, e, b"");
-            libc::_exit(255);
+        if has_preexec {
+            crate::modules::posix::after_fork_child_hook();
+            crate::modules::posix::proc::run_after_fork_child();
         }
+        unsafe { child_exec(&ca, &argv_p, envp_p.as_deref()) };
     }
-    // ---------------- parent
     let e = errno();
     if has_preexec {
         crate::modules::posix::proc::run_after_fork_parent();
     }
-    drop(argv_ptrs);
-    drop(env_ptrs);
     if pid < 0 {
         return Err(crate::types::exceptions::os_error_from_errno(e, None, None));
     }
     Ok(int::new_int(pid as i64))
 }
 
-pub fn init_module() -> PyResult {
+pub fn init() -> PyResult {
     let m = crate::types::module::new_module("_posixsubprocess")?;
     let d = crate::types::module::module_dict(&m);
-    crate::builtins::add_methods_to_dict(&d, crate::mdefs![("fork_exec", FAST, fork_exec)], Some(&m))?;
+    dict::set_item_str(&d, "__doc__", &pystr::new_str("A POSIX helper for the subprocess module."))?;
+    crate::builtins::add_methods_to_dict(
+        &d,
+        crate::mdefs![(
+            "fork_exec",
+            FAST,
+            f_fork_exec,
+            "fork_exec($module, args, executable_list, close_fds, pass_fds, cwd,\n          env, p2cread, p2cwrite, c2pread, c2pwrite, errread,\n          errwrite, errpipe_read, errpipe_write, restore_signals,\n          call_setsid, pgid_to_set, gid, extra_groups, uid,\n          child_umask, preexec_fn, /)\n--\n\nSpawn a fresh new child process.\n\nFork a child process, close parent file descriptors as appropriate in the\nchild and duplicate the few that are needed before calling exec() in the\nchild process.\n\nIf close_fds is True, close file descriptors 3 and higher, except those listed\nin the sorted tuple pass_fds.\n\nThe preexec_fn, if supplied, will be called immediately before closing file\ndescriptors and exec.\n\nWARNING: preexec_fn is NOT SAFE if your application uses threads.\n         It may trigger infrequent, difficult to debug deadlocks.\n\nIf an error occurs in the child process before the exec, it is\nserialized and written to the errpipe_write fd per subprocess.py.\n\nReturns: the child process's PID.\n\nRaises: Only on an error in the parent process."
+        )],
+        Some(&m),
+    )?;
     Ok(m)
 }
