@@ -3,6 +3,7 @@
 __all__ = 'BaseSelectorEventLoop',
 
 import collections
+import contextvars
 import errno
 import functools
 import itertools
@@ -278,9 +279,9 @@ class BaseSelectorEventLoop(base_events.BaseEventLoop):
             return True
         return False
 
-    def _add_reader(self, fd, callback, *args):
+    def _add_reader(self, fd, callback, *args, context=None):
         self._check_closed()
-        handle = events.Handle(callback, args, self, None)
+        handle = events.Handle(callback, args, self, context)
         self._set_callback(fd, selectors.EVENT_READ, handle)
         return handle
 
@@ -289,9 +290,9 @@ class BaseSelectorEventLoop(base_events.BaseEventLoop):
             return False
         return self._set_callback(fd, selectors.EVENT_READ, None)
 
-    def _add_writer(self, fd, callback, *args):
+    def _add_writer(self, fd, callback, *args, context=None):
         self._check_closed()
-        handle = events.Handle(callback, args, self, None)
+        handle = events.Handle(callback, args, self, context)
         self._set_callback(fd, selectors.EVENT_WRITE, handle)
         return handle
 
@@ -588,6 +589,9 @@ class _SelectorTransport(transports._FlowControlMixin,
 
     def __init__(self, loop, sock, protocol, extra=None, server=None):
         super().__init__(extra, loop)
+        # callbacks of this transport run in the context it was created in,
+        # whoever (re)registers them
+        self._context = contextvars.copy_context()
         self._extra['socket'] = trsock.TransportSocket(sock)
         for key, getter in (('sockname', sock.getsockname),
                             ('peername', sock.getpeername)):
@@ -672,7 +676,8 @@ class _SelectorTransport(transports._FlowControlMixin,
             # nothing left to flush: finish now
             self._conn_lost += 1
             self._loop._remove_writer(self._sock_fd)
-            self._loop.call_soon(self._call_connection_lost, None)
+            self._loop.call_soon(self._call_connection_lost, None,
+                                 context=self._context)
 
     def __del__(self, _warn=warnings.warn):
         if self._sock is not None:
@@ -705,7 +710,8 @@ class _SelectorTransport(transports._FlowControlMixin,
             self._closing = True
             self._loop._remove_reader(self._sock_fd)
         self._conn_lost += 1
-        self._loop.call_soon(self._call_connection_lost, exc)
+        self._loop.call_soon(self._call_connection_lost, exc,
+                                 context=self._context)
 
     def _call_connection_lost(self, exc):
         try:
@@ -726,7 +732,7 @@ class _SelectorTransport(transports._FlowControlMixin,
     def _add_reader(self, fd, callback, *args):
         if not self.is_reading():
             return
-        self._loop._add_reader(fd, callback, *args)
+        self._loop._add_reader(fd, callback, *args, context=self._context)
 
 
 class _SelectorSocketTransport(_SelectorTransport):
@@ -745,7 +751,8 @@ class _SelectorSocketTransport(_SelectorTransport):
         # small writes must not wait for Nagle's algorithm
         base_events._set_nodelay(self._sock)
 
-        self._loop.call_soon(self._protocol.connection_made, self)
+        self._loop.call_soon(self._protocol.connection_made, self,
+                             context=self._context)
         self._loop.call_soon(self._add_reader, self._sock_fd, self._read_ready)
         if waiter is not None:
             self._loop.call_soon(futures._set_result_unless_cancelled,
@@ -864,7 +871,8 @@ class _SelectorSocketTransport(_SelectorTransport):
             if sent == len(data):
                 return
             data = memoryview(data)[sent:]
-            self._loop._add_writer(self._sock_fd, self._write_ready)
+            self._loop._add_writer(self._sock_fd, self._write_ready,
+                                  context=self._context)
 
         # keep a private copy: the caller may reuse its buffer
         self._buffer.append(memoryview(bytes(data)))
@@ -957,7 +965,8 @@ class _SelectorSocketTransport(_SelectorTransport):
         self._buffer.extend(memoryview(bytes(chunk)) for chunk in list_of_data)
         self._write_ready()
         if self._buffer:
-            self._loop._add_writer(self._sock_fd, self._write_ready)
+            self._loop._add_writer(self._sock_fd, self._write_ready,
+                                  context=self._context)
             self._maybe_pause_protocol()
 
     def can_write_eof(self):
@@ -999,7 +1008,8 @@ class _SelectorDatagramTransport(_SelectorTransport,
         super().__init__(loop, sock, protocol, extra)
         self._address = address
         self._buffer_size = 0
-        self._loop.call_soon(self._protocol.connection_made, self)
+        self._loop.call_soon(self._protocol.connection_made, self,
+                             context=self._context)
         self._loop.call_soon(self._add_reader, self._sock_fd, self._read_ready)
         if waiter is not None:
             self._loop.call_soon(futures._set_result_unless_cancelled,
@@ -1050,7 +1060,8 @@ class _SelectorDatagramTransport(_SelectorTransport,
                 self._send_one(data, addr)
                 return
             except (BlockingIOError, InterruptedError):
-                self._loop._add_writer(self._sock_fd, self._sendto_ready)
+                self._loop._add_writer(self._sock_fd, self._sendto_ready,
+                                  context=self._context)
             except OSError as exc:
                 self._protocol.error_received(exc)
                 return
