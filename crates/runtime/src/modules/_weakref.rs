@@ -26,7 +26,7 @@ fn remove_dead_weakref(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     let h = dict::hash_for(d, key)?;
     let (g, f) = dict::find(d, key, h)?;
     if let dict::Found::At(ix) = f {
-        let v = dict::table(d).entries[ix].value;
+        let v = dict::table(d).entries()[ix].value;
         let vo = unsafe { &*v };
         if weakref::is_weakref(vo) && weakref::is_dead(vo) {
             let (k, v) = dict::remove_at(d, ix, h);

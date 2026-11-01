@@ -360,26 +360,26 @@ fn iter_next_rs(o: &PyObject) -> PyResult<Option<PyRef>> {
     let found = {
         let _g = dict::ob_lock(d);
         let t = dict::table(d);
-        let n = t.entries.len() as isize;
+        let n = t.entries().len() as isize;
         let mut i = it.pos;
         let mut res = None;
         if rev {
             if i < n {
-                while i >= 0 && t.entries[i as usize].key.is_null() {
+                while i >= 0 && t.entries()[i as usize].key.is_null() {
                     i -= 1;
                 }
                 if i >= 0 {
-                    let e = t.entries[i as usize];
+                    let e = t.entries()[i as usize];
                     res = Some(unsafe { (PyRef::from_borrowed(e.key), PyRef::from_borrowed(e.value)) });
                     it.pos = i - 1;
                 }
             }
         } else {
-            while i < n && t.entries[i as usize].key.is_null() {
+            while i < n && t.entries()[i as usize].key.is_null() {
                 i += 1;
             }
             if i < n {
-                let e = t.entries[i as usize];
+                let e = t.entries()[i as usize];
                 res = Some(unsafe { (PyRef::from_borrowed(e.key), PyRef::from_borrowed(e.value)) });
                 it.pos = i + 1;
             }

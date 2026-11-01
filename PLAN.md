@@ -61,6 +61,19 @@ zipfile), net (_socket/select/subprocess/asyncio).
 Running (wave 5): bindings (_ssl/_sqlite3/_ctypes via system libs, D20), core-runtime (monitoring/settrace/gc/
  slots bugs, lazy imports, list reclamation, _testinternalcapi/_testmultiphase, core test failures).
 Finished also: decimal (662/663 test_decimal), devtools.
+Running (wave 6): pkgtools (importlib.resources/metadata, venv, ensurepip+pip, zipapp, pydoc, tracemalloc), intl
+(CJK codecs, _multibytecodec, codec-name rules), markup2 (_elementtree, pyexpat perf, imaplib, xmlrpc, rule-9 review).
+Finished also: data, markup (XML engine from scratch, email 1803/1814), cleanroom-ut, cleanroom-sys, cleanroom-lang.
+Running (wave 7): jit2 (tier-2 optimizing JIT, deopt, tier-1 gaps), perf-runtime (inline attribute shapes,
+call path, memory, safe reclamation D6, multi-core scaling, startup).
+Finished also: jit (tier-0 caches, tier-1 baseline JIT, generational GC, startup 135M->45M).
+Running (wave 8): stability (crashes, races, heap corruption, hangs; ASAN/TSAN).
+Finished also: bindings (_ctypes/_sqlite3/_ssl via dlopen; crates/bindings), parallel (concurrent.futures,
+multiprocessing, fork safety).
+Running (wave 9): tty2 (_pyrepl, _tkinter+tkinter, login_tty, locking), numpy (C-API fixes until numpy's own test
+suite passes; other cp315t wheels), docsig (__text_signature__ for all builtins).
+Finished also: tty (dbm/readline/curses), pkgtools (importlib.resources/metadata, ensurepip+pip 26.2.2, venv,
+zipapp, tracemalloc, sysconfig, pydoc). MILESTONE: pip installs numpy-2.5.4 cp315t wheel; import numpy works.
 Unassigned: _testclinic re-implemented by us (spec lacks
-internal headers / generated clinic files); curses/_curses_panel/readline/_pyrepl (bind ncurses/
-readline, D20); _tkinter + tkinter (bind Tcl/Tk, D20 — the rebuilt baseline has Tk); _dbm/_gdbm; no-GIL thread-safety audit; startup time (jit owns perf).
+internal headers / generated clinic files); subinterpreters (_interpreters/_interpqueues/_interpchannels,
+concurrent.interpreters, InterpreterPoolExecutor — CPython has them); no-GIL thread-safety audit; startup time (jit owns perf).

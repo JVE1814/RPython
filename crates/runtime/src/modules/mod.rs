@@ -81,6 +81,7 @@ pub mod zlib;
 pub mod hashes;
 pub mod _decimal;
 pub mod _bz2;
+pub mod pyexpat;
 pub mod _pickle;
 pub mod array;
 pub mod _datetime;
@@ -110,6 +111,7 @@ pub fn register_all() {
     crate::import::register_builtin("_json", _json::init_module);
     compress_common::register();
     _decimal::register();
+    crate::import::register_builtin("_expat_engine", pyexpat::init);
     crate::import::register_builtin("_pickle", _pickle::init_module);
     crate::import::register_builtin("array", array::init_module);
     crate::import::register_builtin("_datetime", _datetime::init_module);
