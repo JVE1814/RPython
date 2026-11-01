@@ -119,6 +119,8 @@ pub struct Encoder {
     reps: [u32; 3],
     xxh: Xxh64,
     dict_len: usize,
+    /// Frame header not yet written (it goes out with the first block): its content size.
+    header_due: Option<Option<u64>>,
 }
 
 impl Encoder {
@@ -142,6 +144,7 @@ impl Encoder {
             reps: [1, 4, 8],
             xxh: Xxh64::new(0),
             dict_len: 0,
+            header_due: None,
         }
     }
 
@@ -197,14 +200,13 @@ impl Encoder {
         if self.p.checksum {
             self.xxh.update(data);
         }
-        let header_pending = fresh;
-        if header_pending {
+        if fresh {
             let known = match (mode, self.pledged) {
                 (_, Some(pl)) => Some(pl),
                 (Mode::End, None) => Some(self.frame_in),
                 _ => None,
             };
-            self.write_header(known, out);
+            self.header_due = Some(known);
         }
         match mode {
             Mode::Continue => {
@@ -471,6 +473,9 @@ impl Encoder {
         let a = self.pos;
         let b = a + n;
         self.pos = b;
+        if let Some(cs) = self.header_due.take() {
+            self.write_header(cs, out);
+        }
         let lastbit = last as u32;
         if n == 0 {
             out.extend_from_slice(&[lastbit as u8, 0, 0]);

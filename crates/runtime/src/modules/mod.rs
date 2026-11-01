@@ -80,6 +80,7 @@ pub mod hashes;
 pub mod _decimal;
 pub mod _bz2;
 pub mod _lzma;
+pub mod _zstd;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
 pub fn register_all() {
