@@ -14,8 +14,10 @@ macro_rules! cs {
 pub mod capi;
 pub mod ctypes;
 pub mod dl;
+pub mod sqlite;
 
 /// Register the binding modules as builtin modules (call before runtime initialisation).
 pub fn register() {
     rpy_runtime::import::register_builtin("_ctypes", ctypes::module::init);
+    rpy_runtime::import::register_builtin("_sqlite3", sqlite::init);
 }

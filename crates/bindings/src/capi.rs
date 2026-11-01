@@ -203,5 +203,5 @@ pub mod exc {
     e!(TypeError, ValueError, OverflowError, AttributeError, IndexError, KeyError, RuntimeError, SystemError,
        MemoryError, OSError, NotImplementedError, RuntimeWarning, DeprecationWarning, ZeroDivisionError,
        StopIteration, Exception, UnicodeEncodeError, UnicodeDecodeError, BufferError, ImportError, LookupError,
-       ConnectionError, TimeoutError, UserWarning);
+       ConnectionError, TimeoutError, UserWarning, ResourceWarning, RecursionError);
 }
