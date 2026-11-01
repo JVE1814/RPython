@@ -532,7 +532,7 @@ impl<'a> Reader<'a> {
                 if n == 0 {
                     return Ok(std::borrow::Cow::Owned(Vec::new()));
                 }
-                let buf = bytearray::new_bytearray(&vec![0u8; n])?;
+                let buf = bytearray::new_bytearray(&crate::errors::try_zeroed_vec(n)?)?;
                 let r = ab::call_method_str(file, "readinto", &[&buf])?;
                 let got = if r.is(none::none()) { 0 } else { ab::index_as_ssize(&r, None)? };
                 if got != n as isize {

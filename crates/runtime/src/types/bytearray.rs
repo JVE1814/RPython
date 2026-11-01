@@ -58,7 +58,26 @@ pub fn bytearray_ptr(o: &PyObject) -> *mut u8 {
     }
 }
 
+// Thread safety: mutations run under the object lock (`wlock`, taken by the
+// method entry points after their arguments were converted, never while Python
+// code runs). Storage replaced by a mutation is released through
+// `gc::defer_decref`, so a reader holding a slice of the old storage stays valid
+// until it reaches a safepoint; readers snapshot (start, size) under the lock.
+// With a single thread no lock is taken and storage is released immediately.
+
+/// The object lock, when more than one thread exists.
+#[inline]
+fn wlock(o: &PyObject) -> Option<crate::types::dict::ObGuard> {
+    if crate::threads::multi_threaded() { Some(crate::types::dict::ob_lock(o)) } else { None }
+}
+
 pub fn bytearray_data(o: &PyObject) -> &[u8] {
+    let _g = wlock(o);
+    data_unlocked(o)
+}
+
+/// The data, with the lock already held (or a single thread).
+fn data_unlocked(o: &PyObject) -> &[u8] {
     unsafe {
         let n = (*ba(o)).ob_base.ob_size as usize;
         if n == 0 {
@@ -82,7 +101,10 @@ fn data_mut(o: &PyObject) -> &mut [u8] {
 pub fn exports(o: &PyObject) -> isize {
     unsafe { (*ba(o)).ob_exports }
 }
+/// Pin/unpin the storage (buffer exports). Serialized with resizes, which
+/// check the count under the same lock.
 pub fn add_export(o: &PyObject, delta: isize) {
+    let _g = wlock(o);
     unsafe { (*ba(o)).ob_exports += delta }
 }
 
@@ -125,7 +147,8 @@ unsafe fn set_storage(o: &PyObject, storage: Option<PyRef>, start: usize, size: 
                 b.ob_bytes_object = s.into_raw();
             }
         }
-        xdecref(old);
+        // a concurrent reader may still hold a slice of the old storage
+        crate::gc::defer_decref(old);
     }
 }
 
@@ -165,8 +188,8 @@ fn raw_resize(o: &PyObject, newsize: usize) -> PyResult<()> {
             new_alloc = newsize;
         }
         let keep = size.min(newsize);
-        let storage = if offset == 0 && !(*ba(o)).ob_bytes_object.is_null() {
-            // realloc in place
+        let storage = if offset == 0 && !(*ba(o)).ob_bytes_object.is_null() && !crate::threads::multi_threaded() {
+            // realloc in place (single-threaded only: realloc frees the old block)
             let old = PyRef::from_raw(std::mem::replace(&mut (*ba(o)).ob_bytes_object, std::ptr::null_mut()));
             match bytes::resize_unique(old, new_alloc) {
                 Ok(s) => {
@@ -192,6 +215,12 @@ fn raw_resize(o: &PyObject, newsize: usize) -> PyResult<()> {
 
 /// PyByteArray_Resize: resize with the export check.
 pub fn resize(o: &PyObject, newsize: usize) -> PyResult<()> {
+    let _g = wlock(o);
+    resize_nl(o, newsize)
+}
+
+/// `resize` with the lock held by the caller.
+fn resize_nl(o: &PyObject, newsize: usize) -> PyResult<()> {
     if newsize == bytearray_len(o) {
         return Ok(());
     }
@@ -200,8 +229,33 @@ pub fn resize(o: &PyObject, newsize: usize) -> PyResult<()> {
 }
 
 fn set_contents(o: &PyObject, v: &[u8]) -> PyResult<()> {
-    resize(o, v.len())?;
+    let _g = wlock(o);
+    resize_nl(o, v.len())?;
     unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), bytearray_ptr(o), v.len()) };
+    Ok(())
+}
+
+/// Append one byte (lock taken here).
+fn append_byte(o: &PyObject, v: u8) -> PyResult<()> {
+    let _g = wlock(o);
+    let n = bytearray_len(o);
+    if n >= bytes::MAX_SIZE {
+        raise!(OverflowError, "cannot add more objects to bytearray");
+    }
+    resize_nl(o, n + 1)?;
+    unsafe { *bytearray_ptr(o).add(n) = v };
+    Ok(())
+}
+
+/// Append `data` at the end (lock taken here).
+fn append_bytes(o: &PyObject, data: &[u8]) -> PyResult<()> {
+    let _g = wlock(o);
+    let n = bytearray_len(o);
+    if n.checked_add(data.len()).is_none_or(|t| t > bytes::MAX_SIZE) {
+        return Err(memory_error());
+    }
+    resize_nl(o, n + data.len())?;
+    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), bytearray_ptr(o).add(n), data.len()) };
     Ok(())
 }
 
@@ -329,13 +383,12 @@ fn init_impl(o: &PyObject, source: Option<&PyObject>, enc: Option<&PyObject>, er
     let r = (|| -> PyResult<()> {
         while let Some(item) = ab::iter_next(&it)? {
             let v = getbytevalue(&item)?;
-            let n = bytearray_len(o);
-            resize(o, n + 1)?;
-            unsafe { *bytearray_ptr(o).add(n) = v };
+            append_byte(o, v)?;
         }
         Ok(())
     })();
     if r.is_err() {
+        let _g = wlock(o);
         if exports(o) == 0 {
             let _ = raw_resize(o, 0);
         }
@@ -486,7 +539,7 @@ fn setslice_linear(o: &PyObject, lo: usize, hi: usize, bytes: &[u8]) -> PyResult
                     // apply the downsize policy
                     let cap = capacity(o);
                     if newsize < cap / 2 || newsize == 0 {
-                        let keep: Vec<u8> = bytearray_data(o).to_vec();
+                        let keep: Vec<u8> = data_unlocked(o).to_vec();
                         if newsize == 0 {
                             set_storage(o, None, 0, 0);
                         } else {
@@ -512,7 +565,7 @@ fn setslice_linear(o: &PyObject, lo: usize, hi: usize, bytes: &[u8]) -> PyResult
         if size.checked_add(growth).is_none_or(|n| n > bytes::MAX_SIZE) {
             return Err(memory_error());
         }
-        resize(o, size + growth)?;
+        resize_nl(o, size + growth)?;
         unsafe {
             let p = bytearray_ptr(o);
             std::ptr::copy(p.add(hi), p.add(hi + growth), size - hi);
@@ -550,67 +603,25 @@ fn is_number(v: &PyObject) -> bool {
 fn ass_subscript_impl(o: &PyObject, k: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     if ab::has_index(k) {
         let i = ab::index_as_ssize(k, Some(crate::types::exceptions::IndexError()))?;
-        match v {
-            None => {
-                let n = bytearray_len(o) as isize;
-                let i = if i < 0 { i + n } else { i };
-                if i < 0 || i >= n {
-                    raise!(IndexError, "bytearray index out of range");
-                }
-                return setslice_linear(o, i as usize, i as usize + 1, &[]);
-            }
-            Some(v) => {
-                let b = getbytevalue(v)?;
-                let n = bytearray_len(o) as isize;
-                let i = if i < 0 { i + n } else { i };
-                if i < 0 || i >= n {
-                    raise!(IndexError, "bytearray index out of range");
-                }
-                data_mut(o)[i as usize] = b;
-                return Ok(());
-            }
-        }
+        let b = match v {
+            None => None,
+            Some(v) => Some(getbytevalue(v)?),
+        };
+        return set_or_del_index(o, i, b);
     }
     if !slice::is_slice(k) {
         raise!(TypeError, "bytearray indices must be integers or slices, not {}", tname(k));
     }
+    // convert everything that may run Python code before taking the lock
     let values: Option<Vec<u8>> = match v {
         None => None,
         Some(v) => Some(slice_values(o, v)?),
     };
-    let (start, mut stop, step, slicelen) = slice::indices(k, bytearray_len(o) as isize)?;
+    let (mut start, mut stop, step) = slice::unpack(k)?;
+    let _g = wlock(o);
+    let slicelen = slice::adjust_indices(bytearray_len(o) as isize, &mut start, &mut stop, step);
     match values {
-        None => {
-            if slicelen <= 0 {
-                return Ok(());
-            }
-            if step == 1 {
-                return setslice_linear(o, start as usize, (start + slicelen) as usize, &[]);
-            }
-            can_resize(o)?;
-            // delete an extended slice
-            let (mut lo, mut st) = (start, step);
-            if st < 0 {
-                lo = start + st * (slicelen - 1);
-                st = -st;
-            }
-            let d = bytearray_data(o).to_vec();
-            let mut out = Vec::with_capacity(d.len() - slicelen as usize);
-            let mut next_del = lo as usize;
-            let mut deleted = 0;
-            for (i, &c) in d.iter().enumerate() {
-                if deleted < slicelen as usize && i == next_del {
-                    deleted += 1;
-                    next_del = next_del.saturating_add(st as usize);
-                    continue;
-                }
-                out.push(c);
-            }
-            let n = out.len();
-            raw_resize(o, n)?;
-            unsafe { std::ptr::copy_nonoverlapping(out.as_ptr(), bytearray_ptr(o), n) };
-            Ok(())
-        }
+        None => del_slice_nl(o, start, step, slicelen),
         Some(vals) => {
             if (step < 0 && start < stop) || (step > 0 && start > stop) {
                 stop = start;
@@ -620,7 +631,7 @@ fn ass_subscript_impl(o: &PyObject, k: &PyObject, v: Option<&PyObject>) -> PyRes
             }
             if vals.is_empty() && slicelen > 0 {
                 // b[::2] = b"" deletes
-                return ass_subscript_impl(o, k, None);
+                return del_slice_nl(o, start, step, slicelen);
             }
             if vals.len() as isize != slicelen {
                 raise!(ValueError, "attempt to assign bytes of size {} to extended slice of size {}", vals.len(), slicelen);
@@ -635,6 +646,55 @@ fn ass_subscript_impl(o: &PyObject, k: &PyObject, v: Option<&PyObject>) -> PyRes
         }
     }
 }
+
+/// `del o[start::step]` (slicelen items), lock held.
+fn del_slice_nl(o: &PyObject, start: isize, step: isize, slicelen: isize) -> PyResult<()> {
+    if slicelen <= 0 {
+        return Ok(());
+    }
+    if step == 1 {
+        return setslice_linear(o, start as usize, (start + slicelen) as usize, &[]);
+    }
+    can_resize(o)?;
+    let (mut lo, mut st) = (start, step);
+    if st < 0 {
+        lo = start + st * (slicelen - 1);
+        st = -st;
+    }
+    let d = data_unlocked(o).to_vec();
+    let mut out = Vec::with_capacity(d.len() - slicelen as usize);
+    let mut next_del = lo as usize;
+    let mut deleted = 0;
+    for (i, &c) in d.iter().enumerate() {
+        if deleted < slicelen as usize && i == next_del {
+            deleted += 1;
+            next_del = next_del.saturating_add(st as usize);
+            continue;
+        }
+        out.push(c);
+    }
+    let n = out.len();
+    raw_resize(o, n)?;
+    unsafe { std::ptr::copy_nonoverlapping(out.as_ptr(), bytearray_ptr(o), n) };
+    Ok(())
+}
+
+/// `o[i] = b` / `del o[i]` (negative i counts from the end); takes the lock.
+fn set_or_del_index(o: &PyObject, i: isize, b: Option<u8>) -> PyResult<()> {
+    let _g = wlock(o);
+    let n = bytearray_len(o) as isize;
+    let i = if i < 0 { i + n } else { i };
+    if i < 0 || i >= n {
+        raise!(IndexError, "bytearray index out of range");
+    }
+    match b {
+        None => setslice_linear(o, i as usize, i as usize + 1, &[]),
+        Some(b) => {
+            data_mut(o)[i as usize] = b;
+            Ok(())
+        }
+    }
+}
 unsafe extern "C" fn bytearray_ass_subscript(o: *mut PyObject, k: *mut PyObject, v: *mut PyObject) -> c_int {
     unsafe { int_into_c(ass_subscript_impl(&*o, &*k, if v.is_null() { None } else { Some(&*v) })) }
 }
@@ -642,20 +702,11 @@ unsafe extern "C" fn bytearray_ass_item(o: *mut PyObject, i: Py_ssize_t, v: *mut
     unsafe {
         let o = &*o;
         let r = (|| -> PyResult<()> {
-            if v.is_null() {
-                let n = bytearray_len(o) as isize;
-                if i < 0 || i >= n {
-                    raise!(IndexError, "bytearray index out of range");
-                }
-                return setslice_linear(o, i as usize, i as usize + 1, &[]);
-            }
-            let b = getbytevalue(&*v)?;
-            let n = bytearray_len(o) as isize;
-            if i < 0 || i >= n {
+            if i < 0 {
                 raise!(IndexError, "bytearray index out of range");
             }
-            data_mut(o)[i as usize] = b;
-            Ok(())
+            let b = if v.is_null() { None } else { Some(getbytevalue(&*v)?) };
+            set_or_del_index(o, i, b)
         })();
         int_into_c(r)
     }
@@ -692,12 +743,7 @@ unsafe extern "C" fn bytearray_iconcat(a: *mut PyObject, b: *mut PyObject) -> *m
                     raise!(TypeError, "can't concat {} to {}", tname(b), tname(a));
                 }
             };
-            let n = bytearray_len(a);
-            if n.checked_add(data.len()).is_none_or(|t| t > bytes::MAX_SIZE) {
-                return Err(memory_error());
-            }
-            resize(a, n + data.len())?;
-            std::ptr::copy_nonoverlapping(data.as_ptr(), bytearray_ptr(a).add(n), data.len());
+            append_bytes(a, &data)?;
             Ok(a.to_ref())
         })();
         into_c(r)
@@ -735,11 +781,13 @@ unsafe extern "C" fn bytearray_getbuffer(o: *mut PyObject, view: *mut Py_buffer,
             let _ = err!(BufferError, "bytearray_getbuffer: view==NULL argument is obsolete");
             return -1;
         }
+        // the storage seen by the view and the pin are taken atomically
+        let _g = wlock(ob);
         let r = buffer::fill_info(view, o, bytearray_ptr(ob) as *mut _, bytearray_len(ob) as isize, false, flags);
         if r.is_err() {
             return -1;
         }
-        add_export(ob, 1);
+        (*ba(ob)).ob_exports += 1;
         0
     }
 }
@@ -769,12 +817,7 @@ unsafe extern "C" fn bytearray_iter(o: *mut PyObject) -> *mut PyObject {
 
 fn m_append(o: &PyObject, item: &PyObject) -> PyResult {
     let v = getbytevalue(item)?;
-    let n = bytearray_len(o);
-    if n >= bytes::MAX_SIZE {
-        raise!(OverflowError, "cannot add more objects to bytearray");
-    }
-    resize(o, n + 1)?;
-    unsafe { *bytearray_ptr(o).add(n) = v };
+    append_byte(o, v)?;
     Ok(none::none_ref())
 }
 
@@ -789,6 +832,7 @@ fn m_extend(o: &PyObject, it: &PyObject) -> PyResult {
             b.as_bytes().to_vec()
         };
         // the bounds were computed before the buffer was acquired
+        let _g = wlock(o);
         let size = bytearray_len(o);
         let lo = n.min(size);
         setslice_linear(o, lo, lo, &data)?;
@@ -812,12 +856,7 @@ fn m_extend(o: &PyObject, it: &PyObject) -> PyResult {
     while let Some(item) = ab::iter_next(&iter)? {
         v.push(getbytevalue(&item)?);
     }
-    let n = bytearray_len(o);
-    if n.checked_add(v.len()).is_none_or(|t| t > bytes::MAX_SIZE) {
-        return Err(memory_error());
-    }
-    resize(o, n + v.len())?;
-    unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), bytearray_ptr(o).add(n), v.len()) };
+    append_bytes(o, &v)?;
     Ok(none::none_ref())
 }
 
@@ -825,11 +864,12 @@ fn m_insert(o: &PyObject, args: &[&PyObject]) -> PyResult {
     crate::args::check_pos("insert", args, 2, 2)?;
     let mut w = bm::ssize_arg(args[0])?;
     let v = getbytevalue(args[1])?;
+    let _g = wlock(o);
     let n = bytearray_len(o) as isize;
     if n as usize >= bytes::MAX_SIZE {
         raise!(OverflowError, "cannot add more objects to bytearray");
     }
-    resize(o, n as usize + 1)?;
+    resize_nl(o, n as usize + 1)?;
     if w < 0 {
         w += n;
         if w < 0 {
@@ -853,25 +893,30 @@ fn m_pop(o: &PyObject, args: &[&PyObject]) -> PyResult {
         None => -1,
         Some(x) => bm::ssize_arg(x)?,
     };
-    let n = bytearray_len(o) as isize;
-    if n == 0 {
-        raise!(IndexError, "pop from empty bytearray");
-    }
-    if i < 0 {
-        i += n;
-    }
-    if i < 0 || i >= n {
-        raise!(IndexError, "pop index out of range");
-    }
-    can_resize(o)?;
-    let v = bytearray_data(o)[i as usize];
-    setslice_linear(o, i as usize, i as usize + 1, &[])?;
+    let v = {
+        let _g = wlock(o);
+        let n = bytearray_len(o) as isize;
+        if n == 0 {
+            raise!(IndexError, "pop from empty bytearray");
+        }
+        if i < 0 {
+            i += n;
+        }
+        if i < 0 || i >= n {
+            raise!(IndexError, "pop index out of range");
+        }
+        can_resize(o)?;
+        let v = data_unlocked(o)[i as usize];
+        setslice_linear(o, i as usize, i as usize + 1, &[])?;
+        v
+    };
     Ok(int::new_int(v as i64))
 }
 
 fn m_remove(o: &PyObject, x: &PyObject) -> PyResult {
     let v = getbytevalue(x)?;
-    let pos = match bm::memchr(v, bytearray_data(o)) {
+    let _g = wlock(o);
+    let pos = match bm::memchr(v, data_unlocked(o)) {
         Some(p) => p,
         None => raise!(ValueError, "value not found in bytearray"),
     };
@@ -881,6 +926,7 @@ fn m_remove(o: &PyObject, x: &PyObject) -> PyResult {
 }
 
 fn m_reverse(o: &PyObject) -> PyResult {
+    let _g = wlock(o);
     data_mut(o).reverse();
     Ok(none::none_ref())
 }
@@ -916,6 +962,7 @@ fn m_take_bytes(o: &PyObject, args: &[&PyObject]) -> PyResult {
         Some(x) if none::is_none(x) => None,
         Some(x) => Some(bm::ssize_arg(x)?),
     };
+    let _g = wlock(o);
     let size = bytearray_len(o) as isize;
     let mut n = req.unwrap_or(size);
     if n < 0 {
@@ -934,14 +981,27 @@ fn m_take_bytes(o: &PyObject, args: &[&PyObject]) -> PyResult {
         let offset = logical_offset(o);
         if n * 2 <= size && n < size {
             // small take: copy out and advance the logical start
-            let r = bytes::try_new_bytes(&bytearray_data(o)[..n])?;
+            let r = bytes::try_new_bytes(&data_unlocked(o)[..n])?;
             let b = &mut *ba(o);
             b.ob_start = b.ob_start.add(n);
             b.ob_base.ob_size -= n as isize;
             return Ok(r);
         }
+        let rest: Option<PyRef> = if n < size { Some(bytes::try_new_bytes(&data_unlocked(o)[n..])?) } else { None };
+        if crate::threads::multi_threaded() {
+            // other threads may be reading the storage: copy instead of handing
+            // it over (resizing it in place would free it under them)
+            let taken = bytes::try_new_bytes(&data_unlocked(o)[..n])?;
+            match rest {
+                None => set_storage(o, None, 0, 0),
+                Some(r) => {
+                    let len = bytes::bytes_len(&r);
+                    set_storage(o, Some(r), 0, len);
+                }
+            }
+            return Ok(taken);
+        }
         // large take: hand over the storage (zero copy for the taken part)
-        let rest: Option<PyRef> = if n < size { Some(bytes::try_new_bytes(&bytearray_data(o)[n..])?) } else { None };
         if offset > 0 {
             let p = (*ba(o)).ob_bytes;
             std::ptr::copy(p.add(offset), p, size);
@@ -1008,19 +1068,31 @@ pub struct BaIter {
 }
 unsafe extern "C" fn baiter_next(o: *mut PyObject) -> *mut PyObject {
     unsafe {
-        let it = &mut *(o as *mut BaIter);
-        if it.seq.is_null() {
-            return std::ptr::null_mut();
+        // an iterator shared between threads is stepped under its own lock (the
+        // bytearray it holds must not be released by another thread finishing
+        // the iteration meanwhile); the bytearray is released after unlocking
+        let mut finished: *mut PyObject = std::ptr::null_mut();
+        let r = {
+            let _g = wlock(&*o);
+            let it = &mut *(o as *mut BaIter);
+            if it.seq.is_null() {
+                return std::ptr::null_mut();
+            }
+            let d = bytearray_data(&*it.seq);
+            if it.index >= 0 && (it.index as usize) < d.len() {
+                let v = d[it.index as usize];
+                it.index += 1;
+                Some(v)
+            } else {
+                finished = std::mem::replace(&mut it.seq, std::ptr::null_mut());
+                None
+            }
+        };
+        xdecref(finished);
+        match r {
+            Some(v) => int::new_int(v as i64).into_raw(),
+            None => std::ptr::null_mut(),
         }
-        let d = bytearray_data(&*it.seq);
-        if it.index >= 0 && (it.index as usize) < d.len() {
-            let v = d[it.index as usize];
-            it.index += 1;
-            return int::new_int(v as i64).into_raw();
-        }
-        let s = std::mem::replace(&mut it.seq, std::ptr::null_mut());
-        decref(s);
-        std::ptr::null_mut()
     }
 }
 unsafe extern "C" fn baiter_dealloc(o: *mut PyObject) {
@@ -1036,17 +1108,23 @@ unsafe extern "C" fn baiter_traverse(o: *mut PyObject, visit: visitproc, arg: *m
         if s.is_null() { 0 } else { visit.unwrap()(s, arg) }
     }
 }
-fn baiter_length_hint(o: &PyObject) -> PyResult {
+/// (sequence, index) of an iterator, read under its lock (see baiter_next).
+fn baiter_snapshot(o: &PyObject) -> (Option<PyRef>, isize) {
+    let _g = wlock(o);
     let it = unsafe { &*(o.as_ptr() as *mut BaIter) };
-    if it.seq.is_null() {
+    (unsafe { it.seq.as_ref() }.map(|s| s.to_ref()), it.index)
+}
+fn baiter_length_hint(o: &PyObject) -> PyResult {
+    let (seq, index) = baiter_snapshot(o);
+    let Some(seq) = seq else {
         return Ok(int::new_int(0));
-    }
-    let n = bytearray_len(unsafe { &*it.seq }) as isize - it.index;
+    };
+    let n = bytearray_len(&seq) as isize - index;
     Ok(int::new_int(n.max(0) as i64))
 }
 fn baiter_reduce(o: &PyObject) -> PyResult {
-    let it = unsafe { &*(o.as_ptr() as *mut BaIter) };
-    bm::iter_reduce(it.seq, it.index)
+    let (seq, index) = baiter_snapshot(o);
+    bm::iter_reduce(seq.as_ref().map_or(std::ptr::null_mut(), |s| s.as_ptr()), index)
 }
 fn baiter_setstate(o: &PyObject, state: &PyObject) -> PyResult {
     let it = unsafe { &mut *(o.as_ptr() as *mut BaIter) };

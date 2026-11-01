@@ -790,7 +790,7 @@ fn m_recv(o: &PyObject, args: &[&PyObject]) -> PyResult {
         raise!(ValueError, "negative buffersize in recv");
     }
     let flags = flags_arg(args.get(1).copied())?;
-    let mut buf = vec![0u8; n as usize];
+    let mut buf = crate::errors::try_zeroed_vec(n as usize)?;
     let got = recv_into_buf(sk(o), buf.as_mut_ptr(), n as usize, flags)?;
     Ok(bytes::new_bytes(&buf[..got as usize]))
 }
@@ -837,7 +837,7 @@ fn m_recvfrom(o: &PyObject, args: &[&PyObject]) -> PyResult {
         raise!(ValueError, "negative buffersize in recvfrom");
     }
     let flags = flags_arg(args.get(1).copied())?;
-    let mut buf = vec![0u8; n as usize];
+    let mut buf = crate::errors::try_zeroed_vec(n as usize)?;
     let (got, a) = recvfrom_guts(sk(o), buf.as_mut_ptr(), n as usize, flags)?;
     Ok(tuple::new_tuple(vec![bytes::new_bytes(&buf[..got as usize]), a]))
 }
@@ -1071,7 +1071,7 @@ fn m_recvmsg(o: &PyObject, args: &[&PyObject]) -> PyResult {
         }
     };
     let flags = flags_arg(args.get(2).copied())?;
-    let mut buf = vec![0u8; n as usize];
+    let mut buf = crate::errors::try_zeroed_vec(n as usize)?;
     let mut iov = [libc::iovec { iov_base: buf.as_mut_ptr() as *mut libc::c_void, iov_len: n as usize }];
     let (got, ancdata, mflags, a) = recvmsg_guts(sk(o), &mut iov, anc, flags)?;
     Ok(tuple::new_tuple(vec![bytes::new_bytes(&buf[..got as usize]), ancdata, int::new_int(mflags as i64), a]))

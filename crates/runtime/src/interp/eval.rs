@@ -986,15 +986,10 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             let k = popref!(f);
                             let c = popref!(f);
                             let r = if list::is_list_exact(&c) && int::is_int_exact(&k) && int::is_compact(&k) {
-                                let mut i = int::compact_value(&k);
-                                let n = list::list_len(&c) as i64;
-                                if i < 0 {
-                                    i += n;
+                                match list::get_signed(&c, int::compact_value(&k)) {
+                                    Some(v) => v,
+                                    None => raise!(IndexError, "list index out of range"),
                                 }
-                                if i < 0 || i >= n {
-                                    raise!(IndexError, "list index out of range");
-                                }
-                                list::list_items(&c)[i as usize].to_ref()
                             } else if tuple::is_tuple_exact(&c) && int::is_int_exact(&k) && int::is_compact(&k) {
                                 let mut i = int::compact_value(&k);
                                 let n = tuple::tuple_len(&c) as i64;

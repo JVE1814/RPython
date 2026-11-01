@@ -389,16 +389,13 @@ pub unsafe extern "C" fn h_binary_subscr(sp: *mut *mut PyObject) -> u64 {
         let c = take(sp.sub(2));
         helper!({
             let r = if list::is_list_exact(&c) && int::is_int_exact(&k) && int::is_compact(&k) {
-                let mut i = int::compact_value(&k);
-                let n = list::list_len(&c) as i64;
-                if i < 0 {
-                    i += n;
+                match list::get_signed(&c, int::compact_value(&k)) {
+                    Some(v) => v,
+                    None => {
+                        let _ = err!(IndexError, "list index out of range");
+                        return Err(ERR);
+                    }
                 }
-                if i < 0 || i >= n {
-                    let _ = err!(IndexError, "list index out of range");
-                    return Err(ERR);
-                }
-                list::list_items(&c)[i as usize].to_ref()
             } else if tuple::is_tuple_exact(&c) && int::is_int_exact(&k) && int::is_compact(&k) {
                 let mut i = int::compact_value(&k);
                 let n = tuple::tuple_len(&c) as i64;
@@ -638,12 +635,13 @@ pub unsafe extern "C" fn h_unpack_sequence(sp: *mut *mut PyObject, n: u64) -> u6
             }
             return OK;
         }
-        if list::is_list_exact(&seq) && list::list_len(&seq) == n {
-            let items = list::list_items(&seq);
-            for i in 0..n {
-                *base.add(n - 1 - i) = items[i].to_ref().into_raw();
+        if list::is_list_exact(&seq) {
+            if let Some(items) = list::items_if_len(&seq, n) {
+                for (i, v) in items.into_iter().enumerate() {
+                    *base.add(n - 1 - i) = v.into_raw();
+                }
+                return OK;
             }
-            return OK;
         }
         let mut items = Vec::with_capacity(n);
         if eval::unpack_sequence(&seq, n, &mut items).is_err() {

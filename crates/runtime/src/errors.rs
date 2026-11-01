@@ -118,6 +118,31 @@ pub fn overflow_error(msg: &str) -> PyErr {
 pub fn memory_error() -> PyErr {
     set_err_noargs(crate::types::exceptions::MemoryError())
 }
+/// A zero-filled buffer of `n` bytes, or MemoryError (instead of the process
+/// abort `vec![0; n]` performs when an allocation fails) for sizes that come
+/// from Python code.
+pub fn try_zeroed_vec(n: usize) -> PyResult<Vec<u8>> {
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let Ok(layout) = std::alloc::Layout::array::<u8>(n) else {
+        return Err(memory_error());
+    };
+    // calloc-style: large buffers stay lazily committed
+    let p = unsafe { std::alloc::alloc_zeroed(layout) };
+    if p.is_null() {
+        return Err(memory_error());
+    }
+    Ok(unsafe { Vec::from_raw_parts(p, n, n) })
+}
+/// `Vec::with_capacity(n)` that raises MemoryError instead of aborting.
+pub fn try_vec_with_capacity<T>(n: usize) -> PyResult<Vec<T>> {
+    let mut v: Vec<T> = Vec::new();
+    if v.try_reserve(n).is_err() {
+        return Err(memory_error());
+    }
+    Ok(v)
+}
 pub fn system_error(msg: &str) -> PyErr {
     new_err(crate::types::exceptions::SystemError(), msg)
 }

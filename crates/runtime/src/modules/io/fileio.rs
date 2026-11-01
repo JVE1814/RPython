@@ -446,7 +446,7 @@ fn fio_read(o: &PyObject, args: &[&PyObject]) -> PyResult {
             None => Ok(none::none_ref()),
         };
     }
-    let mut buf = vec![0u8; n as usize];
+    let mut buf = crate::errors::try_zeroed_vec(n as usize)?;
     match raw_read_into(f.fd, &mut buf)? {
         Some(k) => Ok(new_bytes(&buf[..k])),
         None => Ok(none::none_ref()),

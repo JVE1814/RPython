@@ -175,12 +175,29 @@ pub fn new_thread_state() -> *mut ThreadState {
             None => Box::into_raw(Box::new(st)),
         };
         (*ts).c.exc_info = &mut (*ts).c.exc_state;
-        ALL_THREADS.lock().unwrap().push(ts as usize);
+        {
+            let mut all = ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+            if !all.is_empty() {
+                MULTI_THREADED.store(1, SeqCst);
+            }
+            all.push(ts as usize);
+        }
         ts
     }
 }
 
 pub(crate) static FREE_STATES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// 1 once a second thread state was ever created (never reset). Container fast
+/// paths that read without the object lock (interpreter, JIT inline code) are
+/// only taken while this is 0: with a single thread no writer can race them.
+/// (A u64 so JIT code can test it with one qword compare.)
+pub static MULTI_THREADED: AtomicUsize = AtomicUsize::new(0);
+
+#[inline(always)]
+pub fn multi_threaded() -> bool {
+    MULTI_THREADED.load(Relaxed) != 0
+}
 static RECURSION_LIMIT: AtomicUsize = AtomicUsize::new(1000);
 /// pthread id of the main Python thread (0 = not yet known).
 pub static MAIN_THREAD_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

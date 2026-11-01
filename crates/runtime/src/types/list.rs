@@ -173,6 +173,33 @@ pub fn append(o: &PyObject, item: PyRef) {
     }
 }
 
+/// Item `i` (negative counts from the end) for interpreter/JIT fast paths. The
+/// item array can be replaced and freed by a concurrent writer, so the read is
+/// done under the list lock once the process has more than one thread.
+#[inline]
+pub fn get_signed(o: &PyObject, i: i64) -> Option<PyRef> {
+    let _g = if crate::threads::multi_threaded() { Some(ob_lock(o)) } else { None };
+    unsafe {
+        let l = lp(o);
+        let n = (*l).ob_base.ob_size as i64;
+        let i = if i < 0 { i + n } else { i };
+        if i < 0 || i >= n {
+            return None;
+        }
+        Some(PyRef::from_borrowed(*(*l).ob_item.add(i as usize)))
+    }
+}
+
+/// The items, if the list has exactly `n` of them (sequence unpacking).
+pub fn items_if_len(o: &PyObject, n: usize) -> Option<Vec<PyRef>> {
+    let _g = if crate::threads::multi_threaded() { Some(ob_lock(o)) } else { None };
+    let items = list_items(o);
+    if items.len() != n {
+        return None;
+    }
+    Some(items.iter().map(|x| x.to_ref()).collect())
+}
+
 pub fn get(o: &PyObject, i: usize) -> Option<PyRef> {
     let _g = ob_lock(o);
     let items = list_items(o);
@@ -924,42 +951,42 @@ unsafe extern "C" fn list_iter(o: *mut PyObject) -> *mut PyObject {
 pub fn list_reversed(o: &PyObject) -> PyResult {
     Ok(new_iter(&raw mut PyListRevIter_Type, o, list_len(o) as isize - 1))
 }
-fn iter_finish(it: &mut ListIter) {
-    let p = std::mem::replace(&mut it.seq, std::ptr::null_mut());
-    unsafe { xdecref(p) };
+/// One step of a (reverse) list iterator. An iterator shared between threads is
+/// stepped under its own lock so that the list it holds cannot be released by
+/// another thread finishing the iteration in the middle of the read; the list
+/// is released after the lock is dropped (its deallocation may run code).
+unsafe fn listiter_step(o: *mut PyObject, step: isize) -> *mut PyObject {
+    unsafe {
+        let mut finished: *mut PyObject = std::ptr::null_mut();
+        let r = {
+            let _g = if crate::threads::multi_threaded() { Some(ob_lock(&*o)) } else { None };
+            let it = &mut *(o as *mut ListIter);
+            if it.seq.is_null() {
+                return std::ptr::null_mut();
+            }
+            match if it.index >= 0 { get(&*it.seq, it.index as usize) } else { None } {
+                Some(v) => {
+                    it.index += step;
+                    v.into_raw()
+                }
+                None => {
+                    if step < 0 {
+                        it.index = -1;
+                    }
+                    finished = std::mem::replace(&mut it.seq, std::ptr::null_mut());
+                    std::ptr::null_mut()
+                }
+            }
+        };
+        xdecref(finished);
+        r
+    }
 }
 unsafe extern "C" fn listiter_next(o: *mut PyObject) -> *mut PyObject {
-    unsafe {
-        let it = &mut *(o as *mut ListIter);
-        if it.seq.is_null() {
-            return std::ptr::null_mut();
-        }
-        if it.index >= 0 {
-            if let Some(v) = get(&*it.seq, it.index as usize) {
-                it.index += 1;
-                return v.into_raw();
-            }
-        }
-        iter_finish(it);
-        std::ptr::null_mut()
-    }
+    unsafe { listiter_step(o, 1) }
 }
 unsafe extern "C" fn listreviter_next(o: *mut PyObject) -> *mut PyObject {
-    unsafe {
-        let it = &mut *(o as *mut ListIter);
-        if it.seq.is_null() {
-            return std::ptr::null_mut();
-        }
-        if it.index >= 0 {
-            if let Some(v) = get(&*it.seq, it.index as usize) {
-                it.index -= 1;
-                return v.into_raw();
-            }
-        }
-        it.index = -1;
-        iter_finish(it);
-        std::ptr::null_mut()
-    }
+    unsafe { listiter_step(o, -1) }
 }
 unsafe extern "C" fn listiter_dealloc(o: *mut PyObject) {
     unsafe {

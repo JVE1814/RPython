@@ -455,7 +455,7 @@ fn read_n(raw: &PyObject, st: &mut State, n: usize) -> PyResult<Option<Vec<u8>>>
         st.rpos += n;
         return Ok(Some(v));
     }
-    let mut out = Vec::with_capacity(n);
+    let mut out = crate::errors::try_vec_with_capacity(n)?;
     out.extend_from_slice(&st.rbuf[st.rpos..]);
     st.reset_read();
     while out.len() < n {
@@ -546,7 +546,7 @@ fn b_read1(o: &PyObject, args: &[&PyObject]) -> PyResult {
     }
     st.reset_read();
     if n > st.buffer_size {
-        let mut buf = vec![0u8; n];
+        let mut buf = crate::errors::try_zeroed_vec(n)?;
         return match raw_readinto(&raw, &mut buf)? {
             Some(k) => Ok(new_bytes(&buf[..k])),
             None => Ok(none::none_ref()),

@@ -322,6 +322,54 @@ fn start_the_world() {
     RELEASE.store(true, SeqCst);
 }
 
+// ---------------------------------------------------------------- deferred release
+//
+// Storage that other threads may still be reading without a lock (e.g. the
+// buffer of a bytearray that was just resized) is released only after every
+// thread has passed a safepoint: lock-free reads never span a safepoint. The
+// next collection's stop-the-world is such a point (DECISIONS D5). A finer
+// grained mechanism (per-thread quiescent states) can replace this; the API
+// stays `defer_decref`.
+
+static DEFERRED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static MATURE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static DEFERRED_COUNT: AtomicUsize = AtomicUsize::new(0);
+const DEFERRED_TRIGGER: usize = 4096;
+
+/// Release a reference once no thread can still be reading the object through
+/// a pointer loaded before this call. With a single thread it is released now.
+pub unsafe fn defer_decref(op: *mut PyObject) {
+    if op.is_null() {
+        return;
+    }
+    if !crate::threads::multi_threaded() {
+        unsafe { decref(op) };
+        return;
+    }
+    DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).push(op as usize);
+    if DEFERRED_COUNT.fetch_add(1, Relaxed) + 1 >= DEFERRED_TRIGGER {
+        DEFERRED_COUNT.store(0, Relaxed);
+        // force a collection soon even if few GC objects are allocated
+        ALLOCS_SINCE.fetch_add(THRESHOLD.load(Relaxed).max(1), Relaxed);
+        request_collection();
+    }
+}
+
+/// While the world is stopped: everything deferred so far may be released.
+fn mature_deferred() {
+    let v = std::mem::take(&mut *DEFERRED.lock().unwrap_or_else(|e| e.into_inner()));
+    DEFERRED_COUNT.store(0, Relaxed);
+    MATURE.lock().unwrap_or_else(|e| e.into_inner()).extend(v);
+}
+
+/// With the world running again: release what matured.
+fn release_mature() {
+    let v = std::mem::take(&mut *MATURE.lock().unwrap_or_else(|e| e.into_inner()));
+    for op in v {
+        unsafe { decref(op as *mut PyObject) };
+    }
+}
+
 // ---------------------------------------------------------------- collection
 
 fn total_refcnt(o: &PyObject) -> isize {
@@ -476,6 +524,7 @@ fn collect_gen(young_only: bool) -> usize {
     let me = crate::threads::current_mut();
     let saved_exc = crate::errors::take_exc();
     let n = unsafe { collect_phases(me, young_only) };
+    release_mature();
     if let Some(e) = saved_exc {
         crate::errors::set_exc(e);
     }
@@ -509,6 +558,8 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
         if !stop_the_world(me) {
             return None;
         }
+        // every thread is at a safepoint: references deferred before now can go
+        mature_deferred();
         // ---- phase 1 (stopped): find the unreachable objects
         let objs = snapshot_gen(young_only);
         let unreachable = find_unreachable(objs);
@@ -609,7 +660,24 @@ pub fn maybe_collect(ts: &ThreadState) {
         let tracked = TRACKED.load(Relaxed).max(0) as usize;
         let full = YOUNG_COLLECTIONS.load(Relaxed) >= 10 && tracked > LAST_FULL_LIVE.load(Relaxed) + LAST_FULL_LIVE.load(Relaxed) / 2;
         collect_gen(!full);
+    } else if !DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+        // collections are disabled (or not due): still release deferred storage
+        flush_deferred();
     }
+}
+
+/// A stop-the-world handshake that only releases deferred references.
+pub fn flush_deferred() {
+    if COLLECTING.swap(true, AcqRel) {
+        return;
+    }
+    let me = crate::threads::current_mut();
+    if stop_the_world(me) {
+        mature_deferred();
+        start_the_world();
+    }
+    COLLECTING.store(false, Release);
+    release_mature();
 }
 
 /// All tracked objects (for gc.get_objects / get_referrers).
