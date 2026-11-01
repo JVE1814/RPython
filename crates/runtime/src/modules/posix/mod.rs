@@ -586,6 +586,9 @@ fn methods() -> *mut crate::ffi::PyMethodDef {
     use scandir::*;
     use stat::*;
     crate::mdefs![
+        ("login_tty", FAST, os_login_tty),
+        ("_is_inputhook_installed", NOARGS, os_is_inputhook_installed, "_is_inputhook_installed($module, /)\n--\n\n"),
+        ("_inputhook", NOARGS, os_inputhook, "_inputhook($module, /)\n--\n\n"),
         ("stat", FASTKW, os_stat, "stat($module, /, path, *, dir_fd=None, follow_symlinks=True)\n--\n\nReturn a stat_result for a path or file descriptor."),
         ("lstat", FASTKW, os_lstat, "lstat($module, /, path, *, dir_fd=None)\n--\n\nLike stat(), but do not follow a final symbolic link."),
         ("fstat", FASTKW, os_fstat, "fstat($module, /, fd)\n--\n\nReturn a stat_result for an open file descriptor."),

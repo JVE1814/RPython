@@ -339,9 +339,30 @@ fn fancy_repl(quiet: bool) -> Option<i32> {
         return None;
     }
     let r = (|| -> PyResult<()> {
-        let m = crate::import::import_absolute("_pyrepl.main")?;
-        let f = ab::getattr_str(&m, "interactive_console")?;
+        // __main__ must exist before _pyrepl (rlcompleter imports it)
         let main = main_module()?;
+        let m = crate::import::import_absolute("_pyrepl.main")?;
+        let usable = ab::getattr_str(&m, "CAN_USE_PYREPL").and_then(|v| ab::is_true(&v)).unwrap_or(false);
+        if !usable {
+            clear_exc();
+            if let Ok(reason) = ab::getattr_str(&m, "FAIL_REASON") {
+                let reason = pystr::to_string_lossy(&reason);
+                if !reason.is_empty() {
+                    crate::modules::sys::write_stderr(&format!("{}\n", reason));
+                }
+            }
+            clear_exc();
+            return Err(crate::modules::tty::dl::import_error("pyrepl cannot be used"));
+        }
+        let f = ab::getattr_str(&m, "interactive_console")?;
+        if !quiet {
+            let v = crate::modules::sys::get_sys_attr("version").map(|v| pystr::to_string_lossy(&v)).unwrap_or_default();
+            crate::modules::sys::write_stderr(&format!(
+                "Python {} on linux\nType \"help\", \"copyright\", \"credits\" or \"license\" for more information.\n",
+                v
+            ));
+        }
+        run_interactive_hook();
         let startup = if cfg.ignore_environment == 0 && cfg.isolated == 0 { std::env::var("PYTHONSTARTUP").ok().filter(|s| !s.is_empty()) } else { None };
         let st = match startup {
             Some(s) => pystr::new_str(&s),
