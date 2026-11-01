@@ -1685,6 +1685,7 @@ def _check_class(klass, attr):
     return _sentinel
 
 
+@functools.lru_cache()
 def _shadowed_dict_from_weakref_mro_tuple(*weakref_mro):
     for weakref_entry in weakref_mro:
         # Normally we'd have to check whether the result of weakref_entry()
