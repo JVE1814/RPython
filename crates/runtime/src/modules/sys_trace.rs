@@ -109,6 +109,12 @@ fn call_suppressed(ts: &ThreadState, func: &PyObject, args: &[&PyObject]) -> PyR
     r
 }
 
+/// The event bit that enables `ev`: C_RETURN and C_RAISE follow CALL.
+#[inline]
+fn enable_bit(ev: usize) -> usize {
+    if ev == 16 || ev == 17 { 4 } else { ev }
+}
+
 fn events_for(m: &MonState, code: usize, ev: usize) -> u32 {
     let mut tools = 0u32;
     for t in 0..NTOOLS {
@@ -116,7 +122,7 @@ fn events_for(m: &MonState, code: usize, ev: usize) -> u32 {
         if let Some((_, l)) = m.local.get(&code) {
             mask |= l[t];
         }
-        if mask & (1 << ev) != 0 && m.callbacks[t][ev] != 0 {
+        if mask & (1 << enable_bit(ev)) != 0 && m.callbacks[t][ev] != 0 {
             tools |= 1 << t;
         }
     }
@@ -125,7 +131,7 @@ fn events_for(m: &MonState, code: usize, ev: usize) -> u32 {
 
 /// Fire a monitoring event: callbacks get (code, offset_or_line, *extra).
 fn fire(ts: &ThreadState, f: &mut Frame, ev: usize, loc: u32, extra: &[&PyObject]) -> PyResult<()> {
-    if MON_ANY.load(Relaxed) & (1 << ev) == 0 {
+    if MON_ANY.load(Relaxed) & (1 << enable_bit(ev)) == 0 {
         return Ok(());
     }
     let code = f.code().as_ptr() as usize;
@@ -145,8 +151,16 @@ fn fire(ts: &ThreadState, f: &mut Frame, ev: usize, loc: u32, extra: &[&PyObject
     let locobj = int::new_int(loc as i64);
     let mut args: Vec<&PyObject> = vec![&co, &locobj];
     args.extend_from_slice(extra);
+    // callbacks of line/instruction/jump/branch events may set f_lineno
+    let jumpable = matches!(ev, LINE | INSTRUCTION | 7 | 8 | 9);
     for (tool, cb) in calls {
-        let r = call_suppressed(ts, &cb, &args)?;
+        let saved = f.trace_event;
+        if jumpable {
+            f.trace_event = crate::interp::jump::EV_LINE;
+        }
+        let r = call_suppressed(ts, &cb, &args);
+        f.trace_event = saved;
+        let r = r?;
         let dis = DISABLE_OBJ.load(Acquire);
         if !dis.is_null() && r.as_ptr() == dis {
             if (1u32 << ev) & LOCAL_EVENTS_MASK == 0 {
@@ -167,7 +181,18 @@ fn offset(f: &Frame) -> u32 {
 fn call_trace(ts: &ThreadState, func: *mut PyObject, f: &mut Frame, what: &str, arg: &PyObject) -> PyResult {
     let fo = frame_obj(f);
     let w = pystr::intern_str(what);
+    use crate::interp::jump as j;
+    let ev = match what {
+        "call" => j::EV_CALL,
+        "line" => j::EV_LINE,
+        "return" => j::EV_RETURN,
+        "exception" => j::EV_EXCEPTION,
+        "opcode" => j::EV_OPCODE,
+        _ => 0,
+    };
+    let saved = std::mem::replace(&mut f.trace_event, ev);
     let r = call_suppressed(ts, unsafe { &*func }, &[&fo, &w, arg]);
+    f.trace_event = saved;
     if r.is_err() {
         // a failing trace function is removed
         disable_trace(ts);
@@ -258,7 +283,7 @@ pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
         && ((start && (line != f.trace_line || (jumped && lasti <= prev))) || (jumped && (line != f.trace_line || lasti <= prev)));
     if new_line {
         f.trace_line = line;
-        if MON_ANY.load(Relaxed) & (1 << LINE) != 0 {
+        if MON_ANY.load(Relaxed) & (1 << LINE) != 0 && start {
             fire(ts, f, LINE, line as u32, &[])?;
         }
     }
@@ -453,7 +478,7 @@ pub fn after_call(ts: &ThreadState, f: &mut Frame, info: CallInfo, ok: bool) -> 
     let python_callee = crate::types::funcobject::is_function(&info.callable);
     let any = MON_ANY.load(Relaxed);
     if ok {
-        if !python_callee && any & (1 << C_RETURN) != 0 {
+        if !python_callee && any & (1 << CALL) != 0 {
             fire(ts, f, C_RETURN, info.offset, &[&info.callable, &info.arg0])?;
         }
         if let Some(cf) = &info.c_func {
@@ -463,7 +488,7 @@ pub fn after_call(ts: &ThreadState, f: &mut Frame, info: CallInfo, ok: bool) -> 
     }
     let e = take_exc();
     let r = (|| -> PyResult<()> {
-        if !python_callee && any & (1 << C_RAISE) != 0 {
+        if !python_callee && any & (1 << CALL) != 0 {
             fire(ts, f, C_RAISE, info.offset, &[&info.callable, &info.arg0])?;
         }
         if let Some(cf) = &info.c_func {

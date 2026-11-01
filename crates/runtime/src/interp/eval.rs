@@ -174,6 +174,10 @@ fn chain_context(ts: &ThreadState, e: &PyObject) {
     // break cycles: walk handled's context chain and cut a link to e
     unsafe {
         let mut o = handled;
+        // the chain may itself contain a cycle: a second pointer moving at half
+        // speed detects it (Floyd)
+        let mut slow = handled;
+        let mut step = false;
         loop {
             let ctx = exc::exc_context(&*o);
             match ctx {
@@ -184,6 +188,13 @@ fn chain_context(ts: &ThreadState, e: &PyObject) {
                         break;
                     }
                     o = c.as_ptr();
+                    if step {
+                        slow = exc::exc_context(&*slow).map_or(std::ptr::null_mut(), |s| s.as_ptr());
+                    }
+                    step = !step;
+                    if o == slow {
+                        break;
+                    }
                 }
             }
         }
@@ -688,6 +699,12 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                     ext = 0;
                     if crate::modules::sys::tracing_active() {
                         crate::modules::sys::trace_instr(ts, f)?;
+                        if f.jump_to >= 0 {
+                            // the trace function assigned f_lineno
+                            pc = f.jump_to as usize;
+                            f.jump_to = -1;
+                            continue;
+                        }
                     }
                     match op {
                         Op::Nop | Op::Resume => {
@@ -2064,6 +2081,11 @@ pub(super) fn lazy_check(d: &PyObject, nm: &PyObject, v: PyRef) -> PyResult {
         return crate::types::lazyimport::reify_in_dict(d, nm, &v);
     }
     Ok(v)
+}
+
+/// Set the current thread's handled exception (NULL = none); returns the old one (owned).
+pub fn restore_handled_exception(v: *mut PyObject) -> *mut PyObject {
+    set_handled_exception(crate::threads::current(), v)
 }
 
 /// BRANCH_RIGHT (jump taken) or BRANCH_LEFT (fall through) to `dest`.

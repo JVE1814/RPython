@@ -36,6 +36,11 @@ pub struct Frame {
     pub yield_from_send: i32,
     /// Instruction index to use for the next exception-table lookup (set by Reraise), or -1.
     pub unwind_pc: i32,
+    /// Trace event being delivered to this frame's trace function (0 = none; see
+    /// interp::jump::EV_*), so that f_lineno assignments can be validated.
+    pub trace_event: u8,
+    /// Instruction to continue at after a trace function set f_lineno, or -1.
+    pub jump_to: i32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -74,6 +79,8 @@ impl Frame {
             f.f_trace_opcodes = false;
             f.yield_from_send = -1;
             f.unwind_pc = -1;
+            f.trace_event = 0;
+            f.jump_to = -1;
             return f;
         }
         let slots = vec![std::ptr::null_mut::<PyObject>(); total];
@@ -98,6 +105,8 @@ impl Frame {
             f_trace_opcodes: false,
             yield_from_send: -1,
             unwind_pc: -1,
+            trace_event: 0,
+            jump_to: -1,
         })
     }
 

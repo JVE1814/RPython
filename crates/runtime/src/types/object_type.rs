@@ -1207,6 +1207,15 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
             let descr = shared_subtype_descr(1);
             dict::set_item(&dict, name!("__weakref__"), &descr)?;
         }
+        // __classcell__ is filled before the MRO is computed (a custom mro() may
+        // already call methods that use __class__)
+        if let Some(cell) = dict::get_item_str(&dict, name!("__classcell__")) {
+            if !cell.is_type(funcobject::cell_type()) {
+                raise!(TypeError, "__classcell__ must be a nonlocal cell, not {}", tname(&cell));
+            }
+            funcobject::cell_set(&cell, Some(typ.clone()));
+            dict::del_item(&dict, name!("__classcell__"))?;
+        }
         // __firstlineno__ / __static_attributes__ are provided by the compiler in the namespace
         type_ready(tp)?;
         crate::types::slots::fixup_slots(tp);
@@ -1219,17 +1228,11 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
                 (*tp).tp_flags |= Py_TPFLAGS_IS_ABSTRACT;
             }
         }
-        // __classcell__
-        if let Some(cell) = dict::get_item_str(&dict, name!("__classcell__")) {
-            if !cell.is_type(funcobject::cell_type()) {
-                raise!(TypeError, "__classcell__ must be a nonlocal cell, not {}", tname(&cell));
-            }
-            funcobject::cell_set(&cell, Some(typ.clone()));
-            dict::del_item(&dict, name!("__classcell__"))?;
-        }
         if let Some(cd) = dict::get_item_str(&dict, name!("__classdictcell__")) {
             if cd.is_type(funcobject::cell_type()) {
-                funcobject::cell_set(&cd, Some(dict.clone()));
+                // the class-body namespace (not the type dict, which would make
+                // class -> dict -> __annotate__ -> cell -> dict cycles)
+                funcobject::cell_set(&cd, Some(ns.to_ref()));
             }
             dict::del_item(&dict, name!("__classdictcell__"))?;
         }

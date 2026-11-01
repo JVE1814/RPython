@@ -98,7 +98,7 @@ unsafe extern "C" fn super_init(op: *mut PyObject, args: *mut PyObject, kw: *mut
                 0 => crate::modules::builtins_super::zero_arg_super()?,
                 1 => (a[0].to_ref(), None),
                 2 => (a[0].to_ref(), Some(a[1].to_ref())),
-                n => raise!(TypeError, "super() takes at most 2 arguments ({} given)", n),
+                n => raise!(TypeError, "super() expected at most 2 arguments, got {}", n),
             };
             if !is_type(&typ) {
                 raise!(TypeError, "super() argument 1 must be a type, not {}", tname(&typ));
