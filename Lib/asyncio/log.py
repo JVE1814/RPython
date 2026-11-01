@@ -1,7 +1,5 @@
-"""Logging configuration for asyncio."""
+"""The logger used by asyncio ("asyncio")."""
 
 import logging
 
-
-# The package-wide logger ("asyncio").
-logger = logging.getLogger(__package__)
+logger = logging.getLogger("asyncio")

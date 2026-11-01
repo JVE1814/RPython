@@ -1,3 +1,5 @@
+"""Queues for passing data between coroutines (FIFO, LIFO, priority)."""
+
 __all__ = (
     'Queue',
     'PriorityQueue',
@@ -16,57 +18,70 @@ from . import mixins
 
 
 class QueueEmpty(Exception):
-    """Raised when Queue.get_nowait() is called on an empty Queue."""
-    pass
+    """get_nowait() found the queue empty."""
 
 
 class QueueFull(Exception):
-    """Raised when the Queue.put_nowait() method is called on a full Queue."""
-    pass
+    """put_nowait() found the queue full."""
 
 
 class QueueShutDown(Exception):
-    """Raised when putting on to or getting from a shut-down Queue."""
-    pass
+    """The queue was shut down."""
+
+
+def _wake_one(waiters):
+    while waiters:
+        fut = waiters.popleft()
+        if not fut.done():
+            fut.set_result(None)
+            return
+
+
+def _wake_all(waiters):
+    while waiters:
+        fut = waiters.popleft()
+        if not fut.done():
+            fut.set_result(None)
 
 
 class Queue(mixins._LoopBoundMixin):
-    """A FIFO queue for coroutines.
-
-    maxsize <= 0 means unbounded; otherwise put() blocks while the queue
-    holds maxsize items.  Not thread-safe.
-    """
+    """FIFO queue; maxsize <= 0 means unbounded."""
 
     def __init__(self, maxsize=0):
         self._maxsize = maxsize
-
-        # Futures of blocked get() and put() calls.
         self._getters = collections.deque()
         self._putters = collections.deque()
         self._unfinished_tasks = 0
         self._finished = locks.Event()
         self._finished.set()
-        self._init(maxsize)
         self._is_shutdown = False
+        self._init(maxsize)
 
-    # Storage hooks overridden by the subclasses.
-
+    # storage strategy (overridden by the subclasses)
     def _init(self, maxsize):
         self._queue = collections.deque()
-
-    def _get(self):
-        return self._queue.popleft()
 
     def _put(self, item):
         self._queue.append(item)
 
-    def _wakeup_next(self, waiters):
-        # Wake up the next waiter (if any) that isn't cancelled.
-        while waiters:
-            waiter = waiters.popleft()
-            if not waiter.done():
-                waiter.set_result(None)
-                break
+    def _get(self):
+        return self._queue.popleft()
+
+    __class_getitem__ = classmethod(GenericAlias)
+
+    def _format(self):
+        text = f'maxsize={self._maxsize!r}'
+        if getattr(self, '_queue', None):
+            text += f' _queue={list(self._queue)!r}'
+        for label, waiters in (('_getters', self._getters),
+                               ('_putters', self._putters)):
+            if waiters:
+                text += f' {label}[{len(waiters)}]'
+        if self._unfinished_tasks:
+            text += f' tasks={self._unfinished_tasks}'
+        if self._is_shutdown:
+            text += ' shutdown'
+        return text
 
     def __repr__(self):
         return f'<{type(self).__name__} at {id(self):#x} {self._format()}>'
@@ -74,69 +89,45 @@ class Queue(mixins._LoopBoundMixin):
     def __str__(self):
         return f'<{type(self).__name__} {self._format()}>'
 
-    __class_getitem__ = classmethod(GenericAlias)
-
-    def _format(self):
-        result = f'maxsize={self._maxsize!r}'
-        if getattr(self, '_queue', None):
-            result += f' _queue={list(self._queue)!r}'
-        if self._getters:
-            result += f' _getters[{len(self._getters)}]'
-        if self._putters:
-            result += f' _putters[{len(self._putters)}]'
-        if self._unfinished_tasks:
-            result += f' tasks={self._unfinished_tasks}'
-        if self._is_shutdown:
-            result += ' shutdown'
-        return result
-
-    def qsize(self):
-        """Number of items in the queue."""
-        return len(self._queue)
-
     @property
     def maxsize(self):
-        """Number of items allowed in the queue."""
         return self._maxsize
 
+    def qsize(self):
+        return len(self._queue)
+
     def empty(self):
-        """Return True if the queue is empty, False otherwise."""
         return not self._queue
 
     def full(self):
-        """Return True if there are maxsize items in the queue."""
-        if self._maxsize <= 0:
-            return False
-        else:
-            return self.qsize() >= self._maxsize
+        return 0 < self._maxsize <= self.qsize()
+
+    def _unpark(self, fut, waiters, still_blocked):
+        # Called when a parked put()/get() fails (e.g. is cancelled): if it
+        # had been woken, the wake-up is passed on to the next waiter.
+        fut.cancel()
+        try:
+            waiters.remove(fut)
+        except ValueError:
+            pass   # already popped by a waker
+        if not still_blocked() and not fut.cancelled():
+            _wake_one(waiters)
 
     async def put(self, item):
-        """Put an item into the queue, waiting for a free slot if needed.
-
-        Raises QueueShutDown if the queue has been shut down.
-        """
+        """Put *item*, waiting while the queue is full."""
         while self.full():
             if self._is_shutdown:
                 raise QueueShutDown
-            putter = self._get_loop().create_future()
-            self._putters.append(putter)
+            fut = self._get_loop().create_future()
+            self._putters.append(fut)
             try:
-                await putter
+                await fut
             except:
-                putter.cancel()  # may still be pending
-                try:
-                    self._putters.remove(putter)
-                except ValueError:
-                    # already removed by get_nowait() or shutdown()
-                    pass
-                if not self.full() and not putter.cancelled():
-                    # we were woken up but cannot use the slot: pass it on
-                    self._wakeup_next(self._putters)
+                self._unpark(fut, self._putters, self.full)
                 raise
         return self.put_nowait(item)
 
     def put_nowait(self, item):
-        """Put an item without blocking; QueueFull if there is no slot."""
         if self._is_shutdown:
             raise QueueShutDown
         if self.full():
@@ -144,96 +135,72 @@ class Queue(mixins._LoopBoundMixin):
         self._put(item)
         self._unfinished_tasks += 1
         self._finished.clear()
-        self._wakeup_next(self._getters)
+        _wake_one(self._getters)
 
     async def get(self):
-        """Remove and return an item, waiting until one is available.
-
-        Raises QueueShutDown if the queue was shut down and is empty (or
-        shut down immediately).
-        """
+        """Remove and return an item, waiting while the queue is empty."""
         while self.empty():
-            if self._is_shutdown and self.empty():
+            if self._is_shutdown:
                 raise QueueShutDown
-            getter = self._get_loop().create_future()
-            self._getters.append(getter)
+            fut = self._get_loop().create_future()
+            self._getters.append(fut)
             try:
-                await getter
+                await fut
             except:
-                getter.cancel()  # may still be pending
-                try:
-                    self._getters.remove(getter)
-                except ValueError:
-                    # already removed by put_nowait() or shutdown()
-                    pass
-                if not self.empty() and not getter.cancelled():
-                    # we were woken up but cannot take the item: pass it on
-                    self._wakeup_next(self._getters)
+                self._unpark(fut, self._getters, self.empty)
                 raise
         return self.get_nowait()
 
     def get_nowait(self):
-        """Remove and return an item if one is available, else QueueEmpty."""
         if self.empty():
-            if self._is_shutdown:
-                raise QueueShutDown
-            raise QueueEmpty
+            raise QueueShutDown if self._is_shutdown else QueueEmpty
         item = self._get()
-        self._wakeup_next(self._putters)
+        _wake_one(self._putters)
         return item
 
     def task_done(self):
-        """Indicate that a formerly enqueued task is complete (see join())."""
+        """Mark one retrieved item as processed (see join())."""
         if self._unfinished_tasks <= 0:
             raise ValueError('task_done() called too many times')
         self._unfinished_tasks -= 1
-        if self._unfinished_tasks == 0:
+        if not self._unfinished_tasks:
             self._finished.set()
 
     async def join(self):
-        """Block until every item put in the queue has been processed."""
-        if self._unfinished_tasks > 0:
+        """Wait until every item put has been marked done."""
+        if self._unfinished_tasks:
             await self._finished.wait()
 
     def shutdown(self, immediate=False):
-        """Shut down the queue: put() raises QueueShutDown from now on and
-        blocked callers are woken up.  With immediate=True the queue is
-        also emptied (get() raises QueueShutDown right away)."""
+        """Refuse further put()s.  immediate=True also discards the
+        remaining items so that get() fails right away."""
         self._is_shutdown = True
         if immediate:
             while not self.empty():
                 self._get()
-                if self._unfinished_tasks > 0:
+                if self._unfinished_tasks:
                     self._unfinished_tasks -= 1
-            # release all blocked join() calls
-            if self._unfinished_tasks == 0:
+            if not self._unfinished_tasks:
                 self._finished.set()
-        # wake everybody up so they re-check the state
-        while self._getters:
-            getter = self._getters.popleft()
-            if not getter.done():
-                getter.set_result(None)
-        while self._putters:
-            putter = self._putters.popleft()
-            if not putter.done():
-                putter.set_result(None)
+        _wake_all(self._getters)
+        _wake_all(self._putters)
 
 
 class PriorityQueue(Queue):
-    """A queue retrieving entries in priority order (lowest first)."""
+    """Queue returning the smallest item first."""
 
     def _init(self, maxsize):
         self._queue = []
 
-    def _put(self, item, heappush=heapq.heappush):
-        heappush(self._queue, item)
+    def _put(self, item):
+        heapq.heappush(self._queue, item)
 
-    def _get(self, heappop=heapq.heappop):
-        return heappop(self._queue)
+    def _get(self):
+        return heapq.heappop(self._queue)
 
 
 class LifoQueue(Queue):
-    """A queue retrieving the most recently added entries first."""
+    """Queue returning the most recently added item first."""
 
     def _init(self, maxsize):
         self._queue = []

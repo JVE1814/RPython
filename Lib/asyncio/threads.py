@@ -1,21 +1,17 @@
-"""High-level helper to run blocking code in a worker thread."""
+"""Running blocking callables in a thread from coroutines."""
 
-import functools
 import contextvars
+import functools
 
 from . import events
 
-
-__all__ = "to_thread",
+__all__ = ("to_thread",)
 
 
 async def to_thread(func, /, *args, **kwargs):
-    """Run *func* in the loop's default executor and await its result.
-
-    The current context is propagated to the worker thread, so context
-    variables of the calling task are visible in *func*.
-    """
+    """Call func(*args, **kwargs) in the default executor and return its
+    result.  The caller's context variables are visible to *func*."""
     loop = events.get_running_loop()
-    ctx = contextvars.copy_context()
-    func_call = functools.partial(ctx.run, func, *args, **kwargs)
-    return await loop.run_in_executor(None, func_call)
+    snapshot = contextvars.copy_context()
+    job = functools.partial(snapshot.run, func, *args, **kwargs)
+    return await loop.run_in_executor(None, job)
