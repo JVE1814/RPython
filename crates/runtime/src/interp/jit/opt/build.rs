@@ -233,6 +233,8 @@ pub struct Built {
     pub func: Func,
     /// unit has folded global constants (needs invalidation checks)
     pub has_deps: bool,
+    /// (dict, key, value or 0 if absent) lookups folded into the code
+    pub deps: Vec<(usize, usize, usize)>,
     /// IR block of each bytecode instruction that starts a block (u32::MAX: none)
     pub instr_block: Vec<u32>,
     pub reps: Vec<Rep>,
@@ -255,6 +257,8 @@ struct B<'a> {
     /// per local: kinds of values stored (1 int, 2 float, 4 other)
     store_kinds: Vec<u8>,
     has_deps: bool,
+    /// (dict, key) dependencies of folded globals
+    deps: Vec<(usize, usize, usize)>,
     closed: bool,
 }
 
@@ -1305,30 +1309,45 @@ impl<'a> B<'a> {
         self.term(Term::Branch(c2, tl, fl));
     }
 
-    /// Value of a folded LoadGlobal (cache hit with current dict versions).
+    /// Value of a LoadGlobal folded into a constant: the current value of the name in
+    /// globals (or builtins, if globals lacks it). Records the (dict, key)
+    /// dependencies that keep the folding valid (see opt::dict_written).
     fn folded_global(&mut self, i: usize) -> Option<usize> {
-        use crate::interp::cache::kind;
         if !self.u.fold_globals {
             return None;
         }
-        let pc = self.u.an.instrs[i].pc as usize;
-        let e = self.u.tables.entry(pc);
-        let s = e.read()?;
-        if s.kind != kind::GLOBAL || s.c == 0 {
+        let ins = self.u.an.instrs[i];
+        let nm = &self.u.cd.names[ins.arg as usize];
+        if !crate::types::str::is_str_exact(nm) {
             return None;
         }
-        unsafe {
-            let g = &*self.u.globals;
-            let b = &*self.u.builtins;
-            if !crate::types::dict::is_dict_exact(g) || !crate::types::dict::is_dict_exact(b) {
-                return None;
-            }
-            if crate::types::dict::version(g) != s.a || crate::types::dict::version(b) != s.b {
-                return None;
-            }
+        // a name this code rebinds itself would invalidate the code at every store
+        if self.u.an.instrs.iter().any(|x| matches!(x.op, Op::StoreGlobal | Op::DeleteGlobal) && x.arg == ins.arg) {
+            return None;
         }
+        let (gp, bp) = (self.u.globals, self.u.builtins);
+        let (g, b) = unsafe { (&*gp, &*bp) };
+        if !crate::types::dict::is_dict_exact(g) || !crate::types::dict::is_dict_exact(b) {
+            return None;
+        }
+        let key = nm.as_ptr() as usize;
+        let (v, from_builtins) = match crate::types::dict::get_item_str(g, nm) {
+            Some(v) => (v, false),
+            None => (crate::types::dict::get_item_str(b, nm)?, true),
+        };
+        if crate::types::lazyimport::is_lazy(&v) {
+            return None; // must be reified by the generic path
+        }
+        let vp = v.as_ptr() as usize;
+        if from_builtins {
+            self.deps.push((gp as usize, key, 0));
+            self.deps.push((bp as usize, key, vp));
+        } else {
+            self.deps.push((gp as usize, key, vp));
+        }
+        // borrowed from the dict: a write of the key invalidates the code first
         self.has_deps = true;
-        Some(s.c)
+        Some(v.as_ptr() as usize)
     }
 
     fn binary_op(&mut self, i: usize) -> Result<(), String> {
@@ -1900,6 +1919,7 @@ fn build_once(u: &Unit, reps: &[Rep], assume: &mut Vec<Option<State>>) -> Result
         homes,
         store_kinds: vec![0; u.nlp],
         has_deps: u.fold_globals && u.an.instrs.iter().any(|x| x.op == Op::LoadGlobal),
+        deps: Vec::new(),
         closed: false,
     };
     // OSR unit: a separate entry block unboxes the unboxed locals from the frame and
@@ -1939,7 +1959,7 @@ fn build_once(u: &Unit, reps: &[Rep], assume: &mut Vec<Option<State>>) -> Result
     // emission order: creation order (bytecode RPO with synthetic blocks appended)
     f.order = (0..f.blocks.len() as u32).collect();
     let sk = b.store_kinds;
-    Ok((Built { func: f, has_deps: b.has_deps, instr_block, reps: b.reps, homes: b.homes }, restart, sk))
+    Ok((Built { func: f, has_deps: b.has_deps, deps: b.deps, instr_block, reps: b.reps, homes: b.homes }, restart, sk))
 }
 
 /// Build the IR of a unit: choose local representations, iterate loop-header

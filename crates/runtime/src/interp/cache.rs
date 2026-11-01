@@ -115,13 +115,14 @@ pub fn unwatch_type_dict(tp: *mut PyTypeObject) {
     }
 }
 
-/// Called by dict.rs after every mutation.
+/// Called by dict.rs after every mutation. `key`: the key written / inserted /
+/// removed, or NULL when the mutation may affect any key (clear, merge, ...).
 #[inline(always)]
-pub fn on_dict_write(d: &PyObject) {
+pub fn on_dict_write(d: &PyObject, key: *mut PyObject) {
     let tag = unsafe { (*(d.as_ptr() as *const PyDictObject))._ma_watcher_tag };
     if tag != 0 {
         if tag == crate::interp::jit::opt::WATCH_TAG {
-            crate::interp::jit::opt::dict_written(d);
+            crate::interp::jit::opt::dict_written(d, key);
         } else {
             type_dict_written(tag as *mut PyTypeObject);
         }

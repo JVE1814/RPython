@@ -120,13 +120,25 @@ pub fn backedge_threshold() -> i32 {
 
 // ------------------------------------------------------------------ dependencies
 
-/// (watched dict, dependent code caches)
-static DEPS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+/// Dependencies of tier-2 code on dict contents: watched dict -> [(key, dependent
+/// code caches)]. The key is an exact str (borrowed: the dependent code object's
+/// `co_names` keeps it alive, and `forget` runs before the code object dies). A
+/// dependency means "the lookup of `key` in this dict gives the value the code was
+/// compiled with": any write, insertion or deletion of that key, or a mutation that
+/// may touch any key (clear, merge), invalidates the dependent code. Writes of other
+/// keys do not (no invalidation storms from module-level loops assigning globals).
+type DepMap = std::collections::HashMap<usize, Vec<(usize, usize)>>;
+static DEPS: Mutex<Option<DepMap>> = Mutex::new(None);
 
 /// Marker in a dict's `_ma_watcher_tag` (type pointers are aligned, so bit 0 is free).
 pub const WATCH_TAG: u64 = 1;
 
-fn watch(d: *mut PyObject, cc: &CodeCaches) {
+fn deps() -> std::sync::MutexGuard<'static, Option<DepMap>> {
+    DEPS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn watch(d: *mut PyObject, key: *mut PyObject, cc: &CodeCaches) {
+    let mut g = deps();
     unsafe {
         let dp = d as *mut PyDictObject;
         let t = (*dp)._ma_watcher_tag;
@@ -135,33 +147,75 @@ fn watch(d: *mut PyObject, cc: &CodeCaches) {
         }
         (*dp)._ma_watcher_tag = WATCH_TAG;
     }
-    let mut g = DEPS.lock().unwrap_or_else(|e| e.into_inner());
-    let k = (d as usize, cc as *const _ as usize);
-    if !g.contains(&k) {
-        g.push(k);
+    let v = g.get_or_insert_with(Default::default).entry(d as usize).or_default();
+    let k = (key as usize, cc as *const _ as usize);
+    if !v.contains(&k) {
+        v.push(k);
     }
 }
 
-/// A watched dict was written (called from cache::on_dict_write).
+/// Same key? Keys are exact strs; writers may use another (non-interned) str object.
+fn same_key(dep: usize, key: *mut PyObject) -> bool {
+    if dep == key as usize {
+        return true;
+    }
+    unsafe {
+        let k = &*key;
+        crate::types::str::is_str_exact(k) && crate::types::str::str_eq(&*(dep as *mut PyObject), k)
+    }
+}
+
+/// A watched dict was written (called from cache::on_dict_write); `key` NULL: any key
+/// may have changed.
 #[cold]
-pub fn dict_written(d: &PyObject) {
+pub fn dict_written(d: &PyObject, key: *mut PyObject) {
     let dk = d.as_ptr() as usize;
     let victims: Vec<usize> = {
-        let mut g = DEPS.lock().unwrap_or_else(|e| e.into_inner());
-        let v: Vec<usize> = g.iter().filter(|e| e.0 == dk).map(|e| e.1).collect();
-        g.retain(|e| e.0 != dk);
-        v
+        let mut g = deps();
+        let Some(m) = g.as_mut() else { return };
+        let Some(v) = m.get_mut(&dk) else { return };
+        let mut out = Vec::new();
+        v.retain(|&(k, cc)| {
+            if key.is_null() || same_key(k, key) {
+                out.push(cc);
+                false
+            } else {
+                true
+            }
+        });
+        if v.is_empty() {
+            m.remove(&dk);
+            unsafe { (*(d.as_ptr() as *mut PyDictObject))._ma_watcher_tag = 0 };
+        }
+        out
     };
     for cc in victims {
         invalidate(unsafe { &*(cc as *const CodeCaches) });
     }
 }
 
+/// Do the folded lookups still give the values the code was compiled with?
+/// (dict, key, expected value or 0 for "absent")
+fn deps_current(deps: &[(usize, usize, usize)]) -> bool {
+    deps.iter().all(|&(d, k, v)| unsafe {
+        let got = crate::types::dict::get_item_str(&*(d as *mut PyObject), &*(k as *mut PyObject));
+        got.map_or(0, |o| o.as_ptr() as usize) == v
+    })
+}
+
 /// The code caches are being destroyed: forget their dependencies.
 pub fn forget(cc: &CodeCaches) {
+    if cc.t2_tries.load(Relaxed) == 0 {
+        return; // never compiled by tier 2: no dependencies
+    }
     let k = cc as *const _ as usize;
-    let mut g = DEPS.lock().unwrap_or_else(|e| e.into_inner());
-    g.retain(|e| e.1 != k);
+    let mut g = deps();
+    if let Some(m) = g.as_mut() {
+        m.retain(|_, v| {
+            v.retain(|e| e.1 != k);
+            !v.is_empty()
+        });
+    }
 }
 
 /// Discard the tier-2 code of a code object (assumption broken or too many deopts).
@@ -326,6 +380,18 @@ fn compile_locked(code: &PyObject, cd: &CodeData, globals: *mut PyObject, builti
             return None;
         }
     };
+    // register the dependencies before publishing, then re-check that the folded
+    // values are still current (a write between the build and the registration
+    // would otherwise go unnoticed)
+    for &(d, k, _) in &built.deps {
+        watch(d as *mut PyObject, k as *mut PyObject, cc);
+    }
+    if !deps_current(&built.deps) {
+        if dbg {
+            eprintln!("[jit] tier2 {}: a folded global changed during compilation", name());
+        }
+        return None;
+    }
     let asm = &out.asm;
     let addr = super::mem::install(&asm.buf, |buf, base| {
         let _ = asm.patch_abs(buf, base);
@@ -346,10 +412,6 @@ fn compile_locked(code: &PyObject, cd: &CodeData, globals: *mut PyObject, builti
             built.func.classes.len(),
             alloc.frame
         );
-    }
-    if built.has_deps && unit.fold_globals {
-        watch(globals, cc);
-        watch(builtins, cc);
     }
     let oc = Box::into_raw(Box::new(OptCode { addr, len: asm.buf.len(), entries, invalid, deopts }));
     let old = slot.swap(oc, AcqRel);

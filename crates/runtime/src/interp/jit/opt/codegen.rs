@@ -43,6 +43,9 @@ struct Cg<'a, 'b> {
     rt_merge_zero: Label,
     deopt_counter: usize,
     poll_back: Vec<(SnapId, Label)>,
+    /// bytes pushed on the native stack since the spill area was set up (spill slot
+    /// addresses are rsp-relative)
+    sp_bias: i32,
 }
 
 fn fa<T: Copy>(f: T) -> i64 {
@@ -62,6 +65,7 @@ impl<'a, 'b> Cg<'a, 'b> {
         match self.loc(v) {
             Loc::Reg(r) => r,
             Loc::Stack(o) => {
+                let o = o + self.sp_bias;
                 self.a().load(scratch, M(Rsp, o));
                 scratch
             }
@@ -77,6 +81,7 @@ impl<'a, 'b> Cg<'a, 'b> {
         match self.loc(v) {
             Loc::Xmm(x) => X(x),
             Loc::Stack(o) => {
+                let o = o + self.sp_bias;
                 self.a().movsd_load(scratch, M(Rsp, o));
                 scratch
             }
@@ -107,7 +112,10 @@ impl<'a, 'b> Cg<'a, 'b> {
                     self.a().mov_rr(d, r)
                 }
             }
-            Loc::Stack(o) => self.a().store(M(Rsp, o), r),
+            Loc::Stack(o) => {
+                let o = o + self.sp_bias;
+                self.a().store(M(Rsp, o), r)
+            }
             _ => {}
         }
     }
@@ -118,7 +126,10 @@ impl<'a, 'b> Cg<'a, 'b> {
                     self.a().movsd_rr(X(d), x)
                 }
             }
-            Loc::Stack(o) => self.a().movsd_store(M(Rsp, o), x),
+            Loc::Stack(o) => {
+                let o = o + self.sp_bias;
+                self.a().movsd_store(M(Rsp, o), x)
+            }
             _ => {}
         }
     }
@@ -739,10 +750,12 @@ impl<'a, 'b> Cg<'a, 'b> {
                         Opnd::V(v) => {
                             let r = self.gr(v, Rax);
                             self.a().push(r);
+                            self.sp_bias += 8;
                         }
                         Opnd::I(i) => {
                             self.a().mov_ri(Rax, i);
                             self.a().push(Rax);
+                            self.sp_bias += 8;
                         }
                     }
                 }
@@ -750,6 +763,7 @@ impl<'a, 'b> Cg<'a, 'b> {
                 for (r, _) in staged.iter() {
                     self.a().pop(*r);
                 }
+                self.sp_bias = 0;
                 // fargs: move into xmm0/xmm1 (they are scratch)
                 if fargs.len() == 2 {
                     let x1 = self.xr(fargs[1], XS15);
@@ -781,16 +795,19 @@ impl<'a, 'b> Cg<'a, 'b> {
                         Opnd::V(v) => {
                             let r = self.gr(v, Rax);
                             self.a().push(r);
+                            self.sp_bias += 8;
                         }
                         Opnd::I(i) => {
                             self.a().mov_ri(Rax, i);
                             self.a().push(Rax);
+                            self.sp_bias += 8;
                         }
                     }
                 }
                 for k in (0..args.len()).rev() {
                     self.a().pop(AREGS[k]);
                 }
+                self.sp_bias = 0;
                 self.a().call_abs(*addr);
                 let l = self.snap_target(*err);
                 self.a().test_rr(Rax, Rax);
@@ -942,7 +959,9 @@ impl<'a, 'b> Cg<'a, 'b> {
                 // status in eax must survive the sync
                 self.a().push(Rax);
                 self.a().push(Rax);
+                self.sp_bias = 16;
                 self.sync_snapshot_locals(&s);
+                self.sp_bias = 0;
                 self.a().pop(Rax);
                 self.a().pop(Rax);
                 let e = self.exit;
@@ -1230,6 +1249,7 @@ pub fn codegen(u: &Unit, built: &Built, al: &Alloc, deopt_counter: usize) -> Res
         rt_merge_zero,
         deopt_counter,
         poll_back: Vec::new(),
+        sp_bias: 0,
     };
     let frame = al.frame;
     // ---- trampoline (tier-1 contract): fn(frame, slots, ts, target, out)

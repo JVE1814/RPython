@@ -139,9 +139,16 @@ pub fn allocate(f: &Func) -> Alloc {
             u.clear();
             d.clear();
             ins.uses_defs(&mut u, &mut d);
-            snap_uses(ins.snap(), &mut u);
             for &x in &u {
                 ext(x as usize, p, &mut lo, &mut hi);
+            }
+            // the snapshot of a call/template is read on its exit paths, i.e. after
+            // the clobber: such values must live in preserved registers or memory
+            u.clear();
+            snap_uses(ins.snap(), &mut u);
+            let sp = if ins.clobbers_caller_saved() { p + 1 } else { p };
+            for &x in &u {
+                ext(x as usize, sp, &mut lo, &mut hi);
             }
             for &x in &d {
                 ext(x as usize, p + 1, &mut lo, &mut hi);
