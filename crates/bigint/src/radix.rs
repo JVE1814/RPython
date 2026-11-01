@@ -1,7 +1,10 @@
 //! String conversion in radix 2..=36 (lowercase), subquadratic for huge numbers, and Python's
 //! `int(str, base)` parser.
 
-use crate::div::{Divisor, NEWTON_THRESHOLD};
+use crate::div::Divisor;
+
+/// Use cached-reciprocal (Barrett) division for powers with at least this many digits.
+const POWDIV_BARRETT: usize = 1500;
 use crate::nat::{self, MASK, SHIFT};
 use crate::{BigInt, IntError, IntRef};
 
@@ -70,8 +73,9 @@ enum PowDiv {
 }
 
 impl PowDiv {
-    fn new(p: Vec<u32>) -> PowDiv {
-        if p.len() >= NEWTON_THRESHOLD {
+    fn new(p: Vec<u32>, xlen: usize) -> PowDiv {
+        // A cached reciprocal pays off when the power is used for several divisions.
+        if p.len() >= POWDIV_BARRETT && xlen >= 6 * p.len() {
             PowDiv::Barrett(Divisor::new(&p))
         } else {
             PowDiv::Plain(p)
@@ -135,7 +139,7 @@ fn mag_to_limbs(a: &[u32], p: u32) -> Vec<u32> {
         }
         raw.push(sq);
     }
-    let pows: Vec<PowDiv> = raw.into_iter().map(PowDiv::new).collect();
+    let pows: Vec<PowDiv> = raw.into_iter().map(|p| PowDiv::new(p, a.len())).collect();
     let j = pows.len() - 1;
     let mut out = vec![0u32; 1usize << (j + 1)];
     to_limbs_rec(a, j, &pows, p, &mut out, &mut tmp);

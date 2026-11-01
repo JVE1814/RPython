@@ -96,7 +96,7 @@ fn sliding_window<F: Fn(&[u32], &[u32]) -> Vec<u32>>(one: Vec<u32>, base: Vec<u3
 }
 
 fn plain_modpow(base: &[u32], e: &[u32], m: &[u32]) -> Vec<u32> {
-    let big = m.len() >= crate::div::NEWTON_THRESHOLD;
+    let big = m.len() >= 1500;
     let divisor = if big { Some(Divisor::new(m)) } else { None };
     let reduce = |x: Vec<u32>| -> Vec<u32> {
         if nat::cmp(&x, m) == Ordering::Less {

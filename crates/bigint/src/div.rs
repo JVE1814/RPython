@@ -6,7 +6,9 @@ use core::cmp::Ordering;
 
 /// Use the reciprocal-based division when both the divisor and the quotient have at least this
 /// many digits.
-pub const NEWTON_THRESHOLD: usize = 400;
+pub const NEWTON_THRESHOLD: usize = 400000;
+/// Use Burnikel-Ziegler when both the divisor and the quotient have at least this many digits.
+pub const BZ_THRESHOLD: usize = 100;
 /// Reciprocal recursion base size.
 const RECIP_BASE: usize = 64;
 
@@ -83,6 +85,9 @@ pub fn divrem(a: &[u32], b: &[u32]) -> (Vec<u32>, Vec<u32>) {
     let qlen = a.len() - b.len() + 1;
     if b.len() >= NEWTON_THRESHOLD && qlen >= NEWTON_THRESHOLD {
         return divrem_large(a, b);
+    }
+    if b.len() >= BZ_THRESHOLD && qlen >= BZ_THRESHOLD {
+        return divrem_bz(a, b);
     }
     if qlen + 8 < b.len() / 2 && qlen >= 16 && b.len() >= NEWTON_THRESHOLD {
         return divrem_short_quotient(a, b);
@@ -171,7 +176,7 @@ pub struct Divisor {
     pub orig: Vec<u32>,
     /// Shifted divisor, top digit >= 2^29.
     pub d: Vec<u32>,
-    /// floor(B^(2n) / d), n = d.len().
+    /// Approximately floor(B^(2n) / d) (never larger, within a few units), n = d.len().
     pub mu: Vec<u32>,
 }
 
@@ -183,7 +188,7 @@ impl Divisor {
         let s = b[n - 1].leading_zeros() - 2;
         let mut d = vec![0u32; n];
         nat::shl_bits_to(&mut d, b, s);
-        let mu = recip(&d);
+        let mu = recip_approx(&d);
         Divisor { shift: s, orig: b.to_vec(), d, mu }
     }
 
@@ -237,54 +242,18 @@ impl Divisor {
             nat::sub_in_place(&mut r, &self.d);
             nat::add_in_place(&mut q3, &[1]);
             guard += 1;
-            debug_assert!(guard <= 3);
+            debug_assert!(guard <= 64);
         }
         (q3, r)
     }
 }
 
-/// floor(B^(2n) / d) for a normalized `d` (top digit >= 2^29), n = d.len().
+/// floor(B^(2n) / d) for a normalized `d` (top digit >= 2^29), n = d.len() (exact).
 pub fn recip(d: &[u32]) -> Vec<u32> {
     let n = d.len();
     let mut big = vec![0u32; 2 * n + 1];
     big[2 * n] = 1;
-    if n <= RECIP_BASE {
-        if n == 1 {
-            let (q, _) = nat::divrem_u32(&big, d[0]);
-            return q;
-        }
-        let mut q = vec![0u32; n + 2];
-        knuth_divrem(&mut q, &big, d);
-        nat::normalize(&mut q);
-        return q;
-    }
-    let h = n / 2 + 1;
-    let k = n - h;
-    let dh = &d[k..];
-    let mh = recip(dh);
-    // t = d * x0 where x0 = mh * B^k
-    let dm = nat::mul(d, &mh);
-    let mut t = vec![0u32; k];
-    t.extend_from_slice(&dm);
-    nat::normalize(&mut t);
-    // e = B^(2n) - t (signed)
-    let (e, e_neg) = nat::abs_diff(&big, &t);
-    let e_neg = e_neg; // true when t > B^(2n)
-    // corr = mh * e / B^(2n-k)
-    let me = nat::mul(&mh, &e);
-    let shift_digits = 2 * n - k;
-    let corr: Vec<u32> = if me.len() > shift_digits { me[shift_digits..].to_vec() } else { Vec::new() };
-    let mut x1 = vec![0u32; k];
-    x1.extend_from_slice(&mh);
-    nat::normalize(&mut x1);
-    if e_neg {
-        if nat::cmp(&x1, &corr) == Ordering::Greater {
-            nat::sub_in_place(&mut x1, &corr);
-        }
-    } else {
-        nat::add_in_place(&mut x1, &corr);
-    }
-    // exact fix-up
+    let mut x1 = recip_approx(d);
     let t1 = nat::mul(d, &x1);
     match nat::cmp(&t1, &big) {
         Ordering::Equal => x1,
@@ -306,6 +275,58 @@ pub fn recip(d: &[u32]) -> Vec<u32> {
     }
 }
 
+/// Approximate reciprocal: a value <= floor(B^(2n) / d) and within a few units of it, by
+/// Newton iteration from below (each step's truncations only decrease the value).
+pub fn recip_approx(d: &[u32]) -> Vec<u32> {
+    let n = d.len();
+    let mut big = vec![0u32; 2 * n + 1];
+    big[2 * n] = 1;
+    if n <= RECIP_BASE {
+        if n == 1 {
+            let (q, _) = nat::divrem_u32(&big, d[0]);
+            return q;
+        }
+        let mut q = vec![0u32; n + 2];
+        knuth_divrem(&mut q, &big, d);
+        nat::normalize(&mut q);
+        return q;
+    }
+    let h = n / 2 + 1;
+    let k = n - h;
+    let dh = &d[k..];
+    let mh = recip_approx(dh);
+    // t = d * x0 where x0 = mh * B^k
+    let dm = nat::mul(d, &mh);
+    let mut t = vec![0u32; k];
+    t.extend_from_slice(&dm);
+    nat::normalize(&mut t);
+    // e = B^(2n) - t (signed)
+    let (e, e_neg) = nat::abs_diff(&big, &t);
+    let e_neg = e_neg; // true when t > B^(2n)
+    // corr = mh * e / B^(2n-k); the low n-2 digits of e contribute < 1 unit, drop them.
+    let s = n - 2;
+    let e_hi: &[u32] = if e.len() > s { &e[s..] } else { &[][..] };
+    let me = nat::mul(&mh, e_hi);
+    let shift_digits = 2 * n - k - s;
+    let corr: Vec<u32> = if me.len() > shift_digits { me[shift_digits..].to_vec() } else { Vec::new() };
+    let mut x1 = vec![0u32; k];
+    x1.extend_from_slice(&mh);
+    nat::normalize(&mut x1);
+    // Newton from either side lands at or below the true value (exact arithmetic); truncation
+    // of the correction can only raise x1 when it is subtracted, so subtract 2 extra units.
+    if e_neg {
+        let mut c = corr;
+        nat::add_in_place(&mut c, &[2]);
+        if nat::cmp(&x1, &c) != Ordering::Greater {
+            return divrem_knuth(&big, d).0;
+        }
+        nat::sub_in_place(&mut x1, &c);
+        return x1;
+    }
+    nat::add_in_place(&mut x1, &corr);
+    x1
+}
+
 /// Large division via a one-off reciprocal.
 pub fn divrem_large(a: &[u32], b: &[u32]) -> (Vec<u32>, Vec<u32>) {
     Divisor::new(b).divrem(a)
@@ -323,5 +344,128 @@ pub fn divrem_knuth(a: &[u32], b: &[u32]) -> (Vec<u32>, Vec<u32>) {
     let mut q = vec![0u32; a.len() - b.len() + 1];
     let r = knuth_divrem(&mut q, a, b);
     nat::normalize(&mut q);
+    (q, r)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Burnikel-Ziegler recursive division
+// ---------------------------------------------------------------------------------------------
+
+/// Recursion base size (digits) for Burnikel-Ziegler.
+const BZ_LIMIT: usize = 48;
+
+/// Number formed by `lo` (zero-padded to `lo_len` digits) followed by `hi`.
+fn concat(lo: &[u32], lo_len: usize, hi: &[u32]) -> Vec<u32> {
+    let hi = nat::trim(hi);
+    if hi.is_empty() {
+        return nat::trim(lo).to_vec();
+    }
+    let mut v = Vec::with_capacity(lo_len + hi.len());
+    v.extend_from_slice(&lo[..lo.len().min(lo_len)]);
+    v.resize(lo_len, 0);
+    v.extend_from_slice(hi);
+    v
+}
+
+/// Divide `a < b * B^n` by `b` with exactly `n` digits and top digit >= 2^29.
+fn div2n1n(a: &[u32], b: &[u32], n: usize) -> (Vec<u32>, Vec<u32>) {
+    let a = nat::trim(a);
+    if nat::cmp(a, b) == Ordering::Less {
+        return (Vec::new(), a.to_vec());
+    }
+    if n <= BZ_LIMIT || a.len() <= n + 2 {
+        return divrem_knuth(a, b);
+    }
+    if n % 2 == 1 {
+        // pad by one digit
+        let a2 = concat(&[], 1, a);
+        let b2 = concat(&[], 1, b);
+        let (q, r) = div2n1n(&a2, &b2, n + 1);
+        let r = if r.is_empty() { r } else { r[1..].to_vec() };
+        return (q, r);
+    }
+    let h = n / 2;
+    let (b2, b1) = b.split_at(h);
+    let a_hi = if a.len() > h { &a[h..] } else { &[][..] };
+    let (q1, r) = div3n2n(a_hi, b, b1, b2, h);
+    let x = concat(&a[..h.min(a.len())], h, &r);
+    let (q2, s) = div3n2n(&x, b, b1, b2, h);
+    (concat(&q2, h, &q1), s)
+}
+
+/// Divide `a` (< b * B^h, up to 3h digits) by `b = [b1 b2]` (2h digits).
+fn div3n2n(a: &[u32], b: &[u32], b1: &[u32], b2: &[u32], h: usize) -> (Vec<u32>, Vec<u32>) {
+    let a = nat::trim(a);
+    let a12: &[u32] = if a.len() > h { &a[h..] } else { &[][..] };
+    let a1: &[u32] = if a.len() > 2 * h { &a[2 * h..] } else { &[][..] };
+    let a3 = &a[..h.min(a.len())];
+    let (mut q, r1) = if nat::cmp(a1, nat::trim(b1)) == Ordering::Less {
+        div2n1n(a12, b1, h)
+    } else {
+        // q = B^h - 1, r1 = a12 - q*b1 = a12 - b1*B^h + b1
+        let q = vec![MASK; h];
+        let mut t = nat::add(a12, b1);
+        let b1s = concat(&[], h, b1);
+        nat::sub_in_place(&mut t, &b1s);
+        (q, t)
+    };
+    let d = nat::mul(&q, nat::trim(b2));
+    let rhat = concat(a3, h, &r1);
+    if nat::cmp(&rhat, &d) != Ordering::Less {
+        let r = nat::sub(&rhat, &d);
+        return (q, r);
+    }
+    // negative: r = d - rhat (magnitude); add b until non-negative
+    let mut neg = nat::sub(&d, &rhat);
+    loop {
+        nat::sub_digit_assign(&mut q, 1);
+        nat::normalize(&mut q);
+        if nat::cmp(&neg, b) != Ordering::Greater {
+            let r = nat::sub(b, &neg);
+            return (q, r);
+        }
+        nat::sub_in_place(&mut neg, b);
+    }
+}
+
+/// Burnikel-Ziegler division of normalized `a` by normalized `b` (b.len() >= 2).
+pub fn divrem_bz(a: &[u32], b: &[u32]) -> (Vec<u32>, Vec<u32>) {
+    if nat::cmp(a, b) == Ordering::Less {
+        return (Vec::new(), a.to_vec());
+    }
+    let m = b.len();
+    // block size n = k * 2^j >= m with k <= BZ_LIMIT
+    let mut j = 0;
+    while (m >> j) > BZ_LIMIT {
+        j += 1;
+    }
+    let k = m.div_ceil(1 << j);
+    let n = k << j;
+    let pad = n - m;
+    let s = b[m - 1].leading_zeros() - 2;
+    // normalized, padded copies
+    let mut bn = vec![0u32; n];
+    nat::shl_bits_to(&mut bn[pad..], b, s);
+    let mut an = vec![0u32; pad + a.len() + 1];
+    let c = nat::shl_bits_to(&mut an[pad..], a, s);
+    an[pad + a.len()] = c;
+    nat::normalize(&mut an);
+    // blocks of n digits; ensure the top block is < bn
+    let mut t = an.len().div_ceil(n);
+    let top = &an[(t - 1) * n..];
+    if nat::cmp_unnorm(top, &bn) != Ordering::Less {
+        t += 1;
+    }
+    let mut r: Vec<u32> = if (t - 1) * n < an.len() { nat::trim(&an[(t - 1) * n..]).to_vec() } else { Vec::new() };
+    let mut q = vec![0u32; t * n];
+    for i in (0..t - 1).rev() {
+        let x = concat(&an[i * n..((i + 1) * n).min(an.len())], n, &r);
+        let (qi, ri) = div2n1n(&x, &bn, n);
+        q[i * n..i * n + qi.len()].copy_from_slice(&qi);
+        r = ri;
+    }
+    nat::normalize(&mut q);
+    // undo padding and shift
+    let r = if r.len() > pad { nat::shr(&r[pad..], s as u64) } else { Vec::new() };
     (q, r)
 }

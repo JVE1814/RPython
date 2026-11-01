@@ -144,3 +144,81 @@ fn small_quotient_division() {
         assert_eq!((gq.clone(), gr.clone()), div::divrem_knuth(&a, &b));
     }
 }
+
+#[test]
+fn bz_division() {
+    let mut r = Rng::new(34);
+    for _ in 0..300 {
+        let m = 2 + r.below(700) as usize;
+        let n = m + r.below(1500) as usize;
+        let b = patterned(&mut r, m);
+        let a = patterned(&mut r, n);
+        let got = div::divrem_bz(&a, &b);
+        let expect = div::divrem_knuth(&a, &b);
+        assert_eq!(got, expect, "bz {n}/{m}");
+    }
+    // exact multiples and remainder b-1
+    for _ in 0..100 {
+        let m = 100 + r.below(400) as usize;
+        let b = patterned(&mut r, m);
+        let ql = 50 + r.below(600) as usize;
+        let q = patterned(&mut r, ql);
+        let mut a = nat::mul(&b, &q);
+        assert_eq!(div::divrem_bz(&a, &b), (q.clone(), vec![]));
+        nat::add_in_place(&mut a, &nat::sub(&b, &[1]));
+        assert_eq!(div::divrem_bz(&a, &b), (q, nat::sub(&b, &[1])));
+    }
+}
+
+#[test]
+fn mul_threshold_sweep() {
+    use rpy_bigint::mul;
+    // Force every algorithm (including NTT) on small sizes and compare with schoolbook.
+    let saved = mul::thresholds();
+    let mut r = Rng::new(35);
+    let configs = [(4, 4, 8, 16, 16), (8, 8, 1000, 40, 40), (16, 16, 24, 100000, 100000), (2, 2, 9, 3000, 3000)];
+    let mut cases = Vec::new();
+    for _ in 0..40 {
+        let n = 1 + r.below(400) as usize;
+        let m = 1 + r.below(400) as usize;
+        cases.push((patterned(&mut r, n), patterned(&mut r, m)));
+    }
+    let refs: Vec<Vec<u32>> = cases.iter().map(|(a, b)| mul::mul_schoolbook(a, b)).collect();
+    let srefs: Vec<Vec<u32>> = cases.iter().map(|(a, _)| mul::mul_schoolbook(a, a)).collect();
+    for c in configs {
+        mul::set_thresholds(c.0, c.1, c.2, c.3, c.4);
+        for (i, (a, b)) in cases.iter().enumerate() {
+            assert_eq!(nat::mul(a, b), refs[i], "config {c:?} case {i}");
+            assert_eq!(mul::mul_recursive(a, b), refs[i], "config {c:?} case {i} rec");
+            assert_eq!(nat::sqr(a), srefs[i], "config {c:?} sqr {i}");
+            assert_eq!(mul::sqr_recursive(a), srefs[i], "config {c:?} sqr rec {i}");
+        }
+    }
+    mul::set_thresholds(saved.0, saved.1, saved.2, saved.3, saved.4);
+}
+
+#[test]
+fn reciprocal_bounds() {
+    let mut r = Rng::new(36);
+    for _ in 0..60 {
+        let n = 2 + r.below(900) as usize;
+        let mut d = patterned(&mut r, n);
+        d[n - 1] |= 1 << 29; // normalized
+        let approx = div::recip_approx(&d);
+        let mut big = vec![0u32; 2 * n + 1];
+        big[2 * n] = 1;
+        let exact = div::divrem_knuth(&big, &d).0;
+        assert_eq!(div::recip(&d), exact);
+        assert!(nat::cmp(&approx, &exact) != core::cmp::Ordering::Greater, "overestimate n={n}");
+        let diff = nat::sub(&exact, &approx);
+        assert!(nat::cmp(&diff, &[8]) == core::cmp::Ordering::Less, "error too large n={n}: {diff:?}");
+    }
+    // divrem_large on assorted shapes
+    for _ in 0..40 {
+        let m = 2 + r.below(1200) as usize;
+        let n = m + r.below(3000) as usize;
+        let b = patterned(&mut r, m);
+        let a = patterned(&mut r, n);
+        assert_eq!(div::divrem_large(&a, &b), div::divrem_knuth(&a, &b), "large {n}/{m}");
+    }
+}

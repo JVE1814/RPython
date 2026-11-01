@@ -2,14 +2,49 @@
 
 use crate::nat::{self, MASK, SHIFT};
 
-/// Below this many digits (of the shorter operand) use schoolbook multiplication.
-pub const KARATSUBA_THRESHOLD: usize = 48;
-/// Squaring threshold for Karatsuba.
-pub const KARATSUBA_SQR_THRESHOLD: usize = 64;
-/// Use Toom-3 at or above this many digits (shorter operand, balanced).
-pub const TOOM3_THRESHOLD: usize = 160;
-/// Use NTT at or above this many digits (shorter operand).
-pub const NTT_THRESHOLD: usize = 1600;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+static KARATSUBA_T: AtomicUsize = AtomicUsize::new(96);
+static KARATSUBA_SQR_T: AtomicUsize = AtomicUsize::new(96);
+static TOOM3_T: AtomicUsize = AtomicUsize::new(300);
+static NTT_T: AtomicUsize = AtomicUsize::new(1200);
+static NTT_SQR_T: AtomicUsize = AtomicUsize::new(1500);
+
+/// Override the algorithm thresholds (digits of the shorter operand): schoolbook below
+/// `kara`, Karatsuba below `toom3`, Toom-3 below `ntt`, NTT above. For tuning and tests.
+pub fn set_thresholds(kara: usize, kara_sqr: usize, toom3: usize, ntt: usize, ntt_sqr: usize) {
+    KARATSUBA_T.store(kara.max(2), Relaxed);
+    KARATSUBA_SQR_T.store(kara_sqr.max(2), Relaxed);
+    TOOM3_T.store(toom3.max(8), Relaxed);
+    NTT_T.store(ntt.max(2), Relaxed);
+    NTT_SQR_T.store(ntt_sqr.max(2), Relaxed);
+}
+
+/// Current thresholds (kara, kara_sqr, toom3, ntt, ntt_sqr).
+pub fn thresholds() -> (usize, usize, usize, usize, usize) {
+    (KARATSUBA_T.load(Relaxed), KARATSUBA_SQR_T.load(Relaxed), TOOM3_T.load(Relaxed), NTT_T.load(Relaxed), NTT_SQR_T.load(Relaxed))
+}
+
+#[inline(always)]
+fn kara_t() -> usize {
+    KARATSUBA_T.load(Relaxed)
+}
+#[inline(always)]
+fn kara_sqr_t() -> usize {
+    KARATSUBA_SQR_T.load(Relaxed)
+}
+#[inline(always)]
+fn toom3_t() -> usize {
+    TOOM3_T.load(Relaxed)
+}
+#[inline(always)]
+fn ntt_t() -> usize {
+    NTT_T.load(Relaxed)
+}
+#[inline(always)]
+fn ntt_sqr_t() -> usize {
+    NTT_SQR_T.load(Relaxed)
+}
 
 const BATCH: usize = 15;
 const STACK_ACC: usize = 2 * 128;
@@ -192,8 +227,12 @@ fn mul_rec(out: &mut [u32], a: &[u32], b: &[u32], scratch: &mut [u32]) {
     let n = a.len();
     let m = b.len();
     debug_assert!(m >= 1);
-    if m < KARATSUBA_THRESHOLD {
+    if m < kara_t() {
         mul_basecase(out, a, b);
+        return;
+    }
+    if m >= ntt_t() && n + m <= crate::ntt::MAX_LEN && 2 * m > n {
+        mul_ntt_into(out, a, b);
         return;
     }
     if 2 * m <= n + 1 {
@@ -201,11 +240,22 @@ fn mul_rec(out: &mut [u32], a: &[u32], b: &[u32], scratch: &mut [u32]) {
         mul_unbalanced(out, a, b, scratch);
         return;
     }
-    if m >= TOOM3_THRESHOLD {
+    if m >= toom3_t() {
         toom3(out, a, b, scratch);
         return;
     }
     karatsuba(out, a, b, scratch);
+}
+
+fn mul_ntt_into(out: &mut [u32], a: &[u32], b: &[u32]) {
+    let total = a.len() + b.len();
+    let (ta, tb) = (nat::trim(a), nat::trim(b));
+    out[..total].fill(0);
+    if ta.is_empty() || tb.is_empty() {
+        return;
+    }
+    let p = crate::ntt::mul(ta, tb);
+    out[..p.len()].copy_from_slice(&p);
 }
 
 fn mul_unbalanced(out: &mut [u32], a: &[u32], b: &[u32], scratch: &mut [u32]) {
@@ -297,11 +347,20 @@ fn karatsuba(out: &mut [u32], a: &[u32], b: &[u32], scratch: &mut [u32]) {
 
 fn sqr_rec(out: &mut [u32], a: &[u32], scratch: &mut [u32]) {
     let n = a.len();
-    if n < KARATSUBA_SQR_THRESHOLD {
+    if n < kara_sqr_t() {
         sqr_basecase(out, a);
         return;
     }
-    if n >= TOOM3_THRESHOLD {
+    if n >= ntt_sqr_t() && 2 * n <= crate::ntt::MAX_LEN {
+        let t = nat::trim(a);
+        out[..2 * n].fill(0);
+        if !t.is_empty() {
+            let p = crate::ntt::sqr(t);
+            out[..p.len()].copy_from_slice(&p);
+        }
+        return;
+    }
+    if n >= toom3_t() {
         toom3_sqr(out, a, scratch);
         return;
     }
@@ -494,12 +553,11 @@ pub fn mul_into(out: &mut [u32], a: &[u32], b: &[u32]) -> usize {
     }
     let total = a.len() + b.len();
     let small = a.len().min(b.len());
-    if small < KARATSUBA_THRESHOLD {
+    let big = a.len().max(b.len());
+    if small < kara_t() {
         mul_basecase(out, a, b);
-    } else if small >= NTT_THRESHOLD {
-        let p = crate::ntt::mul(a, b);
-        out[..p.len()].copy_from_slice(&p);
-        out[p.len()..total].fill(0);
+    } else if small >= ntt_t() && total <= crate::ntt::MAX_LEN && 2 * small > big {
+        mul_ntt_into(out, a, b);
     } else {
         let mut scratch = vec![0u32; scratch_len(a.len().max(b.len()))];
         mul_rec(out, a, b, &mut scratch);
@@ -511,9 +569,6 @@ pub fn mul_into(out: &mut [u32], a: &[u32], b: &[u32]) -> usize {
 pub fn mul(a: &[u32], b: &[u32]) -> Vec<u32> {
     if a.is_empty() || b.is_empty() {
         return Vec::new();
-    }
-    if a.len().min(b.len()) >= NTT_THRESHOLD {
-        return crate::ntt::mul(a, b);
     }
     if a.len() == 1 {
         return nat::mul_u32(b, a[0]);
@@ -532,11 +587,11 @@ pub fn sqr(a: &[u32]) -> Vec<u32> {
     if a.is_empty() {
         return Vec::new();
     }
-    if a.len() >= NTT_THRESHOLD {
+    if a.len() >= ntt_sqr_t() && 2 * a.len() <= crate::ntt::MAX_LEN {
         return crate::ntt::sqr(a);
     }
     let mut out = vec![0u32; 2 * a.len()];
-    if a.len() < KARATSUBA_SQR_THRESHOLD {
+    if a.len() < kara_sqr_t() {
         sqr_basecase(&mut out, a);
     } else {
         let mut scratch = vec![0u32; scratch_len(a.len())];
