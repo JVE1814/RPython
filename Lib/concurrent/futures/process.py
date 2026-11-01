@@ -406,10 +406,13 @@ class _ExecutorManagerThread(threading.Thread):
                              or not executor._shutdown_thread)):
                     executor._spawn_process()
         except Exception:
-            if self.pending_work_items and not self.processes:
-                self.fail_pending_work(
-                    "A process in the process pool could not be started to "
-                    "replace an exited worker.")
+            if not self.processes:
+                # Nothing can run any more work: the pool is broken.
+                message = ("A process in the process pool could not be "
+                           "started to replace an exited worker.")
+                executor._broken = message
+                executor._shutdown_thread = True
+                self.fail_pending_work(message)
         finally:
             del executor
 
