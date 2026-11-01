@@ -1,7 +1,6 @@
 pub mod annotations;
 pub mod builtins_super;
 pub mod copyreg_support;
-pub mod _json;
 pub mod signal;
 pub mod suggestions;
 pub mod sys;
@@ -66,6 +65,15 @@ pub mod select;
 pub mod _posixsubprocess;
 pub mod gc_mod;
 pub mod faulthandler;
+pub mod devtools;
+pub mod marshal;
+pub mod pwd;
+pub mod resource;
+pub mod fcntl;
+pub mod termios;
+pub mod syslog;
+pub mod mmap;
+pub mod _json;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
 pub fn register_all() {
@@ -86,5 +94,6 @@ pub fn register_all() {
     sys_full::register_system_modules();
     text_util::register();
     crate::import::register_builtin("_typing", crate::types::typevar::make_typing_module);
+    devtools::register();
     crate::import::register_builtin("_json", _json::init_module);
 }

@@ -113,3 +113,23 @@ PyUnicode_FromFormat, PyObject_CallFunction*, ...). Stable Rust 1.97 cannot defi
 functions; we enable the unstable `c_variadic` feature on the stable toolchain via
 `RUSTC_BOOTSTRAP=1` (.cargo/config.toml [env]) rather than switching to nightly or writing
 assembly trampolines. Verified: a Rust `extern "C" fn f(n: i32, mut args: ...)` called from C.
+
+## D19 — Recalled CPython text is not allowed; clean-room rewrite of affected files
+Finding (2026-11-01): several pure-Python stdlib files written by agents reproduce CPython's
+own source text from memory — e.g. Lib/inspect.py, logging/, tempfile.py, shutil.py,
+unittest/case.py, argparse.py, traceback.py contain CPython's comments verbatim (issue-number
+comments like "gh-118013: ..."), and the functional agent reported that enum.py and
+dataclasses.py follow CPython's internals closely. No agent read CPython source (rule 1 held),
+but recalling it verbatim defeats "write everything yourself".
+Decision:
+- New hard rule (AGENTS.md rule 9): never reproduce CPython (or other implementations') source
+  text from memory. Public and test-observed names/behaviour must match (the tests are the
+  spec, incl. private helpers they call); structure, code, comments and docstrings are our own.
+  No issue-number comments. Docstrings that tests compare (e.g. via pydoc output) are the only
+  allowed exact text, and only to the extent a test checks them.
+- Already-merged suspect files are kept for now so the suite can run, and are queued for a
+  clean-room rewrite workstream: the rewriting agent must not open the old file, writes the
+  module from the documented API + spec tests, and must keep the module's test pass rate.
+  Queue: enum, dataclasses, inspect, logging (+handlers), tempfile, shutil, unittest/case,
+  argparse, traceback, contextlib, _collections_abc, pickle (check), _colorize, colorsys
+  (heuristic: grep for "(gh|bpo)-NNNN" plus agents' own reports; extended as found).
