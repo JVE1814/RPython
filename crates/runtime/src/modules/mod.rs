@@ -18,4 +18,6 @@ pub mod codecs_registry;
 pub mod reprlib_guard;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
-pub fn register_all() {}
+pub fn register_all() {
+    crate::import::register_builtin("_typing", crate::types::typevar::make_typing_module);
+}
