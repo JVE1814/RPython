@@ -30,9 +30,13 @@ pub mod itertools;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
 pub fn register_all() {
+pub mod builtins_numbers;
+pub mod math;
+pub mod numbers_registry;
     crate::import::register_builtin("posix", posix::init);
     crate::import::register_builtin("errno", errno::init);
     crate::import::register_builtin("_stat", stat_mod::init);
     crate::import::register_builtin("time", time::init);
     functional::register();
 }
+    numbers_registry::register();

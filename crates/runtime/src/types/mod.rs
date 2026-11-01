@@ -41,6 +41,8 @@ pub mod format_impl;
 pub mod core_slots;
 pub mod dictview;
 pub mod float_math;
+pub mod float_methods;
+pub mod complex_methods;
 pub mod str_sub;
 
 use crate::ffi::PyTypeObject;
@@ -81,6 +83,8 @@ pub fn init_all() -> crate::errors::PyResult<()> {
     none::init_types();
     int_methods::init_types();
     bool_::init_types();
+    float_methods::init_types();
+    complex_methods::init_types();
     core_slots::init_types();
     exceptions::init_types();
     code::init_types();
