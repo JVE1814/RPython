@@ -71,6 +71,37 @@ pub unsafe extern "C" fn h_new_float(v: f64) -> *mut PyObject {
     crate::types::float::new_float(v).into_raw()
 }
 
+/// 1 if the exact dict `d` has no key `name` (an exact str), else 0.
+pub unsafe extern "C" fn h_dict_lacks(d: *mut PyObject, name: *mut PyObject) -> u64 {
+    unsafe {
+        match dict::lookup_index(&*d, &*name, pystr::str_hash(&*name)) {
+            Ok(None) => 1,
+            Ok(Some(_)) => 0,
+            Err(_) => {
+                clear_exc();
+                0
+            }
+        }
+    }
+}
+
+/// Replace the value at entry index `ix` of exact dict `d` if its key is `name`
+/// (taking ownership of `v`): 0 done, 1 key not there (nothing consumed).
+pub unsafe extern "C" fn h_dict_replace(d: *mut PyObject, ix: u64, name: *mut PyObject, v: *mut PyObject) -> u64 {
+    unsafe {
+        let t = dict::table(&*d);
+        match t.entries.get_mut(ix as usize) {
+            Some(e) if e.key == name => {
+                let old = std::mem::replace(&mut e.value, v);
+                t.version = crate::interp::cache::next_dict_version();
+                decref(old);
+                0
+            }
+            _ => 1,
+        }
+    }
+}
+
 // ------------------------------------------------------------------ frame / control
 
 pub unsafe extern "C" fn h_eval_breaker(ts: *const ThreadState) -> u64 {

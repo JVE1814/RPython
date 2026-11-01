@@ -15,7 +15,11 @@ try:
     import os
     _env = os.environ
 except ImportError:
-    _env = {}
+    try:
+        import posix
+        _env = {k.decode(): v.decode() for k, v in posix.environ.items()}
+    except ImportError:
+        _env = {}
 
 
 def _get(k, d):

@@ -28,6 +28,7 @@ pub mod mem;
 pub mod tier1;
 pub mod x64;
 
+use crate::errors::PyResult;
 use crate::ffi::PyObject;
 use crate::interp::cache::tier;
 use crate::interp::frame::Frame;
@@ -157,6 +158,94 @@ fn run(ts: &ThreadState, f: &mut Frame, c: &Compiled, pc: usize) -> Run {
         tier1::ST_ERROR => Run::Error,
         _ => Run::Deopt(f.next_instr as usize),
     }
+}
+
+/// Fast call of a Python function whose code is compiled: exact positional
+/// arguments, no keywords, not a generator. Sets up the frame and enters the machine
+/// code directly (no interpreter prelude). Falls back to the interpreter for the rest
+/// of the activation after a deopt or an exception (the interpreter unwinds).
+/// Returns None if the fast path does not apply.
+#[inline]
+pub fn call_fast(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwnames: Option<&PyObject>) -> Option<PyResult> {
+    if kwnames.is_some() {
+        return None;
+    }
+    let f = crate::types::funcobject::func(func);
+    let code = unsafe { &*f.func_code };
+    let cd = crate::types::code::code_data(code);
+    let c = cd.caches.jit.load(Acquire);
+    if c.is_null() {
+        return None;
+    }
+    let c = unsafe { &*c };
+    let co = crate::types::code::code(code).obj;
+    if co.co_argcount as usize != nargs
+        || co.co_flags as u32
+            & (rpy_compiler::bytecode::co::VARARGS
+                | rpy_compiler::bytecode::co::VARKEYWORDS
+                | rpy_compiler::bytecode::co::GENERATOR
+                | rpy_compiler::bytecode::co::COROUTINE
+                | rpy_compiler::bytecode::co::ASYNC_GENERATOR)
+            != 0
+        || co.co_kwonlyargcount != 0
+        || crate::modules::sys::tracing_active()
+    {
+        return None;
+    }
+    let off = match c.entries.first() {
+        Some(&o) if o != u32::MAX => o,
+        _ => return None,
+    };
+    Some(call_compiled(func, code, cd, c, off, &args[..nargs]))
+}
+
+fn call_compiled(func: &PyObject, code: &PyObject, cd: &CodeData, c: &Compiled, off: u32, args: &[*mut PyObject]) -> PyResult {
+    use crate::interp::frame::FrameState;
+    let f = crate::types::funcobject::func(func);
+    let ts = crate::threads::current();
+    let mut frame = Frame::new(code, Some(func), unsafe { &*f.func_globals }, unsafe { &*f.func_builtins }, None);
+    for (i, &a) in args.iter().enumerate() {
+        unsafe { incref(a) };
+        frame.slots[i] = a;
+    }
+    cd.invocation_count.fetch_add(1, Relaxed);
+    crate::interp::enter_recursive_call(ts, "")?;
+    let prev = ts.frame.get();
+    frame.prev = prev;
+    ts.frame.set(&mut *frame as *mut Frame);
+    frame.state = FrameState::Executing;
+    let entry: EntryFn = unsafe { std::mem::transmute(c.addr) };
+    let mut out: *mut PyObject = std::ptr::null_mut();
+    let fp: *mut Frame = &mut *frame;
+    let st = unsafe { entry(fp, frame.slots.as_mut_ptr(), ts, c.addr + off as usize, &mut out) };
+    let r = match st {
+        tier1::ST_RETURN => {
+            ts.frame.set(prev);
+            frame.prev = std::ptr::null_mut();
+            frame.state = FrameState::Completed;
+            frame.clear_stack();
+            Ok(unsafe { PyRef::from_raw(out) })
+        }
+        _ => {
+            // let the interpreter finish this activation (unwinding or deopt)
+            ts.frame.set(prev);
+            frame.prev = std::ptr::null_mut();
+            let throw = if st == tier1::ST_ERROR {
+                frame.next_instr = frame.lasti + 1;
+                crate::errors::take_exc()
+            } else {
+                None
+            };
+            match crate::interp::eval::eval_frame(ts, &mut frame, throw) {
+                Ok(crate::interp::Exit::Return(v)) => Ok(v),
+                Ok(crate::interp::Exit::Yield(_)) => Err(crate::errors::system_error("yield from a non-generator frame")),
+                Err(e) => Err(e),
+            }
+        }
+    };
+    crate::interp::leave_recursive_call(ts);
+    crate::interp::frame_finished(frame);
+    r
 }
 
 /// Compile the frame's code object (tier 1). Returns true if code is installed.

@@ -48,6 +48,52 @@ const FVAL: i32 = offset_of!(PyFloatObject, ob_fval) as i32;
 
 type Stub = Box<dyn FnOnce(&mut Asm, Label, i32)>;
 
+const TP_TAG: i32 = offset_of!(PyTypeObject, tp_version_tag) as i32;
+const GC_BITS: i32 = offset_of!(PyObject, ob_gc_bits) as i32;
+const MA_KEYS: i32 = offset_of!(PyDictObject, ma_keys) as i32;
+const MA_USED: i32 = offset_of!(PyDictObject, ma_used) as i32;
+const MANAGED_DICT: i32 = -((crate::alloc::GC_HEAD + crate::alloc::MANAGED) as i32);
+const MD_DICT: i32 = offset_of!(crate::types::module::PyModuleObject, md_dict) as i32;
+const FRAME_GLOBALS: i32 = offset_of!(Frame, globals) as i32;
+const FRAME_BUILTINS: i32 = offset_of!(Frame, builtins) as i32;
+const E_SEQ: i32 = offset_of!(crate::interp::cache::Entry, seq) as i32;
+const E_A: i32 = offset_of!(crate::interp::cache::Entry, a) as i32;
+const E_B: i32 = offset_of!(crate::interp::cache::Entry, b) as i32;
+const E_C: i32 = offset_of!(crate::interp::cache::Entry, c) as i32;
+const E_KIND: i32 = offset_of!(crate::interp::cache::Entry, kind) as i32;
+
+/// Layout facts about Rust-owned structures, probed at run time (Vec field order is
+/// not specified by Rust).
+struct Layout {
+    /// DictTable: entries.ptr / entries.len / version
+    entries_ptr: i32,
+    entries_len: i32,
+    version: i32,
+    entry_size: i32,
+    entry_key: i32,
+    entry_value: i32,
+}
+
+fn layout() -> &'static Layout {
+    static L: std::sync::OnceLock<Layout> = std::sync::OnceLock::new();
+    L.get_or_init(|| {
+        let mut v: Vec<u64> = Vec::with_capacity(7);
+        v.extend_from_slice(&[1, 2, 3]);
+        let w: [usize; 3] = unsafe { std::mem::transmute_copy(&v) };
+        let pi = w.iter().position(|&x| x == v.as_ptr() as usize).unwrap();
+        let li = w.iter().position(|&x| x == 3).unwrap();
+        let eo = offset_of!(crate::types::dict::DictTable, entries) as i32;
+        Layout {
+            entries_ptr: eo + 8 * pi as i32,
+            entries_len: eo + 8 * li as i32,
+            version: offset_of!(crate::types::dict::DictTable, version) as i32,
+            entry_size: std::mem::size_of::<crate::types::dict::Entry>() as i32,
+            entry_key: offset_of!(crate::types::dict::Entry, key) as i32,
+            entry_value: offset_of!(crate::types::dict::Entry, value) as i32,
+        }
+    })
+}
+
 pub struct Output {
     pub asm: Asm,
     /// native offset per code index (u32::MAX: not an entry point)
@@ -415,26 +461,14 @@ impl<'a> Gen<'a> {
                 self.a.load(Rax, m);
                 self.decref(Rax);
             }
-            Op::LoadGlobal => {
-                let name = self.cd.names[arg as usize].as_ptr() as i64;
-                let e = self.tables.entry(pc as usize) as *const _ as i64;
-                self.set_lasti(pc);
-                self.a.mov_rr(Rdi, Rbx);
-                self.lea_sp(Rsi, d);
-                self.a.mov_ri(Rdx, name);
-                self.a.mov_ri(Rcx, e);
-                self.call(addr!(h::h_load_global));
-                self.check(pc, d);
-            }
+            Op::LoadGlobal => self.load_global(&ins, d),
             Op::LoadAttr | Op::LoadMethod | Op::StoreAttr => {
-                let name = self.cd.names[arg as usize].as_ptr() as i64;
-                let e = self.tables.entry(pc as usize) as *const _ as i64;
                 let (hf, errd) = match ins.op {
                     Op::LoadAttr => (addr!(h::h_load_attr), d - 1),
                     Op::LoadMethod => (addr!(h::h_load_method), d - 1),
                     _ => (addr!(h::h_store_attr), d - 2),
                 };
-                self.helper_sp(&ins, d, hf, Some(name), Some(e), errd);
+                self.attr_op(&ins, d, hf, errd);
             }
             Op::DeleteAttr => {
                 let name = self.cd.names[arg as usize].as_ptr() as i64;
@@ -605,6 +639,249 @@ impl<'a> Gen<'a> {
             _ => self.deopt(ins.start, d),
         }
         Ok(())
+    }
+
+    // ------------------------------------------------------------ inline caches
+
+    /// rcx = type of obj in `obj`; jump to slow unless its version tag is `tag`.
+    fn guard_tag(&mut self, obj: R, tag: u32, slow: Label) {
+        self.a.load(Rcx, M(obj, OB_TYPE));
+        self.a.cmp32_mi(M(Rcx, TP_TAG), tag as i32);
+        self.a.jcc(Cc::NE, slow);
+    }
+    /// rdx = managed instance dict of obj (exact dict, may be NULL -> `null` label).
+    fn managed_dict(&mut self, obj: R, slow: Label, null: Label) {
+        self.a.load8(Rdx, M(obj, GC_BITS));
+        self.a.and_ri(Rdx, crate::alloc::GC_BIT_MANAGED as i32);
+        self.a.jcc(Cc::E, slow);
+        self.a.load(Rdx, M(obj, MANAGED_DICT));
+        self.a.test_rr(Rdx, Rdx);
+        self.a.jcc(Cc::E, null);
+        self.a.mov_ri(Rsi, crate::types::dict::dict_type() as i64);
+        self.a.cmp_rm(Rsi, M(Rdx, OB_TYPE));
+        self.a.jcc(Cc::NE, slow);
+    }
+    /// rsi = value at entry `hint` of the dict in rdx if its key is `name`, else slow.
+    /// Clobbers rdx.
+    fn dict_hinted(&mut self, hint: u64, name: i64, slow: Label) -> bool {
+        let l = layout();
+        let disp = hint as i64 * l.entry_size as i64;
+        if hint >= (1 << 20) || disp + 64 > i32::MAX as i64 {
+            return false;
+        }
+        self.a.load(Rdx, M(Rdx, MA_KEYS));
+        self.a.cmp_mi(M(Rdx, l.entries_len), hint as i32);
+        self.a.jcc(Cc::BE, slow);
+        self.a.load(Rdx, M(Rdx, l.entries_ptr));
+        self.a.mov_ri(Rsi, name);
+        self.a.cmp_rm(Rsi, M(Rdx, disp as i32 + l.entry_key));
+        self.a.jcc(Cc::NE, slow);
+        self.a.load(Rsi, M(Rdx, disp as i32 + l.entry_value));
+        true
+    }
+
+    /// LoadAttr / LoadMethod / StoreAttr with an inline fast path specialised on the
+    /// cache state observed at compile time; the generic helper is the slow path.
+    fn attr_op(&mut self, ins: &Instr, d: i32, hf: usize, errd: i32) {
+        use crate::interp::cache::kind;
+        let pc = ins.pc as usize;
+        let e = self.tables.entry(pc);
+        let ep = e as *const _ as i64;
+        let name = self.cd.names[ins.arg as usize].as_ptr() as i64;
+        let slow = self.a.label();
+        let done = self.a.label();
+        let snap = e.read();
+        let mut inline = false;
+        if let Some(s) = snap {
+            let tag = s.a as u32;
+            let obj = self.slot(d - 1);
+            match (ins.op, s.kind) {
+                (Op::LoadAttr, kind::INSTANCE_DICT) if s.b < (1 << 20) => {
+                    self.a.load(Rax, obj);
+                    self.guard_tag(Rax, tag, slow);
+                    self.managed_dict(Rax, slow, slow);
+                    if self.dict_hinted(s.b, name, slow) {
+                        self.incref(Rsi);
+                        self.a.store(obj, Rsi);
+                        self.decref(Rax);
+                        inline = true;
+                    }
+                }
+                (Op::LoadAttr, kind::SLOT) => {
+                    self.a.load(Rax, obj);
+                    self.guard_tag(Rax, tag, slow);
+                    self.a.load(Rsi, M(Rax, s.c as i32));
+                    self.a.test_rr(Rsi, Rsi);
+                    self.a.jcc(Cc::E, slow);
+                    self.incref(Rsi);
+                    self.a.store(obj, Rsi);
+                    self.decref(Rax);
+                    inline = true;
+                }
+                (Op::LoadAttr, kind::TYPE_ATTR) => {
+                    self.a.load(Rax, obj);
+                    self.a.mov_ri(Rcx, s.b as i64);
+                    self.a.cmp_rr(Rax, Rcx);
+                    self.a.jcc(Cc::NE, slow);
+                    self.a.cmp32_mi(M(Rcx, TP_TAG), tag as i32);
+                    self.a.jcc(Cc::NE, slow);
+                    self.a.mov_ri(Rsi, s.c as i64);
+                    self.incref(Rsi);
+                    self.a.store(obj, Rsi);
+                    self.decref(Rax);
+                    inline = true;
+                }
+                (Op::LoadAttr, kind::CLASS_ATTR)
+                    if unsafe { (*(s.c as *mut PyObject)).ty().tp_descr_get.is_none() } =>
+                {
+                    self.a.load(Rax, obj);
+                    self.guard_tag(Rax, tag, slow);
+                    self.a.mov_ri(Rsi, s.c as i64);
+                    self.incref(Rsi);
+                    self.a.store(obj, Rsi);
+                    self.decref(Rax);
+                    inline = true;
+                }
+                (Op::LoadAttr, kind::MODULE) => {
+                    // guards read from the entry at run time (module dicts change)
+                    self.a.load(Rax, obj);
+                    self.a.mov_ri(Rcx, crate::types::module::module_type() as i64);
+                    self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
+                    self.a.jcc(Cc::NE, slow);
+                    self.a.mov_ri(Rcx, ep);
+                    self.a.load32(R8, M(Rcx, E_SEQ));
+                    self.a.test_rr(R8, R8); // (low bit tested below)
+                    self.a.mov_rr(R9, R8);
+                    self.a.and_ri(R9, 1);
+                    self.a.jcc(Cc::NE, slow);
+                    self.a.cmp32_mi(M(Rcx, E_KIND), kind::MODULE as i32);
+                    self.a.jcc(Cc::NE, slow);
+                    self.a.load(Rdx, M(Rax, MD_DICT));
+                    self.a.cmp_rm(Rdx, M(Rcx, E_B));
+                    self.a.jcc(Cc::NE, slow);
+                    self.a.test_rr(Rdx, Rdx);
+                    self.a.jcc(Cc::E, slow);
+                    self.a.load(Rdx, M(Rdx, MA_KEYS));
+                    self.a.load(Rdx, M(Rdx, layout().version));
+                    self.a.cmp_rm(Rdx, M(Rcx, E_A));
+                    self.a.jcc(Cc::NE, slow);
+                    self.a.load(Rsi, M(Rcx, E_C));
+                    self.a.cmp32_rm(R8, M(Rcx, E_SEQ));
+                    self.a.jcc(Cc::NE, slow);
+                    self.incref(Rsi);
+                    self.a.store(obj, Rsi);
+                    self.decref(Rax);
+                    inline = true;
+                }
+                (Op::LoadMethod, kind::METHOD) | (Op::LoadMethod, kind::METHOD_SHADOWABLE) => {
+                    let push = self.a.label();
+                    self.a.load(Rax, obj);
+                    self.guard_tag(Rax, tag, slow);
+                    if s.kind == kind::METHOD_SHADOWABLE {
+                        self.managed_dict(Rax, slow, push);
+                        self.a.cmp_mi(M(Rdx, MA_USED), 0);
+                        self.a.jcc(Cc::E, push);
+                        self.a.mov_rr(R14, Rax);
+                        self.a.mov_rr(Rdi, Rdx);
+                        self.a.mov_ri(Rsi, name);
+                        self.call(addr!(h::h_dict_lacks));
+                        self.a.test_rr(Rax, Rax);
+                        self.a.mov_rr(Rax, R14);
+                        self.a.jcc(Cc::E, slow);
+                    }
+                    self.a.bind(push);
+                    self.a.mov_ri(Rsi, s.c as i64);
+                    self.incref(Rsi);
+                    self.a.store(obj, Rsi);
+                    let m = self.slot(d);
+                    self.a.store(m, Rax);
+                    inline = true;
+                }
+                (Op::StoreAttr, kind::SLOT) => {
+                    let val = self.slot(d - 2);
+                    self.a.load(Rax, obj);
+                    self.guard_tag(Rax, tag, slow);
+                    self.a.load(Rsi, val);
+                    self.a.load(Rdx, M(Rax, s.c as i32));
+                    self.a.store(M(Rax, s.c as i32), Rsi);
+                    self.a.mov_rr(R14, Rax);
+                    self.xdecref(Rdx);
+                    self.a.mov_rr(Rax, R14);
+                    self.decref(Rax);
+                    inline = true;
+                }
+                (Op::StoreAttr, kind::INSTANCE_DICT) if s.b < (1 << 20) => {
+                    let val = self.slot(d - 2);
+                    self.a.load(Rax, obj);
+                    self.guard_tag(Rax, tag, slow);
+                    self.managed_dict(Rax, slow, slow);
+                    self.a.mov_rr(R14, Rax);
+                    self.a.mov_rr(Rdi, Rdx);
+                    self.a.mov_ri(Rsi, s.b as i64);
+                    self.a.mov_ri(Rdx, name);
+                    self.a.load(Rcx, val);
+                    self.call(addr!(h::h_dict_replace));
+                    self.a.test_rr(Rax, Rax);
+                    self.a.jcc(Cc::NE, slow);
+                    self.a.mov_rr(Rax, R14);
+                    self.decref(Rax);
+                    inline = true;
+                }
+                _ => {}
+            }
+        }
+        if inline {
+            self.a.jmp(done);
+        }
+        self.a.bind(slow);
+        self.helper_sp(ins, d, hf, Some(name), Some(ep), errd);
+        self.a.bind(done);
+    }
+
+    /// LoadGlobal: inline check of the cache entry (seqlock + both dict versions).
+    fn load_global(&mut self, ins: &Instr, d: i32) {
+        use crate::interp::cache::kind;
+        let e = self.tables.entry(ins.pc as usize) as *const _ as i64;
+        let name = self.cd.names[ins.arg as usize].as_ptr() as i64;
+        let slow = self.a.label();
+        let done = self.a.label();
+        let dict_t = crate::types::dict::dict_type() as i64;
+        let ver = layout().version;
+        self.a.mov_ri(Rcx, e);
+        self.a.load32(R8, M(Rcx, E_SEQ));
+        self.a.mov_rr(R9, R8);
+        self.a.and_ri(R9, 1);
+        self.a.jcc(Cc::NE, slow);
+        self.a.cmp32_mi(M(Rcx, E_KIND), kind::GLOBAL as i32);
+        self.a.jcc(Cc::NE, slow);
+        self.a.mov_ri(Rdi, dict_t);
+        for (field, eoff) in [(FRAME_GLOBALS, E_A), (FRAME_BUILTINS, E_B)] {
+            self.a.load(Rax, M(Rbx, field));
+            self.a.cmp_rm(Rdi, M(Rax, OB_TYPE));
+            self.a.jcc(Cc::NE, slow);
+            self.a.load(Rax, M(Rax, MA_KEYS));
+            self.a.test_rr(Rax, Rax);
+            self.a.jcc(Cc::E, slow);
+            self.a.load(Rax, M(Rax, ver));
+            self.a.cmp_rm(Rax, M(Rcx, eoff));
+            self.a.jcc(Cc::NE, slow);
+        }
+        self.a.load(Rsi, M(Rcx, E_C));
+        self.a.cmp32_rm(R8, M(Rcx, E_SEQ));
+        self.a.jcc(Cc::NE, slow);
+        self.incref(Rsi);
+        let m = self.slot(d);
+        self.a.store(m, Rsi);
+        self.a.jmp(done);
+        self.a.bind(slow);
+        self.set_lasti(ins.pc);
+        self.a.mov_rr(Rdi, Rbx);
+        self.lea_sp(Rsi, d);
+        self.a.mov_ri(Rdx, name);
+        self.a.mov_ri(Rcx, e);
+        self.call(addr!(h::h_load_global));
+        self.check(ins.pc, d);
+        self.a.bind(done);
     }
 
     /// BinaryOp with inline compact-int add/sub/mul/and/or/xor and float add/sub/mul.
