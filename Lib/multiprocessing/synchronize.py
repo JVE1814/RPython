@@ -85,6 +85,10 @@ class SemLock(object):
     def __exit__(self, *args):
         return self._semlock.__exit__(*args)
 
+    def locked(self):
+        """True if the semaphore cannot be acquired without blocking."""
+        return self._semlock._is_zero()
+
     def __getstate__(self):
         context.assert_spawning(self)
         sl = self._semlock
