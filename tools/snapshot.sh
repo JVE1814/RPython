@@ -7,6 +7,8 @@ BIN="$1"; WT="$2"; DEST="$3"
 rm -rf "$DEST.tmp"; mkdir -p "$DEST.tmp/bin" "$DEST.tmp/lib"
 cp "$BIN" "$DEST.tmp/bin/python3"
 cp -r "$WT/Lib" "$DEST.tmp/lib/python3.15t"
+# the test package is part of an installed stdlib (subprocess tests run with -I/-E rely on it)
+cp -r "$WT/spec/Lib/test" "$DEST.tmp/lib/python3.15t/test"
 # the spec's C test helpers (_testcapi, _testlimitedcapi, _testbuffer, ...) are installed next
 # to the stdlib, as in a CPython installation
 bash "$WT/tools/build_test_exts.sh" "$DEST.tmp/lib/python3.15t" > "$DEST.tmp/build_test_exts.log" 2>&1 || echo "warning: test extensions failed to build (see log)"
