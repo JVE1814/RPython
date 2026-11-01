@@ -446,6 +446,7 @@ fn real_main() -> i32 {
     let safe_path = cfg.safe_path;
     let opt = cfg.optimize;
     let rcfg = rpy_runtime::Config { argv, hash_seed: seed, optimize: opt, sys: cfg };
+    rpy_bindings::register();
     if rpy_runtime::initialize(&rcfg).is_err() {
         eprintln!("Fatal Python error: initialization failed");
         rpy_runtime::print_exception_and_clear();
