@@ -225,14 +225,7 @@ impl<'a> Compiler<'a> {
                 self.compile_comprehension(e)?
             }
             ExprKind::Await { value } => {
-                if !self.in_async_context() {
-                    let sc = &self.st.scopes[self.ur().scope];
-                    if !(sc.comprehension != CompKind::None && sc.coroutine) && !self.ur().comps.is_empty() {
-                        // inlined async comprehension in an async function: fine
-                    } else if sc.comprehension == CompKind::None {
-                        return Err(self.error("'await' outside async function", e.loc));
-                    }
-                }
+                // placement errors were reported by the symbol table
                 self.compile_expr(value)?;
                 self.set_loc(e.loc);
                 self.emit(Op::GetAwaitable, 0);
@@ -809,8 +802,6 @@ impl<'a> Compiler<'a> {
             }
             return Ok(());
         }
-        let dummy: &'a Expr = args.first().unwrap_or_else(|| &keywords[0].value);
-        let _ = dummy;
         self.compile_call_ex_loc(loc_e, pushed, args, keywords, generic)
     }
 

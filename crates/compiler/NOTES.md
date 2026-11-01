@@ -11,6 +11,7 @@ pub fn symtable(module: &ast::Mod, opts: &CompileOptions) -> Result<symtable::Sy
 pub fn optimize_ast(module: &mut ast::Mod, optimize: i32, flags: u32) -> Result<(), CompileError>;
 pub fn dis::disassemble(code: &CodeUnit) -> String;
 pub fn unparse::unparse_expr(e: &ast::Expr) -> String;   // ast.unparse-like, annotation style
+pub fn validate_ast(module: &ast::Mod) -> Result<(), CompileError>;  // ValueError for invalid positions
 
 pub struct CompileOptions { filename, mode: Mode /*Exec|Eval|Single|FuncType*/, optimize: i32,
                             flags: u32 /* PyCF_* | CO_FUTURE_* */, interactive: bool, max_depth: u32 }
@@ -245,8 +246,19 @@ parsing) takes ~3 s in release mode.
 ## Tests
 
 * `tests/corpus.rs`: compiles every `.py` under spec/Lib/test the parser accepts (expected
-  failures: `badsyntax*` files). Status: all compile, 0 unexpected errors.
-* `tests/syntax_doctests.rs`: SyntaxError doctests of test_syntax.py etc. that pass the parser
-  must produce exactly the expected message from the compiler.
-* `tests/smoke.rs`, `tests/units.rs`: per-construct checks.
-* `cargo run --example dis -- -c 'source'` prints a disassembly.
+  failures: `badsyntax*` files). Status: 1269/1269 compile, 0 unexpected errors (~3 s release,
+  including parsing).
+* `tests/syntax_doctests.rs`: SyntaxError doctests of test_syntax.py & co. that pass the parser
+  must produce exactly the expected message from the compiler (88/88).
+* `tests/syntax_calls.rs`: `check_syntax_error(self, "...", "msg")`, `self._check_error(...)`,
+  `assert_syntax_error(...)` calls with literal sources extracted from 20 test files; message
+  and (when given) lineno/offset/end_offset must match (107/107).
+* `tests/named_expr.rs`, `tests/async_scope.rs`: cases from test_named_expressions.py and
+  test_coroutines.test_async_comprehension_scope.
+* `tests/symtable_api.rs`: mirrors test_symtable.py assertions on the Rust data structure.
+* `tests/unparse_future.rs`: the 170 `eq(...)` cases of test_future.py (string annotations).
+* `tests/units.rs`, `tests/smoke.rs`, `tests/depth.rs`, `src/assemble.rs` unit tests.
+* `e2e/run.sh <python3>`: runs `e2e/*.py` through the real runtime and diffs against verified
+  `*.expected` outputs (comprehension scoping in module/class/function scope, control flow,
+  annotations, match ...). All pass with the runtime at the time of writing.
+* `cargo run --example dis -- -c 'source'` (or a file) prints a disassembly.

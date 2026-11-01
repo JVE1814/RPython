@@ -333,3 +333,34 @@ fn percent_format_folding() {
     let c = comp("x = '%s=%r' % (a, b)\n");
     assert!(has(&c, Op::FormatSimple) && has(&c, Op::BuildString));
 }
+
+#[test]
+fn unused_consts_removed() {
+    let c = comp("l = lambda: 'this is the only const'\n");
+    assert_eq!(find_code(&c, "<lambda>").unwrap().consts, vec![s("this is the only const")]);
+    let c = comp("def f():\n    'doc'\n    return 42\n");
+    assert_eq!(find_code(&c, "f").unwrap().consts, vec![s("doc"), Constant::Int(42)]);
+    let c = comp("def f():\n    if True:\n        return 'used'\n    else:\n        return 'unused'\n");
+    assert!(!find_code(&c, "f").unwrap().consts.contains(&s("unused")));
+}
+
+#[test]
+fn position_validation() {
+    use rpy_parser::ast::*;
+    let mut m = parse_src("a = 1\n", Mode::Exec);
+    assert!(rpy_compiler::validate_ast(&m).is_ok());
+    for (l, el) in [(10, 1), (-10, -11), (10, -11), (-5, -2), (-5, 1)] {
+        if let Mod::Module { body, .. } = &mut m {
+            body[0].loc.lineno = l;
+            body[0].loc.end_lineno = el;
+        }
+        let e = rpy_compiler::validate_ast(&m).unwrap_err();
+        assert_eq!(e.kind, rpy_compiler::ErrorKind::ValueError);
+    }
+    // compiling odd positions must not panic
+    let mut m = parse_src("import traceback\n", Mode::Exec);
+    if let Mod::Module { body, .. } = &mut m {
+        body[0].loc = Loc::new(-2, -2, -2, -2);
+    }
+    compile(&m, &CompileOptions::new("<t>", Mode::Exec)).unwrap();
+}

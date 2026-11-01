@@ -642,6 +642,7 @@ impl<'w> Folder<'w> {
 
     fn fold_stmt_inner(&mut self, s: &mut Stmt) -> R {
         let loc = s.loc;
+        let is_async_for = matches!(s.node, StmtKind::AsyncFor(_));
         match &mut s.node {
             StmtKind::FunctionDef(f) | StmtKind::AsyncFunctionDef(f) => {
                 for d in f.decorator_list.iter_mut() {
@@ -703,11 +704,7 @@ impl<'w> Folder<'w> {
                 }
             }
             StmtKind::For(f) | StmtKind::AsyncFor(f) => {
-                let is_async = matches!(s.node, StmtKind::AsyncFor(_));
-                let f = match &mut s.node {
-                    StmtKind::For(f) | StmtKind::AsyncFor(f) => f,
-                    _ => unreachable!(),
-                };
+                let is_async = is_async_for;
                 self.fold_expr(&mut f.target)?;
                 if is_async {
                     self.fold_expr(&mut f.iter)?;
