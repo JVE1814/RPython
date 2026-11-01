@@ -46,7 +46,8 @@ class FrozenInstanceError(AttributeError):
 
 
 class _MISSING_TYPE:
-    pass
+    def __repr__(self):
+        return 'MISSING'
 
 
 # Marks "no value supplied" for defaults and the like (None is a valid
@@ -55,7 +56,8 @@ MISSING = _MISSING_TYPE()
 
 
 class _KW_ONLY_TYPE:
-    pass
+    def __repr__(self):
+        return 'KW_ONLY'
 
 
 # Annotating a pseudo-field with KW_ONLY makes all following fields
@@ -255,8 +257,13 @@ def _string_names(text, cls, module, test):
     home = sys.modules.get(cls.__module__)
     if home is None:
         return False
-    namespace = home.__dict__
-    if prefix is not None and namespace.get(prefix) is not module:
+    if prefix is None:
+        # e.g. "ClassVar" after "from typing import ClassVar"
+        namespace = home.__dict__
+    elif home.__dict__.get(prefix) is module:
+        # e.g. "typing.ClassVar" after "import typing"
+        namespace = module.__dict__
+    else:
         return False
     return test(namespace.get(name), module)
 
@@ -656,7 +663,9 @@ def _process_class(cls, init, repr, eq, order, unsafe_hash, frozen,
         cls.__hash__ = None
 
     if not getattr(cls, '__doc__'):
-        cls.__doc__ = _signature_doc(cls)
+        # computed on first access: annotations may refer to names that
+        # only exist once the class statement has completed
+        cls.__doc__ = _SignatureDoc()
 
     if match_args:
         _set_new_attribute(cls, '__match_args__',
@@ -670,6 +679,20 @@ def _process_class(cls, init, repr, eq, order, unsafe_hash, frozen,
     _set_new_attribute(cls, '__replace__', _replace)
     abc.update_abstractmethods(cls)
     return cls
+
+
+class _SignatureDoc:
+    """Stand-in __doc__ of a dataclass without a docstring; becomes the
+    constructor signature when first read."""
+
+    def __get__(self, instance, owner):
+        text = _signature_doc(owner)
+        if owner.__dict__.get('__doc__') is self:
+            try:
+                type.__setattr__(owner, '__doc__', text)
+            except (TypeError, AttributeError):
+                pass
+        return text
 
 
 def _signature_doc(cls):
@@ -745,7 +768,31 @@ def _class_cells_fixed(holder, old, new, seen):
         holder = getattr(holder, '__wrapped__', None)
 
 
+def _forget_old_namespace(new_cls, old_cls):
+    # The compiler-generated annotate function of a class body keeps the
+    # class namespace in a closure cell; where that is the old class's own
+    # dict, its __dict__/__weakref__ descriptors would keep the replaced
+    # class alive.  Give the function a copy without them.
+    marker = old_cls.__dict__.get('__dict__')
+    if marker is None:
+        return
+    for value in new_cls.__dict__.values():
+        closure = getattr(value, '__closure__', None)
+        if not closure:
+            continue
+        for cell in closure:
+            try:
+                contents = cell.cell_contents
+            except ValueError:
+                continue
+            if isinstance(contents, dict) and contents.get('__dict__') is marker:
+                cell.cell_contents = {k: v for k, v in contents.items()
+                                      if k not in ('__dict__', '__weakref__')}
+
+
 def _add_slots(cls, is_frozen, weakref_slot, fields):
+    if '__slots__' in cls.__dict__:
+        raise TypeError(f'{cls.__name__} already specifies __slots__')
     # A class's __slots__ cannot be added after creation, so build a new
     # class from the old one's namespace.
     namespace = dict(cls.__dict__)
@@ -781,6 +828,7 @@ def _add_slots(cls, is_frozen, weakref_slot, fields):
     seen = set()
     for value in new_cls.__dict__.values():
         _class_cells_fixed(value, cls, new_cls, seen)
+    _forget_old_namespace(new_cls, cls)
     init = new_cls.__dict__.get('__init__')
     if init is not None:
         annotate = getattr(init, '__annotate__', None)

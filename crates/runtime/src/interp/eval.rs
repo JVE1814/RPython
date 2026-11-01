@@ -1697,8 +1697,13 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
             }
         };
         let reraise = ReraiseMarker::take(ts);
+        let propagated = ts.propagated_exc.replace((0, 0)) == exc_identity(&e);
         if !reraise {
-            chain_context(ts, &e);
+            // __context__ is attached where an exception is raised, not again in
+            // every frame it propagates through.
+            if !propagated {
+                chain_context(ts, &e);
+            }
             add_traceback(f, &e);
             if crate::modules::sys::tracing_active() {
                 if crate::modules::sys::trace_exception(ts, f, &e).is_err() {
@@ -1728,6 +1733,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
             }
             None => {
                 f.clear_stack();
+                ts.propagated_exc.set(exc_identity(&e));
                 set_exc(e);
                 if crate::modules::sys::tracing_active() {
                     let _ = crate::modules::sys::trace_unwind(ts, f);
@@ -1736,6 +1742,12 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
             }
         }
     }
+}
+
+/// Identity of an exception in flight: its address and its traceback's.
+fn exc_identity(e: &PyObject) -> (usize, usize) {
+    let tb = exc::exc_traceback(e).map_or(0, |t| t.as_ptr() as usize);
+    (e.as_ptr() as usize, tb)
 }
 
 /// Distinguishes a bare re-raise (no new traceback entry) from a fresh raise.

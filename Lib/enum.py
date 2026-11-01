@@ -568,7 +568,7 @@ class EnumType(type):
         inherited = getattr(first_enum, '_new_member_', None)
         if inherited is not None and inherited is not object.__new__:
             return inherited, None, True
-        if member_type is not object:
+        if member_type is not object and member_type.__new__ is not object.__new__:
             return member_type.__new__, None, True
         return object.__new__, None, False
 
@@ -1118,7 +1118,8 @@ class Enum(metaclass=EnumType):
         return hash(self._name_)
 
     def __reduce_ex__(self, proto):
-        return getattr, (self.__class__, self._name_)
+        # by value: unpickling looks the member up again
+        return self.__class__, (self._value_, )
 
     def __deepcopy__(self, memo):
         return self
@@ -1280,12 +1281,6 @@ class Flag(Enum, boundary=STRICT):
         if leftover:
             names.append(cls._numeric_repr_(leftover))
         return '|'.join(names)
-
-    def __reduce_ex__(self, proto):
-        name = self._name_
-        if name is not None and name in self.__class__._member_map_:
-            return getattr, (self.__class__, name)
-        return self.__class__, (self._value_, )
 
     def __repr__(self):
         cls_name = self.__class__.__name__
@@ -1533,6 +1528,7 @@ def _verify_named_flags(enumeration):
 
 _IGNORED_IN_COMPARISON = frozenset((
         '__module__', '__doc__', '__firstlineno__', '__static_attributes__',
+        '__dict__', '__weakref__',
         '_member_map_', '_value2member_map_', '_unhashable_values_',
         '_member_names_', '_new_member_', '__new_member__', '_value_repr_',
         ))
