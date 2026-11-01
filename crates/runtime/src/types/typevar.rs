@@ -1021,9 +1021,6 @@ pub fn ready() -> PyResult<()> {
     ] {
         type_ready(t)?;
     }
-    for t in [typevar_type(), paramspec_type(), typevartuple_type(), typealias_type()] {
-        type_dict_set(t, "__module__", &pystr::new_str("typing"));
-    }
     unsafe {
         let o = &raw mut NODEFAULT_OBJ;
         crate::object::init_header(o, tp!(NODEFAULT_TYPE));
