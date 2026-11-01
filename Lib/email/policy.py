@@ -20,6 +20,7 @@ __all__ = [
 ]
 
 linesep_splitter = re.compile(r'\n|\r')
+_line_breaks = re.compile(r'\r\n|\r|\n')
 
 
 class EmailPolicy(Policy):
@@ -52,7 +53,7 @@ class EmailPolicy(Policy):
         """The name up to the colon; the value with leading whitespace and
         the line ending of the last line removed (folding is kept)."""
         name, value = sourcelines[0].split(':', 1)
-        value = value.lstrip(' \t') + ''.join(sourcelines[1:])
+        value = ''.join((value, *sourcelines[1:])).lstrip(' \t\r\n')
         return (name, value.rstrip('\r\n'))
 
     def header_store_parse(self, name, value):
@@ -86,8 +87,11 @@ class EmailPolicy(Policy):
         if hasattr(value, 'name'):
             return value.fold(policy=self)
         maxlen = self.max_line_length if self.max_line_length else sys.maxsize
-        lines = value.splitlines()
-        refold = (self.refold_source == 'all'
+        lines = _line_breaks.split(value)
+        if lines and lines[-1] == "" and len(lines) > 1:
+            lines.pop()
+        refold = ((not self.utf8 and not value.isascii())
+                  or self.refold_source == 'all'
                   or (self.refold_source == 'long'
                       and ((lines and len(lines[0]) + len(name) + 2 > maxlen)
                            or any(len(x) > maxlen for x in lines[1:]))))

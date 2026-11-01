@@ -1488,6 +1488,7 @@ def get_angle_addr(value):
                 "expected addr-spec or obs-route but found '{}'".format(value))
         angle.append(token)
         token, value = get_addr_spec(value)
+    token._in_angle_addr = True
     angle.append(token)
     if value and value[0] == '>':
         value = value[1:]
@@ -2352,6 +2353,17 @@ def _refold_parse_tree(parse_tree, *, policy):
     return _Refolder(policy).run(parse_tree)
 
 
+_ADDRESS_PARTS = frozenset(('addr-spec', 'local-part', 'domain'))
+
+
+def _address_part_text(part):
+    if part.token_type == 'local-part':
+        return part.local_part
+    if part.token_type == 'domain':
+        return part.domain
+    return part.addr_spec
+
+
 class _Refolder:
 
     def __init__(self, policy):
@@ -2398,6 +2410,31 @@ class _Refolder:
 
             if part.token_type == 'mime-parameters':
                 _fold_mime_parameters(part, lines, maxlen, self.encoding)
+                continue
+
+            if (charset != self.encoding
+                    and part.token_type in _ADDRESS_PARTS
+                    and (part.token_type != 'addr-spec'
+                         or getattr(part, '_in_angle_addr', False))):
+                if charset != 'unknown-8bit':
+                    # Non-ASCII text in an address can only be written
+                    # with utf8 (SMTPUTF8); encoded words are not allowed.
+                    raise errors.HeaderWriteError(
+                        "Non-ASCII {} {!r} cannot be serialized; enable "
+                        "policy.utf8 to allow it".format(
+                            part.token_type, _address_part_text(part)))
+                # Undecodable bytes from a parsed message: keep them as
+                # they were.
+                want_encoding = False
+                self.last_ew = None
+                if len(text) <= maxlen - len(lines[-1]):
+                    lines[-1] += text
+                else:
+                    carry = _steal_trailing_WSP_if_exists(lines)
+                    if carry or text[:1] in WSP:
+                        lines.append(carry + text)
+                    else:
+                        lines[-1] += text
                 continue
 
             if want_encoding and not self.ew_blocked:
@@ -2512,9 +2549,11 @@ def _fold_as_ew(to_encode, lines, maxlen, last_ew, ew_combine_allowed,
         room = maxlen - len(lines[-1])
         text_room = room - chrome_len - len(leading_whitespace)
         if text_room <= 0:
-            lines.append(' ')
+            lines.append(_steal_trailing_WSP_if_exists(lines) or ' ')
+            new_last_ew = len(lines[-1])
             continue
-        if len(lines) > 1 and len(lines[-1]) == 1 and leading_whitespace:
+        if (len(lines) > 1 and len(lines[-1]) == 1 and leading_whitespace
+                and lines[-2].rstrip(" \t").endswith("?=")):
             lines[-1] += _ew.encode(leading_whitespace, charset=encode_as)
             leading_whitespace = ''
         chunk = to_encode[:text_room]

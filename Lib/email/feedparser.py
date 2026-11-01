@@ -405,12 +405,13 @@ class FeedParser:
                     # probably the first line of the body
                     self._input.unreadline(line)
                     return
-                self._cur.defects.append(errors.MisplacedEnvelopeHeaderDefect(line))
+                self.policy.handle_defect(
+                    self._cur, errors.MisplacedEnvelopeHeaderDefect(line))
                 continue
             colon = line.find(':')
             if colon == 0:
-                self._cur.defects.append(
-                    errors.InvalidHeaderDefect("Missing header name."))
+                self.policy.handle_defect(
+                    self._cur, errors.InvalidHeaderDefect("Missing header name."))
                 continue
             assert colon > 0, "_parse_headers fed line with no : and no leading WS"
             name = line[:colon]

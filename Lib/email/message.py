@@ -206,10 +206,13 @@ class Message:
             raise TypeError('Expected list, got %s' % type(self._payload))
         payload = self._payload
         cte = str(self.get('content-transfer-encoding', '')).strip().lower()
-        raw = None
+        raw = payload
         if isinstance(payload, str):
             if utils._has_surrogates(payload):
-                raw = payload.encode('ascii', 'surrogateescape')
+                try:
+                    raw = payload.encode('ascii', 'surrogateescape')
+                except UnicodeEncodeError:
+                    raw = payload.encode('raw-unicode-escape')
                 if not decode:
                     try:
                         payload = raw.decode(self.get_content_charset('ascii'),
@@ -613,7 +616,7 @@ class MIMEPart(Message):
             if subtype in preferencelist:
                 yield (preferencelist.index(subtype), part)
             return
-        if maintype != 'multipart' or not self.is_multipart():
+        if maintype != 'multipart' or not part.is_multipart():
             return
         if subtype != 'related':
             for subpart in part.iter_parts():

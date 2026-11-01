@@ -248,8 +248,8 @@ class Generator:
         candidate = boundary
         counter = 0
         while True:
-            pattern = cls._compile_re('^--' + re.escape(candidate) + '(--)?$',
-                                      re.MULTILINE)
+            pattern = cls._compile_re(
+                '^--' + re.escape(candidate) + r'(--)?\r?$', re.MULTILINE)
             if not pattern.search(text):
                 return candidate
             candidate = boundary + '.' + str(counter)

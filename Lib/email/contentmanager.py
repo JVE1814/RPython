@@ -1,6 +1,7 @@
 """Content managers: get_content()/set_content() support for MIMEPart."""
 
 import binascii
+import sys
 import email.charset
 import email.message
 import email.errors
@@ -140,6 +141,7 @@ def _encode_base64(data, max_line_length):
 def _encode_text(string, charset, cte, policy):
     """Choose (if *cte* is None) and apply a transfer encoding; returns
     (cte, payload)."""
+    max_line_length = policy.max_line_length or sys.maxsize
     lines = string.encode(charset).splitlines()
     linesep = policy.linesep.encode('ascii')
 
@@ -150,7 +152,7 @@ def _encode_text(string, charset, cte, policy):
         return b'\n'.join(lines) + b'\n'
 
     if cte is None:
-        if max((len(x) for x in lines), default=0) <= policy.max_line_length:
+        if max((len(x) for x in lines), default=0) <= max_line_length:
             try:
                 return '7bit', with_newline(lines).decode('ascii')
             except UnicodeDecodeError:
@@ -161,7 +163,7 @@ def _encode_text(string, charset, cte, policy):
         # Compare the encodings on (at most) the first ten lines.
         sample = with_linesep(lines[:10])
         sample_qp = quoprimime.body_encode(sample.decode('latin-1'),
-                                           policy.max_line_length)
+                                           max_line_length)
         sample_b64 = binascii.b2a_base64(sample)
         if len(sample_qp) > len(sample_b64):
             cte = 'base64'
@@ -175,9 +177,9 @@ def _encode_text(string, charset, cte, policy):
         data = with_newline(lines).decode('ascii', 'surrogateescape')
     elif cte == 'quoted-printable':
         data = quoprimime.body_encode(with_newline(lines).decode('latin-1'),
-                                      policy.max_line_length)
+                                      max_line_length)
     elif cte == 'base64':
-        data = _encode_base64(with_linesep(lines), policy.max_line_length)
+        data = _encode_base64(with_linesep(lines), max_line_length)
     else:
         raise ValueError("Unknown content transfer encoding {}".format(cte))
     return cte, data
@@ -230,7 +232,7 @@ def set_bytes_content(msg, data, maintype, subtype, cte='base64',
                       params=None, headers=None):
     _prepare_set(msg, maintype, subtype, headers)
     if cte == 'base64':
-        data = _encode_base64(data, max_line_length=msg.policy.max_line_length)
+        data = _encode_base64(data, max_line_length=msg.policy.max_line_length or sys.maxsize)
     elif cte == 'quoted-printable':
         data = binascii.b2a_qp(data, istext=False, header=False,
                                quotetabs=True).decode('ascii')
