@@ -1077,7 +1077,7 @@ pub fn init_types() -> PyResult<()> {
         let t = &mut *context_type();
         t.tp_name = c"decimal.Context".as_ptr();
         t.tp_basicsize = std::mem::size_of::<CtxObj>() as isize;
-        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE;
+        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_IMMUTABLETYPE;
         t.tp_new = Some(context_new);
         t.tp_init = Some(context_init);
         t.tp_dealloc = Some(context_dealloc);
@@ -1117,7 +1117,7 @@ pub fn init_types() -> PyResult<()> {
         let t = &mut *sigdict_mixin_type();
         t.tp_name = c"decimal.SignalDictMixin".as_ptr();
         t.tp_basicsize = std::mem::size_of::<SigDictObj>() as isize;
-        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE;
+        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_IMMUTABLETYPE;
         t.tp_new = Some(sigdict_new);
         t.tp_dealloc = Some(sigdict_dealloc);
         t.tp_alloc = Some(generic_alloc);
@@ -1148,7 +1148,7 @@ pub fn init_types() -> PyResult<()> {
         let t = &mut *ctxmgr_type();
         t.tp_name = c"decimal.ContextManager".as_ptr();
         t.tp_basicsize = std::mem::size_of::<MgrObj>() as isize;
-        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_DISALLOW_INSTANTIATION;
+        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_DISALLOW_INSTANTIATION | Py_TPFLAGS_IMMUTABLETYPE;
         t.tp_dealloc = Some(mgr_dealloc);
         t.tp_getattro = Some(object_generic_getattro);
         t.tp_doc = c"Object returned by localcontext(); installs a context for a with-block.".as_ptr();
