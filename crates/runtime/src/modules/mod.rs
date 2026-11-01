@@ -75,6 +75,7 @@ pub mod syslog;
 pub mod mmap;
 pub mod _json;
 pub mod _pickle;
+pub mod array;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
 pub fn register_all() {
@@ -98,4 +99,5 @@ pub fn register_all() {
     devtools::register();
     crate::import::register_builtin("_json", _json::init_module);
     crate::import::register_builtin("_pickle", _pickle::init_module);
+    crate::import::register_builtin("array", array::init_module);
 }
