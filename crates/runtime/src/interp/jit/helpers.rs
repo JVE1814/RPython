@@ -278,7 +278,7 @@ pub unsafe extern "C" fn h_binary_op(sp: *mut *mut PyObject, op: u64) -> u64 {
         let b = take(sp.sub(1));
         let a = take(sp.sub(2));
         let op: BinOp = std::mem::transmute(op as u8);
-        match eval::binary_op(op, &a, &b) {
+        match eval::binary_op_on_stack(op, &a, &b) {
             Ok(r) => {
                 put(sp.sub(2), r);
                 OK

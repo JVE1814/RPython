@@ -704,8 +704,12 @@ pub unsafe extern "C" fn PyUnstable_Object_IsUniquelyReferenced(o: *mut PyObject
     }
 }
 #[unsafe(no_mangle)]
+/// A uniquely referenced object that is also an operand the interpreter took off a frame's
+/// value stack for the binary operation now being dispatched (numpy reuses such arrays for the
+/// result). An object that only C code holds, e.g. a Cython temporary passed to
+/// PyNumber_Add, is not a stack temporary.
 pub unsafe extern "C" fn PyUnstable_Object_IsUniqueReferencedTemporary(o: *mut PyObject) -> c_int {
-    unsafe { PyUnstable_Object_IsUniquelyReferenced(o) }
+    unsafe { (PyUnstable_Object_IsUniquelyReferenced(o) != 0 && crate::interp::eval::is_stack_temporary(o)) as c_int }
 }
 
 #[allow(dead_code)]
