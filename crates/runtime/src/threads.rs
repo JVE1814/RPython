@@ -249,3 +249,18 @@ impl ThreadState {
         !self.exited.load(std::sync::atomic::Ordering::Acquire)
     }
 }
+
+/// Run a potentially blocking operation (syscall, lock wait, sleep) with the thread
+/// marked as Blocked so stop-the-world operations (GC safepoints) don't wait for it.
+/// On return the thread polls the safepoint before touching Python objects again.
+pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
+    let ts = current();
+    let prev = ts.mode.get();
+    ts.mode.set(ThreadMode::Blocked);
+    let r = f();
+    ts.mode.set(prev);
+    if ts.c.eval_breaker.load(std::sync::atomic::Ordering::Acquire) & EVAL_SAFEPOINT != 0 {
+        crate::gc::safepoint_poll(ts);
+    }
+    r
+}
