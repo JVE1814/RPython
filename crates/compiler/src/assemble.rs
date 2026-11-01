@@ -793,3 +793,74 @@ fn is_slot_op(op: IOp) -> bool {
             | IOp::Op(Op::StoreFast)
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info() -> UnitInfo {
+        UnitInfo {
+            name: "t".into(),
+            qualname: "t".into(),
+            filename: "f".into(),
+            firstlineno: 1,
+            argcount: 0,
+            posonlyargcount: 0,
+            kwonlyargcount: 0,
+            flags: 0,
+            consts: vec![],
+            names: vec![],
+            varnames: vec![],
+            varkinds: vec![],
+            cellvars: vec![],
+            cellkinds: vec![],
+            cell_arg: vec![],
+            freevars: vec![],
+            nparams: 0,
+        }
+    }
+
+    fn ins(op: Op, arg: u32, target: Label) -> Instr {
+        Instr { op: IOp::Op(op), arg, target, loc: Location { lineno: 1, end_lineno: 1, col: 0, end_col: 1 }, flags: 0 }
+    }
+
+    #[test]
+    fn extended_arg_and_jumps() {
+        let mut ir = Ir::new();
+        let l = ir.new_label();
+        ir.emit(ins(Op::LoadConst, 1 << 25, NO_LABEL));
+        ir.emit(ins(Op::PopJumpIfFalse, 0, l));
+        ir.emit(ins(Op::LoadConst, 0, NO_LABEL));
+        ir.emit(ins(Op::ReturnValue, 0, NO_LABEL));
+        ir.use_label(l);
+        ir.emit(ins(Op::LoadConst, 0, NO_LABEL));
+        ir.emit(ins(Op::ReturnValue, 0, NO_LABEL));
+        let c = assemble(ir, info()).unwrap();
+        assert_eq!(decode(c.code[0]), (Op::ExtendedArg, 2));
+        assert_eq!(decode(c.code[1]), (Op::LoadConst, 0));
+        assert_eq!(decode(c.code[2]), (Op::PopJumpIfFalse, 5));
+        assert_eq!(c.locations.len(), c.code.len());
+        assert_eq!(c.stacksize, 1);
+    }
+
+    #[test]
+    fn handler_depth_and_dead_code() {
+        let mut ir = Ir::new();
+        let h = ir.new_label();
+        ir.emit(ins(Op::LoadConst, 0, NO_LABEL));
+        ir.emit(Instr { op: IOp::SetupCleanup, arg: 0, target: h, loc: NO_LOC_T, flags: 0 });
+        ir.emit(ins(Op::LoadConst, 0, NO_LABEL));
+        ir.emit(ins(Op::ReturnValue, 0, NO_LABEL));
+        ir.emit(ins(Op::Nop, 0, NO_LABEL)); // dead
+        ir.use_label(h);
+        ir.emit(ins(Op::Reraise, 1, NO_LABEL));
+        let c = assemble(ir, info()).unwrap();
+        assert_eq!(c.exception_table.len(), 1);
+        let e = c.exception_table[0];
+        assert_eq!((e.start, e.end, e.target, e.depth, e.lasti), (1, 3, 3, 1, true));
+        assert_eq!(c.stacksize, 3);
+        assert_eq!(c.code.len(), 4);
+    }
+
+    const NO_LOC_T: Location = Location { lineno: 0, end_lineno: 0, col: u32::MAX, end_col: u32::MAX };
+}

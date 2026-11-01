@@ -121,6 +121,8 @@ pub fn frame_finished(mut frame: Box<Frame>) {
     frame.clear_stack();
     if !frame.frame_obj.is_null() {
         unsafe { crate::types::frameobject::take_ownership(frame.frame_obj, frame) };
+    } else {
+        frame::recycle(frame);
     }
 }
 

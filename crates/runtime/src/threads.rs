@@ -85,6 +85,8 @@ pub struct ThreadState {
     pub reraise_flag: Cell<bool>,
     pub headroom: Cell<bool>,
     pub stack_low: Cell<usize>,
+    /// Set when the OS thread has finished (its state may linger in ALL_THREADS).
+    pub exited: std::sync::atomic::AtomicBool,
 }
 
 unsafe impl Sync for ThreadState {}
@@ -136,6 +138,7 @@ pub fn new_thread_state() -> *mut ThreadState {
             reraise_flag: Cell::new(false),
             headroom: Cell::new(false),
             stack_low: Cell::new(compute_stack_low()),
+            exited: std::sync::atomic::AtomicBool::new(false),
         }));
         (*ts).c.exc_info = &mut (*ts).c.exc_state;
         ALL_THREADS.lock().unwrap().push(ts as usize);
@@ -170,6 +173,7 @@ pub const EVAL_MERGE_REFCOUNTS: usize = 1 << 0;
 pub const EVAL_SAFEPOINT: usize = 1 << 1;
 pub const EVAL_SIGNALS: usize = 1 << 2;
 pub const EVAL_ASYNC_EXC: usize = 1 << 3;
+pub const EVAL_GC: usize = 1 << 4;
 
 /// Process pending merges for the current thread.
 pub fn process_merge_queue(ts: &ThreadState) {
@@ -238,4 +242,10 @@ pub fn current_mut() -> *mut ThreadState {
         return current() as *const ThreadState as *mut ThreadState;
     }
     p
+}
+
+impl ThreadState {
+    pub fn alive(&self) -> bool {
+        !self.exited.load(std::sync::atomic::Ordering::Acquire)
+    }
 }

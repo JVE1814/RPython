@@ -1056,7 +1056,10 @@ impl<'a> Compiler<'a> {
                     }
                 }
             }
-            ExprKind::Attribute { value: obj, .. } => {
+            ExprKind::Attribute { value: obj, attr, .. } => {
+                if attr == "__debug__" {
+                    return Err(self.error("cannot assign to __debug__", target.loc));
+                }
                 if value.is_none() {
                     self.compile_expr(obj)?;
                     self.emit(Op::PopTop, 0);
