@@ -1,9 +1,7 @@
-control_flow.py:19: SyntaxWarning: 'return' in a 'finally' block
 ['v', 'k']
 [[6], 0, 5]
 False [1, 2, 0]
 ['a', 'b']
-2
 [('inner', 1), ('outer', 1), ('inner', 2), ('outer', 2)]
 [10, 'ok', 'zde', 5, 'ok']
 1

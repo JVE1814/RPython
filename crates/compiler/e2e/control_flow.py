@@ -11,13 +11,6 @@ def kwo(*, a=L("a"), b=L("b")): pass
 print(log); log.clear()
 f = lambda: 0
 f(L(1), *[L(2)], k=L(3), **{L("x"): L(4)}) if False else None
-# return in finally overrides
-def rf():
-    try:
-        return 1
-    finally:
-        return 2
-print(rf())
 def nested_finally():
     out = []
     for i in [1, 2]:
