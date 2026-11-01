@@ -1485,19 +1485,20 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                                 }
                             };
                             let r = do_raise(ts, e.as_deref(), cause.as_deref());
-                            if arg == 0 {
+                            if arg == 0 && !handled_exception(ts).is_null() {
                                 // re-raise: keep the existing traceback, don't add this frame twice
-                                return Err(r);
+                                let _ = r;
+                                return Err(ReraiseMarker::mark(ts));
                             }
                             return Err(r);
                         }
                         Op::Reraise => {
                             let e = popref!(f);
                             if arg != 0 {
-                                let lasti = popref!(f);
-                                if let Some(l) = int::as_i64(&lasti) {
-                                    f.lasti = l as u32;
-                                }
+                                // CPython restores frame->instr_ptr from lasti, but the handler
+                                // lookup uses the RERAISE position: keep f.lasti (used by
+                                // find_handler) pointing at this instruction.
+                                let _lasti = popref!(f);
                             }
                             set_exc(e);
                             return Err(ReraiseMarker::mark(ts));

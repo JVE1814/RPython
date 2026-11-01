@@ -279,6 +279,11 @@ fn class_getitem(cls: &PyObject, arg: &PyObject) -> PyResult {
 
 pub fn setup_type(tp: *mut PyTypeObject, is_base: bool) {
     if !is_base {
+        // class ExceptionGroup(BaseExceptionGroup, Exception)
+        unsafe {
+            let bases = tuple::new_tuple(vec![type_ref(exc::BaseExceptionGroup()), type_ref(exc::Exception())]);
+            (*tp).tp_bases = bases.into_raw();
+        }
         return;
     }
     unsafe {
