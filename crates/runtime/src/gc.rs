@@ -103,7 +103,7 @@ pub unsafe fn track(op: *mut PyObject) {
 fn trigger_threshold() -> usize {
     // Like a generational heuristic: collect after THRESHOLD new objects, but also
     // at least a quarter of the live set (amortises full collections).
-    THRESHOLD.load(Relaxed).max(LAST_LIVE.load(Relaxed) / 4)
+    THRESHOLD.load(Relaxed).max(LAST_LIVE.load(Relaxed))
 }
 
 #[inline]
