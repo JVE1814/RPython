@@ -68,7 +68,7 @@ pub fn allocate(f: &Func) -> Alloc {
         }
         u.clear();
         f.blocks[b].term.uses(&mut u);
-        if let Term::Deopt(s) = f.blocks[b].term {
+        if let Term::Deopt(s) | Term::Return(_, _, Some(s)) = f.blocks[b].term {
             f.snaps[s as usize].vregs(&mut u);
         }
         for &x in &u {
@@ -160,7 +160,7 @@ pub fn allocate(f: &Func) -> Alloc {
         }
         u.clear();
         f.blocks[bi].term.uses(&mut u);
-        if let Term::Deopt(s) = f.blocks[bi].term {
+        if let Term::Deopt(s) | Term::Return(_, _, Some(s)) = f.blocks[bi].term {
             f.snaps[s as usize].vregs(&mut u);
         }
         for &x in &u {
@@ -191,10 +191,27 @@ pub fn allocate(f: &Func) -> Alloc {
         *nslots += 1;
         l
     };
+    // unboxed-local values listed in template exit snapshots are read by frame
+    // introspection while the template runs (opt::sync_frame): across templates they
+    // must live in spill slots, whose addresses are known
+    let mut in_mem = vec![false; nv];
+    for s in &f.snaps {
+        if s.kind == SnapKind::TemplateExit {
+            for (_, m, _) in &s.locals {
+                if let Some(v) = m.vreg() {
+                    in_mem[v as usize] = true;
+                }
+            }
+        }
+    }
     for &x in &order {
         let (s, e) = (lo[x], hi[x]);
         active.retain(|&(end, _)| end >= s);
         let (cross, cross_tpl) = crosses(s, e);
+        if cross_tpl && in_mem[x] {
+            loc[x] = spill(&mut nslots);
+            continue;
+        }
         let used: Vec<Loc> = active.iter().map(|&(_, v)| loc[v]).collect();
         let pick = match f.classes[x] {
             Class::G => {

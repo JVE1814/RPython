@@ -50,6 +50,9 @@ pub mod layout {
     pub const LASTI: i32 = offset_of!(Frame, lasti) as i32;
     pub const NEXT_INSTR: i32 = offset_of!(Frame, next_instr) as i32;
     pub const STACK_TOP: i32 = offset_of!(Frame, stack_top) as i32;
+    pub const T2_SITE: i32 = offset_of!(Frame, t2_site) as i32;
+    pub const T2_SP: i32 = offset_of!(Frame, t2_sp) as i32;
+    pub const FRAME_OBJ: i32 = offset_of!(Frame, frame_obj) as i32;
     pub const TS_EVAL_BREAKER: i32 = (offset_of!(ThreadState, c) + offset_of!(CThreadState, eval_breaker)) as i32;
     pub use crate::ffi::REF_SHARED_SHIFT;
 }
@@ -63,6 +66,57 @@ pub struct OptCode {
     /// set when an assumption broke; checked by the code itself
     pub invalid: Box<AtomicU8>,
     pub deopts: Box<AtomicU32>,
+    /// descriptors referenced by the code (see `Site`)
+    pub sites: Vec<Box<Site>>,
+}
+
+/// Where the unboxed values of locals live while compiled code runs a template or a
+/// call (stored in `Frame::t2_site` for its duration): frame introspection
+/// (`f_locals`, `locals()`) boxes them into the frame slots first (`sync_frame`).
+pub struct Site {
+    pub entries: Vec<SiteEntry>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SiteEntry {
+    pub slot: u32,
+    pub float: bool,
+    /// the local may be unbound: skip it when its frame slot is NULL
+    pub maybe: bool,
+    /// offset of the raw value from `Frame::t2_sp`; -1: no value (never assigned)
+    pub off: i32,
+}
+
+/// Refresh the frame slots of unboxed locals of `f` if compiled code is suspended
+/// in a call with stale slots. Afterwards the compiled code deoptimises when the
+/// call returns (writes to the slots, e.g. through `f_locals`, must be seen).
+pub fn sync_frame(f: *mut crate::interp::frame::Frame) {
+    let f = unsafe { &mut *f };
+    let s = f.t2_site;
+    if s <= 1 {
+        return;
+    }
+    let site = unsafe { &*(s as *const Site) };
+    for e in &site.entries {
+        if e.off < 0 {
+            continue;
+        }
+        let i = e.slot as usize;
+        if e.maybe && f.slots[i].is_null() {
+            continue;
+        }
+        let raw = unsafe { *((f.t2_sp as isize + e.off as isize) as *const u64) };
+        let o = unsafe {
+            if e.float { crate::interp::jit::helpers::h_new_float(f64::from_bits(raw)) } else { crate::interp::jit::helpers::h_new_int(raw as i64) }
+        };
+        if o.is_null() {
+            crate::errors::clear_exc();
+            continue;
+        }
+        let old = std::mem::replace(&mut f.slots[i], o);
+        unsafe { crate::object::xdecref(old) };
+    }
+    f.t2_site = 1;
 }
 
 impl OptCode {
@@ -413,7 +467,8 @@ fn compile_locked(code: &PyObject, cd: &CodeData, globals: *mut PyObject, builti
             alloc.frame
         );
     }
-    let oc = Box::into_raw(Box::new(OptCode { addr, len: asm.buf.len(), entries, invalid, deopts }));
+    let len = asm.buf.len();
+    let oc = Box::into_raw(Box::new(OptCode { addr, len, entries, invalid, deopts, sites: out.sites }));
     let old = slot.swap(oc, AcqRel);
     if !old.is_null() {
         unsafe { (*old).invalid.store(1, Release) };

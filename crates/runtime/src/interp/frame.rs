@@ -50,6 +50,13 @@ pub struct Frame {
     /// outlive their call (generators, frame objects) are switched to owned first
     /// (`make_owned`).
     pub owns_fc: bool,
+    /// Tier 2 (jit/opt): while compiled code runs a call or template with unboxed
+    /// locals whose frame slots are stale, the descriptor of their native locations
+    /// (`opt::Site`); 1 after `opt::sync_frame` refreshed the slots (the compiled code
+    /// must not use its unboxed copies any more); 0 otherwise.
+    pub t2_site: usize,
+    /// Tier 2: rsp of the running compiled code (base of its spill slots).
+    pub t2_sp: usize,
 }
 
 fn borrows_globals(func: Option<&PyObject>, globals: &PyObject, builtins: &PyObject) -> bool {
@@ -148,6 +155,8 @@ impl Frame {
             unwind_pc: -1,
             trace_event: 0,
             jump_to: -1,
+            t2_site: 0,
+            t2_sp: 0,
         })
     }
 
@@ -198,6 +207,7 @@ impl Frame {
             f.unwind_pc = -1;
             f.trace_event = 0;
             f.jump_to = -1;
+            f.t2_site = 0;
             return f;
         }
         let slots = vec![std::ptr::null_mut::<PyObject>(); total];
@@ -227,6 +237,8 @@ impl Frame {
             unwind_pc: -1,
             trace_event: 0,
             jump_to: -1,
+            t2_site: 0,
+            t2_sp: 0,
         })
     }
 
@@ -334,6 +346,7 @@ impl Frame {
         self.unwind_pc = -1;
         self.trace_event = 0;
         self.jump_to = -1;
+        self.t2_site = 0;
     }
 }
 

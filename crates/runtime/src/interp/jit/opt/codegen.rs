@@ -27,6 +27,7 @@ pub struct Out {
     pub asm: Asm,
     /// (code unit pc, offset of the entry)
     pub entries: Vec<(u32, u32)>,
+    pub sites: Vec<Box<super::Site>>,
 }
 
 struct Cg<'a, 'b> {
@@ -42,6 +43,12 @@ struct Cg<'a, 'b> {
     rt_decref_shared: Label,
     rt_merge_zero: Label,
     deopt_counter: usize,
+    /// descriptors of templates with stale unboxed locals (Frame::t2_site)
+    sites: Vec<Box<super::Site>>,
+    /// deoptimisations forced by frame introspection: (label, resume pc, stack depth)
+    forced: Vec<(Label, u32, i32)>,
+    /// Return with a frame object: (stub, back, snapshot of the dirty locals)
+    ret_syncs: Vec<(Label, Label, SnapId)>,
     poll_back: Vec<(SnapId, Label)>,
     /// bytes pushed on the native stack since the spill area was set up (spill slot
     /// addresses are rsp-relative)
@@ -814,14 +821,48 @@ impl<'a, 'b> Cg<'a, 'b> {
                 self.a().jcc(Cc::NE, l);
             }
             Template(i, exit_snap) => {
+                let i = *i as usize;
                 let saved = self.g.exit;
+                // with stale unboxed locals: publish where they live for the duration
+                // of the template (see opt::sync_frame); a jump out of the template
+                // goes through a trampoline doing the same check as the fall-through
+                let mut tramp: Option<(usize, Label)> = None;
                 if let Some(s) = exit_snap {
                     let l = self.snap_target(*s);
                     self.g.exit = l;
+                    let site = self.site_of(*s);
+                    let p = &*site as *const super::Site as i64;
+                    self.sites.push(site);
+                    self.a().mov_ri(R10, p);
+                    self.a().store(M(Rbx, T2_SITE), R10);
+                    let ins = self.g.an.instrs[i];
+                    if ins.op.is_jump() {
+                        let t = self.g.an.index_of[ins.arg as usize] as usize;
+                        let tl = self.a().label();
+                        let orig = std::mem::replace(&mut self.g.ilabel[t], tl);
+                        tramp = Some((t, orig));
+                    }
                 }
-                let r = self.g.emit(*i as usize);
+                let r = self.g.emit(i);
                 self.g.exit = saved;
                 r?;
+                if exit_snap.is_some() {
+                    if let Some(n) = self.g.an.instrs.get(i + 1).copied() {
+                        let depth = self.g.an.depth[i + 1];
+                        self.after_site(n.start, depth);
+                    }
+                    if let Some((t, orig)) = tramp {
+                        let tl = std::mem::replace(&mut self.g.ilabel[t], orig);
+                        let skip = self.a().label();
+                        self.a().jmp(skip);
+                        self.a().bind(tl);
+                        let tgt = self.g.an.instrs[t];
+                        let depth = self.g.an.depth[t];
+                        self.after_site(tgt.start, depth);
+                        self.a().jmp(orig);
+                        self.a().bind(skip);
+                    }
+                }
             }
             Poll(s) => {
                 let l = self.snap_target(*s);
@@ -935,6 +976,64 @@ impl<'a, 'b> Cg<'a, 'b> {
             }
         }
     }
+    /// Site descriptor for the dirty locals of a template exit snapshot.
+    fn site_of(&self, s: SnapId) -> Box<super::Site> {
+        let snap = &self.f.snaps[s as usize];
+        let entries = snap
+            .locals
+            .iter()
+            .filter_map(|&(slot, m, maybe)| {
+                let (v, float) = match m {
+                    Mat::BoxInt(v) => (v, false),
+                    Mat::BoxFloat(v) => (v, true),
+                    _ => return None,
+                };
+                let off = match self.loc(v) {
+                    Loc::Stack(o) => o,
+                    Loc::None => -1,
+                    // regalloc keeps these in spill slots across templates
+                    l => panic!("tier2: site value v{} in {:?}", v, l),
+                };
+                Some(super::SiteEntry { slot, float, maybe, off })
+            })
+            .collect();
+        Box::new(super::Site { entries })
+    }
+
+    /// After a template with a site: clear it; if frame introspection refreshed the
+    /// frame slots meanwhile, continue in the interpreter at `resume`.
+    fn after_site(&mut self, resume: u32, depth: i32) {
+        if depth < 0 {
+            return;
+        }
+        let forced = self.a().label();
+        self.forced.push((forced, resume, depth));
+        let a = self.a();
+        a.load(R10, M(Rbx, T2_SITE));
+        a.store_i(M(Rbx, T2_SITE), 0);
+        a.cmp_ri(R10, 1);
+        a.jcc(Cc::E, forced);
+    }
+
+    fn emit_forced_and_ret_syncs(&mut self) {
+        let nlp = self.nlp;
+        for (l, resume, depth) in std::mem::take(&mut self.forced) {
+            let e = self.exit;
+            let a = self.a();
+            a.bind(l);
+            a.store32_i(M(Rbx, NEXT_INSTR), resume as i32);
+            a.store_i(M(Rbx, STACK_TOP), nlp + depth);
+            a.mov_ri(Rax, tier1::ST_DEOPT as i64);
+            a.jmp(e);
+        }
+        for (stub, back, s) in std::mem::take(&mut self.ret_syncs) {
+            self.a().bind(stub);
+            let snap = self.f.snaps[s as usize].clone();
+            self.sync_snapshot_locals(&snap);
+            self.a().jmp(back);
+        }
+    }
+
     fn sync_snapshot_locals(&mut self, s: &Snapshot) {
         for &(slot, m, maybe) in &s.locals {
             let (v, k) = match m {
@@ -957,6 +1056,10 @@ impl<'a, 'b> Cg<'a, 'b> {
         match s.kind {
             SnapKind::TemplateExit => {
                 // status in eax must survive the sync
+                // (frame slots already refreshed by frame introspection: keep them)
+                let skip = self.a().label();
+                self.a().cmp_mi(M(Rbx, T2_SITE), 1);
+                self.a().jcc(Cc::E, skip);
                 self.a().push(Rax);
                 self.a().push(Rax);
                 self.sp_bias = 16;
@@ -964,6 +1067,7 @@ impl<'a, 'b> Cg<'a, 'b> {
                 self.sp_bias = 0;
                 self.a().pop(Rax);
                 self.a().pop(Rax);
+                self.a().bind(skip);
                 let e = self.exit;
                 self.a().jmp(e);
             }
@@ -1248,6 +1352,9 @@ pub fn codegen(u: &Unit, built: &Built, al: &Alloc, deopt_counter: usize) -> Res
         rt_decref_shared,
         rt_merge_zero,
         deopt_counter,
+        sites: Vec::new(),
+        forced: Vec::new(),
+        ret_syncs: Vec::new(),
         poll_back: Vec::new(),
         sp_bias: 0,
     };
@@ -1275,6 +1382,7 @@ pub fn codegen(u: &Unit, built: &Built, al: &Alloc, deopt_counter: usize) -> Res
     {
         let a = cg.a();
         a.bind(exit);
+        a.store_i(M(Rbx, T2_SITE), 0);
         if frame > 0 {
             a.add_ri(Rsp, frame);
         }
@@ -1311,6 +1419,7 @@ pub fn codegen(u: &Unit, built: &Built, al: &Alloc, deopt_counter: usize) -> Res
         if frame > 0 {
             cg.a().sub_ri(Rsp, frame);
         }
+        cg.a().store(M(Rbx, T2_SP), Rsp);
         let l = cg.blabel[b as usize];
         cg.a().jmp(l);
     }
@@ -1346,7 +1455,17 @@ pub fn codegen(u: &Unit, built: &Built, al: &Alloc, deopt_counter: usize) -> Res
                     }
                 }
             }
-            Term::Return(v, depth) => {
+            Term::Return(v, depth, snap) => {
+                if let Some(s) = snap {
+                    // a frame object outlives the activation: it must see the final
+                    // values of unboxed locals
+                    let stub = cg.a().label();
+                    let back = cg.a().label();
+                    cg.a().cmp_mi(M(Rbx, FRAME_OBJ), 0);
+                    cg.a().jcc(Cc::NE, stub);
+                    cg.a().bind(back);
+                    cg.ret_syncs.push((stub, back, *s));
+                }
                 let r = cg.gr(*v, Rax);
                 let nlp = cg.nlp;
                 let a = cg.a();
@@ -1373,8 +1492,10 @@ pub fn codegen(u: &Unit, built: &Built, al: &Alloc, deopt_counter: usize) -> Res
     for s in 0..f.snaps.len() {
         cg.snapshot_stub(s);
     }
+    cg.emit_forced_and_ret_syncs();
     emit_routines(cg.a(), rt_box_int, rt_box_float, rt_decref_shared, rt_merge_zero);
     let _ = tier1_exit;
+    let sites = std::mem::take(&mut cg.sites);
     let asm = cg.g.finish()?;
-    Ok(Out { asm, entries })
+    Ok(Out { asm, entries, sites })
 }

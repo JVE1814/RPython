@@ -1271,7 +1271,15 @@ impl<'a> B<'a> {
                 };
                 self.materialize_stack();
                 let d = self.st.stack.len() as u32;
-                self.term(Term::Return(v, d));
+                let locals = self.dirty_locals();
+                let snap = if locals.is_empty() {
+                    None
+                } else {
+                    let ins = self.u.an.instrs[i];
+                    self.f.snaps.push(Snapshot { resume: ins.start, lasti: ins.pc, stack: Vec::new(), locals, kind: SnapKind::TemplateExit });
+                    Some(self.f.snaps.len() as SnapId - 1)
+                };
+                self.term(Term::Return(v, d, snap));
             }
             Op::BinarySubscr => self.binary_subscr(i),
             Op::StoreSubscr => self.store_subscr(i),

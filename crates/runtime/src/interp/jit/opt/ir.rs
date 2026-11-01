@@ -178,8 +178,9 @@ pub enum Inst {
 pub enum Term {
     Jump(BlockId),
     Branch(Cond, BlockId, BlockId),
-    /// return the owned object in v (stack_top = nlp + depth)
-    Return(V, u32),
+    /// return the owned object in v (stack_top = nlp + depth); the snapshot lists the
+    /// dirty unboxed locals (synced if a frame object outlives the activation)
+    Return(V, u32, Option<SnapId>),
     /// unconditional deoptimisation
     Deopt(SnapId),
     /// the block ends in a template instruction that never falls through (or jumps
@@ -419,7 +420,7 @@ impl Term {
                 let mut d = Vec::new();
                 Inst::Guard(*c, 0).uses_defs(u, &mut d);
             }
-            Term::Return(v, _) => u.push(*v),
+            Term::Return(v, _, _) => u.push(*v),
             _ => {}
         }
     }
