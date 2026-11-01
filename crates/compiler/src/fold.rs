@@ -247,7 +247,7 @@ fn fold_num_binop(op: Operator, a: Num, b: Num) -> Option<Constant> {
                         }
                         e >>= 1;
                         if e > 0 {
-                            base = base.checked_mul(base).unwrap_or(if x == 1 || x == 0 || x == -1 { base } else { return None });
+                            base = base.checked_mul(base)?;
                         }
                     }
                     acc
