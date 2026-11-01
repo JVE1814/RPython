@@ -241,8 +241,12 @@ def parsedate_to_datetime(data):
     *fields, offset = parsed
     if offset is None:
         return datetime.datetime(*fields[:6])
-    return datetime.datetime(*fields[:6], tzinfo=datetime.timezone(
-        datetime.timedelta(seconds=offset)))
+    try:
+        delta = datetime.timedelta(seconds=offset)
+    except OverflowError:
+        raise ValueError('Invalid date value or format "%s"'
+                         % str(data)) from None
+    return datetime.datetime(*fields[:6], tzinfo=datetime.timezone(delta))
 
 
 def localtime(dt=None, isdst=None):

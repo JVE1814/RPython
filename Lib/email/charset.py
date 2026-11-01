@@ -104,6 +104,14 @@ _CODEC_TO_MIME = {
 }
 
 
+_SPELLINGS = {
+    'eucjp': 'euc_jp', 'ujis': 'euc_jp',
+    'euckr': 'euc_kr',
+    'iso2022jp': 'iso2022_jp',
+    'iso2022kr': 'iso2022_kr',
+}
+
+
 def _canonical_name(name):
     if name in ALIASES:
         return ALIASES[name]
@@ -113,7 +121,10 @@ def _canonical_name(name):
     try:
         codec = codecs.lookup(name).name
     except (LookupError, ValueError):
-        return name
+        # spellings of codecs that may be missing from this build
+        codec = _SPELLINGS.get(name.replace('-', '').replace('_', ''))
+        if codec is None:
+            return name
     if codec in _CODEC_TO_MIME:
         return _CODEC_TO_MIME[codec]
     if codec.startswith('iso8859-'):

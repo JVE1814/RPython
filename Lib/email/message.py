@@ -205,7 +205,12 @@ class Message:
         if i is not None and not isinstance(self._payload, list):
             raise TypeError('Expected list, got %s' % type(self._payload))
         payload = self._payload
-        cte = str(self.get('content-transfer-encoding', '')).strip().lower()
+        cte_header = self.get('content-transfer-encoding', '')
+        if hasattr(cte_header, 'cte'):
+            # a parsed header knows the mechanism without trailing junk
+            cte = cte_header.cte
+        else:
+            cte = str(cte_header).strip().lower()
         raw = payload
         if isinstance(payload, str):
             if utils._has_surrogates(payload):

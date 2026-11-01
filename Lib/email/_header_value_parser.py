@@ -540,25 +540,23 @@ class LocalPart(TokenList):
 
     @property
     def local_part(self):
-        # Drop CFWS at the ends and around dots.
-        pieces = [DOT]
-        previous = DOT
-        previous_is_list = False
-        for tok in self[0] + [DOT]:
-            if tok.token_type == 'cfws':
-                continue
-            if (previous_is_list and tok.token_type == 'dot'
-                    and previous[-1].token_type == 'cfws'):
-                pieces[-1] = TokenList(previous[:-1])
-            is_list = isinstance(tok, TokenList)
-            if (is_list and previous.token_type == 'dot'
-                    and tok[0].token_type == 'cfws'):
-                pieces.append(TokenList(tok[1:]))
-            else:
-                pieces.append(tok)
-            previous = pieces[-1]
-            previous_is_list = is_list
-        return TokenList(pieces[1:-1]).value
+        # Whitespace and comments vanish at both ends of the local part
+        # and next to dots; elsewhere they keep their (folded) value.
+        items = [t for t in self[0] if t.token_type != 'cfws']
+        last = len(items) - 1
+        kept = []
+        for i, tok in enumerate(items):
+            if isinstance(tok, TokenList):
+                parts = list(tok)
+                if (i == 0 or items[i - 1].token_type == 'dot') and \
+                        parts and parts[0].token_type == 'cfws':
+                    del parts[0]
+                if (i == last or items[i + 1].token_type == 'dot') and \
+                        parts and parts[-1].token_type == 'cfws':
+                    del parts[-1]
+                tok = TokenList(parts)
+            kept.append(tok)
+        return TokenList(kept).value
 
 
 class DomainLiteral(TokenList):
@@ -1287,11 +1285,8 @@ def get_local_part(value):
         local_part.append(obs)
     else:
         local_part.append(token)
-    try:
-        local_part.value.encode('ascii')
-    except UnicodeEncodeError:
-        local_part.defects.append(errors.NonASCIILocalPartDefect(
-            "local-part contains non-ASCII characters)"))
+    # Non-ASCII local parts are legal (RFC 6532); whether they can be
+    # serialized is decided by the policy when the header is written.
     return local_part, value
 
 
