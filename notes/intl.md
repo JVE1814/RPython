@@ -96,7 +96,11 @@ the email charset fixes (6 test_email failures).
 
 ## Next steps
 
-* Re-run test_email / test_unicodedata on a fresh build; test_subinterp needs _testcapi.
+* Verified on the final build (after merging master): test_email, test_unicodedata,
+  test_multibytecodec, test_codecencodings_*, test_codeccallbacks, test_source_encoding pass.
+* test_codecs: only LocaleCodecTest fails — it is newly un-skipped by master's
+  `_testinternalcapi` (DecodeLocaleEx/EncodeLocaleEx semantics), not yet looked at.
+* test_subinterp (test_multibytecodec) needs _testcapi.run_in_subinterp.
 * `_multibytecodec.__create_codec` is a stub; no GC traversal for the stream reader/writer
   `stream` reference.
 * test_xml_etree XInclude errors (urllib) and test_pyexpat traceback depth are not codec issues.
