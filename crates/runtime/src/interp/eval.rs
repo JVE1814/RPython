@@ -306,8 +306,17 @@ pub(super) fn load_global(f: &Frame, nm: &PyObject) -> PyResult {
         if let Some(v) = dict::get_item_str(g, nm) {
             return Ok(v);
         }
-    } else if let Some(v) = dict::get_item(g, nm)? {
-        return Ok(v);
+    } else {
+        // dict subclass: go through __getitem__ (honours __missing__)
+        match ab::getitem(g, nm) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if !exc_matches(exc::KeyError()) {
+                    return Err(e);
+                }
+                clear_exc();
+            }
+        }
     }
     let b = f.builtins();
     if dict::is_dict_exact(b) {
@@ -665,7 +674,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                         continue;
                     }
                     ext = 0;
-                    if tracing {
+                    if crate::modules::sys::tracing_active() {
                         crate::modules::sys::trace_instr(ts, f)?;
                     }
                     match op {
@@ -1666,7 +1675,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
             })();
             match result {
                 Ok(Some(exit)) => {
-                    if tracing {
+                    if crate::modules::sys::tracing_active() {
                         crate::modules::sys::trace_exit(ts, f, &exit)?;
                     }
                     if let Exit::Return(_) = exit {
@@ -1691,7 +1700,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
         if !reraise {
             chain_context(ts, &e);
             add_traceback(f, &e);
-            if tracing {
+            if crate::modules::sys::tracing_active() {
                 if crate::modules::sys::trace_exception(ts, f, &e).is_err() {
                     // tracer raised: replace exception
                     let e2 = take_exc().unwrap();
@@ -1720,7 +1729,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
             None => {
                 f.clear_stack();
                 set_exc(e);
-                if tracing {
+                if crate::modules::sys::tracing_active() {
                     let _ = crate::modules::sys::trace_unwind(ts, f);
                 }
                 return Err(PyErr);
