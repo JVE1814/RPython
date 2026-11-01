@@ -178,13 +178,15 @@ pub fn new_thread_state() -> *mut ThreadState {
             None => Box::into_raw(Box::new(st)),
         };
         (*ts).c.exc_info = &mut (*ts).c.exc_state;
-        {
+        let n = {
             let mut all = ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner());
             if !all.is_empty() {
                 MULTI_THREADED.store(1, SeqCst);
             }
             all.push(ts as usize);
-        }
+            all.len()
+        };
+        crate::qsbr::note_threads(n);
         ts
     }
 }
@@ -256,6 +258,9 @@ pub fn thread_exit() {
             crate::object::xdecref(o);
         }
         process_merge_queue(ts);
+        crate::qsbr::thread_exit();
+        crate::interp::frame::drain_pool();
+        crate::gc::flush_thread_counts();
         // Nobody queues objects for this owner once `alive` is false (checked under
         // the ALL_THREADS lock). Drain the queue while this thread still counts as
         // running for stop-the-world purposes.
@@ -279,6 +284,7 @@ pub fn thread_exit() {
         {
             let mut all = ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner());
             all.retain(|&t| t != p as usize);
+            crate::qsbr::note_threads(all.len());
         }
         FREE_STATES.lock().unwrap_or_else(|e| e.into_inner()).push(p as usize);
         set_current(std::ptr::null_mut());
@@ -408,6 +414,7 @@ pub fn after_fork_child() {
             }
         }
         all.retain(|&t| t == me);
+        crate::qsbr::note_threads(all.len());
     }
     crate::modules::signal::after_fork_child();
 }

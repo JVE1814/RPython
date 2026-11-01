@@ -216,7 +216,22 @@ pub fn lookup_with_owner(tp: *mut PyTypeObject, name: &PyObject) -> Option<(PyRe
 // ---------------------------------------------------------------- instances
 
 /// Address of the instance `__dict__` pointer slot, if the object has one.
+/// Objects keeping their attributes inline (`shape.rs`) get a real dict first, so
+/// `*slot` is always NULL or a dict.
 pub unsafe fn dict_slot(o: *mut PyObject) -> *mut *mut PyObject {
+    unsafe {
+        let tp = (*o).type_ptr();
+        if (*tp).tp_flags & Py_TPFLAGS_MANAGED_DICT != 0 && alloc::has_managed(o) {
+            crate::shape::materialize(&*o);
+            return alloc::managed_dict_slot(o);
+        }
+        dict_slot_raw(o)
+    }
+}
+
+/// The dict slot without materialising inline values: for managed dicts `*slot` may
+/// hold a tagged values pointer (bit 0 set). For dealloc/traverse/clear only.
+pub unsafe fn dict_slot_raw(o: *mut PyObject) -> *mut *mut PyObject {
     unsafe {
         let tp = (*o).type_ptr();
         if (*tp).tp_flags & Py_TPFLAGS_MANAGED_DICT != 0 && alloc::has_managed(o) {
@@ -252,9 +267,13 @@ pub fn instance_dict(o: &PyObject) -> Option<PyRef> {
     }
 }
 
-/// Existing instance dict without creating one.
+/// Existing instance dict without creating one. Inline values count as a dict when
+/// they hold attributes (they are materialised); an empty values area does not.
 pub fn instance_dict_existing(o: &PyObject) -> Option<PyRef> {
     unsafe {
+        if !crate::shape::values_of(o.as_ptr()).is_null() && crate::shape::inline_len(o) == 0 && crate::shape::has_inline_values(o) {
+            return None;
+        }
         let slot = dict_slot(o.as_ptr());
         if slot.is_null() || (*slot).is_null() {
             return None;
@@ -296,7 +315,11 @@ pub fn generic_getattr_opt(o: &PyObject, name: &PyObject, dict_override: Option<
     }
     let idict = match dict_override {
         Some(d) => Some(d.to_ref()),
-        None => instance_dict_existing(o),
+        None => match crate::shape::get(o, name) {
+            crate::shape::Get::Found(v) => return Ok(Some(v)),
+            crate::shape::Get::Missing => None,
+            crate::shape::Get::NotValues => instance_dict_existing(o),
+        },
     };
     if let Some(d) = idict {
         if let Some(v) = dict::get_item(&d, name)? {
@@ -342,7 +365,11 @@ pub fn generic_setattr_with_dict(
     }
     let idict = match dict_override {
         Some(d) => Some(d.to_ref()),
-        None => instance_dict(o),
+        None => match crate::shape::set(o, name, value) {
+            crate::shape::Set::Done => return Ok(()),
+            crate::shape::Set::Missing => return Err(attribute_error_for(o, name)),
+            crate::shape::Set::NotValues => instance_dict(o),
+        },
     };
     match idict {
         Some(d) => match value {
@@ -395,10 +422,14 @@ pub unsafe extern "C" fn generic_alloc(tp: *mut PyTypeObject, nitems: Py_ssize_t
     unsafe {
         let size = (*tp).tp_basicsize as usize + ((nitems + 1) as usize) * (*tp).tp_itemsize as usize;
         let size = (size + 7) & !7;
-        let op = alloc::alloc_object(tp, size);
+        let (extra, cap) = crate::shape::alloc_extra(tp);
+        let op = alloc::alloc_object(tp, size + extra);
         if op.is_null() {
             let _ = memory_error();
             return op;
+        }
+        if extra != 0 {
+            crate::shape::init_values(op, tp, size, cap);
         }
         if (*tp).tp_itemsize != 0 {
             set_var_size(op, nitems);
@@ -449,8 +480,9 @@ pub unsafe extern "C" fn subtype_dealloc(op: *mut PyObject) {
             clear_slots(base, op);
             base = (*base).tp_base;
         }
-        // clear managed / offset dict
-        let slot = dict_slot(op);
+        // clear inline values, then the managed / offset dict
+        crate::shape::clear_values(op, false);
+        let slot = dict_slot_raw(op);
         if !slot.is_null() && !(*slot).is_null() {
             let d = *slot;
             *slot = std::ptr::null_mut();
@@ -515,8 +547,12 @@ pub unsafe extern "C" fn subtype_traverse(op: *mut PyObject, visit: visitproc, a
             }
             base = (*base).tp_base;
         }
-        let slot = dict_slot(op);
-        if !slot.is_null() && !(*slot).is_null() {
+        let r = crate::shape::traverse(op, visit, arg);
+        if r != 0 {
+            return r;
+        }
+        let slot = dict_slot_raw(op);
+        if !slot.is_null() && !(*slot).is_null() && (*slot) as usize & 1 == 0 {
             let r = f(*slot, arg);
             if r != 0 {
                 return r;
@@ -550,8 +586,9 @@ pub unsafe extern "C" fn subtype_clear(op: *mut PyObject) -> c_int {
             clear_slots(base, op);
             base = (*base).tp_base;
         }
-        let slot = dict_slot(op);
-        if !slot.is_null() && !(*slot).is_null() {
+        crate::shape::clear_values(op, true);
+        let slot = dict_slot_raw(op);
+        if !slot.is_null() && !(*slot).is_null() && (*slot) as usize & 1 == 0 {
             dict::clear(&**slot);
         }
         let mut b = tp;

@@ -68,10 +68,36 @@ pub fn fastkw<F: Fn(&PyObject, &[&PyObject], Option<&PyObject>) -> PyResult + Co
     shim_fastkw::<F> as *const c_void
 }
 
+/// Permanent NUL-terminated copy of `s`. perf-runtime (startup/memory): thousands of
+/// method/member/getset names and docs are created at startup; they are bump-allocated
+/// from 64 KiB chunks instead of one malloc each.
 fn leak_cstr(s: &str) -> *const c_char {
-    let mut v = s.as_bytes().to_vec();
-    v.push(0);
-    Box::leak(v.into_boxed_slice()).as_ptr() as *const c_char
+    const CHUNK: usize = 64 * 1024;
+    struct Arena {
+        p: usize,
+        left: usize,
+    }
+    static ARENA: std::sync::Mutex<Arena> = std::sync::Mutex::new(Arena { p: 0, left: 0 });
+    let n = s.len() + 1;
+    if n > CHUNK / 4 {
+        let mut v = s.as_bytes().to_vec();
+        v.push(0);
+        return Box::leak(v.into_boxed_slice()).as_ptr() as *const c_char;
+    }
+    let mut a = ARENA.lock().unwrap_or_else(|e| e.into_inner());
+    if a.left < n {
+        let chunk = Box::leak(vec![0u8; CHUNK].into_boxed_slice());
+        a.p = chunk.as_mut_ptr() as usize;
+        a.left = CHUNK;
+    }
+    let dst = a.p as *mut u8;
+    unsafe {
+        std::ptr::copy_nonoverlapping(s.as_ptr(), dst, s.len());
+        *dst.add(s.len()) = 0;
+    }
+    a.p += n;
+    a.left -= n;
+    dst as *const c_char
 }
 
 pub fn cstr_static(s: &str) -> *const c_char {

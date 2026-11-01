@@ -370,10 +370,14 @@ pub(super) fn load_method(o: &PyObject, nm: &PyObject) -> PyResult<(PyRef, Optio
     if tp.tp_getattro.map(|f| f as usize) == Some(object_generic_getattro as usize) {
         if let Some(d) = lookup(o.type_ptr(), nm) {
             if d.ty().tp_flags & Py_TPFLAGS_METHOD_DESCRIPTOR != 0 {
-                // instance dict may shadow
-                let shadow = match instance_dict_existing(o) {
-                    Some(id) => dict::get_item(&id, nm)?,
-                    None => None,
+                // instance dict (or inline values) may shadow
+                let shadow = match crate::shape::get(o, nm) {
+                    crate::shape::Get::Found(v) => Some(v),
+                    crate::shape::Get::Missing => None,
+                    crate::shape::Get::NotValues => match instance_dict_existing(o) {
+                        Some(id) => dict::get_item(&id, nm)?,
+                        None => None,
+                    },
                 };
                 match shadow {
                     Some(v) => return Ok((v, None)),
@@ -1914,6 +1918,9 @@ pub fn handle_eval_breaker(ts: &ThreadState) -> PyResult<()> {
     }
     if eb & crate::threads::EVAL_GC != 0 {
         crate::gc::maybe_collect(ts);
+    }
+    if eb & crate::qsbr::EVAL_QSBR != 0 {
+        crate::qsbr::on_eval_breaker(ts); // perf-runtime: deferred reclamation
     }
     if eb & crate::threads::EVAL_SIGNALS != 0 {
         crate::modules::signal::run_pending_handlers(ts)?;

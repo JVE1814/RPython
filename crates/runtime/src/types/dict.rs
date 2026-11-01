@@ -619,7 +619,8 @@ pub fn set_item_hash(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) -
             t.version = next_version();
             crate::interp::cache::on_dict_write(d); // jit
             drop(g);
-            unsafe { decref(old) };
+            // perf-runtime (D6): lock-free readers may still hold `old`
+            unsafe { crate::qsbr::decref_deferred(old) };
         }
         Found::Missing => {
             unsafe { incref(key.as_ptr()) };
@@ -692,7 +693,12 @@ pub fn pop_item_hash(d: &PyObject, key: &PyObject, h: isize) -> PyResult<Option<
             set_used(d, t.used);
             drop(g);
             unsafe {
-                decref(k);
+                crate::qsbr::decref_deferred(k);
+                if crate::qsbr::multi_threaded() {
+                    // keep the value alive until racing lock-free readers are done
+                    incref(v);
+                    crate::qsbr::decref_deferred(v);
+                }
                 Ok(Some(PyRef::from_raw(v)))
             }
         }
@@ -727,8 +733,8 @@ pub fn clear(d: &PyObject) {
     for e in old.entries().iter() {
         if !e.key.is_null() {
             unsafe {
-                decref(e.key);
-                decref(e.value);
+                crate::qsbr::decref_deferred(e.key);
+                crate::qsbr::decref_deferred(e.value);
             }
         }
     }

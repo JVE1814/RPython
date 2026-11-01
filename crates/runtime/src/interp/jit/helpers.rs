@@ -97,7 +97,7 @@ pub unsafe extern "C" fn h_dict_replace(d: *mut PyObject, ix: u64, name: *mut Py
                 t.version = crate::interp::cache::next_dict_version();
                 crate::interp::cache::on_dict_write(&*d);
                 drop(g);
-                decref(old);
+                crate::qsbr::decref_deferred(old); // perf-runtime: lock-free readers (D6)
                 0
             }
             _ => 1,

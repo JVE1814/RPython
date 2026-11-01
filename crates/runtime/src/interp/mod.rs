@@ -96,10 +96,15 @@ pub fn call_function(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwna
     }
     let f: &PyFunctionObject = funcobject::func(func);
     let co = unsafe { &*f.func_code };
-    let mut frame = Frame::new(co, Some(func), unsafe { &*f.func_globals }, unsafe { &*f.func_builtins }, None);
-    bind_arguments(func, &mut frame, args, nargs, kwnames)?;
     let flags = code::code(co).flags();
+    // plain calls borrow code/func from the caller (perf-runtime, frame.rs `owns_fc`)
+    let mut frame = Frame::new_call(co, func, unsafe { &*f.func_globals }, unsafe { &*f.func_builtins });
+    if let Err(e) = bind_arguments(func, &mut frame, args, nargs, kwnames) {
+        frame::recycle(frame);
+        return Err(e);
+    }
     if flags & (bc::co::GENERATOR | bc::co::COROUTINE | bc::co::ASYNC_GENERATOR) != 0 {
+        frame.make_owned();
         prepare_cells(&mut frame, f);
         return crate::types::genobject::new_generator_for(frame, func, flags);
     }
@@ -126,6 +131,7 @@ pub fn frame_finished(mut frame: Box<Frame>) {
     frame.state = frame::FrameState::Completed;
     frame.clear_stack();
     if !frame.frame_obj.is_null() {
+        frame.make_owned();
         unsafe { crate::types::frameobject::take_ownership(frame.frame_obj, frame) };
     } else {
         frame::recycle(frame);

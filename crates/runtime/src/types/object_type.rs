@@ -217,6 +217,8 @@ fn object_set_class(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
             type_name(unsafe { &*old })
         );
     }
+    // shapes belong to the old type: move inline values into a real dict first
+    crate::shape::materialize(o);
     unsafe {
         incref(new as *mut PyObject);
         o.ob_type.store(new, std::sync::atomic::Ordering::Release);
@@ -383,13 +385,78 @@ pub unsafe extern "C" fn type_vectorcall(
 ) -> *mut PyObject {
     unsafe {
         let nargs = nargsf & !PY_VECTORCALL_ARGUMENTS_OFFSET;
+        let nkw = if kwnames.is_null() { 0 } else { tuple::tuple_len(&*kwnames) };
+        let tp = callable as *mut PyTypeObject;
+        // perf-runtime: instantiate ordinary classes without an args tuple / kwargs
+        // dict: object.__new__ + a Python __init__ called with self prepended.
+        if (*tp).tp_new == Some(object_new)
+            && (*tp).tp_init == Some(crate::types::slots::slot_tp_init)
+            && (*tp).tp_flags & Py_TPFLAGS_IS_ABSTRACT == 0
+        {
+            if let Some(init) = lookup(tp, name!("__init__")) {
+                if funcobject::is_function(&init) {
+                    return instantiate_with_init(tp, &init, args, nargs, kwnames, nkw);
+                }
+            }
+        }
         let all = if nargs == 0 { &[][..] } else { std::slice::from_raw_parts(args, nargs) };
-        if kwnames.is_null() || tuple::tuple_len(&*kwnames) == 0 {
-            let t = tuple::new_tuple_from_ptrs(all);
+        let t = tuple::new_tuple_from_ptrs(all);
+        if nkw == 0 {
             return type_call(callable, t.as_ptr(), std::ptr::null_mut());
         }
-        crate::abstract_::vectorcall_call(callable, std::ptr::null_mut(), std::ptr::null_mut());
-        std::ptr::null_mut()
+        let d = dict::new_dict();
+        for i in 0..nkw {
+            if dict::set_item(&d, tuple::tuple_get(&*kwnames, i), &**args.add(nargs + i)).is_err() {
+                return std::ptr::null_mut();
+            }
+        }
+        type_call(callable, t.as_ptr(), d.as_ptr())
+    }
+}
+
+#[inline]
+unsafe fn instantiate_with_init(
+    tp: *mut PyTypeObject,
+    init: &PyObject,
+    args: *const *mut PyObject,
+    nargs: usize,
+    kwnames: *mut PyObject,
+    nkw: usize,
+) -> *mut PyObject {
+    unsafe {
+        let alloc = (*tp).tp_alloc.unwrap_or(generic_alloc);
+        let obj = alloc(tp, 0);
+        if obj.is_null() {
+            return obj;
+        }
+        let n = nargs + nkw;
+        let mut buf = [std::ptr::null_mut::<PyObject>(); 9];
+        let mut heap_buf: Vec<*mut PyObject>;
+        let argv: &mut [*mut PyObject] = if n < buf.len() {
+            &mut buf[..n + 1]
+        } else {
+            heap_buf = vec![std::ptr::null_mut(); n + 1];
+            &mut heap_buf[..]
+        };
+        argv[0] = obj;
+        if n > 0 {
+            std::ptr::copy_nonoverlapping(args, argv.as_mut_ptr().add(1), n);
+        }
+        let kn = if nkw == 0 { None } else { Some(&*kwnames) };
+        match crate::interp::call_function(init, argv, nargs + 1, kn) {
+            Ok(r) => {
+                if !r.is(none::none()) {
+                    let _ = err!(TypeError, "__init__() should return None, not '{}'", type_name(r.ty()));
+                    decref(obj);
+                    return std::ptr::null_mut();
+                }
+                obj
+            }
+            Err(_) => {
+                decref(obj);
+                std::ptr::null_mut()
+            }
+        }
     }
 }
 
@@ -459,6 +526,7 @@ unsafe extern "C" fn type_dealloc(op: *mut PyObject) {
         let tp = op as *mut PyTypeObject;
         crate::gc::untrack(op);
         crate::interp::cache::unwatch_type_dict(tp); // jit
+        crate::shape::type_free(tp);
         crate::types::weakref::clear_weakrefs(op);
         if !(*tp).tp_bases.is_null() {
             for b in tuple::tuple_items(&*(*tp).tp_bases) {
@@ -1201,6 +1269,14 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
         (*tp).tp_clear = Some(subtype_clear);
         (*tp).tp_alloc = Some(generic_alloc);
         (*tp).tp_free = Some(generic_free);
+        (*tp).tp_vectorcall = Some(type_vectorcall);
+        {
+            // perf-runtime: inline attribute values sized by the compiler's hint
+            let hint = dict::get_item_str(&dict, name!("__static_attributes__"))
+                .filter(|t| tuple::is_tuple(t))
+                .map_or(0, |t| tuple::tuple_len(&t));
+            crate::shape::type_enable(tp, hint);
+        }
         if add_dict && (*tp).tp_flags & Py_TPFLAGS_MANAGED_DICT != 0 && dict::get_item_str(&dict, name!("__dict__")).is_none() {
             let descr = shared_subtype_descr(0);
             dict::set_item(&dict, name!("__dict__"), &descr)?;
@@ -1220,7 +1296,7 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
         }
         // __firstlineno__ / __static_attributes__ are provided by the compiler in the namespace
         type_ready(tp)?;
-        crate::types::slots::fixup_slots(tp);
+        crate::types::slots::fixup_slots_new_type(tp);
         if (*tp).tp_new.is_none() || (*base).tp_new.is_none() {
             (*tp).tp_new = (*base).tp_new;
         }
@@ -1377,6 +1453,8 @@ pub fn init_types() {
         t.tp_alloc = Some(generic_alloc);
         t.tp_free = Some(generic_free);
         t.tp_vectorcall = Some(type_vectorcall);
+        // calling a type object dispatches through that type's own tp_vectorcall
+        t.tp_vectorcall_offset = std::mem::offset_of!(PyTypeObject, tp_vectorcall) as isize;
         t.tp_weaklistoffset = std::mem::offset_of!(PyTypeObject, tp_weaklist) as isize;
         t.tp_dictoffset = std::mem::offset_of!(PyTypeObject, tp_dict) as isize;
         let n = &mut *(&raw mut TYPE_AS_NUMBER);

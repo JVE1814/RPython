@@ -207,7 +207,8 @@ fn call_compiled(func: &PyObject, code: &PyObject, cd: &CodeData, c: &Compiled, 
     use crate::interp::frame::FrameState;
     let f = crate::types::funcobject::func(func);
     let ts = crate::threads::current();
-    let mut frame = Frame::new(code, Some(func), unsafe { &*f.func_globals }, unsafe { &*f.func_builtins }, None);
+    // perf-runtime: borrowed code/func (frame.rs `new_call`), pooled frame
+    let mut frame = Frame::new_call(code, func, unsafe { &*f.func_globals }, unsafe { &*f.func_builtins });
     for (i, &a) in args.iter().enumerate() {
         unsafe { incref(a) };
         frame.slots[i] = a;

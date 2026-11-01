@@ -248,8 +248,12 @@ pub unsafe extern "C" fn PyObject_VisitManagedDict(o: *mut PyObject, visit: visi
         if (*(*o).type_ptr()).tp_flags & Py_TPFLAGS_MANAGED_DICT == 0 || !crate::alloc::has_managed(o) {
             return 0;
         }
+        let r = crate::shape::traverse(o, visit, arg);
+        if r != 0 {
+            return r;
+        }
         let d = *crate::alloc::managed_dict_slot(o);
-        if !d.is_null() {
+        if !d.is_null() && d as usize & 1 == 0 {
             if let Some(v) = visit {
                 return v(d, arg);
             }
@@ -263,8 +267,12 @@ pub unsafe extern "C" fn PyObject_ClearManagedDict(o: *mut PyObject) {
         if (*(*o).type_ptr()).tp_flags & Py_TPFLAGS_MANAGED_DICT == 0 || !crate::alloc::has_managed(o) {
             return;
         }
+        crate::shape::clear_values(o, true);
         let slot = crate::alloc::managed_dict_slot(o);
         let d = *slot;
+        if d as usize & 1 != 0 {
+            return; // inline values (now empty) stay
+        }
         *slot = std::ptr::null_mut();
         xdecref(d);
     }

@@ -135,10 +135,53 @@ pub unsafe fn track(op: *mut PyObject) {
             (*head).prev = h;
         });
         o.ob_gc_bits.fetch_or(GC_BIT_TRACKED, Relaxed);
-        TRACKED.fetch_add(1, Relaxed);
-        let n = ALLOCS_SINCE.fetch_add(1, Relaxed) + 1;
+        note_tracked(1);
+    }
+}
+
+// perf-runtime: the tracked/allocation counters are kept per thread and published
+// in batches (two global atomic RMWs per tracked object were a contention point for
+// multi-threaded allocation and ~10% of a small-object allocation).
+#[thread_local]
+static mut LOCAL_DELTA: isize = 0;
+const DELTA_BATCH: isize = 32;
+
+#[inline(always)]
+fn note_tracked(d: isize) {
+    unsafe {
+        let v = LOCAL_DELTA + d;
+        if (-DELTA_BATCH..DELTA_BATCH).contains(&v) {
+            LOCAL_DELTA = v;
+        } else {
+            LOCAL_DELTA = 0;
+            publish_delta(v);
+        }
+    }
+}
+
+#[cold]
+fn publish_delta(v: isize) {
+    TRACKED.fetch_add(v, Relaxed);
+    if v > 0 {
+        let n = ALLOCS_SINCE.fetch_add(v as usize, Relaxed) + v as usize;
         if n >= trigger_threshold() && ENABLED.load(Relaxed) && !COLLECTING.load(Relaxed) {
             request_collection();
+        }
+    } else if v < 0 {
+        // allocations minus deallocations (like CPython gen0 counts): short-lived
+        // objects do not trigger collections
+        let _ = ALLOCS_SINCE.fetch_update(Relaxed, Relaxed, |x| Some(x.saturating_sub((-v) as usize)));
+    }
+}
+
+/// Publish the calling thread's pending counter delta (exact counts for gc module
+/// queries; thread exit).
+pub fn flush_thread_counts() {
+    unsafe {
+        let v = LOCAL_DELTA;
+        if v != 0 {
+            LOCAL_DELTA = 0;
+            publish_delta(v);
         }
     }
 }
@@ -168,10 +211,7 @@ pub unsafe fn untrack(op: *mut PyObject) {
             (*h).prev = std::ptr::null_mut();
         });
         o.ob_gc_bits.fetch_and(!GC_BIT_TRACKED, Relaxed);
-        TRACKED.fetch_sub(1, Relaxed);
-        // allocations minus deallocations (like CPython gen0 counts): short-lived
-        // objects do not trigger collections
-        let _ = ALLOCS_SINCE.fetch_update(Relaxed, Relaxed, |v| v.checked_sub(1));
+        note_tracked(-1);
     }
 }
 
@@ -187,6 +227,7 @@ pub unsafe fn set_finalized(op: *mut PyObject) {
     }
 }
 pub fn tracked_count() -> isize {
+    flush_thread_counts();
     TRACKED.load(Relaxed)
 }
 
