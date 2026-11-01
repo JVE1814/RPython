@@ -316,7 +316,10 @@ fn real_main() -> i32 {
         cfg.faulthandler = true;
     }
     if let Some(v) = env(&cfg, "PYTHONTRACEMALLOC") {
-        cfg.tracemalloc = v.parse().unwrap_or(1);
+        cfg.tracemalloc = match v.parse::<i64>() {
+            Ok(n) if (0..=65535).contains(&n) => n as i32,
+            _ => fatal("PYTHONTRACEMALLOC: invalid number of frames"),
+        };
     }
     if let Some(v) = env(&cfg, "PYTHONUTF8") {
         cfg.utf8_mode = if v == "0" { 0 } else { 1 };
@@ -363,7 +366,7 @@ fn real_main() -> i32 {
                 cfg.tracemalloc = match v {
                     None => 1,
                     Some(s) => match s.parse::<i32>() {
-                        Ok(n) if n >= 1 => n,
+                        Ok(n) if (1..=65535).contains(&n) => n,
                         _ => fatal("-X tracemalloc=NFRAME: invalid number of frames"),
                     },
                 }

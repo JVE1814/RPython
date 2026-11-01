@@ -1203,6 +1203,9 @@ pub fn post_init() -> PyResult<()> {
         crate::modules::faulthandler::enable_at_startup();
     }
     crate::import::install_importlib(&stdlib_dir())?;
+    if config().tracemalloc > 0 {
+        crate::modules::_tracemalloc::start(config().tracemalloc as i64)?;
+    }
     Ok(())
 }
 

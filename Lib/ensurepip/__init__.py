@@ -179,12 +179,20 @@ def _importable_location(wheel, tmpdir):
     """Return a sys.path entry from which pip can be imported: the wheel
     itself, or (when zipimport is unavailable) an unpacked copy of it."""
     try:
-        import zipimport  # noqa: F401
+        import zipimport
+        usable = zipimport.zipimporter in sys.path_hooks
     except ImportError:
+        usable = False
+    if not usable:
         import zipfile
         unpacked = os.path.join(tmpdir, 'pip-unpacked')
         with zipfile.ZipFile(wheel) as zf:
             zf.extractall(unpacked)
+        # Without its metadata the unpacked copy does not count as an
+        # installed pip (pip would otherwise skip the installation).
+        for name in os.listdir(unpacked):
+            if name.endswith('.dist-info'):
+                shutil.rmtree(os.path.join(unpacked, name))
         return unpacked
     return os.fsdecode(wheel)
 
