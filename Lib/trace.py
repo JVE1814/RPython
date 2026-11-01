@@ -29,7 +29,6 @@ import token
 import tokenize
 import inspect
 import gc
-import pickle
 from time import monotonic as _time
 
 import threading
@@ -145,6 +144,7 @@ class CoverageResults:
         if self.infile:
             # Try to merge existing counts file.
             try:
+                import pickle
                 with open(self.infile, 'rb') as f:
                     counts, calledfuncs, callers = pickle.load(f)
                 self.update(self.__class__(counts, calledfuncs, callers=callers))
@@ -270,6 +270,7 @@ class CoverageResults:
         if self.outfile:
             # try and store counts and module info into self.outfile
             try:
+                import pickle
                 with open(self.outfile, 'wb') as f:
                     pickle.dump((self.counts, self.calledfuncs, self.callers),
                                 f, 1)
