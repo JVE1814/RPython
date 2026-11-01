@@ -1,6 +1,6 @@
 # PROGRESS
 
-## Status (2026-11-01, day 1, evening)
+## Status (2026-11-01, day 1, night)
 - Spec pinned (CPython v3.15.2). Baselines built: /opt/baseline/py-default (PGO+LTO),
   /opt/baseline/py-ft (PGO+LTO, free-threaded).
 - Foundation crates done & tested: unicode (UCD 17), numfmt, bigint, sre; parser (all spec
@@ -9,9 +9,14 @@
 - Runtime: first end-to-end Python execution (functions, classes, metaclasses, closures,
   generators, exceptions, comprehensions, f-strings, match). Own small-object allocator
   (TLAB-style), frame pool, stop-the-world cycle GC with safepoints.
-- 12 parallel workstreams running in worktrees: str, bytes, numbers, containers, osio,
-  functional, text, harness (unittest/traceback/...), system (sys/threads/importlib/...),
-  lang (except*/typing/async gens), capi (C API + extension loading + numpy), jit.
+- Finished workstreams merged to master: parser, str (full str type, two-way search, format/%),
+  bytes (bytes/bytearray/memoryview/buffer protocol), numbers (float/complex/int/math/cmath/
+  _struct/binascii/_random/random/fractions/statistics).
+- Running: compiler, containers, osio, functional, text, harness, system, lang, capi, jit;
+  wave 2: ast (_ast/ast/tokenize/symtable), data (pickle/json/datetime/array/copy/csv...),
+  compress (zlib/bz2/lzma/zstd/hashes/zip/tar), net (socket/select/asyncio/urllib/http).
+- Known blockers for importing os/functools/collections: range() with big ints (containers),
+  warnings.warn, sys.excepthook (harness), enum (functional).
 
 ## Regression suite
 Reference (CPython 3.15.2 free-threaded, this machine, tools/run_tests.sh):
