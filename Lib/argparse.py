@@ -20,7 +20,6 @@ Namespace, Action, and the constants ONE_OR_MORE, OPTIONAL, PARSER,
 REMAINDER, SUPPRESS and ZERO_OR_MORE.
 """
 
-__version__ = '1.1'
 __all__ = [
     'ArgumentParser',
     'ArgumentError',
@@ -367,78 +366,80 @@ class HelpFormatter(object):
         return lines
 
     def _get_actions_usage_parts(self, actions, groups):
-        """The usage text of each action (mutually exclusive groups
-        bracketed together), and the index of the first positional part."""
-        # find the groups whose actions appear together
-        in_groups = set()
-        spans = {}
-        for group in groups:
-            if not group._group_actions:
-                raise ValueError(f'empty group {group}')
-            if all(a.help is SUPPRESS for a in group._group_actions):
-                continue
-            try:
-                start = min(actions.index(a) for a in group._group_actions)
-            except ValueError:
-                continue
-            end = start + len(group._group_actions)
-            if set(actions[start:end]) == set(group._group_actions):
-                in_groups.update(group._group_actions)
-                spans[start, end] = group
-
+        """The usage text of each action, with the members of a mutually
+        exclusive group bracketed together, and the index of the first
+        part belonging to the positional section."""
         theme = self._theme
+        # a usable group is shown where its first positional member is, or
+        # (without positionals) where its first member is
+        group_of = {}
+        anchors = {}
+        for group in groups:
+            members = [a for a in actions if a in group._group_actions]
+            if not members or all(a.help is SUPPRESS for a in members):
+                continue
+            positional = [a for a in members if not a.option_strings]
+            anchor = positional[0] if positional else members[0]
+            anchors[anchor] = (group, members)
+            for action in members:
+                group_of[action] = group
+
         parts = []
+        pos_start = None
         for action in actions:
+            if pos_start is None and not action.option_strings:
+                pos_start = len(parts)
+            if action in group_of:
+                if action not in anchors:
+                    continue
+                group, members = anchors[action]
+                if pos_start is None and not action.option_strings:
+                    pos_start = len(parts)
+                parts.extend(self._group_usage_parts(group, members))
+                continue
             if action.help is SUPPRESS:
-                parts.append(None)
                 continue
-            if not action.option_strings:
-                default = self._get_default_metavar_for_positional(action)
-                text = self._format_args(action, default)
-                # the brackets of an optional positional in a group go
-                if action in in_groups and len(text) > 1 and \
-                        text[0] == '[' and text[-1] == ']':
-                    text = text[1:-1]
-                parts.append(f'{theme.summary_action}{text}{theme.reset}')
-                continue
-            option = action.option_strings[0]
-            if action.nargs == 0:
-                text = action.format_usage()
-                text = self._color_summary_options(text)
-            else:
-                default = self._get_default_metavar_for_optional(action)
-                args = self._format_args(action, default)
-                color = self._summary_option_color(option)
-                text = (f'{color}{option} {theme.summary_label}{args}'
-                        f'{theme.reset}')
-            if not action.required and action not in in_groups:
-                text = f'[{text}]'
+            text = self._action_usage(action, in_group=False)
             parts.append(text)
+        if pos_start is None:
+            pos_start = len(parts)
+        return parts, pos_start
 
-        separated = set()
-        for start, end in sorted(spans, reverse=True):
-            group = spans[start, end]
-            members = [p for p in parts[start:end] if p is not None]
-            if group.required:
-                opening, closing = '()' if len(members) > 1 else ('', '')
-            else:
-                opening, closing = '[]'
-            members[0] = opening + members[0]
-            members[-1] = members[-1] + closing
-            for index in range(start, start + len(members) - 1):
-                # separators are only added once (nested groups)
-                if index not in separated:
-                    separated.add(index)
-                    members[index - start] += ' |'
-            parts[start:end] = members
+    def _action_usage(self, action, in_group):
+        theme = self._theme
+        if not action.option_strings:
+            default = self._get_default_metavar_for_positional(action)
+            text = self._format_args(action, default)
+            # an optional positional loses its brackets inside a group
+            if in_group and len(text) > 1 and text[0] == '[' and \
+                    text[-1] == ']':
+                text = text[1:-1]
+            return f'{theme.summary_action}{text}{theme.reset}'
+        option = action.option_strings[0]
+        if action.nargs == 0:
+            text = self._color_summary_options(action.format_usage())
+        else:
+            default = self._get_default_metavar_for_optional(action)
+            args = self._format_args(action, default)
+            color = self._summary_option_color(option)
+            text = (f'{color}{option} {theme.summary_label}{args}'
+                    f'{theme.reset}')
+        if not action.required and not in_group:
+            text = f'[{text}]'
+        return text
 
-        optional_count = sum(1 for a in actions if a.option_strings)
-        visible_optionals = 0
-        for action in actions[:optional_count]:
-            if action.help is not SUPPRESS:
-                visible_optionals += 1
-        cleaned = [p for p in parts if p is not None]
-        return cleaned, min(visible_optionals, len(cleaned))
+    def _group_usage_parts(self, group, members):
+        shown = [self._action_usage(action, in_group=True)
+                 for action in members if action.help is not SUPPRESS]
+        if group.required:
+            opening, closing = '()' if len(shown) > 1 else ('', '')
+        else:
+            opening, closing = '[]'
+        shown[0] = opening + shown[0]
+        shown[-1] = shown[-1] + closing
+        for index in range(len(shown) - 1):
+            shown[index] += ' |'
+        return shown
 
     def _summary_option_color(self, option):
         theme = self._theme
@@ -756,7 +757,8 @@ class ArgumentDefaultsHelpFormatter(HelpFormatter):
         text = action.help
         if text is None:
             text = ''
-        if '%(default)' not in text and action.default is not SUPPRESS:
+        if ('%(default)' not in text and action.default is not SUPPRESS
+                and not action.required):
             if action.option_strings or action.nargs in (OPTIONAL,
                                                           ZERO_OR_MORE):
                 text = _DefaultedHelp(text + _(' (default: %(default)s)'))
@@ -881,6 +883,26 @@ class Action(_AttributeHolder):
         raise NotImplementedError('.__call__() not defined')
 
 
+def _negated_option(option):
+    """The negative form of a BooleanOptionalAction option: --foo gives
+    --no-foo, ++foo ++no-foo and a long single-prefix option like -foo
+    gives -nofoo; one-letter options have none."""
+    if len(option) <= 2:
+        return None
+    prefix = option[0]
+    if option[1] == prefix:
+        name = option[2:]
+        if name.startswith('no-'):
+            raise ValueError(f'invalid option name {option!r} '
+                             f'for BooleanOptionalAction')
+        return prefix * 2 + 'no-' + name
+    name = option[1:]
+    if name.startswith('no'):
+        raise ValueError(f'invalid option name {option!r} '
+                         f'for BooleanOptionalAction')
+    return prefix + 'no' + name
+
+
 class BooleanOptionalAction(Action):
     """A flag with a negative form: --foo sets True, --no-foo sets False."""
 
@@ -889,19 +911,18 @@ class BooleanOptionalAction(Action):
         expanded = []
         for option in option_strings:
             expanded.append(option)
-            if option.startswith('--'):
-                if option.startswith('--no-'):
-                    raise ValueError(f'invalid option name {option!r} '
-                                     f'for BooleanOptionalAction')
-                expanded.append('--no-' + option[2:])
+            negative = _negated_option(option)
+            if negative is not None:
+                expanded.append(negative)
         super().__init__(option_strings=expanded, dest=dest, nargs=0,
                          default=default, required=required, help=help,
                          deprecated=deprecated)
+        self._negatives = frozenset(expanded) - frozenset(option_strings)
 
     def __call__(self, parser, namespace, values, option_string=None):
         if option_string in self.option_strings:
             setattr(namespace, self.dest,
-                    not option_string.startswith('--no-'))
+                    option_string not in self._negatives)
 
     def format_usage(self):
         return ' | '.join(self.option_strings)
@@ -1466,14 +1487,15 @@ class _ActionsContainer(object):
 
         dest = kwargs.pop('dest', None)
         if dest is None:
-            # the first long option, else the first short one
-            first_long = None
-            for option_string in option_strings:
-                if len(option_string) > 1 and \
-                        option_string[1] in self.prefix_chars:
-                    first_long = option_string
-                    break
-            dest_option_string = first_long or option_strings[0]
+            # a long option ("--foo-bar"), else a multi-letter one ("-qux"),
+            # else the first one
+            def rank(option):
+                if len(option) > 1 and option[1] in self.prefix_chars:
+                    return 0
+                if len(option) > 2:
+                    return 1
+                return 2
+            dest_option_string = min(option_strings, key=rank)
             dest = dest_option_string.lstrip(self.prefix_chars)
             if not dest:
                 raise TypeError('dest= is required for options like %s'
@@ -1709,9 +1731,11 @@ class ArgumentParser(_AttributeHolder, _ActionsContainer):
         if kwargs.get('prog') is None:
             # the program name plus the positionals before the command
             formatter = self.formatter_class(prog=self.prog)
-            positionals = self._get_positional_actions()
+            # (required options must be given before the command too)
+            shown = [action for action in self._actions
+                     if not action.option_strings or action.required]
             groups = self._mutually_exclusive_groups
-            formatter.add_usage(None, positionals, groups, '')
+            formatter.add_usage(None, shown, groups, '')
             kwargs['prog'] = formatter.format_help().strip()
 
         parsers_class = self._pop_action_class(kwargs, 'parsers')
@@ -1944,7 +1968,8 @@ class ArgumentParser(_AttributeHolder, _ActionsContainer):
         elif nargs == ONE_OR_MORE:
             pattern = '(-*A[A-]*)'
         elif nargs == REMAINDER:
-            pattern = '([AO]*)' if is_option else '(.*)'
+            # everything, including '--'
+            return '([-AO]*)' if is_option else '(.*)'
         elif nargs == PARSER:
             pattern = '(-*A[-AO]*)'
         elif nargs == SUPPRESS:
@@ -2383,3 +2408,11 @@ class _ParseRun:
                      if action.help is not SUPPRESS]
             msg = _('one of the arguments %s is required')
             raise ArgumentError(None, msg % ' '.join(names))
+
+
+def __getattr__(name):
+    if name == "__version__":
+        import warnings
+        warnings._deprecated("__version__", remove=(3, 20))
+        return "1.1"
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
