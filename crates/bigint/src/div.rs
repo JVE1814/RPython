@@ -8,7 +8,7 @@ use core::cmp::Ordering;
 /// many digits.
 pub const NEWTON_THRESHOLD: usize = 400000;
 /// Use Burnikel-Ziegler when both the divisor and the quotient have at least this many digits.
-pub const BZ_THRESHOLD: usize = 100;
+pub const BZ_THRESHOLD: usize = 250;
 /// Reciprocal recursion base size.
 const RECIP_BASE: usize = 64;
 
@@ -38,6 +38,8 @@ pub fn knuth_core(q: &mut [u32], u: &mut [u32], v: &[u32]) {
     let m = u.len() - n; // number of quotient digits
     let vtop = v[n - 1] as u64;
     let vsec = v[n - 2] as u64;
+    let use_kern = n >= nat::KERN_MIN;
+    let mut tmp = if use_kern { vec![0u32; n] } else { Vec::new() };
     for j in (0..m).rev() {
         let utop = u[j + n] as u64;
         let unext = u[j + n - 1] as u64;
@@ -53,7 +55,13 @@ pub fn knuth_core(q: &mut [u32], u: &mut [u32], v: &[u32]) {
             rhat += vtop;
         }
         // multiply and subtract
-        let borrow = nat::mul_digit_sub(&mut u[j..j + n], v, qhat as u32);
+        let borrow = if use_kern {
+            let amt = crate::kern::submul1(&mut tmp, &u[j..j + n], v, qhat as u32);
+            u[j..j + n].copy_from_slice(&tmp);
+            amt as u32
+        } else {
+            nat::mul_digit_sub(&mut u[j..j + n], v, qhat as u32)
+        };
         let top = u[j + n] as i64 - borrow as i64;
         if top < 0 {
             let c = nat::add_assign(&mut u[j..j + n], v);
@@ -352,7 +360,7 @@ pub fn divrem_knuth(a: &[u32], b: &[u32]) -> (Vec<u32>, Vec<u32>) {
 // ---------------------------------------------------------------------------------------------
 
 /// Recursion base size (digits) for Burnikel-Ziegler.
-const BZ_LIMIT: usize = 48;
+const BZ_LIMIT: usize = 80;
 
 /// Number formed by `lo` (zero-padded to `lo_len` digits) followed by `hi`.
 fn concat(lo: &[u32], lo_len: usize, hi: &[u32]) -> Vec<u32> {

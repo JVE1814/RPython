@@ -35,20 +35,22 @@ fn lin_comb(a: &[u32], b: &[u32], ca: i64, cb: i64, cc: i64, cd: i64) -> (Vec<u3
     let n = a.len().max(b.len());
     let mut x = vec![0u32; n + 1];
     let mut y = vec![0u32; n + 1];
-    let mut c1: i128 = 0;
-    let mut c2: i128 = 0;
+    // Cofactors are below 2^31 in magnitude and digits below 2^30: every term fits an i64.
+    let mut c1: i64 = 0;
+    let mut c2: i64 = 0;
+    let bl = b.len();
     for i in 0..n {
-        let ai = *a.get(i).unwrap_or(&0) as i128;
-        let bi = *b.get(i).unwrap_or(&0) as i128;
-        c1 += ca as i128 * ai + cb as i128 * bi;
-        c2 += cc as i128 * ai + cd as i128 * bi;
+        let ai = a[i] as i64;
+        let bi = if i < bl { b[i] as i64 } else { 0 };
+        c1 += ca * ai + cb * bi;
+        c2 += cc * ai + cd * bi;
         x[i] = (c1 as u32) & MASK;
         y[i] = (c2 as u32) & MASK;
         c1 >>= SHIFT;
         c2 >>= SHIFT;
     }
-    debug_assert!((0..(1i128 << SHIFT)).contains(&c1));
-    debug_assert!((0..(1i128 << SHIFT)).contains(&c2));
+    debug_assert!((0..(1i64 << SHIFT)).contains(&c1));
+    debug_assert!((0..(1i64 << SHIFT)).contains(&c2));
     x[n] = c1 as u32;
     y[n] = c2 as u32;
     nat::normalize(&mut x);
@@ -85,6 +87,9 @@ pub fn gcd_mag(a: &[u32], b: &[u32]) -> Vec<u32> {
             let q = (x + ca) / (y + cc);
             let q2 = (x + cb) / (y + cd);
             if q != q2 {
+                break;
+            }
+            if (ca - q * cc).abs() >= (1 << 31) || (cb - q * cd).abs() >= (1 << 31) {
                 break;
             }
             let t = ca - q * cc;
