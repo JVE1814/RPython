@@ -36,7 +36,7 @@ pub struct PySetObject {
     pub finger: Py_ssize_t,
     pub smalltable: [SetEntry; MINSIZE],
     pub weakreflist: *mut PyObject,
-    /// private: bumped on every structural change
+    /// private: bumped whenever the entry table is replaced (resize/clear)
     pub version: u64,
 }
 
@@ -293,7 +293,6 @@ pub fn add_entry(o: &PyObject, key: &PyObject, hash: isize) -> PyResult<()> {
         e.hash = hash;
         s.fill += 1;
         s.used += 1;
-        s.version += 1;
         if (s.fill as usize) * 5 >= (s.mask as usize) * 3 {
             let u = s.used as usize;
             table_resize(s, if u > 50000 { u * 2 } else { u * 4 });
@@ -317,7 +316,6 @@ pub fn discard_entry(o: &PyObject, key: &PyObject, hash: isize) -> PyResult<bool
             e.key = dummy();
             e.hash = -1;
             s.used -= 1;
-            s.version += 1;
             drop(g);
             unsafe { decref(old) };
             Ok(true)
@@ -451,7 +449,6 @@ fn merge_set(o: &PyObject, other: &PyObject) -> PyResult<()> {
             }
             s.fill = n;
             s.used = n;
-            s.version += 1;
             drop(g);
             return Ok(());
         }
@@ -997,7 +994,6 @@ fn pop_m(o: &PyObject) -> PyResult {
     e.hash = -1;
     s.used -= 1;
     s.finger = ((i + 1) & mask) as isize;
-    s.version += 1;
     drop(g);
     Ok(unsafe { PyRef::from_raw(key) })
 }
