@@ -341,8 +341,16 @@ pub struct Tables {
     pub profile: Box<[AtomicU8]>,
 }
 
-fn needs_entry(op: Op) -> bool {
-    matches!(op, Op::LoadGlobal | Op::LoadAttr | Op::LoadMethod | Op::StoreAttr)
+/// Number of cache entries per instruction: attribute sites are polymorphic (up to
+/// `POLY` receiver types), global loads have one entry.
+pub const POLY: usize = 4;
+
+fn entries_for(op: Op) -> u32 {
+    match op {
+        Op::LoadGlobal => 1,
+        Op::LoadAttr | Op::LoadMethod | Op::StoreAttr => POLY as u32,
+        _ => 0,
+    }
 }
 
 impl Tables {
@@ -351,9 +359,10 @@ impl Tables {
         let mut n = 0u32;
         for (pc, w) in code.iter().enumerate() {
             let op = Op::from_u8((*w & 0xff) as u8);
-            if needs_entry(op) {
+            let k = entries_for(op);
+            if k > 0 {
                 index[pc] = n;
-                n += 1;
+                n += k;
             }
         }
         let entries: Box<[Entry]> = (0..n).map(|_| Entry::new()).collect();
@@ -368,6 +377,15 @@ impl Tables {
             let i = *self.index.get_unchecked(pc);
             debug_assert!(i != u32::MAX);
             self.entries.get_unchecked(i as usize)
+        }
+    }
+
+    /// The `POLY` entries of an attribute instruction at `pc`.
+    #[inline(always)]
+    pub fn poly(&self, pc: usize) -> &[Entry] {
+        unsafe {
+            let i = *self.index.get_unchecked(pc) as usize;
+            self.entries.get_unchecked(i..i + POLY)
         }
     }
 
