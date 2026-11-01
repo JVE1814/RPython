@@ -556,7 +556,7 @@ fn b_compile(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResu
     };
     let src = src.unwrap();
     if flags & rpy_compiler::cf::PYCF_ONLY_AST != 0 || crate::modules::ast_bridge::is_ast_node(src) {
-        return crate::modules::ast_bridge::compile_with_ast(src, &fname, mode, flags, optimize);
+        return crate::modules::ast_bridge::compile_with_ast(src, &fname, mode, flags, optimize, match _fv { Some(v) if !v.is(none::none()) => { let x = ab::as_i64(v)?; if x >= 0 { Some(x as u32) } else { None } } _ => None });
     }
     if mode == crate::compile::Mode::FuncType {
         raise!(ValueError, "compile() mode 'func_type' requires flag PyCF_ONLY_AST");
