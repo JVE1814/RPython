@@ -360,25 +360,69 @@ pub unsafe fn clear_weakrefs_at(o: *mut PyObject, list: *mut *mut PyObject) {
             }
         }
         drop(dead_cbs);
-        if pending.is_empty() {
-            return;
-        }
-        let saved = take_exc();
-        for (r, cb) in pending {
-            if let Err(_) = ab::call(&cb, &[&r]) {
-                let msg = format!(
-                    "Exception ignored while calling weakref callback {}",
-                    ab::repr_string(&cb).unwrap_or_else(|_| {
-                        clear_exc();
-                        "<object>".into()
-                    })
-                );
-                crate::modules::sys::write_unraisable_with_obj(&msg, None);
+        run_callbacks(pending);
+    }
+}
+
+/// Cycle-collector variant: clear the weakrefs to every object in `garbage`
+/// first, then run the callbacks of those weakrefs that are not themselves
+/// garbage (the callbacks of garbage weakrefs are dropped, as in CPython).
+pub unsafe fn clear_weakrefs_for_gc(garbage: &[*mut PyObject]) {
+    unsafe {
+        let set: std::collections::HashSet<usize> = garbage.iter().map(|&p| p as usize).collect();
+        let mut pending: Vec<(PyRef, PyRef)> = Vec::new();
+        let mut dropped: Vec<PyRef> = Vec::new();
+        {
+            let _g = list_lock();
+            for &o in garbage {
+                let list = weaklist_slot(o);
+                if list.is_null() {
+                    continue;
+                }
+                let mut r = head(list);
+                *list = std::ptr::null_mut();
+                while !r.is_null() {
+                    let next = (*r).wr_next;
+                    (*r).wr_object = none::none().as_ptr();
+                    (*r).wr_prev = std::ptr::null_mut();
+                    (*r).wr_next = std::ptr::null_mut();
+                    let cb = std::mem::replace(&mut (*r).wr_callback, std::ptr::null_mut());
+                    if !cb.is_null() {
+                        let ro = r as *mut PyObject;
+                        if !set.contains(&(ro as usize)) && (*ro).refcnt() > 0 {
+                            pending.push((PyRef::from_borrowed(ro), PyRef::from_raw(cb)));
+                        } else {
+                            dropped.push(PyRef::from_raw(cb));
+                        }
+                    }
+                    r = next;
+                }
             }
         }
-        if let Some(e) = saved {
-            set_exc(e);
+        drop(dropped);
+        run_callbacks(pending);
+    }
+}
+
+unsafe fn run_callbacks(pending: Vec<(PyRef, PyRef)>) {
+    if pending.is_empty() {
+        return;
+    }
+    let saved = take_exc();
+    for (r, cb) in pending {
+        if ab::call(&cb, &[&r]).is_err() {
+            let msg = format!(
+                "Exception ignored while calling weakref callback {}",
+                ab::repr_string(&cb).unwrap_or_else(|_| {
+                    clear_exc();
+                    "<object>".into()
+                })
+            );
+            crate::modules::sys::write_unraisable_with_obj(&msg, None);
         }
+    }
+    if let Some(e) = saved {
+        set_exc(e);
     }
 }
 
