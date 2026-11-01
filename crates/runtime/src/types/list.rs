@@ -180,6 +180,27 @@ pub fn get(o: &PyObject, i: usize) -> Option<PyRef> {
 }
 
 /// Replace item `i` (must be in range).
+/// Replace item `i` (negative counts from the end); `false` if out of range.
+pub fn set_index(o: &PyObject, i: isize, v: PyRef) -> bool {
+    let old = {
+        let _g = ob_lock(o);
+        unsafe {
+            let l = lp(o);
+            let n = (*l).ob_base.ob_size;
+            let i = if i < 0 { i + n } else { i };
+            if i < 0 || i >= n {
+                return false;
+            }
+            let slot = (*l).ob_item.add(i as usize);
+            let old = *slot;
+            *slot = v.into_raw();
+            old
+        }
+    };
+    unsafe { xdecref(old) };
+    true
+}
+
 pub fn set(o: &PyObject, i: usize, v: PyRef) {
     let old = {
         let _g = ob_lock(o);
@@ -268,17 +289,31 @@ pub fn splice(o: &PyObject, lo: usize, hi: usize, items: Vec<PyRef>) {
     }
 }
 
-/// Remove and return item `i` (must be in range).
-pub fn pop(o: &PyObject, i: usize) -> PyRef {
+/// Remove and return item `i` (negative counts from the end); `Err(len)` if out of
+/// range. The range check happens under the lock.
+pub fn pop_index(o: &PyObject, i: isize) -> Result<PyRef, usize> {
     let _g = ob_lock(o);
     unsafe {
         let l = lp(o);
         let n = (*l).ob_base.ob_size as usize;
+        let i = if i < 0 { i + n as isize } else { i };
+        if i < 0 || i as usize >= n {
+            return Err(n);
+        }
+        let i = i as usize;
         let arr = (*l).ob_item;
         let it = *arr.add(i);
         std::ptr::copy(arr.add(i + 1), arr.add(i), n - i - 1);
         resize_locked(o, n - 1);
-        PyRef::from_raw(it)
+        Ok(PyRef::from_raw(it))
+    }
+}
+
+/// Remove and return item `i`; out of range returns None.
+pub fn pop(o: &PyObject, i: usize) -> PyRef {
+    match pop_index(o, i as isize) {
+        Ok(v) => v,
+        Err(_) => none::none_ref(),
     }
 }
 
@@ -671,17 +706,13 @@ fn list_setitem(o: &PyObject, k: &PyObject, v: Option<&PyObject>) -> PyResult<()
     if !ab::has_index(k) {
         raise!(TypeError, "list indices must be integers or slices, not {}", tname(k));
     }
-    let mut i = ab::index_as_ssize(k, Some(exceptions::IndexError()))?;
-    let n = list_len(o) as isize;
-    if i < 0 {
-        i += n;
-    }
-    if i < 0 || i >= n {
+    let i = ab::index_as_ssize(k, Some(exceptions::IndexError()))?;
+    let ok = match v {
+        None => pop_index(o, i).is_ok(),
+        Some(v) => set_index(o, i, v.to_ref()),
+    };
+    if !ok {
         return Err(index_error("list assignment index out of range"));
-    }
-    match v {
-        None => drop(pop(o, i as usize)),
-        Some(v) => set(o, i as usize, v.to_ref()),
     }
     Ok(())
 }
@@ -691,14 +722,15 @@ unsafe extern "C" fn list_ass_subscript(o: *mut PyObject, k: *mut PyObject, v: *
 unsafe extern "C" fn list_ass_item(o: *mut PyObject, i: Py_ssize_t, v: *mut PyObject) -> c_int {
     unsafe {
         let o = &*o;
-        let n = list_len(o) as isize;
-        if i < 0 || i >= n {
-            return int_into_c(Err(index_error("list assignment index out of range")));
-        }
-        if v.is_null() {
-            drop(pop(o, i as usize));
+        let ok = if i < 0 {
+            false
+        } else if v.is_null() {
+            pop_index(o, i).is_ok()
         } else {
-            set(o, i as usize, (*v).to_ref());
+            set_index(o, i, (*v).to_ref())
+        };
+        if !ok {
+            return int_into_c(Err(index_error("list assignment index out of range")));
         }
         0
     }

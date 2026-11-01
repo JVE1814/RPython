@@ -21,21 +21,15 @@ fn extend_m(o: &PyObject, v: &PyObject) -> PyResult {
 }
 fn pop_m(o: &PyObject, args: &[&PyObject]) -> PyResult {
     crate::args::check_pos("pop", args, 0, 1)?;
-    let mut i = match args.first() {
+    let i = match args.first() {
         Some(a) => ab::index_as_ssize(a, Some(exceptions::IndexError()))?,
         None => -1,
     };
-    let n = list::list_len(o) as isize;
-    if n == 0 {
-        raise!(IndexError, "pop from empty list");
+    match list::pop_index(o, i) {
+        Ok(v) => Ok(v),
+        Err(0) => raise!(IndexError, "pop from empty list"),
+        Err(_) => raise!(IndexError, "pop index out of range"),
     }
-    if i < 0 {
-        i += n;
-    }
-    if i < 0 || i >= n {
-        raise!(IndexError, "pop index out of range");
-    }
-    Ok(list::pop(o, i as usize))
 }
 fn insert_m(o: &PyObject, args: &[&PyObject]) -> PyResult {
     crate::args::check_pos("insert", args, 2, 2)?;
