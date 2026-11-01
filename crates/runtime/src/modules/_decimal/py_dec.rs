@@ -292,7 +292,7 @@ fn tuple_to_dec(v: &PyObject) -> PyResult<Dec> {
     Ok(match kind {
         Kind::Inf => Dec::inf(neg),
         Kind::Finite => Dec::finite(neg, nat::from_digits(&digits), exp),
-        k => Dec { neg, kind: k, exp: 0, coef: nat::from_digits(&digits) },
+        k => Dec { neg, kind: k, exp: 0, coef: nat::from_digits(&digits).into() },
     })
 }
 
@@ -958,7 +958,7 @@ fn m_as_integer_ratio(o: &PyObject) -> PyResult {
     }
     // reduce c / 10^k by removing common factors of 2 and 5
     let k = (-(d.exp as i128)) as u64;
-    let mut c = d.coef.clone();
+    let mut c = d.coef.to_vec();
     let mut twos = 0u64;
     while twos < k && nat::rem_small(&c, 2) == 0 {
         // divide by the largest power of two available at once
