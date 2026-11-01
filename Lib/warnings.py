@@ -93,10 +93,6 @@ try:
 except ImportError:
     _use_c_warnings = False
 
-if _use_context and _warnings_context is None:
-    from _py_warnings import _make_context_var
-    _warnings_context = _make_context_var()
-    del _make_context_var
 
 _set_module(sys.modules[__name__])
 if not _use_c_warnings:
