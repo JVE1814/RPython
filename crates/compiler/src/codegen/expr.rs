@@ -5,6 +5,10 @@ use crate::assemble::F_MAY_STORE_NULL;
 use crate::ast::{BoolOp, Comprehension, ExprContext, Keyword, Operator, UnaryOp};
 use crate::symtable::CompKind;
 
+/// Displays and calls with more items than this are built incrementally so that the
+/// value stack stays small.
+const STACK_USE_GUIDELINE: usize = 30;
+
 pub(crate) fn binop(op: Operator) -> BinOp {
     match op {
         Operator::Add => BinOp::Add,
@@ -174,6 +178,34 @@ impl<'a> Compiler<'a> {
                 let jop = if *op == BoolOp::And { Op::JumpIfFalseOrPop } else { Op::JumpIfTrueOrPop };
                 let n = values.len();
                 for (i, v) in values.iter().enumerate() {
+                    // `a and b or c`: when `a` is falsy the `or` needs no second truth test
+                    // of it, so a nested boolop of the other kind exits straight to the
+                    // next operand.
+                    if i + 1 < n {
+                        if let ExprKind::BoolOp { op: inner_op, values: inner } = &v.node {
+                            if inner_op != op && inner.len() >= 2 {
+                                let next = self.new_label();
+                                let drop_value = self.new_label();
+                                let exit = if *inner_op == BoolOp::And { Op::PopJumpIfFalse } else { Op::PopJumpIfTrue };
+                                for w in &inner[..inner.len() - 1] {
+                                    self.compile_expr(w)?;
+                                    self.set_loc(v.loc);
+                                    self.emit(Op::Copy, 1);
+                                    self.emit(Op::ToBool, 0);
+                                    self.emit_jump(exit, drop_value);
+                                    self.emit(Op::PopTop, 0);
+                                }
+                                self.compile_expr(&inner[inner.len() - 1])?;
+                                self.set_loc(e.loc);
+                                self.emit_jump(jop, end);
+                                self.emit_jump_noloc(Op::Jump, next);
+                                self.use_label(drop_value);
+                                self.emit_noloc(Op::PopTop, 0);
+                                self.use_label(next);
+                                continue;
+                            }
+                        }
+                    }
                     self.compile_expr(v)?;
                     if i + 1 < n {
                         self.set_loc(e.loc);
@@ -523,6 +555,18 @@ impl<'a> Compiler<'a> {
     fn starunpack(&mut self, elts: &'a [Expr], build: Op, add: Op, extend: Op, tuple: bool) -> R {
         let n = elts.len();
         if !has_starred(elts) {
+            if n > STACK_USE_GUIDELINE && !elts.iter().all(is_const) {
+                // long displays are built one item at a time to bound the stack
+                self.emit(build, 0);
+                for x in elts {
+                    self.compile_expr(x)?;
+                    self.emit(add, 1);
+                }
+                if tuple {
+                    self.emit(Op::CallIntrinsic1, Intrinsic1::ListToTuple as u32);
+                }
+                return Ok(());
+            }
             if tuple {
                 if n > 0 && elts.iter().all(is_const) {
                     let v: Vec<Constant> = elts
@@ -594,6 +638,15 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_dict(&mut self, keys: &'a [Option<Expr>], values: &'a [Expr]) -> R {
+        if keys.len() > STACK_USE_GUIDELINE / 2 && keys.iter().all(|k| k.is_some()) {
+            self.emit(Op::BuildMap, 0);
+            for (k, v) in keys.iter().zip(values.iter()) {
+                self.compile_expr(k.as_ref().unwrap())?;
+                self.compile_expr(v)?;
+                self.emit(Op::MapAdd, 1);
+            }
+            return Ok(());
+        }
         let mut have_dict = false;
         let mut elements = 0u32;
         for (k, v) in keys.iter().zip(values.iter()) {
@@ -711,7 +764,7 @@ impl<'a> Compiler<'a> {
     fn compile_call(&mut self, e: &'a Expr, func: &'a Expr, args: &'a [Expr], keywords: &'a [Keyword]) -> R {
         self.validate_keywords(keywords)?;
         let simple = !has_starred(args) && keywords.iter().all(|k| k.arg.is_some());
-        if simple {
+        if simple && args.len() + keywords.len() <= STACK_USE_GUIDELINE {
             if let ExprKind::Attribute { value, attr, ctx: ExprContext::Load } = &func.node {
                 // method call
                 if self.try_super_attr(func, value, attr, true)?.is_none() {
@@ -746,7 +799,7 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_call_args(&mut self, e: &'a Expr, cloc: Loc, pushed: u32, args: &'a [Expr], keywords: &'a [Keyword]) -> R {
-        if has_starred(args) || keywords.iter().any(|k| k.arg.is_none()) {
+        if has_starred(args) || keywords.iter().any(|k| k.arg.is_none()) || args.len() + keywords.len() > STACK_USE_GUIDELINE {
             return self.compile_call_ex(e, pushed, args, keywords, false);
         }
         for a in args {
@@ -879,6 +932,20 @@ impl<'a> Compiler<'a> {
                     let start = i;
                     while i < keywords.len() && keywords[i].arg.is_some() {
                         i += 1;
+                    }
+                    if i - start > STACK_USE_GUIDELINE / 2 {
+                        // many keywords: grow the dict one item at a time
+                        self.u().loc = l;
+                        if !have_dict {
+                            self.emit(Op::BuildMap, 0);
+                        }
+                        for k in &keywords[start..i] {
+                            self.load_const(str_const(k.arg.as_ref().unwrap()));
+                            self.compile_expr(&k.value)?;
+                            self.emit(Op::MapAdd, 1);
+                        }
+                        have_dict = true;
+                        continue;
                     }
                     for k in &keywords[start..i] {
                         self.load_const(str_const(k.arg.as_ref().unwrap()));
@@ -1048,7 +1115,7 @@ impl<'a> Compiler<'a> {
             self.emit(Op::GetIter, 0);
         }
         // isolate names bound in the comprehension
-        let mut ctx = CompCtx { scope: sid, slots: HashMap::new() };
+        let mut ctx = CompCtx { scope: sid, slots: HashMap::new(), has_setup: false };
         let mut pushed: Vec<CompSlot> = Vec::new();
         let syms: Vec<(String, u32, SymScope)> =
             self.st.scopes[sid].symbols.iter().map(|s| (s.name.clone(), s.flags, s.scope)).collect();
@@ -1070,6 +1137,8 @@ impl<'a> Compiler<'a> {
         let cleanup = self.new_label();
         let end = self.new_label();
         if !pushed.is_empty() {
+            self.check_block_limit(21, e.loc)?;
+            ctx.has_setup = true;
             self.emit(Op::Swap, pushed.len() as u32 + 1);
             self.emit_pseudo(IOp::SetupFinally, cleanup);
         }

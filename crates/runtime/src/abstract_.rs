@@ -247,6 +247,12 @@ pub fn call_with_kwargs_dict(callable: &PyObject, args: &[&PyObject], kw: Option
             let mut names = Vec::with_capacity(items.len());
             for (key, _) in items.iter() {
                 if !pystr::is_str(key) {
+                    // non-str keys: only tp_call (which receives the dict itself) can
+                    // decide; Python functions reject them there
+                    if callable.ty().tp_call.is_some() && callable.ty().tp_call != Some(vectorcall_call) {
+                        let t = tuple::new_tuple(args.iter().map(|a| a.to_ref()).collect());
+                        return call_tp_call(callable, &t, Some(k));
+                    }
                     raise!(TypeError, "keywords must be strings");
                 }
                 names.push(key.clone());
