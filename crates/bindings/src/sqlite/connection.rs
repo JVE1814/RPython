@@ -471,6 +471,8 @@ fn conn_init_impl(o: &PyObject, a: &fc::VcArgs) -> PyResult<()> {
     c.thread_ident = current_thread();
     c.cache_size = cache_size;
     c.cache.clear();
+    c.row_factory = none();
+    c.text_factory = rpy_runtime::types::typeobject::type_ref(rpy_runtime::types::str::str_type());
     c.initialized = true;
     if autocommit == 0 {
         exec_simple(c, "BEGIN")?;
@@ -522,6 +524,13 @@ pub fn weak_get(w: &PyObject) -> PyResult<Option<PyRef>> {
     Ok(if is_none(&r) { None } else { Some(r) })
 }
 
+unsafe extern "C" fn conn_dealloc(o: *mut PyObject) {
+    unsafe {
+        conn_finalize(o);
+        fc::robj_dealloc::<Conn>(o);
+    }
+}
+
 unsafe extern "C" fn conn_finalize(o: *mut PyObject) {
     unsafe {
         let c = conn(&*o);
@@ -535,6 +544,10 @@ unsafe extern "C" fn conn_finalize(o: *mut PyObject) {
             if let Some(e) = exc {
                 rpy_runtime::errors::set_exc(e);
             }
+            c.cache.clear();
+            let db = c.db;
+            c.db = std::ptr::null_mut();
+            sq!(sqlite3_close_v2(db));
         }
     }
 }
@@ -872,10 +885,10 @@ fn m_call(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
     if kw.map_or(false, |k| tuple::tuple_len(k) > 0) {
         raise!(TypeError, "Connection() takes no keyword arguments");
     }
+    let c = checked(o)?;
     if args.len() != 1 {
         raise!(TypeError, "Connection() takes exactly 1 argument ({} given)", args.len());
     }
-    let c = checked(o)?;
     prepare(c, args[0])
 }
 
@@ -1012,6 +1025,7 @@ pub fn init_type() -> PyResult<()> {
         (*t).tp_init = Some(conn_init);
         (*t).tp_call = Some(conn_call);
         (*t).tp_finalize = Some(conn_finalize);
+        (*t).tp_dealloc = Some(conn_dealloc);
         (*t).tp_doc = c"SQLite database connection object.".as_ptr();
         (*t).tp_methods = rpy_runtime::mdefs![
             ("cursor", FASTKW, m_cursor, "Return a cursor for the connection."),

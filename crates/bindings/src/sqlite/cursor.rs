@@ -122,6 +122,9 @@ unsafe extern "C" fn cur_init(o: *mut PyObject, args: *mut PyObject, kw: *mut Py
                 raise!(TypeError, "Cursor() argument 1 must be sqlite3.Connection, not {}", tname(a[0]));
             }
             let c = cur(&*o);
+            if c.locked {
+                return Err(programming_error("Recursive use of cursors not allowed."));
+            }
             c.connection = Some(a[0].to_ref());
             c.arraysize = 1;
             c.rowcount = -1;
@@ -446,11 +449,11 @@ fn execute_locked(_o: &PyObject, c: &mut Cur, sql: &PyObject, params: Option<&Py
 pub fn executescript_impl(o: &PyObject, script: &PyObject) -> PyResult<()> {
     let c = check_cursor(o)?;
     if !is_str(script) {
-        raise!(ValueError, "script argument must be unicode.");
+        raise!(TypeError, "executescript() argument must be str, not {}", tname(script));
     }
     let sql = utf8_bytes(script)?;
     if sql.contains(&0) {
-        return Err(programming_error("the query contains a null character"));
+        raise!(ValueError, "embedded null character");
     }
     let conn_obj = c.connection.clone().unwrap();
     let cn = conn(&conn_obj);
@@ -512,7 +515,8 @@ fn column_value(c: &Cur, cn: &connection::Conn, st: *mut Stmt, i: c_int) -> PyRe
             let p = sq!(sqlite3_column_blob(st, i));
             let n = sq!(sqlite3_column_bytes(st, i));
             let b = if p.is_null() {
-                rpy_runtime::types::bytes::new_bytes(&[])
+                // zero-sized values are not passed to converters
+                return Ok(none());
             } else {
                 rpy_runtime::types::bytes::new_bytes(unsafe { std::slice::from_raw_parts(p as *const u8, n as usize) })
             };
@@ -586,9 +590,17 @@ fn next_row(o: &PyObject) -> PyResult<Option<PyRef>> {
     let cn = conn(&conn_obj);
     let n = sq!(sqlite3_data_count(st));
     let mut vals = Vec::with_capacity(n as usize);
+    c.locked = true;
     for i in 0..n {
-        vals.push(column_value(c, cn, st, i)?);
+        match column_value(c, cn, st, i) {
+            Ok(v) => vals.push(v),
+            Err(e) => {
+                c.locked = false;
+                return Err(e);
+            }
+        }
     }
+    c.locked = false;
     let row = tuple::new_tuple(vals);
     // advance
     let rc = step(st);
@@ -731,11 +743,25 @@ fn g_arraysize(o: &PyObject) -> PyResult {
 fn s_arraysize(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     let v = match v {
         Some(v) => v,
-        None => raise!(AttributeError, "cannot delete attribute"),
+        None => raise!(AttributeError, "arraysize cannot be deleted"),
     };
-    let n = unsafe { capi::PyLong_AsInt(v.as_ptr()) };
-    if n == -1 && err_occurred() {
-        return Err(PyErr);
+    if !rpy_runtime::types::int::is_int(v) {
+        raise!(TypeError, "'{}' object cannot be interpreted as an integer", tname(v));
+    }
+    let n = match rpy_runtime::types::int::as_i64(v) {
+        Some(n) => n,
+        None => {
+            if rpy_runtime::types::int::sign(v) < 0 {
+                raise!(ValueError, "arraysize must be >= 0");
+            }
+            raise!(OverflowError, "arraysize is too large");
+        }
+    };
+    if n < 0 {
+        raise!(ValueError, "arraysize must be >= 0");
+    }
+    if n > u32::MAX as i64 {
+        raise!(OverflowError, "arraysize is too large");
     }
     cur(o).arraysize = n as isize;
     Ok(())
@@ -828,7 +854,7 @@ fn row_subscript_impl(o: &PyObject, key: &PyObject) -> PyResult {
                 return Ok(tuple::tuple_get(&data, idx).to_ref());
             }
         }
-        raise!(IndexError, "No item with that key");
+        raise!(IndexError, "No item with that key: {}", crate::ctypes::repr(key)?);
     }
     if unsafe { key.type_ptr() == &raw mut rpy_runtime::types::slice::PySlice_Type } {
         return rpy_runtime::abstract_::getitem(&data, key);

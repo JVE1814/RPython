@@ -284,6 +284,9 @@ fn subscript(o: &PyObject, key: &PyObject) -> PyResult {
         if n <= 0 {
             return Ok(rpy_runtime::types::bytes::new_bytes(&[]));
         }
+        if step < 0 {
+            raise!(ValueError, "step must be positive for non-empty blob slices");
+        }
         if step == 1 {
             let d = read_at(b, start, n)?;
             return Ok(rpy_runtime::types::bytes::new_bytes(&d));
@@ -323,6 +326,9 @@ fn ass_subscript(o: &PyObject, key: &PyObject, v: Option<&PyObject>) -> PyResult
         };
         let (start, step, n) = slice_info(key, len)?;
         let data = buffer_bytes(v)?;
+        if step < 0 && n > 0 {
+            raise!(ValueError, "step must be positive for non-empty blob slices");
+        }
         if data.len() as i64 != n.max(0) {
             raise!(IndexError, "Blob slice assignment is wrong size");
         }
