@@ -1291,7 +1291,7 @@ pub fn init_types() {
             ("__reduce__", NOARGS, object_reduce, "Helper for pickle."),
             ("__getstate__", NOARGS, object_getstate, "Helper for pickle."),
             ("__subclasshook__", FAST, object_subclasshook, "Abstract classes can override this to customize issubclass().\n\nThis is invoked early on by abc.ABCMeta.__subclasscheck__().\nIt should return True, False or NotImplemented.  If it returns\nNotImplemented, the normal algorithm is used.  Otherwise, it\noverrides the normal algorithm (and the outcome is cached).\n"; METH_CLASS),
-            ("__init_subclass__", FASTKW, object_init_subclass, "This method is called when a class is subclassed.\n\nThe default implementation does nothing. It may be\noverridden to extend subclasses.\n"; METH_CLASS),
+            ("__init_subclass__", FASTKW, object_init_subclass, "__init_subclass__($cls, /)\n--\n\nThis method is called when a class is subclassed.\n\nThe default implementation does nothing. It may be\noverridden to extend subclasses.\n"; METH_CLASS),
             ("__format__", O, object_format, "Default object formatter.\n\nReturn str(self) if format_spec is empty. Raise TypeError otherwise."),
             ("__sizeof__", NOARGS, object_sizeof, "Size of object in memory, in bytes."),
             ("__dir__", NOARGS, object_dir, "Default dir() implementation."),
@@ -1343,7 +1343,7 @@ pub fn init_types() {
             ("__dictoffset__", type_dictoffset),
         ];
         t.tp_methods = crate::mdefs![
-            ("mro", NOARGS, type_mro_method, "Return a type's method resolution order."),
+            ("mro", NOARGS, type_mro_method, "mro($self, /)\n--\n\nReturn a type's method resolution order."),
             ("__subclasses__", NOARGS, type_subclasses_method, "Return a list of immediate subclasses."),
             ("__prepare__", FASTKW, type_prepare, "__prepare__($cls, name, bases, /, **kwds)\n--\n\nCreate the namespace for the class statement"; METH_CLASS),
             ("__instancecheck__", O, type_instancecheck, "Check if an object is an instance."),

@@ -4,8 +4,11 @@
 
 pub mod dl;
 pub mod dbm;
+pub mod input;
+pub mod readline;
 
 pub fn register() {
     crate::import::register_builtin("_gdbm", dbm::init_gdbm);
     crate::import::register_builtin("_dbm", dbm::init_ndbm);
+    crate::import::register_builtin("readline", readline::init);
 }
