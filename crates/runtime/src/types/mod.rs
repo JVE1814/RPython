@@ -92,6 +92,7 @@ pub fn init_all() -> crate::errors::PyResult<()> {
     super_::init_types();
     dictview::init_types();
     bootstrap_builtins::init_types();
+    frameobject_proxy::init_types();
     use typeobject::type_ready;
     type_ready(typeobject::object_type())?;
     type_ready(typeobject::type_type())?;
@@ -140,6 +141,7 @@ pub fn init_all() -> crate::errors::PyResult<()> {
     exceptions::ready_all()?;
     dictview::ready()?;
     bootstrap_builtins::ready()?;
+    type_ready(frameobject_proxy::proxy_type())?;
     Ok(())
 }
 pub mod complex_pow;
