@@ -23,7 +23,10 @@ pub struct ParseOptions {
     dont_imply_dedent /*PyCF_DONT_IMPLY_DEDENT*/, hooks: UnicodeHooks,
     filename: String /*only for "Non-UTF-8 code ... in file X"*/,
     decode: Option<tokenizer::DecodeHook> /*codec fallback for parse_bytes*/,
+    max_stack_bytes: usize /*default 256 KiB of caller stack*/, grow_stack: bool /*default true*/,
+    int_max_str_digits: usize /*sys.get_int_max_str_digits(); default 4300, 0 = unlimited*/,
 }
+impl ParseOptions { pub fn new(mode: Mode) -> ParseOptions }   // and Default
 
 pub struct SyntaxError { kind: ErrorKind /*Syntax|Indentation|Tab|IncompleteInput|MemoryError|RecursionError*/, msg,
     lineno, col_offset /*0-based UTF-8 byte*/, end_lineno: Option, end_col_offset: Option,
@@ -126,6 +129,7 @@ pub struct Warning { category /*SyntaxWarning|DeprecationWarning*/, msg,
 | `tokenize.rs` | every constant `check_tokenize` in test_tokenize.py (tokenize + C tokenizer streams) | 182/182 |
 | `type_comments.rs` | port of test_type_comments.py incl. feature_version | pass |
 | `codeop.rs` | av/ai lists of test_codeop.py with `_maybe_compile` emulation | 174/174 |
+| `misc.rs` | test_compile lists (leading zeros, None, imports), int max str digits, 200 nested brackets, recursion limits (RecursionError / MemoryError "too complex"), class table | pass |
 
 ### Files expected not to parse (`EXPECTED_INVALID` in tests/parse_all.rs)
 
@@ -170,10 +174,14 @@ duplicate keys), "'elif' ..." is parser-level (done). Also "invalid syntax. Did 
   positional-only parameters (8), match (10), except* (11), type parameters/`type` (12).
   Other version-dependent behaviour (e.g. PEP 701 f-string rules for < 3.12) is not emulated.
 * The tokenize-module stream is produced from the full source (no incremental readline).
-* Recursion/stack safety: the recursive descent is bounded by a stack budget
-  (`ParseOptions.max_stack_bytes`, default 1 MiB, checked against the real stack pointer) and
-  6000 levels, raising `ErrorKind::MemoryError` "Parser stack overflowed - Python source too
-  complex to parse" (CPython: MemoryError). Constructs parsed iteratively but producing deep
+* Recursion/stack safety: nesting is limited to 6000 recursion levels (like CPython's
+  MAXSTACK), raising `ErrorKind::MemoryError` "Parser stack overflowed - Python source too
+  complex to parse" (CPython: MemoryError). The parser uses at most
+  `ParseOptions.max_stack_bytes` (default 256 KiB, measured with the real stack pointer) of the
+  caller's stack; deeper recursion transparently continues on scoped helper threads with 16 MiB
+  stacks (`grow_stack`, default on), so e.g. 200 nested brackets (~5 KB of stack per level)
+  parse fine even on small thread stacks. UnicodeHooks may therefore be called from a helper
+  thread. Constructs parsed iteratively but producing deep
   ASTs (trailer chains `a()()()...`, binary-operator chains, `elif` chains) are limited to 5000
   and raise `ErrorKind::RecursionError` "maximum recursion depth exceeded during compilation"
   (CPython raises RecursionError for these in ast2obj/the compiler). Brackets: 200 (tokenizer).

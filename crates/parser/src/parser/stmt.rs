@@ -29,18 +29,51 @@ impl<'a> Parser<'a> {
         let mut v = Vec::new();
         loop {
             let m = self.p;
-            match self.statement()? {
-                Some(mut s) => v.append(&mut s),
-                None => {
-                    self.p = m;
-                    break;
-                }
+            if !self.statement_into(&mut v)? {
+                self.p = m;
+                break;
             }
         }
         if v.is_empty() {
             return Ok(None);
         }
         Ok(Some(v))
+    }
+
+    /// statement, appending to `out` (avoids a Vec per statement line).
+    pub(crate) fn statement_into(&mut self, out: &mut Vec<Stmt>) -> Result<bool, PErr> {
+        let m = self.p;
+        if let Some(s) = self.compound_stmt()? {
+            out.push(s);
+            return Ok(true);
+        }
+        self.p = m;
+        self.simple_stmts_into(out)
+    }
+
+    /// simple_stmts, appending to `out`.
+    pub(crate) fn simple_stmts_into(&mut self, out: &mut Vec<Stmt>) -> Result<bool, PErr> {
+        let start = self.p;
+        let n = out.len();
+        let Some(s) = self.simple_stmt()? else { return Ok(false) };
+        out.push(s);
+        while self.at(T::SEMI) {
+            self.advance();
+            let m = self.p;
+            match self.simple_stmt()? {
+                Some(s) => out.push(s),
+                None => {
+                    self.p = m;
+                    break;
+                }
+            }
+        }
+        if self.eat(T::NEWLINE).is_none() {
+            self.p = start;
+            out.truncate(n);
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// statement: compound_stmt | simple_stmts
@@ -644,9 +677,7 @@ impl<'a> Parser<'a> {
                 self.p = start;
                 return Ok(None);
             }
-            self.enter()?;
-            let r = self.statements();
-            self.leave();
+            let r = self.recurse(|p| p.statements());
             let Some(body) = r? else {
                 self.p = start;
                 return Ok(None);
