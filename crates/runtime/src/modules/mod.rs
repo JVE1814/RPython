@@ -111,7 +111,6 @@ pub fn register_all() {
     crate::import::register_builtin("_json", _json::init_module);
     compress_common::register();
     _decimal::register();
-    crate::import::register_builtin("_expat_engine", pyexpat::init);
     crate::import::register_builtin("pyexpat", pyexpat::xmlparser::init);
     crate::import::register_builtin("_elementtree", _elementtree::init);
     crate::import::register_builtin("_pickle", _pickle::init_module);

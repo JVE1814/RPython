@@ -18,6 +18,26 @@ use crate::types::typeobject::{type_obj, type_ref};
 use crate::types::{bool_, dict, int, list, none, str as pystr, tuple};
 use crate::mdefs;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+
+/// FNV-1a: names are short and come from one document, so a simple hash
+/// beats the default DoS-resistant one.
+#[derive(Default)]
+struct Fnv(u64);
+impl Hasher for Fnv {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = if self.0 == 0 { 0xcbf2_9ce4_8422_2325 } else { self.0 };
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        self.0 = h;
+    }
+}
+type NameHash = BuildHasherDefault<Fnv>;
 use std::ffi::c_int;
 use std::sync::Mutex;
 
@@ -1388,7 +1408,7 @@ pub struct EtParser {
     handlers: [Option<PyRef>; 9],
     /// the target is exactly our TreeBuilder: build directly
     fast: bool,
-    names: HashMap<String, PyRef>,
+    names: HashMap<String, PyRef, NameHash>,
     text: String,
     events_append: Option<PyRef>,
     event_names: [Option<PyRef>; 6],
@@ -1422,7 +1442,7 @@ fn blank_parser() -> EtParser {
         entity: None,
         handlers: Default::default(),
         fast: false,
-        names: HashMap::new(),
+        names: HashMap::default(),
         text: String::new(),
         events_append: None,
         event_names: Default::default(),
@@ -1731,7 +1751,8 @@ fn dispatch(o: &PyObject, events: Vec<Event>) -> PyResult<Option<String>> {
                 };
                 emit_event(o, EV_PI, &res)?;
             }
-            Ev::StartDoctype { name, sysid, pubid, .. } => {
+            Ev::StartDoctype(boxed) => {
+            let crate::modules::pyexpat::engine::StartDoctypeEv { name, sysid, pubid, .. } = *boxed;
                 let h = xp(o).handlers[T_DOCTYPE].clone();
                 if let Some(h) = h {
                     ab::call(&h, &[&pystr::new_str(&name), &opt_s(&pubid), &opt_s(&sysid)])?;
@@ -1753,7 +1774,11 @@ fn dispatch(o: &PyObject, events: Vec<Event>) -> PyResult<Option<String>> {
                     entity_ref(o, &name, ev.line, ev.col)?;
                 }
             }
-            Ev::ExternalEntityRef { context: Some(c), .. } => entity_ref(o, &c, ev.line, ev.col)?,
+            Ev::ExternalEntityRef(r) => {
+                if let Some(c) = &r.context {
+                    entity_ref(o, c, ev.line, ev.col)?;
+                }
+            }
             _ => {}
         }
     }
