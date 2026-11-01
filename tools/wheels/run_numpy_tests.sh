@@ -14,6 +14,9 @@
 #   -B          also run the suite on /opt/baseline/py-ft (baseline CPython, free-threaded)
 #   -k          reuse an existing snapshot/venv in OUT (skip snapshot + install)
 #   -T SECS     timeout for one pytest run (default 14400)
+#   -m KB       virtual-memory limit (ulimit -v) for the test runs (default 8000000): numpy has
+#               tests that allocate many GB and expect MemoryError; without a limit the
+#               kernel's OOM killer ends the whole run instead
 # Results: OUT/ours/pytest.log, OUT/ours/junit.xml, OUT/ours/failed.txt (and OUT/baseline/...),
 # OUT/only_ours.txt = failures/errors that do not happen on the baseline.
 set -u
@@ -27,8 +30,9 @@ TESTPKG=numpy
 BASELINE=0
 REUSE=0
 TMO=14400
+MEMKB=8000000
 BASEPY=/opt/baseline/py-ft/bin/python3
-while getopts "b:o:w:p:t:BkT:" opt; do
+while getopts "b:o:w:p:t:BkT:m:" opt; do
     case $opt in
         b) BIN="$OPTARG" ;;
         o) OUT="$OPTARG" ;;
@@ -38,7 +42,8 @@ while getopts "b:o:w:p:t:BkT:" opt; do
         B) BASELINE=1 ;;
         k) REUSE=1 ;;
         T) TMO="$OPTARG" ;;
-        *) sed -n '2,22p' "$0"; exit 2 ;;
+        m) MEMKB="$OPTARG" ;;
+        *) sed -n '2,25p' "$0"; exit 2 ;;
     esac
 done
 shift $((OPTIND - 1))
@@ -60,7 +65,8 @@ run_suite() {
     echo "== $name: pytest --pyargs $TESTPKG"
     local start=$SECONDS
     # run from an empty directory so that nothing local shadows the installed package
-    (cd "$dir" && timeout "$TMO" "$py" -m pytest --pyargs "$TESTPKG" -q -p no:cacheprovider -rfE \
+    # -v: the log names the running test if the process dies
+    (cd "$dir" && ulimit -v "$MEMKB" && timeout "$TMO" "$py" -m pytest --pyargs "$TESTPKG" -v -p no:cacheprovider -rfE \
         --continue-on-collection-errors --junitxml="$dir/junit.xml" "$@" > "$dir/pytest.log" 2>&1)
     local rc=$?
     echo "$rc" > "$dir/exit_code"

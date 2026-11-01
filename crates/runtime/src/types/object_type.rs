@@ -388,8 +388,17 @@ pub unsafe extern "C" fn type_vectorcall(
             let t = tuple::new_tuple_from_ptrs(all);
             return type_call(callable, t.as_ptr(), std::ptr::null_mut());
         }
-        crate::abstract_::vectorcall_call(callable, std::ptr::null_mut(), std::ptr::null_mut());
-        std::ptr::null_mut()
+        // keyword arguments: tuple + dict through tp_call
+        let nkw = tuple::tuple_len(&*kwnames);
+        let all = std::slice::from_raw_parts(args, nargs + nkw);
+        let t = tuple::new_tuple_from_ptrs(&all[..nargs]);
+        let d = dict::new_dict();
+        for i in 0..nkw {
+            if dict::set_item(&d, tuple::tuple_get(&*kwnames, i), &*all[nargs + i]).is_err() {
+                return std::ptr::null_mut();
+            }
+        }
+        type_call(callable, t.as_ptr(), d.as_ptr())
     }
 }
 
@@ -1316,6 +1325,9 @@ pub fn init_types() {
         t.tp_alloc = Some(generic_alloc);
         t.tp_free = Some(generic_free);
         t.tp_vectorcall = Some(type_vectorcall);
+        // Py_TPFLAGS_HAVE_VECTORCALL on `type` means: a class object's vectorcall entry is its
+        // own tp_vectorcall field (NULL = use tp_call). C code reads it through this offset.
+        t.tp_vectorcall_offset = std::mem::offset_of!(PyTypeObject, tp_vectorcall) as isize;
         t.tp_weaklistoffset = std::mem::offset_of!(PyTypeObject, tp_weaklist) as isize;
         t.tp_dictoffset = std::mem::offset_of!(PyTypeObject, tp_dict) as isize;
         let n = &mut *(&raw mut TYPE_AS_NUMBER);
