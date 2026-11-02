@@ -13,7 +13,8 @@
 //!       co_localspluskinds bytes (one CO_FAST_* byte per name)
 //!       co_filename co_name co_qualname   str
 //!       co_firstlineno  int32
-//!       co_linetable    bytes: per instruction lineno, end_lineno, col, end_col (u32 LE)
+//!       co_linetable    bytes: source positions, location-table format (types/code.rs;
+//!                       the older 16-bytes-per-instruction form is still accepted)
 //!       co_exceptiontable bytes: per entry start, end, target, depth, lasti (u32 LE)
 
 use crate::abstract_ as ab;
@@ -54,6 +55,10 @@ const TYPE_TUPLE: u8 = b'(';
 const TYPE_LIST: u8 = b'[';
 const TYPE_DICT: u8 = b'{';
 const TYPE_CODE: u8 = b'c';
+/// Version of the code-object payload layout; part of the pyc magic (`_imp::MAGIC`) so
+/// that caches written by a build with another layout are recompiled, not misread.
+/// 2: location-table line tables (perf2).
+pub const CODE_FORMAT: u32 = 2;
 const TYPE_UNICODE: u8 = b'u';
 const TYPE_UNKNOWN: u8 = b'?';
 const TYPE_SET: u8 = b'<';
@@ -720,10 +725,11 @@ impl<'a> Reader<'a> {
                     self.byte()? as usize
                 };
                 let b = self.read(n)?;
-                let mut s = pystr::from_latin1(&b);
-                if ty == TYPE_ASCII_INTERNED || ty == TYPE_SHORT_ASCII_INTERNED {
-                    s = pystr::intern(s);
-                }
+                let s = if ty == TYPE_ASCII_INTERNED || ty == TYPE_SHORT_ASCII_INTERNED {
+                    pystr::intern_latin1(&b)
+                } else {
+                    pystr::from_latin1(&b)
+                };
                 self.set_ref(flag, s)
             }
             TYPE_UNICODE | TYPE_INTERNED => {
@@ -1013,21 +1019,18 @@ fn build_code(p: CodeParts) -> PyResult<PyRef> {
     if kinds.len() != lpnames {
         return Err(invalid());
     }
-    let lt = bytes::bytes_data(p.linetable);
-    if lt.len() != words.len() * 16 {
-        return Err(invalid());
-    }
     let strip_cols = no_debug_ranges_cached();
-    let locations: Vec<Location> = u32s(lt)
-        .chunks_exact(4)
-        .map(|c| {
-            if strip_cols {
-                Location { lineno: c[0], end_lineno: c[1], col: u32::MAX, end_col: u32::MAX }
-            } else {
-                Location { lineno: c[0], end_lineno: c[1], col: c[2], end_col: c[3] }
+    // compact table (current format) or the older fixed-width one
+    let lines = match code_mod::LineTable::from_bytes(p.linetable.to_ref(), words.len(), p.firstlineno as u32, strip_cols) {
+        Some(t) => t,
+        None => {
+            let lt = bytes::bytes_data(p.linetable);
+            if lt.len() != words.len() * 16 {
+                return Err(invalid());
             }
-        })
-        .collect();
+            code_mod::LineTable::from_locations(&code_mod::lines_from_fixed(lt), p.firstlineno as u32, strip_cols)
+        }
+    };
     let et = bytes::bytes_data(p.exctable);
     if et.len() % 20 != 0 {
         return Err(invalid());
@@ -1042,14 +1045,20 @@ fn build_code(p: CodeParts) -> PyResult<PyRef> {
     }
     let _ = (names, lpnames);
     // Build directly from the unmarshalled objects (constants keep their identity,
-    // names are interned in place: no round trip through Rust strings).
-    let intern_all = |t: &PyObject| -> Vec<PyRef> {
-        tuple::tuple_items(t)
-            .iter()
-            .map(|n| if pystr::is_str_exact(n) { pystr::intern(n.to_ref()) } else { pystr::intern_str(&pystr::to_string_lossy(n)) })
-            .collect()
+    // names are interned in place: no round trip through Rust strings). A names tuple
+    // whose items are all interned already is shared as is.
+    let interned = |t: &PyObject| -> PyRef {
+        if tuple::is_tuple_exact(t) && tuple::tuple_items(t).iter().all(|n| pystr::is_interned(n)) {
+            return t.to_ref();
+        }
+        tuple::new_tuple(
+            tuple::tuple_items(t)
+                .iter()
+                .map(|n| if pystr::is_str_exact(n) { pystr::intern(n.to_ref()) } else { pystr::intern_str(&pystr::to_string_lossy(n)) })
+                .collect(),
+        )
     };
-    let consts = if tuple::is_tuple_exact(p.consts) { p.consts.to_ref() } else { ab::sequence_tuple(p.consts)? };
+    let consts = if tuple::is_tuple_exact(p.consts) { p.consts.to_ref() } else { tuple::new_tuple(tuple::tuple_to_vec(p.consts)) };
     let intern1 = |s: &PyObject| if pystr::is_str_exact(s) { pystr::intern(s.to_ref()) } else { pystr::intern_str(&pystr::to_string_lossy(s)) };
     code_mod::new_code_from_parts(code_mod::CodeParts {
         argcount: p.argcount as u32,
@@ -1059,13 +1068,14 @@ fn build_code(p: CodeParts) -> PyResult<PyRef> {
         stacksize: p.stacksize as u32,
         firstlineno: p.firstlineno as u32,
         code: words,
-        locations,
+        lines: code_mod::Lines::Encoded(lines),
         exception_table,
+        exctable_raw: if bytes::is_bytes_exact(p.exctable) { Some(p.exctable.to_ref()) } else { None },
         kinds,
         filename: p.filename.to_ref(),
-        consts: tuple::tuple_to_vec(&consts),
-        names: intern_all(p.names),
-        localsplusnames: intern_all(p.lpnames),
+        consts,
+        names: interned(p.names),
+        localsplusnames: interned(p.lpnames),
         name: intern1(p.name),
         qualname: intern1(p.qualname),
     })

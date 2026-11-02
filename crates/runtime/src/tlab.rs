@@ -1,33 +1,54 @@
 //! Small-object allocator (HotSpot TLAB / tcmalloc style).
 //!
 //! * Memory comes from 4 MiB segments (mmap), split into 64 KiB pages.
-//! * Each page serves one size class; the page header (first 64 bytes) records it,
-//!   so `free` needs only the pointer (page = ptr & !(PAGE-1)).
-//! * Each thread keeps a free list per size class (no atomics on the fast path).
-//!   Frees from any thread go to the freeing thread's cache (blocks are
+//! * Each page serves one size class of one *kind*; the page header (first 64 bytes)
+//!   records both, so `free` needs only the pointer (page = ptr & !(PAGE-1)).
+//!   Kinds (perf2): 0 = everything that is not a GC object (also table storage and
+//!   PyObject_Malloc memory), 1 = GC objects without a pre-header, 2 = GC objects
+//!   with the 16-byte managed dict/weakref pre-header. Keeping GC objects on pages of
+//!   their own, with the object at a fixed offset in each block, lets the cycle
+//!   collector find every GC object by walking those pages ([`for_each_gc_block`]),
+//!   so GC objects need no list links.
+//! * Each thread keeps a free list per (kind, size class) (no atomics on the fast
+//!   path). Frees from any thread go to the freeing thread's cache (blocks are
 //!   interchangeable). Overfull caches spill batches to a global depot; empty caches
-//!   refill from it, and only then carve fresh pages.
+//!   refill from it, and only then carve fresh blocks. Pages are carved lazily, a few
+//!   KiB at a time (untouched memory stays unmapped), and the page header records the
+//!   carved extent for heap walks.
 //! * Blocks larger than the biggest class are served by the system allocator.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering::*};
 
 pub const PAGE: usize = 64 * 1024;
 const SEGMENT: usize = 4 * 1024 * 1024;
 const HEADER: usize = 64;
 const MAGIC: u32 = 0x5250_5947; // "RPYG"
 
-pub const CLASSES: [usize; 24] = [
-    16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 288, 320, 384, 448, 512, 640, 768, 896, 1024, 2048,
+/// Block sizes. The 8-byte steps below 96 are used by GC objects only (instances with
+/// inline attributes, tuples, lists): other allocations are rounded to 16 bytes, which
+/// PyObject_Malloc callers may rely on for alignment.
+pub const CLASSES: [usize; 28] = [
+    16, 32, 40, 48, 56, 64, 72, 80, 88, 96, 112, 128, 144, 160, 176, 192, 224, 256, 288, 320, 384, 448, 512, 640, 768, 896, 1024, 2048,
 ];
 pub const MAX_SMALL: usize = 2048;
 const NCLASSES: usize = CLASSES.len();
+/// Allocation kinds (see the module docs).
+pub const KIND_RAW: usize = 0;
+pub const KIND_GC: usize = 1;
+pub const KIND_GC_MANAGED: usize = 2;
+const NKINDS: usize = 3;
+/// Free lists: one per (kind, class); index `kind * NCLASSES + class`.
+const NSLOTS: usize = NKINDS * NCLASSES;
+/// Pre-header bytes in front of the object in a block of each kind.
+const KIND_PRE: [usize; NKINDS] = [0, 0, 16];
 
-/// size -> class index lookup for sizes up to 2048 in 16-byte steps.
-static CLASS_OF: [u8; MAX_SMALL / 16 + 1] = {
-    let mut t = [0u8; MAX_SMALL / 16 + 1];
+/// size -> class index lookup for sizes up to 2048 in 8-byte steps.
+static CLASS_OF: [u8; MAX_SMALL / 8 + 1] = {
+    let mut t = [0u8; MAX_SMALL / 8 + 1];
     let mut i = 0;
-    while i <= MAX_SMALL / 16 {
-        let size = i * 16;
+    while i <= MAX_SMALL / 8 {
+        let size = i * 8;
         let mut c = 0;
         while CLASSES[c] < size {
             c += 1;
@@ -41,8 +62,13 @@ static CLASS_OF: [u8; MAX_SMALL / 16 + 1] = {
 #[repr(C)]
 struct PageHeader {
     magic: u32,
+    /// Free-list slot: `kind * NCLASSES + class` (read by JIT code as the class).
     class: u32,
     block: usize,
+    /// Address of the first block.
+    first: usize,
+    /// End of the carved part (blocks at or beyond it were never handed out).
+    carved: AtomicUsize,
 }
 
 #[inline(always)]
@@ -50,20 +76,43 @@ pub fn class_for(size: usize) -> Option<usize> {
     if size > MAX_SMALL {
         return None;
     }
-    Some(CLASS_OF[(size + 15) / 16] as usize)
+    Some(CLASS_OF[((size + 15) & !15) / 8] as usize)
 }
 
 struct Depot {
-    /// batches of free blocks per class
+    /// batches of free blocks per slot
     batches: Vec<Vec<Vec<usize>>>,
+    /// Uncarved block ranges `(next, end)` handed back by exiting threads, per slot.
+    partial: Vec<Vec<(usize, usize)>>,
     /// current segment carve state
     seg_cur: usize,
     seg_end: usize,
-    segments: Vec<usize>,
 }
 
-fn new_page(d: &mut Depot, class: usize) -> Vec<usize> {
+/// Number of free-block batches in the depot per slot (lets refills skip the depot
+/// lock when there is nothing to take).
+static DEPOT_BATCHES: [AtomicUsize; NSLOTS] = [const { AtomicUsize::new(0) }; NSLOTS];
+
+/// Every segment ever mapped (append-only; read by heap walks without the depot lock).
+const MAX_SEGS: usize = 1 << 16;
+static SEGS: [AtomicUsize; MAX_SEGS] = [const { AtomicUsize::new(0) }; MAX_SEGS];
+static NSEGS: AtomicUsize = AtomicUsize::new(0);
+
+#[inline(always)]
+fn page_of(p: usize) -> *mut PageHeader {
+    (p & !(PAGE - 1)) as *mut PageHeader
+}
+
+/// A fresh page for free-list `slot`: writes the header and returns the block range
+/// `(first, end)`. Blocks are not touched here; threads carve them lazily (a few KiB at
+/// a time), so a size class used for only a handful of objects costs a page or two of
+/// resident memory, not 64 KiB.
+fn new_page(d: &mut Depot, slot: usize) -> Option<(usize, usize)> {
     if d.seg_cur + PAGE > d.seg_end {
+        let n = NSEGS.load(Relaxed);
+        if n >= MAX_SEGS {
+            return None;
+        }
         unsafe {
             // over-allocate to guarantee SEGMENT alignment (so `owns` is a bitmap lookup)
             let raw = libc::mmap(
@@ -75,7 +124,7 @@ fn new_page(d: &mut Depot, class: usize) -> Vec<usize> {
                 0,
             );
             if raw == libc::MAP_FAILED {
-                return Vec::new();
+                return None;
             }
             let start = (raw as usize + SEGMENT - 1) & !(SEGMENT - 1);
             if start > raw as usize {
@@ -86,53 +135,71 @@ fn new_page(d: &mut Depot, class: usize) -> Vec<usize> {
                 libc::munmap(tail as *mut libc::c_void, end - tail);
             }
             let g = start / SEGMENT;
-            SEGMENT_MAP[g / 64].fetch_or(1 << (g % 64), std::sync::atomic::Ordering::Release);
+            SEGMENT_MAP[g / 64].fetch_or(1 << (g % 64), Release);
+            SEGS[n].store(start, Release);
+            NSEGS.store(n + 1, Release);
             d.seg_cur = start;
             d.seg_end = start + SEGMENT;
-            d.segments.push(start);
         }
     }
     let page = d.seg_cur;
     d.seg_cur += PAGE;
-    let block = CLASSES[class];
-    unsafe {
-        let h = page as *mut PageHeader;
-        (*h).magic = MAGIC;
-        (*h).class = class as u32;
-        (*h).block = block;
-    }
+    let block = CLASSES[slot % NCLASSES];
     let first = page + HEADER.max(block.min(HEADER));
     let first = (first + 15) & !15;
     let n = (page + PAGE - first) / block;
-    let mut v = Vec::with_capacity(n);
-    for i in (0..n).rev() {
-        v.push(first + i * block);
+    unsafe {
+        let h = page as *mut PageHeader;
+        (*h).class = slot as u32;
+        (*h).block = block;
+        (*h).first = first;
+        (*h).carved.store(first, Release);
+        // magic last: a walker only trusts pages with a complete header
+        std::ptr::write_volatile(&raw mut (*h).magic, MAGIC);
     }
-    v
+    Some((first, first + n * block))
 }
 
 static DEPOT: Mutex<Option<Depot>> = Mutex::new(None);
 
 const BATCH: usize = 64;
 const CACHE_LIMIT: usize = 256;
+/// Bytes of fresh blocks linked into a thread's free list per refill.
+const CARVE_BYTES: usize = 2048;
 
 fn new_depot() -> Depot {
-    Depot { batches: (0..NCLASSES).map(|_| Vec::new()).collect(), seg_cur: 0, seg_end: 0, segments: Vec::new() }
+    Depot {
+        batches: (0..NSLOTS).map(|_| Vec::new()).collect(),
+        partial: (0..NSLOTS).map(|_| Vec::new()).collect(),
+        seg_cur: 0,
+        seg_end: 0,
+    }
 }
 
-/// Per-thread cache: one intrusive free list per size class (the first word of a
-/// free block links to the next one). `#[thread_local]` gives direct fs-relative
-/// access without lazy-init checks; a separate guard returns the blocks to the depot
-/// when the thread exits.
+/// Per-thread cache: one intrusive free list per slot (the first word of a free
+/// block links to the next one), plus the uncarved rest of the page the thread is
+/// currently carving for each slot. `#[thread_local]` gives direct fs-relative access
+/// without lazy-init checks; a separate guard returns the blocks to the depot when the
+/// thread exits. Slots 0..NCLASSES are kind 0, so JIT code indexes `heads`/`counts`
+/// with the plain class (allocation) or the page header's slot (free).
 struct ThreadCache {
-    heads: [usize; NCLASSES],
-    counts: [u32; NCLASSES],
+    heads: [usize; NSLOTS],
+    counts: [u32; NSLOTS],
+    carve_next: [usize; NSLOTS],
+    carve_end: [usize; NSLOTS],
     registered: bool,
     dead: bool,
 }
 
 #[thread_local]
-static mut TC: ThreadCache = ThreadCache { heads: [0; NCLASSES], counts: [0; NCLASSES], registered: false, dead: false };
+static mut TC: ThreadCache = ThreadCache {
+    heads: [0; NSLOTS],
+    counts: [0; NSLOTS],
+    carve_next: [0; NSLOTS],
+    carve_end: [0; NSLOTS],
+    registered: false,
+    dead: false,
+};
 
 struct ExitGuard;
 impl Drop for ExitGuard {
@@ -142,7 +209,7 @@ impl Drop for ExitGuard {
             tc.dead = true;
             let mut g = DEPOT.lock().unwrap_or_else(|e| e.into_inner());
             let d = g.get_or_insert_with(new_depot);
-            for c in 0..NCLASSES {
+            for c in 0..NSLOTS {
                 let mut v = Vec::with_capacity(tc.counts[c] as usize);
                 let mut p = tc.heads[c];
                 while p != 0 {
@@ -153,7 +220,13 @@ impl Drop for ExitGuard {
                 tc.counts[c] = 0;
                 if !v.is_empty() {
                     d.batches[c].push(v);
+                    DEPOT_BATCHES[c].fetch_add(1, Relaxed);
                 }
+                if tc.carve_next[c] < tc.carve_end[c] {
+                    d.partial[c].push((tc.carve_next[c], tc.carve_end[c]));
+                }
+                tc.carve_next[c] = 0;
+                tc.carve_end[c] = 0;
             }
         }
     }
@@ -169,40 +242,99 @@ fn register(tc: &mut ThreadCache) {
     let _ = GUARD.try_with(|_| ());
 }
 
-#[cold]
-fn refill(class: usize, tc: &mut ThreadCache) {
-    if !tc.registered {
-        register(tc);
+/// Take a batch of freed blocks from the depot, or else a carving range.
+fn depot_take(d: &mut Depot, slot: usize) -> Result<Vec<usize>, Option<(usize, usize)>> {
+    if let Some(b) = d.batches[slot].pop() {
+        DEPOT_BATCHES[slot].fetch_sub(1, Relaxed);
+        return Ok(b);
     }
-    let blocks = {
-        let mut g = DEPOT.lock().unwrap_or_else(|e| e.into_inner());
-        let d = g.get_or_insert_with(new_depot);
-        match d.batches[class].pop() {
-            Some(b) => b,
-            None => new_page(d, class),
-        }
-    };
-    for p in blocks {
-        unsafe { *(p as *mut usize) = tc.heads[class] };
-        tc.heads[class] = p;
-        tc.counts[class] += 1;
+    if let Some(r) = d.partial[slot].pop() {
+        return Err(Some(r));
     }
+    Err(new_page(d, slot))
+}
+
+/// Mark `[.., end)` of the page containing `block` as carved.
+#[inline]
+fn note_carved(block: usize, end: usize) {
+    unsafe { (*page_of(block)).carved.fetch_max(end, Release) };
 }
 
 #[cold]
-fn spill(class: usize, tc: &mut ThreadCache) {
+fn refill(slot: usize, tc: &mut ThreadCache) {
+    if !tc.registered {
+        register(tc);
+    }
+    // freed blocks parked in the depot first (reuses memory that is already resident)
+    if DEPOT_BATCHES[slot].load(Relaxed) != 0 || tc.carve_next[slot] >= tc.carve_end[slot] {
+        let got = {
+            let mut g = DEPOT.lock().unwrap_or_else(|e| e.into_inner());
+            let d = g.get_or_insert_with(new_depot);
+            if tc.carve_next[slot] < tc.carve_end[slot] && d.batches[slot].is_empty() {
+                Err(None)
+            } else {
+                depot_take(d, slot)
+            }
+        };
+        match got {
+            Ok(blocks) => {
+                for p in blocks {
+                    unsafe { *(p as *mut usize) = tc.heads[slot] };
+                    tc.heads[slot] = p;
+                    tc.counts[slot] += 1;
+                }
+                return;
+            }
+            Err(Some((a, b))) => {
+                if tc.carve_next[slot] < tc.carve_end[slot] {
+                    // keep the current range; hand the new one back
+                    let mut g = DEPOT.lock().unwrap_or_else(|e| e.into_inner());
+                    g.get_or_insert_with(new_depot).partial[slot].push((a, b));
+                } else {
+                    tc.carve_next[slot] = a;
+                    tc.carve_end[slot] = b;
+                }
+            }
+            Err(None) => {}
+        }
+    }
+    // carve a few KiB of fresh blocks, lowest address first
+    let size = CLASSES[slot % NCLASSES];
+    let next = tc.carve_next[slot];
+    let end = tc.carve_end[slot];
+    if next >= end {
+        return; // out of memory
+    }
+    let n = (CARVE_BYTES / size).max(1).min((end - next) / size);
+    note_carved(next, next + n * size);
+    let mut p = next + (n - 1) * size;
+    loop {
+        unsafe { *(p as *mut usize) = tc.heads[slot] };
+        tc.heads[slot] = p;
+        tc.counts[slot] += 1;
+        if p == next {
+            break;
+        }
+        p -= size;
+    }
+    tc.carve_next[slot] = next + n * size;
+}
+
+#[cold]
+fn spill(slot: usize, tc: &mut ThreadCache) {
     let mut batch = Vec::with_capacity(BATCH);
     for _ in 0..BATCH {
-        let p = tc.heads[class];
+        let p = tc.heads[slot];
         if p == 0 {
             break;
         }
-        tc.heads[class] = unsafe { *(p as *const usize) };
-        tc.counts[class] -= 1;
+        tc.heads[slot] = unsafe { *(p as *const usize) };
+        tc.counts[slot] -= 1;
         batch.push(p);
     }
     let mut g = DEPOT.lock().unwrap_or_else(|e| e.into_inner());
-    g.get_or_insert_with(new_depot).batches[class].push(batch);
+    g.get_or_insert_with(new_depot).batches[slot].push(batch);
+    DEPOT_BATCHES[slot].fetch_add(1, Relaxed);
 }
 
 #[inline(always)]
@@ -221,10 +353,17 @@ unsafe fn zero_block(p: *mut u8, size: usize) {
     }
 }
 
-/// Allocate a zeroed small block (size <= MAX_SMALL). Null on OOM.
+/// Allocate a zeroed small block (size <= MAX_SMALL) of kind 0. Null on OOM.
 #[inline]
 pub fn alloc_small(size: usize) -> *mut u8 {
-    let c = CLASS_OF[(size + 15) / 16] as usize;
+    alloc_kind(size, KIND_RAW)
+}
+
+/// Allocate a zeroed small block (size <= MAX_SMALL) of the given kind. Null on OOM.
+#[inline]
+pub fn alloc_kind(size: usize, kind: usize) -> *mut u8 {
+    let rounded = if kind == KIND_RAW { (size + 15) & !15 } else { (size + 7) & !7 };
+    let c = CLASS_OF[rounded / 8] as usize + kind * NCLASSES;
     unsafe {
         let tc = &mut *(&raw mut TC);
         let mut p = tc.heads[c];
@@ -240,7 +379,7 @@ pub fn alloc_small(size: usize) -> *mut u8 {
         }
         tc.heads[c] = *(p as *const usize);
         tc.counts[c] -= 1;
-        zero_block(p as *mut u8, CLASSES[c]);
+        zero_block(p as *mut u8, CLASSES[c % NCLASSES]);
         p as *mut u8
     }
 }
@@ -250,36 +389,53 @@ fn alloc_from_depot(c: usize) -> *mut u8 {
     // thread is exiting: take directly from the depot
     let mut g = DEPOT.lock().unwrap_or_else(|e| e.into_inner());
     let d = g.get_or_insert_with(new_depot);
-    let mut v = match d.batches[c].pop() {
-        Some(b) => b,
-        None => new_page(d, c),
+    let size = CLASSES[c % NCLASSES];
+    let p = match depot_take(d, c) {
+        Ok(mut v) => {
+            let p = v.pop().unwrap_or(0);
+            if !v.is_empty() {
+                d.batches[c].push(v);
+                DEPOT_BATCHES[c].fetch_add(1, Relaxed);
+            }
+            p
+        }
+        Err(Some((a, b))) => {
+            note_carved(a, a + size);
+            if a + size < b {
+                d.partial[c].push((a + size, b));
+            }
+            a
+        }
+        Err(None) => 0,
     };
-    let p = v.pop().unwrap_or(0);
-    if !v.is_empty() {
-        d.batches[c].push(v);
-    }
     if p != 0 {
-        unsafe { std::ptr::write_bytes(p as *mut u8, 0, CLASSES[c]) };
+        unsafe { std::ptr::write_bytes(p as *mut u8, 0, size) };
     }
     p as *mut u8
 }
 
+/// Free-list slot (kind * classes + class) of a small block.
 #[inline]
 pub fn small_class_of(p: *mut u8) -> usize {
-    let page = (p as usize) & !(PAGE - 1);
     unsafe {
-        let h = page as *const PageHeader;
+        let h = page_of(p as usize);
         debug_assert_eq!((*h).magic, MAGIC);
         (*h).class as usize
     }
 }
 
+/// Is `p` (an address inside a small block) on a GC-object page?
 #[inline]
-pub fn small_size_of(p: *mut u8) -> usize {
-    CLASSES[small_class_of(p)]
+pub fn is_gc_block(p: *mut u8) -> bool {
+    small_class_of(p) >= NCLASSES
 }
 
-/// Free a block returned by `alloc_small`.
+#[inline]
+pub fn small_size_of(p: *mut u8) -> usize {
+    CLASSES[small_class_of(p) % NCLASSES]
+}
+
+/// Free a block returned by `alloc_small` / `alloc_kind`.
 #[inline]
 pub fn free_small(p: *mut u8) {
     let c = small_class_of(p);
@@ -288,6 +444,7 @@ pub fn free_small(p: *mut u8) {
         if tc.dead {
             let mut g = DEPOT.lock().unwrap_or_else(|e| e.into_inner());
             g.get_or_insert_with(new_depot).batches[c].push(vec![p as usize]);
+            DEPOT_BATCHES[c].fetch_add(1, Relaxed);
             return;
         }
         if !tc.registered {
@@ -298,6 +455,39 @@ pub fn free_small(p: *mut u8) {
         tc.counts[c] += 1;
         if tc.counts[c] as usize > CACHE_LIMIT {
             spill(c, tc);
+        }
+    }
+}
+
+/// Call `f(object)` for every block of the GC kinds that was ever handed out, with
+/// the object address (block + pre-header). Free blocks are included: callers check
+/// the object's GC bits (freed GC objects have them cleared). Only meaningful while
+/// no other thread allocates (the world is stopped).
+pub unsafe fn for_each_gc_block(mut f: impl FnMut(*mut crate::ffi::PyObject)) {
+    let n = NSEGS.load(Acquire);
+    for s in 0..n {
+        let seg = SEGS[s].load(Acquire);
+        let mut page = seg;
+        while page < seg + SEGMENT {
+            let h = page as *const PageHeader;
+            unsafe {
+                if std::ptr::read_volatile(&(*h).magic) != MAGIC {
+                    // pages of a segment are handed out in address order
+                    break;
+                }
+                let kind = (*h).class as usize / NCLASSES;
+                if kind != KIND_RAW {
+                    let pre = KIND_PRE[kind];
+                    let block = (*h).block;
+                    let end = (*h).carved.load(Acquire);
+                    let mut b = (*h).first;
+                    while b + block <= end {
+                        f((b + pre) as *mut crate::ffi::PyObject);
+                        b += block;
+                    }
+                }
+            }
+            page += PAGE;
         }
     }
 }
@@ -323,9 +513,9 @@ pub fn jit_layout() -> JitLayout {
     }
 }
 
-/// Size class index for a small size.
+/// Size class index (kind 0 free-list slot) for a small size.
 pub fn class_index(size: usize) -> usize {
-    CLASS_OF[(size + 15) / 16] as usize
+    CLASS_OF[((size + 15) & !15) / 8] as usize
 }
 
 /// Make sure this thread's cache returns its blocks at thread exit (JIT code pushes
@@ -353,7 +543,7 @@ pub fn owns(p: *const u8) -> bool {
     if g >= (1usize << 47) / SEGMENT {
         return false;
     }
-    SEGMENT_MAP[g / 64].load(std::sync::atomic::Ordering::Acquire) & (1 << (g % 64)) != 0
+    SEGMENT_MAP[g / 64].load(Acquire) & (1 << (g % 64)) != 0
 }
 
 /// The allocator depot, held across fork() so that the child never inherits

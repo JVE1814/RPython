@@ -228,7 +228,9 @@ pub unsafe extern "C" fn PyList_SetItem(o: *mut PyObject, i: Py_ssize_t, v: *mut
         };
         match old {
             Some(old) => {
-                xdecref(old);
+                if !old.is_null() {
+                    crate::qsbr::decref_deferred(old); // lock-free readers (list.rs)
+                }
                 0
             }
             None => {

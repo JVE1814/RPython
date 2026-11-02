@@ -2,8 +2,13 @@
 //!
 //! Reference counting (forced by the C ABI) frees acyclic garbage; this module finds
 //! unreachable reference cycles. Design (DECISIONS D5):
-//! * GC-capable objects are linked into a global intrusive list through the 16-byte
-//!   pre-header (`alloc::GcHead`) while tracked.
+//! * GC-capable objects live on the allocator's GC pages (or, when large, in a
+//!   registry in alloc.rs). Tracking an object only sets its `GC_BIT_TRACKED` bit;
+//!   a collection enumerates the candidates by walking those pages (perf2: no list
+//!   links, so no per-object 16-byte header and no global list lock).
+//! * Generations: objects that survived a collection carry `GC_BIT_OLD`; young
+//!   collections only examine the others (references from old objects count as
+//!   external, which is conservative).
 //! * A collection is stop-the-world. Thread coordination follows HotSpot safepoints:
 //!   the collector raises the safepoint bit in every thread's eval breaker; threads
 //!   executing Python park in `safepoint_poll`; threads in native/blocked mode count as
@@ -16,21 +21,14 @@
 //! * Cycles are broken with tp_clear while the garbage is kept alive by a temporary
 //!   reference, then released.
 
-use crate::alloc::{GC_BIT_FINALIZED, GC_BIT_TRACKED, GcHead, gc_head};
+use crate::alloc::{GC_BIT_FINALIZED, GC_BIT_OLD, GC_BIT_TRACKED};
 use crate::ffi::*;
 use crate::object::*;
 use crate::threads::ThreadState;
-use std::collections::HashMap;
 use std::ffi::{c_int, c_void};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering::*};
 
-struct List {
-    head: GcHead,
-}
-unsafe impl Send for List {}
-
-static LIST: Mutex<Option<Box<List>>> = Mutex::new(None);
 static TRACKED: AtomicIsize = AtomicIsize::new(0);
 static ALLOCS_SINCE: AtomicUsize = AtomicUsize::new(0);
 pub static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -41,83 +39,9 @@ pub static COLLECTED: AtomicUsize = AtomicUsize::new(0);
 pub static UNCOLLECTABLE: AtomicUsize = AtomicUsize::new(0);
 /// Size of the live set after the last collection (for adaptive triggering).
 static LAST_LIVE: AtomicUsize = AtomicUsize::new(0);
-
-/// Spin lock protecting the list (critical sections are a few pointer writes; a
-/// std Mutex cost a TLS poison check + futex word on every track/untrack).
-static LIST_LOCK: AtomicBool = AtomicBool::new(false);
-static LIST_HEAD: std::sync::atomic::AtomicPtr<GcHead> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-
-struct ListGuard;
-impl Drop for ListGuard {
-    fn drop(&mut self) {
-        LIST_LOCK.store(false, Release);
-    }
-}
-
-#[inline]
-fn with_list<R>(f: impl FnOnce(*mut GcHead) -> R) -> R {
-    while LIST_LOCK.compare_exchange_weak(false, true, Acquire, Relaxed).is_err() {
-        std::hint::spin_loop();
-    }
-    let _g = ListGuard;
-    let mut head = LIST_HEAD.load(Relaxed);
-    if head.is_null() {
-        let mut g = LIST.lock().unwrap_or_else(|e| e.into_inner());
-        let l = g.get_or_insert_with(|| {
-            let mut b = Box::new(List { head: GcHead { next: std::ptr::null_mut(), prev: std::ptr::null_mut() } });
-            let p = &mut b.head as *mut GcHead;
-            b.head.next = p;
-            b.head.prev = p;
-            b
-        });
-        head = &mut l.head as *mut GcHead;
-        LIST_HEAD.store(head, Relaxed);
-    }
-    f(head)
-}
-
-/// Old generation: objects that survived a collection. New objects are tracked in
-/// the young list (`with_list`); young collections examine only the young list
-/// (references from old objects count as external, which is conservative), then
-/// promote the survivors. Full collections examine both lists.
-static OLD_HEAD: std::sync::atomic::AtomicPtr<GcHead> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 static YOUNG_COLLECTIONS: AtomicUsize = AtomicUsize::new(0);
 /// Tracked objects right after the last full collection.
 static LAST_FULL_LIVE: AtomicUsize = AtomicUsize::new(0);
-
-/// Run `f(young, old)` under the list lock.
-fn with_lists<R>(f: impl FnOnce(*mut GcHead, *mut GcHead) -> R) -> R {
-    with_list(|young| {
-        let mut old = OLD_HEAD.load(Relaxed);
-        if old.is_null() {
-            let b = Box::leak(Box::new(GcHead { next: std::ptr::null_mut(), prev: std::ptr::null_mut() }));
-            let p = b as *mut GcHead;
-            b.next = p;
-            b.prev = p;
-            old = p;
-            OLD_HEAD.store(old, Relaxed);
-        }
-        f(young, old)
-    })
-}
-
-/// Move every object of the young list to the end of the old list.
-fn promote_young() {
-    with_lists(|young, old| unsafe {
-        if (*young).next == young {
-            return;
-        }
-        let first = (*young).next;
-        let last = (*young).prev;
-        let old_last = (*old).prev;
-        (*old_last).next = first;
-        (*first).prev = old_last;
-        (*last).next = old;
-        (*old).prev = last;
-        (*young).next = young;
-        (*young).prev = young;
-    })
-}
 
 #[inline]
 pub unsafe fn track(op: *mut PyObject) {
@@ -127,14 +51,8 @@ pub unsafe fn track(op: *mut PyObject) {
         if bits & crate::alloc::GC_BIT_PREHEADER == 0 || bits & GC_BIT_TRACKED != 0 {
             return;
         }
-        let h = gc_head(op);
-        with_list(|head| {
-            (*h).next = head;
-            (*h).prev = (*head).prev;
-            (*(*head).prev).next = h;
-            (*head).prev = h;
-        });
-        o.ob_gc_bits.fetch_or(GC_BIT_TRACKED, Relaxed);
+        // (re)tracked objects start young
+        o.ob_gc_bits.store((bits | GC_BIT_TRACKED) & !GC_BIT_OLD, Relaxed);
         note_tracked(1);
     }
 }
@@ -200,17 +118,11 @@ fn trigger_threshold() -> usize {
 pub unsafe fn untrack(op: *mut PyObject) {
     unsafe {
         let o = &*op;
-        if o.ob_gc_bits.load(Relaxed) & GC_BIT_TRACKED == 0 {
+        let bits = o.ob_gc_bits.load(Relaxed);
+        if bits & GC_BIT_TRACKED == 0 {
             return;
         }
-        let h = gc_head(op);
-        with_list(|_| {
-            (*(*h).prev).next = (*h).next;
-            (*(*h).next).prev = (*h).prev;
-            (*h).next = std::ptr::null_mut();
-            (*h).prev = std::ptr::null_mut();
-        });
-        o.ob_gc_bits.fetch_and(!GC_BIT_TRACKED, Relaxed);
+        o.ob_gc_bits.store(bits & !(GC_BIT_TRACKED | GC_BIT_OLD), Relaxed);
         note_tracked(-1);
     }
 }
@@ -443,13 +355,14 @@ impl std::hash::Hasher for PtrHasher {
 }
 
 /// Trial-deletion graph. Membership and the dense index of an object are stored in
-/// its GC pre-header while a collection runs (`prev` temporarily holds
-/// `index << 2 | 3`; real link pointers are 8-aligned, so the tag cannot collide),
-/// which avoids a hash map lookup per visited reference. The links are restored
-/// before returning. The graph is passed to the visitors through their `arg`.
+/// its `ob_tid` while a collection runs (it temporarily holds `index << 2 | 3`; real
+/// owner ids are aligned thread pointers or 0, so the tag cannot collide), which
+/// avoids a hash map lookup per visited reference. The owners are restored before
+/// returning (the world is stopped meanwhile). The graph is passed to the visitors
+/// through their `arg`.
 struct Graph {
     objs: Vec<*mut PyObject>,
-    saved_prev: Vec<*mut GcHead>,
+    saved_tid: Vec<usize>,
     refs: Vec<isize>,
     reachable: Vec<bool>,
     stack: Vec<usize>,
@@ -463,7 +376,7 @@ unsafe fn graph_index(op: *mut PyObject) -> Option<usize> {
         if op.is_null() || (*op).ob_gc_bits.load(Relaxed) & GC_BIT_TRACKED == 0 {
             return None;
         }
-        let p = (*gc_head(op)).prev as usize;
+        let p = (*op).ob_tid.load(Relaxed);
         if p & GRAPH_TAG == GRAPH_TAG { Some(p >> 2) } else { None }
     }
 }
@@ -505,16 +418,16 @@ unsafe fn find_unreachable(objs: Vec<*mut PyObject>) -> Vec<*mut PyObject> {
     unsafe {
         let n = objs.len();
         let mut g = Graph {
-            saved_prev: Vec::with_capacity(n),
+            saved_tid: Vec::with_capacity(n),
             refs: objs.iter().map(|&o| total_refcnt(&*o)).collect(),
             reachable: vec![false; n],
             stack: Vec::new(),
             objs,
         };
         for (i, &o) in g.objs.iter().enumerate() {
-            let h = gc_head(o);
-            g.saved_prev.push((*h).prev);
-            (*h).prev = ((i << 2) | GRAPH_TAG) as *mut GcHead;
+            let t = &(*o).ob_tid;
+            g.saved_tid.push(t.load(Relaxed));
+            t.store((i << 2) | GRAPH_TAG, Relaxed);
         }
         let gp = &mut g as *mut Graph as *mut c_void;
         for i in 0..n {
@@ -531,7 +444,7 @@ unsafe fn find_unreachable(objs: Vec<*mut PyObject>) -> Vec<*mut PyObject> {
             traverse(op, Some(visit_mark), gp);
         }
         for (i, &o) in g.objs.iter().enumerate() {
-            (*gc_head(o)).prev = g.saved_prev[i];
+            (*o).ob_tid.store(g.saved_tid[i], Relaxed);
         }
         g.objs.iter().zip(g.reachable.iter()).filter(|(_, r)| !**r).map(|(o, _)| *o).collect()
     }
@@ -541,20 +454,30 @@ fn snapshot() -> Vec<*mut PyObject> {
     snapshot_gen(false)
 }
 
-/// Tracked objects of the young generation (young_only) or of both generations.
+/// Tracked objects of the young generation (young_only) or of both generations, found
+/// by walking the GC pages and the large-object registry. The world must be stopped
+/// (or the process single-threaded).
 fn snapshot_gen(young_only: bool) -> Vec<*mut PyObject> {
-    with_lists(|young, old| unsafe {
-        let mut v = Vec::with_capacity(if young_only { 1024 } else { TRACKED.load(Relaxed).max(0) as usize });
-        let lists: &[*mut GcHead] = if young_only { &[young] } else { &[young, old] };
-        for &head in lists {
-            let mut h = (*head).next;
-            while h != head {
-                v.push((h as *mut u8).add(std::mem::size_of::<GcHead>()) as *mut PyObject);
-                h = (*h).next;
-            }
+    let mut v = Vec::with_capacity(if young_only { 1024 } else { TRACKED.load(Relaxed).max(0) as usize });
+    let mask = if young_only { GC_BIT_TRACKED | GC_BIT_OLD } else { GC_BIT_TRACKED };
+    let mut take = |op: *mut PyObject| unsafe {
+        if (*op).ob_gc_bits.load(Relaxed) & mask == GC_BIT_TRACKED {
+            v.push(op);
         }
-        v
-    })
+    };
+    unsafe { crate::tlab::for_each_gc_block(&mut take) };
+    crate::alloc::for_each_large_gc(&mut take);
+    v
+}
+
+/// The examined objects that survive become old.
+fn promote(objs: &[*mut PyObject]) {
+    for &o in objs {
+        unsafe {
+            let b = &(*o).ob_gc_bits;
+            b.store(b.load(Relaxed) | GC_BIT_OLD, Relaxed);
+        }
+    }
 }
 
 /// Run a full collection; returns the number of unreachable objects found.
@@ -610,8 +533,8 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
         // ---- phase 1 (stopped): find the unreachable objects
         let objs = snapshot_gen(young_only);
         crate::gc_support::CANDIDATES.fetch_add(objs.len(), Relaxed);
+        promote(&objs);
         let unreachable = find_unreachable(objs);
-        promote_young();
         if unreachable.is_empty() {
             start_the_world();
             return Some(0);
@@ -737,16 +660,36 @@ pub fn flush_deferred() {
 
 /// All tracked objects (for gc.get_objects / get_referrers).
 pub fn all_tracked() -> Vec<PyRef> {
-    let v = snapshot();
-    v.into_iter().map(|o| unsafe { PyRef::from_borrowed(o) }).collect()
+    if !crate::threads::multi_threaded() {
+        let v = snapshot();
+        return v.into_iter().map(|o| unsafe { PyRef::from_borrowed(o) }).collect();
+    }
+    // the heap walk needs the other threads parked (they allocate and free on the
+    // pages being walked); take references before they run again
+    while COLLECTING.compare_exchange(false, true, AcqRel, Acquire).is_err() {
+        crate::threads::blocking(|| std::thread::sleep(std::time::Duration::from_micros(200)));
+    }
+    let me = crate::threads::current_mut();
+    let mut stopped = false;
+    for _ in 0..40 {
+        if stop_the_world(me) {
+            stopped = true;
+            break;
+        }
+    }
+    let v: Vec<PyRef> = snapshot().into_iter().map(|o| unsafe { PyRef::from_borrowed(o) }).collect();
+    if stopped {
+        start_the_world();
+    }
+    COLLECTING.store(false, Release);
+    v
 }
 
 // ---------------------------------------------------------------- fork support
 //
 // fork() keeps only the calling thread.  Before forking, the other threads
 // are brought to a safepoint (so that none of them is inside the collector or
-// in the middle of a GC list update), and the forking thread holds the list
-// spin lock across the fork.  See crate::fork.
+// the allocator).  See crate::fork.
 
 /// Stop every other thread for fork().  Returns whether they all arrived
 /// (threads blocked in system calls count as stopped).
@@ -763,15 +706,11 @@ pub fn fork_prepare() -> bool {
             break;
         }
     }
-    while LIST_LOCK.compare_exchange_weak(false, true, Acquire, Relaxed).is_err() {
-        std::hint::spin_loop();
-    }
     stopped
 }
 
 /// Undo fork_prepare() in the parent.
 pub fn fork_parent(stopped: bool) {
-    LIST_LOCK.store(false, Release);
     if stopped {
         start_the_world();
     }
@@ -780,7 +719,6 @@ pub fn fork_parent(stopped: bool) {
 
 /// Reset the collector state in the child: the other threads are gone.
 pub fn fork_child() {
-    LIST_LOCK.store(false, Release);
     PARKED.store(0, Release);
     STW_OWNER.store(0, SeqCst);
     RELEASE.store(true, Release);

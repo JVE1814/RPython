@@ -54,7 +54,7 @@ const TP_TAG: i32 = offset_of!(PyTypeObject, tp_version_tag) as i32;
 const GC_BITS: i32 = offset_of!(PyObject, ob_gc_bits) as i32;
 const MA_KEYS: i32 = offset_of!(PyDictObject, ma_keys) as i32;
 const MA_USED: i32 = offset_of!(PyDictObject, ma_used) as i32;
-const MANAGED_DICT: i32 = -((crate::alloc::GC_HEAD + crate::alloc::MANAGED) as i32);
+const MANAGED_DICT: i32 = -(crate::alloc::MANAGED as i32);
 const MD_DICT: i32 = offset_of!(crate::types::module::PyModuleObject, md_dict) as i32;
 const FRAME_GLOBALS: i32 = offset_of!(Frame, globals) as i32;
 const FRAME_BUILTINS: i32 = offset_of!(Frame, builtins) as i32;
@@ -720,14 +720,6 @@ impl<'a> Gen<'a> {
             self.a.mov_ri(Rdx, tp);
             self.a.cmp_rm(Rdx, M(Rax, OB_TYPE));
             self.a.jcc(Cc::NE, if is_list { not_list } else { slow });
-            if is_list {
-                // lock-free item reads only while the process is single-threaded
-                // (a concurrent writer may free the item array): the helper
-                // reads under the list lock otherwise
-                self.a.mov_ri(Rdx, (&raw const crate::threads::MULTI_THREADED) as i64);
-                self.a.cmp_mi(M(Rdx, 0), 0);
-                self.a.jcc(Cc::NE, slow);
-            }
             self.a.load(Rdx, M(Rax, LIST_SIZE));
             let pos = self.a.label();
             self.a.test_rr(Rsi, Rsi);
@@ -737,8 +729,15 @@ impl<'a> Gen<'a> {
             self.a.cmp_rr(Rsi, Rdx);
             self.a.jcc(Cc::AE, slow);
             if is_list {
+                // lock-free read: size (above), then array, then item; writers keep
+                // this safe while threads share the list (perf2, types/list.rs docs).
+                // A null array or item means a racing writer: take the helper.
                 self.a.load(Rdx, M(Rax, LIST_ITEMS));
+                self.a.test_rr(Rdx, Rdx);
+                self.a.jcc(Cc::E, slow);
                 self.a.load_idx(Rdi, Rdx, Rsi, 8, 0);
+                self.a.test_rr(Rdi, Rdi);
+                self.a.jcc(Cc::E, slow);
                 self.a.jmp(got);
             } else {
                 self.a.load_idx(Rdi, Rax, Rsi, 8, TUPLE_ITEMS);
@@ -866,7 +865,8 @@ impl<'a> Gen<'a> {
     /// obj keeps its attributes inline and its shape has `name` there; jumps to
     /// `notvalues` if obj is not in values mode, to `slow` otherwise. Clobbers rcx/rdx.
     fn inline_values(&mut self, obj: R, hint: u64, name: i64, slow: Label, notvalues: Label) {
-        let (sh_off, vals_off, _id_off, len_off, keys_off) = crate::shape::jit_layout();
+        // managed word = shape | 1; value i lives at obj + shape.voff + 8*i (perf2)
+        let (_id_off, len_off, keys_off, voff_off) = crate::shape::jit_layout();
         let h = hint as i32;
         self.a.load8(Rdx, M(obj, GC_BITS));
         self.a.and_ri(Rdx, crate::alloc::GC_BIT_MANAGED as i32);
@@ -875,16 +875,14 @@ impl<'a> Gen<'a> {
         self.a.mov_rr(Rsi, Rdx);
         self.a.and_ri(Rsi, 1);
         self.a.jcc(Cc::E, notvalues);
-        self.a.load(Rcx, M(Rdx, sh_off - 1));
-        self.a.test_rr(Rcx, Rcx);
-        self.a.jcc(Cc::E, slow);
-        self.a.cmp32_mi(M(Rcx, len_off), h);
+        self.a.cmp32_mi(M(Rdx, len_off - 1), h);
         self.a.jcc(Cc::BE, slow);
-        self.a.load(Rcx, M(Rcx, keys_off));
+        self.a.load(Rcx, M(Rdx, keys_off - 1));
         self.a.mov_ri(Rsi, name);
         self.a.cmp_rm(Rsi, M(Rcx, h * 8));
         self.a.jcc(Cc::NE, slow);
-        self.a.load(Rsi, M(Rdx, vals_off - 1 + h * 8));
+        self.a.load32(Rcx, M(Rdx, voff_off - 1));
+        self.a.load_idx(Rsi, obj, Rcx, 1, h * 8);
         self.a.test_rr(Rsi, Rsi);
         self.a.jcc(Cc::E, slow);
     }

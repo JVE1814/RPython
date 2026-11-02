@@ -482,7 +482,7 @@ pub(crate) fn new_code_from_c(a: CCodeArgs) -> PyResult {
     let stub = c_code_stub();
     let sd = code::code_data(stub);
     let line = a.firstlineno.max(0) as u32;
-    let locations = sd
+    let locations: Vec<rpy_compiler::bytecode::Location> = sd
         .locations
         .iter()
         .map(|_| rpy_compiler::bytecode::Location { lineno: line, end_lineno: line, col: u32::MAX, end_col: u32::MAX })
@@ -495,13 +495,14 @@ pub(crate) fn new_code_from_c(a: CCodeArgs) -> PyResult {
         stacksize: code::code(stub).obj.co_stacksize as u32,
         firstlineno: line,
         code: sd.code.clone(),
-        locations,
+        lines: code::Lines::Decoded(&locations),
         exception_table: sd.exception_table.clone(),
+        exctable_raw: None,
         kinds,
         filename: a.filename.to_ref(),
-        consts: sd.consts.clone(),
-        names: sd.names.clone(),
-        localsplusnames: lpn,
+        consts: sd.consts.tuple().clone(),
+        names: sd.names.tuple().clone(),
+        localsplusnames: tuple::new_tuple(lpn),
         name: pystr::intern(a.name.to_ref()),
         qualname: qualname.to_ref(),
     };
