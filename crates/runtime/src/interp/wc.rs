@@ -191,6 +191,11 @@ pub fn deopt(o: u8) -> Option<u8> {
 
 /// Number of inline CACHE code units following a (base) instruction.
 pub fn cache_entries(base: u8) -> u32 {
+    rpy_compiler::wordcode::cache_entries(base as u16)
+}
+
+#[allow(dead_code)]
+fn cache_entries_local(base: u8) -> u32 {
     use op::*;
     match base {
         LOAD_GLOBAL => 4,

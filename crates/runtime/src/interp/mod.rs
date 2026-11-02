@@ -285,7 +285,7 @@ pub fn bind_arguments(func: &PyObject, frame: &mut Frame, args: &[*mut PyObject]
     }
     // too many positional
     if nargs > argcount && !has_varargs {
-        let defcount = if f.func_defaults.is_null() { 0 } else { tuple::tuple_len(unsafe { &*f.func_defaults }) };
+        let defcount = if f.func_defaults.is_null() { 0 } else { tuple::tuple_len(unsafe { &*f.func_defaults }) }.min(argcount);
         let kwonly_given = (argcount..total_named).filter(|&i| !slots[i].is_null()).count();
         let plural = |n: usize| if n == 1 { "" } else { "s" };
         let takes = if defcount > 0 {
@@ -317,6 +317,8 @@ pub fn bind_arguments(func: &PyObject, frame: &mut Frame, args: &[*mut PyObject]
     // defaults for positional
     if nargs < argcount {
         let defs = if f.func_defaults.is_null() { &[][..] } else { tuple::tuple_items(unsafe { &*f.func_defaults }) };
+        // more defaults than parameters: the surplus leading ones are ignored
+        let defs = &defs[defs.len().saturating_sub(argcount)..];
         let first_default = argcount - defs.len();
         let mut missing: Vec<String> = Vec::new();
         for i in nargs..argcount {

@@ -363,6 +363,73 @@ pub fn new_code_from_unit(cu: &CodeUnit, filename: Option<&PyRef>) -> PyResult {
     new_code_from_parts(parts)
 }
 
+/// Convert a public-form compiler constant into an object.
+pub fn wconst_to_obj(c: &rpy_compiler::wordcode::Constant, filename: &PyRef) -> PyResult {
+    use rpy_compiler::wordcode::Constant as C;
+    Ok(match c {
+        C::None => none::none_ref(),
+        C::Bool(b) => crate::types::bool_::new_bool(*b),
+        C::Ellipsis => none::ellipsis().to_ref(),
+        C::Int(i) => int::new_int(*i),
+        C::BigInt { neg, decimal } => crate::types::int_methods::from_decimal_str(*neg, decimal)?,
+        C::Float(f) => crate::types::float::new_float(*f),
+        C::Complex { real, imag } => crate::types::complex::new_complex(*real, *imag),
+        C::Str(cps) => pystr::intern(pystr::from_codepoints(cps)),
+        C::Bytes(b) => bytes::new_bytes(b),
+        C::Tuple(items) => {
+            let mut v = Vec::with_capacity(items.len());
+            for it in items {
+                v.push(wconst_to_obj(it, filename)?);
+            }
+            tuple::new_tuple(v)
+        }
+        C::FrozenSet(items) => {
+            let mut v = Vec::with_capacity(items.len());
+            for it in items {
+                v.push(wconst_to_obj(it, filename)?);
+            }
+            crate::types::set::new_frozenset_from_vec(v)?
+        }
+        C::Slice(parts) => {
+            let a = wconst_to_obj(&parts[0], filename)?;
+            let b = wconst_to_obj(&parts[1], filename)?;
+            let s = wconst_to_obj(&parts[2], filename)?;
+            crate::types::slice::new_slice(&a, &b, &s)
+        }
+        C::Code(co) => new_code_from_wordcode(co, Some(filename))?,
+    })
+}
+
+/// Build a (public-form) code object from the compiler's wordcode output.
+pub fn new_code_from_wordcode(co: &rpy_compiler::wordcode::CodeObject, filename: Option<&PyRef>) -> PyResult {
+    let filename = match filename {
+        Some(f) => f.clone(),
+        None => pystr::intern_str(&co.filename),
+    };
+    let mut consts = Vec::with_capacity(co.consts.len());
+    for c in &co.consts {
+        consts.push(wconst_to_obj(c, &filename)?);
+    }
+    new_code_from_public(PublicParts {
+        argcount: co.argcount as i32,
+        posonlyargcount: co.posonlyargcount as i32,
+        kwonlyargcount: co.kwonlyargcount as i32,
+        stacksize: co.stacksize as i32,
+        flags: co.flags as i32,
+        firstlineno: co.firstlineno as i32,
+        code: bytes::new_bytes(&co.code),
+        consts,
+        names: co.names.iter().map(|n| pystr::intern_str(n)).collect(),
+        localsplusnames: co.localsplusnames.iter().map(|n| pystr::intern_str(n)).collect(),
+        kinds: co.localspluskinds.clone(),
+        filename,
+        name: pystr::intern_str(&co.name),
+        qualname: pystr::intern_str(&co.qualname),
+        linetable: bytes::new_bytes(&co.linetable),
+        exceptiontable: bytes::new_bytes(&co.exceptiontable),
+    })
+}
+
 /// Everything a legacy code object is made of, with the object-valued parts already built
 /// (used by the compiler path above and by marshal, which reads objects directly).
 pub struct CodeParts {
