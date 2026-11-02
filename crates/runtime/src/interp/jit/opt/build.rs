@@ -1382,6 +1382,22 @@ impl<'a> B<'a> {
         Ok(false)
     }
 
+    /// Branch(Test(r)) on the flag of a SetCond(r, c) emitted just before (nothing
+    /// in between, r used by nothing else) -> Branch(c).
+    fn fuse_branch(&mut self) {
+        let b = &mut self.f.blocks[self.cur as usize];
+        if let Term::Branch(Cond::Test(r, Opnd::V(r2), cc), t, e) = b.term.clone() {
+            if r == r2 && matches!(cc, Cc::NE | Cc::E) {
+                if let Some(Inst::SetCond(d, c)) = b.insts.last().cloned() {
+                    if d == r {
+                        b.insts.pop();
+                        b.term = if cc == Cc::NE { Term::Branch(c, t, e) } else { Term::Branch(c, e, t) };
+                    }
+                }
+            }
+        }
+    }
+
     fn peek_ptr_if_inframe(&mut self, n: usize) {
         if let AV::InFrame(_) = self.peek(n) {
             self.peek_ptr(n);
@@ -1397,6 +1413,7 @@ impl<'a> B<'a> {
         let fl = self.edge(fb);
         let c2 = Cond::Test(r, Opnd::V(r), if on_true { Cc::NE } else { Cc::E });
         self.term(Term::Branch(c2, tl, fl));
+        self.fuse_branch();
     }
 
     /// Value of a LoadGlobal folded into a constant: the current value of the name in
@@ -1642,6 +1659,7 @@ impl<'a> B<'a> {
                     let fl = self.edge(fb);
                     let c2 = Cond::Test(r, Opnd::V(r), if n.op == Op::PopJumpIfTrue { Cc::NE } else { Cc::E });
                     self.term(Term::Branch(c2, tl, fl));
+                    self.fuse_branch();
                     return Ok(true);
                 }
             }

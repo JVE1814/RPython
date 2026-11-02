@@ -225,7 +225,27 @@ impl<'a, 'b> Cg<'a, 'b> {
 
     // ------------------------------------------------------------ conditions
     /// Emit code jumping to `t` iff `c` holds.
+    /// Emit the flags of an integer condition; returns its condition code (None for
+    /// float compares and flag tests, which need branches).
+    fn int_flags(&mut self, c: &Cond) -> Option<Cc> {
+        match *c {
+            Cond::Cmp(..) | Cond::Cmp32(..) | Cond::CmpMem(..) | Cond::CmpMem32(..) | Cond::Test(..) => {
+                Some(self.cmp_only(c))
+            }
+            _ => None,
+        }
+    }
+
     fn jump_if(&mut self, c: &Cond, t: Label) {
+        if let Some(cc) = self.int_flags(c) {
+            self.a().jcc(cc, t);
+            return;
+        }
+        self.jump_if_float(c, t)
+    }
+
+    /// Compare instruction(s) of an integer condition (flags set), its condition code.
+    fn cmp_only(&mut self, c: &Cond) -> Cc {
         match *c {
             Cond::Cmp(a, b, cc) | Cond::Cmp32(a, b, cc) => {
                 let w64 = matches!(c, Cond::Cmp(..));
@@ -246,7 +266,7 @@ impl<'a, 'b> Cg<'a, 'b> {
                         }
                     }
                 }
-                self.a().jcc(cc, t);
+                cc
             }
             Cond::CmpMem(bs, off, imm, cc) | Cond::CmpMem32(bs, off, imm, cc) => {
                 let w64 = matches!(c, Cond::CmpMem(..));
@@ -265,7 +285,7 @@ impl<'a, 'b> Cg<'a, 'b> {
                         self.a().cmp32_mr(M(rb, off), R11)
                     }
                 }
-                self.a().jcc(cc, t);
+                cc
             }
             Cond::Test(a, b, cc) => {
                 let ra = self.gr(a, R10);
@@ -273,8 +293,15 @@ impl<'a, 'b> Cg<'a, 'b> {
                     Ok(rb) => self.a().test_rr(ra, rb),
                     Err(i) => self.a().test_ri(ra, i),
                 }
-                self.a().jcc(cc, t);
+                cc
             }
+            _ => unreachable!("not an integer condition"),
+        }
+    }
+
+    /// Branch on a float compare / flag test.
+    fn jump_if_float(&mut self, c: &Cond, t: Label) {
+        match *c {
             Cond::FCmp(a, b, cc) => {
                 let xa = self.xr(a, XS0);
                 let xb = self.xr(b, XS1);
@@ -314,6 +341,7 @@ impl<'a, 'b> Cg<'a, 'b> {
                 self.a().cmp8_mi(M(R10, 0), 0);
                 self.a().jcc(Cc::NE, t);
             }
+            _ => unreachable!(),
         }
     }
 
@@ -552,16 +580,10 @@ impl<'a, 'b> Cg<'a, 'b> {
                         self.a().bind(done);
                     }
                     _ => {
-                        // flags from the compare, then setcc (r may be an operand:
-                        // setcc writes after the compare)
-                        let yes = self.a().label();
-                        let done = self.a().label();
-                        self.jump_if(c, yes);
-                        self.a().mov_ri(r, 0);
-                        self.a().jmp(done);
-                        self.a().bind(yes);
-                        self.a().mov_ri(r, 1);
-                        self.a().bind(done);
+                        // flags from the compare, then setcc + zero extension (r may be
+                        // an operand: setcc writes after the compare)
+                        let cc = self.cmp_only(c);
+                        self.a().setcc(cc, r);
                     }
                 }
                 self.put(*d, r);
