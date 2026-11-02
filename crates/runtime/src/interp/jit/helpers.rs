@@ -1034,3 +1034,30 @@ pub unsafe extern "C" fn h_load_super_attr(sp: *mut *mut PyObject, arg: u64, nam
         })
     }
 }
+
+// ------------------------------------------------------------------ shared instructions
+
+/// Instructions implemented once in `eval::exec_misc` (exception handlers, with,
+/// async iteration, imports, pattern matching, ...). `oparg` = op | arg << 8; the
+/// value stack ends at `sp`. On error the stack is cut back to `err_top` (absolute
+/// slot index: the depth tier-1 code reports to the unwinder), releasing whatever the
+/// instruction left above it.
+pub unsafe extern "C" fn h_misc(ts: *const ThreadState, f: *mut Frame, sp: *mut *mut PyObject, oparg: u64, err_top: u64) -> u64 {
+    unsafe {
+        let f = &mut *f;
+        f.stack_top = sp.offset_from(f.slots.as_ptr()) as usize;
+        let op = bc::Op::from_u8((oparg & 0xff) as u8);
+        let cd = &*(crate::types::code::code_data(f.code()) as *const crate::types::code::CodeData);
+        match eval::exec_misc(&*ts, f, cd, op, (oparg >> 8) as u32) {
+            Ok(()) => OK,
+            Err(_) => {
+                let e = err_top as usize;
+                while f.stack_top > e {
+                    f.stack_top -= 1;
+                    xdecref(std::mem::replace(&mut f.slots[f.stack_top], std::ptr::null_mut()));
+                }
+                ERR
+            }
+        }
+    }
+}

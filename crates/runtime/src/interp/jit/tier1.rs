@@ -799,6 +799,25 @@ impl<'a> Gen<'a> {
                 let name = self.cd.names[(arg >> 2) as usize].as_ptr() as i64;
                 self.helper_sp(&ins, d, addr!(h::h_load_super_attr), Some(arg as i64), Some(name), d - 3);
             }
+            // instructions shared with the interpreter (eval::exec_misc)
+            op if crate::interp::eval::is_misc(op) => {
+                let pops = match op {
+                    Op::LoadFromDictOrDeref | Op::LoadFromDictOrGlobals | Op::GetAiter | Op::GetAwaitable => 1,
+                    Op::PushExcInfo | Op::PopExcept | Op::CheckExcMatch | Op::BeforeWith | Op::BeforeAsyncWith => 1,
+                    Op::EndAsyncFor | Op::CheckEgMatch | Op::ImportName | Op::BuildTemplate => 2,
+                    Op::BuildInterpolation => 2 + (arg & 1) as i32,
+                    Op::CleanupThrow | Op::MatchClass => 3,
+                    _ => 0,
+                };
+                self.set_lasti(pc);
+                self.a.mov_rr(Rdi, R13);
+                self.a.mov_rr(Rsi, Rbx);
+                self.lea_sp(Rdx, d);
+                self.a.mov_ri(Rcx, op as i64 | (arg as i64) << 8);
+                self.a.mov_ri(R8, (self.nlp + d - pops) as i64);
+                self.call(addr!(h::h_misc));
+                self.check(pc, d - pops);
+            }
             // everything else runs in the interpreter
             _ => self.deopt(ins.start, d),
         }
