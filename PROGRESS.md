@@ -45,7 +45,9 @@ our interpreter; `import numpy` works (array math, linalg, fft, datetime64); num
 Blockers being fixed (numpy workstream): Cython code objects (numpy.random), C-created frame f_locals.
 
 ## Regression suite
-Reference (CPython 3.15.2 free-threaded, this machine, tools/run_tests.sh):
+Reference after the D21 rebuild (zstd + Tk; still no _decimal), ft: 414 PASS, 20 FAIL; tests run 51,220, failures 24,
+skipped 3,276 (/opt/baseline/results/ft2). Default-build re-run: /opt/baseline/results/default2.
+Original Reference (CPython 3.15.2 free-threaded, this machine, tools/run_tests.sh):
 434 modules: 416 PASS, 18 FAIL; tests run 50,649, failures 24, skipped 3,371.
 (tools/baseline_ft_results.tsv). Default-build reference: 416 PASS, 18 FAIL; run 50,576, failures 24, skipped 3,353.
 
@@ -56,6 +58,7 @@ Ours (tools/run_tests.sh, 434 modules):
 | 2 | 819c1f4 | 143 | 284 | 3 | 3 | 7,594 | 900 | 695 |
 | 3 | d8d869f | 158 | 266 | 6 | 4 | 14,157 | 1,195 | 892 |
 | 4 | 30f8658 | 208 | 215 | 6 | 4 | 23,987 | 1,165 | 1,632 |
+| 5 | b578bf8 | 250 | 174 | 6 | 4 | 40,734 | 1,294 | 2,549 |
 Run 3 top blockers: array (39 modules), http (21), urllib (12), multiprocessing (11),
 importlib.resources (11), datetime (11), concurrent (9), xml/email (7 each), html (6).
 Run 1 top blockers: py_compile (230 modules; merged since), unittest.mock (57), doctest (24),
