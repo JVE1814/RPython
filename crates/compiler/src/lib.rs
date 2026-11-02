@@ -17,6 +17,7 @@ pub mod fold;
 pub mod symtable;
 pub mod unparse;
 pub mod validate;
+pub mod wordcode;
 
 pub use error::{CompileError, ErrorKind, Warning, WarningCategory};
 
