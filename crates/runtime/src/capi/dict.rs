@@ -13,6 +13,27 @@ unsafe fn chk<'a>(o: *mut PyObject) -> PyResult<&'a PyObject> {
         Ok(&*o)
     }
 }
+fn is_any_dict(o: &PyObject) -> bool {
+    dict::is_dict(o) || crate::types::frozendict::is_frozendict(o)
+}
+/// dict or frozendict (PyAnyDict_Check): accepted by the read-only functions.
+unsafe fn chk_any<'a>(o: *mut PyObject) -> PyResult<&'a PyObject> {
+    unsafe {
+        if o.is_null() || !(dict::is_dict(&*o) || crate::types::frozendict::is_frozendict(&*o)) {
+            return Err(bad_internal());
+        }
+        Ok(&*o)
+    }
+}
+/// A dict to modify; a frozendict gets the TypeError the item operations raise.
+unsafe fn chk_mut<'a>(o: *mut PyObject, what: &str) -> PyResult<&'a PyObject> {
+    unsafe {
+        if !o.is_null() && crate::types::frozendict::is_frozendict(&*o) {
+            return Err(type_error(&format!("frozendict object does not support item {}", what)));
+        }
+        chk(o)
+    }
+}
 unsafe fn key_str(k: *const c_char) -> PyResult {
     unsafe { Ok(pystr::intern(cstr_obj(k)?)) }
 }
@@ -43,17 +64,22 @@ pub unsafe extern "C" fn PyFrozenDict_New(it: *mut PyObject) -> *mut PyObject {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyDict_GetItem(o: *mut PyObject, k: *mut PyObject) -> *mut PyObject {
     unsafe {
-        if o.is_null() || !dict::is_dict(&*o) {
+        if o.is_null() || !is_any_dict(&*o) {
             return std::ptr::null_mut();
         }
         let saved = take_exc();
-        let r = match dict::get_item(&*o, &*k) {
+        let r = match ab::hash(&*k).and_then(|h| dict::get_item_hash(&*o, &*k, h)) {
             Ok(Some(v)) => {
                 let p = v.as_ptr();
                 drop(v); // borrowed: the dict keeps it alive
                 p
             }
-            _ => std::ptr::null_mut(),
+            Ok(None) => std::ptr::null_mut(),
+            Err(_) => {
+                // the error cannot be returned: it is reported like any ignored exception
+                crate::modules::sys_full::write_unraisable(Some("Exception ignored in PyDict_GetItem()"), None);
+                std::ptr::null_mut()
+            }
         };
         clear_exc();
         if let Some(e) = saved {
@@ -65,7 +91,7 @@ pub unsafe extern "C" fn PyDict_GetItem(o: *mut PyObject, k: *mut PyObject) -> *
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyDict_GetItemWithError(o: *mut PyObject, k: *mut PyObject) -> *mut PyObject {
     unsafe {
-        let Ok(d) = chk(o) else { return std::ptr::null_mut() };
+        let Ok(d) = chk_any(o) else { return std::ptr::null_mut() };
         match dict::get_item(d, &*k) {
             Ok(Some(v)) => {
                 let p = v.as_ptr();
@@ -79,7 +105,7 @@ pub unsafe extern "C" fn PyDict_GetItemWithError(o: *mut PyObject, k: *mut PyObj
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _PyDict_GetItem_KnownHash(o: *mut PyObject, k: *mut PyObject, h: Py_hash_t) -> *mut PyObject {
     unsafe {
-        let Ok(d) = chk(o) else { return std::ptr::null_mut() };
+        let Ok(d) = chk_any(o) else { return std::ptr::null_mut() };
         match dict::get_item_hash(d, &*k, h) {
             Ok(Some(v)) => {
                 let p = v.as_ptr();
@@ -96,7 +122,10 @@ pub unsafe extern "C" fn PyDict_GetItemString(o: *mut PyObject, k: *const c_char
         let saved = take_exc();
         let r = match key_str(k) {
             Ok(key) => PyDict_GetItem(o, key.as_ptr()),
-            Err(_) => std::ptr::null_mut(),
+            Err(_) => {
+                crate::modules::sys_full::write_unraisable(Some("Exception ignored in PyDict_GetItemString()"), None);
+                std::ptr::null_mut()
+            }
         };
         clear_exc();
         if let Some(e) = saved {
@@ -118,7 +147,7 @@ pub unsafe extern "C" fn _PyDict_GetItemStringWithError(o: *mut PyObject, k: *co
 pub unsafe extern "C" fn PyDict_GetItemRef(o: *mut PyObject, k: *mut PyObject, result: *mut *mut PyObject) -> c_int {
     unsafe {
         *result = std::ptr::null_mut();
-        if o.is_null() || !dict::is_dict(&*o) {
+        if o.is_null() || chk_any(o).is_err() {
             let _ = bad_internal();
             return -1;
         }
@@ -145,7 +174,7 @@ pub unsafe extern "C" fn PyDict_GetItemStringRef(o: *mut PyObject, k: *const c_c
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyDict_SetItem(o: *mut PyObject, k: *mut PyObject, v: *mut PyObject) -> c_int {
     unsafe {
-        let Ok(d) = chk(o) else { return -1 };
+        let Ok(d) = chk_mut(o, "assignment") else { return -1 };
         if k.is_null() || v.is_null() {
             let _ = bad_internal();
             return -1;
@@ -165,7 +194,7 @@ pub unsafe extern "C" fn PyDict_SetItemString(o: *mut PyObject, k: *const c_char
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyDict_DelItem(o: *mut PyObject, k: *mut PyObject) -> c_int {
     unsafe {
-        let Ok(d) = chk(o) else { return -1 };
+        let Ok(d) = chk_mut(o, "deletion") else { return -1 };
         match dict::del_item(d, &*k) {
             Ok(true) => 0,
             Ok(false) => {
@@ -188,7 +217,7 @@ pub unsafe extern "C" fn PyDict_DelItemString(o: *mut PyObject, k: *const c_char
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyDict_Contains(o: *mut PyObject, k: *mut PyObject) -> c_int {
     unsafe {
-        let Ok(d) = chk(o) else { return -1 };
+        let Ok(d) = chk_any(o) else { return -1 };
         ret_b(dict::contains(d, &*k))
     }
 }
@@ -214,7 +243,7 @@ pub unsafe extern "C" fn PyDict_Clear(o: *mut PyObject) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyDict_Size(o: *mut PyObject) -> Py_ssize_t {
     unsafe {
-        match chk(o) {
+        match chk_any(o) {
             Ok(d) => dict::dict_len(d) as Py_ssize_t,
             Err(_) => -1,
         }
@@ -231,7 +260,7 @@ pub unsafe extern "C" fn PyDict_Copy(o: *mut PyObject) -> *mut PyObject {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyDict_Next(o: *mut PyObject, pos: *mut Py_ssize_t, key: *mut *mut PyObject, value: *mut *mut PyObject) -> c_int {
     unsafe {
-        if o.is_null() || !dict::is_dict(&*o) {
+        if o.is_null() || !is_any_dict(&*o) {
             return 0;
         }
         let t = dict::table(&*o);
@@ -257,21 +286,21 @@ pub unsafe extern "C" fn PyDict_Next(o: *mut PyObject, pos: *mut Py_ssize_t, key
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyDict_Keys(o: *mut PyObject) -> *mut PyObject {
     unsafe {
-        let Ok(d) = chk(o) else { return std::ptr::null_mut() };
+        let Ok(d) = chk_any(o) else { return std::ptr::null_mut() };
         list::new_list(dict::keys_vec(d)).into_raw()
     }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyDict_Values(o: *mut PyObject) -> *mut PyObject {
     unsafe {
-        let Ok(d) = chk(o) else { return std::ptr::null_mut() };
+        let Ok(d) = chk_any(o) else { return std::ptr::null_mut() };
         list::new_list(dict::items_vec(d).into_iter().map(|(_, v)| v).collect()).into_raw()
     }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyDict_Items(o: *mut PyObject) -> *mut PyObject {
     unsafe {
-        let Ok(d) = chk(o) else { return std::ptr::null_mut() };
+        let Ok(d) = chk_any(o) else { return std::ptr::null_mut() };
         list::new_list(dict::items_vec(d).into_iter().map(|(k, v)| tuple::tuple2(k, v)).collect()).into_raw()
     }
 }
@@ -279,7 +308,7 @@ pub unsafe extern "C" fn PyDict_Items(o: *mut PyObject) -> *mut PyObject {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyDict_Merge(a: *mut PyObject, b: *mut PyObject, over: c_int) -> c_int {
     unsafe {
-        let Ok(d) = chk(a) else { return -1 };
+        let Ok(d) = chk_mut(a, "assignment") else { return -1 };
         if b.is_null() {
             let _ = bad_internal();
             return -1;
@@ -326,7 +355,7 @@ pub unsafe extern "C" fn PyDict_Update(a: *mut PyObject, b: *mut PyObject) -> c_
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyDict_MergeFromSeq2(a: *mut PyObject, seq: *mut PyObject, over: c_int) -> c_int {
     unsafe {
-        let Ok(d) = chk(a) else { return -1 };
+        let Ok(d) = chk_mut(a, "assignment") else { return -1 };
         let r = (|| -> PyResult<()> {
             let it = ab::get_iter(&*seq)?;
             let mut i = 0usize;
@@ -379,7 +408,7 @@ pub unsafe extern "C" fn PyDict_SetDefaultRef(o: *mut PyObject, k: *mut PyObject
         if !result.is_null() {
             *result = std::ptr::null_mut();
         }
-        let Ok(d) = chk(o) else { return -1 };
+        let Ok(d) = chk_mut(o, "assignment") else { return -1 };
         match dict::get_item(d, &*k) {
             Ok(Some(v)) => {
                 if !result.is_null() {
@@ -406,7 +435,10 @@ pub unsafe extern "C" fn PyDict_Pop(o: *mut PyObject, k: *mut PyObject, result: 
         if !result.is_null() {
             *result = std::ptr::null_mut();
         }
-        let Ok(d) = chk(o) else { return -1 };
+        let Ok(d) = chk_mut(o, "deletion") else { return -1 };
+        if dict::dict_len(d) == 0 {
+            return 0; // nothing to remove: the key is not even hashed
+        }
         match dict::get_item(d, &*k) {
             Ok(Some(v)) => {
                 if dict::del_item(d, &*k).is_err() {

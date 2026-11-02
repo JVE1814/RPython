@@ -629,6 +629,14 @@ pub fn fixup_slots_new_type(tp: *mut PyTypeObject) {
                 }
             }
             if !fallback {
+                // tp_hash and tp_richcompare are inherited only as a pair (inherit_slots), so
+                // a class defining just one of them must look the other up along the MRO
+                // (a subclass with its own __hash__ keeps its base's comparisons)
+                for (a, b) in [(Slot::TpHash, Slot::TpRichcompare), (Slot::TpRichcompare, Slot::TpHash)] {
+                    if todo.contains(&a) && !todo.contains(&b) {
+                        todo.push(b);
+                    }
+                }
                 for s in todo {
                     update_one_slot(tp, s);
                 }
