@@ -32,7 +32,10 @@ fn frame_obj(p: &PyObject) -> &PyObject {
 
 fn frame(p: &PyObject) -> PyResult<&mut Frame> {
     match frame_of(frame_obj(p)) {
-        Some(f) => Ok(f),
+        Some(f) => {
+            crate::interp::jit::opt::sync_frame(f as *mut Frame); // jit: unboxed locals of tier-2 code
+            Ok(f)
+        }
         None => raise!(RuntimeError, "frame has been cleared"),
     }
 }
