@@ -51,8 +51,13 @@ Branch: `worktree-agent-acb5abd1545c1e9ca` (commits prefixed `tk:`).
     expect the 3.15 AttributeError hint "Did you mean '.real' instead of
     '.reel'?"; our traceback/excepthook print "Did you mean '.real'?"
     (runtime + Lib/traceback.py, not this workstream).
-- test_idle with `-u gui` under Xvfb: run per module (see below); most
-  modules pass.
+- test_idle with a display (Xvfb, per module): all modules pass except
+  the failures above, help_about's license printer (see below) and 10
+  ShellSidebarTest tests: they check the shell right after one short
+  mainloop turn, but a statement's round trip to our user process takes
+  ~95 ms (the subprocess's queue wait does not wake promptly), so the
+  output/prompt is not there yet.  The prompt bookkeeping itself is
+  correct when checked after the output arrives.
 
 ## Missing / known problems
 
