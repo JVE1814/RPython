@@ -421,7 +421,7 @@ fn const_size(c: &Constant) -> usize {
     }
 }
 
-fn fold_binop(op: Operator, a: &Constant, b: &Constant) -> Option<Constant> {
+pub(crate) fn fold_binop(op: Operator, a: &Constant, b: &Constant) -> Option<Constant> {
     if let (Some(x), Some(y)) = (num_of(a), num_of(b)) {
         // bool & bool, bool | bool, bool ^ bool stay bool
         if let (Constant::Bool(p), Constant::Bool(q)) = (a, b) {
@@ -510,7 +510,7 @@ fn repeat(seq: &Constant, n: i128) -> Option<Constant> {
     }
 }
 
-fn fold_unary(op: UnaryOp, c: &Constant) -> Option<Constant> {
+pub(crate) fn fold_unary(op: UnaryOp, c: &Constant) -> Option<Constant> {
     match op {
         UnaryOp::Not => crate::codegen::const_truth(c).map(|t| Constant::Bool(!t)),
         UnaryOp::USub => match c {

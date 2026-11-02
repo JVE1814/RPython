@@ -12,6 +12,7 @@ pub use rpy_parser::ast;
 
 mod assemble;
 mod codegen;
+pub(crate) mod wc;
 pub mod dis;
 pub mod fold;
 pub mod symtable;
@@ -136,5 +137,13 @@ pub fn optimize_ast(module: &mut ast::Mod, optimize: i32, flags: u32) -> Result<
 pub fn validate_ast(module: &ast::Mod) -> Result<(), CompileError> {
     validate::validate_positions(module)
 }
+
+/// Compile to the public CPython 3.15 code format (D24). Transitional: the runtime still
+/// executes [`compile`]'s legacy output; see notes/bytecode.md.
+pub fn compile_wordcode(module: &ast::Mod, opts: &CompileOptions) -> Result<wc::WordcodeOutput, CompileError> {
+    wc::compile_module(module, opts)
+}
+
+pub use wc::WordcodeOutput;
 
 include!(concat!(env!("OUT_DIR"), "/bytecode_hash.rs"));
