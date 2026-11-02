@@ -420,6 +420,11 @@ fn resolve_name(nm: &str, globals: Option<&PyObject>, level: i64) -> PyResult<St
         _ => match spec.filter(|s| !s.is(none::none())) {
             Some(s) => pystr::to_string_lossy(&*ab::getattr(&s, name!("parent"))?),
             None => {
+                crate::modules::warnings::warn(
+                    crate::types::exceptions::ImportWarning(),
+                    "can't resolve package from __spec__ or __package__, falling back on __name__ and __path__",
+                    1,
+                )?;
                 let n = match dict::get_item_str(g, name!("__name__")) {
                     Some(n) => n,
                     None => raise!(KeyError, "'__name__' not in globals"),

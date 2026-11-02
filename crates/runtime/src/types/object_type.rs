@@ -139,7 +139,14 @@ pub unsafe extern "C" fn object_richcompare(a: *mut PyObject, b: *mut PyObject, 
                             Err(_) => std::ptr::null_mut(),
                         }
                     }
-                    None => none::not_implemented().to_ref().into_raw(),
+                    // no comparison of its own: object's identity __eq__ applies
+                    None => {
+                        if a == b {
+                            crate::types::bool_::new_bool(false).into_raw()
+                        } else {
+                            none::not_implemented().to_ref().into_raw()
+                        }
+                    }
                 }
             }
             _ => none::not_implemented().to_ref().into_raw(),
@@ -714,10 +721,18 @@ fn type_set_bases(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         for b in tuple::tuple_items(&*old_bases) {
             remove_subclass(as_type(b), tp);
         }
-        (*tp).tp_bases = v.to_ref().into_raw();
+        let ours = v.to_ref().into_raw();
+        (*tp).tp_bases = ours;
         incref(new_base as *mut PyObject);
         (*tp).tp_base = new_base;
         let r = mro_internal(tp);
+        if r.is_err() && (*tp).tp_bases != ours {
+            // a re-entrant __bases__ assignment (from mro()) replaced ours and
+            // released the references we had installed: keep its result
+            decref(old_bases);
+            decref(old_base as *mut PyObject);
+            return r;
+        }
         if r.is_err() {
             let nb = (*tp).tp_bases;
             (*tp).tp_bases = old_bases;
@@ -777,6 +792,8 @@ fn type_get_module(o: &PyObject) -> PyResult {
 fn type_set_module(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     check_set_special(o, v, "__module__")?;
     crate::types::slots::type_modified(t(o));
+    // the first line number belongs to the original module
+    dict::del_item(type_dict(t(o)), name!("__firstlineno__"))?;
     dict::set_item(type_dict(t(o)), name!("__module__"), v.unwrap())
 }
 fn type_get_dict(o: &PyObject) -> PyResult {
@@ -875,9 +892,6 @@ fn type_get_type_params(o: &PyObject) -> PyResult {
 fn type_set_type_params(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     check_set_special(o, v, "__type_params__")?;
     let v = v.unwrap();
-    if !tuple::is_tuple(v) {
-        raise!(TypeError, "__type_params__ must be set to a tuple, not {}", tname(v));
-    }
     crate::types::slots::type_modified(t(o));
     dict::set_item(type_dict(t(o)), name!("__type_params__"), v)
 }
@@ -1056,7 +1070,7 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
     if !tuple::is_tuple(bases) {
         raise!(TypeError, "type.__new__() argument 2 must be tuple, not {}", tname(bases));
     }
-    if !dict::is_dict(ns) {
+    if !dict::is_anydict(ns) {
         raise!(TypeError, "type.__new__() argument 3 must be dict, not {}", tname(ns));
     }
     // metaclass
@@ -1086,7 +1100,19 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
         bases.to_ref()
     };
     let base = best_base(&bases_owned)?;
-    let dict = dict::copy(ns)?;
+    // a dict subclass with its own iteration order (OrderedDict) is copied in
+    // that order
+    let dict = if dict::is_dict_exact(ns) || crate::types::frozendict::is_frozendict(ns) || unsafe { (*ns.type_ptr()).tp_iter } == unsafe { (*dict::dict_type()).tp_iter } {
+        dict::copy(ns)?
+    } else {
+        let d = dict::new_dict();
+        let keys = ab::call_method(ns, name!("keys"), &[])?;
+        for k in ab::collect_iterable(&keys)? {
+            let v = ab::getitem(ns, &k)?;
+            dict::set_item(&d, &k, &v)?;
+        }
+        d
+    };
     let name_s = pystr::to_string_lossy(nm);
     if pystr::as_utf8(nm)?.contains('\0') {
         raise!(ValueError, "type name must not contain null characters");
@@ -1208,7 +1234,8 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
         match dict::get_item_str(&dict, name!("__doc__")) {
             Some(d) => {
                 if pystr::is_str(&d) {
-                    let s = pystr::to_string_lossy(&d);
+                    // tp_doc is UTF-8: a docstring with lone surrogates is an error
+                    let s = pystr::as_utf8(&d)?.to_string();
                     let mut v = s.into_bytes();
                     v.push(0);
                     (*tp).tp_doc = Box::leak(v.into_boxed_slice()).as_ptr() as *const _;

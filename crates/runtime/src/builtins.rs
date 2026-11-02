@@ -373,10 +373,8 @@ fn b_chr(_m: &PyObject, o: &PyObject) -> PyResult {
         Ok(i) => i,
         Err(e) => return Err(e),
     };
-    let c = match int::as_i64(&v) {
-        Some(c) => c,
-        None => raise!(OverflowError, "Python int too large to convert to C int"),
-    };
+    // any int outside the range (however large) is a ValueError
+    let c = int::as_i64(&v).unwrap_or(-1);
     if !(0..=0x10ffff).contains(&c) {
         raise!(ValueError, "chr() arg not in range(0x110000)");
     }
@@ -558,7 +556,7 @@ fn exec_or_eval(args: &[&PyObject], kw: Option<&PyObject>, is_eval: bool) -> PyR
     let globals = globals.filter(|g| !g.is(none::none()));
     let locals = locals.filter(|l| !l.is(none::none()));
     if let Some(g) = globals {
-        if !dict::is_dict(g) {
+        if !dict::is_anydict(g) {
             if is_eval {
                 raise!(TypeError, "globals must be a real dict; try eval(expr, {{}}, mapping)");
             }
@@ -586,6 +584,9 @@ fn exec_or_eval(args: &[&PyObject], kw: Option<&PyObject>, is_eval: bool) -> PyR
         }
     };
     if dict::get_item_str(&g, name!("__builtins__")).is_none() {
+        if !dict::is_dict(&g) {
+            raise!(TypeError, "cannot assign __builtins__ to frozendict globals");
+        }
         // the caller's builtins mapping, as CPython's exec/eval insert it
         dict::set_item(&g, name!("__builtins__"), &crate::interp::current_builtins())?;
     }

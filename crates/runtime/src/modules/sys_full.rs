@@ -434,7 +434,7 @@ fn sys_breakpointhook(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) 
     let hook = match r {
         Ok(h) => h,
         Err(_) => {
-            if exc_matches(crate::types::exceptions::ImportError()) || exc_matches(crate::types::exceptions::AttributeError()) {
+            if exc_matches(crate::types::exceptions::ImportError()) || exc_matches(crate::types::exceptions::AttributeError()) || exc_matches(crate::types::exceptions::ValueError()) {
                 clear_exc();
                 crate::modules::warnings::warn(
                     crate::types::exceptions::RuntimeWarning(),

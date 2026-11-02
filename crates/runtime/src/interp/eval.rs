@@ -592,7 +592,16 @@ pub(super) fn call_intrinsic2(f: &mut Frame, which: u32, a: PyRef, b: PyRef) -> 
     let which: Intrinsic2 = unsafe { std::mem::transmute(which as u8) };
     let _ = f;
     match which {
-        Intrinsic2::PrepReraiseStar => crate::types::exceptiongroup::prep_reraise_star(&a, &b),
+        Intrinsic2::PrepReraiseStar => {
+            let r = crate::types::exceptiongroup::prep_reraise_star(&a, &b)?;
+            // a group made here (the wrapper of a naked exception, or a new
+            // combination) has not been raised yet: its traceback starts at
+            // this frame's except* statement
+            if exc::is_exception_instance(&r) && exc::exc_traceback(&r).is_none() {
+                add_traceback(f, &r);
+            }
+            Ok(r)
+        }
         Intrinsic2::TypeVarWithBound => crate::types::typevar::make_typevar(&a, Some(&b), None, false),
         Intrinsic2::TypeVarWithConstraints => crate::types::typevar::make_typevar(&a, None, Some(&b), false),
         Intrinsic2::SetFunctionTypeParams => {
@@ -780,6 +789,10 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             let n = arg as usize;
                             let func = f.func;
                             if func.is_null() {
+                                // exec(code, closure=...) placed the cells already
+                                if (f.nlocalsplus - n..f.nlocalsplus).all(|i| !f.slots[i].is_null()) {
+                                    continue;
+                                }
                                 return Err(system_error("CopyFreeVars without function"));
                             }
                             let clos = funcobject::func(unsafe { &*func }).func_closure;

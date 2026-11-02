@@ -191,6 +191,8 @@ pub fn call_fast(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwnames:
                 | rpy_compiler::bytecode::co::COROUTINE
                 | rpy_compiler::bytecode::co::ASYNC_GENERATOR)
             != 0
+        // (non-optimized code runs with its globals as locals: interpreter path)
+        || co.co_flags as u32 & rpy_compiler::bytecode::co::OPTIMIZED == 0
         || co.co_kwonlyargcount != 0
         || crate::modules::sys::tracing_active()
     {

@@ -325,10 +325,8 @@ pub fn eg_match(e: &PyObject, t: &PyObject) -> PyResult<(PyRef, PyRef)> {
             return Ok((none::none_ref(), e.to_ref()));
         }
         // naked exception: wrap it
+        // (the wrapper gets its own traceback when it is re-raised)
         let wrapped = create_exception_group("", vec![e.to_ref()])?;
-        if let Some(tb) = exc::exc_traceback(e) {
-            exc::set_exc_traceback(&wrapped, Some(&tb));
-        }
         return Ok((none::none_ref(), wrapped));
     }
     if is_exception_group(e) {

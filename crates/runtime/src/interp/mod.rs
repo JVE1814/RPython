@@ -112,6 +112,11 @@ pub fn call_function(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwna
     let flags = code::code(co).flags();
     // plain calls borrow code/func from the caller (perf-runtime, frame.rs `owns_fc`)
     let mut frame = Frame::new_call(co, func, unsafe { &*f.func_globals }, unsafe { &*f.func_builtins });
+    if flags & bc::co::OPTIMIZED == 0 && frame.locals.is_null() {
+        // a function made from module-level code (FunctionType(compile(...)))
+        // stores its names into its globals
+        frame.locals = unsafe { (*f.func_globals).to_ref().into_raw() };
+    }
     if let Err(e) = bind_arguments(func, &mut frame, args, nargs, kwnames) {
         frame::recycle(frame);
         return Err(e);

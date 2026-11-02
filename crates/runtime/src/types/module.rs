@@ -203,7 +203,12 @@ fn get_dict(o: &PyObject) -> PyResult {
     Ok(module_dict(o))
 }
 fn module_dir(o: &PyObject) -> PyResult {
-    let d = module_dict(o);
+    // through the attribute: a subclass may shadow __dict__
+    let d = ab::getattr(o, name!("__dict__"))?;
+    if !dict::is_dict(&d) {
+        let nm = ab::getattr_opt(o, name!("__name__")).ok().flatten().map(|n| pystr::to_string_lossy(&n)).unwrap_or_else(|| "?".into());
+        raise!(TypeError, "{}.__dict__ is not a dictionary", nm);
+    }
     if let Some(f) = dict::get_item_str(&d, name!("__dir__")) {
         return ab::call(&f, &[]);
     }
