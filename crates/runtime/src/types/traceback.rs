@@ -38,7 +38,10 @@ pub fn new_traceback(next: Option<&PyObject>, frame: &PyObject, lasti_instr: i32
         let t = &mut *(op as *mut PyTracebackObject);
         t.tb_next = next.map_or(std::ptr::null_mut(), |n| n.to_ref().into_raw());
         t.tb_frame = frame.to_ref().into_raw();
-        t.tb_lasti = lasti_instr * 4;
+        t.tb_lasti = match crate::types::frameobject::frame_of(frame) {
+            Some(f) => crate::types::code::lasti_offset(f.code(), lasti_instr as i64) as c_int,
+            None => lasti_instr * 4,
+        };
         t.tb_lineno = lineno;
         crate::gc::track(op);
         PyRef::from_raw(op)

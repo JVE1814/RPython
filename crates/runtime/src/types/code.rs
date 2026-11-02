@@ -71,6 +71,8 @@ pub struct CodeData {
 
 /// Public (CPython 3.15) view of a code object; see [`CodeData::public`].
 pub struct PublicView {
+    /// legacy instruction index -> public byte offset (built on first use)
+    pub lasti_map: std::sync::OnceLock<Vec<u32>>,
     pub code: PyRef,
     pub consts: PyRef,
     pub names: PyRef,
@@ -268,6 +270,7 @@ fn public_view(p: &wc::CodeObject, mut nested: Option<&mut std::vec::IntoIter<Py
         consts.push(public_const_to_obj(c, &mut nested, filename)?);
     }
     Ok(PublicView {
+        lasti_map: std::sync::OnceLock::new(),
         code: bytes::new_bytes(&p.code),
         consts: tuple::new_tuple(consts),
         names: tuple::new_tuple(p.names.iter().map(|n| pystr::intern_str(n)).collect()),
@@ -768,6 +771,7 @@ fn code_replace(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRe
     let r = new_code_from_unit(&cu, None)?;
     if let (true, Some(p)) = (keep_public, d.public.get()) {
         let view = PublicView {
+            lasti_map: std::sync::OnceLock::new(),
             code: p.code.clone(),
             consts: p.consts.clone(),
             names: p.names.clone(),
@@ -798,6 +802,15 @@ fn code_replace(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRe
     }
     Ok(r)
 }
+fn code_varname_from_oparg(o: &PyObject, i: &PyObject) -> PyResult {
+    let d = code_data(o);
+    let k = crate::abstract_::as_i64(i)?;
+    if k < 0 || k as usize >= d.localsplusnames.len() {
+        raise!(IndexError, "tuple index out of range");
+    }
+    Ok(d.localsplusnames[k as usize].clone())
+}
+
 fn code_sizeof(o: &PyObject) -> PyResult {
     let d = code_data(o);
     Ok(int::new_int((std::mem::size_of::<PyCodeObject>() + d.code.len() * 4) as i64))
@@ -842,7 +855,49 @@ pub fn init_types() {
             ("replace", FASTKW, code_replace, "replace($self, /, *, co_argcount=-1, co_posonlyargcount=-1, co_kwonlyargcount=-1,\n        co_nlocals=-1, co_stacksize=-1, co_flags=-1, co_firstlineno=-1,\n        co_code=None, co_consts=None, co_names=None, co_varnames=None,\n        co_freevars=None, co_cellvars=None, co_filename=None, co_name=None,\n        co_qualname=None, co_linetable=None, co_exceptiontable=None)\n--\n\nReturn a copy of the code object with the given fields replaced."),
             ("__replace__", FASTKW, code_replace, "__replace__($self, /, **changes)\n--\n\nReturn a copy of the code object with the given fields replaced."),
             ("__sizeof__", NOARGS, code_sizeof),
+            ("_varname_from_oparg", O, code_varname_from_oparg, "_varname_from_oparg($self, /, oparg)\n--\n\n(internal-only) Return the local variable name for the given oparg."),
         ];
     }
     let _ = std::ptr::null::<c_void>();
+}
+
+/// `f_lasti` / `tb_lasti` for a legacy instruction index: the byte offset of the matching
+/// public instruction when the code object has a public view (transitional, D24: matched by
+/// source position, in order), else the legacy convention (index * 4).
+pub fn lasti_offset(co: &PyObject, legacy_index: i64) -> i64 {
+    if legacy_index < 0 || !is_code(co) {
+        return legacy_index * 4;
+    }
+    let d = code_data(co);
+    let Some(p) = d.public.get() else { return legacy_index * 4 };
+    let map = p.lasti_map.get_or_init(|| build_lasti_map(co, d, p));
+    map.get(legacy_index as usize).map(|&o| o as i64).unwrap_or(legacy_index * 4)
+}
+
+fn build_lasti_map(co: &PyObject, d: &CodeData, p: &PublicView) -> Vec<u32> {
+    let code = bytes::bytes_data(&p.code);
+    let instrs = wc::instructions(code);
+    let pos = public_positions(co, p);
+    let key = |q: &wc::Position| (q.lineno, q.end_lineno, q.col, q.end_col);
+    let pub_keys: Vec<_> =
+        instrs.iter().map(|i| key(&pos.get(i.offset as usize).copied().unwrap_or(wc::Position::NONE))).collect();
+    let n = pub_keys.len();
+    let mut out = Vec::with_capacity(d.locations.len());
+    let mut cursor = 0usize;
+    for l in &d.locations {
+        let lk = if l.lineno == 0 {
+            (None, None, None, None)
+        } else {
+            let opt = |x: u32| if x == u32::MAX { None } else { Some(x) };
+            (Some(l.lineno), Some(l.end_lineno), opt(l.col), opt(l.end_col))
+        };
+        let scan = || (cursor..n).chain(0..cursor.min(n));
+        let found = scan().find(|&j| pub_keys[j] == lk).or_else(|| scan().find(|&j| pub_keys[j].0 == lk.0));
+        let j = found.unwrap_or(cursor.min(n.saturating_sub(1)));
+        if j >= cursor {
+            cursor = j;
+        }
+        out.push(instrs.get(j).map(|i| i.offset * 2).unwrap_or(0));
+    }
+    out
 }

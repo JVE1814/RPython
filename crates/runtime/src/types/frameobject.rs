@@ -189,7 +189,7 @@ fn f_set_lineno(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
 }
 fn f_lasti(o: &PyObject) -> PyResult {
     let f = need(o)?;
-    Ok(int::new_int(f.lasti as i64 * 4))
+    Ok(int::new_int(crate::types::code::lasti_offset(f.code(), f.lasti as i64)))
 }
 fn f_back(o: &PyObject) -> PyResult {
     let f = need(o)?;
