@@ -139,26 +139,10 @@ pub unsafe extern "C" fn PyObject_DelAttr(o: *mut PyObject, n: *mut PyObject) ->
 pub unsafe extern "C" fn PyObject_DelAttrString(o: *mut PyObject, n: *const c_char) -> c_int {
     unsafe { PyObject_SetAttrString(o, n, std::ptr::null_mut()) }
 }
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyObject_GenericGetAttr(o: *mut PyObject, n: *mut PyObject) -> *mut PyObject {
-    unsafe {
-        if !pystr::is_str(&*n) {
-            let _ = type_error(&format!("attribute name must be string, not '{}'", tname(&*n)));
-            return std::ptr::null_mut();
-        }
-        ret(to::generic_getattr(&*o, &*n))
-    }
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyObject_GenericSetAttr(o: *mut PyObject, n: *mut PyObject, v: *mut PyObject) -> c_int {
-    unsafe {
-        if !pystr::is_str(&*n) {
-            let _ = type_error(&format!("attribute name must be string, not '{}'", tname(&*n)));
-            return -1;
-        }
-        ret_i(to::generic_setattr(&*o, &*n, opt(v)))
-    }
-}
+// PyObject_GenericGetAttr / PyObject_GenericSetAttr are object's own tp_getattro /
+// tp_setattro (typeobject.rs), so `tp->tp_getattro == PyObject_GenericGetAttr` holds for
+// ordinary classes as in CPython.
+pub use crate::types::typeobject::{object_generic_getattro as PyObject_GenericGetAttr, object_generic_setattro as PyObject_GenericSetAttr};
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _PyObject_GenericGetAttrWithDict(o: *mut PyObject, n: *mut PyObject, d: *mut PyObject, suppress: c_int) -> *mut PyObject {
     unsafe {

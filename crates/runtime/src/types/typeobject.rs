@@ -246,8 +246,9 @@ pub unsafe fn dict_slot(o: *mut PyObject) -> *mut *mut PyObject {
 pub unsafe fn dict_slot_raw(o: *mut PyObject) -> *mut *mut PyObject {
     unsafe {
         let tp = (*o).type_ptr();
-        if (*tp).tp_flags & Py_TPFLAGS_MANAGED_DICT != 0 && alloc::has_managed(o) {
-            return alloc::managed_dict_slot(o);
+        if (*tp).tp_flags & Py_TPFLAGS_MANAGED_DICT != 0 {
+            // (tp_dictoffset is then the sentinel -1, not an offset)
+            return if alloc::has_managed(o) { alloc::managed_dict_slot(o) } else { std::ptr::null_mut() };
         }
         let off = (*tp).tp_dictoffset;
         if off == 0 {
@@ -419,12 +420,27 @@ pub fn generic_setattr_with_dict(
     }
 }
 
+/// object's tp_getattro, exported as PyObject_GenericGetAttr: extensions compare a type's
+/// tp_getattro with that symbol to detect standard attribute lookup (msgspec, Cython).
+#[unsafe(export_name = "PyObject_GenericGetAttr")]
 pub unsafe extern "C" fn object_generic_getattro(o: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
-    unsafe { into_c(generic_getattr(&*o, &*name)) }
+    unsafe {
+        if !pystr::is_str(&*name) {
+            return into_c(Err(crate::err!(TypeError, "attribute name must be string, not '{}'", tname(&*name))));
+        }
+        into_c(generic_getattr(&*o, &*name))
+    }
 }
 
+/// object's tp_setattro, exported as PyObject_GenericSetAttr (see above).
+#[unsafe(export_name = "PyObject_GenericSetAttr")]
 pub unsafe extern "C" fn object_generic_setattro(o: *mut PyObject, name: *mut PyObject, v: *mut PyObject) -> c_int {
-    unsafe { int_into_c(generic_setattr(&*o, &*name, if v.is_null() { None } else { Some(&*v) })) }
+    unsafe {
+        if !pystr::is_str(&*name) {
+            return int_into_c(Err(crate::err!(TypeError, "attribute name must be string, not '{}'", tname(&*name))));
+        }
+        int_into_c(generic_setattr(&*o, &*name, if v.is_null() { None } else { Some(&*v) }))
+    }
 }
 
 // ---------------------------------------------------------------- allocation
@@ -1005,9 +1021,13 @@ unsafe fn inherit_slots(tp: *mut PyTypeObject, base: *mut PyTypeObject) {
         copyslot!(t, b, tp_repr);
         copyslot!(t, b, tp_call);
         copyslot!(t, b, tp_str);
-        if t.tp_vectorcall_offset == 0 && t.tp_call == b.tp_call && b.tp_flags & Py_TPFLAGS_HAVE_VECTORCALL != 0 && !is_heap_type(tp) {
+        if t.tp_vectorcall_offset == 0 && t.tp_call == b.tp_call && b.tp_flags & Py_TPFLAGS_HAVE_VECTORCALL != 0 {
+            // the offset is inherited with tp_call (PyVectorcall_Call as tp_call reads it); heap
+            // types do not get the flag, so a later `__call__` assignment still takes effect
             t.tp_vectorcall_offset = b.tp_vectorcall_offset;
-            t.tp_flags |= Py_TPFLAGS_HAVE_VECTORCALL;
+            if !is_heap_type(tp) {
+                t.tp_flags |= Py_TPFLAGS_HAVE_VECTORCALL;
+            }
         }
         if t.tp_richcompare.is_none() && t.tp_hash.is_none() {
             let d = &*t.tp_dict;

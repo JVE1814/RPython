@@ -80,7 +80,11 @@ pub unsafe extern "C" fn PyVectorcall_Function(callable: *mut PyObject) -> vecto
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyVectorcall_Call(callable: *mut PyObject, tup: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
     unsafe {
-        let Some(f) = ab::vectorcall_func(&*callable) else {
+        // the slot at tp_vectorcall_offset, even without the type flag (heap subclasses of a
+        // vectorcall type inherit only the offset, e.g. Python subclasses of msgspec's StructMeta)
+        let off = (*callable).ty().tp_vectorcall_offset;
+        let f = if off > 0 { *((callable as *mut u8).offset(off) as *const vectorcallfunc) } else { None };
+        let Some(f) = f else {
             let _ = type_error(&format!("'{}' object does not support vectorcall", tname(&*callable)));
             return std::ptr::null_mut();
         };

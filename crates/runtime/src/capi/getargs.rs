@@ -905,6 +905,10 @@ unsafe fn parse_keywords(args: &[*mut PyObject], kw: Kw, fmt: *const c_char, kwl
         // match keywords
         let mut kwvals: Vec<Option<PyRef>> = vec![None; len];
         let mut used = vec![false; nkw];
+        // a keyword naming a parameter already filled by position is an error only if no
+        // later parameter takes it (a keyword-only parameter may repeat a positional name,
+        // as msgspec's StructMeta.__new__(name, bases, dict, *, ..., dict=...) does)
+        let mut conflict: Vec<Option<(usize, String)>> = vec![None; nkw];
         for i in pos..len {
             let Some(name) = names[i].as_ref() else { continue };
             let Ok(namestr) = std::str::from_utf8(name) else { continue };
@@ -913,14 +917,22 @@ unsafe fn parse_keywords(args: &[*mut PyObject], kw: Kw, fmt: *const c_char, kwl
                     if used[j] {
                         continue;
                     }
-                    used[j] = true;
                     if i < nargs {
-                        let _ = type_error(&format!("argument for {}{} given by name ('{}') and position ({})", fnm, fsuf, namestr, i + 1));
-                        return 0;
+                        if conflict[j].is_none() {
+                            conflict[j] = Some((i, namestr.to_string()));
+                        }
+                        continue;
                     }
+                    used[j] = true;
                     kwvals[i] = Some(val.clone());
                     break;
                 }
+            }
+        }
+        for j in 0..nkw {
+            if let (false, Some((i, n))) = (used[j], &conflict[j]) {
+                let _ = type_error(&format!("argument for {}{} given by name ('{}') and position ({})", fnm, fsuf, n, i + 1));
+                return 0;
             }
         }
         if let Some(j) = used.iter().position(|u| !u) {
