@@ -41,7 +41,8 @@ pub fn allocate(f: &Func) -> Alloc {
     }
     // ---- per-block use/def (uses before defs)
     let mut uses_b: Vec<Vec<V>> = vec![Vec::new(); nb];
-    let mut defs_b: Vec<Vec<bool>> = vec![Vec::new(); nb];
+    let words = nv.div_ceil(64).max(1);
+    let mut defs_b: Vec<Vec<u64>> = vec![Vec::new(); nb];
     let mut u = Vec::new();
     let mut d = Vec::new();
     let snap_uses = |s: Option<SnapId>, out: &mut Vec<V>| {
@@ -49,8 +50,10 @@ pub fn allocate(f: &Func) -> Alloc {
             f.snaps[s as usize].vregs(out);
         }
     };
+    // (per-block scratch: vregs defined so far, cleared via the list of set ones)
+    let mut defined = vec![false; nv];
+    let mut set_list: Vec<V> = Vec::new();
     for b in 0..nb {
-        let mut defined = vec![false; nv];
         let mut ub = Vec::new();
         for ins in &f.blocks[b].insts {
             u.clear();
@@ -63,7 +66,10 @@ pub fn allocate(f: &Func) -> Alloc {
                 }
             }
             for &x in &d {
-                defined[x as usize] = true;
+                if !defined[x as usize] {
+                    defined[x as usize] = true;
+                    set_list.push(x);
+                }
             }
         }
         u.clear();
@@ -77,10 +83,15 @@ pub fn allocate(f: &Func) -> Alloc {
             }
         }
         uses_b[b] = ub;
-        defs_b[b] = defined;
+        let mut bits = vec![0u64; words];
+        for &x in &set_list {
+            bits[x as usize / 64] |= 1 << (x % 64);
+            defined[x as usize] = false;
+        }
+        set_list.clear();
+        defs_b[b] = bits;
     }
     // ---- liveness (bit sets as Vec<u64>)
-    let words = nv.div_ceil(64).max(1);
     let mut live_in = vec![vec![0u64; words]; nb];
     let mut live_out = vec![vec![0u64; words]; nb];
     let succs: Vec<Vec<BlockId>> = f.blocks.iter().map(|b| b.term.succs().into_iter().chain(b.tsuccs.iter().copied()).collect()).collect();
@@ -96,10 +107,8 @@ pub fn allocate(f: &Func) -> Alloc {
                 }
             }
             let mut inn = out.clone();
-            for x in 0..nv {
-                if defs_b[b][x] {
-                    inn[x / 64] &= !(1 << (x % 64));
-                }
+            for w in 0..words {
+                inn[w] &= !defs_b[b][w];
             }
             for &x in &uses_b[b] {
                 inn[x as usize / 64] |= 1 << (x % 64);
@@ -126,12 +135,15 @@ pub fn allocate(f: &Func) -> Alloc {
     for &b in &f.order {
         let bi = b as usize;
         let (start, end) = pos_of_block[bi];
-        for x in 0..nv {
-            if live_in[bi][x / 64] >> (x % 64) & 1 != 0 {
-                ext(x, start, &mut lo, &mut hi);
-            }
-            if live_out[bi][x / 64] >> (x % 64) & 1 != 0 {
-                ext(x, end, &mut lo, &mut hi);
+        // (iterate the set bits only: blocks x vregs is large for big units)
+        for (set, p) in [(&live_in[bi], start), (&live_out[bi], end)] {
+            for (w, &bits) in set.iter().enumerate() {
+                let mut bits = bits;
+                while bits != 0 {
+                    let x = w * 64 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    ext(x, p, &mut lo, &mut hi);
+                }
             }
         }
         let mut p = start;
@@ -168,17 +180,16 @@ pub fn allocate(f: &Func) -> Alloc {
         }
     }
     // ---- linear scan
+    // clobber positions are increasing (blocks in order): binary search
+    let tpl_pos: Vec<u32> = clobbers.iter().filter(|c| c.1).map(|c| c.0).collect();
+    let all_pos: Vec<u32> = clobbers.iter().map(|c| c.0).collect();
+    let in_open = |v: &[u32], a: u32, b: u32| -> bool {
+        let k = v.partition_point(|&p| p <= a);
+        k < v.len() && v[k] < b
+    };
     let crosses = |a: u32, b: u32| -> (bool, bool) {
         // (crosses any clobber, crosses a template)
-        let mut any = false;
-        let mut tpl = false;
-        for &(p, t) in &clobbers {
-            if p > a && p < b {
-                any = true;
-                tpl |= t;
-            }
-        }
-        (any, tpl)
+        (in_open(&all_pos, a, b), in_open(&tpl_pos, a, b))
     };
     let mut order: Vec<usize> = (0..nv).filter(|&x| lo[x] != u32::MAX).collect();
     order.sort_by_key(|&x| lo[x]);
