@@ -131,7 +131,8 @@ pub fn handle_system_exit(e: &PyRef) -> i32 {
     }
     let c = unsafe { &*code };
     if types::int::is_int(c) {
-        return types::int::as_i64(c).unwrap_or(1) as i32;
+        // out of the C int range: -1, as CPython's failed conversion gives
+        return types::int::as_i64(c).and_then(|v| i32::try_from(v).ok()).unwrap_or(-1);
     }
     let s = abstract_::str_string(c).unwrap_or_default();
     modules::sys::write_stderr(&format!("{}\n", s));

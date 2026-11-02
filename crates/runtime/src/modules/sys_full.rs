@@ -514,15 +514,35 @@ fn sys_unraisablehook(_m: &PyObject, a: &PyObject) -> PyResult {
 
 /// PyErr_WriteUnraisable / PyErr_FormatUnraisable implementation.
 pub fn write_unraisable(err_msg: Option<&str>, obj: Option<&PyObject>) {
+    write_unraisable_obj(err_msg.map(pystr::new_str), obj)
+}
+
+/// As write_unraisable, with the message as a str object (None: the hook's
+/// default wording). An exception without a traceback gets one for the current
+/// frame, so that the report says where it happened.
+pub fn write_unraisable_obj(err_msg: Option<PyRef>, obj: Option<&PyObject>) {
     let e = take_exc();
+    if let Some(e) = &e {
+        if crate::types::exceptions::is_exception_instance(e) && crate::types::exceptions::exc_traceback(e).is_none() {
+            let f = crate::interp::current_frame_ptr();
+            if !f.is_null() {
+                unsafe {
+                    let fo = crate::interp::eval::frame_object(&mut *f);
+                    let tb = crate::types::traceback::new_traceback(None, &*fo, (*f).lasti as i32, (*f).lineno());
+                    crate::types::exceptions::set_exc_traceback(e, Some(&tb));
+                }
+            }
+        }
+    }
     let tp = unraisable_args_type();
     let et = e.as_ref().map(|e| crate::types::typeobject::type_ref(e.type_ptr())).unwrap_or_else(none::none_ref);
     let ev = e.clone().unwrap_or_else(none::none_ref);
     let tb = e.as_ref().and_then(|e| crate::types::exceptions::exc_traceback(e)).unwrap_or_else(none::none_ref);
-    let m = err_msg.map(pystr::new_str).unwrap_or_else(none::none_ref);
+    let msg_text = err_msg.as_ref().map(|m| pystr::to_string_lossy(m));
+    let m = err_msg.unwrap_or_else(none::none_ref);
     let o = obj.map(|o| o.to_ref()).unwrap_or_else(none::none_ref);
     if tp.is_null() {
-        crate::modules::sys::write_stderr(&format!("{}\n", err_msg.unwrap_or("Exception ignored")));
+        crate::modules::sys::write_stderr(&format!("{}\n", msg_text.as_deref().unwrap_or("Exception ignored")));
         if let Some(e) = &e {
             crate::modules::traceback_print::print_exception(e);
         }
@@ -1363,7 +1383,7 @@ pub fn populate(d: &PyObject) -> PyResult<()> {
         ),
     )?;
     let ti = ss::make_type("sys.thread_info", &["name", "lock", "version"], 3, false)?;
-    set("thread_info", &ss::new_instance(ti, vec![s("pthread"), s("mutex+cond"), thread_lib_version()]))?;
+    set("thread_info", &ss::new_instance(ti, vec![s("pthread"), s("pymutex"), thread_lib_version()]))?;
     let ua = ss::make_type("UnraisableHookArgs", &["exc_type", "exc_value", "exc_traceback", "err_msg", "object"], 5, false)?;
     UNRAISABLE_ARGS_TYPE.store(ua, Release);
     set("UnraisableHookArgs", crate::types::typeobject::type_obj(ua))?;
