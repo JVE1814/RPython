@@ -57,8 +57,8 @@ const TYPE_DICT: u8 = b'{';
 const TYPE_CODE: u8 = b'c';
 /// Version of the code-object payload layout; part of the pyc magic (`_imp::MAGIC`) so
 /// that caches written by a build with another layout are recompiled, not misread.
-/// 2: location-table line tables (perf2).
-pub const CODE_FORMAT: u32 = 2;
+/// 2: location-table line tables; 3: header + length-prefixed body (lazy loading) (perf2).
+pub const CODE_FORMAT: u32 = 3;
 const TYPE_UNICODE: u8 = b'u';
 const TYPE_UNKNOWN: u8 = b'?';
 const TYPE_SET: u8 = b'<';
@@ -424,19 +424,24 @@ impl Writer {
             codeb.extend_from_slice(&w.to_le_bytes());
         }
         let codeo = bytes::new_bytes(&codeb);
-        self.keep.push(codeo.clone());
-        self.object(&codeo)?;
         unsafe {
-            self.object(&*c.co_consts)?;
-            self.object(&*c.co_names)?;
-            self.object(&*c.co_localsplusnames)?;
             self.object(&*c.co_localspluskinds)?;
             self.object(&*c.co_filename)?;
             self.object(&*c.co_name)?;
             self.object(&*c.co_qualname)?;
             self.long(c.co_firstlineno);
-            self.object(&*c.co_linetable)?;
-            self.object(&*c.co_exceptiontable)?;
+            let doc = code_mod::code(v).docstring().unwrap_or_else(none::none_ref);
+            self.object(&doc)?;
+            // the body: a self-contained stream (own back-references) behind its length
+            let mut w = Writer::new(self.version, self.allow_code, self.depth);
+            w.object(&codeo)?;
+            w.object(&*c.co_consts)?;
+            w.object(&*c.co_names)?;
+            w.object(&*c.co_localsplusnames)?;
+            w.object(&*c.co_linetable)?;
+            w.object(&*c.co_exceptiontable)?;
+            self.size(w.out.len())?;
+            self.out.extend_from_slice(&w.out);
         }
         Ok(())
     }
@@ -516,6 +521,9 @@ struct Reader<'a> {
     refs: Vec<Option<PyRef>>,
     depth: usize,
     allow_code: bool,
+    /// The bytes object the data comes from and the data's offset in it: code bodies
+    /// are then left marshalled until first use (perf2, `code::LazyBody`).
+    lazy: Option<(PyRef, usize)>,
 }
 
 fn bad(what: &str) -> PyErr {
@@ -869,40 +877,125 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
+    /// Code object (format `CODE_FORMAT` 3): header fields, the docstring, then the
+    /// body (bytecode, constants, names, positions) as a self-contained marshal stream
+    /// prefixed by its length, so it can stay marshalled until the code first runs.
     fn read_code(&mut self) -> PyResult<PyRef> {
         let argcount = self.long()?;
         let posonly = self.long()?;
         let kwonly = self.long()?;
         let stacksize = self.long()?;
         let flags = self.long()?;
-        let code = self.object_notnull("object")?;
-        let consts = self.object_notnull("object")?;
-        let names = self.object_notnull("object")?;
-        let lpnames = self.object_notnull("object")?;
         let lpkinds = self.object_notnull("object")?;
         let filename = self.object_notnull("object")?;
         let name = self.object_notnull("object")?;
         let qualname = self.object_notnull("object")?;
         let firstlineno = self.long()?;
-        let linetable = self.object_notnull("object")?;
-        let exctable = self.object_notnull("object")?;
+        let doc = self.object_notnull("object")?;
+        let n = self.long()?;
+        if n < 0 {
+            return Err(bad("invalid code object"));
+        }
+        let n = n as usize;
+        if !bytes::is_bytes(&lpkinds) || !pystr::is_str(&filename) || !pystr::is_str(&name) || !pystr::is_str(&qualname) {
+            return Err(bad("invalid code object"));
+        }
+        if let (Source::Mem { data, pos }, Some((src, base))) = (&mut self.src, &self.lazy) {
+            if data.len() - *pos < n {
+                raise!(EOFError, "marshal data too short");
+            }
+            let off = *base + *pos;
+            *pos += n;
+            let intern1 = |s: &PyObject| if pystr::is_str_exact(s) { pystr::intern(s.to_ref()) } else { pystr::intern_str(&pystr::to_string_lossy(s)) };
+            let kinds = if bytes::is_bytes_exact(&lpkinds) { lpkinds.clone() } else { bytes::new_bytes(bytes::bytes_data(&lpkinds)) };
+            return Ok(code_mod::new_code_lazy(
+                code_mod::LazyHeader {
+                    argcount: argcount as u32,
+                    posonlyargcount: posonly as u32,
+                    kwonlyargcount: kwonly as u32,
+                    flags: flags as u32,
+                    stacksize: stacksize as u32,
+                    firstlineno: firstlineno as u32,
+                    kinds,
+                    filename: filename.clone(),
+                    name: intern1(&name),
+                    qualname: intern1(&qualname),
+                    doc,
+                },
+                code_mod::LazyBody { src: src.clone(), off, len: n, allow_code: self.allow_code },
+            ));
+        }
+        let body = self.read(n)?;
+        let mut r = Reader { src: Source::Mem { data: &body, pos: 0 }, refs: Vec::new(), depth: self.depth + 1, allow_code: self.allow_code, lazy: None };
+        let b = r.body_objects()?;
         build_code(CodeParts {
             argcount,
             posonly,
             kwonly,
             stacksize,
             flags,
-            code: &code,
-            consts: &consts,
-            names: &names,
-            lpnames: &lpnames,
+            code: &b[0],
+            consts: &b[1],
+            names: &b[2],
+            lpnames: &b[3],
             lpkinds: &lpkinds,
             filename: &filename,
             name: &name,
             qualname: &qualname,
             firstlineno,
-            linetable: &linetable,
-            exctable: &exctable,
+            linetable: &b[4],
+            exctable: &b[5],
+        })
+    }
+
+    /// The objects of a code body: bytecode, consts, names, localsplusnames, line
+    /// table, exception table.
+    fn body_objects(&mut self) -> PyResult<[PyRef; 6]> {
+        Ok([
+            self.object_notnull("object")?,
+            self.object_notnull("object")?,
+            self.object_notnull("object")?,
+            self.object_notnull("object")?,
+            self.object_notnull("object")?,
+            self.object_notnull("object")?,
+        ])
+    }
+}
+
+/// Unmarshal the body of lazily loaded code object `o` (see `code::load_body`).
+pub fn read_lazy_body(o: &PyObject, lazy: &code_mod::LazyBody) -> PyResult<code_mod::CodeParts<'static>> {
+    let data = bytes::bytes_data(&lazy.src);
+    if lazy.off + lazy.len > data.len() {
+        return Err(bad("invalid code object"));
+    }
+    let body = &data[lazy.off..lazy.off + lazy.len];
+    let mut r = Reader {
+        src: Source::Mem { data: body, pos: 0 },
+        refs: Vec::new(),
+        depth: 0,
+        allow_code: lazy.allow_code,
+        lazy: Some((lazy.src.clone(), lazy.off)),
+    };
+    let b = r.body_objects()?;
+    let c = unsafe { &*(o.as_ptr() as *const PyCodeObject) };
+    unsafe {
+        body_parts(CodeParts {
+            argcount: c.co_argcount,
+            posonly: c.co_posonlyargcount,
+            kwonly: c.co_kwonlyargcount,
+            stacksize: c.co_stacksize,
+            flags: c.co_flags,
+            code: &b[0],
+            consts: &b[1],
+            names: &b[2],
+            lpnames: &b[3],
+            lpkinds: &*c.co_localspluskinds,
+            filename: &*c.co_filename,
+            name: &*c.co_name,
+            qualname: &*c.co_qualname,
+            firstlineno: c.co_firstlineno,
+            linetable: &b[4],
+            exctable: &b[5],
         })
     }
 }
@@ -998,6 +1091,12 @@ fn no_debug_ranges() -> bool {
 }
 
 fn build_code(p: CodeParts) -> PyResult<PyRef> {
+    code_mod::new_code_from_parts(body_parts(p)?)
+}
+
+/// Validate and convert unmarshalled code-object fields (shared by eager loading and
+/// the lazy body loader).
+fn body_parts(p: CodeParts) -> PyResult<code_mod::CodeParts<'static>> {
     let invalid = || bad("invalid code object");
     if !bytes::is_bytes(p.code) || !bytes::is_bytes(p.lpkinds) || !bytes::is_bytes(p.linetable) || !bytes::is_bytes(p.exctable) {
         return Err(invalid());
@@ -1060,7 +1159,7 @@ fn build_code(p: CodeParts) -> PyResult<PyRef> {
     };
     let consts = if tuple::is_tuple_exact(p.consts) { p.consts.to_ref() } else { tuple::new_tuple(tuple::tuple_to_vec(p.consts)) };
     let intern1 = |s: &PyObject| if pystr::is_str_exact(s) { pystr::intern(s.to_ref()) } else { pystr::intern_str(&pystr::to_string_lossy(s)) };
-    code_mod::new_code_from_parts(code_mod::CodeParts {
+    Ok(code_mod::CodeParts {
         argcount: p.argcount as u32,
         posonlyargcount: p.posonly as u32,
         kwonlyargcount: p.kwonly as u32,
@@ -1083,7 +1182,18 @@ fn build_code(p: CodeParts) -> PyResult<PyRef> {
 
 /// PyMarshal_ReadObjectFromString equivalent.
 pub fn loads_slice(data: &[u8], allow_code: bool) -> PyResult {
-    let mut r = Reader { src: Source::Mem { data, pos: 0 }, refs: Vec::new(), depth: 0, allow_code };
+    let mut r = Reader { src: Source::Mem { data, pos: 0 }, refs: Vec::new(), depth: 0, allow_code, lazy: None };
+    match r.object()? {
+        Some(v) => Ok(v),
+        None => raise!(TypeError, "NULL object in marshal data for object"),
+    }
+}
+
+/// Load from a bytes object; code bodies stay marshalled (referencing `data`) until
+/// they first run.
+pub fn loads_bytes(data: &PyObject, allow_code: bool) -> PyResult {
+    let b = bytes::bytes_data(data);
+    let mut r = Reader { src: Source::Mem { data: b, pos: 0 }, refs: Vec::new(), depth: 0, allow_code, lazy: Some((data.to_ref(), 0)) };
     match r.object()? {
         Some(v) => Ok(v),
         None => raise!(TypeError, "NULL object in marshal data for object"),
@@ -1092,7 +1202,7 @@ pub fn loads_slice(data: &[u8], allow_code: bool) -> PyResult {
 
 /// Load from bytes; also returns the number of bytes consumed.
 pub fn loads_prefix(data: &[u8], allow_code: bool) -> PyResult<(PyRef, usize)> {
-    let mut r = Reader { src: Source::Mem { data, pos: 0 }, refs: Vec::new(), depth: 0, allow_code };
+    let mut r = Reader { src: Source::Mem { data, pos: 0 }, refs: Vec::new(), depth: 0, allow_code, lazy: None };
     let v = match r.object()? {
         Some(v) => v,
         None => raise!(TypeError, "NULL object in marshal data for object"),
@@ -1150,10 +1260,10 @@ fn m_loads(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult
     let allow = parse_allow_code(allow)?;
     let data = data.unwrap();
     if bytes::is_bytes(data) {
-        return loads_slice(bytes::bytes_data(data), allow);
+        return loads_bytes(data, allow);
     }
     let view = crate::buffer::with_buffer(data, |b| b.to_vec())?;
-    loads_slice(&view, allow)
+    loads_bytes(&bytes::new_bytes(&view), allow)
 }
 
 /// Private helper (used by doctest): loads() with column information removed from
@@ -1176,7 +1286,7 @@ fn m_load(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult 
     if !bytes::is_bytes(&data) {
         raise!(TypeError, "file.read() returned not bytes but {}", tname(&data));
     }
-    let mut r = Reader { src: Source::File { file, consumed: 0 }, refs: Vec::new(), depth: 0, allow_code: allow };
+    let mut r = Reader { src: Source::File { file, consumed: 0 }, refs: Vec::new(), depth: 0, allow_code: allow, lazy: None };
     match r.object()? {
         Some(v) => Ok(v),
         None => raise!(TypeError, "NULL object in marshal data for object"),

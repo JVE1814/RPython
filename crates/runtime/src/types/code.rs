@@ -37,8 +37,22 @@ pub struct PyCodeObject {
     pub co_linetable: *mut PyObject,
     pub co_weakreflist: *mut PyObject,
     pub _reserved: [usize; 8],
-    /// Rust side data (owned Box).
+    /// Rust side data (owned Box); null while the body is not loaded yet.
     pub data: *mut CodeData,
+    /// Where to load the body from (perf2: lazily unmarshalled code; owned Box).
+    pub lazy: *mut LazyBody,
+    /// Docstring of a code object whose body is not loaded (owned; else null).
+    pub doc: *mut PyObject,
+}
+
+/// A marshalled code body not unmarshalled yet: most functions of an imported module
+/// never run, so their bytecode, constants and names are only built on first use
+/// (`code_data`). `src` is the bytes object the module was loaded from.
+pub struct LazyBody {
+    pub src: PyRef,
+    pub off: usize,
+    pub len: usize,
+    pub allow_code: bool,
 }
 
 /// Executable representation.
@@ -416,15 +430,67 @@ pub fn is_code(o: &PyObject) -> bool {
 
 pub fn code(o: &PyObject) -> CodeRef<'_> {
     unsafe {
+        let d = code_data(o);
         let c = &*(o.as_ptr() as *const PyCodeObject);
-        let d = &*c.data;
         CodeRef { obj: c, d, co_name: &d.co_name, co_qualname: &d.co_qualname }
     }
 }
 
 #[inline(always)]
 pub fn code_data(o: &PyObject) -> &CodeData {
-    unsafe { &*(*(o.as_ptr() as *const PyCodeObject)).data }
+    unsafe {
+        let p = std::sync::atomic::AtomicPtr::from_ptr(&raw mut (*(o.as_ptr() as *mut PyCodeObject)).data).load(std::sync::atomic::Ordering::Acquire);
+        if !p.is_null() { &*p } else { load_body(o) }
+    }
+}
+
+/// Name, qualified name and docstring without loading a lazy body (function creation).
+pub fn code_name(o: &PyObject) -> PyRef {
+    unsafe { PyRef::from_borrowed((*(o.as_ptr() as *const PyCodeObject)).co_name) }
+}
+pub fn code_qualname(o: &PyObject) -> PyRef {
+    unsafe { PyRef::from_borrowed((*(o.as_ptr() as *const PyCodeObject)).co_qualname) }
+}
+pub fn code_docstring(o: &PyObject) -> Option<PyRef> {
+    unsafe {
+        let c = &*(o.as_ptr() as *const PyCodeObject);
+        if c.data.is_null() {
+            return if c.doc.is_null() { None } else { Some(PyRef::from_borrowed(c.doc)) };
+        }
+    }
+    code(o).docstring()
+}
+
+/// Unmarshal the body of a lazily loaded code object (once; concurrent callers wait).
+#[cold]
+#[inline(never)]
+fn load_body(o: &PyObject) -> &CodeData {
+    unsafe {
+        let c = o.as_ptr() as *mut PyCodeObject;
+        let _g = crate::types::dict::ob_lock(o);
+        if (*c).data.is_null() {
+            let lazy = (*c).lazy;
+            if lazy.is_null() {
+                crate::capi::refcount::fatal("code object without a body");
+            }
+            let saved = crate::errors::take_exc();
+            match crate::modules::marshal::read_lazy_body(o, &*lazy) {
+                Ok(parts) => fill_code(c, parts),
+                Err(_) => {
+                    crate::errors::clear_exc();
+                    crate::capi::refcount::fatal("corrupt marshal data in a code object body");
+                }
+            }
+            if let Some(e) = saved {
+                crate::errors::set_exc(e);
+            }
+            (*c).lazy = std::ptr::null_mut();
+            drop(Box::from_raw(lazy));
+            let d = std::mem::replace(&mut (*c).doc, std::ptr::null_mut());
+            xdecref(d);
+        }
+        &*(*c).data
+    }
 }
 
 /// Convert a compiler constant into an object.
@@ -525,10 +591,78 @@ pub struct CodeParts<'a> {
 }
 
 pub fn new_code_from_parts(p: CodeParts) -> PyResult {
+    unsafe {
+        let op = crate::alloc::alloc_object(code_type(), std::mem::size_of::<PyCodeObject>()) as *mut PyCodeObject;
+        fill_header(op, p.argcount, p.posonlyargcount, p.kwonlyargcount, p.flags, p.stacksize, p.firstlineno, &p.kinds);
+        let c = &mut *op;
+        c.co_localspluskinds = bytes::new_bytes(&p.kinds).into_raw();
+        c.co_filename = p.filename.clone().into_raw();
+        c.co_name = p.name.clone().into_raw();
+        c.co_qualname = p.qualname.clone().into_raw();
+        fill_code(op, p);
+        Ok(PyRef::from_raw(op as *mut PyObject))
+    }
+}
+
+/// The scalar header fields of a fresh code object.
+#[allow(clippy::too_many_arguments)]
+unsafe fn fill_header(op: *mut PyCodeObject, argc: u32, posonly: u32, kwonly: u32, flags: u32, stacksize: u32, firstlineno: u32, kinds: &[u8]) {
+    unsafe {
+        let c = &mut *op;
+        c.co_flags = flags as c_int;
+        c.co_argcount = argc as c_int;
+        c.co_posonlyargcount = posonly as c_int;
+        c.co_kwonlyargcount = kwonly as c_int;
+        c.co_stacksize = stacksize as c_int;
+        c.co_firstlineno = firstlineno as c_int;
+        c.co_nlocalsplus = kinds.len() as c_int;
+        c.co_framesize = (kinds.len() + stacksize as usize) as c_int;
+        c.co_nlocals = kinds.iter().filter(|&&k| k & bc::fast::LOCAL != 0).count() as c_int;
+        c.co_ncellvars = kinds.iter().filter(|&&k| k & bc::fast::CELL != 0).count() as c_int;
+        c.co_nfreevars = kinds.iter().filter(|&&k| k & bc::fast::FREE != 0).count() as c_int;
+        c.co_version = 1;
+    }
+}
+
+/// Header fields of a code object whose body stays marshalled until first use.
+pub struct LazyHeader {
+    pub argcount: u32,
+    pub posonlyargcount: u32,
+    pub kwonlyargcount: u32,
+    pub flags: u32,
+    pub stacksize: u32,
+    pub firstlineno: u32,
+    /// `co_localspluskinds` (bytes)
+    pub kinds: PyRef,
+    pub filename: PyRef,
+    pub name: PyRef,
+    pub qualname: PyRef,
+    /// docstring (or None)
+    pub doc: PyRef,
+}
+
+/// A code object whose body is loaded from `body` on first use (`code_data`).
+pub fn new_code_lazy(h: LazyHeader, body: LazyBody) -> PyRef {
+    unsafe {
+        let op = crate::alloc::alloc_object(code_type(), std::mem::size_of::<PyCodeObject>()) as *mut PyCodeObject;
+        fill_header(op, h.argcount, h.posonlyargcount, h.kwonlyargcount, h.flags, h.stacksize, h.firstlineno, bytes::bytes_data(&h.kinds));
+        let c = &mut *op;
+        c.co_localspluskinds = h.kinds.into_raw();
+        c.co_filename = h.filename.into_raw();
+        c.co_name = h.name.into_raw();
+        c.co_qualname = h.qualname.into_raw();
+        if !h.doc.is(none::none()) {
+            c.doc = h.doc.into_raw();
+        }
+        c.lazy = Box::into_raw(Box::new(body));
+        PyRef::from_raw(op as *mut PyObject)
+    }
+}
+
+/// Install the body (`data` and the object-valued fields) of a code object whose
+/// header is set. The data pointer is published last.
+unsafe fn fill_code(op: *mut PyCodeObject, p: CodeParts) {
     let kinds = p.kinds;
-    let nlocals = kinds.iter().filter(|&&k| k & bc::fast::LOCAL != 0).count();
-    let ncell = kinds.iter().filter(|&&k| k & bc::fast::CELL != 0).count();
-    let nfree = kinds.iter().filter(|&&k| k & bc::fast::FREE != 0).count();
     let cell_slots: Vec<u32> =
         kinds.iter().enumerate().filter(|(_, k)| **k & bc::fast::CELL != 0).map(|(i, _)| i as u32).collect();
     let exctable = match p.exctable_raw {
@@ -550,41 +684,23 @@ pub fn new_code_from_parts(p: CodeParts) -> PyResult {
         consts: RefTuple::new(p.consts.clone()),
         names: RefTuple::new(p.names.clone()),
         localsplusnames: RefTuple::new(p.localsplusnames.clone()),
-        localspluskinds: kinds.clone(),
-        co_name: p.name.clone(),
-        co_qualname: p.qualname.clone(),
-        filename: p.filename.clone(),
+        localspluskinds: kinds,
+        co_name: p.name,
+        co_qualname: p.qualname,
+        filename: p.filename,
         cell_slots,
         invocation_count: std::sync::atomic::AtomicU32::new(0),
         backedge_count: std::sync::atomic::AtomicU32::new(0),
         caches: crate::interp::cache::CodeCaches::new(ninstr),
     });
     unsafe {
-        let op = crate::alloc::alloc_object(code_type(), std::mem::size_of::<PyCodeObject>());
-        let c = &mut *(op as *mut PyCodeObject);
+        let c = &mut *op;
         c.co_consts = p.consts.into_raw();
         c.co_names = p.names.into_raw();
         c.co_exceptiontable = exctable.into_raw();
-        c.co_flags = p.flags as c_int;
-        c.co_argcount = p.argcount as c_int;
-        c.co_posonlyargcount = p.posonlyargcount as c_int;
-        c.co_kwonlyargcount = p.kwonlyargcount as c_int;
-        c.co_stacksize = p.stacksize as c_int;
-        c.co_firstlineno = p.firstlineno as c_int;
-        c.co_nlocalsplus = kinds.len() as c_int;
-        c.co_framesize = (kinds.len() + p.stacksize as usize) as c_int;
-        c.co_nlocals = nlocals as c_int;
-        c.co_ncellvars = ncell as c_int;
-        c.co_nfreevars = nfree as c_int;
-        c.co_version = 1;
         c.co_localsplusnames = p.localsplusnames.into_raw();
-        c.co_localspluskinds = bytes::new_bytes(&kinds).into_raw();
-        c.co_filename = p.filename.into_raw();
-        c.co_name = p.name.into_raw();
-        c.co_qualname = p.qualname.into_raw();
         c.co_linetable = linetable.into_raw();
-        c.data = Box::into_raw(data);
-        Ok(PyRef::from_raw(op))
+        std::sync::atomic::AtomicPtr::from_ptr(&raw mut c.data).store(Box::into_raw(data), std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -629,11 +745,15 @@ unsafe extern "C" fn code_dealloc(op: *mut PyObject) {
             c.co_name,
             c.co_qualname,
             c.co_linetable,
+            c.doc,
         ] {
             xdecref(p);
         }
         if !c.data.is_null() {
             drop(Box::from_raw(c.data));
+        }
+        if !c.lazy.is_null() {
+            drop(Box::from_raw(c.lazy));
         }
         crate::alloc::free_object(op);
     }
@@ -664,8 +784,8 @@ unsafe extern "C" fn code_richcompare(a: *mut PyObject, b: *mut PyObject, op: c_
             if a == b {
                 return Ok(true);
             }
-            let dx = &*x.data;
-            let dy = &*y.data;
+            let dx = code_data(&*a);
+            let dy = code_data(&*b);
             if dx.code != dy.code
                 || x.co_flags != y.co_flags
                 || x.co_argcount != y.co_argcount
@@ -707,7 +827,7 @@ unsafe extern "C" fn code_richcompare(a: *mut PyObject, b: *mut PyObject, op: c_
 unsafe extern "C" fn code_hash(op: *mut PyObject) -> Py_hash_t {
     unsafe {
         let c = &*(op as *mut PyCodeObject);
-        let d = &*c.data;
+        let d = code_data(&*op);
         let mut h = crate::hash::TupleHasher::new(4);
         h.add(pystr::str_hash(&*c.co_name));
         h.add(d.code.len() as isize);
@@ -814,15 +934,19 @@ fn co_filename_get(o: &PyObject) -> PyResult {
     borrowed(get(o).co_filename)
 }
 fn co_consts_get(o: &PyObject) -> PyResult {
+    code_data(o);
     borrowed(get(o).co_consts)
 }
 fn co_names_get(o: &PyObject) -> PyResult {
+    code_data(o);
     borrowed(get(o).co_names)
 }
 fn co_linetable_get(o: &PyObject) -> PyResult {
+    code_data(o);
     borrowed(get(o).co_linetable)
 }
 fn co_exceptiontable_get(o: &PyObject) -> PyResult {
+    code_data(o);
     borrowed(get(o).co_exceptiontable)
 }
 fn int_field(v: c_int) -> PyResult {
