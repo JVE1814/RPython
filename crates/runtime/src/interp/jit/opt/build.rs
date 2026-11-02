@@ -1360,7 +1360,7 @@ impl<'a> B<'a> {
             Op::LoadMethod => self.load_method(i),
             Op::StoreAttr => self.store_attr(i),
             Op::Call => {
-                if !self.try_inline(i)? {
+                if !self.try_builtin(i) && !self.try_inline(i)? {
                     self.template(i);
                 }
             }
@@ -2233,6 +2233,79 @@ impl<'a> B<'a> {
         self.pop();
     }
 
+    // ------------------------------------------------------------ builtins
+
+    /// Name of builtin function `p` if it belongs to the builtins module the code runs
+    /// with.
+    fn builtin_name(&self, p: usize) -> Option<&'static str> {
+        unsafe {
+            let o = &*(p as *mut PyObject);
+            if !o.is_type(crate::types::cfunction::cfunction_type()) {
+                return None;
+            }
+            let cf = p as *mut PyCFunctionObject;
+            let (ml, ms) = ((*cf).m_ml, (*cf).m_self);
+            if ml.is_null() || ms.is_null() || !(*ms).is_type(crate::types::module::module_type()) {
+                return None;
+            }
+            if crate::types::module::m(&*ms).md_dict != self.u.builtins {
+                return None;
+            }
+            std::ffi::CStr::from_ptr((*ml).ml_name).to_str().ok()
+        }
+    }
+
+    /// Calls of a few builtins compiled inline: len() of lists/tuples/dicts/strs.
+    fn try_builtin(&mut self, i: usize) -> bool {
+        let n = self.u.an.instrs[i].arg as usize;
+        let d = self.st.stack.len();
+        let AV::Const(fp) = self.st.stack[d - n - 2] else { return false };
+        if !matches!(self.st.stack[d - n - 1], AV::Null) {
+            return false;
+        }
+        match (self.builtin_name(fp), n) {
+            (Some("len"), 1) => {
+                let esnap = self.snap(i, SnapKind::Error);
+                let x = self.peek_ptr(1);
+                let res = self.v(Class::G);
+                let cont = self.new_block(u32::MAX);
+                let ty = self.v(Class::G);
+                self.emit(Inst::Load(ty, Base::V(x), OB_TYPE));
+                let cases: [(usize, i32); 4] = [
+                    (list_t(), LIST_SIZE),
+                    (tuple_t(), LIST_SIZE),
+                    (crate::types::dict::dict_type() as usize, std::mem::offset_of!(PyDictObject, ma_used) as i32),
+                    (crate::types::str::str_type() as usize, std::mem::offset_of!(PyASCIIObject, length) as i32),
+                ];
+                for (tp, off) in cases {
+                    let hit = self.new_block(u32::MAX);
+                    let next = self.new_block(u32::MAX);
+                    self.term(Term::Branch(Cond::Cmp(ty, Opnd::I(tp as i64), Cc::E), hit, next));
+                    self.switch_to(hit);
+                    let sz = self.v(Class::G);
+                    self.emit(Inst::Load(sz, Base::V(x), off));
+                    self.emit(Inst::Mov(res, sz));
+                    self.term(Term::Jump(cont));
+                    self.switch_to(next);
+                }
+                let r = self.v(Class::G);
+                self.emit(Inst::Call { addr: h2_len as usize, args: vec![Opnd::V(x)], fargs: vec![], ret: Some(r), fret: None });
+                self.emit(Inst::Guard(Cond::Cmp(r, Opnd::I(0), Cc::L), esnap));
+                self.emit(Inst::Mov(res, r));
+                self.term(Term::Jump(cont));
+                self.switch_to(cont);
+                let k = self.st.stack.len() - 1;
+                let a = self.pop();
+                self.discard(a, k);
+                self.pop();
+                self.pop();
+                self.push(AV::I64(res));
+                true
+            }
+            _ => false,
+        }
+    }
+
     // ------------------------------------------------------------ inlining
 
     /// The callee of Call instruction i if it can be inlined: a constant plain
@@ -2283,7 +2356,7 @@ impl<'a> B<'a> {
                     Op::ReturnValue => last,
                     Op::Nop | Op::ExtendedArg | Op::LoadFast | Op::LoadFastCheck | Op::StoreFast | Op::LoadConst | Op::PopTop | Op::PushNull | Op::Copy | Op::Swap => true,
                     Op::LoadGlobal | Op::LoadAttr | Op::StoreAttr | Op::BinaryOp | Op::CompareOp | Op::IsOp | Op::UnaryNegative | Op::UnaryNot | Op::ToBool => true,
-                    Op::BinarySubscr | Op::StoreSubscr | Op::UnpackSequence => true,
+                    Op::BinarySubscr | Op::StoreSubscr | Op::UnpackSequence | Op::Call => true,
                     _ => ins.op == Op::Resume,
                 };
                 if !ok || an.depth[k] < 0 {
@@ -2675,6 +2748,16 @@ pub unsafe extern "C" fn h_shape_lacks(sh: *const crate::shape::Shape, name: *mu
         }
         (*cell).store(sh as usize, std::sync::atomic::Ordering::Relaxed);
         1
+    }
+}
+
+/// len(o) for types without an inline path: the length, or -1 with an exception set.
+pub unsafe extern "C" fn h2_len(o: *mut PyObject) -> i64 {
+    unsafe {
+        match crate::abstract_::length(&*o) {
+            Ok(n) => n as i64,
+            Err(_) => -1,
+        }
     }
 }
 
