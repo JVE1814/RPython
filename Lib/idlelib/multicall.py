@@ -63,6 +63,20 @@ def _report_bad_binding(virtual, sequence, err):
           f"of action {virtual!r}: {err}", file=sys.stderr)
 
 
+_EVENT_TYPE_NAMES = {'Key': 'KeyPress', 'Button': 'ButtonPress'}
+
+
+def _single_event_form(sequence):
+    """Return a single-event sequence with the event type spelled out
+    ('<Control-Key-s>' -> '<Control-KeyPress-s>'); sequences of several
+    events are returned unchanged."""
+    if sequence.count('<') != 1 or not sequence.endswith('>'):
+        return sequence
+    parts = sequence[1:-1].split('-')
+    parts = [_EVENT_TYPE_NAMES.get(part, part) for part in parts]
+    return '<' + '-'.join(parts) + '>'
+
+
 def MultiCallCreator(widget):
     """Return the MultiCall subclass of the tkinter widget class *widget*."""
     if widget in _multicall_dict:
@@ -116,6 +130,12 @@ def MultiCallCreator(widget):
                     widget.event_delete(self, virtual, seq)
                 except tkinter.TclError:
                     pass  # a sequence that was never added
+
+        def event_info(self, virtual=None):
+            if virtual is None:
+                return widget.event_info(self)
+            return tuple(_single_event_form(seq)
+                         for seq in widget.event_info(self, virtual))
 
         def __del__(self):
             self.__binders = []

@@ -29,14 +29,19 @@ def make_pat():
     only count in the statement positions where they are keywords.
     """
     kw = r"\b" + any("KEYWORD", keyword.kwlist) + r"\b"
-    # A soft keyword followed by something that cannot follow a name in an
-    # expression statement.
-    not_expression = r"[ \t]+(?![=.,:)\]}]|[-+*/%@&|^<>!]=)"
+    # 'match' and 'case' starting a line are keywords when what follows
+    # cannot continue an expression using them as names: the end of the
+    # line, or a blank and then a name (not a keyword), a bracket or a
+    # string.
+    hard_keywords = "|".join(keyword.kwlist)
+    soft_follow = (r"(?=[ \t]*$|[ \t]+(?!(?:" + hard_keywords +
+                   r")\b)[\w(\[{'\"])")
     match_softkw = (r"^[ \t]*" + any("MATCH_SOFTKW", [r"match"]) +
-                    r"(?=" + not_expression + r"[^\n]*:[ \t]*(?:#[^\n]*)?$)")
+                    soft_follow)
     case_softkw = (r"^[ \t]*" + any("CASE_SOFTKW", [r"case"]) +
-                   r"(?=" + not_expression + r"[^\n]*:)")
-    case_default = (r"^[ \t]*case[ \t]+" +
+                   soft_follow)
+    # The wildcard pattern of 'case _:' (or 'case _ if ...:').
+    case_default = (r"(?<=\bcase)[ \t]+" +
                     any("CASE_DEFAULT_UNDERSCORE", [r"_"]) +
                     r"(?=[ \t]*(?::|if\b))")
     type_softkw = (r"^[ \t]*" + any("TYPE_SOFTKW", [r"type"]) +
@@ -45,7 +50,9 @@ def make_pat():
                    r"(?=[ \t]+(?:import|from)\b)")
     builtinlist = [str(name) for name in dir(builtins)
                    if not name.startswith('_') and name not in keyword.kwlist]
-    builtin = r"([^.'\"\\#]\b|^)" + any("BUILTIN", builtinlist) + r"\b"
+    # (A builtin name after a newline is found at the line start, so that
+    # the newline stays a SYNC point.)
+    builtin = r"([^.'\"\\#\n]\b|^)" + any("BUILTIN", builtinlist) + r"\b"
     comment = any("COMMENT", [r"#[^\n]*"])
     prefix = r"(?i:r|u|f|fr|rf|b|br|rb|t|tr|rt)?"
     sqstring = prefix + r"'[^'\\\n]*(\\.[^'\\\n]*)*'?"
@@ -60,6 +67,10 @@ def make_pat():
 
 prog = re.compile(make_pat(), re.DOTALL | re.MULTILINE)
 idprog = re.compile(r"\s+(\w+)")
+
+# Characters of a line colorized at most.
+MAX_COLORIZED_LINE = 1000
+_long_line_re = re.compile(r"(?m)^([^\n]{%d})([^\n]+)" % MAX_COLORIZED_LINE)
 
 # Regex groups colored with the KEYWORD tag.
 _KEYWORD_GROUPS = {"KEYWORD", "MATCH_SOFTKW", "CASE_SOFTKW",
@@ -253,7 +264,15 @@ class ColorDelegator(Delegator):
         self.tag_add(tag, f"{head}+{start:d}c", f"{head}+{end:d}c")
 
     def _add_tags_in_section(self, chars, head):
-        """Tag the syntax elements of *chars* (the text from *head*)."""
+        """Tag the syntax elements of *chars* (the text from *head*).
+
+        Only the first MAX_COLORIZED_LINE characters of each line are
+        colorized (very long lines would make IDLE slow); the rest is
+        masked with characters no pattern starts with.
+        """
+        if len(chars) > MAX_COLORIZED_LINE:
+            chars = _long_line_re.sub(
+                lambda m: m.group(1) + '\0' * len(m.group(2)), chars)
         for m in self.prog.finditer(chars):
             for name, matched_text in matched_named_groups(m):
                 a, b = m.span(name)

@@ -387,22 +387,22 @@ class HighPage(Frame):
 
     def create_page_highlight(self):
         self.theme_elements = {
-            'Normal Code or Text': ('normal', '00'),
-            'Code Context': ('context', '01'),
-            'Python Keywords': ('keyword', '02'),
-            'Python Definitions': ('definition', '03'),
-            'Python Builtins': ('builtin', '04'),
-            'Python Comments': ('comment', '05'),
-            'Python Strings': ('string', '06'),
-            'Selected Text': ('hilite', '07'),
-            'Found Text': ('hit', '08'),
-            'Cursor': ('cursor', '09'),
-            'Editor Breakpoint': ('break', '10'),
-            'Shell Prompt': ('console', '11'),
-            'Error Text': ('error', '12'),
-            'Shell User Output': ('stdout', '13'),
-            'Shell User Exception': ('stderr', '14'),
-            'Line Number': ('linenumber', '16'),
+            'Normal Code or Text': 'normal',
+            'Code Context': 'context',
+            'Python Keywords': 'keyword',
+            'Python Definitions': 'definition',
+            'Python Builtins': 'builtin',
+            'Python Comments': 'comment',
+            'Python Strings': 'string',
+            'Selected Text': 'hilite',
+            'Found Text': 'hit',
+            'Cursor': 'cursor',
+            'Editor Breakpoint': 'break',
+            'Shell Prompt': 'console',
+            'Error Text': 'error',
+            'Shell User Output': 'stdout',
+            'Shell User Exception': 'stderr',
+            'Line Number': 'linenumber',
         }
         self.builtin_name = tracers.add(
             StringVar(self), self.var_changed_builtin_name)
@@ -428,7 +428,7 @@ class HighPage(Frame):
         text.bind('<B1-Motion>', lambda e: 'break')
         for chars, element in self._sample:
             text.insert(END, chars, element)
-        for element_title, (element, _) in self.theme_elements.items():
+        for element_title, element in self.theme_elements.items():
             def tem(event, elem=element_title):
                 # Clicking an element of the sample chooses it.
                 self.highlight_target.set(elem)
@@ -513,8 +513,7 @@ class HighPage(Frame):
             self.customlist.SetMenu(customs, current_option)
             self.builtinlist.SetMenu(builtins, builtins[0])
         self.set_theme_type()
-        names = sorted(self.theme_elements,
-                       key=lambda name: self.theme_elements[name][1])
+        names = list(self.theme_elements)
         self.targetlist.SetMenu(names, names[0])
         self.paint_theme_sample()
         self.set_highlight_target()
@@ -568,15 +567,13 @@ class HighPage(Frame):
             self.customlist['state'] = 'normal'
             self.button_delete_custom.state(('!disabled',))
 
-    askcolor = staticmethod(colorchooser.askcolor)
-
     def get_color(self):
         """Ask for a color for the target element.  A built-in theme is
         first copied to a new custom theme."""
         target = self.highlight_target.get()
         prev_color = self.style.lookup(self.frame_color_set['style'],
                                        'background')
-        rgb, color_string = self.askcolor(
+        rgb, color_string = colorchooser.askcolor(
             parent=self, title='Pick new color for : ' + target,
             initialcolor=prev_color)
         if color_string and color_string != prev_color:
@@ -597,7 +594,7 @@ class HighPage(Frame):
         new_color = self.color.get()
         self.style.configure('frame_color_set.TFrame', background=new_color)
         plane = 'foreground' if self.fg_bg_toggle.get() else 'background'
-        sample_element = self.theme_elements[self.highlight_target.get()][0]
+        sample_element = self.theme_elements[self.highlight_target.get()]
         self.highlight_sample.tag_config(sample_element, **{plane: new_color})
         theme = self.custom_name.get()
         theme_element = sample_element + '-' + plane
@@ -647,7 +644,7 @@ class HighPage(Frame):
 
     def set_color_sample(self):
         """Show the target element's current color."""
-        tag = self.theme_elements[self.highlight_target.get()][0]
+        tag = self.theme_elements[self.highlight_target.get()]
         plane = 'foreground' if self.fg_bg_toggle.get() else 'background'
         color = self.highlight_sample.tag_cget(tag, plane)
         self.style.configure('frame_color_set.TFrame', background=color)
@@ -659,7 +656,7 @@ class HighPage(Frame):
         else:
             theme = self.custom_name.get()
         for element_title in self.theme_elements:
-            element = self.theme_elements[element_title][0]
+            element = self.theme_elements[element_title]
             colors = idleConf.GetHighlight(theme, element)
             if element == 'cursor':
                 colors['background'] = idleConf.GetHighlight(
@@ -736,8 +733,9 @@ class KeysPage(Frame):
         scroll_target_x = Scrollbar(frame_target, orient=HORIZONTAL)
         self.bindingslist = Listbox(frame_target, takefocus=FALSE,
                                     exportselection=FALSE)
-        self.bindingslist.bind('<ButtonRelease-1>',
-                               self.on_bindingslist_select)
+        for sequence in ('<ButtonRelease-1>', '<KeyRelease-Up>',
+                         '<KeyRelease-Down>'):
+            self.bindingslist.bind(sequence, self.on_bindingslist_select)
         scroll_target_y['command'] = self.bindingslist.yview
         scroll_target_x['command'] = self.bindingslist.xview
         self.bindingslist['yscrollcommand'] = scroll_target_y.set
@@ -913,6 +911,14 @@ class KeysPage(Frame):
             self.create_new_key_set(new_keys_name)
 
     def on_bindingslist_select(self, event):
+        """An action was selected (with the arrow keys, the active one:
+        Tk moves only the active item)."""
+        if event is not None and getattr(event, 'type', None) == \
+                EventType.KeyRelease:
+            index = self.bindingslist.index(ACTIVE)
+            self.bindingslist.selection_clear(0, END)
+            self.bindingslist.selection_set(index)
+            self.bindingslist.selection_anchor(index)
         self.button_new_keys.state(('!disabled',))
 
     def create_new_key_set(self, new_key_set_name):
@@ -947,10 +953,14 @@ class KeysPage(Frame):
             name = bind_name[2:-2]
             key = pending.get(name, key)
             self.bindingslist.insert(END, name + ' - ' + key)
-        if reselect:
+        if not reselect:
+            list_index = 0  # select the first action
+        if self.bindingslist.size():
             self.bindingslist.see(list_index)
             self.bindingslist.select_set(list_index)
             self.bindingslist.select_anchor(list_index)
+            self.bindingslist.activate(list_index)
+            self.button_new_keys.state(('!disabled',))
 
     @staticmethod
     def save_new_key_set(keyset_name, keyset):

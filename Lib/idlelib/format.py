@@ -345,7 +345,8 @@ class Rstrip:
         # In files (not in the shell), also drop blank lines at the end,
         # keeping a single final newline.
         if not hasattr(self.editwin, 'interp'):
-            while (text.get('end-2c') == '\n' and
+            while (text.compare('end-1c', '>', '1.0') and
+                   text.get('end-2c') == '\n' and
                    (text.index('end-2c') == '1.0' or
                     text.get('end-3c') == '\n')):
                 text.delete('end-2c')
