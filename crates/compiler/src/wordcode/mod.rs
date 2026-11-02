@@ -10,6 +10,7 @@
 //! public [`CodeObject`] the compiler produces, and encoders/decoders for `co_linetable` and
 //! `co_exceptiontable` shared by the compiler, the runtime and the `dis` support code.
 
+pub mod dis;
 pub mod opcodes;
 pub use opcodes as op;
 
@@ -158,7 +159,8 @@ pub fn has_arg(code: u16) -> bool {
         if code >= MIN_INSTRUMENTED_OPCODE {
             return code == ENTER_EXECUTOR;
         }
-        return code >= HAVE_ARGUMENT && opname(code).is_some();
+        // HAVE_ARGUMENT itself (WITH_EXCEPT_START) takes no argument
+        return code > HAVE_ARGUMENT && opname(code).is_some();
     }
     matches!(
         code,
