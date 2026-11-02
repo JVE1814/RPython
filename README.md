@@ -1,7 +1,5 @@
 # RPython
 
-[![standard-readme compliant](https://img.shields.io/badge/readme%20style-standard-brightgreen.svg?style=flat-square)](https://github.com/RichardLitt/standard-readme)
-
 > A from-scratch Rust re-implementation of CPython 3.15.2, with the free-threaded C ABI, no GIL, and a tiered JIT.
 
 RPython aims to be a drop-in replacement for CPython **3.15.2** in its free-threaded build (`cp315t`).
