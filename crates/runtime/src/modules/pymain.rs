@@ -69,6 +69,10 @@ fn run_code_in_main(src: &[u8], filename: &str) -> Outcome {
         let m = main_module()?;
         let d = module::module_dict(&m);
         let code = crate::compile::compile_bytes(src, filename, crate::compile::Mode::Exec, 0, -1)?;
+        if filename == "<string>" {
+            // `-c` code: tracebacks show its lines like those of a file
+            register_source(&code.code, &String::from_utf8_lossy(src), "<string>");
+        }
         crate::interp::eval_code(&code.code, &d, Some(&d))?;
         Ok(())
     })();
@@ -319,10 +323,14 @@ fn set_exc_kbd() {
 /// Make the source of an interactive statement available to tracebacks
 /// (linecache keeps it keyed by the code objects).
 fn register_interactive_source(code: &PyObject, src: &str) {
+    register_source(code, src, "<stdin>")
+}
+
+fn register_source(code: &PyObject, src: &str, name: &str) {
     let r = (|| -> PyResult<()> {
         let lc = crate::import::import_absolute("linecache")?;
         let f = ab::getattr_str(&lc, "_register_code")?;
-        ab::call(&f, &[code, &pystr::new_str(src), &pystr::new_str("<stdin>")])?;
+        ab::call(&f, &[code, &pystr::new_str(src), &pystr::new_str(name)])?;
         Ok(())
     })();
     if r.is_err() {

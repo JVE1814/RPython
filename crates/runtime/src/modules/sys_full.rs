@@ -202,6 +202,12 @@ fn sys_addaudithook(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) ->
 fn sys_exit(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     crate::args::check_pos("exit", args, 0, 1)?;
     match args.first() {
+        // a tuple is the exception's argument list (sys.exit((42,)) exits with 42)
+        Some(c) if tuple::is_tuple(c) => {
+            let e = ab::call(&crate::types::typeobject::type_ref(crate::types::exceptions::SystemExit()), tuple::tuple_items(c))?;
+            set_exc(e);
+            Err(PyErr)
+        }
         Some(c) => Err(set_err_obj(crate::types::exceptions::SystemExit(), c.to_ref())),
         None => Err(set_err_noargs(crate::types::exceptions::SystemExit())),
     }
@@ -386,8 +392,20 @@ pub fn print_exception_full(v: &PyObject) {
         if let Ok(f) = ab::getattr_str(&tbm, "print_exception") {
             if let Some(err) = crate::modules::sys::get_sys_attr("stderr") {
                 if !err.is(none::none()) {
-                    let kwn = tuple::new_tuple(vec![pystr::new_str("file")]);
-                    if ab::call_kw(&f, &[v, &err], Some(&kwn)).is_ok() {
+                    // sys.tracebacklimit keeps the innermost entries (<= 0: none)
+                    let limit = match crate::modules::sys::get_sys_attr("tracebacklimit") {
+                        Some(l) if int::is_int(&l) => match int::as_i64(&l) {
+                            Some(n) if n <= 0 => int::new_int(0),
+                            Some(n) if n < (1 << 31) => int::new_int(-n),
+                            Some(_) => none::none_ref(),
+                            None => {
+                                if int::sign(&l) < 0 { int::new_int(0) } else { none::none_ref() }
+                            }
+                        },
+                        _ => none::none_ref(),
+                    };
+                    let kwn = tuple::new_tuple(vec![pystr::new_str("file"), pystr::new_str("limit")]);
+                    if ab::call_kw(&f, &[v, &err, &limit], Some(&kwn)).is_ok() {
                         return;
                     }
                 }
@@ -625,28 +643,30 @@ fn sys_getsizeof(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> Py
     static P: crate::args::Params = crate::args::Params::new("getsizeof", &["object", "default"], 0, 1);
     let [o, default] = crate::args::parse::<2>(&P, args, kw)?;
     let o = o.unwrap();
-    match ab::call_special_opt(o, crate::name!("__sizeof__"), &[]) {
-        Ok(Some(r)) => {
-            if !int::is_int(&r) {
-                raise!(TypeError, "an integer is required");
-            }
-            let n = match int::as_i64(&r) {
-                Some(n) => n,
-                None => {
-                    if int::sign(&r) < 0 {
-                        raise!(ValueError, "__sizeof__() should return >= 0");
-                    }
-                    raise!(OverflowError, "Python int too large to convert to C ssize_t");
-                }
-            };
-            if n < 0 {
-                raise!(ValueError, "__sizeof__() should return >= 0");
-            }
-            // like the free-threaded build: no GC header is reported (ours is internal),
-            // only the managed __dict__/__weakref__ pre-header
-            let extra = if unsafe { (*o.type_ptr()).tp_flags } & crate::ffi::Py_TPFLAGS_PREHEADER != 0 { crate::alloc::MANAGED as i64 } else { 0 };
-            Ok(int::new_int(n + extra))
+    let sized = ab::call_special_opt(o, crate::name!("__sizeof__"), &[]).and_then(|r| {
+        let Some(r) = r else { return Ok(None) };
+        if !int::is_int(&r) {
+            raise!(TypeError, "an integer is required");
         }
+        let n = match int::as_i64(&r) {
+            Some(n) => n,
+            None => {
+                if int::sign(&r) < 0 {
+                    raise!(ValueError, "__sizeof__() should return >= 0");
+                }
+                raise!(OverflowError, "Python int too large to convert to C ssize_t");
+            }
+        };
+        if n < 0 {
+            raise!(ValueError, "__sizeof__() should return >= 0");
+        }
+        // like the free-threaded build: no GC header is reported (ours is internal),
+        // only the managed __dict__/__weakref__ pre-header
+        let extra = if unsafe { (*o.type_ptr()).tp_flags } & crate::ffi::Py_TPFLAGS_PREHEADER != 0 { crate::alloc::MANAGED as i128 } else { 0 };
+        Ok(Some(int::new_int_i128(n as i128 + extra)))
+    });
+    match sized {
+        Ok(Some(r)) => Ok(r),
         Ok(None) => match default {
             Some(d) => Ok(d.to_ref()),
             None => raise!(TypeError, "Type {} doesn't define __sizeof__", crate::types::typeobject::tname(o)),
@@ -774,7 +794,16 @@ fn sys_getunicodeinternedsize(_m: &PyObject, args: &[&PyObject], kw: Option<&PyO
     let _ = crate::args::parse::<1>(&P, args, kw)?;
     Ok(int::new_int(0))
 }
+/// Allocator statistics on the C stderr. There is no pymalloc and there are no
+/// per-type free lists in this runtime (the small-object allocator keeps
+/// per-thread caches instead), so the free-list counts are all zero.
 fn sys_debugmallocstats(_m: &PyObject) -> PyResult {
+    let mut s = String::from("Small-object allocator: per-thread caches over 64 KiB pages (no pymalloc arenas)\n");
+    s.push_str(&format!("{:>10} tracked GC objects\n", crate::gc::tracked_count()));
+    for name in ["PyDictObjects", "PyListObjects", "PyFloatObjects", "PyTupleObjects"] {
+        s.push_str(&format!("{:>10} free {}\n", 0, name));
+    }
+    crate::modules::sys::write_fd(2, s.as_bytes());
     Ok(none::none_ref())
 }
 fn sys_get_coroutine_origin_tracking_depth(_m: &PyObject) -> PyResult {

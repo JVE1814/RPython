@@ -134,8 +134,24 @@ pub fn handle_system_exit(e: &PyRef) -> i32 {
         // out of the C int range: -1, as CPython's failed conversion gives
         return types::int::as_i64(c).and_then(|v| i32::try_from(v).ok()).unwrap_or(-1);
     }
-    let s = abstract_::str_string(c).unwrap_or_default();
-    modules::sys::write_stderr(&format!("{}\n", s));
+    // printed through sys.stderr (its error handler deals with surrogates)
+    let printed = match modules::sys::get_sys_attr("stderr") {
+        Some(err) if !err.is(types::none::none()) => (|| -> errors::PyResult<()> {
+            let s = abstract_::str(c)?;
+            abstract_::call_method_str(&err, "write", &[&s])?;
+            abstract_::call_method_str(&err, "write", &[&types::str::new_str("\n")])?;
+            let _ = abstract_::call_method_str(&err, "flush", &[]);
+            Ok(())
+        })()
+        .is_ok(),
+        _ => false,
+    };
+    if !printed {
+        errors::clear_exc();
+        let s = abstract_::str_string(c).unwrap_or_default();
+        modules::sys::write_stderr(&format!("{}\n", s));
+    }
+    errors::clear_exc();
     1
 }
 
