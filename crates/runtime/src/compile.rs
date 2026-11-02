@@ -409,8 +409,17 @@ pub fn compile_mod(module: &rpy_parser::ast::Mod, o: &Opts, src: Option<&str>) -
         emit_warning_m(&cat, &w.msg, &w.msg, filename, w.lineno, off, text.as_deref(), o.module, (Some(w.end_lineno), Some(end_off)))?;
     }
     let fname = pystr::intern_str(filename);
-    let code = crate::types::code::new_code_from_unit(&out.code, Some(&fname))?;
+    // Transitional (D24): the public CPython 3.15 form is produced alongside and attached as
+    // each code object's public view; execution still uses the legacy form.
+    let public = if wordcode_view_enabled() { rpy_compiler::compile_wordcode(module, &copts).ok() } else { None };
+    let code = crate::types::code::new_code_from_unit_public(&out.code, public.as_ref().map(|p| &p.code), Some(&fname))?;
     Ok(Compiled { code, future_flags: out.future_flags })
+}
+
+/// The public wordcode view can be switched off with RPY_NO_WORDCODE=1 (debugging aid).
+fn wordcode_view_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("RPY_NO_WORDCODE").is_none())
 }
 
 /// AST-level optimization of `ast.parse(..., optimize=N)` / PyCF_OPTIMIZED_AST.

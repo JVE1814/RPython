@@ -9,6 +9,7 @@ use crate::types::typeobject::*;
 use crate::types::{bytes, int, none, str as pystr, tuple};
 use crate::raise;
 use rpy_compiler::bytecode::{self as bc, CodeUnit, Constant, ExceptionEntry, Location};
+use rpy_compiler::wordcode as wc;
 use std::ffi::{c_int, c_void};
 
 #[repr(C)]
@@ -62,6 +63,20 @@ pub struct CodeData {
     pub backedge_count: std::sync::atomic::AtomicU32,
     /// Per-instruction inline caches (owned by the interpreter).
     pub caches: crate::interp::cache::CodeCaches,
+    /// Transitional (D24, see notes/bytecode.md): the public CPython 3.15 form produced by
+    /// the wordcode pipeline, shown by co_code / co_consts / co_names / co_linetable /
+    /// co_exceptiontable / co_lines / co_positions while execution still uses `code`.
+    pub public: std::sync::OnceLock<Box<PublicView>>,
+}
+
+/// Public (CPython 3.15) view of a code object; see [`CodeData::public`].
+pub struct PublicView {
+    pub code: PyRef,
+    pub consts: PyRef,
+    pub names: PyRef,
+    pub linetable: PyRef,
+    pub exceptiontable: PyRef,
+    pub stacksize: u32,
 }
 
 /// Convenience accessor bundle.
@@ -146,13 +161,34 @@ pub fn const_to_obj(c: &Constant, filename: &PyRef) -> PyResult {
 
 /// Build a code object from a compiled unit.
 pub fn new_code_from_unit(cu: &CodeUnit, filename: Option<&PyRef>) -> PyResult {
+    new_code_from_unit_public(cu, None, filename)
+}
+
+/// Like [`new_code_from_unit`], attaching the public (wordcode) form `public` of the same
+/// unit as the code object's public view (transitional, D24). Nested code objects are
+/// paired by their order in the constant tables.
+pub fn new_code_from_unit_public(cu: &CodeUnit, public: Option<&wc::CodeObject>, filename: Option<&PyRef>) -> PyResult {
     let filename = match filename {
         Some(f) => f.clone(),
         None => pystr::intern_str(&cu.filename),
     };
+    let pub_codes: Vec<&wc::CodeObject> = public
+        .map(|p| p.consts.iter().filter_map(|c| if let wc::Constant::Code(x) = c { Some(&**x) } else { None }).collect())
+        .unwrap_or_default();
+    let n_codes = cu.consts.iter().filter(|c| matches!(c, Constant::Code(_))).count();
+    let paired = public.is_some() && pub_codes.len() == n_codes;
     let mut consts = Vec::with_capacity(cu.consts.len());
+    let mut code_objs: Vec<PyRef> = Vec::new();
     for c in &cu.consts {
-        consts.push(const_to_obj(c, &filename)?);
+        match c {
+            Constant::Code(inner) => {
+                let p = if paired { Some(pub_codes[code_objs.len()]) } else { None };
+                let o = new_code_from_unit_public(inner, p, Some(&filename))?;
+                code_objs.push(o.clone());
+                consts.push(o);
+            }
+            _ => consts.push(const_to_obj(c, &filename)?),
+        }
     }
     let names: Vec<PyRef> = cu.names.iter().map(|n| pystr::intern_str(n)).collect();
     let lpn: Vec<PyRef> = cu.localsplusnames.iter().map(|n| pystr::intern_str(n)).collect();
@@ -174,7 +210,71 @@ pub fn new_code_from_unit(cu: &CodeUnit, filename: Option<&PyRef>) -> PyResult {
         name: pystr::intern_str(&cu.name),
         qualname: pystr::intern_str(&cu.qualname),
     };
-    new_code_from_parts(parts)
+    let fname = parts.filename.clone();
+    let r = new_code_from_parts(parts)?;
+    if let Some(p) = public {
+        let mut nested = code_objs.into_iter();
+        if let Ok(view) = public_view(p, if paired { Some(&mut nested) } else { None }, &fname) {
+            let _ = code_data(&r).public.set(Box::new(view));
+        } else {
+            clear_exc();
+        }
+    }
+    Ok(r)
+}
+
+/// Constant of the public form as an object (nested code objects come from `nested`).
+fn public_const_to_obj(c: &wc::Constant, nested: &mut Option<&mut std::vec::IntoIter<PyRef>>, filename: &PyRef) -> PyResult {
+    Ok(match c {
+        wc::Constant::None => none::none_ref(),
+        wc::Constant::Bool(b) => crate::types::bool_::new_bool(*b),
+        wc::Constant::Ellipsis => none::ellipsis().to_ref(),
+        wc::Constant::Int(i) => int::new_int(*i),
+        wc::Constant::BigInt { neg, decimal } => crate::types::int_methods::from_decimal_str(*neg, decimal)?,
+        wc::Constant::Float(f) => crate::types::float::new_float(*f),
+        wc::Constant::Complex { real, imag } => crate::types::complex::new_complex(*real, *imag),
+        wc::Constant::Str(cps) => pystr::intern(pystr::from_codepoints(cps)),
+        wc::Constant::Bytes(b) => bytes::new_bytes(b),
+        wc::Constant::Tuple(items) => {
+            let mut v = Vec::with_capacity(items.len());
+            for it in items {
+                v.push(public_const_to_obj(it, nested, filename)?);
+            }
+            tuple::new_tuple(v)
+        }
+        wc::Constant::FrozenSet(items) => {
+            let mut v = Vec::with_capacity(items.len());
+            for it in items {
+                v.push(public_const_to_obj(it, nested, filename)?);
+            }
+            crate::types::set::new_frozenset_from_vec(v)?
+        }
+        wc::Constant::Slice(s) => {
+            let a = public_const_to_obj(&s[0], nested, filename)?;
+            let b = public_const_to_obj(&s[1], nested, filename)?;
+            let c = public_const_to_obj(&s[2], nested, filename)?;
+            crate::types::slice::new_slice(&a, &b, &c)
+        }
+        wc::Constant::Code(_) => match nested.as_mut().and_then(|it| it.next()) {
+            Some(o) => o,
+            None => raise!(SystemError, "unpaired code constant"),
+        },
+    })
+}
+
+fn public_view(p: &wc::CodeObject, mut nested: Option<&mut std::vec::IntoIter<PyRef>>, filename: &PyRef) -> PyResult<PublicView> {
+    let mut consts = Vec::with_capacity(p.consts.len());
+    for c in &p.consts {
+        consts.push(public_const_to_obj(c, &mut nested, filename)?);
+    }
+    Ok(PublicView {
+        code: bytes::new_bytes(&p.code),
+        consts: tuple::new_tuple(consts),
+        names: tuple::new_tuple(p.names.iter().map(|n| pystr::intern_str(n)).collect()),
+        linetable: bytes::new_bytes(&p.linetable),
+        exceptiontable: bytes::new_bytes(&p.exceptiontable),
+        stacksize: p.stacksize,
+    })
 }
 
 /// Everything a code object is made of, with the object-valued parts already built
@@ -224,6 +324,7 @@ pub fn new_code_from_parts(p: CodeParts) -> PyResult {
         invocation_count: std::sync::atomic::AtomicU32::new(0),
         backedge_count: std::sync::atomic::AtomicU32::new(0),
         caches: crate::interp::cache::CodeCaches::new(ninstr),
+        public: std::sync::OnceLock::new(),
     });
     unsafe {
         let op = crate::alloc::alloc_object(code_type(), std::mem::size_of::<PyCodeObject>());
@@ -424,6 +525,9 @@ fn co_nlocals(o: &PyObject) -> PyResult {
     Ok(int::new_int(tuple::tuple_len(&*co_varnames(o)?) as i64))
 }
 fn co_code(o: &PyObject) -> PyResult {
+    if let Some(p) = code_data(o).public.get() {
+        return Ok(p.code.clone());
+    }
     let d = code_data(o);
     let mut v = Vec::with_capacity(d.code.len() * 4);
     for w in &d.code {
@@ -432,6 +536,9 @@ fn co_code(o: &PyObject) -> PyResult {
     Ok(bytes::new_bytes(&v))
 }
 fn co_lines(o: &PyObject) -> PyResult {
+    if let Some(p) = code_data(o).public.get() {
+        return public_co_lines(o, p);
+    }
     // (start_offset, end_offset, lineno) with offsets in bytes (4 per instruction)
     let d = code_data(o);
     let mut out: Vec<PyRef> = Vec::new();
@@ -460,6 +567,9 @@ pub fn no_debug_ranges() -> bool {
 }
 
 fn co_positions(o: &PyObject) -> PyResult {
+    if let Some(p) = code_data(o).public.get() {
+        return public_co_positions(o, p);
+    }
     let d = code_data(o);
     let mut out: Vec<PyRef> = Vec::new();
     let opt = |x: u32, none_if_zero: bool| -> PyRef {
@@ -480,6 +590,55 @@ fn co_positions(o: &PyObject) -> PyResult {
     let lst = crate::types::list::new_list(out);
     crate::abstract_::get_iter(&lst)
 }
+/// Per-code-unit positions decoded from the public location table.
+fn public_positions(o: &PyObject, p: &PublicView) -> Vec<wc::Position> {
+    let code = bytes::bytes_data(&p.code);
+    let lt = bytes::bytes_data(&p.linetable);
+    wc::decode_linetable(lt, get(o).co_firstlineno.max(0) as u32, code.len() / 2)
+}
+
+fn public_co_lines(o: &PyObject, p: &PublicView) -> PyResult {
+    // (start, end, line) in bytes, merging consecutive code units on the same line
+    let pos = public_positions(o, p);
+    let mut out: Vec<PyRef> = Vec::new();
+    let mut i = 0;
+    while i < pos.len() {
+        let line = pos[i].lineno;
+        let mut j = i + 1;
+        while j < pos.len() && pos[j].lineno == line {
+            j += 1;
+        }
+        let l = match line {
+            Some(l) => int::new_int(l as i64),
+            None => none::none_ref(),
+        };
+        out.push(tuple::new_tuple(vec![int::new_int((i * 2) as i64), int::new_int((j * 2) as i64), l]));
+        i = j;
+    }
+    crate::abstract_::get_iter(&crate::types::list::new_list(out))
+}
+
+fn public_co_positions(o: &PyObject, p: &PublicView) -> PyResult {
+    let pos = public_positions(o, p);
+    let no_ranges = no_debug_ranges();
+    let opt = |x: Option<u32>| match x {
+        Some(v) => int::new_int(v as i64),
+        None => none::none_ref(),
+    };
+    let out: Vec<PyRef> = pos
+        .iter()
+        .map(|q| {
+            tuple::new_tuple(vec![
+                opt(q.lineno),
+                opt(q.end_lineno),
+                if no_ranges { none::none_ref() } else { opt(q.col) },
+                if no_ranges { none::none_ref() } else { opt(q.end_col) },
+            ])
+        })
+        .collect();
+    crate::abstract_::get_iter(&crate::types::list::new_list(out))
+}
+
 fn co_name_get(o: &PyObject) -> PyResult {
     borrowed(get(o).co_name)
 }
@@ -490,15 +649,27 @@ fn co_filename_get(o: &PyObject) -> PyResult {
     borrowed(get(o).co_filename)
 }
 fn co_consts_get(o: &PyObject) -> PyResult {
+    if let Some(p) = code_data(o).public.get() {
+        return Ok(p.consts.clone());
+    }
     borrowed(get(o).co_consts)
 }
 fn co_names_get(o: &PyObject) -> PyResult {
+    if let Some(p) = code_data(o).public.get() {
+        return Ok(p.names.clone());
+    }
     borrowed(get(o).co_names)
 }
 fn co_linetable_get(o: &PyObject) -> PyResult {
+    if let Some(p) = code_data(o).public.get() {
+        return Ok(p.linetable.clone());
+    }
     borrowed(get(o).co_linetable)
 }
 fn co_exceptiontable_get(o: &PyObject) -> PyResult {
+    if let Some(p) = code_data(o).public.get() {
+        return Ok(p.exceptiontable.clone());
+    }
     borrowed(get(o).co_exceptiontable)
 }
 fn int_field(v: c_int) -> PyResult {
@@ -514,6 +685,9 @@ fn co_kwonlyargcount(o: &PyObject) -> PyResult {
     int_field(get(o).co_kwonlyargcount)
 }
 fn co_stacksize(o: &PyObject) -> PyResult {
+    if let Some(p) = code_data(o).public.get() {
+        return Ok(int::new_int(p.stacksize as i64));
+    }
     int_field(get(o).co_stacksize)
 }
 fn co_flags(o: &PyObject) -> PyResult {
@@ -549,6 +723,8 @@ fn code_replace(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRe
     };
     let mut new_consts: Option<PyRef> = None;
     let mut new_names: Option<PyRef> = None;
+    let mut new_linetable: Option<PyRef> = None;
+    let mut new_exctable: Option<PyRef> = None;
     for (k, v) in kws {
         let ks = pystr::to_string_lossy(k);
         let as_int = || -> PyResult<u32> { Ok(crate::abstract_::as_i64(v)? as u32) };
@@ -570,6 +746,17 @@ fn code_replace(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRe
             "co_stacksize" => cu.stacksize = as_int()?,
             "co_consts" => new_consts = Some(v.to_ref()),
             "co_names" => new_names = Some(v.to_ref()),
+            "co_linetable" | "co_exceptiontable" if d.public.get().is_some() => {
+                if !bytes::is_bytes(v) {
+                    raise!(TypeError, "replace() argument '{}' must be bytes, not {}", ks, tname(v));
+                }
+                if ks == "co_linetable" {
+                    new_linetable = Some(v.to_ref());
+                } else {
+                    new_exctable = Some(v.to_ref());
+                }
+            }
+            "co_code" if d.public.get().is_some_and(|p| bytes::is_bytes(v) && bytes::bytes_data(v) == bytes::bytes_data(&p.code)) => {}
             "co_varnames" | "co_freevars" | "co_cellvars" | "co_nlocals" | "co_code" | "co_linetable"
             | "co_exceptiontable" => {
                 raise!(ValueError, "replace(): changing {} is not supported by this implementation", ks)
@@ -577,7 +764,19 @@ fn code_replace(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRe
             _ => raise!(TypeError, "replace() got an unexpected keyword argument '{}'", ks),
         }
     }
+    let keep_public = new_consts.is_none() && new_names.is_none();
     let r = new_code_from_unit(&cu, None)?;
+    if let (true, Some(p)) = (keep_public, d.public.get()) {
+        let view = PublicView {
+            code: p.code.clone(),
+            consts: p.consts.clone(),
+            names: p.names.clone(),
+            linetable: new_linetable.unwrap_or_else(|| p.linetable.clone()),
+            exceptiontable: new_exctable.unwrap_or_else(|| p.exceptiontable.clone()),
+            stacksize: p.stacksize,
+        };
+        let _ = code_data(&r).public.set(Box::new(view));
+    }
     unsafe {
         let rc = &mut *(r.as_ptr() as *mut PyCodeObject);
         let rd = &mut *rc.data;

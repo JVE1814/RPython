@@ -1,14 +1,9 @@
+"""Opcode tables of the CPython 3.15 instruction set (names, numbers, argument kinds,
+inline-cache layout), as used by dis and other bytecode tools.
 
-"""Tables describing the interpreter's instruction set (names, numbers and
-argument kinds), for dis and other bytecode tools.
-
-This implementation's bytecode is its own (not CPython's): every instruction
-is one 32-bit little-endian word, the low 8 bits being the opcode and the
-high 24 bits the argument (EXTENDED_ARG prefixes supply higher bits).  Jump
-arguments are absolute instruction indices.  There are no inline cache
-entries.
+The numbers are the public ABI fixed by Include/opcode_ids.h; the tables are provided by
+the _opcode builtin module.
 """
-
 
 __all__ = ["cmp_op", "stack_effect", "hascompare", "opname", "opmap",
            "HAVE_ARGUMENT", "EXTENDED_ARG", "hasarg", "hasconst", "hasname",
@@ -19,25 +14,43 @@ from _opcode import stack_effect
 
 cmp_op = ('<', '<=', '==', '!=', '>', '>=')
 
-opname = list(_opcode._opnames)
-opmap = {name: op for op, name in enumerate(opname)}
 
-# Every opcode is "below" HAVE_ARGUMENT only by convention in CPython; here
-# use has_arg() / hasarg instead.
-HAVE_ARGUMENT = 0
+def _build_tables():
+    specialized = {}
+    for base, names in _opcode._specializations().items():
+        for name in names:
+            specialized[name] = base
+    regular = {}
+    special = {}
+    for name, number in _opcode._opcodes():
+        if name in specialized:
+            special[name] = number
+        else:
+            regular[name] = number
+    return regular, special
+
+
+opmap, _specialized_opmap = _build_tables()
+del _build_tables
+
+_specializations = _opcode._specializations()
+
+opname = ['<%r>' % (op,) for op in range(max(opmap.values()) + 1)]
+for _name, _op in [*opmap.items(), *_specialized_opmap.items()]:
+    opname[_op] = _name
+del _name, _op
+
+HAVE_ARGUMENT = 41
 EXTENDED_ARG = opmap['EXTENDED_ARG']
-MIN_INSTRUMENTED_OPCODE = 256
-
-_specializations = {}
-_specialized_opmap = {}
-_inline_cache_entries = {name: 0 for name in opname}
-_cache_format = {}
+MIN_INSTRUMENTED_OPCODE = 233
+ENABLE_SPECIALIZATION = _opcode.ENABLE_SPECIALIZATION
+ENABLE_SPECIALIZATION_FT = _opcode.ENABLE_SPECIALIZATION_FT
 
 hasarg = [op for op in opmap.values() if _opcode.has_arg(op)]
 hasconst = [op for op in opmap.values() if _opcode.has_const(op)]
 hasname = [op for op in opmap.values() if _opcode.has_name(op)]
 hasjump = [op for op in opmap.values() if _opcode.has_jump(op)]
-hasjrel = hasjump  # for backward compatibility
+hasjrel = hasjump  # kept for backwards compatibility
 hasjabs = []
 hasfree = [op for op in opmap.values() if _opcode.has_free(op)]
 haslocal = [op for op in opmap.values() if _opcode.has_local(op)]
@@ -50,5 +63,7 @@ _special_method_names = _opcode.get_special_method_names()
 _common_constants = _opcode.get_common_constants()
 _nb_ops = _opcode.get_nb_ops()
 
-# Instruction size in bytes (co_code offsets).
-_INSTRUCTION_SIZE = 4
+_cache_format = {name: dict(fields)
+                 for name, fields in _opcode._cache_format().items()}
+_inline_cache_entries = {name: sum(fields.values())
+                         for name, fields in _cache_format.items()}

@@ -337,7 +337,7 @@ impl<'a> Compiler<'a> {
             ExprKind::JoinedStr { values } => {
                 if values.is_empty() {
                     self.load_const(Constant::Str(Vec::new()));
-                } else if values.len() == 1 && matches!(values[0].node, ExprKind::FormattedValue { .. } | ExprKind::Interpolation { .. }) {
+                } else if values.len() == 1 && matches!(values[0].node, ExprKind::FormattedValue { .. } | ExprKind::Interpolation { .. } | ExprKind::Constant { .. }) {
                     self.compile_expr(&values[0])?;
                 } else {
                     for v in values {
