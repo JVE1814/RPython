@@ -9,6 +9,8 @@ cp "$BIN" "$DEST.tmp/bin/python3"
 cp -r "$WT/Lib" "$DEST.tmp/lib/python3.15t"
 # the test package is part of an installed stdlib (subprocess tests run with -I/-E rely on it)
 cp -r "$WT/spec/Lib/test" "$DEST.tmp/lib/python3.15t/test"
+# license() (site) reads LICENSE.txt from the stdlib directory, as in a CPython install
+cp "$WT/spec/LICENSE" "$DEST.tmp/lib/python3.15t/LICENSE.txt"
 # idlelib's own tests live inside the package in an installed stdlib
 if [ -d "$WT/spec/Lib/idlelib/idle_test" ] && [ -d "$DEST.tmp/lib/python3.15t/idlelib" ]; then cp -r "$WT/spec/Lib/idlelib/idle_test" "$DEST.tmp/lib/python3.15t/idlelib/"; fi
 # the spec's C test helpers (_testcapi, _testlimitedcapi, _testbuffer, ...) are installed next

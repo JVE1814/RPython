@@ -1,6 +1,11 @@
 # PROGRESS
 
-## PAUSED (2026-11-01, ~21:00 UTC) at user request
+## RESUMED (2026-11-01, 22:15 UTC) after a pause at user request
+Wave 10 running: jit3 (merge+enable tier 2, perf), numpy2 (numpy/other wheels own test suites vs baseline),
+core3 (finalization, frozen modules, settrace, core failures), perf2 (startup, memory, scaling, shapes),
+tk (_tkinter, tkinter, idlelib — D23). Measurement queue: suite run 5, then re-runs of both rebuilt baselines.
+
+### Pause notes (2026-11-01, ~21:00 UTC)
 In-flight agents were asked to wrap up; their branches are merged into master as they report.
 To resume: read PLAN.md (workstream table, unassigned list), notes/*.md (per-workstream status and next
 steps), DECISIONS.md D19-D22; integration happens in the /home/user/core worktree (branch `core`), pushed
@@ -40,7 +45,9 @@ our interpreter; `import numpy` works (array math, linalg, fft, datetime64); num
 Blockers being fixed (numpy workstream): Cython code objects (numpy.random), C-created frame f_locals.
 
 ## Regression suite
-Reference (CPython 3.15.2 free-threaded, this machine, tools/run_tests.sh):
+Reference after the D21 rebuild (zstd + Tk; still no _decimal), ft: 414 PASS, 20 FAIL; tests run 51,220, failures 24,
+skipped 3,276 (/opt/baseline/results/ft2). Default-build re-run: /opt/baseline/results/default2.
+Original Reference (CPython 3.15.2 free-threaded, this machine, tools/run_tests.sh):
 434 modules: 416 PASS, 18 FAIL; tests run 50,649, failures 24, skipped 3,371.
 (tools/baseline_ft_results.tsv). Default-build reference: 416 PASS, 18 FAIL; run 50,576, failures 24, skipped 3,353.
 
@@ -51,12 +58,35 @@ Ours (tools/run_tests.sh, 434 modules):
 | 2 | 819c1f4 | 143 | 284 | 3 | 3 | 7,594 | 900 | 695 |
 | 3 | d8d869f | 158 | 266 | 6 | 4 | 14,157 | 1,195 | 892 |
 | 4 | 30f8658 | 208 | 215 | 6 | 4 | 23,987 | 1,165 | 1,632 |
+| 5 | b578bf8 | 250 | 174 | 6 | 4 | 40,734 | 1,294 | 2,549 |
 Run 3 top blockers: array (39 modules), http (21), urllib (12), multiprocessing (11),
 importlib.resources (11), datetime (11), concurrent (9), xml/email (7 each), html (6).
 Run 1 top blockers: py_compile (230 modules; merged since), unittest.mock (57), doctest (24),
 array (24), socket (17), pathlib (16), http (14), multiprocessing, decimal, datetime, ntpath.
 
 ## Benchmarks
+### Latest (jit3, tier 2 on by default; steady-state callgrind instructions per loop, millions; ratio = ours / best CPython)
+| bench | CPython default | CPython ft | ours | ratio |
+|---|---|---|---|---|
+| richards | 461 | 566 | 353 | 0.77 |
+| nbody | 1108 | 1401 | 394 | 0.36 |
+| spectral_norm | 1208 | 1404 | 818 | 0.68 |
+| float | 778 | 870 | 866 | 1.11 |
+| richards_super | 530 | 639 | 559 | 1.05 |
+| chaos | 611 | 683 | 723 | 1.18 |
+| raytrace | 2757 | 3201 | 3640 | 1.32 |
+| hexiom | 58 | 66 | 78 | 1.35 |
+| deltablue | 29 | 42 | 49 | 1.70 |
+| go | 1138 | 1260 | 2111 | 1.85 |
+| fannkuch | 4393 | 4963 | 8647 | 1.97 |
+| coroutines | 294 | 300 | 605 | 2.06 |
+| generators | 337 | 372 | 810 | 2.40 |
+| nqueens | 842 | 943 | 2086 | 2.48 |
+| comprehensions | 0.19 | 0.24 | 0.42 | 2.2 |
+| unpack_sequence | 0.25 | 0.15 | 0.37 | 2.5 |
+Next: generators/coroutines in tier 2 + deeper inlining (jit4); runtime costs in fannkuch/nqueens (perf2).
+
+### Earlier table (jit workstream)
 Callgrind instructions, whole process, millions (machine heavily loaded, so instruction counts
 are the primary metric; jit workstream, before generational GC / dict storage changes except float
 and generators):
