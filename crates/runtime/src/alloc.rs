@@ -270,7 +270,7 @@ pub unsafe extern "C" fn free_object_c(op: *mut PyObject) {
         let tp = (*op).type_ptr();
         free_object(op);
         if (*tp).tp_flags & Py_TPFLAGS_HEAPTYPE != 0 {
-            crate::object::decref(tp as *mut PyObject);
+            crate::object::decref_type(tp);
         }
     }
 }

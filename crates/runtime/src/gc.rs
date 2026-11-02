@@ -335,6 +335,7 @@ fn total_refcnt(o: &PyObject) -> isize {
         return isize::MAX / 2;
     }
     local as isize + (o.ob_ref_shared.load(Relaxed) >> REF_SHARED_SHIFT)
+        - unsafe { crate::object::has_type_id(o.as_ptr()) } as isize
 }
 
 /// Multiplicative hash for object addresses (SipHash dominated collection time).
@@ -530,6 +531,7 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
         }
         // every thread is at a safepoint: references deferred before now can go
         mature_deferred();
+        crate::object::merge_type_counts();
         // ---- phase 1 (stopped): find the unreachable objects
         let objs = snapshot_gen(young_only);
         crate::gc_support::CANDIDATES.fetch_add(objs.len(), Relaxed);
@@ -541,6 +543,13 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
         }
         // keep the garbage alive while we work on it
         let garbage: Vec<PyRef> = unreachable.iter().map(|&o| PyRef::from_borrowed(o)).collect();
+        // unreachable types stop per-thread counting (their bias goes; `garbage` keeps
+        // them alive meanwhile)
+        for &o in &unreachable {
+            if crate::object::has_type_id(o) {
+                crate::object::release_type_id(o as *mut PyTypeObject, true);
+            }
+        }
         let needs_finalize = garbage.iter().any(|g| {
             let op = g.as_ptr();
             (*(*op).type_ptr()).tp_finalize.is_some() && !is_finalized(op)

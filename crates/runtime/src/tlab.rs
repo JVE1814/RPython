@@ -344,10 +344,16 @@ unsafe fn zero_block(p: *mut u8, size: usize) {
         match size {
             16 => std::ptr::write_bytes(p, 0, 16),
             32 => std::ptr::write_bytes(p, 0, 32),
+            40 => std::ptr::write_bytes(p, 0, 40),
             48 => std::ptr::write_bytes(p, 0, 48),
+            56 => std::ptr::write_bytes(p, 0, 56),
             64 => std::ptr::write_bytes(p, 0, 64),
+            72 => std::ptr::write_bytes(p, 0, 72),
             80 => std::ptr::write_bytes(p, 0, 80),
+            88 => std::ptr::write_bytes(p, 0, 88),
             96 => std::ptr::write_bytes(p, 0, 96),
+            112 => std::ptr::write_bytes(p, 0, 112),
+            128 => std::ptr::write_bytes(p, 0, 128),
             _ => std::ptr::write_bytes(p, 0, size),
         }
     }
@@ -360,7 +366,7 @@ pub fn alloc_small(size: usize) -> *mut u8 {
 }
 
 /// Allocate a zeroed small block (size <= MAX_SMALL) of the given kind. Null on OOM.
-#[inline]
+#[inline(always)]
 pub fn alloc_kind(size: usize, kind: usize) -> *mut u8 {
     let rounded = if kind == KIND_RAW { (size + 15) & !15 } else { (size + 7) & !7 };
     let c = CLASS_OF[rounded / 8] as usize + kind * NCLASSES;
