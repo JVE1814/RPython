@@ -112,9 +112,8 @@ fn partial_new_impl(tp: *mut PyTypeObject, a: &[&PyObject], kw: Option<&PyObject
     }
     let mut pargs: Vec<PyRef> = Vec::new();
     let mut pkw: Option<PyRef> = None;
-    // Flatten nested partial objects of the exact base type.
-    let base = partial_type();
-    if func.is_type(base) && tp == base && pobj(&func).dict.is_null() {
+    // flatten a nested partial of exactly the type being created (grind-lib: subclasses too)
+    if func.type_ptr() == tp && pobj(&func).dict.is_null() {
         let inner = pobj(&func);
         let inner_args = tuple::tuple_items(unsafe { &*inner.args });
         let mut j = 0;
@@ -186,13 +185,34 @@ fn partial_build_args(fargs: &PyObject, phcount: isize, call: &[&PyObject]) -> P
     Ok(out)
 }
 
-fn partial_call_impl(o: &PyObject, call_pos: &[&PyObject], call_kw: Option<&PyObject>) -> PyResult {
-    // Hold strong references: the call may re-enter and change our state.
+/// Strong references to a partial's state, taken before anything that can run
+/// Python code (hashing keyword names, building arguments) so that a re-entrant
+/// `__setstate__` cannot mix old and new state within one call.
+struct PartialState {
+    func: PyRef,
+    fargs: PyRef,
+    fkw: PyRef,
+    phcount: isize,
+}
+
+fn partial_state(o: &PyObject) -> PartialState {
     let p = pobj(o);
-    let func = unsafe { (*p.func).to_ref() };
-    let fargs = unsafe { (*p.args).to_ref() };
-    let fkw = unsafe { (*p.kw).to_ref() };
-    let phcount = p.phcount;
+    unsafe {
+        PartialState {
+            func: (*p.func).to_ref(),
+            fargs: (*p.args).to_ref(),
+            fkw: (*p.kw).to_ref(),
+            phcount: p.phcount,
+        }
+    }
+}
+
+fn partial_call_impl(o: &PyObject, call_pos: &[&PyObject], call_kw: Option<&PyObject>) -> PyResult {
+    partial_call_state(partial_state(o), call_pos, call_kw)
+}
+
+fn partial_call_state(st: PartialState, call_pos: &[&PyObject], call_kw: Option<&PyObject>) -> PyResult {
+    let PartialState { func, fargs, fkw, phcount } = st;
     let args = partial_build_args(&fargs, phcount, call_pos)?;
     let argrefs: Vec<&PyObject> = args.iter().map(|x| &**x).collect();
     let kwd: Option<PyRef> = if dict::dict_len(&fkw) == 0 {
@@ -235,6 +255,7 @@ unsafe extern "C" fn partial_vectorcall(
             })();
             return into_c(r);
         }
+        let st = partial_state(o);
         let kwd = if nkw == 0 {
             None
         } else {
@@ -246,7 +267,7 @@ unsafe extern "C" fn partial_vectorcall(
             }
             Some(d)
         };
-        into_c(partial_call_impl(o, &all[..n], kwd.as_deref()))
+        into_c(partial_call_state(st, &all[..n], kwd.as_deref()))
     }
 }
 
