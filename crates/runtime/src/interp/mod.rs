@@ -6,6 +6,8 @@ pub mod frame;
 pub mod jump;
 pub mod jit;
 pub mod specialize;
+pub mod translate;
+pub mod wc;
 
 use crate::errors::*;
 use crate::ffi::*;
@@ -106,6 +108,11 @@ pub fn call_function(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwna
     if flags & (bc::co::GENERATOR | bc::co::COROUTINE | bc::co::ASYNC_GENERATOR) != 0 {
         frame.make_owned();
         prepare_cells(&mut frame, f);
+        if code::code_data(co).eager_prologue {
+            // RETURN_GENERATOR is preceded by real work (a genexpr's `iter()`): run the
+            // frame up to it now, so errors surface at call time.
+            frame = run_generator_prologue(frame)?;
+        }
         return crate::types::genobject::new_generator_for(frame, func, flags);
     }
     prepare_cells(&mut frame, f);
@@ -123,6 +130,32 @@ pub fn run_frame(mut frame: Box<Frame>) -> PyResult {
         Ok(Exit::Return(v)) => Ok(v),
         Ok(Exit::Yield(_)) => Err(system_error("yield from a non-generator frame")),
         Err(e) => Err(e),
+    }
+}
+
+/// Run a generator frame's eager prologue up to the internal `ReturnGenerator`; the frame
+/// is then "just created" again (nothing is pushed on the first resume).
+fn run_generator_prologue(mut frame: Box<Frame>) -> PyResult<Box<Frame>> {
+    let ts = crate::threads::current();
+    if let Err(e) = enter_recursive_call(ts, "") {
+        frame_finished(frame);
+        return Err(e);
+    }
+    let r = eval::eval_frame(ts, &mut frame, None);
+    leave_recursive_call(ts);
+    match r {
+        Ok(Exit::Yield(_)) => {
+            frame.state = frame::FrameState::Created;
+            Ok(frame)
+        }
+        Ok(Exit::Return(_)) => {
+            frame_finished(frame);
+            Err(system_error("generator prologue returned"))
+        }
+        Err(e) => {
+            frame_finished(frame);
+            Err(e)
+        }
     }
 }
 

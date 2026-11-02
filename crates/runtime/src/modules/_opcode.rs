@@ -76,6 +76,8 @@ pub fn has_arg(op: Op) -> bool {
             | Unused1
             | Unused2
             | Unused3
+            | LoadSpecial
+            | ReturnGenerator
     )
 }
 
@@ -223,6 +225,8 @@ pub fn stack_effect(op: Op, arg: u32, jump: bool) -> i32 {
         Unused1 => -1,
         Unused2 => 0,
         Unused3 => -1,
+        LoadSpecial => 1,
+        ReturnGenerator => 0,
     }
 }
 

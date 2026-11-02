@@ -76,7 +76,8 @@ pub fn effect(op: Op, arg: u32) -> (i32, i32) {
         JumpIfFalseOrPop | JumpIfTrueOrPop => return (-1, 0),
         ForIter => return (1, -1),
         Send => return (0, -1),
-        Unused1 | Unused2 | Unused3 => 0,
+        Unused1 | Unused2 | Unused3 | ReturnGenerator => 0,
+        LoadSpecial => 1,
     };
     (d, d)
 }
