@@ -13,8 +13,17 @@ cd /tmp || exit 1
 cg() { valgrind --tool=callgrind --demangle=no --callgrind-out-file="$TMP/cg.$1" "${@:2}" >/dev/null 2>&1; }
 cg 1 "$PY" -c pass
 cg 2 "$PY" -S -c pass
-cg 3 "$PY" -c 'import os, re, collections, functools, threading, json'
-cat "$TMP"/cg.1 "$TMP"/cg.2 "$TMP"/cg.3 | grep -oE '^c?fn=\([0-9]+\) [^ ]+' | sed -E 's/^c?fn=\([0-9]+\) //' |
+cg 3 "$PY" -c 'for l in open("/proc/self/status"):
+    if l.startswith(("VmHWM", "RssAnon")): print(l.split()[0], l.split()[1])'
+cg 4 "$PY" -c 'import os, re, collections, functools, threading, json'
+cg 5 "$PY" "$ROOT/tools/bench/perf/objs_small.py" 2000
+# common operations (micro benchmarks with small sizes) after the startup set
+n=6
+for m in "$ROOT"/tools/bench/micro/*.py; do
+  cg $n "$PY" "$m" 5000
+  n=$((n + 1))
+done
+ls "$TMP"/cg.* | sort -t. -k2 -n | xargs cat | grep -oE '^c?fn=\([0-9]+\) [^ ]+' | sed -E 's/^c?fn=\([0-9]+\) //' |
   grep -E '^[A-Za-z_][A-Za-z0-9_$.]*$' | sed -E 's/\.llvm\.[0-9]+$//' | awk '!seen[$0]++' > "$TMP/names0"
 # LLVM merges identical functions (one body, several symbol names): callgrind reports one
 # name, but the section may carry another, so add every name that shares the address.
