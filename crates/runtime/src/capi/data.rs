@@ -36,7 +36,7 @@ macro_rules! placeholder_types {
     };
 }
 placeholder_types!(
-    (PyInstanceMethod_Type, "instancemethod"),
+
     (PyODictItems_Type, "odict_items"),
     (PyODictIter_Type, "odict_iterator"),
     (PyODictKeys_Type, "odict_keys"),
@@ -49,6 +49,7 @@ placeholder_types!(
 /// Called before the first extension module is loaded.
 pub fn init() {
     init_placeholders();
+    super::funcs::init_instancemethod_type();
     super::capsule::init_type();
 }
 

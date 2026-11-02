@@ -406,17 +406,39 @@ pub unsafe extern "C" fn PyByteArray_Resize(o: *mut PyObject, n: Py_ssize_t) -> 
 
 pub struct BytesWriter {
     buf: Vec<u8>,
+    /// finish() makes a bytearray (_PyBytesWriter_CreateByteArray) instead of bytes
+    bytearray: bool,
+}
+/// Set `buf` to `n` bytes (new bytes zeroed); MemoryError instead of an abort.
+fn bw_set_len(buf: &mut Vec<u8>, n: usize) -> PyResult<()> {
+    if n > buf.len() && buf.try_reserve(n - buf.len()).is_err() {
+        return Err(crate::errors::memory_error());
+    }
+    buf.resize(n, 0);
+    Ok(())
+}
+unsafe fn bw_create(size: Py_ssize_t, bytearray: bool) -> *mut BytesWriter {
+    if size < 0 {
+        let _ = value_error("size must be >= 0");
+        return std::ptr::null_mut();
+    }
+    let mut buf = Vec::new();
+    if bw_set_len(&mut buf, size as usize).is_err() {
+        return std::ptr::null_mut();
+    }
+    Box::into_raw(Box::new(BytesWriter { buf, bytearray }))
+}
+/// Private helper used by _testcapi: a writer whose result is a bytearray.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _PyBytesWriter_CreateByteArray(size: Py_ssize_t) -> *mut BytesWriter {
+    unsafe { bw_create(size, true) }
 }
 unsafe fn bw<'a>(w: *mut BytesWriter) -> &'a mut BytesWriter {
     unsafe { &mut *w }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyBytesWriter_Create(size: Py_ssize_t) -> *mut BytesWriter {
-    if size < 0 {
-        let _ = value_error("size must be >= 0");
-        return std::ptr::null_mut();
-    }
-    Box::into_raw(Box::new(BytesWriter { buf: vec![0u8; size as usize] }))
+    unsafe { bw_create(size, false) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyBytesWriter_Discard(w: *mut BytesWriter) {
@@ -446,7 +468,11 @@ pub unsafe extern "C" fn PyBytesWriter_FinishWithSize(w: *mut BytesWriter, size:
             let _ = value_error("invalid size");
             return std::ptr::null_mut();
         }
-        bytes::new_bytes(&b.buf[..size as usize]).into_raw()
+        let data = &b.buf[..size as usize];
+        if b.bytearray {
+            return ret(crate::types::bytearray::new_bytearray(data));
+        }
+        ret(bytes::try_new_bytes(data))
     }
 }
 #[unsafe(no_mangle)]
@@ -476,14 +502,13 @@ pub unsafe extern "C" fn PyBytesWriter_Resize(w: *mut BytesWriter, size: Py_ssiz
             let _ = value_error("size must be >= 0");
             return -1;
         }
-        bw(w).buf.resize(size as usize, 0);
-        0
+        ret_i(bw_set_len(&mut bw(w).buf, size as usize))
     }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyBytesWriter_Grow(w: *mut BytesWriter, size: Py_ssize_t) -> c_int {
     unsafe {
-        let n = bw(w).buf.len() as Py_ssize_t + size;
+        let n = (bw(w).buf.len() as Py_ssize_t).saturating_add(size);
         if n < 0 {
             let _ = value_error("invalid size");
             return -1;

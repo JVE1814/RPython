@@ -1956,6 +1956,9 @@ pub fn handle_eval_breaker(ts: &ThreadState) -> PyResult<()> {
     if eb & crate::threads::EVAL_ASYNC_EXC != 0 {
         crate::modules::thread::raise_async_exc(ts)?;
     }
+    if eb & crate::threads::EVAL_PENDING != 0 {
+        crate::capi::pystate::run_pending_calls()?;
+    }
     Ok(())
 }
 

@@ -162,6 +162,48 @@ def code_returns_only_none(code):
     return False
 "#;
 
+/// Runs a queued Python callable (the queue owns one reference to it).
+unsafe extern "C" fn run_pending_callable(arg: *mut std::ffi::c_void) -> std::ffi::c_int {
+    unsafe {
+        let f = PyRef::from_raw(arg as *mut PyObject);
+        match ab::call(&f, &[]) {
+            Ok(_) => 0,
+            Err(_) => -1,
+        }
+    }
+}
+
+/// pending_threadfunc(callback, num=1, *, blocking=False, ensure_added=False): queue
+/// `callback` `num` times as a pending call that any thread may run; returns how many
+/// were queued (the queue holds at most 300).
+fn pending_threadfunc(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
+    static P: crate::args::Params = crate::args::Params::new("pending_threadfunc", &["callback", "num", "blocking", "ensure_added"], 0, 1);
+    let [cb, num, _blocking, ensure] = crate::args::parse::<4>(&P, args, kw)?;
+    let cb = cb.unwrap();
+    let num = match num {
+        Some(n) => ab::as_i64(n)?.max(0) as u64,
+        None => 1,
+    };
+    let ensure = match ensure {
+        Some(e) => ab::is_true(e)?,
+        None => false,
+    };
+    let mut added = 0u64;
+    while added < num {
+        let p = cb.to_ref().into_raw() as *mut std::ffi::c_void;
+        if crate::capi::pystate::add_pending_call(run_pending_callable, p, false) < 0 {
+            unsafe { decref(p as *mut PyObject) };
+            if ensure {
+                std::thread::yield_now();
+                continue;
+            }
+            break;
+        }
+        added += 1;
+    }
+    Ok(int::new_int(added as i64))
+}
+
 pub fn init() -> PyResult {
     let m = crate::types::module::new_module("_testinternalcapi")?;
     let d = crate::types::module::module_dict(&m);
@@ -169,6 +211,7 @@ pub fn init() -> PyResult {
         &d,
         crate::mdefs![
             ("has_inline_values", O, has_inline_values),
+            ("pending_threadfunc", FASTKW, pending_threadfunc),
             ("has_split_table", O, has_split_table),
             ("get_recursion_depth", NOARGS, get_recursion_depth),
             ("get_c_recursion_remaining", NOARGS, get_c_recursion_remaining),
@@ -200,6 +243,7 @@ pub fn init() -> PyResult {
         ("TIER2_RESUME_THRESHOLD", 4096),
         ("_PY_NSMALLPOSINTS", 1025),
         ("_PY_NSMALLNEGINTS", 5),
+        ("_Py_MAX_UNICODE", 0x10ffff),
     ] {
         dict::set_item_str(&d, k, &int::new_int(v))?;
     }
