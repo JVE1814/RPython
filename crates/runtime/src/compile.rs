@@ -384,11 +384,19 @@ pub fn compile_mod(module: &rpy_parser::ast::Mod, o: &Opts, src: Option<&str>) -
     let mut copts = CompileOptions::new(filename, o.mode.c());
     copts.flags = o.flags;
     copts.optimize = if o.optimize < 0 { crate::modules::sys::optimize_flag() } else { o.optimize };
-    let out = match rpy_compiler::compile(module, &copts) {
-        Ok(o) => o,
-        Err(e) => return Err(compile_error(&e, filename, src)),
+    // D24: RPYTHON_WORDCODE=1 selects the CPython 3.15 wordcode pipeline
+    let (legacy, wcode, warnings, future_flags) = if crate::types::code::public_mode() {
+        match rpy_compiler::compile_wordcode(module, &copts) {
+            Ok(o) => (None, Some(o.code), o.warnings, o.future_flags),
+            Err(e) => return Err(compile_error(&e, filename, src)),
+        }
+    } else {
+        match rpy_compiler::compile(module, &copts) {
+            Ok(o) => (Some(o.code), None, o.warnings, o.future_flags),
+            Err(e) => return Err(compile_error(&e, filename, src)),
+        }
     };
-    for w in &out.warnings {
+    for w in &warnings {
         let cat = format!("{:?}", w.category);
         let text = src.and_then(|s| source_line(s, w.lineno));
         let off = match &text {
@@ -409,8 +417,12 @@ pub fn compile_mod(module: &rpy_parser::ast::Mod, o: &Opts, src: Option<&str>) -
         emit_warning_m(&cat, &w.msg, &w.msg, filename, w.lineno, off, text.as_deref(), o.module, (Some(w.end_lineno), Some(end_off)))?;
     }
     let fname = pystr::intern_str(filename);
-    let code = crate::types::code::new_code_from_unit(&out.code, Some(&fname))?;
-    Ok(Compiled { code, future_flags: out.future_flags })
+    let code = match (&legacy, &wcode) {
+        (Some(cu), _) => crate::types::code::new_code_from_unit(cu, Some(&fname))?,
+        (_, Some(co)) => crate::types::code::new_code_from_wordcode(co, Some(&fname))?,
+        _ => unreachable!(),
+    };
+    Ok(Compiled { code, future_flags })
 }
 
 /// AST-level optimization of `ast.parse(..., optimize=N)` / PyCF_OPTIMIZED_AST.

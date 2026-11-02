@@ -680,6 +680,7 @@ pub fn translate(inp: &Input) -> Result<Output, String> {
     let mut state: Vec<Option<St>> = vec![None; n];
     let mut work: Vec<(usize, St)> = Vec::new();
     if n > 0 {
+        state[0] = Some(Vec::new());
         work.push((0, Vec::new()));
     }
     let merge = |state: &mut Vec<Option<St>>, work: &mut Vec<(usize, St)>, k: usize, s: St, lenient: bool| -> Result<(), String> {

@@ -194,7 +194,22 @@ pub fn code_data(o: &PyObject) -> &CodeData {
 #[cold]
 fn code_data_slow(o: &PyObject) -> &CodeData {
     let c = get(o);
-    let fresh = Box::into_raw(Box::new(build_exec(c, unsafe { &*c.meta })));
+    let built = build_exec(c, unsafe { &*c.meta });
+    if std::env::var_os("RPYTHON_TRANSLATE_DEBUG").is_some() {
+        let m = unsafe { &*c.meta };
+        eprintln!("== translate {} ({})", pystr::to_string_lossy(&m.co_qualname), pystr::to_string_lossy(&m.filename));
+        if let Some(e) = &built.invalid {
+            eprintln!("   ERROR {}", e);
+        }
+        for (i, w) in built.code.iter().enumerate() {
+            let (op, a) = bc::decode(*w);
+            eprintln!("   {:4} [pub {:4}] {:?} {}", i, built.pub_offset(i) * 2, op, a);
+        }
+        for e in &built.exception_table {
+            eprintln!("   exc {}..{} -> {} depth {} lasti {}", e.start, e.end, e.target, e.depth, e.lasti);
+        }
+    }
+    let fresh = Box::into_raw(Box::new(built));
     match c.data.compare_exchange(std::ptr::null_mut(), fresh, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => unsafe { &*fresh },
         Err(winner) => {
