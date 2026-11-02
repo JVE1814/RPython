@@ -55,6 +55,8 @@ pub enum Own {
     Owned,
     /// borrowed from the frame slot of local #i
     Borrowed(u32),
+    /// borrowed from local #i of the callee being inlined
+    Inl(u32),
     /// constant / immortal: no reference counting needed while in use
     Const,
 }
@@ -274,6 +276,27 @@ struct B<'a> {
     /// per-site memo cells referenced by the code (leaked boxes, freed with the code)
     cells: Vec<usize>,
     closed: bool,
+    /// inlining in progress (callee context)
+    inl: Option<InlCtx>,
+    /// callee analyses / units referenced through `u` while inlining
+    inl_an: Vec<Box<Analysis>>,
+    inl_units: Vec<Box<Unit<'static>>>,
+}
+
+/// State of an inlined call being built.
+struct InlCtx {
+    func: usize,
+    /// stack depth of the caller below the call
+    base: usize,
+    /// callee locals (AV::Null: unbound)
+    locals: Vec<AV>,
+    cont: BlockId,
+    res: V,
+    err: SnapId,
+    /// an instruction needed a template: give up inlining
+    failed: bool,
+    /// inline snapshots were made (the result arrives in `res`)
+    snapped: bool,
 }
 
 const SK_INT: u8 = 1;
@@ -326,6 +349,12 @@ fn const_float(p: usize) -> Option<f64> {
         Some(crate::types::float::float_value(&*(p as *mut PyObject)))
     }
 }
+/// Inlining of small callees (RPYTHON_JIT2_INLINE=0 disables it).
+fn inline_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RPYTHON_JIT2_INLINE").map_or(true, |v| v != "0"))
+}
+
 /// Is `tp` (a type pointer recorded in an inline-cache entry) still the live type
 /// with version tag `tag`? Tags are unique and never reused, so a freed or modified
 /// type cannot match.
@@ -407,9 +436,20 @@ impl<'a> B<'a> {
     fn snap(&mut self, i: usize, kind: SnapKind) -> SnapId {
         self.force_conds();
         let ins = self.u.an.instrs[i];
+        if let Some(c) = &self.inl {
+            // inside an inlined callee: describe the callee frame (all its locals and
+            // its part of the value stack); the caller continues in compiled code
+            let kind = if kind == SnapKind::Error { SnapKind::InlineError } else { SnapKind::InlineDeopt };
+            let stack = self.st.stack[c.base..].iter().map(|a| self.mat_of(a)).collect();
+            let locals = c.locals.iter().enumerate().map(|(k, a)| (k as u32, self.mat_of(a), false)).collect();
+            let inl = Some(InlSnap { func: c.func, res: c.res, cont: c.cont, err: c.err });
+            self.inl.as_mut().unwrap().snapped = true;
+            self.f.snaps.push(Snapshot { resume: ins.start, lasti: ins.pc, stack, locals, kind, inl });
+            return self.f.snaps.len() as SnapId - 1;
+        }
         let stack = self.st.stack.iter().map(|a| self.mat_of(a)).collect();
         let locals = self.dirty_locals();
-        self.f.snaps.push(Snapshot { resume: ins.start, lasti: ins.pc, stack, locals, kind });
+        self.f.snaps.push(Snapshot { resume: ins.start, lasti: ins.pc, stack, locals, kind, inl: None });
         self.f.snaps.len() as SnapId - 1
     }
     /// Snapshot for resuming at the instruction after `i` with the current state.
@@ -418,7 +458,7 @@ impl<'a> B<'a> {
         let resume = self.u.an.instrs.get(i + 1).map_or(self.u.an.instrs[i].pc + 1, |n| n.start);
         let stack = self.st.stack.iter().map(|a| self.mat_of(a)).collect();
         let locals = self.dirty_locals();
-        self.f.snaps.push(Snapshot { resume, lasti: self.u.an.instrs[i].pc, stack, locals, kind: SnapKind::Deopt });
+        self.f.snaps.push(Snapshot { resume, lasti: self.u.an.instrs[i].pc, stack, locals, kind: SnapKind::Deopt, inl: None });
         self.f.snaps.len() as SnapId - 1
     }
 
@@ -833,13 +873,18 @@ impl<'a> B<'a> {
     // ------------------------------------------------------------ templates
     /// Emit instruction #i through the tier-1 template generator.
     fn template(&mut self, i: usize) {
+        if let Some(c) = self.inl.as_mut() {
+            // inlined callees are compiled without templates: give up inlining
+            c.failed = true;
+            return;
+        }
         self.materialize_stack();
         let locals = self.dirty_locals();
         let exit = if locals.is_empty() {
             None
         } else {
             let ins = self.u.an.instrs[i];
-            self.f.snaps.push(Snapshot { resume: ins.start, lasti: ins.pc, stack: Vec::new(), locals, kind: SnapKind::TemplateExit });
+            self.f.snaps.push(Snapshot { resume: ins.start, lasti: ins.pc, stack: Vec::new(), locals, kind: SnapKind::TemplateExit, inl: None });
             Some(self.f.snaps.len() as SnapId - 1)
         };
         self.emit(Inst::Template(i as u32, exit));
@@ -1078,7 +1123,7 @@ impl<'a> B<'a> {
     fn instr(&mut self, i: usize, last: usize) -> Result<bool, String> {
         let ins = self.u.an.instrs[i];
         let arg = ins.arg;
-        debug_assert_eq!(self.st.stack.len() as i32, self.u.an.depth[i], "tier2: depth mismatch at {}", ins.pc);
+        debug_assert_eq!((self.st.stack.len() - self.inl.as_ref().map_or(0, |c| c.base)) as i32, self.u.an.depth[i], "tier2: depth mismatch at {}", ins.pc);
         match ins.op {
             Op::Nop | Op::ExtendedArg => {}
             Op::Resume => {
@@ -1305,7 +1350,7 @@ impl<'a> B<'a> {
                     None
                 } else {
                     let ins = self.u.an.instrs[i];
-                    self.f.snaps.push(Snapshot { resume: ins.start, lasti: ins.pc, stack: Vec::new(), locals, kind: SnapKind::TemplateExit });
+                    self.f.snaps.push(Snapshot { resume: ins.start, lasti: ins.pc, stack: Vec::new(), locals, kind: SnapKind::TemplateExit, inl: None });
                     Some(self.f.snaps.len() as SnapId - 1)
                 };
                 self.term(Term::Return(v, d, snap));
@@ -1314,6 +1359,11 @@ impl<'a> B<'a> {
             Op::LoadAttr => self.load_attr(i),
             Op::LoadMethod => self.load_method(i),
             Op::StoreAttr => self.store_attr(i),
+            Op::Call => {
+                if !self.try_inline(i)? {
+                    self.template(i);
+                }
+            }
             Op::StoreSubscr => self.store_subscr(i),
             Op::UnpackSequence => self.unpack_sequence(i),
             Op::DeleteFast | Op::LoadFastAndClear => self.template(i),
@@ -2183,6 +2233,274 @@ impl<'a> B<'a> {
         self.pop();
     }
 
+    // ------------------------------------------------------------ inlining
+
+    /// The callee of Call instruction i if it can be inlined: a constant plain
+    /// function with exactly the given positional arguments, a small straight-line
+    /// body (no jumps, no handlers, no cells) of instructions the builder compiles
+    /// natively, and tier-1 profiles. Returns (function, its unit, analysis).
+    fn inline_candidate(&self, i: usize) -> Option<(usize, Box<Analysis>)> {
+        if self.inl.is_some() || !inline_enabled() {
+            return None;
+        }
+        let n = self.u.an.instrs[i].arg as usize;
+        let d = self.st.stack.len();
+        let AV::Const(fp) = self.st.stack[d - n - 2] else { return None };
+        let has_self = !matches!(self.st.stack[d - n - 1], AV::Null);
+        unsafe {
+            let fo = &*(fp as *mut PyObject);
+            if !fo.is_type(crate::types::funcobject::function_type()) {
+                return None;
+            }
+            let f = crate::types::funcobject::func(fo);
+            let code = &*f.func_code;
+            let cd = crate::types::code::code_data(code);
+            if std::ptr::eq(cd, self.u.cd) || cd.caches.jit.load(std::sync::atomic::Ordering::Acquire).is_null() {
+                return None; // recursion, or not warm (no profiles)
+            }
+            let co = crate::types::code::code(code).obj;
+            use rpy_compiler::bytecode::co as cof;
+            let bad = cof::VARARGS | cof::VARKEYWORDS | cof::GENERATOR | cof::COROUTINE | cof::ASYNC_GENERATOR | cof::ITERABLE_COROUTINE;
+            if co.co_flags as u32 & bad != 0 || co.co_flags as u32 & cof::OPTIMIZED == 0 || co.co_kwonlyargcount != 0 {
+                return None;
+            }
+            if co.co_argcount as usize != n + has_self as usize || co.co_nlocalsplus as usize > 16 {
+                return None;
+            }
+            if !cd.exception_table.is_empty() || cd.localspluskinds.iter().any(|k| k & (bc::fast::CELL | bc::fast::FREE) != 0) {
+                return None;
+            }
+            if f.func_globals.is_null() || f.func_builtins.is_null() {
+                return None;
+            }
+            let an = super::super::analysis::analyze(&cd.code, &cd.exception_table).ok()?;
+            if an.instrs.len() > 48 {
+                return None;
+            }
+            for (k, ins) in an.instrs.iter().enumerate() {
+                let last = k + 1 == an.instrs.len();
+                let ok = match ins.op {
+                    Op::ReturnValue => last,
+                    Op::Nop | Op::ExtendedArg | Op::LoadFast | Op::LoadFastCheck | Op::StoreFast | Op::LoadConst | Op::PopTop | Op::PushNull | Op::Copy | Op::Swap => true,
+                    Op::LoadGlobal | Op::LoadAttr | Op::StoreAttr | Op::BinaryOp | Op::CompareOp | Op::IsOp | Op::UnaryNegative | Op::UnaryNot | Op::ToBool => true,
+                    Op::BinarySubscr | Op::StoreSubscr | Op::UnpackSequence => true,
+                    _ => ins.op == Op::Resume,
+                };
+                if !ok || an.depth[k] < 0 {
+                    return None;
+                }
+            }
+            if an.instrs.last().map(|x| x.op) != Some(Op::ReturnValue) {
+                return None;
+            }
+            Some((fp, Box::new(an)))
+        }
+    }
+
+    /// Try to compile Call instruction i by inlining its callee. False: nothing was
+    /// emitted (the caller emits the call normally).
+    fn try_inline(&mut self, i: usize) -> Result<bool, String> {
+        let Some((fp, an)) = self.inline_candidate(i) else { return Ok(false) };
+        let n = self.u.an.instrs[i].arg as usize;
+        // rollback point
+        let save_st = self.st.clone();
+        let save_cur = self.cur;
+        let save_insts = self.f.blocks[self.cur as usize].insts.len();
+        let save_term = self.f.blocks[self.cur as usize].term.clone();
+        let save_tsuccs = self.f.blocks[self.cur as usize].tsuccs.len();
+        let (save_nblocks, save_nsnaps, save_ncls) = (self.f.blocks.len(), self.f.snaps.len(), self.f.classes.len());
+        let (save_deps, save_cells, save_has_deps, save_closed) = (self.deps.len(), self.cells.len(), self.has_deps, self.closed);
+        let caller_u = self.u;
+        // error of the call as a whole: the caller's state without the call operands
+        self.force_conds();
+        let d = self.st.stack.len();
+        let base = d - n - 2;
+        let ins = self.u.an.instrs[i];
+        let err = {
+            let stack = self.st.stack[..base].iter().map(|a| self.mat_of(a)).collect();
+            let locals = self.dirty_locals();
+            self.f.snaps.push(Snapshot { resume: ins.start, lasti: ins.pc, stack, locals, kind: SnapKind::Error, inl: None });
+            self.f.snaps.len() as SnapId - 1
+        };
+        // callee locals: the arguments (moved from the caller's stack)
+        let has_self = !matches!(self.st.stack[d - n - 1], AV::Null);
+        let f = unsafe { crate::types::funcobject::func(&*(fp as *mut PyObject)) };
+        let code = unsafe { &*f.func_code };
+        let cd = crate::types::code::code_data(code);
+        let co = crate::types::code::code(code).obj;
+        let nlp = co.co_nlocalsplus as usize;
+        let mut locals = vec![AV::Null; nlp];
+        let first = if has_self { d - n - 1 } else { d - n };
+        for (k, slot) in (first..d).enumerate() {
+            let a = self.st.stack[slot];
+            locals[k] = match a {
+                AV::InFrame(t) => {
+                    let v = self.v(Class::G);
+                    let off = self.slot_off(slot);
+                    self.emit(Inst::Load(v, Base::Slots, off));
+                    AV::Obj(v, Own::Owned, t)
+                }
+                AV::Cond(c) => {
+                    let v = self.v(Class::G);
+                    self.emit(Inst::SetCond(v, c));
+                    AV::Bool(v)
+                }
+                other => other,
+            };
+        }
+        self.st.stack.truncate(base);
+        let cont = self.new_block(u32::MAX);
+        let res = self.v(Class::G);
+        // switch to the callee
+        self.inl_an.push(an);
+        // (boxed: the addresses stay valid while `inl_an` grows; B outlives every use)
+        let an_ref: &'static Analysis = unsafe { &*(&**self.inl_an.last().unwrap() as *const Analysis) };
+        let tables: &'static crate::interp::cache::Tables = unsafe { &*(cd.caches.tables(&cd.code) as *const _) };
+        let cd_s: &'static CodeData = unsafe { &*(cd as *const CodeData) };
+        let unit = Box::new(Unit {
+            cd: cd_s,
+            an: an_ref,
+            tables,
+            nlp,
+            entry: 0,
+            nargs: co.co_argcount as usize,
+            globals: f.func_globals,
+            builtins: f.func_builtins,
+            invalid_flag: self.u.invalid_flag,
+            flags: co.co_flags as u32,
+            fold_globals: self.u.fold_globals,
+        });
+        self.inl_units.push(unit);
+        let up: &'a Unit<'a> = unsafe { &*(&**self.inl_units.last().unwrap() as *const Unit<'static> as *const Unit<'a>) };
+        self.u = up;
+        self.inl = Some(InlCtx { func: fp, base, locals, cont, res, err, failed: false, snapped: false });
+        let mut ok = true;
+        let mut result: Option<AV> = None;
+        for j in 0..an_ref.instrs.len() {
+            let ci = an_ref.instrs[j];
+            match ci.op {
+                Op::Resume | Op::Nop | Op::ExtendedArg => {}
+                Op::LoadFast | Op::LoadFastCheck => {
+                    let k = ci.arg as usize;
+                    let a = self.inl.as_ref().unwrap().locals[k];
+                    let pushed = match a {
+                        AV::Null => {
+                            ok = false;
+                            break;
+                        }
+                        AV::Obj(v, Own::Owned, t) => AV::Obj(v, Own::Inl(k as u32), t),
+                        other => other,
+                    };
+                    self.push(pushed);
+                }
+                Op::StoreFast => {
+                    let k = ci.arg as usize;
+                    let mut a = self.pop();
+                    let slot = self.st.stack.len();
+                    match a {
+                        AV::InFrame(t) => {
+                            let v = self.v(Class::G);
+                            let off = self.slot_off(slot);
+                            self.emit(Inst::Load(v, Base::Slots, off));
+                            a = AV::Obj(v, Own::Owned, t);
+                        }
+                        AV::Cond(c) => {
+                            let v = self.v(Class::G);
+                            self.emit(Inst::SetCond(v, c));
+                            a = AV::Bool(v);
+                        }
+                        // a value borrowed from another callee local: own it
+                        AV::Obj(v, Own::Inl(o), t) if o as usize != k => {
+                            self.emit(Inst::Incref(v));
+                            a = AV::Obj(v, Own::Owned, t);
+                        }
+                        AV::Obj(_, Own::Inl(_), _) => continue, // x = x
+                        _ => {}
+                    }
+                    // stack entries borrowed from the old value become owned
+                    for s in 0..self.st.stack.len() {
+                        if let AV::Obj(v, Own::Inl(o), t) = self.st.stack[s] {
+                            if o as usize == k {
+                                self.emit(Inst::Incref(v));
+                                self.st.stack[s] = AV::Obj(v, Own::Owned, t);
+                            }
+                        }
+                    }
+                    let old = std::mem::replace(&mut self.inl.as_mut().unwrap().locals[k], a);
+                    if let AV::Obj(v, Own::Owned, _) = old {
+                        self.emit(Inst::Decref(v));
+                    }
+                }
+                Op::ReturnValue => {
+                    result = Some(self.pop());
+                }
+                _ => {
+                    self.instr(j, j)?;
+                }
+            }
+            if self.inl.as_ref().unwrap().failed || self.closed {
+                ok = false;
+                break;
+            }
+        }
+        let ctx = self.inl.take().unwrap();
+        self.u = caller_u;
+        if !ok || result.is_none() || self.st.stack.len() != base {
+            // roll back everything emitted for the attempt
+            self.st = save_st;
+            self.f.blocks.truncate(save_nblocks);
+            self.cur = save_cur;
+            let b = &mut self.f.blocks[save_cur as usize];
+            b.insts.truncate(save_insts);
+            b.term = save_term;
+            b.tsuccs.truncate(save_tsuccs);
+            self.f.snaps.truncate(save_nsnaps);
+            self.f.classes.truncate(save_ncls);
+            self.deps.truncate(save_deps);
+            super::free_cells(&self.cells[save_cells..]);
+            self.cells.truncate(save_cells);
+            self.has_deps = save_has_deps;
+            self.closed = save_closed;
+            return Ok(false);
+        }
+        // the result: owned (or a value needing no reference); release the callee locals
+        let mut r = result.unwrap();
+        let mut keep: Option<usize> = None;
+        if let AV::Obj(v, Own::Inl(k), t) = r {
+            if let AV::Obj(_, Own::Owned, _) = ctx.locals[k as usize] {
+                keep = Some(k as usize); // ownership moves to the result
+                r = AV::Obj(v, Own::Owned, t);
+            } else {
+                r = match ctx.locals[k as usize] {
+                    AV::Obj(_, o, _) => AV::Obj(v, o, t),
+                    other => other,
+                };
+            }
+        }
+        for (k, a) in ctx.locals.iter().enumerate() {
+            if Some(k) != keep {
+                if let AV::Obj(v, Own::Owned, _) = *a {
+                    self.emit(Inst::Decref(v));
+                }
+            }
+        }
+        if ctx.snapped {
+            // deoptimisation stubs deliver the callee's result in `res` at `cont`
+            let v = self.obj_owned(r);
+            self.emit(Inst::Mov(res, v));
+            self.term(Term::Jump(cont));
+            self.cur = cont;
+            self.closed = false;
+            self.push(AV::Obj(res, Own::Owned, Ty::Unknown));
+        } else {
+            self.term(Term::Jump(cont));
+            self.cur = cont;
+            self.closed = false;
+            self.push(r);
+        }
+        Ok(true)
+    }
+
     fn binary_subscr(&mut self, i: usize) {
         let (pa, pb) = self.prof(i);
         let is_list = pa == prof::LIST;
@@ -2455,6 +2773,9 @@ fn build_once(u: &Unit, reps: &[Rep], assume: &mut Vec<Option<State>>) -> Result
         deps: Vec::new(),
         cells: Vec::new(),
         closed: false,
+        inl: None,
+        inl_an: Vec::new(),
+        inl_units: Vec::new(),
     };
     // OSR unit: a separate entry block unboxes the unboxed locals from the frame and
     // jumps to the loop header

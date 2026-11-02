@@ -310,6 +310,59 @@ fn finish_in_interp(ts: &ThreadState, mut frame: Box<Frame>, st: u32) -> PyResul
     r
 }
 
+/// Deoptimisation inside a callee inlined by tier 2 (opt/build.rs `try_inline`):
+/// build its frame from `buf` (owned references: `nloc` locals, then `nstack` stack
+/// entries; NULL = unbound), resume it in the interpreter at `resume` (or raise the
+/// pending exception at `lasti` when `error`), and return its result (new reference)
+/// or NULL with an exception set.
+pub unsafe extern "C" fn h2_run_inlined(func: *mut PyObject, buf: *mut *mut PyObject, counts: u64, resume: u64, lasti: u64, error: u64) -> *mut PyObject {
+    unsafe {
+        let (nloc, nstack) = ((counts & 0xffff_ffff) as usize, (counts >> 32) as usize);
+        let f = crate::types::funcobject::func(&*func);
+        let code = f.func_code;
+        let co = crate::types::code::code(&*code).obj;
+        let nlp = co.co_nlocalsplus as usize;
+        let total = nlp + co.co_stacksize as usize + 1;
+        let mut frame = Frame::new_call_raw(code, func, f.func_globals, f.func_builtins, nlp, total);
+        // the function object is only borrowed from a constant in compiled code
+        frame.make_owned();
+        let s = frame.slots.as_mut_ptr();
+        for k in 0..nloc.min(nlp) {
+            *s.add(k) = *buf.add(k);
+        }
+        for k in 0..nstack {
+            *s.add(nlp + k) = *buf.add(nloc + k);
+        }
+        frame.stack_top = nlp + nstack;
+        frame.lasti = lasti as u32;
+        frame.next_instr = resume as u32;
+        let throw = if error != 0 {
+            frame.next_instr = lasti as u32 + 1;
+            crate::errors::take_exc()
+        } else {
+            None
+        };
+        let ts = crate::threads::current();
+        let r = match crate::interp::enter_recursive_call(ts, "") {
+            Ok(()) => {
+                let r = crate::interp::eval::eval_frame(ts, &mut frame, throw);
+                crate::interp::leave_recursive_call(ts);
+                match r {
+                    Ok(crate::interp::Exit::Return(v)) => v.into_raw(),
+                    Ok(crate::interp::Exit::Yield(_)) => {
+                        let _ = crate::errors::system_error("yield from an inlined frame");
+                        std::ptr::null_mut()
+                    }
+                    Err(_) => std::ptr::null_mut(),
+                }
+            }
+            Err(_) => std::ptr::null_mut(),
+        };
+        crate::interp::frame_finished(frame);
+        r
+    }
+}
+
 /// Tier-1 `Call` of a Python function: [callable, self_or_null, args..] at `base`
 /// (n = argument count without self). The arguments (and self) are moved into the
 /// callee frame, the callable reference becomes the frame's `func`. Result in

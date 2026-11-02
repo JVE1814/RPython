@@ -976,6 +976,76 @@ impl<'a, 'b> Cg<'a, 'b> {
             }
         }
     }
+    /// An owned reference for snapshot entry `m` in rax (0 for none).
+    fn mat_rax(&mut self, m: &Mat) {
+        match *m {
+            Mat::InFrame => self.a().mov_ri(Rax, 0),
+            Mat::Owned(v) => {
+                let r = self.gr(v, Rax);
+                if r != Rax {
+                    self.a().mov_rr(Rax, r);
+                }
+            }
+            Mat::Borrowed(v) => {
+                let r = self.gr(v, Rax);
+                if r != Rax {
+                    self.a().mov_rr(Rax, r);
+                }
+                self.incref(Rax);
+            }
+            Mat::Const(p) => {
+                self.a().mov_ri(Rax, p as i64);
+                if p != 0 && unsafe { !(*(p as *mut PyObject)).is_immortal() } {
+                    self.incref(Rax);
+                }
+            }
+            Mat::BoxInt(v) => self.box_into_rax(v, BoxK::Int),
+            Mat::BoxFloat(v) => self.box_into_rax(v, BoxK::Float),
+            Mat::BoxBool(v) => self.box_into_rax(v, BoxK::Bool),
+        }
+    }
+
+    /// Stub of an inline deoptimisation: rebuild the callee frame, let the
+    /// interpreter finish it, continue at the call's continuation with its result.
+    fn inline_stub(&mut self, s: &Snapshot) {
+        let inl = s.inl.expect("inline snapshot");
+        save_all(self.a());
+        self.sp_bias = 192;
+        let mut items: Vec<Mat> = s.locals.iter().map(|&(_, m, _)| m).collect();
+        let nloc = items.len() as i64;
+        items.extend(s.stack.iter().copied());
+        let count = items.len() as i32;
+        let pad = count % 2 == 1;
+        if pad {
+            self.a().sub_ri(Rsp, 8);
+            self.sp_bias += 8;
+        }
+        for m in items.iter().rev() {
+            self.mat_rax(m);
+            self.a().push(Rax);
+            self.sp_bias += 8;
+        }
+        {
+            let a = self.a();
+            a.mov_ri(Rdi, inl.func as i64);
+            a.mov_rr(Rsi, Rsp);
+            a.mov_ri(Rdx, nloc | ((s.stack.len() as i64) << 32));
+            a.mov_ri(Rcx, s.resume as i64);
+            a.mov_ri(R8, s.lasti as i64);
+            a.mov_ri(R9, (s.kind == SnapKind::InlineError) as i64);
+            a.call_abs(fa(crate::interp::jit::h2_run_inlined as unsafe extern "C" fn(_, _, _, _, _, _) -> _) as usize);
+            a.add_ri(Rsp, 8 * count + if pad { 8 } else { 0 });
+        }
+        self.sp_bias = 0;
+        restore_all(self.a());
+        let err = self.snap_target(inl.err);
+        self.a().test_rr(Rax, Rax);
+        self.a().jcc(Cc::E, err);
+        self.put(inl.res, Rax);
+        let c = self.blabel[inl.cont as usize];
+        self.a().jmp(c);
+    }
+
     /// Site descriptor for the dirty locals of a template exit snapshot.
     fn site_of(&self, s: SnapId) -> Box<super::Site> {
         let snap = &self.f.snaps[s as usize];
@@ -1054,6 +1124,7 @@ impl<'a, 'b> Cg<'a, 'b> {
         let s = self.f.snaps[sid].clone();
         self.a().bind(l);
         match s.kind {
+            SnapKind::InlineDeopt | SnapKind::InlineError => self.inline_stub(&s),
             SnapKind::TemplateExit => {
                 // status in eax must survive the sync
                 // (frame slots already refreshed by frame introspection: keep them)
@@ -1488,9 +1559,20 @@ pub fn codegen(u: &Unit, built: &Built, al: &Alloc, deopt_counter: usize) -> Res
             }
         }
     }
-    // ---- snapshot stubs
-    for s in 0..f.snaps.len() {
-        cg.snapshot_stub(s);
+    // ---- snapshot stubs (stubs may reference other snapshots: until none is left)
+    let mut emitted = vec![false; f.snaps.len()];
+    loop {
+        let mut progress = false;
+        for s in 0..f.snaps.len() {
+            if !emitted[s] && cg.snap_label[s].is_some() {
+                emitted[s] = true;
+                progress = true;
+                cg.snapshot_stub(s);
+            }
+        }
+        if !progress {
+            break;
+        }
     }
     cg.emit_forced_and_ret_syncs();
     emit_routines(cg.a(), rt_box_int, rt_box_float, rt_decref_shared, rt_merge_zero);

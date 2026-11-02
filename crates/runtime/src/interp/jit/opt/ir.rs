@@ -216,6 +216,20 @@ pub struct Snapshot {
     /// dirty unboxed locals: (slot, value, maybe-undefined)
     pub locals: Vec<(u32, Mat, bool)>,
     pub kind: SnapKind,
+    /// InlineDeopt / InlineError: the inlined callee (its frame is rebuilt from
+    /// `locals` (all callee locals in order) and `stack`, and run in the interpreter)
+    pub inl: Option<InlSnap>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct InlSnap {
+    /// the callee function object
+    pub func: usize,
+    /// the callee result goes here, then execution continues at block `cont`
+    pub res: V,
+    pub cont: BlockId,
+    /// error snapshot of the call in the caller (exception from the callee)
+    pub err: SnapId,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -228,6 +242,11 @@ pub enum SnapKind {
     Poll,
     /// exit path of a template instruction: sync the dirty locals, keep the status
     TemplateExit,
+    /// guard failure inside an inlined callee: rebuild the callee frame, finish it
+    /// in the interpreter, continue in compiled code with its result
+    InlineDeopt,
+    /// exception inside an inlined callee: like InlineDeopt, raising it at `lasti`
+    InlineError,
 }
 
 pub struct Block {
