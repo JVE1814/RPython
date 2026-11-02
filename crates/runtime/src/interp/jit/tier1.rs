@@ -64,6 +64,7 @@ const E_A: i32 = offset_of!(crate::interp::cache::Entry, a) as i32;
 const E_B: i32 = offset_of!(crate::interp::cache::Entry, b) as i32;
 const E_C: i32 = offset_of!(crate::interp::cache::Entry, c) as i32;
 const E_KIND: i32 = offset_of!(crate::interp::cache::Entry, kind) as i32;
+const E_MEMO: i32 = offset_of!(crate::interp::cache::Entry, memo) as i32;
 
 const FUNC_CODE: i32 = offset_of!(crate::types::funcobject::PyFunctionObject, func_code) as i32;
 const CODE_DATA: i32 = offset_of!(crate::types::code::PyCodeObject, data) as i32;
@@ -1129,6 +1130,34 @@ impl<'a> Gen<'a> {
                     self.a.load(Rax, obj);
                     self.guard_tag(Rax, tag, slow);
                     if s.kind == kind::METHOD_SHADOWABLE {
+                        // inline values (shape.rs): the shape must lack the name;
+                        // the entry memoises the id of a shape known to lack it
+                        let not_values = self.a.label();
+                        let (sh_off, _vals, id_off, _len, _keys) = crate::shape::jit_layout();
+                        self.a.load8(Rdx, M(Rax, GC_BITS));
+                        self.a.and_ri(Rdx, crate::alloc::GC_BIT_MANAGED as i32);
+                        self.a.jcc(Cc::E, not_values);
+                        self.a.load(Rdx, M(Rax, MANAGED_DICT));
+                        self.a.test_ri(Rdx, 1);
+                        self.a.jcc(Cc::E, not_values);
+                        self.a.load(Rdx, M(Rdx, sh_off - 1));
+                        self.a.test_rr(Rdx, Rdx);
+                        self.a.jcc(Cc::E, slow);
+                        self.a.load32(Rcx, M(Rdx, id_off));
+                        let memo = (e as *const crate::interp::cache::Entry as i64) + E_MEMO as i64;
+                        self.a.mov_ri(Rsi, memo);
+                        self.a.cmp32_rm(Rcx, M(Rsi, 0));
+                        self.a.jcc(Cc::E, push);
+                        self.a.mov_rr(R14, Rax);
+                        self.a.mov_rr(Rdi, Rdx);
+                        self.a.mov_rr(Rdx, Rsi);
+                        self.a.mov_ri(Rsi, name);
+                        self.call(addr!(h::h_shape_lacks_memo));
+                        self.a.test_rr(Rax, Rax);
+                        self.a.mov_rr(Rax, R14);
+                        self.a.jcc(Cc::E, slow);
+                        self.a.jmp(push);
+                        self.a.bind(not_values);
                         self.managed_dict(Rax, slow, push);
                         self.a.cmp_mi(M(Rdx, MA_USED), 0);
                         self.a.jcc(Cc::E, push);
@@ -1165,6 +1194,23 @@ impl<'a> Gen<'a> {
                     let val = self.slot(d - 2);
                     self.a.load(Rax, obj);
                     self.guard_tag(Rax, tag, slow);
+                    // inline values (jit3): replace the existing attribute in place
+                    // while single-threaded (rsi = old value, rdx = values word)
+                    let dict_path = self.a.label();
+                    self.inline_values(Rax, s.b, name, slow, dict_path);
+                    self.a.mov_ri(Rcx, (&raw const crate::threads::MULTI_THREADED) as i64);
+                    self.a.cmp_mi(M(Rcx, 0), 0);
+                    self.a.jcc(Cc::NE, slow);
+                    let (_sh, vals_off, _id, _len, _keys) = crate::shape::jit_layout();
+                    self.a.load(Rcx, val);
+                    self.a.store(M(Rdx, vals_off - 1 + 8 * s.b as i32), Rcx);
+                    self.a.mov_rr(R14, Rax);
+                    self.a.mov_rr(Rax, Rsi);
+                    self.decref(Rax);
+                    self.a.mov_rr(Rax, R14);
+                    self.decref(Rax);
+                    self.a.jmp(done);
+                    self.a.bind(dict_path);
                     self.managed_dict(Rax, slow, slow);
                     self.a.mov_rr(R14, Rax);
                     self.a.mov_rr(Rdi, Rdx);

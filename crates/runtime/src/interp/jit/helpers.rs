@@ -249,6 +249,18 @@ pub unsafe extern "C" fn h_delete_attr(sp: *mut *mut PyObject, name: *mut PyObje
     }
 }
 
+/// LoadMethod on an object with inline values (jit3): does shape `sh` lack the
+/// interned `name`? If so, remember the shape's id in the cache entry's memo. 1/0.
+pub unsafe extern "C" fn h_shape_lacks_memo(sh: *const crate::shape::Shape, name: *mut PyObject, memo: *const std::sync::atomic::AtomicU32) -> u64 {
+    unsafe {
+        if (*sh).keys().contains(&name) {
+            return 0;
+        }
+        (*memo).store((*sh).id, std::sync::atomic::Ordering::Relaxed);
+        1
+    }
+}
+
 pub unsafe extern "C" fn h_store_global(f: *mut Frame, sp: *mut *mut PyObject, name: *mut PyObject) -> u64 {
     unsafe {
         let v = take(sp.sub(1));

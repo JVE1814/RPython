@@ -239,7 +239,9 @@ pub struct Entry {
     pub c: AtomicUsize,
     /// number of misses (to stop re-filling megamorphic sites)
     pub misses: AtomicU32,
-    pub _pad: u32,
+    /// LoadMethod METHOD_SHADOWABLE: id of a shape known to lack the name (shape ids
+    /// are unique and shapes immutable, so a stale value is still a valid fact)
+    pub memo: AtomicU32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -261,7 +263,7 @@ impl Entry {
             b: AtomicU64::new(0),
             c: AtomicUsize::new(0),
             misses: AtomicU32::new(0),
-            _pad: 0,
+            memo: AtomicU32::new(0),
         }
     }
 
