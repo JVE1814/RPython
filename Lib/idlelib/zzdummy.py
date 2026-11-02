@@ -21,26 +21,21 @@ class ZzDummy:
         cls.ztext = idleConf.GetOption('extensions', 'ZzDummy', 'z-text')
 
     def z_in_event(self, event=None):
-        """Insert the z-text at the start of each selected line."""
-        text = self.text
-        text.undo_block_start()
+        """Insert the z-text at the start of each selected line (set_region
+        makes it one undo block)."""
         head, tail, chars, lines = self.editwin.fregion.get_region()
         # the last item is what follows the final newline of the region
         lines = [self.ztext + line for line in lines[:-1]] + lines[-1:]
         self.editwin.fregion.set_region(head, tail, chars, lines)
-        text.undo_block_stop()
         return "break"
 
     def z_out_event(self, event=None):
         """Remove the z-text from the start of each selected line."""
-        text = self.text
-        text.undo_block_start()
         head, tail, chars, lines = self.editwin.fregion.get_region()
         zlen = len(self.ztext)
         lines = [line[zlen:] if line.startswith(self.ztext) else line
                  for line in lines]
         self.editwin.fregion.set_region(head, tail, chars, lines)
-        text.undo_block_stop()
         return "break"
 
 

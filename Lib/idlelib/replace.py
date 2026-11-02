@@ -103,13 +103,17 @@ class ReplaceDialog(SearchDialogBase):
         text.tag_remove("hit", "1.0", "end")
         line = res[0]
         col = res[1].start()
-        if self.engine.iswrap():
+        # With wrap: the whole text.  Without: from the cursor down, or
+        # (searching up) from the top down to the cursor.
+        backwards_only = self.engine.isback() and not self.engine.iswrap()
+        if self.engine.iswrap() or backwards_only:
             line = 1
             col = 0
+        if backwards_only:
+            text.mark_set("replace_all_stop", "insert")
         ok = True
         first = last = None
-        # Remember the replacements from the end of the text backwards, so
-        # that earlier indices stay valid; group the edits for undo.
+        # The matches are replaced from top to bottom, as one undo block.
         text.undo_block_start()
         while True:
             res = self.engine.search_forward(text, prog, line, col,
@@ -117,6 +121,9 @@ class ReplaceDialog(SearchDialogBase):
             if not res:
                 break
             line, m = res
+            if backwards_only and text.compare(
+                    "%d.%d" % (line, m.start()), ">=", "replace_all_stop"):
+                break
             chars = text.get("%d.0" % line, "%d.0" % (line + 1))
             orig = m.group()
             new = self._replace_expand(m, repl)

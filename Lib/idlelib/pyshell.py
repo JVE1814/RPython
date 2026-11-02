@@ -1366,18 +1366,21 @@ class PyShell(OutputWindow):
         added newline.
         """
         text = self.text
+        # Output goes below the undo delegator (which protects the text
+        # before the input area).
+        bottom = self.per.bottom
         if self._output_newline_added:
             # Continue the output on its last line.
-            text.insert("iomark-1c", s, tags)
+            bottom.insert("iomark-1c", s, tags)
             if s.endswith('\n'):
-                text.delete("iomark-1c")
+                bottom.delete("iomark-1c")
                 self._output_newline_added = False
                 text.tag_add("console", "iomark-1c")
         else:
             text.tag_remove("console", "iomark-1c")
-            text.insert("iomark", s, tags)
+            bottom.insert("iomark", s, tags)
             if not s.endswith('\n'):
-                text.insert("iomark", '\n', tags)
+                bottom.insert("iomark", '\n', tags)
                 self._output_newline_added = True
             text.tag_add("console", "iomark-1c")
         text.see("iomark")

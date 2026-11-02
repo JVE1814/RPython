@@ -75,9 +75,9 @@ class OnHoverTooltipBase(TooltipBase):
         super().__init__(anchor_widget)
         self.hover_delay = hover_delay
         self._after_id = None
-        self._id1 = self.anchor_widget.bind("<Enter>", self._show_event, '+')
-        self._id2 = self.anchor_widget.bind("<Leave>", self._hide_event, '+')
-        self._id3 = self.anchor_widget.bind("<Button>", self._hide_event, '+')
+        self._id1 = self.anchor_widget.bind("<Enter>", self._show_event)
+        self._id2 = self.anchor_widget.bind("<Leave>", self._hide_event)
+        self._id3 = self.anchor_widget.bind("<Button>", self._hide_event)
 
     def __del__(self):
         try:
