@@ -1,6 +1,11 @@
 # PROGRESS
 
-## PAUSED (2026-11-01, ~21:00 UTC) at user request
+## RESUMED (2026-11-01, 22:15 UTC) after a pause at user request
+Wave 10 running: jit3 (merge+enable tier 2, perf), numpy2 (numpy/other wheels own test suites vs baseline),
+core3 (finalization, frozen modules, settrace, core failures), perf2 (startup, memory, scaling, shapes),
+tk (_tkinter, tkinter, idlelib — D23). Measurement queue: suite run 5, then re-runs of both rebuilt baselines.
+
+### Pause notes (2026-11-01, ~21:00 UTC)
 In-flight agents were asked to wrap up; their branches are merged into master as they report.
 To resume: read PLAN.md (workstream table, unassigned list), notes/*.md (per-workstream status and next
 steps), DECISIONS.md D19-D22; integration happens in the /home/user/core worktree (branch `core`), pushed
