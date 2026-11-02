@@ -204,7 +204,9 @@ pub fn allocate(f: &Func) -> Alloc {
     };
     // unboxed-local values listed in template exit snapshots are read by frame
     // introspection while the template runs (opt::sync_frame): across templates they
-    // must live in spill slots, whose addresses are known
+    // must live in spill slots, whose addresses are known (also when their interval
+    // starts at the template: their value is then undefined there, but the slot must
+    // still be addressable)
     let mut in_mem = vec![false; nv];
     for s in &f.snaps {
         if s.kind == SnapKind::TemplateExit {
@@ -219,7 +221,7 @@ pub fn allocate(f: &Func) -> Alloc {
         let (s, e) = (lo[x], hi[x]);
         active.retain(|&(end, _)| end >= s);
         let (cross, cross_tpl) = crosses(s, e);
-        if cross_tpl && in_mem[x] {
+        if in_mem[x] {
             loc[x] = spill(&mut nslots);
             continue;
         }
