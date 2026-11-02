@@ -657,7 +657,7 @@ pub fn eval_frame(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyRe
     r
 }
 
-fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult<Exit> {
+pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult<Exit> {
     let code_obj: PyRef = f.code().to_ref();
     let cd = crate::types::code::code_data(&code_obj);
     let code: &[u32] = &cd.code;

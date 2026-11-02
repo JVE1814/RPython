@@ -458,6 +458,80 @@ pub fn resume(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> Result<P
     }
 }
 
+// ------------------------------------------------------------------ generator resumption
+
+static TRAMPOLINE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// A process-wide copy of the entry trampoline every compiled unit starts with
+/// (fn(frame, slots, ts, target, out) -> status; tier1.rs `compile`). Units share the
+/// stack layout of the trampoline, so code entered through it may exit through the
+/// epilogue of any unit.
+pub fn trampoline() -> usize {
+    *TRAMPOLINE.get_or_init(|| {
+        use x64::R::*;
+        let mut a = x64::Asm::new();
+        a.push(Rbp);
+        a.mov_rr(Rbp, Rsp);
+        a.push(Rbx);
+        a.push(R12);
+        a.push(R13);
+        a.push(R14);
+        a.push(R15);
+        a.sub_ri(Rsp, 8);
+        a.store(x64::M(Rsp, 0), R8);
+        a.mov_rr(Rbx, Rdi);
+        a.mov_rr(R12, Rsi);
+        a.mov_rr(R13, Rdx);
+        a.load_fs0(R15);
+        a.jmp_r(Rcx);
+        mem::install(&a.buf, |_, _| {}).expect("jit: cannot install the entry trampoline")
+    })
+}
+
+/// Machine-code entry of a newly created generator frame of `code` (0 if its code is
+/// not compiled): the frame's first resumption enters it directly (`Frame::resume`).
+#[inline]
+pub fn generator_entry(cd: &CodeData) -> usize {
+    let c = cd.caches.jit.load(Acquire);
+    if c.is_null() || crate::modules::sys::tracing_active() {
+        return 0;
+    }
+    match opt_entry(cd, 0) {
+        Some(t) => t,
+        None => match unsafe { (*c).entries.first() } {
+            Some(&o) if o != u32::MAX => unsafe { (*c).addr + o as usize },
+            _ => 0,
+        },
+    }
+}
+
+/// Enter compiled code at `target` for the linked, executing frame `f`.
+#[inline(always)]
+pub fn enter(ts: &ThreadState, f: &mut Frame, target: usize, out: &mut *mut PyObject) -> u32 {
+    crate::tlab::ensure_registered();
+    let entry: EntryFn = unsafe { std::mem::transmute(trampoline()) };
+    unsafe { entry(f, f.slots.as_mut_ptr(), ts, target, out) }
+}
+
+/// Compiled code entered by `enter` ended with a deopt or an error (status `st`): the
+/// interpreter finishes this activation (or runs it to the next yield).
+#[cold]
+#[inline(never)]
+pub fn continue_in_interp(ts: &ThreadState, f: &mut Frame, st: u32) -> PyResult<crate::interp::Exit> {
+    let throw = if st == tier1::ST_ERROR {
+        f.next_instr = f.lasti + 1;
+        match crate::errors::take_exc() {
+            Some(e) => Some(e),
+            None => return Err(crate::errors::system_error("error return without exception set")),
+        }
+    } else {
+        let cc = &crate::types::code::code_data(f.code()).caches;
+        opt::note_deopt(cc, f);
+        None
+    };
+    crate::interp::eval::eval_inner(ts, f, throw)
+}
+
 /// Publish the fast-call descriptor of a code object (see CodeCaches::fast_entry).
 fn publish_fast_entry(code: &PyObject, cd: &CodeData, target: usize) {
     use rpy_compiler::bytecode::co;

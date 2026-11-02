@@ -36,6 +36,7 @@ pub const ST_ERROR: u32 = 1;
 pub const ST_DEOPT: u32 = 2;
 pub const ST_YIELD: u32 = 3;
 const YIELD_FROM_SEND: i32 = offset_of!(Frame, yield_from_send) as i32;
+const RESUME: i32 = offset_of!(Frame, resume) as i32;
 
 const LASTI: i32 = offset_of!(Frame, lasti) as i32;
 const NEXT_INSTR: i32 = offset_of!(Frame, next_instr) as i32;
@@ -496,6 +497,13 @@ impl<'a> Gen<'a> {
                 self.a.store32_i(M(Rbx, NEXT_INSTR), next as i32);
                 self.a.store32_i(M(Rbx, YIELD_FROM_SEND), send);
                 self.a.store_i(M(Rbx, STACK_TOP), self.nlp + d - 1);
+                if !self.no_fuse && i + 1 < self.ilabel.len() {
+                    // the next resumption enters the continuation directly
+                    // (genobject.rs `gen_send_fast`)
+                    let cont = self.ilabel[i + 1];
+                    self.a.mov_r_label_addr(Rcx, cont);
+                    self.a.store(M(Rbx, RESUME), Rcx);
+                }
                 self.a.mov_ri(Rax, ST_YIELD as i64);
                 self.a.jmp(self.exit);
             }
