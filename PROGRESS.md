@@ -45,7 +45,9 @@ our interpreter; `import numpy` works (array math, linalg, fft, datetime64); num
 Blockers being fixed (numpy workstream): Cython code objects (numpy.random), C-created frame f_locals.
 
 ## Regression suite
-Reference (CPython 3.15.2 free-threaded, this machine, tools/run_tests.sh):
+Reference after the D21 rebuild (zstd + Tk; still no _decimal), ft: 414 PASS, 20 FAIL; tests run 51,220, failures 24,
+skipped 3,276 (/opt/baseline/results/ft2). Default-build re-run: /opt/baseline/results/default2.
+Original Reference (CPython 3.15.2 free-threaded, this machine, tools/run_tests.sh):
 434 modules: 416 PASS, 18 FAIL; tests run 50,649, failures 24, skipped 3,371.
 (tools/baseline_ft_results.tsv). Default-build reference: 416 PASS, 18 FAIL; run 50,576, failures 24, skipped 3,353.
 
