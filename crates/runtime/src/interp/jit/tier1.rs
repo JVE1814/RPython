@@ -751,6 +751,9 @@ impl<'a> Gen<'a> {
                 self.a.jcc(Cc::NE, generic);
                 self.a.load(Rcx, M(Rax, FUNC_CODE));
                 self.a.load(Rcx, M(Rcx, CODE_DATA));
+                // body not unmarshalled yet (perf2 lazy code): the generic path loads it
+                self.a.test_rr(Rcx, Rcx);
+                self.a.jcc(Cc::E, generic);
                 self.a.cmp_mi(M(Rcx, CD_FAST_ENTRY), 0);
                 self.a.jcc(Cc::E, generic);
                 self.set_lasti(pc);
