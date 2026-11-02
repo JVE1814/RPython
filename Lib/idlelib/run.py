@@ -6,6 +6,7 @@ sys.stdin, sys.stdout and sys.stderr to the shell window.  User code runs
 in the main thread; a socket thread serves the GUI's requests, so that a
 running program can be interrupted.
 """
+import contextlib
 import functools
 import io
 import linecache
@@ -182,6 +183,16 @@ def show_socket_error(err, address):
 def get_message_lines(typ, exc, tb):
     """Return the lines of the exception message, including hints such
     as 'Did you mean ...?'."""
+    if typ in (NameError, AttributeError):
+        # Some suggestions need the traceback's frames, which
+        # format_exception_only does not get: take the last line of the
+        # interpreter's own report.
+        report = io.StringIO()
+        with contextlib.redirect_stderr(report):
+            sys.__excepthook__(typ, exc, tb)
+        lines = report.getvalue().rstrip('\n').split('\n')
+        if lines and lines[-1].startswith(typ.__name__):
+            return [lines[-1] + '\n']
     return traceback.format_exception_only(typ, exc)
 
 
@@ -483,6 +494,22 @@ class StdInputFile(StdioFile):
             size = eol + 1
         self._line_buffer = line[size:]
         return line[:size]
+
+    def readlines(self, hint=-1):
+        """Read lines until EOF, or until more than *hint* characters
+        have been read (hint <= 0 or None: no limit)."""
+        if hint is None:
+            hint = -1
+        elif not isinstance(hint, int):
+            raise TypeError('must be int, not ' + type(hint).__name__)
+        lines = []
+        total = 0
+        while line := self.readline():
+            lines.append(line)
+            total += len(line)
+            if 0 < hint < total:
+                break
+        return lines
 
     def close(self):
         # User code cannot close the shell's input.

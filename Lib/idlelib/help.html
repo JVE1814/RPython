@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>IDLE — Python editor and shell</title>
+<style>
+body { font-family: sans-serif; max-width: 50em; margin: auto; }
+pre { background: #eeffcc; padding: 0.5em; }
+</style>
+</head>
+<body>
+<h1>IDLE — Python editor and shell</h1>
+
+<p>IDLE is the integrated development environment that comes with
+Python.  It is written in Python with the <code>tkinter</code> GUI
+toolkit and works the same on Windows, macOS and Unix.</p>
+
+<ul>
+<li>A shell window: an interactive interpreter with colorized code,
+input and output and error messages.</li>
+<li>Editor windows with undo, syntax coloring, smart indentation, call
+tips, completions and many more conveniences.</li>
+<li>Search and replace in a window, and search in many files.</li>
+<li>A debugger with breakpoints, stepping and views of the namespaces.</li>
+<li>Settings dialogs, browsers of modules and of <code>sys.path</code>.</li>
+</ul>
+
+<h2>Menus</h2>
+
+<p>The shell and the editor windows have menus for the commands below
+(the shell has a Shell and a Debug menu, editors a Format and a Run
+menu).  Most commands have a key binding, shown next to the item; the
+bindings can be changed in the settings.</p>
+
+<h3>File menu</h3>
+<dl>
+<dt>New File</dt><dd>Open a new, empty editor window.</dd>
+<dt>Open...</dt><dd>Open an existing file in an editor window.</dd>
+<dt>Recent Files</dt><dd>Open one of the recently used files.</dd>
+<dt>Open Module...</dt><dd>Open the source of a module found on
+<code>sys.path</code>.</dd>
+<dt>Module Browser</dt><dd>Show the classes and functions of the file
+of the window, in a tree.</dd>
+<dt>Path Browser</dt><dd>Show the directories of <code>sys.path</code>,
+their modules and the modules' classes and functions.</dd>
+<dt>Save, Save As..., Save Copy As...</dt><dd>Write the window to its
+file, to another file (which becomes the window's file), or to another
+file without changing the window.</dd>
+<dt>Print Window</dt><dd>Print the window's text.</dd>
+<dt>Close Window, Exit IDLE</dt><dd>Close this window, or all windows
+(asking to save changed ones).</dd>
+</dl>
+
+<h3>Edit menu</h3>
+<dl>
+<dt>Undo, Redo</dt><dd>Undo or redo the last change.</dd>
+<dt>Cut, Copy, Paste, Select All</dt><dd>The usual clipboard commands.</dd>
+<dt>Find..., Find Again, Find Selection</dt><dd>Search the window.</dd>
+<dt>Find in Files...</dt><dd>Search files; the hits are listed in an
+output window, where Go to File/Line opens them.</dd>
+<dt>Replace...</dt><dd>Search and replace.</dd>
+<dt>Go to Line</dt><dd>Move the cursor to a line.</dd>
+<dt>Show Completions</dt><dd>List the names (or file names) that can
+complete the word before the cursor.</dd>
+<dt>Expand Word</dt><dd>Complete the word with a word found in the
+window; repeat for other expansions.</dd>
+<dt>Show Call Tip</dt><dd>Show the parameters of the function whose
+call the cursor is in.</dd>
+<dt>Show Surrounding Parens</dt><dd>Highlight the brackets around the
+cursor.</dd>
+</dl>
+
+<h3>Format menu (editor)</h3>
+<dl>
+<dt>Format Paragraph</dt><dd>Rewrap the paragraph, comment block or
+selection to the configured width.</dd>
+<dt>Indent Region, Dedent Region</dt><dd>Shift the selected lines by
+one indentation level.</dd>
+<dt>Comment Out Region, Uncomment Region</dt><dd>Add or remove
+<code>##</code> at the start of the selected lines.</dd>
+<dt>Tabify Region, Untabify Region</dt><dd>Turn leading spaces into
+tabs, or all tabs into spaces.</dd>
+<dt>Toggle Tabs, New Indent Width</dt><dd>Indent with tabs or spaces;
+change the number of columns of an indentation level.</dd>
+<dt>Strip Trailing Whitespace</dt><dd>Remove blanks at the end of lines
+and blank lines at the end of the file.</dd>
+</dl>
+
+<h3>Run menu (editor)</h3>
+<dl>
+<dt>Run Module</dt><dd>Save the file, check it, restart the shell and
+run the file in it.  The file's names stay available in the shell.</dd>
+<dt>Run... Customized</dt><dd>Run with command line arguments, and
+optionally without restarting the shell.</dd>
+<dt>Check Module</dt><dd>Check the syntax and indentation only.</dd>
+<dt>Python Shell</dt><dd>Open or show the shell.</dd>
+</dl>
+
+<h3>Shell menu</h3>
+<dl>
+<dt>View Last Restart</dt><dd>Scroll to the last restart.</dd>
+<dt>Restart Shell</dt><dd>Start a fresh process for user code.</dd>
+<dt>Previous History, Next History</dt><dd>Recall earlier input.</dd>
+<dt>Interrupt Execution</dt><dd>Stop the running code.</dd>
+</dl>
+
+<h3>Debug menu</h3>
+<dl>
+<dt>Go to File/Line</dt><dd>Open the file and line named on the line of
+the cursor (in tracebacks and Find in Files output).</dd>
+<dt>Debugger</dt><dd>Run code in the shell under the debugger.</dd>
+<dt>Stack Viewer</dt><dd>Show the stack of the last exception.</dd>
+<dt>Auto-open Stack Viewer</dt><dd>Open the stack viewer after every
+uncaught exception.</dd>
+</dl>
+
+<h3>Options and Window menus</h3>
+<dl>
+<dt>Configure IDLE</dt><dd>Fonts, indentation, colors, keys, windows,
+the shell and extensions.</dd>
+<dt>Show/Hide Code Context</dt><dd>Show the headers of the blocks
+containing the top line.</dd>
+<dt>Show/Hide Line Numbers</dt><dd>Show line numbers left of the
+text.</dd>
+<dt>Zoom Height</dt><dd>Toggle between the normal and the maximal
+height of the window.</dd>
+<dt>Window</dt><dd>List the open windows; select one to show it.</dd>
+</dl>
+
+<h2>Editing and navigation</h2>
+
+<p>The cursor keys, Home, End and the mouse work as usual.  Home goes to
+the first non-blank character of the line, pressed again to the start
+of the line.  In the shell, the input starts after the prompt.</p>
+
+<p>After a line ending with a colon, Return indents the next line one
+level; after <code>return</code>, <code>pass</code> and similar
+statements, it dedents.  Backspace in the indentation deletes one level.
+Inside brackets, the continuation lines are aligned with the opening
+bracket.</p>
+
+<p>Completions open after a dot or a quote in a string (for file
+names), after a short delay, or with the Show Completions command.  Tab
+completes, Escape closes the list.</p>
+
+<h2>The shell</h2>
+
+<p>Statements typed at the <code>&gt;&gt;&gt;</code> prompt run when
+complete.  Return on earlier input copies it to the prompt.  Long output
+is squeezed into a button; double-click the button to expand it, or use
+its context menu to copy or view the text.</p>
+
+<p>User code runs in a separate process.  It is started again for each
+Run Module and with Restart Shell, so that every run begins with a fresh
+namespace.</p>
+
+<pre>&gt;&gt;&gt; print("Hello")
+Hello</pre>
+
+<h2>Command line</h2>
+
+<pre>python -m idlelib [-e] [-i] [-n] [-d] [-s] [-t title] [file ...]
+python -m idlelib (-c command | -r script | -) [arg ...]</pre>
+
+<p>Use <code>-h</code> for a description of the options.</p>
+
+<h2>Startup failure</h2>
+
+<p>IDLE and the process running user code communicate through a local
+socket.  A firewall, a broken network configuration or a file in the
+current directory with the name of a standard module (for example
+<code>random.py</code>) can prevent the start.  Configuration files with
+errors are set aside and reported.</p>
+
+</body>
+</html>
