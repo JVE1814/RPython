@@ -30,12 +30,23 @@ pub fn finalize() -> bool {
         return true;
     }
     wait_for_thread_shutdown();
-    super::sys_full::call_module_func("atexit", "_run_exitfuncs");
+    // the callback registry is per interpreter, not per atexit module object
+    super::atexit::run_exitfuncs();
     crate::capi::lifecycle::run_interp_atexit();
+    // threads started by atexit callbacks are waited for as well (threading's
+    // own bookkeeping already shut down: join the handles directly)
+    if super::_thread::thread_shutdown(crate::types::none::none()).is_err() {
+        super::sys_full::write_unraisable(Some("Exception ignored on threading shutdown"), None);
+    }
     super::sys_full::FINALIZING.store(true, Release);
     crate::gc::park_other_threads();
     let ok = super::sys_full::flush_std("stdout");
     super::sys_full::flush_std("stderr");
+    // garbage that exists already is collected while every module is intact
+    // (and what cannot be collected is reported as such, not everything that
+    // becomes reachable from it once the modules are unregistered)
+    collect();
+    crate::gc_support::dump_shutdown_stats();
     finalize_modules();
     collect();
     super::sys_full::flush_std("stdout");
@@ -115,11 +126,9 @@ fn finalize_modules() {
             }
         }
     }
-    // One collection serves two purposes: cycles that were garbage already and
     // modules that nobody but sys.modules held go away, with their finalizers
-    // running against intact module globals.
+    // running against intact module globals
     collect();
-    crate::gc_support::dump_shutdown_stats();
 
     // clear what is still alive, newest first
     for w in tracked.iter().rev() {

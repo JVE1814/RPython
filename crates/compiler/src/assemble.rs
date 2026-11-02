@@ -981,10 +981,20 @@ fn thread_jumps(ir: &mut Ir, order: &[Label]) {
             if !jumpy || i.target == NO_LABEL {
                 continue;
             }
+            // Only the unconditional Jump may go backwards: the interpreter and
+            // the JIT poll the eval breaker (signals, GC, stop-the-world) on
+            // backward Jumps, so a conditional jump must keep jumping forward to
+            // the Jump that closes a loop.
+            let conditional = i.op != IOp::Op(Op::Jump);
             let mut t = i.target;
             for _ in 0..8 {
                 match first_real(ir, t as usize) {
-                    Some((_, j)) if j.op == IOp::Op(Op::Jump) && j.target != t && (j.loc.lineno == 0 || j.loc.lineno == i.loc.lineno) => {
+                    Some((_, j))
+                        if j.op == IOp::Op(Op::Jump)
+                            && j.target != t
+                            && (j.loc.lineno == 0 || j.loc.lineno == i.loc.lineno)
+                            && !(conditional && pos[j.target as usize] <= pos[b as usize]) =>
+                    {
                         t = j.target;
                     }
                     _ => break,

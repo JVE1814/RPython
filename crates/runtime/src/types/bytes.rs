@@ -47,12 +47,37 @@ pub fn alloc_bytes(n: usize) -> PyRef {
         }
     }
 }
+/// The shared (immortal) empty bytes object: every empty bytes result is this one.
+pub fn empty_bytes() -> PyRef {
+    static EMPTY: std::sync::atomic::AtomicPtr<PyObject> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
+    let p = EMPTY.load(Acquire);
+    if !p.is_null() {
+        return unsafe { PyRef::from_borrowed(p) };
+    }
+    let r = alloc_bytes(0);
+    let op = r.into_raw();
+    unsafe {
+        crate::object::make_immortal(op);
+        match EMPTY.compare_exchange(std::ptr::null_mut(), op, AcqRel, Acquire) {
+            Ok(_) => PyRef::from_raw(op),
+            // another thread won the race; the loser stays allocated (immortal)
+            Err(o) => PyRef::from_borrowed(o),
+        }
+    }
+}
 pub fn new_bytes(b: &[u8]) -> PyRef {
+    if b.is_empty() {
+        return empty_bytes();
+    }
     let r = alloc_bytes(b.len());
     unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), bytes_ptr(&r), b.len()) };
     r
 }
 pub fn try_new_bytes(b: &[u8]) -> PyResult<PyRef> {
+    if b.is_empty() {
+        return Ok(empty_bytes());
+    }
     let r = try_alloc_bytes(b.len())?;
     unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), bytes_ptr(&r), b.len()) };
     Ok(r)

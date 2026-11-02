@@ -320,6 +320,19 @@ pub unsafe extern "C" fn PyModule_FromDefAndSpec2(def: *mut PyModuleDef, spec: *
                     // PEP 793: a create slot of a slot-defined module receives no def
                     let from_slots = FROM_SLOTS.with(|c| c.replace(false));
                     let r = c(spec, if from_slots { std::ptr::null_mut() } else { def });
+                    if r.is_null() && !err_occurred() {
+                        return Err(system_error(&format!("creation of module {} failed without setting an exception", pystr::to_string_lossy(&name))));
+                    }
+                    if !r.is_null() && err_occurred() {
+                        let cause = take_exc();
+                        decref(r);
+                        let e = system_error(&format!("creation of module {} raised unreported exception", pystr::to_string_lossy(&name)));
+                        if let (Some(c), Some(ex)) = (cause, take_exc()) {
+                            crate::types::exceptions::set_exc_cause(&ex, Some(&c));
+                            set_exc(ex);
+                        }
+                        return Err(e);
+                    }
                     let r = from_c(r)?;
                     if tmod::is_module(&r) {
                         if md(r.as_ptr()).md_def.is_null() {

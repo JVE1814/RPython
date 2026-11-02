@@ -70,6 +70,19 @@ pub fn current_globals() -> Option<PyRef> {
     unsafe { Some(PyRef::from_borrowed((*f).globals)) }
 }
 
+/// builtins mapping of the currently executing frame, else the builtins dict
+/// (PyEval_GetBuiltins).
+pub fn current_builtins() -> PyRef {
+    let f = crate::threads::current().frame.get();
+    if !f.is_null() {
+        let b = unsafe { (*f).builtins };
+        if !b.is_null() {
+            return unsafe { PyRef::from_borrowed(b) };
+        }
+    }
+    crate::builtins::builtins_dict()
+}
+
 pub fn current_frame_ptr() -> *mut Frame {
     crate::threads::current().frame.get()
 }
@@ -356,9 +369,9 @@ pub fn eval_code(code: &PyObject, globals: &PyObject, locals: Option<&PyObject>)
             }
         }
         None => {
-            let b = crate::builtins::builtins_module();
+            let b = current_builtins();
             dict::set_item(globals, crate::name!("__builtins__"), &b)?;
-            crate::builtins::builtins_dict()
+            b
         }
     };
     let frame = Frame::new(code, None, globals, &builtins, locals);

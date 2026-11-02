@@ -210,7 +210,7 @@ pub fn import_frozen(name: &str, any: bool) -> PyResult<Option<PyRef>> {
     let d = crate::types::module::module_dict(&m);
     let r = (|| -> PyResult<()> {
         if dict::get_item_rs(&d, "__builtins__").is_none() {
-            dict::set_item_str(&d, "__builtins__", &crate::builtins::builtins_module())?;
+            dict::set_item_str(&d, "__builtins__", &crate::builtins::builtins_dict())?;
         }
         if e.is_package && dict::get_item_rs(&d, "__path__").is_none() {
             dict::set_item_str(&d, "__path__", &list::new_list(vec![]))?;

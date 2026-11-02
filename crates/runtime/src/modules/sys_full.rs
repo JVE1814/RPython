@@ -355,9 +355,9 @@ fn sys_displayhook(_m: &PyObject, o: &PyObject) -> PyResult {
     Ok(none::none_ref())
 }
 
-fn sys_excepthook(_m: &PyObject, args: &[&PyObject]) -> PyResult {
-    crate::args::check_pos("excepthook", args, 3, 3)?;
-    let v = args[1];
+/// Print an exception (with traceback and chained exceptions) to sys.stderr, as
+/// sys.excepthook and PyErr_Display do; a non-exception is reported as such.
+pub fn display_exception(v: &PyObject) {
     if crate::types::exceptions::is_exception_instance(v) {
         print_exception_full(v);
     } else {
@@ -366,6 +366,11 @@ fn sys_excepthook(_m: &PyObject, args: &[&PyObject]) -> PyResult {
             crate::types::typeobject::tname(v)
         ));
     }
+}
+
+fn sys_excepthook(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    crate::args::check_pos("excepthook", args, 3, 3)?;
+    display_exception(args[1]);
     Ok(none::none_ref())
 }
 

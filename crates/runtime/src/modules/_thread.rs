@@ -745,7 +745,7 @@ fn start_joinable_thread(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject
     }
 }
 
-fn thread_shutdown(_m: &PyObject) -> PyResult {
+pub fn thread_shutdown(_m: &PyObject) -> PyResult {
     loop {
         let next: Option<Arc<HandleInner>> = {
             let nd = NON_DAEMON.lock().unwrap();

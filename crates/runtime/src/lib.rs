@@ -90,6 +90,13 @@ pub fn initialize(cfg: &Config) -> PyResult<()> {
     modules::sys_full::post_init()?;
     // real std streams (and builtins.open) must exist before site runs .pth files
     modules::sys::init_stdio();
+    // -W options / PYTHONWARNINGS take effect through the warnings module's
+    // filters, so it is imported right away when there are any
+    if !modules::sys_full::config().warnoptions.is_empty() {
+        if import::import_absolute("warnings").is_err() {
+            errors::clear_exc();
+        }
+    }
     modules::sys_full::import_site()?;
     Ok(())
 }

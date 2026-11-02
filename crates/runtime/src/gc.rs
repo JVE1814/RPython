@@ -354,12 +354,28 @@ pub fn park_other_threads() {
             std::thread::sleep(std::time::Duration::from_micros(100));
         }
     });
-    while !stop_the_world(me) {
+    // A thread that never reaches a safepoint (stuck in native code that claims
+    // to be in the VM) must not hang the exit: after ~2 s carry on; such a thread
+    // parks at its next safepoint poll.
+    let mut stopped = false;
+    for _ in 0..20 {
+        if stop_the_world(me) {
+            stopped = true;
+            break;
+        }
         std::thread::yield_now();
     }
     FINALIZER.store(unsafe { &(*me).mode as *const _ as usize }, SeqCst);
     PARK_ALL.store(true, SeqCst);
-    start_the_world();
+    if stopped {
+        start_the_world();
+    } else {
+        for &t in crate::threads::ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            if t != me as usize {
+                unsafe { &*(t as *const ThreadState) }.c.eval_breaker.fetch_or(crate::threads::EVAL_SAFEPOINT, SeqCst);
+            }
+        }
+    }
     COLLECTING.store(false, Release);
 }
 
@@ -635,6 +651,7 @@ fn collect_gen(young_only: bool) -> usize {
         crate::gc_support::DURATION_NS.fetch_add((t0.elapsed().as_nanos() as usize).max(1), Relaxed);
         ALLOCS_SINCE.store(0, Relaxed);
         LAST_LIVE.store(TRACKED.load(Relaxed).max(0) as usize, Relaxed);
+        crate::gc_support::LONG_LIVED_TOTAL.store(TRACKED.load(Relaxed).max(0) as usize + crate::gc_support::UNTRACKED_TUPLES.swap(0, Relaxed), Relaxed);
         if young_only {
             YOUNG_COLLECTIONS.fetch_add(1, Relaxed);
         } else {
@@ -665,14 +682,24 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
         // every thread is at a safepoint: references deferred before now can go
         mature_deferred();
         // ---- phase 1 (stopped): find the unreachable objects
-        let objs = snapshot_gen(young_only);
+        let mut objs = snapshot_gen(young_only);
+        crate::gc_support::untrack_atomic_tuples(&mut objs);
         crate::gc_support::CANDIDATES.fetch_add(objs.len(), Relaxed);
-        let unreachable = find_unreachable(objs);
+        let mut unreachable = find_unreachable(objs);
         promote_young();
+        // cycles with legacy finalizers (tp_del) are left alone and reported
+        let legacy = crate::gc_support::split_legacy_finalizers(&mut unreachable);
         if unreachable.is_empty() {
             start_the_world();
-            return Some(0);
+            if legacy.is_empty() {
+                return Some(0);
+            }
+            let u = crate::gc_support::report_uncollectable(legacy);
+            UNCOLLECTABLE.fetch_add(u, Relaxed);
+            return Some(u);
         }
+        let n_legacy = if legacy.is_empty() { 0 } else { legacy.len() };
+        let mut legacy = Some(legacy);
         // keep the garbage alive while we work on it
         let garbage: Vec<PyRef> = unreachable.iter().map(|&o| PyRef::from_borrowed(o)).collect();
         let needs_finalize = garbage.iter().any(|g| {
@@ -725,13 +752,16 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
             v
         };
         // ---- phase 4 (running): break the cycles (gc.DEBUG_SAVEALL keeps them)
+        if let Some(l) = legacy.take().filter(|l| !l.is_empty()) {
+            UNCOLLECTABLE.fetch_add(crate::gc_support::report_uncollectable(l), Relaxed);
+        }
         let countable = crate::gc_support::countable(&to_clear);
         let n = countable.len();
         if crate::gc_support::save_all(&countable) {
             drop(to_clear);
             drop(garbage);
             COLLECTED.fetch_add(n, Relaxed);
-            return Some(n);
+            return Some(n + n_legacy);
         }
         for g in &to_clear {
             let op = g.as_ptr();
@@ -749,7 +779,7 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
         drop(to_clear);
         drop(garbage);
         COLLECTED.fetch_add(n, Relaxed);
-        Some(n)
+        Some(n + n_legacy)
     }
 }
 

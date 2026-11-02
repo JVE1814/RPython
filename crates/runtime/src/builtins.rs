@@ -586,7 +586,8 @@ fn exec_or_eval(args: &[&PyObject], kw: Option<&PyObject>, is_eval: bool) -> PyR
         }
     };
     if dict::get_item_str(&g, name!("__builtins__")).is_none() {
-        dict::set_item(&g, name!("__builtins__"), &builtins_module())?;
+        // the caller's builtins mapping, as CPython's exec/eval insert it
+        dict::set_item(&g, name!("__builtins__"), &crate::interp::current_builtins())?;
     }
     let code = if crate::types::code::is_code(src) {
         src.to_ref()

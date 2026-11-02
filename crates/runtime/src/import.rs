@@ -144,7 +144,7 @@ fn exec_bootstrap_module(name: &str, file: &str, display: &str) -> PyResult {
     };
     let m = module::new_module(name)?;
     let d = module::module_dict(&m);
-    dict::set_item_str(&d, "__builtins__", &crate::builtins::builtins_module())?;
+    dict::set_item_str(&d, "__builtins__", &crate::builtins::builtins_dict())?;
     // these count as frozen modules: FrozenImporter._fix_up_module reads (and
     // removes) the original name when it gives them their spec
     if let Some(orig) = display.strip_prefix("<frozen ").and_then(|s| s.strip_suffix('>')) {
@@ -785,7 +785,7 @@ pub fn load_source(abs: &str, file: &std::path::Path, pkg_dir: Option<&std::path
             dict::set_item_str(&d, "__package__", &pystr::new_str(parent))?;
         }
     }
-    dict::set_item_str(&d, "__builtins__", &crate::builtins::builtins_module())?;
+    dict::set_item_str(&d, "__builtins__", &crate::builtins::builtins_dict())?;
     if let Some(spec) = crate::import_spec::make_spec(abs, Some(&fname), pkg_dir.is_some())? {
         dict::set_item_str(&d, "__spec__", &spec)?;
         if let Ok(Some(l)) = ab::getattr_opt(&spec, name!("loader")) {

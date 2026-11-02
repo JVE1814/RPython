@@ -876,14 +876,16 @@ pub unsafe extern "C" fn PyErr_FormatUnraisable(fmt: *const c_char, mut args: ..
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyErr_DisplayException(e: *mut PyObject) {
     unsafe {
-        crate::modules::traceback_print::print_exception(&*e);
+        if !e.is_null() {
+            crate::modules::sys_full::display_exception(&*e);
+        }
     }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyErr_Display(_t: *mut PyObject, v: *mut PyObject, _tb: *mut PyObject) {
     unsafe {
         if !v.is_null() {
-            crate::modules::traceback_print::print_exception(&*v);
+            crate::modules::sys_full::display_exception(&*v);
         }
     }
 }
