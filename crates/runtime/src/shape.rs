@@ -647,6 +647,31 @@ pub fn inline_len(o: &PyObject) -> usize {
     if s.is_null() { 0 } else { unsafe { (*s).len as usize } }
 }
 
+/// Byte offset (from the object) of the byte holding the number of value slots the
+/// object has room for (JIT code checks it before appending an attribute).
+pub const fn capacity_offset() -> i32 {
+    std::mem::offset_of!(PyObject, ob_flags) as i32 + (CAP_SHIFT / 8) as i32
+}
+
+/// (jit3) Shape transitions of `tp` that append interned `name` at index `ix`, as
+/// (parent, child) pairs: the optimizing JIT compiles attribute-adding stores (e.g. in
+/// `__init__`) to "shape == parent and room left -> store, shape = child". Shapes
+/// live as long as their type.
+pub fn transitions_adding(tp: *mut PyTypeObject, name: *mut PyObject, ix: usize) -> Vec<(*const Shape, *const Shape)> {
+    let t = tree_of(tp);
+    if t.is_null() {
+        return Vec::new();
+    }
+    let g = unsafe { (*t).inner.lock().unwrap_or_else(|e| e.into_inner()) };
+    g.shapes
+        .iter()
+        .filter_map(|&s| unsafe {
+            let s = &*s;
+            if s.len as usize == ix + 1 && !s.parent.is_null() && s.keys()[ix] == name { Some((s.parent, s as *const Shape)) } else { None }
+        })
+        .collect()
+}
+
 /// Layout constants for JIT code: byte offsets of (shape.id, shape.len, shape.keys,
 /// shape.voff). The managed-dict word holds `shape | 1`; value `i` of an object `o`
 /// is at `o + shape.voff + 8 * i`.

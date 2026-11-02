@@ -16,7 +16,7 @@
 use crate::ffi::*;
 use rpy_compiler::bytecode::Op;
 use std::cell::Cell;
-use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicPtr, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering::*};
 
 // ------------------------------------------------------------------ dict versions
 
@@ -115,12 +115,17 @@ pub fn unwatch_type_dict(tp: *mut PyTypeObject) {
     }
 }
 
-/// Called by dict.rs after every mutation.
+/// Called by dict.rs after every mutation. `key`: the key written / inserted /
+/// removed, or NULL when the mutation may affect any key (clear, merge, ...).
 #[inline(always)]
-pub fn on_dict_write(d: &PyObject) {
+pub fn on_dict_write(d: &PyObject, key: *mut PyObject) {
     let tag = unsafe { (*(d.as_ptr() as *const PyDictObject))._ma_watcher_tag };
     if tag != 0 {
-        type_dict_written(tag as *mut PyTypeObject);
+        if tag == crate::interp::jit::opt::WATCH_TAG {
+            crate::interp::jit::opt::dict_written(d, key);
+        } else {
+            type_dict_written(tag as *mut PyTypeObject);
+        }
     }
 }
 
@@ -198,7 +203,8 @@ pub mod kind {
     /// LoadGlobal: a = globals version, b = builtins version, c = value (borrowed)
     pub const GLOBAL: u32 = 1;
     /// LoadAttr/StoreAttr: attribute lives in the instance dict. a = type tag,
-    /// b = entry-index hint in the dict.
+    /// b = entry-index hint in the dict; c = class attribute fallback (LoadAttr) or
+    /// the type (StoreAttr).
     pub const INSTANCE_DICT: u32 = 2;
     /// LoadAttr/StoreAttr: __slots__ member at byte offset c. a = type tag.
     pub const SLOT: u32 = 3;
@@ -210,7 +216,7 @@ pub mod kind {
     /// Like CLASS_ATTR but the instance may have a dict that must not shadow it.
     pub const CLASS_ATTR_SHADOWABLE: u32 = 6;
     /// LoadMethod: c is a method descriptor on the type (pushed as unbound + self);
-    /// instance has no dict slot. a = type tag.
+    /// instance has no dict slot. a = type tag, b = the type.
     pub const METHOD: u32 = 7;
     /// LoadMethod with an instance dict that must not shadow the name.
     pub const METHOD_SHADOWABLE: u32 = 8;
@@ -233,7 +239,9 @@ pub struct Entry {
     pub c: AtomicUsize,
     /// number of misses (to stop re-filling megamorphic sites)
     pub misses: AtomicU32,
-    pub _pad: u32,
+    /// LoadMethod METHOD_SHADOWABLE: id of a shape known to lack the name (shape ids
+    /// are unique and shapes immutable, so a stale value is still a valid fact)
+    pub memo: AtomicU32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -255,7 +263,7 @@ impl Entry {
             b: AtomicU64::new(0),
             c: AtomicUsize::new(0),
             misses: AtomicU32::new(0),
-            _pad: 0,
+            memo: AtomicU32::new(0),
         }
     }
 
@@ -329,6 +337,14 @@ pub mod prof {
     pub const DICT: u8 = 32;
     pub const BIGINT: u8 = 64;
     pub const OTHER: u8 = 128;
+    /// ForIter: kind of iterator (operand A)
+    pub const IT_RANGE: u8 = 1;
+    pub const IT_LIST: u8 = 8;
+    pub const IT_TUPLE: u8 = 16;
+    pub const IT_ENUM: u8 = 32;
+    pub const IT_GEN: u8 = 64;
+    /// operand B shift
+    pub const B: u32 = 8;
 }
 
 // ------------------------------------------------------------------ tables
@@ -337,8 +353,10 @@ pub struct Tables {
     /// pc -> entry index (u32::MAX: no entry)
     pub index: Box<[u32]>,
     pub entries: Box<[Entry]>,
-    /// pc -> profile bits (only meaningful for profiled opcodes)
-    pub profile: Box<[AtomicU8]>,
+    /// pc -> profile word (only meaningful for profiled opcodes): operand A's
+    /// `prof` bits in the low byte, operand B's in the high byte. Written by tier 1
+    /// (inline in its fast paths, `h_prof` in the slow paths), read by tier 2.
+    pub profile: Box<[AtomicU16]>,
 }
 
 /// Number of cache entries per instruction: attribute sites are polymorphic (up to
@@ -366,7 +384,7 @@ impl Tables {
             }
         }
         let entries: Box<[Entry]> = (0..n).map(|_| Entry::new()).collect();
-        let profile: Box<[AtomicU8]> = (0..code.len()).map(|_| AtomicU8::new(0)).collect();
+        let profile: Box<[AtomicU16]> = (0..code.len()).map(|_| AtomicU16::new(0)).collect();
         Tables { index, entries, profile }
     }
 
@@ -389,8 +407,14 @@ impl Tables {
         }
     }
 
+    /// Profile word of the instruction at `pc` (operand A bits | operand B bits << 8).
     #[inline(always)]
-    pub fn record(&self, pc: usize, bits: u8) {
+    pub fn profile_at(&self, pc: usize) -> u16 {
+        self.profile.get(pc).map_or(0, |p| p.load(Relaxed))
+    }
+
+    #[inline(always)]
+    pub fn record(&self, pc: usize, bits: u16) {
         let p = unsafe { self.profile.get_unchecked(pc) };
         let old = p.load(Relaxed);
         if old | bits != old {
@@ -414,12 +438,56 @@ pub struct CodeCaches {
     pub jit: AtomicPtr<crate::interp::jit::Compiled>,
     /// tier::* state; also the per-function compilation lock (CAS INTERP->COMPILING).
     pub tier_state: AtomicU8,
+    /// Fast-call descriptor (jit::call_py): absolute address of the compiled entry at
+    /// pc 0 if the function can be entered with exactly `fast_argc` positional
+    /// arguments and nothing else (no defaults needed, no */** parameters, not a
+    /// generator), else 0. Published with Release after the fields below.
+    pub fast_entry: AtomicUsize,
+    pub fast_argc: AtomicU32,
+    /// co_nlocalsplus and co_nlocalsplus + co_stacksize + 1 (frame slot count)
+    pub fast_nlp: AtomicU32,
+    pub fast_total: AtomicU32,
+    /// the code qualifies for the fast call path (see fast_entry)
+    pub fast_argc_ok: std::sync::atomic::AtomicBool,
+    /// Tier-2 code: standard unit (entered at pc 0) and OSR unit (loop header).
+    pub opt: AtomicPtr<crate::interp::jit::opt::OptCode>,
+    pub osr: AtomicPtr<crate::interp::jit::opt::OptCode>,
+    /// countdowns to a tier-2 compilation: calls (decremented by the call paths) and
+    /// backedges (decremented by tier-1 code)
+    pub t2_calls: std::sync::atomic::AtomicI32,
+    pub t2_backedge: std::sync::atomic::AtomicI32,
+    pub t2_tries: AtomicU8,
+    pub t2_busy: AtomicU8,
+    pub t2_invalidations: AtomicU8,
+    /// tier-1 slow paths record type profiles while this is non-zero (off while
+    /// tier-2 code is installed)
+    pub t2_prof: AtomicU8,
+    /// invalidated tier-2 code, freed with the code object
+    pub t2_retired: std::sync::Mutex<Vec<usize>>,
 }
 
 impl CodeCaches {
     pub fn new(ninstr: usize) -> CodeCaches {
         let _ = ninstr;
-        CodeCaches { tables: AtomicPtr::new(std::ptr::null_mut()), jit: AtomicPtr::new(std::ptr::null_mut()), tier_state: AtomicU8::new(0) }
+        CodeCaches {
+            tables: AtomicPtr::new(std::ptr::null_mut()),
+            jit: AtomicPtr::new(std::ptr::null_mut()),
+            tier_state: AtomicU8::new(0),
+            fast_entry: AtomicUsize::new(0),
+            fast_argc: AtomicU32::new(0),
+            fast_nlp: AtomicU32::new(0),
+            fast_total: AtomicU32::new(0),
+            fast_argc_ok: std::sync::atomic::AtomicBool::new(false),
+            opt: AtomicPtr::new(std::ptr::null_mut()),
+            osr: AtomicPtr::new(std::ptr::null_mut()),
+            t2_calls: std::sync::atomic::AtomicI32::new(i32::MAX),
+            t2_backedge: std::sync::atomic::AtomicI32::new(i32::MAX),
+            t2_tries: AtomicU8::new(0),
+            t2_busy: AtomicU8::new(0),
+            t2_invalidations: AtomicU8::new(0),
+            t2_prof: AtomicU8::new(1),
+            t2_retired: std::sync::Mutex::new(Vec::new()),
+        }
     }
 
     /// The side tables, allocating them on first use.
@@ -458,6 +526,8 @@ impl Drop for CodeCaches {
         if !p.is_null() {
             unsafe { drop(Box::from_raw(p)) };
         }
+        crate::interp::jit::opt::forget(self);
+        crate::interp::jit::opt::free_retired(self);
         let j = *self.jit.get_mut();
         if !j.is_null() {
             crate::interp::jit::release_compiled(j);
