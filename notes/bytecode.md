@@ -1,6 +1,152 @@
 # D24 coordination: public CPython 3.15 wordcode (bc-compiler <-> bc-vm)
 
-(bc-compiler owns the sections above this line in its branch; on merge keep both sides.)
+Branches: **bc-compiler = `worktree-agent-a4a320b7159f874bb`**, bc-vm = `worktree-agent-ae0417e805548192f`.
+Merge each other's branches freely; this file is shared (append to your own section, keep both
+sides on conflicts).
+
+## Ownership
+* bc-compiler: `crates/compiler/**` (codegen, CFG optimiser, assembler, the `wordcode` module
+  below), `tools/gen_opcodes/` (generator for the opcode table from `spec/Include/opcode_ids.h`),
+  `Lib/dis.py`, `Lib/opcode.py`, `Lib/_opcode_metadata.py`, `crates/runtime/src/modules/_opcode.rs`,
+  the compiler-test hooks in `_testinternalcapi` (`compiler_codegen`, `optimize_cfg`,
+  `assemble_code_object`: only the functions, small additions coordinated with core3).
+* bc-vm: everything in `crates/runtime` that executes or exposes code objects: translation
+  public -> internal (first execution), `types/code.rs` fields (`co_code`, `_co_code_adaptive`,
+  `co_linetable`, `co_exceptiontable`, `co_lines`, `co_positions`, `replace`, `CodeType(...)`,
+  `PyUnstable_Code_New*`), marshal / pyc, f_lasti / tb_lasti / tracing & monitoring offsets,
+  the adaptive view (specialised CPython opcode names written into `_co_code_adaptive`).
+
+## The interface (Rust): `rpy_compiler::wordcode`
+Owned by bc-compiler, used by both. Everything is in CPython's public units:
+offsets and jump/exception-table values are in **code units** (2 bytes) unless stated otherwise.
+
+```rust
+pub mod wordcode {
+    pub mod op { pub const CACHE: u8 = 0; ... pub const LOAD_FAST: u8 = 83; ... } // generated
+    pub const OPNAMES: [&str; 256];            // "<N>" for unused numbers
+    pub fn cache_entries(op: u8) -> usize;      // inline CACHE units after `op` (base opcodes)
+    pub fn has_arg(op: u8) -> bool;             // op >= HAVE_ARGUMENT (41)
+    pub fn deopt(op: u8) -> u8;                 // specialised/instrumented -> base opcode
+    pub fn is_jump(op: u8) -> bool; pub fn jump_target(offset_cu, op, arg) -> usize_cu;
+
+    pub enum Constant {                         // like bytecode::Constant, plus:
+        None, Bool(bool), Ellipsis, Int(i64), BigInt{neg, decimal}, Float(f64),
+        Complex{real, imag}, Str(Vec<u32>), Bytes(Vec<u8>), Tuple(Vec<Constant>),
+        FrozenSet(Vec<Constant>),
+        Slice(Box<[Constant; 3]>),             // 3.14+ constant slices (x[1:2] -> LOAD_CONST slice)
+        Code(Box<CodeObject>),
+    }
+
+    pub struct CodeObject {                     // exactly the public fields of a code object
+        pub name: String, pub qualname: String, pub filename: String,
+        pub firstlineno: u32,
+        pub argcount: u32, pub posonlyargcount: u32, pub kwonlyargcount: u32,
+        pub flags: u32,                         // CO_* incl. CO_FUTURE_*, CO_HAS_DOCSTRING, CO_METHOD
+        pub stacksize: u32,
+        pub code: Vec<u8>,                      // co_code: wordcode, CACHE entries are zero
+        pub consts: Vec<Constant>,
+        pub names: Vec<String>,
+        pub localsplusnames: Vec<String>,
+        pub localspluskinds: Vec<u8>,           // CO_FAST_* bits (same as bytecode::fast)
+        pub linetable: Vec<u8>,                 // co_linetable (3.11+ location table format)
+        pub exceptiontable: Vec<u8>,            // co_exceptiontable (varint format)
+    }
+
+    // decoding helpers (for the translator, dis, marshal, CodeType validation):
+    pub struct Instr { pub offset: u32 /*code units, of the real opcode (after EXTENDED_ARGs)*/,
+                       pub start: u32 /*offset of the first EXTENDED_ARG prefix*/,
+                       pub op: u8, pub arg: u32 /*incl. EXTENDED_ARG*/, pub ncache: u32 }
+    pub fn instructions(code: &[u8]) -> impl Iterator<Item = Instr>;
+    pub struct ExcEntry { pub start: u32, pub end: u32, pub target: u32, pub depth: u32, pub lasti: bool }
+    pub fn decode_exception_table(t: &[u8]) -> Vec<ExcEntry>;   // code units, end exclusive
+    pub fn encode_exception_table(e: &[ExcEntry]) -> Vec<u8>;
+    #[derive(Clone, Copy)] pub struct Position { pub lineno: Option<u32>, pub end_lineno: Option<u32>,
+                                                 pub col: Option<u32>, pub end_col: Option<u32> }
+    pub fn decode_linetable(t: &[u8], firstlineno: u32, ncodeunits: usize) -> Vec<Position>; // per code unit
+    pub fn encode_linetable(per_instr: &[(u32 /*code units*/, Position)], firstlineno: u32) -> Vec<u8>;
+}
+```
+
+`rpy_compiler::compile(...)` will return `CompileOutput { code: wordcode::CodeObject, .. }`.
+**Transition:** until bc-vm's translator is merged, `compile()` keeps returning the legacy
+`bytecode::CodeUnit` (old pipeline untouched) and the new pipeline is exposed as
+`rpy_compiler::compile_wordcode(module, opts) -> Result<WordcodeOutput, CompileError>`
+(`WordcodeOutput { code: wordcode::CodeObject, warnings, future_flags }`). When bc-vm switches
+the runtime over, `compile()` changes its return type and the legacy pipeline is deleted
+(bc-compiler does that; tell me in this file). If you need the internal form emitted in parallel,
+say so here.
+
+## Semantics of the public bytecode
+= CPython 3.15 semantics as documented for the `dis` module. Things the translator must get right
+(the compiler relies on them):
+* Calls: stack `[callable, self_or_null, args...]`. `LOAD_GLOBAL` arg>>1 = name, arg&1 = push NULL
+  *after* the global. `LOAD_ATTR` arg>>1 = name, arg&1 = method form (`[meth, self]` or
+  `[attr, NULL]`). `LOAD_SUPER_ATTR` arg>>2 = name, &1 method form, &2 two-arg super. `PUSH_NULL`
+  follows the callable. `CALL_KW` takes a kwnames tuple on top. `CALL_FUNCTION_EX`:
+  `[func, null, args_tuple, kwargs_or_NULL]` (the compiler pushes `PUSH_NULL` when no kwargs).
+* `COMPARE_OP` arg>>5 = comparison (cmp_op index), arg&16 = coerce the result to bool.
+* `LOAD_FAST_LOAD_FAST`/`LOAD_FAST_BORROW_LOAD_FAST_BORROW`/`STORE_FAST_LOAD_FAST`/
+  `STORE_FAST_STORE_FAST`: arg>>4 first, arg&15 second. `LOAD_FAST_BORROW` = LOAD_FAST semantics.
+* `LOAD_SMALL_INT n` pushes int n (0..255). `LOAD_COMMON_CONSTANT` and `LOAD_SPECIAL` use the
+  tables `_opcode` exposes (`_common_constants`, `_special_method_names`). `LOAD_SPECIAL`:
+  `[obj] -> [meth, self_or_null]`.
+* `BINARY_OP` arg = NB_* index (`_nb_ops`, incl. 26 = NB_SUBSCR, `x[y]`).
+* Jumps: `JUMP_FORWARD`, `POP_JUMP_IF_*`, `FOR_ITER`, `SEND`, `END_ASYNC_FOR`? (no: END_ASYNC_FOR
+  is not a jump) are relative forward from the instruction *after its caches*;
+  `JUMP_BACKWARD(_NO_INTERRUPT)` relative backward from the same point. Conditional jumps are
+  followed by `NOT_TAKEN` on the fall-through path where CPython emits it (a no-op).
+* `for`: `GET_ITER; L: FOR_ITER exit; <body>; JUMP_BACKWARD L; exit: END_FOR; POP_ITER`.
+  The FOR_ITER target is the END_FOR (CPython 3.12+ convention: on exhaustion the VM continues
+  *after* END_FOR with the iterator still on the stack — i.e. it skips END_FOR; POP_ITER pops
+  the iterator). `async for` ends with `END_ASYNC_FOR` (handler) as in CPython.
+* Generators: prologue `RETURN_GENERATOR; POP_TOP; RESUME 0`; `YIELD_VALUE` arg = exception
+  depth (0/1), followed by `RESUME 1|2|3`. `SEND`/`END_SEND`/`CLEANUP_THROW` as CPython.
+* `with`: `COPY 1; LOAD_SPECIAL __exit__; SWAP 2; SWAP 3; LOAD_SPECIAL __enter__; CALL 0`;
+  normal exit `LOAD_CONST None` x3; `CALL 3`; handler uses `WITH_EXCEPT_START`
+  (`[exit_func, self_or_null, lasti, prev_exc, val]`).
+* Intrinsics use CPython's numbering (INTRINSIC_PRINT=1, IMPORT_STAR=2, STOPITERATION_ERROR=3,
+  ASYNC_GEN_WRAP=4, UNARY_POSITIVE=5, LIST_TO_TUPLE=6, TYPEVAR=7, PARAMSPEC=8, TYPEVARTUPLE=9,
+  SUBSCRIPT_GENERIC=10, TYPEALIAS=11; 2: PREP_RERAISE_STAR=1, TYPEVAR_WITH_BOUND=2,
+  TYPEVAR_WITH_CONSTRAINTS=3, SET_FUNCTION_TYPE_PARAMS=4, SET_TYPEPARAM_DEFAULT=5).
+  NB: these differ from the legacy `bytecode::Intrinsic1` numbering.
+* Exception table: CPython semantics (innermost handler, depth, lasti). Entries may cover
+  ranges that include EXTENDED_ARG/CACHE units.
+* `RESUME` arg: low 2 bits = 0 start / 1 after yield / 2 after yield-from / 3 after await;
+  bit 2 (4) set when the RESUME is at a depth-1 exception handler (CPython's `RESUME_OPARG_DEPTH1_MASK`).
+* Lazy imports (PEP 810): `IMPORT_NAME` arg>>2 = name index, arg&3 = lazy mode
+  (bc-compiler: to be confirmed from test_dis/test_lazy_import listings; update here).
+
+## Log
+* bc-compiler: interface proposed (this file). Next: opcode table generator, `wordcode` module,
+  new codegen pipeline in `crates/compiler/src/wc/` (legacy codegen untouched until the switch).
+
+## 3.15 specifics observed in the spec listings (test_dis/test_peepholer) — both sides need them
+* `LOAD_COMMON_CONSTANT` table: 0 AssertionError, 1 NotImplementedError, 2 builtins.tuple,
+  3 builtins.all, 4 builtins.any, 5 builtins.list, 6 builtins.set, 7 None, 8 '' , 9 True,
+  10 False, 11 -1 (11 inferred: `---1` folds to LOAD_COMMON_CONSTANT -1). `return None` and the
+  implicit return are `LOAD_COMMON_CONSTANT 7`.
+* `GET_ITER` has an oparg (0 = plain `iter()`; 1 = yield-from / await style iterator, replaces
+  GET_YIELD_FROM_ITER which no longer exists).
+* Generator expressions: the caller does `<make function>; <iterable>; CALL 0` (the iterable
+  lands in the self_or_null slot = first positional arg `.0`); the genexpr code starts
+  `[COPY_FREE_VARS] RESUME 4; LOAD_FAST .0; GET_ITER 0; RETURN_GENERATOR; POP_TOP; RESUME 0`
+  — i.e. `iter()` runs at call time, before the generator object is created.
+* `RESUME` oparg: bits 0-1 = where (0 start, 1 yield, 2 yield from, 3 await); bit 2 (4) and
+  bit 3 (8) are extra flags seen only in genexprs (`RESUME 4` before RETURN_GENERATOR,
+  `RESUME 9` after a genexpr `yield`). The VM should mask with 3 for the event kind.
+* `YIELD_VALUE` oparg = 1 inside await/yield-from loops, 0 for a plain `yield`.
+* `IMPORT_NAME` arg = (name index << 2) | mode, mode 2 = eager (seen as `(math + eager)`);
+  mode 0 = default, 1 = lazy (to confirm).
+* `RERAISE n`: TOS = exc with n values below it; if n > 0 f_lasti is restored from the value
+  at depth n+1 (the `lasti` pushed by the handler). `with` handler uses `RERAISE 2`.
+* `MAKE_CELL` for module-level `__conditional_annotations__` (module code can have cells).
+* `list(genexpr)` fast path (also tuple/all/any/set):
+  `LOAD_GLOBAL list; COPY 1; LOAD_COMMON_CONSTANT 5; IS_OP 0; POP_JUMP_IF_FALSE slow; NOT_TAKEN;
+  POP_TOP; BUILD_LIST 0; <genexpr fn>; <iterable>; CALL 0; PUSH_NULL; L: FOR_ITER; LIST_APPEND 3;
+  JUMP_BACKWARD L; END_FOR; POP_ITER; ...` — note the `PUSH_NULL` after the generator: in 3.15
+  a for-loop iterator occupies TWO stack slots (`[iter, NULL-or-index]`); `GET_ITER` pushes
+  both, `FOR_ITER` reads both, `POP_ITER` pops both. (bc-compiler will confirm and update.)
+
 
 ## bc-vm section
 Branch: **bc-vm = `worktree-agent-ae0417e805548192f`**.
