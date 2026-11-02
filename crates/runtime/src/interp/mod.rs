@@ -226,6 +226,21 @@ pub fn bind_arguments(func: &PyObject, frame: &mut Frame, args: &[*mut PyObject]
                         posonly_as_kw.push(pystr::to_string_lossy(key));
                         continue;
                     }
+                    // a positional-only name passed by keyword anywhere in the call
+                    // is reported in preference to the unknown keyword (grind-lib)
+                    let po: Vec<String> = tuple::tuple_items(kn)
+                        .iter()
+                        .filter(|k| names[..posonly].iter().any(|n| pystr::str_eq(n, k)))
+                        .map(|k| pystr::to_string_lossy(k))
+                        .collect();
+                    if !po.is_empty() {
+                        raise!(
+                            TypeError,
+                            "{}() got some positional-only arguments passed as keyword arguments: '{}'",
+                            qualname(),
+                            po.join(", ")
+                        );
+                    }
                     let ks = pystr::to_string_lossy(key);
                     let suggestion = crate::modules::suggestions::suggest_keyword(&ks, &names[..total_named]);
                     match suggestion {
