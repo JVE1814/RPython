@@ -242,7 +242,9 @@ pub fn init() -> PyResult {
         ("SIZEOF_MANAGED_PRE_HEADER", crate::alloc::MANAGED as i64),
         ("SIZEOF_PYOBJECT", std::mem::size_of::<PyObject>() as i64),
         ("SIZEOF_TIME_T", std::mem::size_of::<libc::time_t>() as i64),
-        ("SHARED_KEYS_MAX_SIZE", INLINE_VALUES_MAX as i64),
+        // CPython: an object reaching this many attributes leaves the shared-keys (inline)
+        // layout; ours holds INLINE_VALUES_MAX inline, so one more forces the dict
+        ("SHARED_KEYS_MAX_SIZE", INLINE_VALUES_MAX as i64 + 1),
         ("SPECIALIZATION_THRESHOLD", 2),
         ("SPECIALIZATION_COOLDOWN", 53),
         ("TIER2_THRESHOLD", 4096),
