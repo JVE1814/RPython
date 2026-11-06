@@ -89,6 +89,15 @@ Ours skips 2 tests the baseline runs: test_subinterpreter_import_fails_cleanly
 the long run; passes alone). Timing: ours 15m46s with the tier-2 JIT on (master as of
 2026-11-06), baseline 10m12s.
 
+Re-run after merging master e57fa85 (perf2 + D24 wordcode, 2026-11-06 late): ours 7m30s
+(faster than the baseline's 10m12s), 50,567 passed; the only new failures were 8 warnings
+tests (numpy.testing assert_warns / suppress_warnings, test_assert_warns_deprecated): a
+master change made `catch_warnings(record=True)` recording win over *any* replaced
+`showwarning`, so numpy's suppress_warnings (which installs its showwarning inside an outer
+recording context) never saw its warnings. Fixed in Lib/_py_warnings.py (recording wins only
+over a showwarning installed before the recording started); those 8 tests pass again and
+test_warnings is unchanged (3 failures before and after, unrelated) -> numpy only-ours = 0.
+
 test_capi (spec): before this round the package did not load at all (load errors) and, once it
 loaded, 13 of its 43 modules crashed the interpreter. Now `python -m test test_capi` runs to the
 end: 1,531 tests run (baseline 1,562), with failures left in test_modsupport-like areas listed
@@ -152,11 +161,28 @@ test_capi:
   contradict/repeat PyModuleDef fields, private `_PyUnicodeWriter_*` called with a public writer.
 
 ## Open issues (for the coordinator)
-1. **pandas**: collecting the whole suite in one process crashes in the cycle GC (heap
-   corruption: garbage pointers in the GC lists / visit_decref on 0x4cbbf) after about 3,800
-   collected tests; every tests/ subpackage collected alone is fine, so the run is split per
-   subpackage (scratch script pdrun.sh). Not yet localised (needs ASAN or a GC verifier);
-   suspects are anything that frees a tracked object without untracking it.
+1. **pandas: heap corruption (use-after-free of a heap type)**. `import pandas` and small
+   scripts work, and pandas modules collected alone are fine, but most pandas test
+   subpackages segfault after some tens to hundreds of tests (per-subpackage run: api, config,
+   construction, interchange, test_nanops, test_sorting, test_take, ... pass; apply,
+   arithmetic, arrays, frame, groupby, indexes, series, ... crash). Collecting the whole suite
+   in one process crashes in the cycle GC (garbage in the GC lists). Findings so far:
+   - not the JIT (RPYTHON_JIT=0 crashes too), not the cycle GC (gc disabled crashes too), not
+     the two IsUniquely*/IsUniqueReferencedTemporary changes (forcing both to 0 crashes too);
+   - reproducer: `pytest --pyargs pandas.tests.test_multilevel` (seconds). gdb: crash in
+     shape::clear_values <- subtype_dealloc of an instance (basicsize 104) whose *type object is
+     already freed* (its tp_name points to reused memory, its ob_ref_shared is negative with the
+     merged flags), reached from numpy's object-array clear (array_dealloc ->
+     PyArray_ClearArray -> _Py_MergeZeroLocalRefcount -> dealloc). So a heap type's refcount
+     underflows: some path decrefs a heap type once more than it increfs it (instances of
+     heap types created by a C allocator path that does not incref the type, or a type
+     reference stolen/borrowed wrongly in the C API). Next step: a debug build with an
+     assertion in type dealloc that no live instance exists, or count incref/decref of heap
+     types per allocation path (generic_alloc vs PyObject_Init/PyObject_GC_New vs
+     tp_alloc of extension bases).
+   Baseline pandas (same marker selection "not slow and not network and not db and not
+   single_cpu"): 182,561 passed, 3,344 failed, 1,362 errors, 21,948 skipped in 35 min (many
+   failures from missing optional dependencies) - the comparison waits on this crash.
 2. **Hang in numpy test_hashtable concurrent tests** (about 1 run in 20, only under pytest): a
    ThreadPoolExecutor future is never completed while the workers sit idle in
    SimpleQueue.get (one worker thread missing). Repro: scratch hang.sh with
