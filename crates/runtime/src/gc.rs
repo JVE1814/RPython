@@ -409,7 +409,7 @@ fn total_refcnt(o: &PyObject) -> isize {
         return isize::MAX / 2;
     }
     local as isize + (o.ob_ref_shared.load(Relaxed) >> REF_SHARED_SHIFT)
-        - unsafe { crate::object::has_type_id(o.as_ptr()) } as isize
+        - if unsafe { crate::object::has_type_id(o.as_ptr()) } { crate::object::TYPE_BIAS } else { 0 }
 }
 
 /// Multiplicative hash for object addresses (SipHash dominated collection time).

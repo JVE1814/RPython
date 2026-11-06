@@ -385,12 +385,24 @@ pub unsafe fn init_header(op: *mut PyObject, tp: *mut PyTypeObject) {
 // they have one, references taken and dropped by instance creation/destruction on
 // threads other than the type's owner go to a plain per-thread counter array instead
 // (perf2; CPython's free-threaded build does the same). The true count is the sum of
-// the object's fields and every thread's counter; a type with an id also carries one
-// extra "bias" reference so that the fields alone never drop to zero. Counters are
-// merged into the type at every collection (world stopped) and at thread exit; the
-// cycle collector discounts the bias, and when it finds the type unreachable it gives
-// up the id and the bias (heap types are always in a cycle through their MRO, so they
-// were only ever freed by the collector anyway).
+// the object's fields and every thread's counter, minus a large bias (`TYPE_BIAS`)
+// that a type with an id carries in its shared field.
+//
+// The bias must be large, not one reference: an instance's type reference is often
+// taken through one path and dropped through the other. Extension deallocs drop it
+// with a plain Py_DECREF(tp) (heap-type bases such as Cython classes built from specs),
+// `__class__` assignment and C code use plain counts, while generic allocation counts
+// per thread. Between merges the fields alone can therefore fall by any number of
+// instances; with a one-reference bias they reached zero and the type was freed while
+// instances still used it (pandas: Timestamp freed under live Timestamps). With a bias
+// far above any real count the fields never reach zero, so a type with an id is only
+// ever freed by the cycle collector (heap types are in a cycle through their MRO
+// anyway). Counters are merged into the type at every collection (world stopped) and
+// at thread exit; the collector discounts the bias, and when it finds the type
+// unreachable it gives up the id and the bias.
+
+/// Bias held in the shared field of a type with per-thread counting (in references).
+pub const TYPE_BIAS: isize = 1 << 50;
 
 struct TypeCounts {
     /// Every live thread's counter array (owner key, array).
@@ -429,7 +441,7 @@ pub unsafe fn assign_type_id(tp: *mut PyTypeObject) {
             }
         };
         g.types[id] = tp as usize;
-        (*tp.cast::<PyObject>()).ob_ref_shared.fetch_add(1 << REF_SHARED_SHIFT, Relaxed); // bias
+        (*tp.cast::<PyObject>()).ob_ref_shared.fetch_add(TYPE_BIAS << REF_SHARED_SHIFT, Relaxed);
         (*(tp as *mut crate::ffi::PyHeapTypeObject)).unique_id = id as isize;
     }
 }
@@ -481,8 +493,20 @@ pub unsafe fn has_type_id(op: *mut PyObject) -> bool {
     }
 }
 
+/// Reference count of `o` as Python and C code should see it (sys.getrefcount,
+/// Py_REFCNT): without the per-thread-counting bias of a type.
+pub fn visible_refcnt(o: &PyObject) -> isize {
+    let n = o.refcnt();
+    if !o.is_immortal() && unsafe { has_type_id(o.as_ptr()) } {
+        n - TYPE_BIAS
+    } else {
+        n
+    }
+}
+
 /// Stop per-thread counting for `tp` (collector found it unreachable, or it is being
-/// deallocated): drop the bias and recycle the id. Counters must have been merged.
+/// deallocated): drop the bias and recycle the id. Counters must have been merged, and
+/// with `drop_bias` the world must be stopped and the caller must hold a reference.
 pub unsafe fn release_type_id(tp: *mut PyTypeObject, drop_bias: bool) {
     unsafe {
         let id = type_id(tp);
@@ -498,6 +522,11 @@ pub unsafe fn release_type_id(tp: *mut PyTypeObject, drop_bias: bool) {
             (*(tp as *mut crate::ffi::PyHeapTypeObject)).unique_id = 0;
         }
         if drop_bias {
+            // fold the owner's local count into the shared field first so that removing
+            // the bias cannot leave a negative shared count next to a positive local one
+            let o = &*(tp as *mut PyObject);
+            explicit_merge(tp as *mut PyObject);
+            o.ob_ref_shared.fetch_sub((TYPE_BIAS - 1) << REF_SHARED_SHIFT, AcqRel);
             decref(tp as *mut PyObject);
         }
     }

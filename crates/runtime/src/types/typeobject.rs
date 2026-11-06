@@ -565,11 +565,55 @@ pub unsafe extern "C" fn subtype_dealloc(op: *mut PyObject) {
         if b.is_null() || b == object_type() || (*b).tp_dealloc.is_none() {
             generic_free_and_type_decref(op, tp);
         } else {
-            // base dealloc frees memory; it will decref the heap type itself if it
-            // uses generic_free_and_type_decref with the object's type.
-            (*b).tp_dealloc.unwrap()(op);
+            // The base dealloc frees the memory. Who drops the instance's reference to
+            // its heap type: our own deallocs do it themselves
+            // (generic_free_and_type_decref with the object's type); an extension's
+            // heap-type dealloc does it too (Py_DECREF(Py_TYPE(self)), the C-API
+            // contract for heap types); an extension's *static* type knows nothing of
+            // heap types, so the reference is dropped here.
+            let f = (*b).tp_dealloc.unwrap();
+            f(op);
+            if !is_heap_type(b) && !is_own_code(f as usize) {
+                crate::object::decref_type(tp);
+            }
         }
     }
+}
+
+/// Is `addr` inside this executable's code (as opposed to an extension module's)?
+pub fn is_own_code(addr: usize) -> bool {
+    static RANGE: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    let &(lo, hi) = RANGE.get_or_init(|| {
+        // the first object dl_iterate_phdr reports is the main program; take the
+        // executable PT_LOAD segment that contains this very function
+        unsafe extern "C" fn cb(info: *mut libc::dl_phdr_info, _size: usize, data: *mut c_void) -> c_int {
+            unsafe {
+                let out = &mut *(data as *mut (usize, usize));
+                let me = is_own_code as usize;
+                let info = &*info;
+                let (mut lo, mut hi, mut mine) = (usize::MAX, 0usize, false);
+                for i in 0..info.dlpi_phnum as usize {
+                    let ph = &*info.dlpi_phdr.add(i);
+                    if ph.p_type == libc::PT_LOAD && ph.p_flags & libc::PF_X != 0 {
+                        let s = info.dlpi_addr as usize + ph.p_vaddr as usize;
+                        let e = s + ph.p_memsz as usize;
+                        mine |= (s..e).contains(&me);
+                        lo = lo.min(s);
+                        hi = hi.max(e);
+                    }
+                }
+                if mine {
+                    *out = (lo, hi);
+                    return 1;
+                }
+                0
+            }
+        }
+        let mut r = (0usize, 0usize);
+        unsafe { libc::dl_iterate_phdr(Some(cb), &mut r as *mut _ as *mut c_void) };
+        r
+    });
+    (lo..hi).contains(&addr)
 }
 
 unsafe fn clear_slots(tp: *mut PyTypeObject, op: *mut PyObject) {
