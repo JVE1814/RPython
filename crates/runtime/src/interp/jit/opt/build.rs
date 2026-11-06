@@ -317,6 +317,8 @@ struct B<'a> {
     inl_outer: Vec<InlCtx>,
     /// code data of the root unit and of every callee being inlined (no recursion)
     inl_cds: Vec<usize>,
+    /// an inconsistent join was met: abandon the compilation
+    fatal: Option<&'static str>,
     /// generator unit: YieldValue suspends natively and resumes at its own entry
     is_gen: bool,
 }
@@ -397,7 +399,7 @@ fn inline_enabled() -> bool {
 /// with version tag `tag`? Tags are unique and never reused, so a freed or modified
 /// type cannot match.
 fn live_type(tp: usize, tag: u64) -> bool {
-    tag != 0 && crate::interp::cache::type_tag(tp as *mut PyTypeObject) as u64 == tag
+    tag != 0 && tag <= u32::MAX as u64 && crate::interp::cache::type_alive_with_tag(tp, tag as u32)
 }
 fn is_heap_type(tp: usize) -> bool {
     unsafe { (*(tp as *mut PyTypeObject)).tp_flags & Py_TPFLAGS_HEAPTYPE != 0 }
@@ -1040,8 +1042,10 @@ impl<'a> B<'a> {
         if let Some(es) = &self.entry_state[t] {
             // backedge: the target's assumed state must hold
             if !compatible(&st, es) {
-                let w = meet(es, &st);
-                self.assume[t] = Some(w);
+                match meet(es, &st) {
+                    Ok(w) => self.assume[t] = Some(w),
+                    Err(e) => self.fatal = Some(e),
+                }
                 self.restart = true;
             }
         } else {
@@ -1049,30 +1053,31 @@ impl<'a> B<'a> {
         }
     }
 
-    fn block_entry(&mut self, b: usize) -> State {
+    fn block_entry(&mut self, b: usize) -> Result<State, String> {
         if b == self.cfg.block_of[self.u.entry] as usize && self.pending[b].is_empty() && self.u.entry == self.cfg.blocks[b].first {
             let mut s = self.initial_state();
             if let Some(a) = &self.assume[b] {
-                s = meet(&s, a);
+                s = meet(&s, a)?;
             }
-            return s;
+            return Ok(s);
         }
         let mut it = std::mem::take(&mut self.pending[b]).into_iter();
-        let mut s = it.next().expect("tier2: block without predecessor state");
+        let Some(mut s) = it.next() else { return Err("tier2: block without predecessor state".into()) };
         for o in it {
-            s = meet(&s, &o);
+            s = meet(&s, &o)?;
         }
         if self.cfg.blocks[b].first == self.u.entry {
-            s = meet(&s, &self.initial_state());
+            let i = self.initial_state();
+            s = meet(&s, &i)?;
         }
         if self.cfg.blocks[b].header {
             if let Some(a) = &self.assume[b] {
-                s = meet(&s, a);
+                s = meet(&s, a)?;
             }
             s.ptr.iter_mut().for_each(|p| *p = None);
             s.unb.iter_mut().for_each(|p| *p = None);
         }
-        s
+        Ok(s)
     }
 }
 
@@ -1111,8 +1116,12 @@ fn compatible(actual: &State, assumed: &State) -> bool {
     true
 }
 
-fn meet(a: &State, b: &State) -> State {
-    assert_eq!(a.stack.len(), b.stack.len(), "tier2: stack depth mismatch at join");
+/// Join of two states (an inconsistent pair abandons the compilation: `B::fatal`).
+fn meet(a: &State, b: &State) -> Result<State, &'static str> {
+    if a.stack.len() != b.stack.len() || a.locals.len() != b.locals.len() {
+        return Err("tier2: stack depth mismatch at join");
+    }
+    let mut bad = None;
     let stack = a
         .stack
         .iter()
@@ -1120,7 +1129,10 @@ fn meet(a: &State, b: &State) -> State {
         .map(|(x, y)| match (x, y) {
             (AV::InFrame(s), AV::InFrame(t)) => AV::InFrame(s.meet(*t)),
             _ if x == y => *x,
-            _ => panic!("tier2: unmaterialised stack entry at join"),
+            _ => {
+                bad = Some("tier2: unmaterialised stack entry at join");
+                *x
+            }
         })
         .collect();
     let locals = a
@@ -1130,12 +1142,18 @@ fn meet(a: &State, b: &State) -> State {
         .map(|(x, y)| match (x, y) {
             (LS::Frame(s), LS::Frame(t)) => LS::Frame(s.meet(*t)),
             (LS::Unboxed { dirty: d1, def: f1 }, LS::Unboxed { dirty: d2, def: f2 }) => LS::Unboxed { dirty: *d1 || *d2, def: f1.meet(*f2) },
-            _ => panic!("tier2: local representation mismatch"),
+            _ => {
+                bad = Some("tier2: local representation mismatch");
+                *x
+            }
         })
         .collect();
     let ptr = a.ptr.iter().zip(&b.ptr).map(|(x, y)| if x == y { *x } else { None }).collect();
     let unb = a.unb.iter().zip(&b.unb).map(|(x, y)| if x == y { *x } else { None }).collect();
-    State { stack, locals, ptr, unb }
+    match bad {
+        Some(e) => Err(e),
+        None => Ok(State { stack, locals, ptr, unb }),
+    }
 }
 
 // ================================================================ instructions
@@ -1155,7 +1173,10 @@ impl<'a> B<'a> {
 
     /// Build one bytecode block.
     fn build_block(&mut self, b: usize) -> Result<(), String> {
-        let st = self.block_entry(b);
+        if let Some(e) = self.fatal {
+            return Err(e.into());
+        }
+        let st = self.block_entry(b)?;
         self.entry_state[b] = Some(st.clone());
         self.st = st;
         self.cur = self.ir_block[b];
@@ -1948,6 +1969,10 @@ impl<'a> B<'a> {
             match s.kind {
                 kind::EMPTY => {}
                 kind::UNCACHEABLE => return None,
+                // (`a` is a dict version there, not a type tag)
+                kind::MODULE | kind::GLOBAL => out.push(s),
+                // entries of classes that died since: their pointers dangle
+                _ if !crate::interp::cache::tag_alive(s.a) => {}
                 _ => out.push(s),
             }
         }
@@ -2165,6 +2190,10 @@ impl<'a> B<'a> {
         self.switch_to(slow);
         let ea = self.entries_addr(i);
         let r = self.v(Class::G);
+        if self.inl.is_none() {
+            // (cache misses refresh the adaptive view of the running instruction)
+            self.emit(Inst::SetLasti(self.u.an.instrs[i].pc));
+        }
         self.emit(Inst::Call { addr: h2_load_attr as usize, args: vec![Opnd::V(p), Opnd::I(name as i64), Opnd::I(ea)], fargs: vec![], ret: Some(r), fret: None });
         self.emit(Inst::Guard(Cond::Test(r, Opnd::V(r), Cc::E), esnap));
         self.emit(Inst::Mov(res, r));
@@ -2385,6 +2414,10 @@ impl<'a> B<'a> {
         // generic store (refills the inline cache); the value reference is released
         self.switch_to(slow);
         let ea = self.entries_addr(i);
+        if self.inl.is_none() {
+            // (cache misses refresh the adaptive view of the running instruction)
+            self.emit(Inst::SetLasti(self.u.an.instrs[i].pc));
+        }
         self.emit(Inst::CallChecked { addr: h2_store_attr as usize, args: vec![Opnd::V(p), Opnd::I(name as i64), Opnd::V(val), Opnd::I(ea)], err: esnap });
         self.term(Term::Jump(cont));
         self.switch_to(cont);
@@ -2462,6 +2495,42 @@ impl<'a> B<'a> {
                 self.pop();
                 self.pop();
                 self.push(AV::I64(res));
+                true
+            }
+            (Some("isinstance"), 2) => {
+                // isinstance(x, C) with a constant class: exact type match inline,
+                // the full check (subclasses, __instancecheck__) through a call
+                let AV::Const(cls) = self.st.stack[d - 1] else { return false };
+                if !unsafe { (*(cls as *mut PyObject)).ty().tp_flags } & Py_TPFLAGS_TYPE_SUBCLASS != 0 {
+                    return false;
+                }
+                let esnap = self.snap(i, SnapKind::Error);
+                let x = self.peek_ptr(2);
+                let res = self.v(Class::G);
+                let (hit, slow, cont) = (self.new_block(u32::MAX), self.new_block(u32::MAX), self.new_block(u32::MAX));
+                let ty = self.v(Class::G);
+                self.emit(Inst::Load(ty, Base::V(x), OB_TYPE));
+                self.term(Term::Branch(Cond::Cmp(ty, Opnd::I(cls as i64), Cc::E), hit, slow));
+                self.switch_to(hit);
+                let one = self.imm(1);
+                self.emit(Inst::Mov(res, one));
+                self.term(Term::Jump(cont));
+                self.switch_to(slow);
+                let r = self.v(Class::G);
+                self.emit(Inst::Call { addr: h2_isinstance as usize, args: vec![Opnd::V(x), Opnd::I(cls as i64)], fargs: vec![], ret: Some(r), fret: None });
+                self.emit(Inst::Guard(Cond::Cmp(r, Opnd::I(0), Cc::L), esnap));
+                self.emit(Inst::Mov(res, r));
+                self.term(Term::Jump(cont));
+                self.switch_to(cont);
+                self.pop(); // the class (a constant)
+                let k = self.st.stack.len() - 1;
+                let a = self.pop();
+                self.discard(a, k);
+                self.pop();
+                self.pop();
+                // __instancecheck__ may have run arbitrary code
+                self.forget_tags();
+                self.push(AV::Bool(res));
                 true
             }
             _ => false,
@@ -3226,6 +3295,16 @@ pub unsafe extern "C" fn h2_init_done(r: *mut PyObject) -> u64 {
     }
 }
 
+/// isinstance(o, cls) for compiled code: 1, 0, or -1 with an exception set.
+pub unsafe extern "C" fn h2_isinstance(o: *mut PyObject, cls: *mut PyObject) -> i64 {
+    unsafe {
+        match crate::abstract_::isinstance(&*o, &*cls) {
+            Ok(b) => b as i64,
+            Err(_) => -1,
+        }
+    }
+}
+
 /// Truth value of `o` for compiled ToBool / UnaryNot: 1, 0, or -1 with an exception set.
 pub unsafe extern "C" fn h2_truth(o: *mut PyObject) -> i64 {
     unsafe {
@@ -3257,6 +3336,7 @@ pub unsafe extern "C" fn h2_load_attr(o: *mut PyObject, name: *mut PyObject, es:
 pub unsafe extern "C" fn h2_store_attr(o: *mut PyObject, name: *mut PyObject, v: *mut PyObject, es: *const crate::interp::cache::Entry) -> u64 {
     unsafe {
         let es = std::slice::from_raw_parts(es, crate::interp::cache::POLY);
+        crate::interp::specialize::adaptive_note(|| crate::interp::adaptive::store_attr(&*o, &*name));
         match crate::interp::specialize::store_attr(&*o, &*name, &*v, es) {
             Ok(()) => {
                 crate::object::decref(v);
@@ -3341,6 +3421,7 @@ fn build_once(u: &Unit, reps: &[Rep], assume: &mut Vec<Option<State>>) -> Result
         inl_units: Vec::new(),
         is_gen: !resumes.is_empty(),
         inl_outer: Vec::new(),
+        fatal: None,
         inl_cds: vec![u.cd as *const CodeData as usize],
     };
     // OSR unit / generator resumption: a separate entry block unboxes the unboxed
@@ -3376,6 +3457,9 @@ fn build_once(u: &Unit, reps: &[Rep], assume: &mut Vec<Option<State>>) -> Result
         if b.restart {
             break;
         }
+    }
+    if let Some(e) = b.fatal {
+        return Err(e.into());
     }
     let restart = b.restart;
     let mut instr_block = vec![u32::MAX; u.an.instrs.len()];
