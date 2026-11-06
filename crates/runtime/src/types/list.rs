@@ -78,7 +78,7 @@ pub fn list_to_vec(o: &PyObject) -> Vec<PyRef> {
 }
 
 unsafe fn alloc_items(n: usize) -> *mut *mut PyObject {
-    unsafe { alloc::raw_malloc(n * 8) as *mut *mut PyObject }
+    unsafe { alloc::buf_calloc(n * 8) as *mut *mut PyObject }
 }
 
 /// Lock-free readers may exist (see the module docs).
@@ -88,7 +88,7 @@ fn shared() -> bool {
 }
 
 unsafe fn free_items_now(p: *mut u8) {
-    unsafe { alloc::raw_free(p) }
+    unsafe { alloc::buf_free(p) }
 }
 
 /// Free an item array that lock-free readers may still be looking at.
@@ -134,14 +134,14 @@ unsafe fn grow_items(l: *mut PyListObject, cap: usize) -> bool {
     unsafe {
         let old = (*l).ob_item;
         let arr = if shared() {
-            let a = alloc::raw_calloc(cap * 8) as *mut *mut PyObject;
+            let a = alloc::buf_calloc(cap * 8) as *mut *mut PyObject;
             if !a.is_null() && !old.is_null() {
                 let n = ((*l).ob_base.ob_size.max(0) as usize).min((*l).allocated.max(0) as usize);
                 std::ptr::copy_nonoverlapping(old, a, n);
             }
             a
         } else {
-            alloc::raw_realloc(old as *mut u8, cap * 8) as *mut *mut PyObject
+            alloc::buf_realloc(old as *mut u8, cap * 8) as *mut *mut PyObject
         };
         if arr.is_null() {
             return false;
@@ -225,11 +225,11 @@ fn resize_locked(o: &PyObject, newsize: usize) {
         }
         let arr = if new_alloc == 0 {
             if !(*l).ob_item.is_null() {
-                alloc::raw_free((*l).ob_item as *mut u8);
+                alloc::buf_free((*l).ob_item as *mut u8);
             }
             std::ptr::null_mut()
         } else {
-            alloc::raw_realloc((*l).ob_item as *mut u8, new_alloc * 8) as *mut *mut PyObject
+            alloc::buf_realloc((*l).ob_item as *mut u8, new_alloc * 8) as *mut *mut PyObject
         };
         (*l).ob_item = arr;
         (*l).allocated = new_alloc as isize;
@@ -346,7 +346,7 @@ pub fn set_contents(o: &PyObject, items: Vec<PyRef>) {
             let old_n = (*l).ob_base.ob_size as usize;
             let old_arr = (*l).ob_item;
             let n = items.len();
-            let arr = if n > 0 { if shared() { alloc::raw_calloc(n * 8) as *mut *mut PyObject } else { alloc_items(n) } } else { std::ptr::null_mut() };
+            let arr = if n > 0 { if shared() { alloc::buf_calloc(n * 8) as *mut *mut PyObject } else { alloc_items(n) } } else { std::ptr::null_mut() };
             for (i, it) in items.into_iter().enumerate() {
                 *arr.add(i) = it.into_raw();
             }
@@ -383,7 +383,7 @@ fn release_array(arr: *mut *mut PyObject, n: usize, shared_ok: bool) {
             i -= 1;
             xdecref(*arr.add(i));
         }
-        alloc::raw_free(arr as *mut u8);
+        alloc::buf_free(arr as *mut u8);
     }
 }
 
@@ -503,7 +503,7 @@ pub fn take_items(o: &PyObject) -> Vec<*mut PyObject> {
         publish_size(l, 0);
         publish_items(l, std::ptr::null_mut());
         if !arr.is_null() {
-            if shared() { free_items(arr) } else { alloc::raw_free(arr as *mut u8) }
+            if shared() { free_items(arr) } else { alloc::buf_free(arr as *mut u8) }
         }
         (*l).allocated = -1;
         v
@@ -529,7 +529,7 @@ pub fn restore_items(o: &PyObject, items: Vec<*mut PyObject>) -> Vec<*mut PyObje
         (*l).allocated = n as isize;
         publish_size(l, n);
         if !old_arr.is_null() {
-            if shared() { free_items(old_arr) } else { alloc::raw_free(old_arr as *mut u8) }
+            if shared() { free_items(old_arr) } else { alloc::buf_free(old_arr as *mut u8) }
         }
         old
     }

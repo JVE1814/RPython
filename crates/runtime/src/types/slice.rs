@@ -24,7 +24,8 @@ pub fn new_slice(start: &PyObject, stop: &PyObject, step: &PyObject) -> PyRef {
         s.start = start.to_ref().into_raw();
         s.stop = stop.to_ref().into_raw();
         s.step = step.to_ref().into_raw();
-        crate::gc::track(op);
+        // not GC-tracked (perf2; like CPython 3.12+): slices are short-lived and
+        // cycles through them are not worth tracking every one
         PyRef::from_raw(op)
     }
 }

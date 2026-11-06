@@ -290,3 +290,60 @@ unsafe fn ready_lazily(tp: *mut PyTypeObject) {
         }
     }
 }
+
+// ---------------------------------------------------------------- variable buffers
+//
+// Item arrays and hash tables of containers (perf2): small ones come from the tlab
+// allocator (kind 0, zeroed), larger ones from the system allocator. The free and
+// realloc functions accept either (`tlab::owns`), so storage allocated elsewhere with
+// malloc (e.g. by the C API) can be released here too.
+
+/// Zeroed buffer of `n` bytes.
+#[inline]
+pub unsafe fn buf_calloc(n: usize) -> *mut u8 {
+    if n <= crate::tlab::MAX_SMALL {
+        let p = crate::tlab::alloc_small(n.max(1));
+        if !p.is_null() {
+            return p;
+        }
+    }
+    unsafe { libc::calloc(1, n.max(1)) as *mut u8 }
+}
+
+/// Resize a buffer from `buf_calloc`/malloc to `n` bytes (contents kept up to the
+/// smaller size; growth is not zeroed beyond the old block for system memory).
+#[inline]
+pub unsafe fn buf_realloc(p: *mut u8, n: usize) -> *mut u8 {
+    unsafe {
+        if p.is_null() {
+            return buf_calloc(n);
+        }
+        if crate::tlab::owns(p) {
+            let old = crate::tlab::small_size_of(p);
+            if n <= old {
+                return p;
+            }
+            let q = buf_calloc(n);
+            if !q.is_null() {
+                std::ptr::copy_nonoverlapping(p, q, old);
+                crate::tlab::free_small(p);
+            }
+            return q;
+        }
+        libc::realloc(p as *mut libc::c_void, n.max(1)) as *mut u8
+    }
+}
+
+#[inline]
+pub unsafe fn buf_free(p: *mut u8) {
+    unsafe {
+        if p.is_null() {
+            return;
+        }
+        if crate::tlab::owns(p) {
+            crate::tlab::free_small(p);
+        } else {
+            libc::free(p as *mut libc::c_void);
+        }
+    }
+}

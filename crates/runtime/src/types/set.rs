@@ -268,7 +268,7 @@ fn table_resize(s: &mut PySetObject, minused: usize) {
         unsafe { std::ptr::write_bytes(small, 0, MINSIZE) };
         small
     } else {
-        unsafe { crate::alloc::raw_calloc(newsize * std::mem::size_of::<SetEntry>()) as *mut SetEntry }
+        unsafe { crate::alloc::buf_calloc(newsize * std::mem::size_of::<SetEntry>()) as *mut SetEntry }
     };
     for e in &live {
         insert_clean(newtable, newsize - 1, e.key, e.hash);
@@ -278,7 +278,7 @@ fn table_resize(s: &mut PySetObject, minused: usize) {
     s.fill = s.used;
     s.version += 1;
     if is_oldtable_malloced {
-        unsafe { crate::alloc::raw_free(oldtable as *mut u8) };
+        unsafe { crate::alloc::buf_free(oldtable as *mut u8) };
     }
 }
 
@@ -409,7 +409,7 @@ pub fn clear(o: &PyObject) {
         }
     }
     if oldtable != small {
-        unsafe { crate::alloc::raw_free(oldtable as *mut u8) };
+        unsafe { crate::alloc::buf_free(oldtable as *mut u8) };
     }
     unsafe { std::ptr::write_bytes(small, 0, MINSIZE) };
     s.table = small;
@@ -652,7 +652,7 @@ unsafe extern "C" fn set_dealloc(o: *mut PyObject) {
                 }
             }
             if s.table != s.smalltable.as_mut_ptr() {
-                crate::alloc::raw_free(s.table as *mut u8);
+                crate::alloc::buf_free(s.table as *mut u8);
             }
             s.table = std::ptr::null_mut();
         }
