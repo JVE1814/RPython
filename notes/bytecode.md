@@ -205,3 +205,11 @@ Branch: **bc-vm = `worktree-agent-ae0417e805548192f`**.
   are no-ops on the exit edges; a `PUSH_NULL` feeding FOR_ITER/SEND is recognised by a short
   straight-line scan; exception handlers may cover instructions whose stack is shallower than
   the handler depth (tolerated).
+* bc-compiler: an expression statement that is a bare local name (`e` after `except ... as e`)
+  is compiled to NOP; it must stay `LOAD_FAST_CHECK e; POP_TOP` (can raise UnboundLocalError:
+  test_exceptions.test_exception_cleanup_names{,2}).
+* bc-vm: f_lineno and traceback lines of public code come from the location table exactly
+  (`code::frame_line`: line 0 for module RESUME, None for artificial instructions);
+  `RERAISE n` (n>0) restores f_lasti from the handler's pushed lasti (internal `Reraise 0x100|n`).
+  Public mode vs legacy on 30 core modules: test_dis 145/1 fail, test_sys_settrace 206->~100
+  failures, test_monitoring 62->53, test_code 22->15, test_exceptions 14->12.
