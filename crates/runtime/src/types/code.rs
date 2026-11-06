@@ -103,6 +103,9 @@ pub struct CodeData {
     pub gen_start: u32,
     /// Translation failed: executing the code raises SystemError(msg).
     pub invalid: Option<String>,
+    /// Public objects: line of each internal word's public instruction (-1 = none);
+    /// empty for legacy objects.
+    pub pub_lines: Vec<i32>,
 }
 
 impl CodeData {
@@ -284,6 +287,7 @@ fn build_exec(c: &PyCodeObject, m: &CodeMeta) -> CodeData {
         eager_prologue: false,
         gen_start: 0,
         invalid: None,
+        pub_lines: Vec::new(),
     };
     match crate::interp::translate::translate(&inp) {
         Ok(out) => {
@@ -295,6 +299,7 @@ fn build_exec(c: &PyCodeObject, m: &CodeMeta) -> CodeData {
             d.internal_of_pub = out.internal_of_pub;
             d.eager_prologue = out.eager_prologue;
             d.gen_start = out.gen_start;
+            d.pub_lines = d.pub_of_internal.iter().map(|&u| positions.get(u as usize).and_then(|p| p.lineno).map_or(-1, |l| l as i32)).collect();
             d
         }
         Err(msg) => {
@@ -576,6 +581,7 @@ pub fn new_code_from_parts(p: CodeParts) -> PyResult {
         eager_prologue: false,
         gen_start: 0,
         invalid: None,
+        pub_lines: Vec::new(),
     });
     unsafe {
         let r = alloc_code(
@@ -707,6 +713,17 @@ pub fn line_for_instr(co: &PyObject, i: usize) -> Option<u32> {
         }
         j -= 1;
     }
+}
+
+/// Line of internal pc `i` as frames report it (f_lineno, tracebacks): for public code
+/// exactly the line co_lines() gives the instruction (None for artificial ones); legacy
+/// code walks back over artificial instructions.
+pub fn frame_line(co: &PyObject, i: usize) -> Option<u32> {
+    let d = code_data(co);
+    if !d.pub_lines.is_empty() {
+        return d.pub_lines.get(i.min(d.pub_lines.len() - 1)).and_then(|&l| if l < 0 { None } else { Some(l as u32) });
+    }
+    line_for_instr(co, i)
 }
 
 /// f_lasti / tb_lasti value (bytes) for internal pc `i`.

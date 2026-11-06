@@ -524,7 +524,7 @@ impl<'a> Ctx<'a> {
                 // RERAISE leaves the values below the exception on the stack (handlers below
                 // still need them, e.g. the previous exception for POP_EXCEPT): internal
                 // `Reraise 0` pops only the exception
-                em.op(Op::Reraise, 0);
+                em.op(Op::Reraise, 0x100 | arg.min(0xff));
                 s.truncate(n - 1 - arg as usize);
             }
             PUSH_EXC_INFO => simple!(Op::PushExcInfo, 0, 1, 2),

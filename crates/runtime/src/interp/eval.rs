@@ -1588,7 +1588,20 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                         Op::Reraise => {
                             f.unwind_pc = (pc - 1) as i32;
                             let e = popref!(f);
-                            if arg != 0 {
+                            if arg & 0x100 != 0 {
+                                // translated RERAISE n: the n values stay on the stack; the
+                                // deepest one (n > 0) is the lasti the handler pushed
+                                let n = (arg & 0xff) as usize;
+                                if n > 0 && f.stack_top >= f.nlocalsplus + n {
+                                    let v = peek!(f, n);
+                                    if !v.is_null() && int::is_int_exact(unsafe { &*v }) && int::is_compact(unsafe { &*v }) {
+                                        let li = int::compact_value(unsafe { &*v });
+                                        if li >= 0 && (li as usize) < code.len() {
+                                            f.lasti = li as u32;
+                                        }
+                                    }
+                                }
+                            } else if arg != 0 {
                                 // CPython restores frame->instr_ptr from lasti, but the handler
                                 // lookup uses the RERAISE position: keep f.lasti (used by
                                 // find_handler) pointing at this instruction.

@@ -275,7 +275,7 @@ impl Frame {
 
     /// Current line number.
     pub fn lineno(&self) -> i32 {
-        crate::types::code::line_for_instr(self.code(), self.lasti as usize).map(|l| l as i32).unwrap_or(-1)
+        crate::types::code::frame_line(self.code(), self.lasti as usize).map(|l| l as i32).unwrap_or(-1)
     }
 }
 impl Frame {
