@@ -96,7 +96,12 @@ unsafe extern "C" fn obj_free(_: *mut c_void, p: *mut c_void) {
             return;
         }
         if crate::tlab::owns(p as *const u8) {
-            crate::tlab::free_small(p as *mut u8);
+            if crate::tlab::is_gc_block(p as *mut u8) {
+                // a GC object released with PyObject_Free instead of PyObject_GC_Del
+                alloc::free_object(p as *mut PyObject);
+            } else {
+                crate::tlab::free_small(p as *mut u8);
+            }
         } else {
             libc::free(p);
         }

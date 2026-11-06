@@ -1062,11 +1062,10 @@ pub fn init_hashlib() -> PyResult {
     add_type(&d, "HASHXOF", T_HASHXOF)?;
     add_type(&d, "HMAC", T_OHMAC)?;
     cc::set_int(&d, "_GIL_MINSIZE", GIL_MINSIZE)?;
-    let ds = |s: &'static str| s;
     crate::builtins::add_methods_to_dict(
         &d,
         crate::mdefs![
-            ("new", FASTKW, hl_new, ds("new($module, /, name, data=b'', *, usedforsecurity=True, string=None)\n--\n\nReturn a new hash object using the named algorithm.")),
+            ("new", FASTKW, hl_new, "new($module, /, name, data=b'', *, usedforsecurity=True, string=None)\n--\n\nReturn a new hash object using the named algorithm."),
             ("openssl_md5", FASTKW, o_md5, "openssl_md5($module, /, data=b'', *, usedforsecurity=True, string=None)\n--\n\nReturns a md5 hash object; optionally initialized with a string"),
             ("openssl_sha1", FASTKW, o_sha1, "openssl_sha1($module, /, data=b'', *, usedforsecurity=True, string=None)\n--\n\nReturns a sha1 hash object; optionally initialized with a string"),
             ("openssl_sha224", FASTKW, o_sha224, "openssl_sha224($module, /, data=b'', *, usedforsecurity=True, string=None)\n--\n\nReturns a sha224 hash object; optionally initialized with a string"),

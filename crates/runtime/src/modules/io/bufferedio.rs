@@ -16,6 +16,9 @@ pub struct State {
     pub buffer_size: usize,
     /// read-ahead data; unread part is rbuf[rpos..]
     pub rbuf: Vec<u8>,
+    /// Bytes of `rbuf`'s allocation that were ever initialised (perf2: refills reuse
+    /// them instead of zeroing the whole 128 KiB buffer again).
+    pub rbuf_init: usize,
     pub rpos: usize,
     /// pending writes (logically located at the raw position)
     pub wbuf: Vec<u8>,
@@ -262,7 +265,14 @@ fn rewind_read(raw: &PyObject, st: &mut State) -> PyResult<()> {
 fn fill_buffer(raw: &PyObject, st: &mut State) -> PyResult<Option<usize>> {
     st.reset_read();
     let mut buf = std::mem::take(&mut st.rbuf);
+    let init = st.rbuf_init.min(buf.capacity()).min(st.buffer_size);
+    if init > buf.len() {
+        // SAFETY: these bytes were initialised by an earlier fill (truncation does
+        // not de-initialise memory) and the allocation is unchanged
+        unsafe { buf.set_len(init) };
+    }
     buf.resize(st.buffer_size, 0);
+    st.rbuf_init = st.rbuf_init.max(buf.len());
     let r = raw_readinto(raw, &mut buf);
     match r {
         Ok(Some(n)) => {
@@ -332,6 +342,7 @@ fn buffered_init_impl(o: &PyObject, raw: &PyObject, size: Option<&PyObject>) -> 
     b.st = Box::into_raw(Box::new(State {
         buffer_size: bs as usize,
         rbuf: Vec::new(),
+        rbuf_init: 0,
         rpos: 0,
         wbuf: Vec::new(),
         readable: kind != Kind::Writer,

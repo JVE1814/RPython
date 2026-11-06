@@ -22,9 +22,12 @@ fn has_inline_values(_m: &PyObject, o: &PyObject) -> PyResult {
             false
         } else if o.ob_gc_bits.load(std::sync::atomic::Ordering::Relaxed) & crate::alloc::GC_BIT_DICT_DETACHED != 0 {
             false
+        } else if crate::shape::has_inline_values(o) {
+            true
         } else {
+            // the dict materialised from the inline values (shape.rs)
             let d = *crate::alloc::managed_dict_slot(o.as_ptr());
-            d.is_null() || dict::dict_len(&*d) <= INLINE_VALUES_MAX
+            d.is_null() || (d as usize & 1 == 0 && dict::dict_len(&*d) <= INLINE_VALUES_MAX)
         }
     };
     Ok(bool_::new_bool(r))

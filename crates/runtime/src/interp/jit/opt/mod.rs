@@ -54,7 +54,7 @@ pub mod layout {
     pub const T2_SP: i32 = offset_of!(Frame, t2_sp) as i32;
     pub const FRAME_OBJ: i32 = offset_of!(Frame, frame_obj) as i32;
     pub const TP_TAG: i32 = offset_of!(PyTypeObject, tp_version_tag) as i32;
-    pub const MANAGED_DICT: i32 = -((crate::alloc::GC_HEAD + crate::alloc::MANAGED) as i32);
+    pub const MANAGED_DICT: i32 = -(crate::alloc::MANAGED as i32);
     pub const TS_EVAL_BREAKER: i32 = (offset_of!(ThreadState, c) + offset_of!(CThreadState, eval_breaker)) as i32;
     pub use crate::ffi::REF_SHARED_SHIFT;
 }
