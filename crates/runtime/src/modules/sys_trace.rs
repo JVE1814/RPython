@@ -243,7 +243,8 @@ pub fn trace_call(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
     if ts.tracing_depth.get() > 0 {
         return Ok(());
     }
-    let cd = crate::types::code::code_data(f.code());
+    let co = f.code().to_ref();
+    let cd = crate::types::code::code_data(&co);
     if cd.eager_prologue && f.next_instr < cd.gen_start {
         // the eager part of a generator prologue (before RETURN_GENERATOR) is not traced
         return Ok(());
@@ -252,6 +253,12 @@ pub fn trace_call(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
     f.trace_last = u32::MAX;
     if !resume {
         f.trace_line = -1;
+        // The start event is reported at the RESUME instruction (the `def` line), past a
+        // prologue without line numbers (COPY_FREE_VARS, MAKE_CELL).
+        let start = f.next_instr as usize;
+        if let Some(k) = cd.code.iter().skip(start).take(16).position(|w| (w & 0xff) as u8 == rpy_compiler::bytecode::Op::Resume as u8) {
+            f.lasti = (start + k) as u32;
+        }
     }
     fire(ts, f, if resume { PY_RESUME } else { PY_START }, offset(f), &[])?;
     call_profile(ts, f, "call", none::none())?;
