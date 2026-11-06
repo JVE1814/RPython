@@ -84,7 +84,13 @@ pub unsafe extern "C" fn PyUnicode_New(size: Py_ssize_t, maxchar: Py_UCS4) -> *m
     if size == 0 {
         return pystr::new_str("").into_raw();
     }
-    pystr::alloc_str(size as usize, maxchar).into_raw()
+    match pystr::try_alloc_str(size as usize, maxchar) {
+        Some(s) => s.into_raw(),
+        None => {
+            let _ = memory_error();
+            std::ptr::null_mut()
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -921,6 +927,9 @@ pub unsafe extern "C" fn PyUnicode_RPartition(s: *mut PyObject, sep: *mut PyObje
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnicode_Join(sep: *mut PyObject, seq: *mut PyObject) -> *mut PyObject {
     unsafe {
+        if seq.is_null() {
+            return null_arg();
+        }
         let sep_o = if sep.is_null() { pystr::new_str(" ") } else { (*sep).to_ref() };
         if !pystr::is_str(&sep_o) {
             let _ = type_error(&format!("separator: expected str instance, {} found", tname(&sep_o)));
@@ -1187,8 +1196,26 @@ pub extern "C" fn _PyUnicode_IsAlpha(c: Py_UCS4) -> c_int {
 
 // ---------------------------------------------------------------- PyUnicodeWriter (3.14)
 
+/// The public PyUnicodeWriter. Its first word is a tag that tells the private
+/// _PyUnicodeWriter_* functions (compat.rs) when C code hands them a public writer (CPython's
+/// two writer APIs share one struct, and _testcapi relies on that).
+#[repr(C)]
 pub struct Writer {
+    tag: usize,
     b: StrBuilder,
+}
+pub(crate) const PUBLIC_WRITER_TAG: usize = 0x7075_6277_7269_7465;
+/// The public writer behind a private-writer pointer, if it is one.
+pub(crate) unsafe fn as_public_writer(p: *mut std::ffi::c_void) -> Option<*mut Writer> {
+    unsafe { if !p.is_null() && *(p as *const usize) == PUBLIC_WRITER_TAG { Some(p as *mut Writer) } else { None } }
+}
+/// Append chars to a public writer (the private API's byte-string writes).
+pub(crate) unsafe fn public_writer_push(p: *mut Writer, chars: impl Iterator<Item = u32>) {
+    unsafe {
+        for c in chars {
+            w(p).push(c);
+        }
+    }
 }
 
 unsafe fn w<'a>(p: *mut Writer) -> &'a mut StrBuilder {
@@ -1201,7 +1228,7 @@ pub unsafe extern "C" fn PyUnicodeWriter_Create(length: Py_ssize_t) -> *mut Writ
         let _ = value_error("length must be positive");
         return std::ptr::null_mut();
     }
-    Box::into_raw(Box::new(Writer { b: StrBuilder::with_capacity(length as usize) }))
+    Box::into_raw(Box::new(Writer { tag: PUBLIC_WRITER_TAG, b: StrBuilder::with_capacity(length as usize) }))
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnicodeWriter_Discard(wr: *mut Writer) {

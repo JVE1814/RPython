@@ -591,8 +591,10 @@ pub(crate) fn add_pending_call(f: unsafe extern "C" fn(*mut c_void) -> c_int, ar
     }
     request_pending(threads::MAIN_THREAD_STATE.load(std::sync::atomic::Ordering::Acquire));
     if !main_only {
-        // the queuing thread (if it runs Python code) can serve it too
-        request_pending(threads::current_ptr());
+        // any thread may serve it: wake them all (the first to look takes it)
+        for &t in threads::ALL_THREADS.lock().unwrap().iter() {
+            request_pending(t as *const ThreadState);
+        }
     }
     0
 }
