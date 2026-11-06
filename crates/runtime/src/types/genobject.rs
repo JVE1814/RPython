@@ -744,10 +744,10 @@ pub fn get_awaitable_iter(o: &PyObject) -> PyResult {
             if let Some(f) = (*am).am_await {
                 let r = from_c(f(o.as_ptr()))?;
                 if is_coroutine_exact(&r) || gen_is_iterable_coroutine(&r) {
-                    raise!(TypeError, "__await__() returned a coroutine");
+                    raise!(TypeError, "__await__() must return an iterator, not coroutine");
                 }
                 if r.ty().tp_iternext.is_none() {
-                    raise!(TypeError, "__await__() returned non-iterator of type '{}'", tname(&r));
+                    raise!(TypeError, "__await__() must return an iterator, not {}", tname(&r));
                 }
                 return Ok(r);
             }
