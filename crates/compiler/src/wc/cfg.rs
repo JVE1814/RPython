@@ -673,7 +673,11 @@ fn duplicate_exits_without_lineno(cfg: &mut Cfg) {
             continue;
         }
         let tl = cfg.blocks[t as usize].instrs.last().copied();
-        if !tl.map(|i| is_exit_op(i.op)).unwrap_or(false) || cfg.blocks[t as usize].instrs.len() > MAX_COPY_SIZE {
+        let tlen = cfg.blocks[t as usize].instrs.len();
+        let exit = tl.map(|i| is_exit_op(i.op)).unwrap_or(false) && tlen <= MAX_COPY_SIZE;
+        // a lone synthetic jump (e.g. a loop back-edge reached from several places)
+        let lone_jump = tlen == 1 && tl.map(|i| is_uncond_jump(i.op)).unwrap_or(false);
+        if !exit && !lone_jump {
             continue;
         }
         if cfg.blocks[t as usize].instrs.iter().any(|i| is_pseudo_marker(i.op)) {

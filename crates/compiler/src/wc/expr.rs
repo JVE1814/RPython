@@ -1196,7 +1196,7 @@ impl<'a> Compiler<'a> {
         };
         let async_outer = generators[0].is_async != 0;
         if kind == CompKind::Gen && !async_outer {
-            self.pending_genexpr = Some(loc_of(e.loc));
+            self.pending_genexpr = Some(loc_of(generators[0].iter.loc));
         }
         let r = self.enter_scope(name, UnitKind::Comprehension, sid, e.loc.lineno);
         self.pending_genexpr = None;
@@ -1219,9 +1219,12 @@ impl<'a> Compiler<'a> {
         }
         // (a synchronous genexpr's prologue already pushed [iterator, NULL])
         self.comprehension_generator(e, generators, 0, 0, elt, value, kind)?;
-        self.set_loc(e.loc);
         if kind == CompKind::Gen {
+            // the implicit return keeps the location of the loop exit
+            self.u().loc = NO_LOC;
             self.load_none();
+        } else {
+            self.set_loc(e.loc);
         }
         self.emit(O::RETURN_VALUE, 0);
         let code = self.exit_scope()?;
