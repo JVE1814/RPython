@@ -392,7 +392,7 @@ fn m_localsplusnames(_m: &PyObject, code: &PyObject) -> PyResult {
         raise!(TypeError, "expected a code object");
     }
     let d = crate::types::code::code_data(code);
-    Ok(tuple::new_tuple(d.localsplusnames.clone()))
+    Ok(d.localsplusnames.tuple().clone())
 }
 
 fn m_get_executor(_m: &PyObject, _args: &[&PyObject]) -> PyResult {

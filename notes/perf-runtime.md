@@ -133,3 +133,66 @@ of dict values read lock-free by the inline caches) — re-check after the merge
 6. Startup: snapshot of post-bootstrap state or frozen stdlib code; lazy type readying.
 7. RSS: `-c pass` RssFile 10.7 MB vs 6.1 MB (binary text pages touched) and RssAnon
    6.5 MB vs 3.3 MB.
+
+# perf2 workstream (branch worktree-agent-ad5580471f243533d)
+
+## What changed (all from scratch)
+* **Link-time code layout** (`crates/launcher/build.rs`, `startup.ld`, `tools/bench/perf/gen_order.sh`):
+  functions run at startup / in common micro paths are grouped in `.text.startup_hot` via a
+  linker-script fragment (matches `.text.NAME`, `.llvm.*`, `.unlikely.`/`.hot.` variants and
+  ICF aliases). Regenerate with `gen_order.sh PY` after larger changes (stale order costs
+  ~1 MB RSS). `-z pack-relative-relocs` (RELR) shrinks .rela.dyn 370 KB -> 5 KB.
+* **tlab.rs**: lazy page carving (2 KiB per refill, page header records the carved end),
+  allocation *kinds* (0 raw, 1 GC, 2 GC+managed pre-header) on separate pages, 8-byte size
+  classes below 96 for GC kinds, segment registry, `for_each_gc_block` heap walk.
+  `alloc::buf_calloc/buf_realloc/buf_free`: small container storage from the tlab
+  (list item arrays, set tables; frees accept malloc memory too).
+* **GC without list links** (gc.rs/alloc.rs): GC objects lose the 16-byte GcHead; track/untrack
+  are bit flips; collections walk the GC pages + a registry of large GC objects; old
+  generation = `GC_BIT_OLD`; graph index kept in `ob_tid` during a collection. Young
+  interval = max(threshold, live/4) (walk cost amortised). No global spin lock any more.
+* **Shapes** (shape.rs): managed word = `shape|1`, values at `obj + shape.voff`, capacity in the
+  high byte of `ob_flags` (`capacity_offset()`), no 16-byte values header. JIT: tier-1 and
+  jit3's tier-2 (`opt/build.rs`) ported; `transitions_adding` kept. has_inline_values follows
+  CPython for test_class (dict materialised from inline values counts while <= 30 entries).
+* **Code objects**: co_linetable is CPython's location-table format (test_code parser; random
+  access via lazy checkpoints), no duplicated Vec<Location>/consts/names; **lazy bodies**:
+  marshal code format 3 = header + docstring + length-prefixed self-contained body, loaded on
+  first `code_data()` (pyc magic includes `marshal::CODE_FORMAT`). Tier-1 direct calls check
+  `data != NULL`. Interning: flat open-addressing table, `intern_latin1` without allocation.
+* **Lists (D6)**: lock-free readers (`get_signed`, JIT inline subscript) are safe with threads:
+  arrays never shrink/realloc in place while shared, replaced arrays and removed items go
+  through QSBR; JIT MULTI_THREADED guard removed from list subscript (iterator guard kept).
+* **Per-thread heap-type refcounts** (object.rs): instance alloc/free on non-owner threads
+  count in a thread-local array (`unique_id`), merged at collections/thread exit, bias
+  discounted by the GC. Removes the shared-refcount hot line on classes.
+* Misc: method names/docs NUL-terminated at compile time (`mdefs!` takes literals), buffered
+  reads no longer re-zero 128 KiB per refill, slices tracked only with GC members,
+  length_hint skips len() for types without a length slot, bytearray slice race panic fixed.
+
+## Measurements (quiet machine except where noted; callgrind = deterministic)
+| metric | before (master at start) | after | CPython default | CPython ft |
+|---|---|---|---|---|
+| `-c pass` instructions | 44.3M | **35.0M** | 40.6M | 50.9M |
+| `-c pass` wall best-of-30 (quiet) | 16.8 ms | **13.4 ms** | 14.5 ms | 16.9 ms |
+| `-c pass` peak RSS in-process (median) | 15.9 MB | 9.76 MB | 9.08 MB | 10.64 MB |
+| `-c pass` RSS at exit (gdb) | 16.8 MB | 9.26 MB | 8.9 MB | – |
+| objs.py 200k instances peak RSS | 49.7 MB | **35.2–35.4 MB** | 36.0 MB | 42.2 MB |
+| objs.py instructions | – | 1216M (was 1503M before GC interval fix) | 1083M | – |
+| hexiom per loop tier-1 only | 89M (regressed) | 55.5M | 58M | – |
+| nqueens per loop (tier 2) | 1544M | 1419M | 841M | – |
+| fannkuch per loop tier-1 / tier-2 | 9209M (coordinator) | 6457M / 5995M | – | – |
+CPU-bound scaling (scal2, 1->4 threads, quiet run): py-ft 1/1.96/2.70/2.40, py-default ~1.0;
+ours finishes the same work in ~10 ms (tier 2), too short to time; under load cpu-per-unit
+rises <=20% at 4 threads (object-heavy: 0.167 -> 0.192 after per-thread type counts).
+Remaining gaps: `-c pass` RSS +0.7 MB vs default (anon 3.54 vs 3.29 MB: dict tables, code
+caches, tlab partial pages; RssFile 6.2 vs 5.9 MB); object-model throughput (alloc_object
+~100 instr/call, module-level dict-name loops in objs.py, Vec temporaries in tuple/list
+builders); wall-clock scaling must be re-measured on an idle machine.
+
+## Next steps
+1. Shrink dicts (1/2-byte indices, 16-byte str-key entries); code-cache tables only on 2nd run.
+2. alloc_object fast path (specialised per kind, no generic zeroing switch).
+3. Deferred refcounts for functions/code (LOAD_GLOBAL increfs from all threads).
+4. List iterator lock-free path (JIT `for_iter` still guarded by MULTI_THREADED).
+5. Validate lazily loaded code bodies at load (corrupt bodies abort at first call today).

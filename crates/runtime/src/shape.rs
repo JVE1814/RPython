@@ -1,12 +1,12 @@
-//! Inline instance attributes ("shapes"; perf-runtime workstream).
+//! Inline instance attributes ("shapes"; perf-runtime / perf2 workstreams).
 //!
 //! Instances of ordinary Python classes (heap types with a managed `__dict__` and a
 //! fixed-size layout) do not get a dict when they are created. Their attribute values
-//! live in a *values area* allocated together with the object, right after the type's
-//! `tp_basicsize`:
+//! live in value slots allocated together with the object, right after the type's
+//! `tp_basicsize` (rounded up to 8):
 //!
 //! ```text
-//!   [managed dict word][weakref][gc next][gc prev] PyObject ... [Values hdr][v0 v1 ...]
+//!   [managed dict word][weakref][gc next][gc prev] PyObject ... [v0 v1 v2 ...]
 //! ```
 //!
 //! The attribute *names* live in a shared, immutable [`Shape`]: an ordered key list.
@@ -18,18 +18,22 @@
 //! The managed-dict word in the pre-header encodes the state:
 //! * `0`               no dict and no values (allocation did not go through
 //!                     `generic_alloc`, or the dict was deleted): dict mode;
-//! * `values | 1`      inline values are live (tag bit 0);
+//! * `shape | 1`       the attributes are inline, described by `shape` (tag bit 0);
 //! * a dict pointer    a real dict was materialised; it is authoritative from then on
 //!                     (requested through `__dict__`/`vars()`/C API, too many
 //!                     attributes, unusual deletions, non-str names, `__class__`
 //!                     assignment).
+//!
+//! The number of value slots an instance has room for is decided at allocation (the
+//! type's learned capacity, rounded up to what the allocator's size class holds) and
+//! kept in the high byte of `ob_flags` (CPython only uses its low bits).
 //!
 //! Every path that hands out the dict slot (`typeobject::dict_slot`,
 //! `_PyObject_GetDictPtr`, `PyObject_GenericGetDict`, ...) materialises first, so code
 //! that only knows dicts keeps working unchanged.
 //!
 //! Concurrency (no GIL): writers take the object's `ob_mutex` once a second thread
-//! exists; readers are lock-free (acquire loads of the shape and the value). Values
+//! exists; readers are lock-free (acquire loads of the word and the value). Values
 //! replaced or removed while other threads may be reading are released through
 //! [`crate::qsbr`] (deferred until every thread passed a quiescent point), so a racing
 //! reader never increfs a freed object. Shapes themselves are immutable and freed only
@@ -51,23 +55,8 @@ pub const MAX_INLINE: u32 = 30;
 const MAX_SHAPES: u32 = 256;
 /// Capacity of the values area for types without `__static_attributes__` hints.
 const DEFAULT_CAP: u32 = 4;
-
-/// Header of the values area (followed by `cap` value slots).
-#[repr(C)]
-pub struct Values {
-    /// Current shape; null once the values were moved into a materialised dict.
-    pub shape: AtomicPtr<Shape>,
-    pub cap: u32,
-    pub _pad: u32,
-}
-pub const VALUES_HDR: usize = std::mem::size_of::<Values>();
-
-impl Values {
-    #[inline(always)]
-    pub fn slot(&self, i: usize) -> &AtomicPtr<PyObject> {
-        unsafe { &*((self as *const Values as *const u8).add(VALUES_HDR + i * 8) as *const AtomicPtr<PyObject>) }
-    }
-}
+/// `ob_flags` bits holding the inline capacity of an instance.
+const CAP_SHIFT: u32 = 8;
 
 /// An ordered list of attribute names (interned, immortal strs).
 #[repr(C)]
@@ -79,6 +68,9 @@ pub struct Shape {
     pub keys: *const *mut PyObject,
     pub parent: *const Shape,
     pub tree: *const ShapeTree,
+    /// Byte offset of the first value slot from the object start (the owning type's
+    /// rounded `tp_basicsize`; every shape of a tree belongs to one type).
+    pub voff: u32,
     /// Children, as an immutable list replaced on insertion (readers are lock-free).
     trans: AtomicPtr<TransList>,
 }
@@ -147,6 +139,7 @@ impl Shape {
             keys: keys.as_ptr(),
             parent: self as *const Shape,
             tree: self.tree,
+            voff: self.voff,
             trans: AtomicPtr::new(std::ptr::null_mut()),
         }));
         g.keys.push(keys);
@@ -194,6 +187,12 @@ pub fn tree_of(tp: *mut PyTypeObject) -> *const ShapeTree {
     }
 }
 
+/// Offset of the first value slot for instances of `tp`.
+#[inline(always)]
+fn values_offset(tp: *mut PyTypeObject) -> usize {
+    unsafe { ((*tp).tp_basicsize as usize + 7) & !7 }
+}
+
 /// Called by `type_new` for a new class with a managed dict: enable inline values if
 /// the layout allows (fixed size, generic allocation). `hint` = number of attribute
 /// names the compiler saw assigned through `self` (`__static_attributes__`).
@@ -207,7 +206,10 @@ pub unsafe fn type_enable(tp: *mut PyTypeObject, hint: usize) {
             return;
         }
         let base = (*tp).tp_base;
-        let mut cap = (hint as u32).clamp(DEFAULT_CAP, MAX_INLINE);
+        let mut cap = (hint as u32).clamp(1, MAX_INLINE);
+        if hint == 0 {
+            cap = DEFAULT_CAP;
+        }
         if !base.is_null() {
             let bt = tree_of(base);
             if !bt.is_null() {
@@ -226,6 +228,7 @@ pub unsafe fn type_enable(tp: *mut PyTypeObject, hint: usize) {
             keys: std::ptr::null(),
             parent: std::ptr::null(),
             tree,
+            voff: values_offset(tp) as u32,
             trans: AtomicPtr::new(std::ptr::null_mut()),
         }));
         (*tree).root = root;
@@ -247,7 +250,7 @@ pub unsafe fn type_free(tp: *mut PyTypeObject) {
     }
 }
 
-/// Extra bytes `generic_alloc` adds for the values area of a new instance of `tp`
+/// Extra bytes `generic_alloc` adds for the value slots of a new instance of `tp`
 /// (0 if the type has no inline values), plus the capacity.
 #[inline(always)]
 pub unsafe fn alloc_extra(tp: *mut PyTypeObject) -> (usize, u32) {
@@ -256,20 +259,21 @@ pub unsafe fn alloc_extra(tp: *mut PyTypeObject) -> (usize, u32) {
         return (0, 0);
     }
     let cap = unsafe { (*t).cap.load(Relaxed) };
-    (VALUES_HDR + cap as usize * 8, cap)
+    (cap as usize * 8, cap)
 }
 
-/// Initialise the values area at byte offset `off` of freshly allocated (zeroed) `op`.
+/// Set up the value slots at byte offset `off` of freshly allocated (zeroed) `op`.
+/// The capacity is rounded up to what the allocation actually holds.
 #[inline(always)]
 pub unsafe fn init_values(op: *mut PyObject, tp: *mut PyTypeObject, off: usize, cap: u32) {
     unsafe {
-        if !crate::alloc::has_managed(op) {
+        if !crate::alloc::has_managed(op) || off != values_offset(tp) {
             return;
         }
-        let v = (op as *mut u8).add(off) as *mut Values;
-        (*v).shape = AtomicPtr::new((*tree_of(tp)).root as *mut Shape);
-        (*v).cap = cap;
-        *crate::alloc::managed_dict_slot(op) = (v as usize | 1) as *mut PyObject;
+        let usable = crate::alloc::usable_size(op);
+        let cap = if usable > off { ((usable - off) / 8).min(MAX_INLINE as usize) as u32 } else { 0 }.max(cap.min(MAX_INLINE));
+        (*op).ob_flags.fetch_or((cap as u16) << CAP_SHIFT, Relaxed);
+        *crate::alloc::managed_dict_slot(op) = ((*tree_of(tp)).root as usize | 1) as *mut PyObject;
     }
 }
 
@@ -285,29 +289,46 @@ fn slot_word(op: *mut PyObject) -> Option<&'static AtomicPtr<PyObject>> {
     }
 }
 
-/// The live values area of `op`, or null (dict mode / no managed dict).
+/// Capacity of `op`'s value slots.
 #[inline(always)]
-pub fn values_of(op: *mut PyObject) -> *mut Values {
+fn capacity(op: *mut PyObject) -> u32 {
+    unsafe { ((*op).ob_flags.load(Relaxed) >> CAP_SHIFT) as u32 }
+}
+
+/// Value slot `i` of `op` (whose current shape is `sh`).
+#[inline(always)]
+unsafe fn slot(op: *mut PyObject, sh: *const Shape, i: usize) -> &'static AtomicPtr<PyObject> {
+    unsafe { &*((op as *const u8).add((*sh).voff as usize + i * 8) as *const AtomicPtr<PyObject>) }
+}
+
+/// The current shape of `op` if its attributes are inline, else null.
+#[inline(always)]
+fn live_shape(op: *mut PyObject) -> *const Shape {
     match slot_word(op) {
         Some(w) => {
             let p = w.load(Acquire) as usize;
-            if p & 1 != 0 { (p & !1) as *mut Values } else { std::ptr::null_mut() }
+            if p & 1 != 0 { (p & !1) as *const Shape } else { std::ptr::null() }
         }
-        None => std::ptr::null_mut(),
+        None => std::ptr::null(),
     }
+}
+
+/// Non-null if `op` keeps its attributes inline (kept for callers that test for a
+/// values area; the pointer is the shape, not a separate header).
+#[inline(always)]
+pub fn values_of(op: *mut PyObject) -> *const Shape {
+    live_shape(op)
 }
 
 /// True if `op` currently keeps its attributes inline (`_testinternalcapi.has_inline_values`).
 pub fn has_inline_values(o: &PyObject) -> bool {
-    let v = values_of(o.as_ptr());
-    !v.is_null() && unsafe { !(*v).shape.load(Acquire).is_null() }
+    !live_shape(o.as_ptr()).is_null()
 }
 
 /// Current shape of `o` (null in dict mode). For JIT guards: `(*shape).id`.
 #[inline(always)]
 pub fn shape_of(o: &PyObject) -> *const Shape {
-    let v = values_of(o.as_ptr());
-    if v.is_null() { std::ptr::null() } else { unsafe { (*v).shape.load(Acquire) } }
+    live_shape(o.as_ptr())
 }
 
 /// Canonical (interned) key for a lookup: Ok(Some(k)) usable key, Ok(None) the name
@@ -333,8 +354,12 @@ pub enum Get {
 /// Look `name` up in the inline values of `o`.
 #[inline]
 pub fn get(o: &PyObject, name: &PyObject) -> Get {
-    let v = values_of(o.as_ptr());
-    if v.is_null() {
+    let op = o.as_ptr();
+    let w = match slot_word(op) {
+        Some(w) => w,
+        None => return Get::NotValues,
+    };
+    if w.load(Relaxed) as usize & 1 == 0 {
         return Get::NotValues;
     }
     let k = match key_for_get(name) {
@@ -347,19 +372,20 @@ pub fn get(o: &PyObject, name: &PyObject) -> Get {
     };
     unsafe {
         loop {
-            let sh = (*v).shape.load(Acquire);
-            if sh.is_null() {
+            let p = w.load(Acquire) as usize;
+            if p & 1 == 0 {
                 return Get::NotValues; // materialised concurrently
             }
+            let sh = (p & !1) as *const Shape;
             match (*sh).index_of(k) {
                 None => return Get::Missing,
                 Some(i) => {
-                    let p = (*v).slot(i).load(Acquire);
-                    if !p.is_null() {
-                        return Get::Found(PyRef::from_borrowed(p));
+                    let v = slot(op, sh, i).load(Acquire);
+                    if !v.is_null() {
+                        return Get::Found(PyRef::from_borrowed(v));
                     }
                     // removed concurrently: re-read the shape
-                    if (*v).shape.load(Acquire) == sh {
+                    if w.load(Acquire) as usize == p {
                         return Get::Missing;
                     }
                 }
@@ -373,20 +399,19 @@ pub fn get(o: &PyObject, name: &PyObject) -> Get {
 /// `None`: dict mode. Used by the inline caches (racy-read contract as for dicts).
 #[inline(always)]
 pub fn get_hinted(o: &PyObject, name: *mut PyObject, hint: u64) -> Option<Option<(*mut PyObject, usize)>> {
-    let v = values_of(o.as_ptr());
-    if v.is_null() {
+    let op = o.as_ptr();
+    let sh = live_shape(op);
+    if sh.is_null() {
         return None;
     }
     unsafe {
-        let sh = (*v).shape.load(Acquire);
-        if sh.is_null() {
-            return None;
-        }
         let keys = (*sh).keys();
         let i = if (hint as usize) < keys.len() && keys[hint as usize] == name {
             hint as usize
         } else {
-            let k = if pystr::is_interned(&*name) { name } else {
+            let k = if pystr::is_interned(&*name) {
+                name
+            } else {
                 match key_for_get(&*name) {
                     Ok(Some(k)) => k,
                     _ => return Some(None),
@@ -397,19 +422,19 @@ pub fn get_hinted(o: &PyObject, name: *mut PyObject, hint: u64) -> Option<Option
                 None => return Some(None),
             }
         };
-        let p = (*v).slot(i).load(Acquire);
+        let p = slot(op, sh, i).load(Acquire);
         if p.is_null() { Some(None) } else { Some(Some((p, i))) }
     }
 }
 
 /// Optional writer lock: only needed once other threads exist.
-struct WLock(Option<dict::ObGuard>);
+struct WLock(#[allow(dead_code)] Option<dict::ObGuard>);
 #[inline(always)]
 fn wlock(o: &PyObject) -> WLock {
     if crate::qsbr::multi_threaded() { WLock(Some(dict::ob_lock(o))) } else { WLock(None) }
 }
 
-/// Release a value removed from a values area (deferred while other threads may
+/// Release a value removed from the value slots (deferred while other threads may
 /// still be reading it lock-free).
 #[inline(always)]
 unsafe fn release_old(p: *mut PyObject) {
@@ -427,17 +452,18 @@ pub enum Set {
 }
 
 /// Store (`Some`) or delete (`None`) attribute `name` in the inline values of `o`.
-/// Returns the index used through `idx` for cache hints.
 #[inline]
 pub fn set(o: &PyObject, name: &PyObject, value: Option<&PyObject>) -> Set {
     set_ix(o, name, value).0
 }
 
+/// As [`set`]; also returns the slot index used (for cache hints).
 pub fn set_ix(o: &PyObject, name: &PyObject, value: Option<&PyObject>) -> (Set, usize) {
-    let v = values_of(o.as_ptr());
-    if v.is_null() {
-        return (Set::NotValues, usize::MAX);
-    }
+    let op = o.as_ptr();
+    let w = match slot_word(op) {
+        Some(w) if w.load(Relaxed) as usize & 1 != 0 => w,
+        _ => return (Set::NotValues, usize::MAX),
+    };
     let k: *mut PyObject = if pystr::is_interned(name) {
         name.as_ptr()
     } else if pystr::is_str_exact(name) {
@@ -454,26 +480,26 @@ pub fn set_ix(o: &PyObject, name: &PyObject, value: Option<&PyObject>) -> (Set, 
     };
     unsafe {
         let g = wlock(o);
-        let sh = (*v).shape.load(Acquire);
-        if sh.is_null() {
+        let p = w.load(Acquire) as usize;
+        if p & 1 == 0 {
             return (Set::NotValues, usize::MAX);
         }
-        let shr = &*sh;
+        let shr = &*((p & !1) as *const Shape);
         match (shr.index_of(k), value) {
             (Some(i), Some(val)) => {
                 incref(val.as_ptr());
-                let old = (*v).slot(i).swap(val.as_ptr(), AcqRel);
+                let old = slot(op, shr, i).swap(val.as_ptr(), AcqRel);
                 drop(g);
                 release_old(old);
                 (Set::Done, i)
             }
             (None, Some(val)) => {
                 let len = shr.len;
-                if len < (*v).cap {
+                if len < capacity(op) {
                     if let Some(next) = shr.add(k) {
                         incref(val.as_ptr());
-                        (*v).slot(len as usize).store(val.as_ptr(), Release);
-                        (*v).shape.store(next as *mut Shape, Release);
+                        slot(op, shr, len as usize).store(val.as_ptr(), Release);
+                        w.store((next as usize | 1) as *mut PyObject, Release);
                         return (Set::Done, len as usize);
                     }
                 } else {
@@ -489,8 +515,8 @@ pub fn set_ix(o: &PyObject, name: &PyObject, value: Option<&PyObject>) -> (Set, 
             (Some(i), None) => {
                 if i + 1 == shr.len as usize && !shr.parent.is_null() {
                     // deleting the most recently added attribute: back to the parent
-                    let old = (*v).slot(i).swap(std::ptr::null_mut(), AcqRel);
-                    (*v).shape.store(shr.parent as *mut Shape, Release);
+                    let old = slot(op, shr, i).swap(std::ptr::null_mut(), AcqRel);
+                    w.store((shr.parent as usize | 1) as *mut PyObject, Release);
                     drop(g);
                     release_old(old);
                     return (Set::Done, i);
@@ -508,22 +534,24 @@ pub fn set_ix(o: &PyObject, name: &PyObject, value: Option<&PyObject>) -> (Set, 
 /// (JIT/inline-cache store fast path). False: take the generic path.
 #[inline(always)]
 pub fn replace_hinted(o: &PyObject, name: *mut PyObject, hint: u64, val: &PyObject) -> bool {
-    let v = values_of(o.as_ptr());
-    if v.is_null() {
-        return false;
-    }
+    let op = o.as_ptr();
+    let w = match slot_word(op) {
+        Some(w) if w.load(Relaxed) as usize & 1 != 0 => w,
+        _ => return false,
+    };
     unsafe {
         let g = wlock(o);
-        let sh = (*v).shape.load(Acquire);
-        if sh.is_null() {
+        let p = w.load(Acquire) as usize;
+        if p & 1 == 0 {
             return false;
         }
+        let sh = (p & !1) as *const Shape;
         let keys = (*sh).keys();
         if (hint as usize) >= keys.len() || keys[hint as usize] != name {
             return false;
         }
         incref(val.as_ptr());
-        let old = (*v).slot(hint as usize).swap(val.as_ptr(), AcqRel);
+        let old = slot(op, sh, hint as usize).swap(val.as_ptr(), AcqRel);
         drop(g);
         release_old(old);
         true
@@ -542,33 +570,28 @@ pub fn materialize(o: &PyObject) -> bool {
     if p & 1 == 0 {
         return p != 0;
     }
-    let v = (p & !1) as *mut Values;
     // build the dict outside the lock (allocation), then swap under it
-    let d = dict::new_dict_presized(unsafe { (*v).cap as usize });
+    let d = dict::new_dict_presized(capacity(op) as usize);
     let _g = dict::ob_lock(o);
     unsafe {
-        if w.load(Acquire) as usize != p {
+        let p = w.load(Acquire) as usize;
+        if p & 1 == 0 {
             return true; // someone else materialised
         }
-        let sh = (*v).shape.swap(std::ptr::null_mut(), AcqRel);
-        if !sh.is_null() {
-            for (i, &k) in (*sh).keys().iter().enumerate() {
-                let val = (*v).slot(i).load(Acquire);
-                if !val.is_null() {
-                    // transfer the reference into the dict
-                    dict::insert_unique(&d, &*k, pystr::str_hash(&*k), &*val);
-                }
+        let sh = (p & !1) as *const Shape;
+        for (i, &k) in (*sh).keys().iter().enumerate() {
+            let val = slot(op, sh, i).load(Acquire);
+            if !val.is_null() {
+                dict::insert_unique(&d, &*k, pystr::str_hash(&*k), &*val);
             }
         }
         w.store(d.into_raw(), Release);
-        // the dict took its own references; drop the values' ones (deferred: lock-free
-        // readers may still be looking at the values area)
-        if !sh.is_null() {
-            for i in 0..(*sh).len as usize {
-                let val = (*v).slot(i).swap(std::ptr::null_mut(), AcqRel);
-                if !val.is_null() {
-                    crate::qsbr::decref_deferred(val);
-                }
+        // the dict took its own references; drop the slots' ones (deferred: lock-free
+        // readers may still be looking at the slots)
+        for i in 0..(*sh).len as usize {
+            let val = slot(op, sh, i).swap(std::ptr::null_mut(), AcqRel);
+            if !val.is_null() {
+                crate::qsbr::decref_deferred(val);
             }
         }
     }
@@ -579,21 +602,19 @@ pub fn materialize(o: &PyObject) -> bool {
 /// shape (tp_clear, PyObject_ClearManagedDict) instead of leaving values mode.
 pub unsafe fn clear_values(op: *mut PyObject, keep_mode: bool) {
     unsafe {
-        let v = values_of(op);
-        if v.is_null() {
+        let w = match slot_word(op) {
+            Some(w) => w,
+            None => return,
+        };
+        let p = w.load(Acquire) as usize;
+        if p & 1 == 0 {
             return;
         }
-        let sh = (*v).shape.load(Acquire);
-        if sh.is_null() {
-            return;
-        }
-        let root = (*(*sh).tree).root as *mut Shape;
-        (*v).shape.store(if keep_mode { root } else { std::ptr::null_mut() }, Release);
-        if !keep_mode {
-            *crate::alloc::managed_dict_slot(op) = std::ptr::null_mut();
-        }
+        let sh = (p & !1) as *const Shape;
+        let root = (*(*sh).tree).root;
+        w.store(if keep_mode { (root as usize | 1) as *mut PyObject } else { std::ptr::null_mut() }, Release);
         for i in 0..(*sh).len as usize {
-            let val = (*v).slot(i).swap(std::ptr::null_mut(), AcqRel);
+            let val = slot(op, sh, i).swap(std::ptr::null_mut(), AcqRel);
             xdecref(val);
         }
     }
@@ -602,17 +623,13 @@ pub unsafe fn clear_values(op: *mut PyObject, keep_mode: bool) {
 /// Visit the inline values (tp_traverse).
 pub unsafe fn traverse(op: *mut PyObject, visit: visitproc, arg: *mut c_void) -> c_int {
     unsafe {
-        let v = values_of(op);
-        if v.is_null() {
-            return 0;
-        }
-        let sh = (*v).shape.load(Acquire);
+        let sh = live_shape(op);
         if sh.is_null() {
             return 0;
         }
         let f = visit.unwrap();
         for i in 0..(*sh).len as usize {
-            let val = (*v).slot(i).load(Acquire);
+            let val = slot(op, sh, i).load(Acquire);
             if !val.is_null() {
                 let r = f(val, arg);
                 if r != 0 {
@@ -630,9 +647,10 @@ pub fn inline_len(o: &PyObject) -> usize {
     if s.is_null() { 0 } else { unsafe { (*s).len as usize } }
 }
 
-/// Byte offset of `Values::cap` (JIT code checks the room left before appending).
-pub const fn values_cap_offset() -> i32 {
-    std::mem::offset_of!(Values, cap) as i32
+/// Byte offset (from the object) of the byte holding the number of value slots the
+/// object has room for (JIT code checks it before appending an attribute).
+pub const fn capacity_offset() -> i32 {
+    std::mem::offset_of!(PyObject, ob_flags) as i32 + (CAP_SHIFT / 8) as i32
 }
 
 /// (jit3) Shape transitions of `tp` that append interned `name` at index `ix`, as
@@ -654,14 +672,14 @@ pub fn transitions_adding(tp: *mut PyTypeObject, name: *mut PyObject, ix: usize)
         .collect()
 }
 
-/// Layout constants for JIT code: (values.shape, values slots, shape.id, shape.len,
-/// shape.keys) byte offsets.
-pub const fn jit_layout() -> (i32, i32, i32, i32, i32) {
+/// Layout constants for JIT code: byte offsets of (shape.id, shape.len, shape.keys,
+/// shape.voff). The managed-dict word holds `shape | 1`; value `i` of an object `o`
+/// is at `o + shape.voff + 8 * i`.
+pub const fn jit_layout() -> (i32, i32, i32, i32) {
     (
-        std::mem::offset_of!(Values, shape) as i32,
-        VALUES_HDR as i32,
         std::mem::offset_of!(Shape, id) as i32,
         std::mem::offset_of!(Shape, len) as i32,
         std::mem::offset_of!(Shape, keys) as i32,
+        std::mem::offset_of!(Shape, voff) as i32,
     )
 }

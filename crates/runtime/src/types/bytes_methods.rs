@@ -1965,12 +1965,18 @@ pub fn slice_bytes(d: &[u8], start: isize, step: isize, len: isize) -> Vec<u8> {
     if len <= 0 {
         return Vec::new();
     }
+    // The indices were computed from a length read earlier; a bytearray resized by
+    // another thread meanwhile yields a truncated (racy) result, never a panic.
     if step == 1 {
-        return d[start as usize..(start + len) as usize].to_vec();
+        let s = (start as usize).min(d.len());
+        return d[s..(start + len).max(0).min(d.len() as isize) as usize].to_vec();
     }
     let mut v = Vec::with_capacity(len as usize);
     let mut i = start;
     for _ in 0..len {
+        if i < 0 || i as usize >= d.len() {
+            break;
+        }
         v.push(d[i as usize]);
         i = i.wrapping_add(step);
     }
