@@ -979,7 +979,7 @@ fn m_take_bytes(o: &PyObject, args: &[&PyObject]) -> PyResult {
     }
     unsafe {
         let offset = logical_offset(o);
-        if n * 2 <= size && n < size {
+        if n * 2 < size {
             // small take: copy out and advance the logical start
             let r = bytes::try_new_bytes(&data_unlocked(o)[..n])?;
             let b = &mut *ba(o);

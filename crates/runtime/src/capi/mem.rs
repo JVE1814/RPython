@@ -147,6 +147,31 @@ pub unsafe extern "C" fn PyMem_SetAllocator(domain: c_int, a: *mut PyMemAllocato
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyMem_SetupDebugHooks() {}
 
+/// Runtime-internal buffers (bytes payloads and the like) are not carved out of
+/// the hookable allocator domains. While a C extension has replaced the object
+/// allocator (e.g. a failure-injecting test hook), those allocations ask the
+/// installed hook first, so that a hook refusing memory turns into MemoryError.
+/// Returns true when the hook refused `n` bytes.
+pub fn hooked_alloc_refuses(n: usize) -> bool {
+    if !HOOKED.load(Acquire) {
+        return false;
+    }
+    unsafe {
+        let a = *dom(2);
+        let default_malloc: unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void = obj_malloc;
+        let (Some(m), Some(f)) = (a.malloc, a.free) else { return false };
+        if m as usize == default_malloc as usize {
+            return false;
+        }
+        let p = m(a.ctx, n.max(1));
+        if p.is_null() {
+            return true;
+        }
+        f(a.ctx, p);
+        false
+    }
+}
+
 macro_rules! domain_fns {
     ($d:expr, $m:ident, $c:ident, $r:ident, $f:ident) => {
         #[unsafe(no_mangle)]

@@ -23,6 +23,14 @@ pub const MAX_SIZE: usize = (isize::MAX as usize) - HEADER - 64;
 
 /// Allocate an uninitialised (zeroed) exact bytes object of size `n`, or raise MemoryError.
 pub fn try_alloc_bytes(n: usize) -> PyResult<PyRef> {
+    if crate::capi::mem::hooked_alloc_refuses(HEADER + n + 1) {
+        return Err(memory_error());
+    }
+    alloc_bytes_unhooked(n)
+}
+
+/// `try_alloc_bytes` without consulting an installed allocator hook.
+fn alloc_bytes_unhooked(n: usize) -> PyResult<PyRef> {
     if n > MAX_SIZE {
         return Err(memory_error());
     }
@@ -39,7 +47,7 @@ pub fn try_alloc_bytes(n: usize) -> PyResult<PyRef> {
 
 /// Allocate a zeroed exact bytes object of size `n` (aborts on allocation failure).
 pub fn alloc_bytes(n: usize) -> PyRef {
-    match try_alloc_bytes(n) {
+    match alloc_bytes_unhooked(n) {
         Ok(r) => r,
         Err(_) => {
             clear_exc();
@@ -119,7 +127,7 @@ pub fn bytes_hash(o: &PyObject) -> isize {
 /// object (unchanged) with MemoryError set.
 pub unsafe fn resize_unique(o: PyRef, n: usize) -> Result<PyRef, PyRef> {
     unsafe {
-        if n > MAX_SIZE {
+        if n > MAX_SIZE || crate::capi::mem::hooked_alloc_refuses(HEADER + n + 1) {
             let _ = memory_error();
             return Err(o);
         }

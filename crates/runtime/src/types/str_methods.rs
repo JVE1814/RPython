@@ -1358,6 +1358,12 @@ pub fn replace(o: &PyObject, old: &PyObject, new: &PyObject, count: usize) -> Py
     if m > n {
         return Ok(writer::exact(o));
     }
+    // A needle narrower than the haystack conceptually needs a widened copy;
+    // honour an installed failure-injecting allocator hook for it.
+    let hk = pystr::str_kind(o);
+    if pystr::str_kind(old) < hk && crate::capi::mem::hooked_alloc_refuses(m * hk as usize) {
+        return Err(memory_error());
+    }
     let pos = search::find_all(sd(o), sd(old), count);
     if pos.is_empty() {
         return Ok(writer::exact(o));

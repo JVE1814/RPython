@@ -902,12 +902,8 @@ fn split_whitespace(d: &[u8], maxsplit: isize) -> Vec<&[u8]> {
             break;
         }
         if maxsplit >= 0 && count >= maxsplit {
-            // rest (with trailing whitespace stripped)
-            let mut e = n;
-            while e > i && is_space(d[e - 1]) {
-                e -= 1;
-            }
-            out.push(&d[i..e]);
+            // the remainder keeps its trailing whitespace
+            out.push(&d[i..]);
             return out;
         }
         let s = i;
@@ -932,11 +928,8 @@ fn rsplit_whitespace(d: &[u8], maxsplit: isize) -> Vec<&[u8]> {
             break;
         }
         if maxsplit >= 0 && count >= maxsplit {
-            let mut s = 0;
-            while s < i && is_space(d[s]) {
-                s += 1;
-            }
-            out.push(&d[s..i]);
+            // the remainder keeps its leading whitespace
+            out.push(&d[..i]);
             break;
         }
         let e = i;
