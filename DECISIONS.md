@@ -195,3 +195,6 @@ CPython's specialized instruction names. Our pyc format carries the public form.
   worktrees kept the work and they were resumed after the reset. To spread usage over the
   remaining budget, at most ~7 agents run at once and finished agents are not immediately
   replaced unless the work is on the critical path (suite pass rate, benchmarks, numpy).
+- 2026-11-06: the container restarted twice within an hour while six agents were building
+  (cause not visible from inside; memory pressure from concurrent release/LTO builds suspected).
+  Concurrency reduced to 4 agents, -j2 builds, non-LTO profiles for iteration, frequent commits.
