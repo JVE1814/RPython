@@ -191,3 +191,7 @@ code objects created from Python (CodeType/replace) or C (PyUnstable_Code_New*) 
 valid wordcode therefore execute too. f_lasti, tracing/monitoring offsets, tb_lasti and
 co_positions are in public units. dis's adaptive view maps our inline-cache specialisations to
 CPython's specialized instruction names. Our pyc format carries the public form.
+- 2026-11-02 → 11-05: all agents stopped when the account's weekly API limit was reached; their
+  worktrees kept the work and they were resumed after the reset. To spread usage over the
+  remaining budget, at most ~7 agents run at once and finished agents are not immediately
+  replaced unless the work is on the critical path (suite pass rate, benchmarks, numpy).
