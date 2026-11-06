@@ -330,7 +330,7 @@ fn set_co_filename(co: &PyObject, old: &PyObject, new: &PyObject) {
         let prev = std::mem::replace(&mut (*c).co_filename, new.to_ref().into_raw());
         xdecref(prev);
     }
-    for k in cd.consts.clone() {
+    for k in cd.consts.to_vec() {
         if crate::types::code::is_code(&k) {
             set_co_filename(&k, old, new);
         }
