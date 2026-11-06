@@ -106,8 +106,40 @@ Sequence of `finalize()` (also behind `Py_FinalizeEx`, run once):
   test compares).
 * `_testinternalcapi.has_inline_values` uses `shape::has_inline_values`.
 
-## Results (snapshot layout, release build)
-See the final report for the latest table.
+* Later rounds: ImportError repr/kwargs/reset; SyntaxError constructor/re-init and
+  compiler-error text read from the file (PEP 263 cookie, BOM, byte offsets without text);
+  finished frames keep f_back; module attribute errors (circular import "from 'origin'",
+  submodule being imported, stdlib/third-party shadowing hints using the start-up
+  sys.path[0]); cannot-import-name shadowing hint; `_imp._fix_co_filename`;
+  `f(**m)` key checks; `{**m}` error propagation; mappingproxy equality; full tp_name in
+  comparison errors; sys.implementation is a types.SimpleNamespace; types.CapsuleType;
+  tp_del on deallocation; `__bases__` assignment rolls back subclass MROs on failure;
+  complex.real/imag members; anext(it, default).
+
+## Results (installed-layout snapshot of this branch, release build, after merging master 4606f2c)
+| module | run5 (master) | core3 |
+|---|---|---|
+| test_threading | TIMEOUT | 247 run, 4 failures (~35-110 s) |
+| test_gc | 61/12 | 61/1 (test_get_referents_on_capsule: _socket.CAPI) |
+| test_sys | 105/17 | 105/4 (3 SizeofTest layout, supports_isolated_interpreters) |
+| test_atexit | 10/6 | 10/4 (subinterpreter tests) |
+| test_frozen | 3/0 (FAIL) | pass |
+| test_builtin | 157/9 | 157/3 |
+| test_descr | 168/22 | 168/14 |
+| test_class | 42/3 | 42/1 |
+| test_types | 135/8 | 135/1 (subinterpreters) |
+| test_exceptions | 115/17 | 115/9 |
+| test_import | 128/18 | 128/5 |
+| test_extcall / test_unpack_ex | 6/16, 6/9 | pass, pass |
+| test_range | 29/36 | 29/1 |
+| test_traceback | CRASH | 441/16 |
+| test_finalization | 18/4 | pass |
+| test_asyncgen | 85 (errors) | pass |
+| test_coroutines | 100/7 | 100/3 |
+| test_importlib | CRASH | 1236/19 (baseline ft: 20) |
+Startup: `-c pass` 44.5M instructions; finalization is ~7.5M of that (three full
+collections + clearing survivor modules). perf2: the collections dominate; CPython does
+the same three collections.
 
 ## Not done / handed over
 * test_class TestInlineValues (`c.__dict__` access/update keeps inline values) — needs
