@@ -1,7 +1,7 @@
 //! Unparse of annotations under `from __future__ import annotations`, checked against the
 //! eq(...) cases of spec/Lib/test/test_future_stmt/test_future.py.
 mod common;
-use rpy_compiler::bytecode::Constant;
+use rpy_compiler::wordcode::Constant;
 use rpy_compiler::Mode;
 
 fn parse_str_lits(s: &[u8], mut i: usize) -> Option<(String, usize)> {

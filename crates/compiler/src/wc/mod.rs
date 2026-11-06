@@ -3,7 +3,7 @@
 
 pub(crate) mod cfg;
 pub mod hooks;
-mod expr;
+pub(crate) mod expr;
 pub(crate) mod ir;
 mod pattern;
 mod stmt;

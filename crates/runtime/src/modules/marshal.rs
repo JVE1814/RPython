@@ -27,7 +27,7 @@ use crate::types::{
     bool_, bytearray, bytes, complex, dict, exceptions, float, int, list, none, set, slice, str as pystr, tuple,
 };
 use crate::{mdefs, raise};
-use rpy_compiler::bytecode::{self as bc, CodeUnit, ExceptionEntry, Location};
+use rpy_compiler::bytecode as bc;
 use std::collections::HashMap;
 
 pub const VERSION: i32 = 6;
@@ -921,10 +921,6 @@ struct CodeParts<'a> {
     exctable: &'a PyObject,
 }
 
-fn u32s(b: &[u8]) -> Vec<u32> {
-    b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
-}
-
 /// Number of items if `o` is a tuple of str, else None.
 fn str_count(o: &PyObject) -> Option<usize> {
     if !tuple::is_tuple(o) {
@@ -990,19 +986,6 @@ fn no_debug_ranges() -> bool {
         clear_exc();
         false
     })
-}
-
-/// Does the serialized code object use the legacy internal layout (32-bit words, 16-byte
-/// location records, 20-byte exception entries)? (D24 transition only.)
-fn looks_legacy(p: &CodeParts) -> bool {
-    if !bytes::is_bytes(p.code) || !bytes::is_bytes(p.linetable) || !bytes::is_bytes(p.exctable) {
-        return true; // let the legacy validator report it
-    }
-    let codeb = bytes::bytes_data(p.code);
-    codeb.len() % 4 == 0
-        && bytes::bytes_data(p.linetable).len() == codeb.len() * 4
-        && bytes::bytes_data(p.exctable).len() % 20 == 0
-        && u32s(codeb).iter().all(|w| ((w & 0xff) as usize) < bc::NUM_OPS)
 }
 
 /// Re-encode a location table without column information (`-X no_debug_ranges`).
@@ -1076,86 +1059,7 @@ fn build_public_code(p: CodeParts) -> PyResult<PyRef> {
 }
 
 fn build_code(p: CodeParts) -> PyResult<PyRef> {
-    if !looks_legacy(&p) {
-        return build_public_code(p);
-    }
-    let invalid = || bad("invalid code object");
-    if !bytes::is_bytes(p.code) || !bytes::is_bytes(p.lpkinds) || !bytes::is_bytes(p.linetable) || !bytes::is_bytes(p.exctable) {
-        return Err(invalid());
-    }
-    if !tuple::is_tuple(p.consts) || !pystr::is_str(p.filename) || !pystr::is_str(p.name) || !pystr::is_str(p.qualname) {
-        return Err(invalid());
-    }
-    let codeb = bytes::bytes_data(p.code);
-    if codeb.len() % 4 != 0 {
-        return Err(invalid());
-    }
-    let words = u32s(codeb);
-    if words.iter().any(|w| (w & 0xff) as usize >= bc::NUM_OPS) {
-        return Err(invalid());
-    }
-    let names = str_count(p.names).ok_or_else(invalid)?;
-    let lpnames = str_count(p.lpnames).ok_or_else(invalid)?;
-    let kinds = bytes::bytes_data(p.lpkinds).to_vec();
-    if kinds.len() != lpnames {
-        return Err(invalid());
-    }
-    let lt = bytes::bytes_data(p.linetable);
-    if lt.len() != words.len() * 16 {
-        return Err(invalid());
-    }
-    let strip_cols = no_debug_ranges_cached();
-    let locations: Vec<Location> = u32s(lt)
-        .chunks_exact(4)
-        .map(|c| {
-            if strip_cols {
-                Location { lineno: c[0], end_lineno: c[1], col: u32::MAX, end_col: u32::MAX }
-            } else {
-                Location { lineno: c[0], end_lineno: c[1], col: c[2], end_col: c[3] }
-            }
-        })
-        .collect();
-    let et = bytes::bytes_data(p.exctable);
-    if et.len() % 20 != 0 {
-        return Err(invalid());
-    }
-    let exception_table: Vec<ExceptionEntry> = u32s(et)
-        .chunks_exact(5)
-        .map(|c| ExceptionEntry { start: c[0], end: c[1], target: c[2], depth: c[3], lasti: c[4] != 0 })
-        .collect();
-    let n = words.len() as u32;
-    if exception_table.iter().any(|e| e.start > e.end || e.end > n || e.target >= n.max(1)) {
-        return Err(invalid());
-    }
-    let _ = (names, lpnames);
-    // Build directly from the unmarshalled objects (constants keep their identity,
-    // names are interned in place: no round trip through Rust strings).
-    let intern_all = |t: &PyObject| -> Vec<PyRef> {
-        tuple::tuple_items(t)
-            .iter()
-            .map(|n| if pystr::is_str_exact(n) { pystr::intern(n.to_ref()) } else { pystr::intern_str(&pystr::to_string_lossy(n)) })
-            .collect()
-    };
-    let consts = if tuple::is_tuple_exact(p.consts) { p.consts.to_ref() } else { ab::sequence_tuple(p.consts)? };
-    let intern1 = |s: &PyObject| if pystr::is_str_exact(s) { pystr::intern(s.to_ref()) } else { pystr::intern_str(&pystr::to_string_lossy(s)) };
-    code_mod::new_code_from_parts(code_mod::CodeParts {
-        argcount: p.argcount as u32,
-        posonlyargcount: p.posonly as u32,
-        kwonlyargcount: p.kwonly as u32,
-        flags: p.flags as u32,
-        stacksize: p.stacksize as u32,
-        firstlineno: p.firstlineno as u32,
-        code: words,
-        locations,
-        exception_table,
-        kinds,
-        filename: p.filename.to_ref(),
-        consts: tuple::tuple_to_vec(&consts),
-        names: intern_all(p.names),
-        localsplusnames: intern_all(p.lpnames),
-        name: intern1(p.name),
-        qualname: intern1(p.qualname),
-    })
+    build_public_code(p)
 }
 
 /// PyMarshal_ReadObjectFromString equivalent.

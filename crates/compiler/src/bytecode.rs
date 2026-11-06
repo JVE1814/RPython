@@ -391,25 +391,6 @@ pub mod fast {
     pub const ARG_VAR: u8 = 0x08;
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum Constant {
-    None,
-    Bool(bool),
-    Ellipsis,
-    /// small int
-    Int(i64),
-    /// big int as decimal digits with sign
-    BigInt { neg: bool, decimal: String },
-    Float(f64),
-    Complex { real: f64, imag: f64 },
-    /// code points (may contain lone surrogates)
-    Str(Vec<u32>),
-    Bytes(Vec<u8>),
-    Tuple(Vec<Constant>),
-    FrozenSet(Vec<Constant>),
-    Code(Box<CodeUnit>),
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Location {
     /// 0 means "no location" (e.g. artificial instructions)
@@ -431,28 +412,6 @@ pub struct ExceptionEntry {
     pub depth: u32,
     /// push the raising instruction index before the exception
     pub lasti: bool,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct CodeUnit {
-    pub name: String,
-    pub qualname: String,
-    pub filename: String,
-    pub firstlineno: u32,
-    pub argcount: u32,
-    pub posonlyargcount: u32,
-    pub kwonlyargcount: u32,
-    pub flags: u32,
-    pub stacksize: u32,
-    pub code: Vec<u32>,
-    /// one entry per instruction in `code`
-    pub locations: Vec<Location>,
-    pub consts: Vec<Constant>,
-    pub names: Vec<String>,
-    /// all local slots: arguments, locals, cells, then free vars (CPython's localsplus order)
-    pub localsplusnames: Vec<String>,
-    pub localspluskinds: Vec<u8>,
-    pub exception_table: Vec<ExceptionEntry>,
 }
 
 #[inline]

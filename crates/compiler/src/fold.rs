@@ -520,7 +520,7 @@ fn repeat(seq: &Constant, n: i128) -> Option<Constant> {
 
 pub(crate) fn fold_unary(op: UnaryOp, c: &Constant) -> Option<Constant> {
     match op {
-        UnaryOp::Not => crate::codegen::const_truth(c).map(|t| Constant::Bool(!t)),
+        UnaryOp::Not => crate::wc::expr::const_truth(c).map(|t| Constant::Bool(!t)),
         UnaryOp::USub => match c {
             Constant::Bool(b) => Some(make_int(-(*b as i128))),
             Constant::Int(i) => Some(make_int(-int_value(i)?)),
@@ -1266,3 +1266,4 @@ fn optimize_format(fmt: &PyStr, elts: &[Expr], loc: Loc) -> Option<Expr> {
     }
     Some(Expr::new(ExprKind::JoinedStr { values: seq }, loc))
 }
+
