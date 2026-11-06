@@ -46,8 +46,12 @@ pub const LINE: usize = 5;
 pub const INSTRUCTION: usize = 6;
 pub const RAISE: usize = 11;
 pub const PY_UNWIND: usize = 13;
-/// Events that can be set per code object (and disabled per location).
-pub const LOCAL_EVENTS_MASK: u32 = (1 << 11) - 1 | (1 << 18);
+/// Events that can be set per code object (3.15: every event, the exception events and
+/// the ancillary C_RETURN/C_RAISE included).
+pub const LOCAL_EVENTS_MASK: u32 = (1 << 19) - 1;
+/// Events a callback may disable by returning DISABLE (per location for instrumented
+/// events, per code object for the exception events).
+pub const DISABLE_MASK: u32 = ((1 << 16) - 1) | (1 << 18);
 
 pub struct MonState {
     pub names: [Option<usize>; NTOOLS],
@@ -140,7 +144,7 @@ fn fire(ts: &ThreadState, f: &mut Frame, ev: usize, loc: u32, extra: &[&PyObject
         let tools = events_for(&m, code, ev);
         (0..NTOOLS)
             .filter(|t| tools & (1 << t) != 0)
-            .filter(|t| !m.disabled.contains(&(*t, code, loc, ev)))
+            .filter(|t| !m.disabled.contains(&(*t, code, loc, ev)) && !m.disabled.contains(&(*t, code, u32::MAX, ev)))
             .map(|t| (t, unsafe { PyRef::from_borrowed(m.callbacks[t][ev] as *mut PyObject) }))
             .collect()
     };
@@ -163,10 +167,12 @@ fn fire(ts: &ThreadState, f: &mut Frame, ev: usize, loc: u32, extra: &[&PyObject
         let r = r?;
         let dis = DISABLE_OBJ.load(Acquire);
         if !dis.is_null() && r.as_ptr() == dis {
-            if (1u32 << ev) & LOCAL_EVENTS_MASK == 0 {
+            if (1u32 << ev) & DISABLE_MASK == 0 {
                 crate::raise!(ValueError, "Cannot disable {} events. Callback removed.", EVENT_NAMES[ev]);
             }
-            MON.lock().unwrap().disabled.insert((tool, code, loc, ev));
+            // exception events are disabled for the whole code object (location u32::MAX)
+            let at = if ev >= 11 && ev <= 15 { u32::MAX } else { loc };
+            MON.lock().unwrap().disabled.insert((tool, code, at, ev));
         }
     }
     Ok(())
@@ -305,7 +311,8 @@ pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
     // one INSTRUCTION / opcode event per public instruction (an instruction may be
     // implemented by several internal words)
     let first_word = crate::types::code::code_data(f.code()).starts_public_instr(lasti as usize);
-    if first_word && MON_ANY.load(Relaxed) & (1 << INSTRUCTION) != 0 {
+    // RESUME produces no INSTRUCTION event
+    if first_word && !is_resume && MON_ANY.load(Relaxed) & (1 << INSTRUCTION) != 0 {
         fire(ts, f, INSTRUCTION, offset(f), &[])?;
     }
     if ts.trace_func.get().is_null() || f.f_trace.is_null() {

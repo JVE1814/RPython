@@ -1,29 +1,28 @@
 //! Object allocation. Small objects come from the thread-caching page allocator
 //! (`tlab.rs`, HotSpot TLAB style); large ones from the system allocator.
-//! GC objects carry a pre-header in front of the object:
-//!   [managed dict][managed weakref]   (only if Py_TPFLAGS_PREHEADER bits set)
-//!   [gc next][gc prev]                (always for GC objects)
+//! Objects of types with Py_TPFLAGS_PREHEADER bits carry a pre-header in front:
+//!   [managed dict][managed weakref]
 //!   PyObject ...
+//! GC objects have no list links (perf2): the cycle collector finds small ones by
+//! walking the allocator's GC pages (`tlab::for_each_gc_block`) and large ones in the
+//! registry kept here ([`for_each_large_gc`]).
 
 use crate::ffi::*;
 use crate::object::init_header;
 use std::sync::atomic::Ordering::*;
 
-#[repr(C)]
-pub struct GcHead {
-    pub next: *mut GcHead,
-    pub prev: *mut GcHead,
-}
-
-pub const GC_HEAD: usize = std::mem::size_of::<GcHead>();
 pub const MANAGED: usize = 16;
 /// Bits in ob_gc_bits (private to this runtime).
+/// The object is GC-capable (allocated on GC pages / in the large registry).
 pub const GC_BIT_PREHEADER: u8 = 0x80;
+/// The object has the managed dict/weakref pre-header.
 pub const GC_BIT_MANAGED: u8 = 0x40;
 /// Allocation came from the system allocator (not a tlab page).
 pub const GC_BIT_LARGE: u8 = 0x20;
 pub const GC_BIT_TRACKED: u8 = 0x01;
 pub const GC_BIT_FINALIZED: u8 = 0x02;
+/// Survived a collection (old generation).
+pub const GC_BIT_OLD: u8 = 0x04;
 /// The managed __dict__ was replaced or deleted (no "inline values" any more).
 pub const GC_BIT_DICT_DETACHED: u8 = 0x10;
 
@@ -32,30 +31,85 @@ pub fn type_is_gc(tp: *const PyTypeObject) -> bool {
     unsafe { (*tp).tp_flags & Py_TPFLAGS_HAVE_GC != 0 }
 }
 
+/// (pre-header bytes, initial gc bits, allocator kind) for instances of `tp`.
 #[inline]
-fn preheader_for(tp: *const PyTypeObject) -> (usize, u8) {
+fn preheader_for(tp: *const PyTypeObject) -> (usize, u8, usize) {
     unsafe {
         let f = (*tp).tp_flags;
         if f & Py_TPFLAGS_HAVE_GC == 0 {
-            return (0, 0);
+            return (0, 0, crate::tlab::KIND_RAW);
         }
         if f & Py_TPFLAGS_PREHEADER != 0 {
-            (GC_HEAD + MANAGED, GC_BIT_PREHEADER | GC_BIT_MANAGED)
+            (MANAGED, GC_BIT_PREHEADER | GC_BIT_MANAGED, crate::tlab::KIND_GC_MANAGED)
         } else {
-            (GC_HEAD, GC_BIT_PREHEADER)
+            (0, GC_BIT_PREHEADER, crate::tlab::KIND_GC)
         }
     }
 }
 
 #[inline]
-fn raw_obj_alloc(total: usize) -> (*mut u8, u8) {
+fn kind_of_bits(bits: u8) -> usize {
+    if bits & GC_BIT_PREHEADER == 0 {
+        crate::tlab::KIND_RAW
+    } else if bits & GC_BIT_MANAGED != 0 {
+        crate::tlab::KIND_GC_MANAGED
+    } else {
+        crate::tlab::KIND_GC
+    }
+}
+
+#[inline]
+fn raw_obj_alloc(total: usize, kind: usize) -> (*mut u8, u8) {
     if total <= crate::tlab::MAX_SMALL {
-        let p = crate::tlab::alloc_small(total);
+        let p = crate::tlab::alloc_kind(total, kind);
         if !p.is_null() {
             return (p, 0);
         }
     }
     (unsafe { libc::calloc(1, total) as *mut u8 }, GC_BIT_LARGE)
+}
+
+// ---------------------------------------------------------------- large GC objects
+
+/// GC objects from the system allocator (rare: big tuples and the like), keyed by
+/// object address.
+struct LargeSet(std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddrHasher>>);
+#[derive(Default)]
+struct AddrHasher(u64);
+impl std::hash::Hasher for AddrHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 << 8 | b as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+    }
+    fn write_usize(&mut self, v: usize) {
+        self.0 = ((v as u64) >> 4).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+static LARGE_GC: std::sync::Mutex<Option<LargeSet>> = std::sync::Mutex::new(None);
+
+fn large_register(op: *mut PyObject) {
+    let mut g = LARGE_GC.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(|| LargeSet(Default::default())).0.insert(op as usize);
+}
+fn large_unregister(op: *mut PyObject) {
+    let mut g = LARGE_GC.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = g.as_mut() {
+        s.0.remove(&(op as usize));
+    }
+}
+
+/// Call `f` for every GC object living in system-allocator memory.
+pub fn for_each_large_gc(mut f: impl FnMut(*mut PyObject)) {
+    let g = LARGE_GC.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = g.as_ref() {
+        for &p in s.0.iter() {
+            f(p as *mut PyObject);
+        }
+    }
 }
 
 /// Allocate `size` zeroed bytes for an object of type `tp` and initialise its header.
@@ -65,14 +119,17 @@ pub unsafe fn alloc_object(tp: *mut PyTypeObject, size: usize) -> *mut PyObject 
         if (*tp).tp_flags & crate::ffi::Py_TPFLAGS_READY == 0 {
             ready_lazily(tp);
         }
-        let (pre, bits) = preheader_for(tp);
-        let (raw, large) = raw_obj_alloc(size + pre);
+        let (pre, bits, kind) = preheader_for(tp);
+        let (raw, large) = raw_obj_alloc(size + pre, kind);
         if raw.is_null() {
             return std::ptr::null_mut();
         }
         let op = raw.add(pre) as *mut PyObject;
         init_header(op, tp);
         (*op).ob_gc_bits.store(bits | large, Relaxed);
+        if large != 0 && bits != 0 {
+            large_register(op);
+        }
         if crate::modules::_tracemalloc::TRACING.load(Relaxed) {
             crate::modules::_tracemalloc::track(op as *const u8, size + pre);
         }
@@ -84,13 +141,7 @@ pub unsafe fn alloc_object(tp: *mut PyTypeObject, size: usize) -> *mut PyObject 
 pub unsafe fn preheader_size(op: *mut PyObject) -> usize {
     unsafe {
         let b = (*op).ob_gc_bits.load(Relaxed);
-        if b & GC_BIT_PREHEADER == 0 {
-            0
-        } else if b & GC_BIT_MANAGED != 0 {
-            GC_HEAD + MANAGED
-        } else {
-            GC_HEAD
-        }
+        if b & GC_BIT_MANAGED != 0 { MANAGED } else { 0 }
     }
 }
 
@@ -102,16 +153,24 @@ pub unsafe fn has_managed(op: *mut PyObject) -> bool {
 /// Address of the managed __dict__ slot (only valid if has_managed).
 #[inline]
 pub unsafe fn managed_dict_slot(op: *mut PyObject) -> *mut *mut PyObject {
-    unsafe { (op as *mut u8).sub(GC_HEAD + MANAGED) as *mut *mut PyObject }
+    unsafe { (op as *mut u8).sub(MANAGED) as *mut *mut PyObject }
 }
 #[inline]
 pub unsafe fn managed_weakref_slot(op: *mut PyObject) -> *mut *mut PyObject {
-    unsafe { (op as *mut u8).sub(GC_HEAD + 8) as *mut *mut PyObject }
+    unsafe { (op as *mut u8).sub(8) as *mut *mut PyObject }
 }
 
+/// Bytes from the object start to the end of its small-object block (the size class
+/// may be larger than requested; that slack is zeroed and usable). For objects from
+/// the system allocator: 0 (callers then rely on the requested size).
 #[inline]
-pub unsafe fn gc_head(op: *mut PyObject) -> *mut GcHead {
-    unsafe { (op as *mut u8).sub(GC_HEAD) as *mut GcHead }
+pub unsafe fn usable_size(op: *mut PyObject) -> usize {
+    unsafe {
+        if (*op).ob_gc_bits.load(Relaxed) & GC_BIT_LARGE != 0 {
+            return 0;
+        }
+        crate::tlab::small_size_of(alloc_start(op)) - preheader_size(op)
+    }
 }
 
 /// Raw memory start of an object allocation.
@@ -132,8 +191,13 @@ pub unsafe fn free_object(op: *mut PyObject) {
         }
         let start = alloc_start(op);
         if bits & GC_BIT_LARGE != 0 {
+            if bits & GC_BIT_PREHEADER != 0 {
+                large_unregister(op);
+            }
             libc::free(start as *mut libc::c_void);
         } else {
+            // a free block on a GC page must not look tracked to heap walks
+            (*op).ob_gc_bits.store(0, Relaxed);
             crate::tlab::free_small(start);
         }
     }
@@ -156,25 +220,35 @@ unsafe fn realloc_object_impl(op: *mut PyObject, new_size: usize) -> *mut PyObje
         let bits = (*op).ob_gc_bits.load(Relaxed);
         let start = alloc_start(op);
         let total = new_size + pre;
+        let gc = bits & GC_BIT_PREHEADER != 0;
         if bits & GC_BIT_LARGE != 0 {
             let raw = libc::realloc(start as *mut libc::c_void, total) as *mut u8;
             if raw.is_null() {
                 return std::ptr::null_mut();
             }
-            return raw.add(pre) as *mut PyObject;
+            let nop = raw.add(pre) as *mut PyObject;
+            if gc && nop != op {
+                large_unregister(op);
+                large_register(nop);
+            }
+            return nop;
         }
         let old = crate::tlab::small_size_of(start);
         if total <= old {
             return op;
         }
-        let (raw, large) = raw_obj_alloc(total);
+        let (raw, large) = raw_obj_alloc(total, kind_of_bits(bits));
         if raw.is_null() {
             return std::ptr::null_mut();
         }
         std::ptr::copy_nonoverlapping(start, raw, old);
+        (*op).ob_gc_bits.store(0, Relaxed);
         crate::tlab::free_small(start);
         let nop = raw.add(pre) as *mut PyObject;
         (*nop).ob_gc_bits.store((bits & !GC_BIT_LARGE) | large, Relaxed);
+        if gc && large != 0 {
+            large_register(nop);
+        }
         nop
     }
 }
@@ -196,7 +270,7 @@ pub unsafe extern "C" fn free_object_c(op: *mut PyObject) {
         let tp = (*op).type_ptr();
         free_object(op);
         if (*tp).tp_flags & Py_TPFLAGS_HEAPTYPE != 0 {
-            crate::object::decref(tp as *mut PyObject);
+            crate::object::decref_type(tp);
         }
     }
 }
@@ -213,6 +287,63 @@ unsafe fn ready_lazily(tp: *mut PyTypeObject) {
         }
         if crate::types::typeobject::type_ready(tp).is_err() {
             crate::errors::clear_exc();
+        }
+    }
+}
+
+// ---------------------------------------------------------------- variable buffers
+//
+// Item arrays and hash tables of containers (perf2): small ones come from the tlab
+// allocator (kind 0, zeroed), larger ones from the system allocator. The free and
+// realloc functions accept either (`tlab::owns`), so storage allocated elsewhere with
+// malloc (e.g. by the C API) can be released here too.
+
+/// Zeroed buffer of `n` bytes.
+#[inline]
+pub unsafe fn buf_calloc(n: usize) -> *mut u8 {
+    if n <= crate::tlab::MAX_SMALL {
+        let p = crate::tlab::alloc_small(n.max(1));
+        if !p.is_null() {
+            return p;
+        }
+    }
+    unsafe { libc::calloc(1, n.max(1)) as *mut u8 }
+}
+
+/// Resize a buffer from `buf_calloc`/malloc to `n` bytes (contents kept up to the
+/// smaller size; growth is not zeroed beyond the old block for system memory).
+#[inline]
+pub unsafe fn buf_realloc(p: *mut u8, n: usize) -> *mut u8 {
+    unsafe {
+        if p.is_null() {
+            return buf_calloc(n);
+        }
+        if crate::tlab::owns(p) {
+            let old = crate::tlab::small_size_of(p);
+            if n <= old {
+                return p;
+            }
+            let q = buf_calloc(n);
+            if !q.is_null() {
+                std::ptr::copy_nonoverlapping(p, q, old);
+                crate::tlab::free_small(p);
+            }
+            return q;
+        }
+        libc::realloc(p as *mut libc::c_void, n.max(1)) as *mut u8
+    }
+}
+
+#[inline]
+pub unsafe fn buf_free(p: *mut u8) {
+    unsafe {
+        if p.is_null() {
+            return;
+        }
+        if crate::tlab::owns(p) {
+            crate::tlab::free_small(p);
+        } else {
+            libc::free(p as *mut libc::c_void);
         }
     }
 }

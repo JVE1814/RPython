@@ -101,7 +101,14 @@ fn step(op: Op, arg: u32, s: &Stack) -> (Option<Stack>, Option<(usize, Stack)>) 
             f.push(Object)
         }
         Op::ReturnGenerator => {}
-        Op::LoadMethod | Op::LoadSpecial => {
+        Op::LoadSpecial => {
+            // the self slot of a special method is never NULL for jump purposes (CPython
+            // lets f_lineno jumps leave a `with` block)
+            pop(&mut f, 1);
+            f.push(Object);
+            f.push(Object);
+        }
+        Op::LoadMethod => {
             pop(&mut f, 1);
             f.push(Object);
             f.push(Null);

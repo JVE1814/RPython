@@ -146,8 +146,10 @@ pub fn gen_send_ex(o: &PyObject, arg: Option<&PyObject>, throw: Option<PyRef>, c
                 raise!(TypeError, "can't send non-None value to a just-started {}", kind_name(o));
             }
         }
-    } else if throw.is_none() {
-        let v = arg.map(|a| a.to_ref()).unwrap_or_else(none::none_ref);
+    } else {
+        // the suspended YIELD_VALUE produces its result first (the sent value, or None
+        // when an exception is thrown in): handlers covering the yield count that slot
+        let v = if throw.is_none() { arg.map(|a| a.to_ref()).unwrap_or_else(none::none_ref) } else { none::none_ref() };
         frame.slots[frame.stack_top] = v.into_raw();
         frame.stack_top += 1;
     }

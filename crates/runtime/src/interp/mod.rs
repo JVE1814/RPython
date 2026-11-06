@@ -6,6 +6,7 @@ pub mod frame;
 pub mod jump;
 pub mod jit;
 pub mod specialize;
+pub mod adaptive;
 pub mod translate;
 pub mod wc;
 

@@ -1887,17 +1887,16 @@ impl<'a> B<'a> {
         w
     }
 
-    /// Current shape of values word `w`.
+    /// Current shape of values word `w` (perf2 layout: the word is `shape | 1`).
     fn shape_of(&mut self, w: V) -> V {
-        let (sh_off, _vals, _id, _len, _keys) = crate::shape::jit_layout();
         let sh = self.v(Class::G);
-        self.emit(Inst::Load(sh, Base::V(w), sh_off - 1));
+        self.emit(Inst::Lea(sh, Base::V(w), -1));
         sh
     }
 
     /// Leave for `f` unless the shape of values word `w` has `name` at index h.
     fn check_shape_key(&mut self, w: V, h: u64, name: usize, f: Fail) {
-        let (_sh, _vals, _id, len_off, keys_off) = crate::shape::jit_layout();
+        let (_id, len_off, keys_off, _voff) = crate::shape::jit_layout();
         let sh = self.shape_of(w);
         self.check(Cond::Test(sh, Opnd::V(sh), Cc::E), f);
         self.check(Cond::CmpMem32(Base::V(sh), len_off, h as i64, Cc::BE), f);
@@ -1906,9 +1905,14 @@ impl<'a> B<'a> {
         self.check(Cond::CmpMem(Base::V(keys), 8 * h as i32, name as i64, Cc::NE), f);
     }
 
-    fn vals_off(h: u64) -> i32 {
-        let (_sh, vals_off, _id, _len, _keys) = crate::shape::jit_layout();
-        vals_off - 1 + 8 * h as i32
+    /// Address of value slot 0 of `p`, whose values word is `w`: `p + shape.voff`.
+    fn values_base(&mut self, p: V, w: V) -> V {
+        let (_id, _len, _keys, voff_off) = crate::shape::jit_layout();
+        let vo = self.v(Class::G);
+        self.emit(Inst::Load32(vo, Base::V(w), voff_off - 1));
+        let vb = self.v(Class::G);
+        self.emit(Inst::Alu(Alu::Add, vb, p, Opnd::V(vo)));
+        vb
     }
 
     fn load_attr(&mut self, i: usize) {
@@ -2004,8 +2008,9 @@ impl<'a> B<'a> {
                 kind::INSTANCE_DICT => {
                     let w = self.values_word(p, f);
                     self.check_shape_key(w, s.b, name, f);
+                    let vb = self.values_base(p, w);
                     let x = self.v(Class::G);
-                    self.emit(Inst::Load(x, Base::V(w), Self::vals_off(s.b)));
+                    self.emit(Inst::Load(x, Base::V(vb), 8 * s.b as i32));
                     self.check(Cond::Test(x, Opnd::V(x), Cc::E), f);
                     x
                 }
@@ -2200,7 +2205,7 @@ impl<'a> B<'a> {
                     let mta = self.imm(mt_addr);
                     self.check(Cond::CmpMem(Base::V(mta), 0, 0, Cc::NE), f);
                     let w = self.values_word(p, f);
-                    let off = Self::vals_off(s.b);
+                    let off = 8 * s.b as i32;
                     let trans = if s.c != 0 && live_type(s.c, s.a) { crate::shape::transitions_adding(s.c as *mut PyTypeObject, name as *mut PyObject, s.b as usize) } else { Vec::new() };
                     if trans.len() == 1 {
                         // replace (shape = child) or add (shape = parent, room left)
@@ -2212,21 +2217,25 @@ impl<'a> B<'a> {
                         self.term(Term::Branch(Cond::Cmp(sh, Opnd::I(child as i64), Cc::E), replace, notc));
                         self.switch_to(notc);
                         self.check(Cond::Cmp(sh, Opnd::I(parent as i64), Cc::NE), f);
-                        self.check(Cond::CmpMem32(Base::V(w), crate::shape::values_cap_offset() - 1, s.b as i64, Cc::BE), f);
+                        // room left: the capacity byte (shape.rs) must exceed the index
+                        let cap = self.v(Class::G);
+                        self.emit(Inst::Load8(cap, Base::V(p), crate::shape::capacity_offset()));
+                        self.check(Cond::Cmp(cap, Opnd::I(s.b as i64), Cc::BE), f);
                         self.term(Term::Jump(add));
                         self.switch_to(add);
-                        self.emit(Inst::Store(Base::V(w), off, val));
-                        let (sh_off, _vals, _id, _len, _keys) = crate::shape::jit_layout();
-                        let cv = self.imm(child as i64);
-                        self.emit(Inst::Store(Base::V(w), sh_off - 1, cv));
+                        let vb = self.values_base(p, w);
+                        self.emit(Inst::Store(Base::V(vb), off, val));
+                        let cv = self.imm(child as i64 | 1);
+                        self.emit(Inst::Store(Base::V(p), MANAGED_DICT, cv));
                         self.term(Term::Jump(cont));
                         self.switch_to(replace);
                     } else {
                         self.check_shape_key(w, s.b, name, f);
                     }
+                    let vb = self.values_base(p, w);
                     let old = self.v(Class::G);
-                    self.emit(Inst::Load(old, Base::V(w), off));
-                    self.emit(Inst::Store(Base::V(w), off, val));
+                    self.emit(Inst::Load(old, Base::V(vb), off));
+                    self.emit(Inst::Store(Base::V(vb), off, val));
                     self.emit(Inst::XDecref(old));
                 }
                 _ => {

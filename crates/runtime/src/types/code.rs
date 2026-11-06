@@ -103,6 +103,11 @@ pub struct CodeData {
     pub gen_start: u32,
     /// Translation failed: executing the code raises SystemError(msg).
     pub invalid: Option<String>,
+    /// Public objects: line of each internal word's public instruction (-1 = none);
+    /// empty for legacy objects.
+    pub pub_lines: Vec<i32>,
+    /// Public objects: observed CPython specialisation per internal word (interp::adaptive).
+    pub spec: Box<[std::sync::atomic::AtomicU8]>,
 }
 
 impl CodeData {
@@ -284,6 +289,8 @@ fn build_exec(c: &PyCodeObject, m: &CodeMeta) -> CodeData {
         eager_prologue: false,
         gen_start: 0,
         invalid: None,
+        pub_lines: Vec::new(),
+        spec: Box::new([]),
     };
     match crate::interp::translate::translate(&inp) {
         Ok(out) => {
@@ -295,6 +302,8 @@ fn build_exec(c: &PyCodeObject, m: &CodeMeta) -> CodeData {
             d.internal_of_pub = out.internal_of_pub;
             d.eager_prologue = out.eager_prologue;
             d.gen_start = out.gen_start;
+            d.pub_lines = d.pub_of_internal.iter().map(|&u| positions.get(u as usize).and_then(|p| p.lineno).map_or(-1, |l| l as i32)).collect();
+            d.spec = (0..d.code.len()).map(|_| std::sync::atomic::AtomicU8::new(0)).collect();
             d
         }
         Err(msg) => {
@@ -309,10 +318,11 @@ fn build_exec(c: &PyCodeObject, m: &CodeMeta) -> CodeData {
     }
 }
 
-/// `RPYTHON_WORDCODE=1`: the compiler emits public wordcode (D24 switch-over flag).
+/// The compiler emits public CPython 3.15 wordcode (D24; the default since the switch-over).
+/// `RPYTHON_WORDCODE=0` selects the legacy pipeline (comparison only, until it is deleted).
 pub fn public_mode() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var_os("RPYTHON_WORDCODE").is_some_and(|v| v != "0" && !v.is_empty()))
+    *V.get_or_init(|| std::env::var_os("RPYTHON_WORDCODE").is_none_or(|v| v != "0"))
 }
 
 /// Convert a compiler constant into an object.
@@ -390,7 +400,7 @@ pub fn wconst_to_obj(c: &rpy_compiler::wordcode::Constant, filename: &PyRef) -> 
         C::Float(f) => crate::types::float::new_float(*f),
         C::Complex { real, imag } => crate::types::complex::new_complex(*real, *imag),
         C::Str(cps) => pystr::intern(pystr::from_codepoints(cps)),
-        C::Bytes(b) => bytes::new_bytes(b),
+        C::Bytes(b) => bytes::bytes_singleton(b).unwrap_or_else(|| bytes::new_bytes(b)),
         C::Tuple(items) => {
             let mut v = Vec::with_capacity(items.len());
             for it in items {
@@ -578,6 +588,8 @@ pub fn new_code_from_parts(p: CodeParts) -> PyResult {
         eager_prologue: false,
         gen_start: 0,
         invalid: None,
+        pub_lines: Vec::new(),
+        spec: Box::new([]),
     });
     unsafe {
         let r = alloc_code(
@@ -711,6 +723,27 @@ pub fn line_for_instr(co: &PyObject, i: usize) -> Option<u32> {
     }
 }
 
+pub fn code_name(o: &PyObject) -> PyRef {
+    code_meta(o).co_name.clone()
+}
+pub fn code_qualname(o: &PyObject) -> PyRef {
+    code_meta(o).co_qualname.clone()
+}
+pub fn code_docstring(o: &PyObject) -> Option<PyRef> {
+    code(o).docstring()
+}
+
+/// Line of internal pc `i` as frames report it (f_lineno, tracebacks): for public code
+/// exactly the line co_lines() gives the instruction (None for artificial ones); legacy
+/// code walks back over artificial instructions.
+pub fn frame_line(co: &PyObject, i: usize) -> Option<u32> {
+    let d = code_data(co);
+    if !d.pub_lines.is_empty() {
+        return d.pub_lines.get(i.min(d.pub_lines.len() - 1)).and_then(|&l| if l < 0 { None } else { Some(l as u32) });
+    }
+    line_for_instr(co, i)
+}
+
 /// f_lasti / tb_lasti value (bytes) for internal pc `i`.
 pub fn lasti_bytes(co: &PyObject, i: usize) -> i64 {
     code_data(co).pub_offset(i) as i64 * 2
@@ -757,6 +790,7 @@ unsafe extern "C" fn code_dealloc(op: *mut PyObject) {
     unsafe {
         let c = &mut *(op as *mut PyCodeObject);
         crate::types::weakref::clear_weakrefs_at(op, &mut c.co_weakreflist);
+        crate::capi::funcs::free_code_extras(op);
         for p in [
             c.co_consts,
             c.co_names,
@@ -946,7 +980,7 @@ fn co_code(o: &PyObject) -> PyResult {
     Ok(code_meta(o).co_code.clone())
 }
 fn co_code_adaptive(o: &PyObject) -> PyResult {
-    Ok(code_meta(o).co_code.clone())
+    Ok(bytes::new_bytes(&crate::interp::adaptive::adaptive_code(o)))
 }
 
 /// (start, end, line) byte ranges, consecutive entries with the same line merged.

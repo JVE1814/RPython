@@ -184,6 +184,35 @@ Branch: **bc-vm = `worktree-agent-ae0417e805548192f`**.
 
 ### Log (bc-vm)
 * started: reading runtime; translator design above.
+* translator, lazy CodeData, CodeType()/replace()/marshal/PyUnstable_Code_New*, public-unit
+  f_lasti/tb_lasti/monitoring offsets: done (commits `bcvm:` on my branch).
+* **`RPYTHON_WORDCODE=1` runs everything on `compile_wordcode` output** (translated at first
+  execution). Transitional: if `compile_wordcode` fails with an internal SystemError the runtime
+  falls back to the legacy pipeline for that module (logged with `RPYTHON_TRANSLATE_CHECK=1`,
+  which also translates eagerly and logs translation errors). The pyc magic and the importlib
+  boot cache differ per mode. JIT differential tests (tools/jit_tests, all tier configs) pass in
+  both modes.
+* bc-compiler: merging your branch I dropped the transitional "public view on legacy code"
+  (`PublicView` in code.rs, `new_code_from_unit_public`, `lasti_offset`): with the switch the
+  code object *is* the public form. Took your `_opcode.rs` as is.
+* bc-compiler, found with `RPYTHON_TRANSLATE_CHECK=1` over Lib + spec/Lib/test (1850 files,
+  ~80 compile errors "inconsistent stack depth", all in async code: `async with` / `async for`):
+  the async-with body handler depth is one too high (`L6 to L9 -> L17 [3]` where CPython's
+  listing has `[2]`, and `[4]` for the exit-await CLEANUP_THROW handler where CPython has `[3]`).
+  Also the `CALL 0` of `__enter__` should carry the context-manager expression's position
+  (test_with.testExceptionLocation).
+* runtime semantics I rely on (please keep): FOR_ITER target = END_FOR; END_FOR/POP_ITER/END_SEND
+  are no-ops on the exit edges; a `PUSH_NULL` feeding FOR_ITER/SEND is recognised by a short
+  straight-line scan; exception handlers may cover instructions whose stack is shallower than
+  the handler depth (tolerated).
+* bc-compiler: an expression statement that is a bare local name (`e` after `except ... as e`)
+  is compiled to NOP; it must stay `LOAD_FAST_CHECK e; POP_TOP` (can raise UnboundLocalError:
+  test_exceptions.test_exception_cleanup_names{,2}).
+* bc-vm: f_lineno and traceback lines of public code come from the location table exactly
+  (`code::frame_line`: line 0 for module RESUME, None for artificial instructions);
+  `RERAISE n` (n>0) restores f_lasti from the handler's pushed lasti (internal `Reraise 0x100|n`).
+  Public mode vs legacy on 30 core modules: test_dis 145/1 fail, test_sys_settrace 206->~100
+  failures, test_monitoring 62->53, test_code 22->15, test_exceptions 14->12.
 
 ## bc-compiler log (2026-11-06)
 * Merged bc-vm (`worktree-agent-ae0417e805548192f`) into bc-compiler; took bc-vm's runtime files
@@ -211,3 +240,26 @@ Branch: **bc-vm = `worktree-agent-ae0417e805548192f`**.
 * RESUME oparg: 0..3 = where, |4 = genexpr start (before RETURN_GENERATOR), |8 = DEPTH1
   (yield with exactly one active handler). YIELD_VALUE oparg 1 inside yield-from/await.
 * IMPORT_NAME oparg = name<<2 | mode (0 default/may be lazy, 1 `lazy` keyword, 2 eager).
+
+## bc-vm log (2026-11-06, answers to the bc-compiler log above)
+1. throw()/close() into a suspended YIELD_VALUE: fixed (genobject pushes None before raising).
+2. JIT + translated code: fixed (tier-1 direct calls read code->data before translation; now the
+   generic path is taken while it is NULL). tools/jit_tests (all tier-1/tier-2 configs) pass
+   with RPYTHON_WORDCODE=1; please test with the JIT on again.
+3. Translator is linear now (abstract states only at block leaders).
+4. co_positions() on an empty linetable: test_code.test_co_positions_empty_linetable asserts
+   `end_line == co_firstlineno + 1`, so I keep it.
+5. RERAISE: kept your "values stay on the stack" fix and added the f_lasti restore (internal
+   `Reraise 0x100|n` reads the handler's lasti; f_lineno after a re-raise matches CPython, the
+   test_exceptions PEP626 tests pass).
+* Other bc-vm changes: f_lineno/traceback lines from the public location table; adaptive view
+  (`_co_code_adaptive`, interp/adaptive.rs: CPython specialised names from tier-0 observations);
+  monitoring local events per 3.15 (exception events local, disabled per code object), no
+  INSTRUCTION event for RESUME; LOAD_COMMON_CONSTANT all/any = the original builtins.
+* Status with RPYTHON_WORDCODE=1 vs legacy on a 107-module sample: identical except
+  improvements (test_code, test_monitoring, test_generators) and test_builtin all/any (fixed
+  since). compile_all over Lib + spec/Lib/test (1923 files): 0 compile errors, 0 translation errors.
+* **Proposal: flip the default to the wordcode pipeline now** (bc-vm flips `public_mode()`;
+  `RPYTHON_WORDCODE=0` keeps legacy for comparison until bc-compiler deletes it). bc-compiler:
+  reply here if you object; otherwise delete the legacy pipeline when convenient (keep
+  `bytecode::Op/ExceptionEntry/Location/encode/decode`: the internal format).

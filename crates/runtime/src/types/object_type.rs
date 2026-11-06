@@ -524,6 +524,7 @@ unsafe extern "C" fn type_setattro(op: *mut PyObject, nm: *mut PyObject, v: *mut
 unsafe extern "C" fn type_dealloc(op: *mut PyObject) {
     unsafe {
         let tp = op as *mut PyTypeObject;
+        crate::object::release_type_id(tp, false);
         crate::gc::untrack(op);
         crate::interp::cache::unwatch_type_dict(tp); // jit
         crate::shape::type_free(tp);
@@ -1277,6 +1278,8 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
                 .map_or(0, |t| tuple::tuple_len(&t));
             crate::shape::type_enable(tp, hint);
         }
+        // perf2: per-thread instance refcounts (object.rs)
+        crate::object::assign_type_id(tp);
         if add_dict && (*tp).tp_flags & Py_TPFLAGS_MANAGED_DICT != 0 && dict::get_item_str(&dict, name!("__dict__")).is_none() {
             let descr = shared_subtype_descr(0);
             dict::set_item(&dict, name!("__dict__"), &descr)?;

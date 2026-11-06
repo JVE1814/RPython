@@ -599,32 +599,86 @@ pub unsafe extern "C" fn PyUnstable_Code_NewWithPosOnlyArgs(
 ) -> *mut PyObject {
     unsafe { code_new_c(a, p, k, s, f, code, consts, names, varnames, freevars, cellvars, filename, name, qualname, fl, lt, et) }
 }
+// co_extra (PEP 523 scratch space): the code object's `co_extra` slot (`_reserved[6]` in our
+// PyCodeObject, where CPython keeps it) points to a boxed vector of per-index values; the
+// free functions registered with PyUnstable_Eval_RequestCodeExtraIndex run when a value is
+// replaced and when the code object is deallocated.
 static CODE_EXTRA: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
-static CODE_EXTRA_DATA: std::sync::Mutex<Vec<(usize, isize, usize)>> = std::sync::Mutex::new(Vec::new());
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_Eval_RequestCodeExtraIndex(free: *mut c_void) -> Py_ssize_t {
     let mut g = CODE_EXTRA.lock().unwrap();
+    if g.len() >= 255 {
+        return -1;
+    }
     g.push(free as usize);
     (g.len() - 1) as Py_ssize_t
+}
+fn extra_free_fn(index: usize) -> Option<unsafe extern "C" fn(*mut c_void)> {
+    let f = *CODE_EXTRA.lock().unwrap().get(index)?;
+    if f == 0 { None } else { Some(unsafe { std::mem::transmute::<usize, unsafe extern "C" fn(*mut c_void)>(f) }) }
+}
+unsafe fn extra_slot(co: *mut PyObject) -> *mut usize {
+    unsafe { &mut (*(co as *mut code::PyCodeObject))._reserved[6] as *mut usize }
+}
+/// Called by the code object's deallocator.
+pub(crate) unsafe fn free_code_extras(co: *mut PyObject) {
+    unsafe {
+        let slot = extra_slot(co);
+        if *slot == 0 {
+            return;
+        }
+        let v = Box::from_raw(*slot as *mut Vec<usize>);
+        *slot = 0;
+        for (i, &x) in v.iter().enumerate() {
+            if x != 0 {
+                if let Some(f) = extra_free_fn(i) {
+                    f(x as *mut c_void);
+                }
+            }
+        }
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_Code_GetExtra(co: *mut PyObject, index: Py_ssize_t, extra: *mut *mut c_void) -> c_int {
     unsafe {
-        let g = CODE_EXTRA_DATA.lock().unwrap();
-        *extra = g.iter().find(|(c, i, _)| *c == co as usize && *i == index).map_or(std::ptr::null_mut(), |x| x.2 as *mut c_void);
+        if co.is_null() || !code::is_code(&*co) {
+            let _ = bad_internal();
+            return -1;
+        }
+        *extra = std::ptr::null_mut();
+        let slot = extra_slot(co);
+        if index >= 0 && *slot != 0 {
+            if let Some(&x) = (&*(*slot as *const Vec<usize>)).get(index as usize) {
+                *extra = x as *mut c_void;
+            }
+        }
         0
     }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_Code_SetExtra(co: *mut PyObject, index: Py_ssize_t, extra: *mut c_void) -> c_int {
-    if index < 0 || index as usize >= CODE_EXTRA.lock().unwrap().len() {
-        let _ = bad_internal();
-        return -1;
+    unsafe {
+        if co.is_null() || !code::is_code(&*co) || index < 0 || index as usize >= CODE_EXTRA.lock().unwrap().len() {
+            let _ = bad_internal();
+            return -1;
+        }
+        let slot = extra_slot(co);
+        if *slot == 0 {
+            *slot = Box::into_raw(Box::new(Vec::<usize>::new())) as usize;
+        }
+        let v = &mut *(*slot as *mut Vec<usize>);
+        let i = index as usize;
+        if v.len() <= i {
+            v.resize(i + 1, 0);
+        }
+        let old = std::mem::replace(&mut v[i], extra as usize);
+        if old != 0 {
+            if let Some(f) = extra_free_fn(i) {
+                f(old as *mut c_void);
+            }
+        }
+        0
     }
-    let mut g = CODE_EXTRA_DATA.lock().unwrap();
-    g.retain(|(c, i, _)| !(*c == co as usize && *i == index));
-    g.push((co as usize, index, extra as usize));
-    0
 }
 
 // ---------------------------------------------------------------- frames

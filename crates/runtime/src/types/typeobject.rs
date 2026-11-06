@@ -450,7 +450,7 @@ pub unsafe fn generic_free_and_type_decref(op: *mut PyObject, tp: *mut PyTypeObj
             None => alloc::free_object(op),
         }
         if is_heap_type(tp) {
-            decref(tp as *mut PyObject);
+            crate::object::decref_type(tp);
         }
     }
 }

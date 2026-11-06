@@ -31,6 +31,9 @@ use rpy_compiler::bytecode::{self as bc, CodeUnit, ExceptionEntry, Location};
 use std::collections::HashMap;
 
 pub const VERSION: i32 = 6;
+/// Layout generation of serialized code objects (part of the pyc magic): 4 = D24 public
+/// wordcode objects (bc-vm).
+pub const CODE_FORMAT: u32 = 4;
 const MAX_DEPTH: usize = 2000;
 const SIZE32_MAX: i64 = 0x7fff_ffff;
 
@@ -170,8 +173,12 @@ impl Writer {
                 self.long(idx as i32);
                 return Ok(None);
             }
-            // An immutable container referring to itself: the reader could not resolve
-            // the reference, so write it again (this recurses until the depth limit).
+            // An object under construction referring to itself. Code objects, slices and
+            // frozendicts can only be built once their parts exist: refuse the loop.
+            if code_mod::is_code(v) || v.is_type(crate::types::slice::slice_type()) || crate::types::frozendict::is_frozendict(v) {
+                raise!(ValueError, "cannot marshal a recursive {} object", tname(v));
+            }
+            // Other immutable containers: write it again (recurses until the depth limit).
             return Ok(Some((0, None)));
         }
         let n = self.refs.len();
@@ -701,7 +708,7 @@ impl<'a> Reader<'a> {
                     return Err(bad("bytes object size out of range"));
                 }
                 let b = self.read(n as usize)?;
-                self.set_ref(flag, bytes::new_bytes(&b))
+                self.set_ref(flag, bytes::bytes_singleton(&b).unwrap_or_else(|| bytes::new_bytes(&b)))
             }
             TYPE_ASCII | TYPE_ASCII_INTERNED | TYPE_SHORT_ASCII | TYPE_SHORT_ASCII_INTERNED => {
                 let n = if ty == TYPE_ASCII || ty == TYPE_ASCII_INTERNED {
@@ -1161,6 +1168,11 @@ pub fn loads_slice(data: &[u8], allow_code: bool) -> PyResult {
 }
 
 /// Load from bytes; also returns the number of bytes consumed.
+/// Load one object from a bytes object.
+pub fn loads_bytes(data: &PyObject, allow_code: bool) -> PyResult {
+    loads_slice(bytes::bytes_data(data), allow_code)
+}
+
 pub fn loads_prefix(data: &[u8], allow_code: bool) -> PyResult<(PyRef, usize)> {
     let mut r = Reader { src: Source::Mem { data, pos: 0 }, refs: Vec::new(), depth: 0, allow_code };
     let v = match r.object()? {

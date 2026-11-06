@@ -52,6 +52,29 @@ pub fn new_bytes(b: &[u8]) -> PyRef {
     unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), bytes_ptr(&r), b.len()) };
     r
 }
+/// Shared bytes objects for b"" and the 256 one-byte values (CPython keeps such
+/// singletons; code constants and marshal return them). Created on first use, never freed.
+pub fn bytes_singleton(b: &[u8]) -> Option<PyRef> {
+    use std::sync::atomic::{AtomicPtr, Ordering};
+    static TABLE: [AtomicPtr<PyObject>; 257] = [const { AtomicPtr::new(std::ptr::null_mut()) }; 257];
+    let slot = match b {
+        [] => 256,
+        [x] => *x as usize,
+        _ => return None,
+    };
+    let p = TABLE[slot].load(Ordering::Acquire);
+    if !p.is_null() {
+        return Some(unsafe { PyRef::from_borrowed(p) });
+    }
+    let fresh = new_bytes(b).into_raw();
+    match TABLE[slot].compare_exchange(std::ptr::null_mut(), fresh, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => Some(unsafe { PyRef::from_borrowed(fresh) }),
+        Err(cur) => {
+            unsafe { crate::object::decref(fresh) };
+            Some(unsafe { PyRef::from_borrowed(cur) })
+        }
+    }
+}
 pub fn try_new_bytes(b: &[u8]) -> PyResult<PyRef> {
     let r = try_alloc_bytes(b.len())?;
     unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), bytes_ptr(&r), b.len()) };
