@@ -106,11 +106,12 @@ pub fn flush_thread_counts() {
 
 fn trigger_threshold() -> usize {
     // young collection after THRESHOLD net new tracked objects; 0 disables
-    // automatic collection (gc.set_threshold(0))
-    let _ = LAST_LIVE.load(Relaxed);
+    // automatic collection (gc.set_threshold(0)). A collection walks every GC page
+    // (perf2: no young list), so the interval also grows with the live set (a quarter
+    // of it), which keeps the walking cost per allocation constant.
     match THRESHOLD.load(Relaxed) {
         0 => usize::MAX,
-        t => t,
+        t => t.max(LAST_LIVE.load(Relaxed) / 4),
     }
 }
 
