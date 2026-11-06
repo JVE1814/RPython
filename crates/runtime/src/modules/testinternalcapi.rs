@@ -160,9 +160,6 @@ class SelfInterruptingContextManager:
 
 def get_interp_settings(interp=None):
     return 0
-
-def code_returns_only_none(code):
-    return False
 "#;
 
 pub fn init() -> PyResult {
@@ -188,6 +185,10 @@ pub fn init() -> PyResult {
             ("is_specialization_enabled", NOARGS, is_specialization_enabled),
             ("get_rare_event_counters", NOARGS, get_rare_event_counters),
             ("reset_rare_event_counters", NOARGS, reset_rare_event_counters),
+            ("get_co_localskinds", O, crate::types::code_introspect::get_co_localskinds),
+            ("get_code_var_counts", FASTKW, crate::types::code_introspect::get_code_var_counts),
+            ("verify_stateless_code", FASTKW, crate::types::code_introspect::verify_stateless_code),
+            ("code_returns_only_none", O, crate::types::code_introspect::code_returns_only_none),
         ],
         Some(&m),
     )?;
