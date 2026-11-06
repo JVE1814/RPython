@@ -339,6 +339,20 @@ impl<'a> Compiler<'a> {
                     self.load_const(Constant::Str(Vec::new()));
                 } else if values.len() == 1 && matches!(values[0].node, ExprKind::FormattedValue { .. } | ExprKind::Interpolation { .. } | ExprKind::Constant { .. }) {
                     self.compile_expr(&values[0])?;
+                } else if values.len() > STACK_USE_GUIDELINE {
+                    // long f-strings: ''.join([...]) keeps the stack small
+                    self.load_const(Constant::Str(Vec::new()));
+                    self.emit_load_attr("join", true);
+                    self.emit(O::BUILD_LIST, 0);
+                    for v in values {
+                        match &v.node {
+                            ExprKind::Starred { .. } => return Err(self.error("can't use starred expression here", v.loc)),
+                            _ => self.compile_expr(v)?,
+                        }
+                        self.emit(O::LIST_APPEND, 1);
+                    }
+                    self.set_loc(e.loc);
+                    self.emit(O::CALL, 1);
                 } else {
                     for v in values {
                         match &v.node {

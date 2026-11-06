@@ -184,3 +184,30 @@ Branch: **bc-vm = `worktree-agent-ae0417e805548192f`**.
 
 ### Log (bc-vm)
 * started: reading runtime; translator design above.
+
+## bc-compiler log (2026-11-06)
+* Merged bc-vm (`worktree-agent-ae0417e805548192f`) into bc-compiler; took bc-vm's runtime files
+  (code.rs/compile.rs/frameobject.rs/traceback.rs) and dropped my transitional "public view"
+  hack. Testing now uses `RPYTHON_WORDCODE=1` (translator path).
+* Small fixes made in bc-vm files (please keep): `code._varname_from_oparg` (dis needs it);
+  translator `RERAISE n` now emits internal `Reraise 0` (internal `Reraise 1` popped `prev`
+  for `RERAISE 2` of the `with` handler, so the following `COPY 3; POP_EXCEPT` restored an int
+  as the handled exception -> "int has no __traceback__" crashes in regrtest's unraisable hook).
+* Issues for bc-vm found with RPYTHON_WORDCODE=1 (compiler output matches CPython there):
+  1. `gen.throw()/close()` into a generator suspended at the YIELD_VALUE of a yield-from/await
+     loop: CPython pushes the sent value (None) before unwinding, so the handler (depth 5 in
+     `[exit, self, iter, NULL, value]`) sees `[iter, NULL, None, exc]` at CLEANUP_THROW. Repro:
+     `def g(cm):\n with cm:\n  yield from sub()` then `next(g); g.close()` -> "'CM' object is
+     not callable" (stack off by one). Breaks 2 test_contextlib tests.
+  2. JIT (tier 2 on by default) + translated code segfaults on `import unittest`
+     (dataclasses `_process_class`); with RPYTHON_JIT=0 fine. All my testing uses RPYTHON_JIT=0.
+  3. Translator memory blows up on very deep stacks (BUILD_STRING 65280 -> OOM); the compiler
+     now builds long f-strings incrementally, but the translator should stay linear.
+  4. `co_positions()` on an empty co_linetable yields `(None, 2, None, None)` (end_lineno should
+     be None too).
+  5. An unraisable exception whose printing fails makes regrtest's hook segfault (secondary to 1).
+* NULL producers besides GET_ITER/PUSH_NULL: none. `GET_ITER 1` (yield from) also pushes
+  `[iter, NULL]`. Genexpr call convention: `<fn>; <iterable>; CALL 0`.
+* RESUME oparg: 0..3 = where, |4 = genexpr start (before RETURN_GENERATOR), |8 = DEPTH1
+  (yield with exactly one active handler). YIELD_VALUE oparg 1 inside yield-from/await.
+* IMPORT_NAME oparg = name<<2 | mode (0 default/may be lazy, 1 `lazy` keyword, 2 eager).
