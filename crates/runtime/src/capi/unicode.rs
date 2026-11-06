@@ -101,6 +101,11 @@ pub unsafe extern "C" fn PyUnicode_FromStringAndSize(u: *const c_char, size: Py_
             let _ = system_error("NULL string with positive size with NULL passed to PyUnicode_FromStringAndSize");
             return std::ptr::null_mut();
         }
+        if size as usize > (isize::MAX as usize) / 4 {
+            // no str of that length can be allocated (and the data cannot be that long)
+            let _ = memory_error();
+            return std::ptr::null_mut();
+        }
         ret(decode_utf8(std::slice::from_raw_parts(u as *const u8, size as usize), None))
     }
 }

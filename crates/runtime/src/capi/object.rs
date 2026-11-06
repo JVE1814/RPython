@@ -220,6 +220,9 @@ pub unsafe extern "C" fn PyObject_GetItemData(o: *mut PyObject) -> *mut c_void {
 pub unsafe extern "C" fn PyObject_GetItemData_DuringGC(o: *mut PyObject) -> *mut c_void {
     unsafe {
         let tp = (*o).type_ptr();
+        if (*tp).tp_flags & Py_TPFLAGS_ITEMS_AT_END == 0 {
+            return std::ptr::null_mut();
+        }
         (o as *mut u8).offset((*tp).tp_basicsize) as *mut c_void
     }
 }
