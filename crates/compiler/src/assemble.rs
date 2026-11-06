@@ -228,6 +228,8 @@ pub(crate) fn stack_effect(op: IOp, arg: u32, jump: bool) -> i32 {
             Op::Unused1 => -1,
             Op::Unused2 => 0,
             Op::Unused3 => -1,
+            Op::LoadSpecial => 1,
+            Op::ReturnGenerator => 0,
         },
     }
 }

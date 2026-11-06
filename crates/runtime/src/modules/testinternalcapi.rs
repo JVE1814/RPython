@@ -82,7 +82,7 @@ fn iframe_getline(_m: &PyObject, o: &PyObject) -> PyResult {
 }
 fn iframe_getlasti(_m: &PyObject, o: &PyObject) -> PyResult {
     let f = frame_arg(o)?;
-    Ok(int::new_int(f.lasti as i64 * 4))
+    Ok(int::new_int(crate::types::code::lasti_bytes(f.code(), f.lasti as usize)))
 }
 
 fn get_co_framesize(_m: &PyObject, o: &PyObject) -> PyResult {

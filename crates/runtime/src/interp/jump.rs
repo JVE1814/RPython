@@ -100,7 +100,8 @@ fn step(op: Op, arg: u32, s: &Stack) -> (Option<Stack>, Option<(usize, Stack)>) 
             pop(&mut f, 1);
             f.push(Object)
         }
-        Op::LoadMethod => {
+        Op::ReturnGenerator => {}
+        Op::LoadMethod | Op::LoadSpecial => {
             pop(&mut f, 1);
             f.push(Object);
             f.push(Null);

@@ -408,19 +408,13 @@ impl Writer {
 
     fn code(&mut self, v: &PyObject) -> PyResult<()> {
         let c = unsafe { &*(v.as_ptr() as *const PyCodeObject) };
-        let d = code_mod::code_data(v);
+        let m = code_mod::code_meta(v);
         self.long(c.co_argcount);
         self.long(c.co_posonlyargcount);
         self.long(c.co_kwonlyargcount);
         self.long(c.co_stacksize);
         self.long(c.co_flags);
-        let mut codeb = Vec::with_capacity(d.code.len() * 4);
-        for w in &d.code {
-            codeb.extend_from_slice(&w.to_le_bytes());
-        }
-        let codeo = bytes::new_bytes(&codeb);
-        self.keep.push(codeo.clone());
-        self.object(&codeo)?;
+        self.object(&m.co_code)?;
         unsafe {
             self.object(&*c.co_consts)?;
             self.object(&*c.co_names)?;
@@ -991,7 +985,93 @@ fn no_debug_ranges() -> bool {
     })
 }
 
+/// Does the serialized code object use the legacy internal layout (32-bit words, 16-byte
+/// location records, 20-byte exception entries)? (D24 transition only.)
+fn looks_legacy(p: &CodeParts) -> bool {
+    if !bytes::is_bytes(p.code) || !bytes::is_bytes(p.linetable) || !bytes::is_bytes(p.exctable) {
+        return true; // let the legacy validator report it
+    }
+    let codeb = bytes::bytes_data(p.code);
+    codeb.len() % 4 == 0
+        && bytes::bytes_data(p.linetable).len() == codeb.len() * 4
+        && bytes::bytes_data(p.exctable).len() % 20 == 0
+        && u32s(codeb).iter().all(|w| ((w & 0xff) as usize) < bc::NUM_OPS)
+}
+
+/// Re-encode a location table without column information (`-X no_debug_ranges`).
+fn strip_linetable_columns(lt: &[u8], firstlineno: u32) -> Vec<u8> {
+    let entries = crate::interp::wc::decode_linetable_entries(lt, firstlineno);
+    let items: Vec<(u32, crate::interp::wc::Position)> = entries
+        .iter()
+        .map(|e| {
+            let mut p = e.pos;
+            p.end_lineno = p.lineno;
+            p.col = None;
+            p.end_col = None;
+            (e.len, p)
+        })
+        .collect();
+    crate::interp::wc::encode_linetable(&items, firstlineno)
+}
+
+fn build_public_code(p: CodeParts) -> PyResult<PyRef> {
+    let invalid = || bad("invalid code object");
+    if !bytes::is_bytes(p.code) || !bytes::is_bytes(p.lpkinds) || !bytes::is_bytes(p.linetable) || !bytes::is_bytes(p.exctable) {
+        return Err(invalid());
+    }
+    if !tuple::is_tuple(p.consts) || !pystr::is_str(p.filename) || !pystr::is_str(p.name) || !pystr::is_str(p.qualname) {
+        return Err(invalid());
+    }
+    str_count(p.names).ok_or_else(invalid)?;
+    let nlp = str_count(p.lpnames).ok_or_else(invalid)?;
+    let kinds = bytes::bytes_data(p.lpkinds).to_vec();
+    if kinds.len() != nlp {
+        return Err(invalid());
+    }
+    let intern_all = |t: &PyObject| -> Vec<PyRef> {
+        tuple::tuple_items(t)
+            .iter()
+            .map(|n| if pystr::is_str_exact(n) { pystr::intern(n.to_ref()) } else { n.to_ref() })
+            .collect()
+    };
+    let linetable = if no_debug_ranges_cached() {
+        bytes::new_bytes(&strip_linetable_columns(bytes::bytes_data(p.linetable), p.firstlineno.max(0) as u32))
+    } else {
+        p.linetable.to_ref()
+    };
+    let consts = if tuple::is_tuple_exact(p.consts) { p.consts.to_ref() } else { ab::sequence_tuple(p.consts)? };
+    code_mod::new_code_from_public(code_mod::PublicParts {
+        argcount: p.argcount,
+        posonlyargcount: p.posonly,
+        kwonlyargcount: p.kwonly,
+        stacksize: p.stacksize,
+        flags: p.flags,
+        firstlineno: p.firstlineno,
+        code: p.code.to_ref(),
+        consts: tuple::tuple_to_vec(&consts),
+        names: intern_all(p.names),
+        localsplusnames: intern_all(p.lpnames),
+        kinds,
+        filename: p.filename.to_ref(),
+        name: p.name.to_ref(),
+        qualname: p.qualname.to_ref(),
+        linetable,
+        exceptiontable: p.exctable.to_ref(),
+    })
+    .map_err(|e| {
+        if exc_matches(crate::types::exceptions::SystemError()) || exc_matches(crate::types::exceptions::ValueError()) {
+            clear_exc();
+            invalid()
+        } else {
+            e
+        }
+    })
+}
+
 fn build_code(p: CodeParts) -> PyResult<PyRef> {
+    if !looks_legacy(&p) {
+        return build_public_code(p);
+    }
     let invalid = || bad("invalid code object");
     if !bytes::is_bytes(p.code) || !bytes::is_bytes(p.lpkinds) || !bytes::is_bytes(p.linetable) || !bytes::is_bytes(p.exctable) {
         return Err(invalid());

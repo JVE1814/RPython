@@ -225,9 +225,17 @@ pub enum Op {
     Unused2,
     /// [value] -> [] (for `print` of interactive expressions, also see Intrinsic1::Print)
     Unused3,
+    /// ADDED by bc-vm (internal form of LOAD_SPECIAL): [obj] -> [method, self_or_null],
+    /// the special method looked up on type(obj); arg 0 __enter__, 1 __exit__,
+    /// 2 __aenter__, 3 __aexit__. Raises TypeError if missing.
+    LoadSpecial,
+    /// ADDED by bc-vm (internal form of RETURN_GENERATOR when real work precedes it):
+    /// [] -> [] ends the eager part of a generator prologue: the frame suspends and the
+    /// caller wraps it in a generator object (nothing is pushed on the first resume).
+    ReturnGenerator,
 }
 
-pub const NUM_OPS: usize = Op::Unused3 as usize + 1;
+pub const NUM_OPS: usize = Op::ReturnGenerator as usize + 1;
 
 impl Op {
     pub fn from_u8(b: u8) -> Op {

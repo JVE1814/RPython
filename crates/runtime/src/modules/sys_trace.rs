@@ -173,7 +173,7 @@ fn fire(ts: &ThreadState, f: &mut Frame, ev: usize, loc: u32, extra: &[&PyObject
 }
 
 fn offset(f: &Frame) -> u32 {
-    f.lasti * 4
+    crate::types::code::lasti_bytes(f.code(), f.lasti as usize) as u32
 }
 
 // ------------------------------------------------------------------ settrace/setprofile helpers
@@ -242,7 +242,12 @@ pub fn trace_call(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
     if ts.tracing_depth.get() > 0 {
         return Ok(());
     }
-    let resume = f.next_instr > 0;
+    let cd = crate::types::code::code_data(f.code());
+    if cd.eager_prologue && f.next_instr < cd.gen_start {
+        // the eager part of a generator prologue (before RETURN_GENERATOR) is not traced
+        return Ok(());
+    }
+    let resume = f.next_instr > cd.gen_start;
     LAST.with(|l| {
         l.borrow_mut().insert(f as *mut Frame as usize, u32::MAX);
     });
@@ -266,6 +271,12 @@ fn is_line_start(code: &PyObject, i: usize, line: i32) -> bool {
 pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
     if ts.tracing_depth.get() > 0 {
         return Ok(());
+    }
+    {
+        let cd = crate::types::code::code_data(f.code());
+        if cd.eager_prologue && f.lasti < cd.gen_start {
+            return Ok(());
+        }
     }
     let lasti = f.lasti;
     let key = f as *mut Frame as usize;
@@ -291,7 +302,10 @@ pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
             fire(ts, f, LINE, line as u32, &[])?;
         }
     }
-    if MON_ANY.load(Relaxed) & (1 << INSTRUCTION) != 0 {
+    // one INSTRUCTION / opcode event per public instruction (an instruction may be
+    // implemented by several internal words)
+    let first_word = crate::types::code::code_data(f.code()).starts_public_instr(lasti as usize);
+    if first_word && MON_ANY.load(Relaxed) & (1 << INSTRUCTION) != 0 {
         fire(ts, f, INSTRUCTION, offset(f), &[])?;
     }
     if ts.trace_func.get().is_null() || f.f_trace.is_null() {
@@ -303,7 +317,7 @@ pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
         let r = call_trace(ts, ftr.as_ptr(), f, "line", none::none())?;
         set_f_trace(f, r);
     }
-    if f.f_trace_opcodes && !f.f_trace.is_null() {
+    if first_word && f.f_trace_opcodes && !f.f_trace.is_null() {
         let ftr = unsafe { PyRef::from_borrowed(f.f_trace) };
         let r = call_trace(ts, ftr.as_ptr(), f, "opcode", none::none())?;
         set_f_trace(f, r);
@@ -535,7 +549,7 @@ pub fn fire_branch(ts: &ThreadState, f: &mut Frame, ev: usize, dest: usize) -> P
     if ts.tracing_depth.get() > 0 || MON_ANY.load(Relaxed) & (1 << ev) == 0 {
         return Ok(());
     }
-    let d = int::new_int(dest as i64 * 4);
+    let d = int::new_int(crate::types::code::lasti_bytes(f.code(), dest));
     let off = offset(f);
     fire(ts, f, ev, off, &[&d])
 }

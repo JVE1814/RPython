@@ -98,7 +98,7 @@ fn bootstrap_code(src: &[u8], file: &str, display: &str) -> PyResult {
     let key = (|| {
         let (sl, st) = stamp(path)?;
         let (el, et) = stamp(&std::env::current_exe().ok()?)?;
-        Some(format!("rpython-boot v1 {} {} {} {} {}\n", sl, st, el, et, display))
+        Some(format!("rpython-boot v1{} {} {} {} {} {}\n", if crate::types::code::public_mode() { "w" } else { "" }, sl, st, el, et, display))
     })();
     let cache = path.parent().map(|dir| {
         let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();

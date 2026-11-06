@@ -214,7 +214,7 @@ fn add_traceback(f: &mut Frame, e: &PyObject) {
     let fo = frame_object(f);
     let prev = exc::exc_traceback(e);
     let lineno = f.lineno();
-    let tb = crate::types::traceback::new_traceback(prev.as_deref(), unsafe { &*fo }, f.lasti as i32, lineno);
+    let tb = crate::types::traceback::new_traceback(prev.as_deref(), unsafe { &*fo }, crate::types::code::lasti_bytes(f.code(), f.lasti as usize) as i32, lineno);
     exc::set_exc_traceback(e, Some(&tb));
 }
 
@@ -633,6 +633,43 @@ fn get_awaitable(o: &PyObject, where_: u32) -> PyResult {
                 }
             }
             Err(e)
+        }
+    }
+}
+
+/// LOAD_SPECIAL: look up a context-manager method on type(o). Returns (callable,
+/// self_or_null) like LoadMethod.
+pub(super) fn load_special(o: &PyObject, which: u32) -> PyResult<(PyRef, Option<PyRef>)> {
+    let names = [name!("__enter__"), name!("__exit__"), name!("__aenter__"), name!("__aexit__")];
+    let nm = names[(which & 3) as usize];
+    match lookup(o.type_ptr(), nm) {
+        Some(m) => {
+            if m.ty().tp_flags & Py_TPFLAGS_METHOD_DESCRIPTOR != 0 {
+                return Ok((m, Some(o.to_ref())));
+            }
+            let bound = match m.ty().tp_descr_get {
+                Some(g) => unsafe { from_c(g(m.as_ptr(), o.as_ptr(), o.type_ptr() as *mut PyObject))? },
+                None => m,
+            };
+            Ok((bound, None))
+        }
+        None => {
+            let sync = which < 2;
+            let kind = if sync { "" } else { "asynchronous " };
+            let (oe, ox, hint) = if sync {
+                (name!("__aenter__"), name!("__aexit__"), " but it supports the asynchronous context manager protocol. Did you mean to use 'async with'?")
+            } else {
+                (name!("__enter__"), name!("__exit__"), " but it supports the context manager protocol. Did you mean to use 'with'?")
+            };
+            let other = lookup(o.type_ptr(), oe).is_some() && lookup(o.type_ptr(), ox).is_some();
+            raise!(
+                TypeError,
+                "'{}' object does not support the {}context manager protocol (missed {} method){}",
+                tname(o),
+                kind,
+                pystr::to_string_lossy(nm),
+                if other { hint } else { "" }
+            );
         }
     }
 }
@@ -1612,6 +1649,17 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             };
                             push!(f, r.into_raw());
                         }
+                        Op::LoadSpecial => {
+                            let o = popref!(f);
+                            let (m, s) = load_special(&o, arg)?;
+                            push!(f, m.into_raw());
+                            push!(f, s.map_or(std::ptr::null_mut(), |s| s.into_raw()));
+                        }
+                        Op::ReturnGenerator => {
+                            // end of the eager generator prologue (see interp::call_function)
+                            f.next_instr = pc as u32;
+                            return Ok(Some(Exit::Yield(none::none_ref())));
+                        }
                         Op::BeforeWith | Op::BeforeAsyncWith => {
                             let mgr = popref!(f);
                             let (enter_n, exit_n) = if op == Op::BeforeWith {
@@ -1785,12 +1833,17 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                                 1 => type_ref(exc::NotImplementedError()),
                                 2 => type_ref(tuple::tuple_type()),
                                 3 => crate::builtins::builtin("all")?,
-                                _ => crate::builtins::builtin("any")?,
+                                4 => crate::builtins::builtin("any")?,
+                                5 => type_ref(list::list_type()),
+                                _ => type_ref(crate::types::set::set_type()),
                             };
                             push!(f, v.into_raw());
                         }
                         Op::ExtendedArg => unreachable!(),
-                        Op::Unused1 | Op::Unused2 | Op::Unused3 => raise!(SystemError, "unknown opcode {}", op as u8),
+                        Op::Unused1 | Op::Unused2 | Op::Unused3 => match &cd.invalid {
+                            Some(msg) => raise!(SystemError, "{}", msg),
+                            None => raise!(SystemError, "unknown opcode {}", op as u8),
+                        },
                     }
                 }
             })();

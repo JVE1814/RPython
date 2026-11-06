@@ -290,6 +290,6 @@ pub fn init_module() -> PyResult {
     )?;
     let chk = crate::modules::sys_full::config().check_hash_based_pycs.clone();
     dict::set_item_str(&d, "check_hash_based_pycs", &pystr::new_str(&chk))?;
-    dict::set_item_str(&d, "pyc_magic_number_token", &int::new_int(MAGIC as i64))?;
+    dict::set_item_str(&d, "pyc_magic_number_token", &int::new_int(if crate::types::code::public_mode() { (MAGIC + 50) as i64 } else { MAGIC as i64 }))?;
     Ok(m)
 }
