@@ -755,7 +755,12 @@ pub fn type_ready(tp: *mut PyTypeObject) -> PyResult<()> {
     }
 }
 
+/// Guards every type's `tp_subclasses` vector (no GIL: classes are created and
+/// destroyed concurrently; bc-vm fix found by test_opcache's race tests).
+static SUBCLASSES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn add_subclass(base: *mut PyTypeObject, sub: *mut PyTypeObject) {
+    let _g = SUBCLASSES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     unsafe {
         if (*base).tp_subclasses.is_null() {
             (*base).tp_subclasses = Box::into_raw(Box::new(Vec::<usize>::new())) as *mut c_void;
@@ -768,6 +773,7 @@ pub fn add_subclass(base: *mut PyTypeObject, sub: *mut PyTypeObject) {
 }
 
 pub fn remove_subclass(base: *mut PyTypeObject, sub: *mut PyTypeObject) {
+    let _g = SUBCLASSES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     unsafe {
         if (*base).tp_subclasses.is_null() {
             return;
@@ -778,6 +784,7 @@ pub fn remove_subclass(base: *mut PyTypeObject, sub: *mut PyTypeObject) {
 }
 
 pub fn subclasses(tp: *mut PyTypeObject) -> Vec<*mut PyTypeObject> {
+    let _g = SUBCLASSES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     unsafe {
         if (*tp).tp_subclasses.is_null() {
             return Vec::new();
