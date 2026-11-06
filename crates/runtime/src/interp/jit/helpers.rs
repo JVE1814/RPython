@@ -1064,11 +1064,19 @@ pub unsafe extern "C" fn h_get_awaitable(sp: *mut *mut PyObject, arg: u64) -> u6
 pub unsafe extern "C" fn h_misc(ts: *const ThreadState, f: *mut Frame, sp: *mut *mut PyObject, oparg: u64, err_top: u64) -> u64 {
     unsafe {
         let f = &mut *f;
+        // compiled code does not maintain stack_top: it is accurate only while the
+        // instruction runs, and restored afterwards (slots above the static depth
+        // that compiled code later pops are not cleared, so a stale stack_top would
+        // expose freed objects to frame traversal)
+        let saved = f.stack_top;
         f.stack_top = sp.offset_from(f.slots.as_ptr()) as usize;
         let op = bc::Op::from_u8((oparg & 0xff) as u8);
         let cd = &*(crate::types::code::code_data(f.code()) as *const crate::types::code::CodeData);
         match eval::exec_misc(&*ts, f, cd, op, (oparg >> 8) as u32) {
-            Ok(()) => OK,
+            Ok(()) => {
+                f.stack_top = saved;
+                OK
+            }
             Err(_) => {
                 let e = err_top as usize;
                 while f.stack_top > e {

@@ -465,6 +465,31 @@ pub fn resume(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> Result<P
     }
 }
 
+fn env_flag(cell: &AtomicU32, var: &str) -> bool {
+    match cell.load(Relaxed) {
+        UNSET => {
+            let en = std::env::var(var).map(|v| v != "0").unwrap_or(true);
+            cell.store(en as u32, Relaxed);
+            en
+        }
+        x => x != 0,
+    }
+}
+
+/// Tier 1 compiles the instructions shared with the interpreter through
+/// `eval::exec_misc` (RPYTHON_JIT1_MISC=0: they deoptimise instead).
+pub fn misc_enabled() -> bool {
+    static F: AtomicU32 = AtomicU32::new(UNSET);
+    env_flag(&F, "RPYTHON_JIT1_MISC")
+}
+
+/// Generator frames are resumed directly in compiled code (RPYTHON_JIT_GENFAST=0:
+/// always through the interpreter's entry).
+pub fn genfast_enabled() -> bool {
+    static F: AtomicU32 = AtomicU32::new(UNSET);
+    env_flag(&F, "RPYTHON_JIT_GENFAST")
+}
+
 // ------------------------------------------------------------------ generator resumption
 
 static TRAMPOLINE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();

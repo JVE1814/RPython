@@ -823,7 +823,7 @@ impl<'a> Gen<'a> {
             }
             Op::GetAwaitable => self.helper_sp(&ins, d, addr!(h::h_get_awaitable), Some(arg as i64), None, d - 1),
             // instructions shared with the interpreter (eval::exec_misc)
-            op if crate::interp::eval::is_misc(op) => {
+            op if crate::interp::eval::is_misc(op) && super::misc_enabled() => {
                 let pops = match op {
                     Op::LoadFromDictOrDeref | Op::LoadFromDictOrGlobals | Op::GetAiter | Op::GetAwaitable => 1,
                     Op::PushExcInfo | Op::PopExcept | Op::CheckExcMatch | Op::BeforeWith | Op::BeforeAsyncWith => 1,

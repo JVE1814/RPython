@@ -197,7 +197,7 @@ pub fn gen_send_fast(o: &PyObject, arg: *mut PyObject) -> PyResult<SendResult> {
     let fp = gn.frame;
     if !gn.running && !fp.is_null() {
         let f = unsafe { &mut *fp };
-        if f.resume != 0 && !crate::modules::sys::tracing_active() {
+        if f.resume != 0 && !crate::modules::sys::tracing_active() && crate::interp::jit::genfast_enabled() {
             let ok = match f.state {
                 FrameState::Suspended => true,
                 FrameState::Created => arg.is_null() || arg == none::none().as_ptr(),
