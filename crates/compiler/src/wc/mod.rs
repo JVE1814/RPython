@@ -2,6 +2,7 @@
 //! CPython-numbered instructions -> CFG optimisation -> [`CodeObject`].
 
 pub(crate) mod cfg;
+pub mod hooks;
 mod expr;
 pub(crate) mod ir;
 mod pattern;
@@ -107,6 +108,7 @@ enum CKey {
     FrozenSet(Vec<CKey>),
     Slice(Box<[CKey; 3]>),
     Code(usize),
+    Opaque(u32),
 }
 
 fn ckey(c: &Constant, code_ctr: &mut usize) -> CKey {
@@ -127,6 +129,7 @@ fn ckey(c: &Constant, code_ctr: &mut usize) -> CKey {
             *code_ctr += 1;
             CKey::Code(*code_ctr)
         }
+        Constant::Opaque(i) => CKey::Opaque(*i),
     }
 }
 
@@ -237,6 +240,9 @@ pub(crate) struct Compiler<'a> {
     pub interactive: bool,
     /// test hook: return the unoptimised instruction sequence (no CFG passes)
     pub codegen_only: bool,
+    /// codegen-only mode: instruction sequences of the units being compiled (innermost last)
+    pub seq_stack: Vec<Vec<hooks::Seq>>,
+    pub seq_result: Option<hooks::Seq>,
     /// location of a generator expression whose unit is being entered
     pub pending_genexpr: Option<Pos>,
 }
@@ -421,6 +427,10 @@ pub(crate) fn clean_doc(doc: &ast::PyStr) -> Vec<u32> {
 }
 
 pub(crate) fn compile_module(module: &Mod, opts: &CompileOptions) -> R<WordcodeOutput> {
+    Ok(compile_module_impl(module, opts, false)?.0)
+}
+
+pub(crate) fn compile_module_impl(module: &Mod, opts: &CompileOptions, codegen_only: bool) -> R<(WordcodeOutput, Option<hooks::Seq>)> {
     let future = check_future(module, opts.flags)?;
     if opts.mode == Mode::FuncType || matches!(module, Mod::FunctionType { .. }) {
         return Err(CompileError::other(ErrorKind::ValueError, "compile() of a func_type AST is not supported"));
@@ -439,7 +449,9 @@ pub(crate) fn compile_module(module: &Mod, opts: &CompileOptions) -> R<WordcodeO
         warnings,
         depth: 0,
         interactive: opts.interactive || matches!(m, Mod::Interactive { .. }),
-        codegen_only: false,
+        codegen_only,
+        seq_stack: Vec::new(),
+        seq_result: None,
         pending_genexpr: None,
     };
     let code = c.compile_mod(&m)?;
@@ -451,7 +463,8 @@ pub(crate) fn compile_module(module: &Mod, opts: &CompileOptions) -> R<WordcodeO
             ws.push(w);
         }
     }
-    Ok(WordcodeOutput { code, warnings: ws, future_flags: future })
+    let seq = c.seq_result.take();
+    Ok((WordcodeOutput { code, warnings: ws, future_flags: future }, seq))
 }
 
 impl<'a> Compiler<'a> {
@@ -591,6 +604,9 @@ impl<'a> Compiler<'a> {
         flags |= self.future & cf::PYCF_MASK;
         u.flags = flags;
         self.units.push(u);
+        if self.codegen_only {
+            self.seq_stack.push(Vec::new());
+        }
         self.set_qualname();
         self.emit_unit_start();
         Ok(())
@@ -683,7 +699,10 @@ impl<'a> Compiler<'a> {
             freevars: u.freevars,
             nparams: u.nparams,
         };
-        cfg::assemble_unit(u.ir, info, self.codegen_only)
+        if self.codegen_only {
+            return Ok(self.finish_codegen_only(u.ir, info));
+        }
+        cfg::assemble_unit(u.ir, info, false)
     }
 
     /// Unit start: RESUME (module/class/function), the generator prologue
@@ -1054,7 +1073,7 @@ impl<'a> Compiler<'a> {
                 self.compile_body(body, true)?;
                 self.process_deferred_annotations_module()?;
                 self.u().loc = NO_LOC;
-                if !self.ur().ir.last_is_terminator() {
+                if self.codegen_only || !self.ur().ir.last_is_terminator() {
                     self.load_const_noloc(Constant::None);
                     self.emit_noloc(O::RETURN_VALUE, 0);
                 }
@@ -1430,7 +1449,7 @@ impl<'a> Compiler<'a> {
         for s in body {
             self.compile_stmt(s)?;
         }
-        if !self.ur().ir.last_is_terminator() {
+        if self.codegen_only || !self.ur().ir.last_is_terminator() {
             self.u().loc = NO_LOC;
             self.load_const_noloc(Constant::None);
             self.emit_noloc(O::RETURN_VALUE, 0);

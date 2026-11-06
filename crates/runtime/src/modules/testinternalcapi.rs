@@ -204,6 +204,7 @@ pub fn init() -> PyResult {
         dict::set_item_str(&d, k, &int::new_int(v))?;
     }
     dict::set_item_str(&d, "__builtins__", &crate::builtins::builtins_module())?;
+    crate::modules::compiler_hooks::install(&d, &m)?;
     let code = crate::compile::compile_str(SRC, "<_testinternalcapi>", crate::compile::Mode::Exec, 0, -1)?;
     crate::interp::eval_code(&code.code, &d, Some(&d))?;
     let _ = tuple::new_tuple(vec![]);

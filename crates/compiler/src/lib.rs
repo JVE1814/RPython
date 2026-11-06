@@ -145,5 +145,8 @@ pub fn compile_wordcode(module: &ast::Mod, opts: &CompileOptions) -> Result<wc::
 }
 
 pub use wc::WordcodeOutput;
+/// the compiler stages behind `_testinternalcapi.compiler_codegen` / `optimize_cfg` /
+/// `assemble_code_object`
+pub use wc::hooks;
 
 include!(concat!(env!("OUT_DIR"), "/bytecode_hash.rs"));

@@ -216,6 +216,20 @@ pub(crate) fn assemble_unit(ir: Ir, info: UnitInfo, _codegen_only: bool) -> R<Co
     finish(cfg, info, layout)
 }
 
+/// Assemble a CFG whose local arguments are already localsplus slots, without optimising
+/// it (the `assemble_code_object` test hook).
+pub(crate) fn assemble_only(mut cfg: Cfg, info: UnitInfo) -> R<CodeObject> {
+    let layout = Layout::new(&info);
+    if !cfg.order.is_empty() {
+        skip_empty_targets(&mut cfg);
+        mark_handlers(&mut cfg);
+        label_exception_targets(&mut cfg);
+        cfg.remove_unreachable();
+        convert_closure_loads(&mut cfg);
+    }
+    finish(cfg, info, layout)
+}
+
 /// The localsplus layout: varnames, then cells that do not share an argument's slot, then
 /// free variables.
 pub(crate) struct Layout {
@@ -289,16 +303,19 @@ pub(crate) fn optimize_cfg(cfg: &mut Cfg, consts: &mut Vec<Constant>, nlocals: u
     inline_small_exit_blocks(cfg);
     cfg.remove_unreachable();
     propagate_line_numbers(cfg);
-    for _ in 0..4 {
-        let mut changed = false;
-        for k in 0..cfg.order.len() {
-            let b = cfg.order[k];
-            changed |= fold_constants(cfg, b, consts);
-            changed |= peephole_block(cfg, b, consts);
+    for k in 0..cfg.order.len() {
+        let b = cfg.order[k];
+        optimize_block(cfg, b, consts);
+    }
+    for _ in 0..cfg.order.len() + 1 {
+        if !thread_jumps(cfg) {
+            break;
         }
-        changed |= thread_jumps(cfg);
-        changed |= merge_fallthrough_blocks(cfg);
-        remove_redundant_nops(cfg);
+    }
+    remove_redundant_nops_and_pairs(cfg, consts);
+    for _ in 0..8 {
+        let mut changed = merge_fallthrough_blocks(cfg);
+        remove_redundant_nops_and_pairs(cfg, consts);
         changed |= remove_redundant_jumps(cfg);
         cfg.remove_unreachable();
         if !changed {
@@ -401,6 +418,10 @@ fn label_exception_targets(cfg: &mut Cfg) {
                 }
             }
             cfg.blocks[b as usize].instrs[k].handler = handler;
+            if ins.op == O::POP_BLOCK {
+                // its job (closing the handler range) is done
+                cfg.blocks[b as usize].instrs[k].op = O::NOP;
+            }
         }
         if cfg.falls_through(b) {
             if let Some(nb) = cfg.next_in_order(&pos, b) {
@@ -458,6 +479,12 @@ fn inline_small_exit_blocks(cfg: &mut Cfg) {
             for c in copy.iter_mut() {
                 c.handler = last.handler;
             }
+            // an inlined jump keeps the interrupt check of the jump it replaces
+            if let Some(cl) = copy.last_mut() {
+                if cl.op == O::JUMP_NO_INTERRUPT && last.op == O::JUMP {
+                    cl.op = O::JUMP;
+                }
+            }
             let blk = &mut cfg.blocks[b as usize];
             blk.instrs.pop();
             if last.loc.is_some() {
@@ -482,6 +509,25 @@ fn thread_jumps(cfg: &mut Cfg) -> bool {
         let Some(idx) = cfg.blocks[b as usize].instrs.len().checked_sub(1) else { continue };
         let ins = cfg.blocks[b as usize].instrs[idx];
         if !(is_uncond_jump(ins.op) || is_cond_jump(ins.op)) {
+            continue;
+        }
+        if is_uncond_jump(ins.op) {
+            // jump to a jump: keep this jump's line as a NOP, then jump straight to the final
+            // target with the second jump's location (interrupt check if either had one)
+            let Some((tb, ti)) = cfg.first_real(&pos, ins.target) else { continue };
+            let tins = cfg.blocks[tb as usize].instrs[ti];
+            if !is_uncond_jump(tins.op) || tins.target == ins.target || (tb == b && ti == idx) {
+                continue;
+            }
+            let op = if ins.op == O::JUMP || tins.op == O::JUMP { O::JUMP } else { O::JUMP_NO_INTERRUPT };
+            let blk = &mut cfg.blocks[b as usize];
+            blk.instrs.pop();
+            let loc = if tins.loc.is_some() { tins.loc } else { ins.loc };
+            if ins.loc.is_some() && tins.loc.is_some() {
+                blk.instrs.push(Instr { op: O::NOP, arg: 0, target: NO_LABEL, loc: ins.loc, handler: ins.handler });
+            }
+            blk.instrs.push(Instr { op, arg: 0, target: tins.target, loc, handler: ins.handler });
+            changed = true;
             continue;
         }
         let mut target = ins.target;
@@ -618,6 +664,8 @@ pub(crate) fn propagate_line_numbers(cfg: &mut Cfg) {
     let pos = cfg.positions();
     let preds = cfg.predecessor_counts();
     // the location flowing out of each block
+    // (an empty block passes on what flowed into it)
+    let mut inherited: Vec<Option<Pos>> = vec![None; cfg.blocks.len()];
     for k in 0..cfg.order.len() {
         let b = cfg.order[k];
         let mut cur: Option<Pos> = None;
@@ -630,14 +678,15 @@ pub(crate) fn propagate_line_numbers(cfg: &mut Cfg) {
                 }
             }
         }
-        let Some(out_loc) = cur else { continue };
         if cfg.blocks[b as usize].instrs.is_empty() {
-            continue;
+            cur = inherited[b as usize];
         }
+        let Some(out_loc) = cur else { continue };
         for s in cfg.successors(&pos, b, false) {
             if preds[s as usize] != 1 || cfg.blocks[s as usize].is_handler {
                 continue;
             }
+            inherited[s as usize] = Some(out_loc);
             if let Some(first) = cfg.blocks[s as usize].instrs.iter().find(|i| !is_pseudo_marker(i.op)) {
                 if !first.loc.is_some() {
                     // set the leading location-less instructions now
@@ -675,8 +724,9 @@ fn duplicate_exits_without_lineno(cfg: &mut Cfg) {
         let tl = cfg.blocks[t as usize].instrs.last().copied();
         let tlen = cfg.blocks[t as usize].instrs.len();
         let exit = tl.map(|i| is_exit_op(i.op)).unwrap_or(false) && tlen <= MAX_COPY_SIZE;
-        // a lone synthetic jump (e.g. a loop back-edge reached from several places)
-        let lone_jump = tlen == 1 && tl.map(|i| is_uncond_jump(i.op)).unwrap_or(false);
+        // a synthetic block ending in an interruptible jump (e.g. a loop back-edge reached
+        // from several places) needs the line of whoever jumps there
+        let lone_jump = tlen <= MAX_COPY_SIZE && tl.map(|i| i.op == O::JUMP || i.op == O::JUMP_BACKWARD).unwrap_or(false);
         if !exit && !lone_jump {
             continue;
         }
@@ -767,7 +817,7 @@ fn to_ast(c: &Constant) -> Option<ast::Constant> {
         Constant::Bytes(b) => ast::Constant::Bytes(b.clone()),
         Constant::Tuple(v) => ast::Constant::Tuple(v.iter().map(to_ast).collect::<Option<Vec<_>>>()?),
         Constant::FrozenSet(v) => ast::Constant::FrozenSet(v.iter().map(to_ast).collect::<Option<Vec<_>>>()?),
-        Constant::Slice(_) | Constant::Code(_) => return None,
+        Constant::Slice(_) | Constant::Code(_) | Constant::Opaque(_) => return None,
     })
 }
 
@@ -788,6 +838,7 @@ fn const_truth(c: &Constant) -> Option<bool> {
         Constant::Bytes(b) => !b.is_empty(),
         Constant::Tuple(v) | Constant::FrozenSet(v) => !v.is_empty(),
         Constant::Slice(_) | Constant::Code(_) => true,
+        Constant::Opaque(_) => return None,
     })
 }
 
@@ -933,6 +984,15 @@ fn const_operands(instrs: &[Instr], end: usize, n: usize, consts: &[Constant]) -
 }
 
 fn set_load_const(ins: &mut Instr, c: Constant, consts: &mut Vec<Constant>) {
+    // a small int result needs no constant
+    if let Constant::Int(v) = c {
+        if (0..256).contains(&v) {
+            ins.op = O::LOAD_SMALL_INT;
+            ins.arg = v as i32;
+            ins.target = NO_LABEL;
+            return;
+        }
+    }
     let idx = add_const(consts, c);
     ins.op = O::LOAD_CONST;
     ins.arg = idx as i32;
@@ -950,112 +1010,178 @@ fn nop_out(ins: &mut Instr) {
 /// Size limit for folded tuples/sets (same order as CPython's).
 const MAX_FOLD_COLLECTION: usize = 256;
 
-/// Constant folding within one block. Returns whether anything changed.
-fn fold_constants(cfg: &mut Cfg, b: Label, consts: &mut Vec<Constant>) -> bool {
-    let mut changed = false;
-    let instrs = &mut cfg.blocks[b as usize].instrs;
-    let mut k = 0;
-    while k < instrs.len() {
-        let ins = instrs[k];
-        match ins.op {
-            O::BUILD_TUPLE => {
-                let n = ins.arg as usize;
+/// Constant folding at instruction `k` (its operands may be separated from it by NOPs).
+/// The folded-away operands become location-less NOPs. Returns whether anything changed.
+fn fold_at(instrs: &mut [Instr], k: usize, consts: &mut Vec<Constant>) -> bool {
+    let ins = instrs[k];
+    match ins.op {
+        O::BUILD_TUPLE => {
+            let n = ins.arg as usize;
+            if let Some(ops) = const_operands(instrs, k, n, consts) {
+                let items: Vec<Constant> = ops.iter().map(|(_, c)| c.clone()).collect();
+                for (j, _) in &ops {
+                    nop_out(&mut instrs[*j]);
+                }
+                set_load_const(&mut instrs[k], Constant::Tuple(items), consts);
+                return true;
+            }
+            false
+        }
+        O::BUILD_LIST | O::BUILD_SET => {
+            let n = ins.arg as usize;
+            let next = instrs[k + 1..].iter().find(|x| x.op != O::NOP).map(|x| (x.op, x.arg));
+            let is_set = ins.op == O::BUILD_SET;
+            // `x in [a, b]` / `for x in [a, b]`: an immutable constant will do
+            let consumer = matches!(next, Some((O::CONTAINS_OP, _)) | Some((O::GET_ITER, _)));
+            if n >= 1 && n <= MAX_FOLD_COLLECTION {
                 if let Some(ops) = const_operands(instrs, k, n, consts) {
                     let items: Vec<Constant> = ops.iter().map(|(_, c)| c.clone()).collect();
-                    for (j, _) in &ops {
-                        nop_out(&mut instrs[*j]);
+                    let value = if is_set { Constant::FrozenSet(dedup_set(items)) } else { Constant::Tuple(items) };
+                    if consumer {
+                        for (j, _) in &ops {
+                            nop_out(&mut instrs[*j]);
+                        }
+                        set_load_const(&mut instrs[k], value, consts);
+                        return true;
+                    } else if n >= 3 {
+                        // BUILD_LIST 0; LOAD_CONST tuple; LIST_EXTEND 1
+                        let first = ops[0].0;
+                        let second = ops[1].0;
+                        for (j, _) in &ops[2..] {
+                            nop_out(&mut instrs[*j]);
+                        }
+                        let loc0 = instrs[first].loc;
+                        instrs[first] = Instr { op: ins.op, arg: 0, target: NO_LABEL, loc: loc0, handler: instrs[first].handler };
+                        set_load_const(&mut instrs[second], value, consts);
+                        instrs[k].op = if is_set { O::SET_UPDATE } else { O::LIST_EXTEND };
+                        instrs[k].arg = 1;
+                        return true;
+                    }
+                }
+            }
+            if !is_set && consumer {
+                // iterating over (or testing membership in) a list display: a tuple will do
+                instrs[k].op = O::BUILD_TUPLE;
+                return true;
+            }
+            false
+        }
+        O::BINARY_OP => {
+            if let Some(ops) = const_operands(instrs, k, 2, consts) {
+                if let Some(r) = fold_binary(ins.arg, &ops[0].1, &ops[1].1) {
+                    nop_out(&mut instrs[ops[0].0]);
+                    nop_out(&mut instrs[ops[1].0]);
+                    set_load_const(&mut instrs[k], r, consts);
+                    return true;
+                }
+            }
+            false
+        }
+        O::CALL_INTRINSIC_1 if ins.arg as u32 == wordcode::intrinsic1::LIST_TO_TUPLE => {
+            match fold_append_chain(instrs, k, O::BUILD_LIST, O::LIST_APPEND, consts) {
+                Some((items, idxs)) => {
+                    for i in idxs {
+                        nop_out(&mut instrs[i]);
                     }
                     set_load_const(&mut instrs[k], Constant::Tuple(items), consts);
-                    changed = true;
+                    true
                 }
+                None => false,
             }
-            O::BUILD_LIST | O::BUILD_SET => {
-                let n = ins.arg as usize;
-                let next = instrs[k + 1..].iter().find(|x| x.op != O::NOP).map(|x| (x.op, x.arg));
-                let is_set = ins.op == O::BUILD_SET;
-                // `x in [a, b]` / `for x in [a, b]`: an immutable constant will do
-                let consumer = matches!(next, Some((O::CONTAINS_OP, _)) | Some((O::GET_ITER, _)));
-                if n >= 1 && n <= MAX_FOLD_COLLECTION {
-                    if let Some(ops) = const_operands(instrs, k, n, consts) {
-                        let items: Vec<Constant> = ops.iter().map(|(_, c)| c.clone()).collect();
-                        let value = if is_set { Constant::FrozenSet(dedup_set(items)) } else { Constant::Tuple(items) };
-                        if consumer {
-                            for (j, _) in &ops {
-                                nop_out(&mut instrs[*j]);
-                            }
-                            set_load_const(&mut instrs[k], value, consts);
-                            changed = true;
-                        } else if n >= 3 {
-                            // BUILD_LIST 0; LOAD_CONST tuple; LIST_EXTEND 1
-                            let first = ops[0].0;
-                            let second = ops[1].0;
-                            for (j, _) in &ops[2..] {
-                                nop_out(&mut instrs[*j]);
-                            }
-                            let loc0 = instrs[first].loc;
-                            instrs[first] = Instr { op: ins.op, arg: 0, target: NO_LABEL, loc: loc0, handler: instrs[first].handler };
-                            set_load_const(&mut instrs[second], value, consts);
-                            instrs[k].op = if is_set { O::SET_UPDATE } else { O::LIST_EXTEND };
-                            instrs[k].arg = 1;
-                            changed = true;
+        }
+        O::CONTAINS_OP | O::GET_ITER => {
+            // a list / set built element by element from constants, then iterated over or
+            // tested for membership: one constant tuple / frozenset
+            let Some(last) = prev_non_nop(instrs, k) else { return false };
+            let (build, append) = match instrs[last].op {
+                O::LIST_APPEND => (O::BUILD_LIST, O::LIST_APPEND),
+                O::SET_ADD => (O::BUILD_SET, O::SET_ADD),
+                _ => return false,
+            };
+            match fold_append_chain(instrs, last + 1, build, append, consts) {
+                Some((items, idxs)) => {
+                    for i in idxs {
+                        if i != last {
+                            nop_out(&mut instrs[i]);
                         }
                     }
+                    let value = if build == O::BUILD_SET { Constant::FrozenSet(dedup_set(items)) } else { Constant::Tuple(items) };
+                    set_load_const(&mut instrs[last], value, consts);
+                    true
                 }
-                if !changed && !is_set && matches!(next, Some((O::GET_ITER, _)) | Some((O::CONTAINS_OP, _))) {
-                    // iterating over (or testing membership in) a list display: a tuple will do
-                    instrs[k].op = O::BUILD_TUPLE;
-                    changed = true;
-                }
+                None => false,
             }
-            O::BINARY_OP => {
-                if let Some(ops) = const_operands(instrs, k, 2, consts) {
-                    if let Some(r) = fold_binary(ins.arg, &ops[0].1, &ops[1].1) {
-                        nop_out(&mut instrs[ops[0].0]);
-                        nop_out(&mut instrs[ops[1].0]);
-                        set_load_const(&mut instrs[k], r, consts);
-                        changed = true;
-                    }
-                }
-            }
-            O::UNARY_NEGATIVE | O::UNARY_INVERT | O::CALL_INTRINSIC_1 => {
-                if let Some(ops) = const_operands(instrs, k, 1, consts) {
-                    if ins.op == O::CALL_INTRINSIC_1 && ins.arg as u32 == wordcode::intrinsic1::LIST_TO_TUPLE {
-                        // handled below (needs the list's construction)
-                    } else if let Some(r) = fold_unary(ins.op, ins.arg, &ops[0].1) {
-                        nop_out(&mut instrs[ops[0].0]);
-                        set_load_const(&mut instrs[k], r, consts);
-                        changed = true;
-                    }
-                }
-                if ins.op == O::CALL_INTRINSIC_1 && ins.arg as u32 == wordcode::intrinsic1::LIST_TO_TUPLE {
-                    if fold_list_to_tuple(instrs, k, consts) {
-                        changed = true;
-                    }
-                }
-            }
-            O::TO_BOOL => {
-                if let Some(ops) = const_operands(instrs, k, 1, consts) {
-                    if let Some(t) = const_truth(&ops[0].1) {
-                        nop_out(&mut instrs[ops[0].0]);
-                        set_load_const(&mut instrs[k], Constant::Bool(t), consts);
-                        changed = true;
-                    }
-                }
-            }
-            O::UNARY_NOT => {
-                if let Some(ops) = const_operands(instrs, k, 1, consts) {
-                    if let Constant::Bool(v) = ops[0].1 {
-                        nop_out(&mut instrs[ops[0].0]);
-                        set_load_const(&mut instrs[k], Constant::Bool(!v), consts);
-                        changed = true;
-                    }
-                }
-            }
-            _ => {}
         }
-        k += 1;
+        O::UNARY_NEGATIVE | O::UNARY_INVERT | O::CALL_INTRINSIC_1 => {
+            if let Some(ops) = const_operands(instrs, k, 1, consts) {
+                if let Some(r) = fold_unary(ins.op, ins.arg, &ops[0].1) {
+                    nop_out(&mut instrs[ops[0].0]);
+                    set_load_const(&mut instrs[k], r, consts);
+                    return true;
+                }
+            }
+            false
+        }
+        O::TO_BOOL | O::UNARY_NOT => {
+            if let Some(ops) = const_operands(instrs, k, 1, consts) {
+                if let Some(t) = const_truth(&ops[0].1) {
+                    nop_out(&mut instrs[ops[0].0]);
+                    let v = if ins.op == O::UNARY_NOT { !t } else { t };
+                    set_load_const(&mut instrs[k], Constant::Bool(v), consts);
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
     }
-    changed
+}
+
+fn prev_non_nop(instrs: &[Instr], k: usize) -> Option<usize> {
+    (0..k).rev().find(|&j| instrs[j].op != O::NOP)
+}
+
+/// `BUILD_x 0; (const; APPEND 1)*` ending right before `end` (NOPs may be interleaved; for
+/// lists, `LIST_EXTEND 1` of a constant tuple also counts): the constant items, and the
+/// indices of all the instructions involved.
+fn fold_append_chain(instrs: &[Instr], end: usize, build: u16, append: u16, consts: &[Constant]) -> Option<(Vec<Constant>, Vec<usize>)> {
+    let mut idxs: Vec<usize> = Vec::new();
+    let mut rev: Vec<Constant> = Vec::new();
+    let mut j = end;
+    loop {
+        if j == 0 {
+            return None;
+        }
+        j -= 1;
+        let i = instrs[j];
+        if i.op == O::NOP {
+            idxs.push(j);
+            continue;
+        }
+        if i.op == build && i.arg == 0 {
+            idxs.push(j);
+            break;
+        }
+        let extend = append == O::LIST_APPEND && i.op == O::LIST_EXTEND;
+        if !(i.op == append || extend) || i.arg != 1 {
+            return None;
+        }
+        idxs.push(j);
+        let m = prev_non_nop(instrs, j)?;
+        let c = const_of(&instrs[m], consts)?;
+        if extend {
+            match c {
+                Constant::Tuple(v) => rev.extend(v.into_iter().rev()),
+                _ => return None,
+            }
+        } else {
+            rev.push(c);
+        }
+        idxs.push(m);
+        j = m;
+    }
+    rev.reverse();
+    Some((rev, idxs))
 }
 
 fn dedup_set(items: Vec<Constant>) -> Vec<Constant> {
@@ -1083,69 +1209,6 @@ fn set_equal(a: &Constant, b: &Constant) -> bool {
         return x == y;
     }
     a == b
-}
-
-/// `BUILD_LIST 0; (LOAD_CONST x; LIST_APPEND 1)*; CALL_INTRINSIC_1 LIST_TO_TUPLE` (also with a
-/// LIST_EXTEND of a constant tuple) -> `LOAD_CONST tuple`.
-fn fold_list_to_tuple(instrs: &mut [Instr], k: usize, consts: &mut Vec<Constant>) -> bool {
-    let mut items: Vec<Constant> = Vec::new();
-    let mut idxs: Vec<usize> = Vec::new();
-    let mut j = k;
-    // walk backwards over (const, LIST_APPEND/LIST_EXTEND 1) pairs to BUILD_LIST 0
-    let mut rev: Vec<Constant> = Vec::new();
-    loop {
-        if j == 0 {
-            return false;
-        }
-        j -= 1;
-        let i = instrs[j];
-        match i.op {
-            O::NOP => {
-                idxs.push(j);
-            }
-            O::BUILD_LIST if i.arg == 0 => {
-                idxs.push(j);
-                break;
-            }
-            O::LIST_APPEND | O::LIST_EXTEND if i.arg == 1 => {
-                idxs.push(j);
-                // the operand
-                let mut m = j;
-                loop {
-                    if m == 0 {
-                        return false;
-                    }
-                    m -= 1;
-                    if instrs[m].op != O::NOP {
-                        break;
-                    }
-                }
-                let Some(c) = const_of(&instrs[m], consts) else { return false };
-                if i.op == O::LIST_APPEND {
-                    rev.push(c);
-                } else {
-                    match c {
-                        Constant::Tuple(v) => {
-                            for x in v.into_iter().rev() {
-                                rev.push(x);
-                            }
-                        }
-                        _ => return false,
-                    }
-                }
-                idxs.push(m);
-                j = m;
-            }
-            _ => return false,
-        }
-    }
-    rev.reverse();
-    items.extend(rev);
-    for i in idxs {
-        nop_out(&mut instrs[i]);
-    }
-    set_load_const(&mut instrs[k], Constant::Tuple(items), consts);
-    true
 }
 
 /// LOAD_CONST of small ints and of the common constants become LOAD_SMALL_INT /
@@ -1244,202 +1307,217 @@ fn produces_exact_bool(i: &Instr) -> bool {
     }
 }
 
-fn peephole_block(cfg: &mut Cfg, b: Label, consts: &mut Vec<Constant>) -> bool {
-    let mut changed = false;
-    let instrs = &mut cfg.blocks[b as usize].instrs;
+/// NOP an instruction that a peephole made redundant; it keeps its location (line event).
+fn nop_keep(ins: &mut Instr) {
+    ins.op = O::NOP;
+    ins.arg = 0;
+    ins.target = NO_LABEL;
+}
+
+/// `instrs[k]` replaces the instruction before it, which moves forward to slot `k` (so that
+/// a following instruction sees it as its neighbour); the old slot becomes a NOP with the
+/// replaced instruction's location.
+fn move_forward(instrs: &mut [Instr], k: usize) {
+    let loc = instrs[k].loc;
+    instrs[k] = instrs[k - 1];
+    instrs[k - 1] = Instr { op: O::NOP, arg: 0, target: NO_LABEL, loc, handler: instrs[k].handler };
+}
+
+/// Peephole rewrites at instruction `k`, looking only at its immediate neighbours.
+fn peephole_at(instrs: &mut [Instr], k: usize, consts: &mut Vec<Constant>) -> bool {
     let n = instrs.len();
-    let mut k = 0;
-    while k < n {
-        let ins = instrs[k];
-        let next = next_real(instrs, k);
-        match ins.op {
-            O::TO_BOOL => {
-                if let Some(p) = prev_real(instrs, k) {
-                    let pi = instrs[p];
-                    if produces_exact_bool(&pi) {
-                        nop_out(&mut instrs[k]);
-                        changed = true;
-                    } else if pi.op == O::COMPARE_OP {
-                        instrs[p].arg |= wordcode::CMP_TO_BOOL as i32;
-                        nop_out(&mut instrs[k]);
-                        changed = true;
-                    }
-                }
+    let ins = instrs[k];
+    let next = if k + 1 < n { Some(k + 1) } else { None };
+    let next_op = next.map(|x| instrs[x].op).unwrap_or(0);
+    let prev_op = if k > 0 { instrs[k - 1].op } else { 0 };
+    match ins.op {
+        O::TO_BOOL => {
+            if k > 0 && produces_exact_bool(&instrs[k - 1]) {
+                move_forward(instrs, k);
+                return true;
             }
-            O::UNARY_NOT => {
-                if let Some(nx) = next {
-                    match instrs[nx].op {
-                        O::POP_JUMP_IF_FALSE | O::POP_JUMP_IF_TRUE => {
-                            if prev_real(instrs, k).map(|p| produces_exact_bool(&instrs[p])).unwrap_or(false) {
-                                instrs[nx].op = invert_jump(instrs[nx].op);
-                                nop_out(&mut instrs[k]);
-                                changed = true;
-                            }
-                        }
-                        O::UNARY_NOT => {
-                            if prev_real(instrs, k).map(|p| produces_exact_bool(&instrs[p])).unwrap_or(false) {
-                                nop_out(&mut instrs[k]);
-                                nop_out(&mut instrs[nx]);
-                                changed = true;
-                            }
-                        }
-                        O::TO_BOOL => {
-                            nop_out(&mut instrs[nx]);
-                            changed = true;
-                        }
-                        _ => {}
-                    }
-                }
-                if instrs[k].op == O::UNARY_NOT {
-                    if let Some(p) = prev_real(instrs, k) {
-                        if matches!(instrs[p].op, O::IS_OP | O::CONTAINS_OP) {
-                            instrs[p].arg ^= 1;
-                            nop_out(&mut instrs[k]);
-                            changed = true;
-                        }
-                    }
-                }
+            if k > 0 && prev_op == O::COMPARE_OP {
+                instrs[k - 1].arg |= wordcode::CMP_TO_BOOL as i32;
+                move_forward(instrs, k);
+                return true;
             }
-            O::LOAD_CONST | O::LOAD_SMALL_INT | O::LOAD_COMMON_CONSTANT => {
-                if let (Some(nx), Some(c)) = (next, const_of(&ins, consts)) {
-                    let nop = instrs[nx];
-                    match nop.op {
-                        O::COPY if nop.arg == 1 => {
-                            // `const and x` / `const or x`: COPY 1; TO_BOOL; POP_JUMP_IF_x
-                            let tb = next_real(instrs, nx);
-                            let jp = tb.and_then(|t| next_real(instrs, t));
-                            if let (Some(tb), Some(jp)) = (tb, jp) {
-                                let jop = instrs[jp].op;
-                                if instrs[tb].op == O::TO_BOOL && matches!(jop, O::POP_JUMP_IF_FALSE | O::POP_JUMP_IF_TRUE) {
-                                    if let Some(t) = const_truth(&c) {
-                                        let taken = (jop == O::POP_JUMP_IF_TRUE) == t;
-                                        nop_out(&mut instrs[nx]);
-                                        nop_out(&mut instrs[tb]);
-                                        if taken {
-                                            instrs[jp].op = O::JUMP;
-                                        } else {
-                                            nop_out(&mut instrs[jp]);
-                                        }
-                                        changed = true;
-                                    }
-                                }
-                            }
-                        }
-                        O::POP_JUMP_IF_FALSE | O::POP_JUMP_IF_TRUE => {
-                            if let Some(t) = const_truth(&c) {
-                                let jump = (nop.op == O::POP_JUMP_IF_TRUE) == t;
-                                nop_out(&mut instrs[k]);
-                                if jump {
-                                    instrs[nx].op = O::JUMP;
-                                } else {
-                                    nop_out(&mut instrs[nx]);
-                                }
-                                changed = true;
-                            }
-                        }
-                        O::POP_JUMP_IF_NONE | O::POP_JUMP_IF_NOT_NONE => {
-                            let is_none = matches!(c, Constant::None);
-                            let jump = (nop.op == O::POP_JUMP_IF_NONE) == is_none;
-                            nop_out(&mut instrs[k]);
-                            if jump {
-                                instrs[nx].op = O::JUMP;
-                            } else {
-                                nop_out(&mut instrs[nx]);
-                            }
-                            changed = true;
-                        }
-                        O::POP_TOP => {
-                            nop_out(&mut instrs[k]);
-                            nop_out(&mut instrs[nx]);
-                            changed = true;
-                        }
-                        O::IS_OP if matches!(c, Constant::None) => {
-                            // x is None; POP_JUMP_IF_*  ->  POP_JUMP_IF_[NOT_]NONE
-                            if let Some(nn) = next_real(instrs, nx) {
-                                if matches!(instrs[nn].op, O::POP_JUMP_IF_FALSE | O::POP_JUMP_IF_TRUE) {
-                                    let is_not = instrs[nx].arg != 0;
-                                    let on_true = instrs[nn].op == O::POP_JUMP_IF_TRUE;
-                                    // jump when (x is None) == on_true, inverted by `is not`
-                                    let jump_if_none = on_true != is_not;
-                                    instrs[nn].op = if jump_if_none { O::POP_JUMP_IF_NONE } else { O::POP_JUMP_IF_NOT_NONE };
-                                    nop_out(&mut instrs[k]);
-                                    nop_out(&mut instrs[nx]);
-                                    changed = true;
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            O::LOAD_GLOBAL => {
-                if ins.arg & 1 == 0 {
-                    if let Some(nx) = next {
-                        if instrs[nx].op == O::PUSH_NULL && nx == k + 1 {
-                            instrs[k].arg |= 1;
-                            nop_out(&mut instrs[nx]);
-                            changed = true;
-                        }
-                    }
-                }
-            }
-            O::COPY if ins.arg == 1 => {
-                if let Some(nx) = next {
-                    if instrs[nx].op == O::POP_TOP {
-                        nop_out(&mut instrs[k]);
-                        nop_out(&mut instrs[nx]);
-                        changed = true;
-                    }
-                }
-            }
-            O::LOAD_FAST | O::LOAD_FAST_BORROW => {
-                if let Some(nx) = next {
-                    if instrs[nx].op == O::POP_TOP && nx == k + 1 {
-                        nop_out(&mut instrs[k]);
-                        nop_out(&mut instrs[nx]);
-                        changed = true;
-                    }
-                }
-            }
-            O::BUILD_TUPLE => {
-                if let Some(nx) = next {
-                    if instrs[nx].op == O::UNPACK_SEQUENCE && instrs[nx].arg == ins.arg {
-                        match ins.arg {
-                            1 => {
-                                nop_out(&mut instrs[k]);
-                                nop_out(&mut instrs[nx]);
-                                changed = true;
-                            }
-                            2 | 3 => {
-                                nop_out(&mut instrs[k]);
-                                instrs[nx].op = O::SWAP;
-                                changed = true;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            O::SWAP => {
-                if apply_static_swap(instrs, k) {
-                    changed = true;
-                }
-            }
-            O::STORE_FAST => {
-                // a store immediately overwritten by another store to the same local
-                if let Some(nx) = next {
-                    if instrs[nx].op == O::STORE_FAST && instrs[nx].arg == ins.arg && instrs[nx].loc.line == ins.loc.line {
-                        instrs[k].op = O::POP_TOP;
-                        instrs[k].arg = 0;
-                        changed = true;
-                    }
-                }
-            }
-            _ => {}
+            false
         }
-        k += 1;
+        O::UNARY_NOT => {
+            if matches!(prev_op, O::IS_OP | O::CONTAINS_OP) {
+                instrs[k - 1].arg ^= 1;
+                move_forward(instrs, k);
+                return true;
+            }
+            match next_op {
+                O::UNARY_NOT => {
+                    nop_keep(&mut instrs[k]);
+                    nop_keep(&mut instrs[k + 1]);
+                    true
+                }
+                O::POP_JUMP_IF_FALSE | O::POP_JUMP_IF_TRUE => {
+                    instrs[k + 1].op = invert_jump(next_op);
+                    nop_keep(&mut instrs[k]);
+                    true
+                }
+                _ => false,
+            }
+        }
+        O::LOAD_CONST | O::LOAD_SMALL_INT | O::LOAD_COMMON_CONSTANT => {
+            let (Some(nx), Some(c)) = (next, const_of(&ins, consts)) else { return false };
+            match next_op {
+                O::COPY if instrs[nx].arg == 1 => {
+                    // `const and x` / `const or x`: COPY 1; TO_BOOL; POP_JUMP_IF_x
+                    if nx + 2 >= n {
+                        return false;
+                    }
+                    let (tb, jp) = (nx + 1, nx + 2);
+                    let jop = instrs[jp].op;
+                    if instrs[tb].op != O::TO_BOOL || !matches!(jop, O::POP_JUMP_IF_FALSE | O::POP_JUMP_IF_TRUE) {
+                        return false;
+                    }
+                    let Some(t) = const_truth(&c) else { return false };
+                    nop_keep(&mut instrs[nx]);
+                    nop_keep(&mut instrs[tb]);
+                    if (jop == O::POP_JUMP_IF_TRUE) == t {
+                        instrs[jp].op = O::JUMP;
+                    } else {
+                        nop_keep(&mut instrs[jp]);
+                    }
+                    true
+                }
+                O::POP_JUMP_IF_FALSE | O::POP_JUMP_IF_TRUE => {
+                    let Some(t) = const_truth(&c) else { return false };
+                    nop_keep(&mut instrs[k]);
+                    if (next_op == O::POP_JUMP_IF_TRUE) == t {
+                        instrs[nx].op = O::JUMP;
+                    } else {
+                        nop_keep(&mut instrs[nx]);
+                    }
+                    true
+                }
+                O::POP_JUMP_IF_NONE | O::POP_JUMP_IF_NOT_NONE => {
+                    let is_none = matches!(c, Constant::None);
+                    nop_keep(&mut instrs[k]);
+                    if (next_op == O::POP_JUMP_IF_NONE) == is_none {
+                        instrs[nx].op = O::JUMP;
+                    } else {
+                        nop_keep(&mut instrs[nx]);
+                    }
+                    true
+                }
+                O::POP_TOP => {
+                    nop_keep(&mut instrs[k]);
+                    nop_keep(&mut instrs[nx]);
+                    true
+                }
+                O::IS_OP if matches!(c, Constant::None) && nx + 1 < n => {
+                    // x is None; POP_JUMP_IF_*  ->  POP_JUMP_IF_[NOT_]NONE
+                    let nn = nx + 1;
+                    if !matches!(instrs[nn].op, O::POP_JUMP_IF_FALSE | O::POP_JUMP_IF_TRUE) {
+                        return false;
+                    }
+                    let is_not = instrs[nx].arg != 0;
+                    let on_true = instrs[nn].op == O::POP_JUMP_IF_TRUE;
+                    instrs[nn].op = if on_true != is_not { O::POP_JUMP_IF_NONE } else { O::POP_JUMP_IF_NOT_NONE };
+                    nop_keep(&mut instrs[k]);
+                    nop_keep(&mut instrs[nx]);
+                    true
+                }
+                _ => false,
+            }
+        }
+        O::LOAD_GLOBAL if ins.arg & 1 == 0 && next_op == O::PUSH_NULL => {
+            instrs[k].arg |= 1;
+            nop_keep(&mut instrs[k + 1]);
+            true
+        }
+        O::COPY if ins.arg == 1 && next_op == O::POP_TOP => {
+            nop_keep(&mut instrs[k]);
+            nop_keep(&mut instrs[k + 1]);
+            true
+        }
+        O::BUILD_TUPLE if next_op == O::UNPACK_SEQUENCE && instrs[k + 1].arg == ins.arg => match ins.arg {
+            1 => {
+                nop_keep(&mut instrs[k]);
+                nop_keep(&mut instrs[k + 1]);
+                true
+            }
+            2 | 3 => {
+                nop_keep(&mut instrs[k]);
+                instrs[k + 1].op = O::SWAP;
+                true
+            }
+            _ => false,
+        },
+        O::CALL_INTRINSIC_1 if ins.arg as u32 == wordcode::intrinsic1::LIST_TO_TUPLE && next_op == O::GET_ITER => {
+            // iterating over the list directly is the same
+            nop_keep(&mut instrs[k]);
+            true
+        }
+        O::SWAP => apply_static_swap(instrs, k),
+        O::STORE_FAST => {
+            // a store immediately overwritten by another store to the same local
+            if next_op == O::STORE_FAST && instrs[k + 1].arg == ins.arg && instrs[k + 1].loc.line == ins.loc.line {
+                instrs[k].op = O::POP_TOP;
+                instrs[k].arg = 0;
+                return true;
+            }
+            false
+        }
+        _ => false,
     }
-    changed
+}
+
+/// One forward pass over a block: constant folding, then peepholes, at each instruction.
+/// It is deliberately not repeated until nothing changes.
+fn optimize_block(cfg: &mut Cfg, b: Label, consts: &mut Vec<Constant>) {
+    let instrs = &mut cfg.blocks[b as usize].instrs;
+    for k in 0..instrs.len() {
+        fold_at(instrs, k, consts);
+        if peephole_at(instrs, k, consts) {
+            // a rewrite may let the SWAPs right before it turn into store reordering
+            let mut j = k;
+            while j > 0 && (matches!(instrs[j - 1].op, O::SWAP | O::NOP) || is_swappable_store(&instrs[j - 1])) {
+                j -= 1;
+                if instrs[j].op == O::SWAP {
+                    apply_static_swap(instrs, j);
+                }
+            }
+        }
+    }
+}
+
+/// `LOAD_CONST; POP_TOP` and `COPY 1; POP_TOP` pairs (adjacent once redundant NOPs are
+/// gone) are removed, repeatedly.
+fn remove_redundant_nops_and_pairs(cfg: &mut Cfg, consts: &[Constant]) {
+    loop {
+        remove_redundant_nops(cfg);
+        let mut changed = false;
+        for &b in &cfg.order {
+            let instrs = &mut cfg.blocks[b as usize].instrs;
+            let mut k = 1;
+            while k < instrs.len() {
+                let p = instrs[k - 1];
+                let removable = match p.op {
+                    O::LOAD_CONST | O::LOAD_SMALL_INT | O::LOAD_COMMON_CONSTANT => const_of(&p, consts).is_some(),
+                    O::COPY => p.arg == 1,
+                    _ => false,
+                };
+                if removable && instrs[k].op == O::POP_TOP {
+                    nop_keep(&mut instrs[k - 1]);
+                    nop_keep(&mut instrs[k]);
+                    changed = true;
+                    k += 2;
+                } else {
+                    k += 1;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
 }
 
 /// Instructions that store the top of stack and nothing else.
@@ -1692,11 +1770,11 @@ fn stack_io(op: u16, arg: i32) -> (usize, usize) {
 /// block before the local can change (and is not stored into a local itself). Only blocks
 /// reachable without exception edges are considered.
 fn optimize_load_fast(cfg: &mut Cfg) {
-    // Abstract interpretation over the blocks reachable without exception edges. Each stack
+    // Abstract interpretation of each block reachable without exception edges. Each stack
     // slot records the LOAD_FAST (block, index) that produced it. A load is unsafe (stays a
     // strong LOAD_FAST) when its reference is stored into a local, is still on the stack
-    // when its local changes, is on the stack across a yield, reaches a join point with a
-    // different stack, or is still on the stack when the frame returns or raises.
+    // when its local changes, is on the stack across a yield, or is still on the stack at
+    // the end of its block (passed on to a successor, or the frame returns or raises).
     #[derive(Clone, Copy, PartialEq, Eq)]
     struct Ref {
         block: Label,
@@ -1707,9 +1785,11 @@ fn optimize_load_fast(cfg: &mut Cfg) {
     let pos = cfg.positions();
     let n = cfg.blocks.len();
     let mut unsafe_: std::collections::HashSet<(Label, usize)> = std::collections::HashSet::new();
-    let mut entry: Vec<Option<Stack>> = vec![None; n];
+    // only the stack depth flows into a successor: references still on the stack at the end
+    // of a block are consumed elsewhere and are never borrowed
+    let mut entry: Vec<Option<usize>> = vec![None; n];
     let start = cfg.order[0];
-    entry[start as usize] = Some(Vec::new());
+    entry[start as usize] = Some(0);
     let mut work = vec![start];
     let mark_all = |s: &Stack, u: &mut std::collections::HashSet<(Label, usize)>| {
         for r in s.iter().flatten() {
@@ -1717,9 +1797,9 @@ fn optimize_load_fast(cfg: &mut Cfg) {
         }
     };
     while let Some(b) = work.pop() {
-        let mut stack = entry[b as usize].clone().unwrap_or_default();
+        let mut stack: Stack = vec![None; entry[b as usize].unwrap_or(0)];
         let instrs = cfg.blocks[b as usize].instrs.clone();
-        let mut outs: Vec<(Label, Stack)> = Vec::new();
+        let mut outs: Vec<(Label, usize)> = Vec::new();
         let kill = |stack: &Stack, u: &mut std::collections::HashSet<(Label, usize)>, local: i32| {
             for r in stack.iter().flatten() {
                 if r.local == local {
@@ -1791,6 +1871,30 @@ fn optimize_load_fast(cfg: &mut Cfg) {
                     stack.push(None);
                     stack.push(v);
                 }
+                O::LOAD_SUPER_ATTR if i.arg & 1 != 0 => {
+                    // the method form leaves `self` on the stack
+                    let v = stack.pop().flatten();
+                    stack.pop();
+                    stack.pop();
+                    stack.push(None);
+                    stack.push(v);
+                }
+                O::PUSH_EXC_INFO => {
+                    let v = stack.pop().flatten();
+                    stack.push(None);
+                    stack.push(v);
+                }
+                O::FORMAT_SIMPLE => {
+                    // may return its (str) operand itself
+                    let v = stack.pop().flatten();
+                    stack.push(v);
+                }
+                O::SET_FUNCTION_ATTRIBUTE => {
+                    // the function stays on the stack
+                    let f = stack.pop().flatten();
+                    stack.pop();
+                    stack.push(f);
+                }
                 O::YIELD_VALUE => {
                     // a suspended frame must not hold borrowed references
                     mark_all(&stack, &mut unsafe_);
@@ -1816,7 +1920,7 @@ fn optimize_load_fast(cfg: &mut Cfg) {
                 }
             }
             if is_jump_edge(i.op) {
-                outs.push((i.target, stack.clone()));
+                outs.push((i.target, stack.len()));
             }
             if is_terminator(i.op) && !is_exit_op(i.op) {
                 terminated = true;
@@ -1824,25 +1928,14 @@ fn optimize_load_fast(cfg: &mut Cfg) {
         }
         if !terminated && cfg.falls_through(b) {
             if let Some(nb) = cfg.next_in_order(&pos, b) {
-                outs.push((nb, stack.clone()));
+                outs.push((nb, stack.len()));
             }
         }
-        for (t, s) in outs {
-            if cfg.blocks[t as usize].is_handler {
-                mark_all(&s, &mut unsafe_);
-                continue;
-            }
-            match &entry[t as usize] {
-                None => {
-                    entry[t as usize] = Some(s);
-                    work.push(t);
-                }
-                Some(old) => {
-                    if *old != s {
-                        mark_all(old, &mut unsafe_);
-                        mark_all(&s, &mut unsafe_);
-                    }
-                }
+        mark_all(&stack, &mut unsafe_);
+        for (t, depth) in outs {
+            if !cfg.blocks[t as usize].is_handler && entry[t as usize].is_none() {
+                entry[t as usize] = Some(depth);
+                work.push(t);
             }
         }
     }

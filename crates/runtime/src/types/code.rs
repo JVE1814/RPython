@@ -412,6 +412,8 @@ pub fn wconst_to_obj(c: &rpy_compiler::wordcode::Constant, filename: &PyRef) -> 
             crate::types::slice::new_slice(&a, &b, &s)
         }
         C::Code(co) => new_code_from_wordcode(co, Some(filename))?,
+        // placeholders of the compiler test hooks; they substitute the real objects
+        C::Opaque(_) => none::none_ref(),
     })
 }
 

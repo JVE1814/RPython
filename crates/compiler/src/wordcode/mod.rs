@@ -545,6 +545,9 @@ pub enum Constant {
     /// `slice(start, stop, step)` of constants
     Slice(Box<[Constant; 3]>),
     Code(Box<CodeObject>),
+    /// a constant the compiler cannot represent, by its index in an outside constant list
+    /// (only produced by the test hooks that take constants from Python)
+    Opaque(u32),
 }
 
 /// The public fields of a code object, as CPython 3.15 defines them.
