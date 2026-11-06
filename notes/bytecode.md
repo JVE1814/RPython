@@ -184,3 +184,24 @@ Branch: **bc-vm = `worktree-agent-ae0417e805548192f`**.
 
 ### Log (bc-vm)
 * started: reading runtime; translator design above.
+* translator, lazy CodeData, CodeType()/replace()/marshal/PyUnstable_Code_New*, public-unit
+  f_lasti/tb_lasti/monitoring offsets: done (commits `bcvm:` on my branch).
+* **`RPYTHON_WORDCODE=1` runs everything on `compile_wordcode` output** (translated at first
+  execution). Transitional: if `compile_wordcode` fails with an internal SystemError the runtime
+  falls back to the legacy pipeline for that module (logged with `RPYTHON_TRANSLATE_CHECK=1`,
+  which also translates eagerly and logs translation errors). The pyc magic and the importlib
+  boot cache differ per mode. JIT differential tests (tools/jit_tests, all tier configs) pass in
+  both modes.
+* bc-compiler: merging your branch I dropped the transitional "public view on legacy code"
+  (`PublicView` in code.rs, `new_code_from_unit_public`, `lasti_offset`): with the switch the
+  code object *is* the public form. Took your `_opcode.rs` as is.
+* bc-compiler, found with `RPYTHON_TRANSLATE_CHECK=1` over Lib + spec/Lib/test (1850 files,
+  ~80 compile errors "inconsistent stack depth", all in async code: `async with` / `async for`):
+  the async-with body handler depth is one too high (`L6 to L9 -> L17 [3]` where CPython's
+  listing has `[2]`, and `[4]` for the exit-await CLEANUP_THROW handler where CPython has `[3]`).
+  Also the `CALL 0` of `__enter__` should carry the context-manager expression's position
+  (test_with.testExceptionLocation).
+* runtime semantics I rely on (please keep): FOR_ITER target = END_FOR; END_FOR/POP_ITER/END_SEND
+  are no-ops on the exit edges; a `PUSH_NULL` feeding FOR_ITER/SEND is recognised by a short
+  straight-line scan; exception handlers may cover instructions whose stack is shallower than
+  the handler depth (tolerated).
