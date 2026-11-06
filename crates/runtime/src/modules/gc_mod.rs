@@ -21,6 +21,7 @@ static CALLBACKS: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
 static FROZEN: AtomicUsize = AtomicUsize::new(0);
 static THRESHOLD1: AtomicI64 = AtomicI64::new(10);
 static THRESHOLD2: AtomicI64 = AtomicI64::new(0);
+static GEN_COUNTS: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
 static COLLECTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn module_list(p: &AtomicPtr<PyObject>) -> PyRef {
@@ -47,7 +48,7 @@ fn gc_isenabled(_m: &PyObject) -> PyResult {
     Ok(bool_::new_bool(crate::gc::ENABLED.load(Acquire)))
 }
 
-fn run_callbacks(phase: &str, generation: i64, collected: usize, uncollectable: usize) {
+fn run_callbacks(phase: &str, generation: i64, collected: usize, uncollectable: usize, candidates: usize, duration: f64) {
     let cbs = module_list(&CALLBACKS);
     if list::list_len(&cbs) == 0 {
         return;
@@ -56,6 +57,8 @@ fn run_callbacks(phase: &str, generation: i64, collected: usize, uncollectable: 
     let _ = dict::set_item_str(&info, "generation", &int::new_int(generation));
     let _ = dict::set_item_str(&info, "collected", &int::new_int(collected as i64));
     let _ = dict::set_item_str(&info, "uncollectable", &int::new_int(uncollectable as i64));
+    let _ = dict::set_item_str(&info, "candidates", &int::new_int(candidates as i64));
+    let _ = dict::set_item_str(&info, "duration", &crate::types::float::new_float(duration));
     let ph = pystr::new_str(phase);
     for cb in list::list_to_vec(&cbs) {
         if ab::call(&cb, &[&ph, &info]).is_err() {
@@ -69,10 +72,27 @@ pub fn collect_with_callbacks(generation: i64) -> usize {
     if COLLECTING.swap(true, AcqRel) {
         return 0;
     }
-    run_callbacks("start", generation, 0, 0);
+    run_callbacks("start", generation, 0, 0, 0, 0.0);
     let before_unc = crate::gc::UNCOLLECTABLE.load(Relaxed);
     let before = gc_totals();
+    let cand0 = crate::gc_support::CANDIDATES.load(Relaxed);
+    let dur0 = crate::gc_support::DURATION_NS.load(Relaxed);
     let n = crate::gc::collect();
+    match generation {
+        0 => {
+            GEN_COUNTS[0].fetch_add(1, Relaxed);
+        }
+        1 => {
+            GEN_COUNTS[0].store(0, Relaxed);
+            GEN_COUNTS[1].fetch_add(1, Relaxed);
+        }
+        _ => {
+            GEN_COUNTS[0].store(0, Relaxed);
+            GEN_COUNTS[1].store(0, Relaxed);
+        }
+    }
+    let candidates = crate::gc_support::CANDIDATES.load(Relaxed).saturating_sub(cand0);
+    let duration = crate::gc_support::DURATION_NS.load(Relaxed).saturating_sub(dur0) as f64 / 1e9;
     if generation < 2 {
         let after = gc_totals();
         for i in 0..4 {
@@ -80,7 +100,7 @@ pub fn collect_with_callbacks(generation: i64) -> usize {
         }
     }
     let unc = crate::gc::UNCOLLECTABLE.load(Relaxed).saturating_sub(before_unc);
-    run_callbacks("stop", generation, n, unc);
+    run_callbacks("stop", generation, n.saturating_sub(unc), unc, candidates, duration);
     COLLECTING.store(false, Release);
     n
 }
@@ -100,7 +120,13 @@ fn gc_collect(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRes
 
 fn gc_get_count(_m: &PyObject) -> PyResult {
     let n = crate::gc::tracked_count().max(0) as i64;
-    Ok(tuple::new_tuple(vec![int::new_int(n % (crate::gc::THRESHOLD.load(Relaxed).max(1) as i64)), int::new_int(0), int::new_int(0)]))
+    // [1] and [2]: collections of the younger generation since the last one of
+    // this generation (explicit gc.collect(n) calls)
+    Ok(tuple::new_tuple(vec![
+        int::new_int(n % (crate::gc::THRESHOLD.load(Relaxed).max(1) as i64)),
+        int::new_int(GEN_COUNTS[0].load(Relaxed) as i64),
+        int::new_int(GEN_COUNTS[1].load(Relaxed) as i64),
+    ]))
 }
 fn gc_get_threshold(_m: &PyObject) -> PyResult {
     Ok(tuple::new_tuple(vec![
@@ -200,6 +226,20 @@ fn gc_get_referrers(_m: &PyObject, args: &[&PyObject]) -> PyResult {
 }
 
 fn gc_is_tracked(_m: &PyObject, o: &PyObject) -> PyResult {
+    if crate::types::typeobject::is_type(o) {
+        // Types of extension modules (dotted tp_name) are statically allocated
+        // here but are collectable heap types in the reference implementation;
+        // report them as tracked like any heap type.
+        let tp = o.as_ptr() as *mut PyTypeObject;
+        unsafe {
+            if (*tp).tp_flags & Py_TPFLAGS_HEAPTYPE == 0 && !(*tp).tp_name.is_null() {
+                let name = std::ffi::CStr::from_ptr((*tp).tp_name).to_bytes();
+                if name.contains(&b'.') && !name.starts_with(b"builtins.") {
+                    return Ok(bool_::new_bool(true));
+                }
+            }
+        }
+    }
     Ok(bool_::new_bool(crate::gc::is_tracked(o)))
 }
 fn gc_is_finalized(_m: &PyObject, o: &PyObject) -> PyResult {

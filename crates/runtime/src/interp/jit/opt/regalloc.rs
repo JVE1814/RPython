@@ -136,7 +136,11 @@ pub fn allocate(f: &Func) -> Alloc {
         let bi = b as usize;
         let (start, end) = pos_of_block[bi];
         // (iterate the set bits only: blocks x vregs is large for big units)
-        for (set, p) in [(&live_in[bi], start), (&live_out[bi], end)] {
+        // live-in values are live *before* the first instruction: a call there must
+        // count as crossed (their interval may otherwise start exactly at the call when
+        // all their definitions come later in the layout, e.g. the continuation of an
+        // inlined callee laid out before its return paths)
+        for (set, p) in [(&live_in[bi], start.saturating_sub(1)), (&live_out[bi], end)] {
             for (w, &bits) in set.iter().enumerate() {
                 let mut bits = bits;
                 while bits != 0 {

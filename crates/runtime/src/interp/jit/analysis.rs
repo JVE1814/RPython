@@ -69,14 +69,15 @@ pub fn effect(op: Op, arg: u32) -> (i32, i32) {
         BuildInterpolation => -1 - (arg & 1) as i32,
         ReturnValue => -1,
         RaiseVarargs => -a,
-        Reraise => -1 - (arg != 0) as i32,
+        Reraise => if arg & 0x100 != 0 { -1 } else { -1 - (arg != 0) as i32 },
         // jumps
         Jump => 0,
         PopJumpIfFalse | PopJumpIfTrue | PopJumpIfNone | PopJumpIfNotNone => -1,
         JumpIfFalseOrPop | JumpIfTrueOrPop => return (-1, 0),
         ForIter => return (1, -1),
         Send => return (0, -1),
-        Unused1 | Unused2 | Unused3 => 0,
+        Unused1 | Unused2 | Unused3 | ReturnGenerator => 0,
+        LoadSpecial => 1,
     };
     (d, d)
 }

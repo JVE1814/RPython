@@ -36,6 +36,14 @@ pub struct OneField {
     pub value: *mut PyObject,
 }
 
+/// ParamSpecArgs / ParamSpecKwargs: one field plus a weak reference list.
+#[repr(C)]
+pub struct OneFieldWeak {
+    pub ob_base: PyObject,
+    pub value: *mut PyObject,
+    pub weakreflist: *mut PyObject,
+}
+
 /// TypeAliasType layout.
 #[repr(C)]
 pub struct TypeAliasObject {
@@ -178,6 +186,7 @@ pub fn make_paramspec(name: &PyObject) -> PyResult {
 }
 pub fn make_typevartuple(name: &PyObject) -> PyResult {
     let o = new_param(typevartuple_type(), name)?;
+    set_field(&o, INFER, Some(bool_::new_bool(true)));
     set_module(&o, caller_module())?;
     Ok(o)
 }
@@ -343,7 +352,6 @@ fn typevar_new_impl(args: &PyObject, kw: *mut PyObject) -> PyResult {
     set_field(&o, INFER, Some(bool_::new_bool(infer)));
     if let Some(d) = k.get("default") {
         if !d.is(nodefault()) {
-            let d = if d.is(none::none()) { type_ref(none::none().type_ptr()) } else { d };
             set_field(&o, DEFAULT, Some(d));
         }
     }
@@ -372,10 +380,8 @@ fn paramspec_new_impl(args: &PyObject, kw: *mut PyObject) -> PyResult {
     if infer && (cov || contra) {
         raise!(ValueError, "Variance cannot be specified with infer_variance.");
     }
-    let mut bound = k.get("bound").filter(|b| !b.is(none::none()));
-    if let Some(b) = &bound {
-        bound = Some(type_check(b, "Bound must be a type.")?);
-    }
+    // a ParamSpec bound may be any object (e.g. a list of types)
+    let bound = k.get("bound").filter(|b| !b.is(none::none()));
     let o = new_param(paramspec_type(), &nm)?;
     set_field(&o, BOUND, bound);
     set_field(&o, COVARIANT, Some(bool_::new_bool(cov)));
@@ -383,7 +389,6 @@ fn paramspec_new_impl(args: &PyObject, kw: *mut PyObject) -> PyResult {
     set_field(&o, INFER, Some(bool_::new_bool(infer)));
     if let Some(d) = k.get("default") {
         if !d.is(nodefault()) {
-            let d = if d.is(none::none()) { type_ref(none::none().type_ptr()) } else { d };
             set_field(&o, DEFAULT, Some(d));
         }
     }
@@ -395,7 +400,7 @@ unsafe extern "C" fn typevartuple_new(_tp: *mut PyTypeObject, args: *mut PyObjec
     unsafe { into_c(typevartuple_new_impl(&*args, kw)) }
 }
 fn typevartuple_new_impl(args: &PyObject, kw: *mut PyObject) -> PyResult {
-    let names = ["name", "default"];
+    let names = ["name", "bound", "covariant", "contravariant", "infer_variance", "default"];
     let mut k = parse_kw("TypeVarTuple", &names, kw)?;
     let a = tuple::tuple_items(args);
     if a.len() > 1 {
@@ -403,7 +408,21 @@ fn typevartuple_new_impl(args: &PyObject, kw: *mut PyObject) -> PyResult {
     }
     k.take_pos("name", a.first().copied(), "TypeVarTuple", 1)?;
     let nm = check_name("TypeVarTuple", k.get("name"))?;
+    let cov = truthy(k.get("covariant"))?;
+    let contra = truthy(k.get("contravariant"))?;
+    let infer = truthy(k.get("infer_variance"))?;
+    if cov && contra {
+        raise!(ValueError, "Bivariant type variables are not supported.");
+    }
+    if infer && (cov || contra) {
+        raise!(ValueError, "Variance cannot be specified with infer_variance.");
+    }
     let o = new_param(typevartuple_type(), &nm)?;
+    // the bound is stored as given (no type check), like ParamSpec's
+    set_field(&o, BOUND, k.get("bound").filter(|b| !b.is(none::none())));
+    set_field(&o, COVARIANT, Some(bool_::new_bool(cov)));
+    set_field(&o, CONTRAVARIANT, Some(bool_::new_bool(contra)));
+    set_field(&o, INFER, Some(bool_::new_bool(infer)));
     if let Some(d) = k.get("default") {
         if !d.is(nodefault()) {
             set_field(&o, DEFAULT, Some(d));
@@ -495,7 +514,7 @@ unsafe extern "C" fn typevar_repr(o: *mut PyObject) -> *mut PyObject {
     unsafe {
         let o = &*o;
         let nm = pystr::to_string_lossy(&get_name(o).unwrap());
-        let s = if o.is_type(typevartuple_type()) || flag(o, INFER) {
+        let s = if flag(o, INFER) {
             nm
         } else if flag(o, COVARIANT) {
             format!("+{}", nm)
@@ -922,7 +941,12 @@ pub fn init_types() {
         t.tp_new = Some(typevartuple_new);
         t.tp_iter = Some(typevartuple_iter);
         t.tp_getset = common_getset(vec![
+            g("__bound__", gt(get_bound)),
+            g("__covariant__", gt(get_covariant)),
+            g("__contravariant__", gt(get_contravariant)),
+            g("__infer_variance__", gt(get_infer)),
             g("__default__", gt(get_default)),
+            g("evaluate_bound", gt(get_evaluate_bound)),
             g("evaluate_default", gt(get_evaluate_default)),
         ]);
         t.tp_methods = crate::mdefs![
@@ -934,8 +958,9 @@ pub fn init_types() {
         ];
 
         for (t, nm) in [(paramspecargs_type(), "typing.ParamSpecArgs"), (paramspeckwargs_type(), "typing.ParamSpecKwargs")] {
-            lu::setup_ptr_type(t, nm, std::mem::size_of::<OneField>(), 0);
+            lu::setup_ptr_type(t, nm, std::mem::size_of::<OneFieldWeak>(), 0);
             let tt = &mut *t;
+            tt.tp_weaklistoffset = std::mem::offset_of!(OneFieldWeak, weakreflist) as isize;
             tt.tp_new = Some(psa_new);
             tt.tp_repr = Some(psa_repr);
             tt.tp_richcompare = Some(psa_richcompare);

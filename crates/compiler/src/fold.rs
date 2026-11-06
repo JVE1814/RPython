@@ -44,6 +44,14 @@ pub fn fold_module(m: &mut Mod, optimize: i32, future: u32, warnings: &mut Vec<W
     f.fold_mod(m)
 }
 
+/// AST pass of the wordcode pipeline: warnings, match-value folding and `%`-format rewriting
+/// only (constant expressions are folded by the CFG optimiser, as in CPython 3.14+).
+pub fn fold_module_ast_only(m: &mut Mod, optimize: i32, future: u32, warnings: &mut Vec<Warning>, max_depth: u32) -> R {
+    let string_annotations = future & crate::cf::CO_FUTURE_ANNOTATIONS != 0;
+    let mut f = Folder { optimize, full: false, warnings: Some(warnings), depth: 0, max_depth, ctx: Vec::new(), string_annotations };
+    f.fold_mod(m)
+}
+
 pub fn optimize_ast(m: &mut Mod, optimize: i32, _flags: u32) -> R {
     if optimize <= 0 {
         return Ok(());
@@ -421,7 +429,7 @@ fn const_size(c: &Constant) -> usize {
     }
 }
 
-fn fold_binop(op: Operator, a: &Constant, b: &Constant) -> Option<Constant> {
+pub(crate) fn fold_binop(op: Operator, a: &Constant, b: &Constant) -> Option<Constant> {
     if let (Some(x), Some(y)) = (num_of(a), num_of(b)) {
         // bool & bool, bool | bool, bool ^ bool stay bool
         if let (Constant::Bool(p), Constant::Bool(q)) = (a, b) {
@@ -510,7 +518,7 @@ fn repeat(seq: &Constant, n: i128) -> Option<Constant> {
     }
 }
 
-fn fold_unary(op: UnaryOp, c: &Constant) -> Option<Constant> {
+pub(crate) fn fold_unary(op: UnaryOp, c: &Constant) -> Option<Constant> {
     match op {
         UnaryOp::Not => crate::codegen::const_truth(c).map(|t| Constant::Bool(!t)),
         UnaryOp::USub => match c {

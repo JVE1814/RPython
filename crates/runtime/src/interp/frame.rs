@@ -28,6 +28,8 @@ pub struct Frame {
     pub state: FrameState,
     /// Line of the last 'line' trace event (for sys.settrace).
     pub trace_line: i32,
+    /// Last instruction seen by the line tracer (u32::MAX: none yet).
+    pub trace_last: u32,
     /// Per-frame f_trace callable (owned).
     pub f_trace: *mut PyObject,
     pub f_trace_lines: bool,
@@ -152,6 +154,7 @@ impl Frame {
             generator: std::ptr::null_mut(),
             state: FrameState::Created,
             trace_line: -1,
+            trace_last: u32::MAX,
             f_trace: std::ptr::null_mut(),
             f_trace_lines: true,
             f_trace_opcodes: false,
@@ -205,6 +208,7 @@ impl Frame {
             f.generator = std::ptr::null_mut();
             f.state = FrameState::Created;
             f.trace_line = -1;
+            f.trace_last = u32::MAX;
             f.f_trace = std::ptr::null_mut();
             f.f_trace_lines = true;
             f.f_trace_opcodes = false;
@@ -236,6 +240,7 @@ impl Frame {
             generator: std::ptr::null_mut(),
             state: FrameState::Created,
             trace_line: -1,
+            trace_last: u32::MAX,
             f_trace: std::ptr::null_mut(),
             f_trace_lines: true,
             f_trace_opcodes: false,
@@ -282,7 +287,7 @@ impl Frame {
 
     /// Current line number.
     pub fn lineno(&self) -> i32 {
-        crate::types::code::line_for_instr(self.code(), self.lasti as usize).map(|l| l as i32).unwrap_or(-1)
+        crate::types::code::frame_line(self.code(), self.lasti as usize).map(|l| l as i32).unwrap_or(-1)
     }
 }
 impl Frame {
@@ -347,6 +352,7 @@ impl Frame {
         self.generator = std::ptr::null_mut();
         self.state = FrameState::Created;
         self.trace_line = -1;
+        self.trace_last = u32::MAX;
         self.f_trace_lines = true;
         self.f_trace_opcodes = false;
         self.yield_from_send = -1;

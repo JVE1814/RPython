@@ -261,6 +261,10 @@ fn get_parameters(o: &PyObject) -> PyResult {
 fn get_origin(_o: &PyObject) -> PyResult {
     Ok(type_ref(union_type()))
 }
+fn get_module(_o: &PyObject) -> PyResult {
+    Ok(pystr::new_str("typing"))
+}
+
 fn get_name(_o: &PyObject) -> PyResult {
     Ok(pystr::new_str("Union"))
 }
@@ -326,6 +330,7 @@ pub fn init_types() {
             ("__origin__", get_origin),
             ("__name__", get_name),
             ("__qualname__", get_name),
+            ("__module__", get_module),
         ];
     }
 }

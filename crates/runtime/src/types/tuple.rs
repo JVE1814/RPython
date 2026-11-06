@@ -248,11 +248,18 @@ unsafe extern "C" fn tuple_repr(o: *mut PyObject) -> *mut PyObject {
             let mut sb = pystr::StrBuilder::new();
             sb.push('(' as u32);
             let res = (|| {
-                for (i, it) in items.iter().enumerate() {
+                // a tuple from PyTuple_New may still hold NULL items: shown as <NULL>
+                let raw = item_ptr(o.as_ptr());
+                for i in 0..items.len() {
                     if i > 0 {
                         sb.push_str(", ");
                     }
-                    sb.push_obj(&*ab::repr(it)?);
+                    let p = *raw.add(i);
+                    if p.is_null() {
+                        sb.push_str("<NULL>");
+                    } else {
+                        sb.push_obj(&*ab::repr(&*p)?);
+                    }
                 }
                 Ok::<(), PyErr>(())
             })();

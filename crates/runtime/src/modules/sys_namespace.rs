@@ -30,6 +30,11 @@ pub fn namespace_type() -> *mut PyTypeObject {
         return o;
     }
     unsafe {
+        // sys.implementation & co. are types.SimpleNamespace instances
+        let real = crate::types::namespace::namespace_type();
+        if (*real).tp_flags & Py_TPFLAGS_READY != 0 {
+            return real;
+        }
         let tp = &raw mut NS_TYPE;
         if (*tp).tp_flags & Py_TPFLAGS_READY == 0 {
             init_type();

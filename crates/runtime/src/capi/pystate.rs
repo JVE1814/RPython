@@ -194,22 +194,10 @@ pub unsafe extern "C" fn PyThreadState_Next(ts: *mut c_void) -> *mut c_void {
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyThreadState_SetAsyncExc(id: std::ffi::c_ulong, exc: *mut PyObject) -> c_int {
-    unsafe {
-        let g = threads::ALL_THREADS.lock().unwrap();
-        let mut n = 0;
-        for &t in g.iter() {
-            let ts = &mut *(t as *mut ThreadState);
-            if ts.c.thread_id == id {
-                let old = std::mem::replace(&mut ts.c.async_exc, if exc.is_null() { std::ptr::null_mut() } else { (*exc).to_ref().into_raw() });
-                xdecref(old);
-                if !exc.is_null() {
-                    ts.c.eval_breaker.fetch_or(threads::EVAL_ASYNC_EXC, std::sync::atomic::Ordering::Release);
-                }
-                n += 1;
-            }
-        }
-        n
-    }
+    // the pending exception lives in ThreadState::async_exc, where the eval
+    // breaker looks for it
+    let exc = if exc.is_null() { None } else { Some(unsafe { &*exc }) };
+    crate::modules::thread::set_async_exc(id as u64, exc) as c_int
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyThreadState_EnterTracing(ts: *mut c_void) {
@@ -565,32 +553,79 @@ pub unsafe extern "C" fn PyThreadState_Release(tok: *mut c_void) {
 }
 // ---------------------------------------------------------------- pending calls
 
-static PENDING: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+// Two queues as in CPython: calls for the main thread (Py_AddPendingCall, at most 32 queued)
+// and calls any thread of the interpreter may run (at most 300). Queuing sets EVAL_PENDING
+// in the eval breaker of the thread(s) that may run them; the interpreter then calls
+// `run_pending_calls` between instructions.
+static PENDING_MAIN: Mutex<std::collections::VecDeque<(usize, usize)>> = Mutex::new(std::collections::VecDeque::new());
+static PENDING_ANY: Mutex<std::collections::VecDeque<(usize, usize)>> = Mutex::new(std::collections::VecDeque::new());
+const MAX_PENDING_MAIN: usize = 32;
+const MAX_PENDING_ANY: usize = 300;
+
+fn request_pending(ts: *const ThreadState) {
+    if !ts.is_null() {
+        unsafe { (*ts).c.eval_breaker.fetch_or(threads::EVAL_PENDING, std::sync::atomic::Ordering::Release) };
+    }
+}
+/// Queue `f(arg)`; `main_only`: only the main thread runs it. -1 if the queue is full.
+pub(crate) fn add_pending_call(f: unsafe extern "C" fn(*mut c_void) -> c_int, arg: *mut c_void, main_only: bool) -> c_int {
+    let (q, max) = if main_only { (&PENDING_MAIN, MAX_PENDING_MAIN) } else { (&PENDING_ANY, MAX_PENDING_ANY) };
+    {
+        let mut g = q.lock().unwrap();
+        if g.len() >= max {
+            return -1;
+        }
+        g.push_back((f as usize, arg as usize));
+    }
+    request_pending(threads::MAIN_THREAD_STATE.load(std::sync::atomic::Ordering::Acquire));
+    if !main_only {
+        // any thread may serve it: wake them all (the first to look takes it)
+        for &t in threads::ALL_THREADS.lock().unwrap().iter() {
+            request_pending(t as *const ThreadState);
+        }
+    }
+    0
+}
+/// Run queued calls this thread may run (eval breaker, Py_MakePendingCalls).
+pub(crate) fn run_pending_calls() -> PyResult<()> {
+    let ts = threads::current_ptr();
+    if !ts.is_null() {
+        unsafe { (*ts).c.eval_breaker.fetch_and(!threads::EVAL_PENDING, std::sync::atomic::Ordering::AcqRel) };
+    }
+    let main = threads::is_main_thread();
+    loop {
+        let item = {
+            let a = if main { PENDING_MAIN.lock().unwrap().pop_front() } else { None };
+            match a {
+                Some(x) => Some(x),
+                None => PENDING_ANY.lock().unwrap().pop_front(),
+            }
+        };
+        let Some((f, arg)) = item else { return Ok(()) };
+        let f: unsafe extern "C" fn(*mut c_void) -> c_int = unsafe { std::mem::transmute(f) };
+        if unsafe { f(arg as *mut c_void) } < 0 {
+            // leave the rest for the next check
+            if !PENDING_ANY.lock().unwrap().is_empty() || (main && !PENDING_MAIN.lock().unwrap().is_empty()) {
+                request_pending(ts);
+            }
+            if !err_occurred() {
+                let _ = system_error("pending call failed without setting an exception");
+            }
+            return Err(PyErr);
+        }
+    }
+}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Py_AddPendingCall(func: Option<unsafe extern "C" fn(*mut c_void) -> c_int>, arg: *mut c_void) -> c_int {
     let Some(f) = func else { return -1 };
-    let mut g = PENDING.lock().unwrap();
-    if g.len() >= 300 {
-        return -1;
-    }
-    g.push((f as usize, arg as usize));
-    0
+    add_pending_call(f, arg, true)
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Py_MakePendingCalls() -> c_int {
-    loop {
-        let item = {
-            let mut g = PENDING.lock().unwrap();
-            if g.is_empty() {
-                return 0;
-            }
-            g.remove(0)
-        };
-        let f: unsafe extern "C" fn(*mut c_void) -> c_int = unsafe { std::mem::transmute(item.0) };
-        if unsafe { f(item.1 as *mut c_void) } < 0 {
-            return -1;
-        }
+    if !threads::is_main_thread() {
+        return 0;
     }
+    ret_i(run_pending_calls())
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _PyThread_CurrentFrames() -> *mut PyObject {

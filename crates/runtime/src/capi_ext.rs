@@ -172,6 +172,11 @@ unsafe fn create_from_initfunc(
             }
             return Err(PyErr);
         }
+        if (*r).type_ptr().is_null() {
+            // a PyModuleDef that never went through PyModuleDef_Init (no type,
+            // no reference count to give back)
+            raise!(SystemError, "init function of {} returned uninitialized object", name.rsplit('.').next().unwrap());
+        }
         let ro = PyRef::from_raw(r);
         if is_moduledef(&ro) {
             let def = ro.as_ptr() as *mut PyModuleDef;

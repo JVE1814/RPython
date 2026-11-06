@@ -117,8 +117,10 @@ fn kind_name(o: &PyObject) -> &'static str {
 
 /// Resume a generator. `exc`: throw this exception at the suspension point.
 pub fn gen_send_ex(o: &PyObject, arg: Option<&PyObject>, throw: Option<PyRef>, closing: bool) -> PyResult<SendResult> {
+    // no GIL: claiming the generator must be atomic (two threads may resume it at once)
     let gn = g(o);
-    if gn.running {
+    let flag = unsafe { &*(&raw mut gn.running as *const std::sync::atomic::AtomicBool) };
+    if flag.compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire).is_err() {
         let msg = if is_coroutine_exact(o) {
             "coroutine already executing"
         } else if is_asyncgen(o) {
@@ -128,6 +130,13 @@ pub fn gen_send_ex(o: &PyObject, arg: Option<&PyObject>, throw: Option<PyRef>, c
         };
         raise!(ValueError, "{}", msg);
     }
+    let r = gen_send_claimed(o, arg, throw, closing);
+    flag.store(false, std::sync::atomic::Ordering::Release);
+    r
+}
+
+fn gen_send_claimed(o: &PyObject, arg: Option<&PyObject>, throw: Option<PyRef>, closing: bool) -> PyResult<SendResult> {
+    let gn = g(o);
     if gn.frame.is_null() || unsafe { (*gn.frame).state == FrameState::Completed || (*gn.frame).state == FrameState::Cleared } {
         if is_coroutine_exact(o) && !closing {
             raise!(RuntimeError, "cannot reuse already awaited coroutine");
@@ -148,8 +157,10 @@ pub fn gen_send_ex(o: &PyObject, arg: Option<&PyObject>, throw: Option<PyRef>, c
                 raise!(TypeError, "can't send non-None value to a just-started {}", kind_name(o));
             }
         }
-    } else if throw.is_none() {
-        let v = arg.map(|a| a.to_ref()).unwrap_or_else(none::none_ref);
+    } else {
+        // the suspended YIELD_VALUE produces its result first (the sent value, or None
+        // when an exception is thrown in): handlers covering the yield count that slot
+        let v = if throw.is_none() { arg.map(|a| a.to_ref()).unwrap_or_else(none::none_ref) } else { none::none_ref() };
         frame.slots[frame.stack_top] = v.into_raw();
         frame.stack_top += 1;
     }
@@ -160,7 +171,6 @@ pub fn gen_send_ex(o: &PyObject, arg: Option<&PyObject>, throw: Option<PyRef>, c
         gn.exc_state.previous_item = (*ts_mut).c.exc_info;
         (*ts_mut).c.exc_info = &mut gn.exc_state;
     }
-    gn.running = true;
     // compiled code that suspends the frame again records its continuation
     frame.resume = 0;
     let r = crate::interp::enter_recursive_call(ts, "").and_then(|_| {
@@ -168,7 +178,6 @@ pub fn gen_send_ex(o: &PyObject, arg: Option<&PyObject>, throw: Option<PyRef>, c
         crate::interp::leave_recursive_call(ts);
         r
     });
-    gn.running = false;
     unsafe {
         let ts_mut = ts as *const _ as *mut crate::threads::ThreadState;
         (*ts_mut).c.exc_info = gn.exc_state.previous_item;
@@ -194,8 +203,16 @@ pub fn gen_send_ex(o: &PyObject, arg: Option<&PyObject>, throw: Option<PyRef>, c
 #[inline]
 pub fn gen_send_fast(o: &PyObject, arg: *mut PyObject) -> PyResult<SendResult> {
     let gn = g(o);
+    let argo = || if arg.is_null() { None } else { Some(unsafe { &*arg }) };
+    // claim the generator (as gen_send_ex does); a failed claim reports "already
+    // executing" through the general path
+    let flag = unsafe { &*(&raw mut gn.running as *const std::sync::atomic::AtomicBool) };
+    if flag.compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire).is_err() {
+        return gen_send_ex(o, argo(), None, false);
+    }
     let fp = gn.frame;
-    if !gn.running && !fp.is_null() {
+    let mut r = None;
+    if !fp.is_null() {
         let f = unsafe { &mut *fp };
         if f.resume != 0 && !crate::modules::sys::tracing_active() && crate::interp::jit::genfast_enabled() {
             let ok = match f.state {
@@ -207,12 +224,17 @@ pub fn gen_send_fast(o: &PyObject, arg: *mut PyObject) -> PyResult<SendResult> {
                 let ts = crate::threads::current();
                 let d = ts.recursion_depth.get() + 1;
                 if d <= ts.c.py_recursion_limit && crate::interp::stack_pointer() >= ts.stack_soft_limit() {
-                    return resume_compiled(ts, gn, f, arg, d);
+                    r = Some(resume_compiled(ts, gn, f, arg, d));
                 }
             }
         }
     }
-    gen_send_ex(o, if arg.is_null() { None } else { Some(unsafe { &*arg }) }, None, false)
+    let r = match r {
+        Some(r) => r,
+        None => gen_send_claimed(o, argo(), None, false),
+    };
+    flag.store(false, std::sync::atomic::Ordering::Release);
+    r
 }
 
 #[inline(always)]
@@ -230,7 +252,6 @@ fn resume_compiled(ts: &crate::threads::ThreadState, gn: &mut GenObject, f: &mut
         gn.exc_state.previous_item = (*tsm).c.exc_info;
         (*tsm).c.exc_info = &mut gn.exc_state;
     }
-    gn.running = true;
     let prev = ts.frame.get();
     f.prev = prev;
     ts.frame.set(f as *mut Frame);
@@ -249,7 +270,6 @@ fn resume_compiled(ts: &crate::threads::ThreadState, gn: &mut GenObject, f: &mut
     ts.frame.set(prev);
     f.prev = std::ptr::null_mut();
     ts.recursion_depth.set(depth - 1);
-    gn.running = false;
     unsafe {
         (*tsm).c.exc_info = gn.exc_state.previous_item;
     }
@@ -834,10 +854,10 @@ pub fn get_awaitable_iter(o: &PyObject) -> PyResult {
             if let Some(f) = (*am).am_await {
                 let r = from_c(f(o.as_ptr()))?;
                 if is_coroutine_exact(&r) || gen_is_iterable_coroutine(&r) {
-                    raise!(TypeError, "__await__() returned a coroutine");
+                    raise!(TypeError, "__await__() must return an iterator, not coroutine");
                 }
                 if r.ty().tp_iternext.is_none() {
-                    raise!(TypeError, "__await__() returned non-iterator of type '{}'", tname(&r));
+                    raise!(TypeError, "__await__() must return an iterator, not {}", tname(&r));
                 }
                 return Ok(r);
             }

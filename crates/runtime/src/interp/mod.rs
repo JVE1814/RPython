@@ -6,6 +6,9 @@ pub mod frame;
 pub mod jump;
 pub mod jit;
 pub mod specialize;
+pub mod adaptive;
+pub mod translate;
+pub mod wc;
 
 use crate::errors::*;
 use crate::ffi::*;
@@ -70,6 +73,19 @@ pub fn current_globals() -> Option<PyRef> {
     unsafe { Some(PyRef::from_borrowed((*f).globals)) }
 }
 
+/// builtins mapping of the currently executing frame, else the builtins dict
+/// (PyEval_GetBuiltins).
+pub fn current_builtins() -> PyRef {
+    let f = crate::threads::current().frame.get();
+    if !f.is_null() {
+        let b = unsafe { (*f).builtins };
+        if !b.is_null() {
+            return unsafe { PyRef::from_borrowed(b) };
+        }
+    }
+    crate::builtins::builtins_dict()
+}
+
 pub fn current_frame_ptr() -> *mut Frame {
     crate::threads::current().frame.get()
 }
@@ -105,6 +121,7 @@ pub fn call_function(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwna
             && nargs == cobj.co_argcount as usize
             && flags & (bc::co::VARARGS | bc::co::VARKEYWORDS) == 0
             && cobj.co_kwonlyargcount == 0
+            && !code::code_data(co).eager_prologue
         {
             let mut frame = Frame::new_call(co, func, unsafe { &*f.func_globals }, unsafe { &*f.func_builtins });
             for (i, &a) in args[..nargs].iter().enumerate() {
@@ -119,6 +136,11 @@ pub fn call_function(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwna
     }
     // plain calls borrow code/func from the caller (perf-runtime, frame.rs `owns_fc`)
     let mut frame = Frame::new_call(co, func, unsafe { &*f.func_globals }, unsafe { &*f.func_builtins });
+    if flags & bc::co::OPTIMIZED == 0 && frame.locals.is_null() {
+        // a function made from module-level code (FunctionType(compile(...)))
+        // stores its names into its globals
+        frame.locals = unsafe { (*f.func_globals).to_ref().into_raw() };
+    }
     if let Err(e) = bind_arguments(func, &mut frame, args, nargs, kwnames) {
         frame::recycle(frame);
         return Err(e);
@@ -126,6 +148,11 @@ pub fn call_function(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwna
     if flags & (bc::co::GENERATOR | bc::co::COROUTINE | bc::co::ASYNC_GENERATOR) != 0 {
         frame.make_owned();
         prepare_cells(&mut frame, f);
+        if code::code_data(co).eager_prologue {
+            // RETURN_GENERATOR is preceded by real work (a genexpr's `iter()`): run the
+            // frame up to it now, so errors surface at call time.
+            frame = run_generator_prologue(frame)?;
+        }
         return crate::types::genobject::new_generator_for(frame, func, flags);
     }
     prepare_cells(&mut frame, f);
@@ -146,11 +173,43 @@ pub fn run_frame(mut frame: Box<Frame>) -> PyResult {
     }
 }
 
+/// Run a generator frame's eager prologue up to the internal `ReturnGenerator`; the frame
+/// is then "just created" again (nothing is pushed on the first resume).
+fn run_generator_prologue(mut frame: Box<Frame>) -> PyResult<Box<Frame>> {
+    let ts = crate::threads::current();
+    if let Err(e) = enter_recursive_call(ts, "") {
+        frame_finished(frame);
+        return Err(e);
+    }
+    let r = eval::eval_frame(ts, &mut frame, None);
+    leave_recursive_call(ts);
+    match r {
+        Ok(Exit::Yield(_)) => {
+            frame.state = frame::FrameState::Created;
+            Ok(frame)
+        }
+        Ok(Exit::Return(_)) => {
+            frame_finished(frame);
+            Err(system_error("generator prologue returned"))
+        }
+        Err(e) => {
+            frame_finished(frame);
+            Err(e)
+        }
+    }
+}
+
 /// Called when a frame completes: hand it to its frame object if one exists.
 pub fn frame_finished(mut frame: Box<Frame>) {
     frame.state = frame::FrameState::Completed;
     frame.clear_stack();
     if !frame.frame_obj.is_null() {
+        // the frame object outlives the activation: it keeps its caller as f_back
+        let caller = crate::threads::current().frame.get();
+        if !caller.is_null() && !std::ptr::eq(caller, &*frame) {
+            let back = eval::frame_object(unsafe { &mut *caller });
+            unsafe { crate::types::frameobject::set_back(frame.frame_obj, back) };
+        }
         frame.make_owned();
         unsafe { crate::types::frameobject::take_ownership(frame.frame_obj, frame) };
     } else {
@@ -246,6 +305,21 @@ pub fn bind_arguments(func: &PyObject, frame: &mut Frame, args: &[*mut PyObject]
                         posonly_as_kw.push(pystr::to_string_lossy(key));
                         continue;
                     }
+                    // a positional-only name passed by keyword anywhere in the call
+                    // is reported in preference to the unknown keyword (grind-lib)
+                    let po: Vec<String> = tuple::tuple_items(kn)
+                        .iter()
+                        .filter(|k| names[..posonly].iter().any(|n| pystr::str_eq(n, k)))
+                        .map(|k| pystr::to_string_lossy(k))
+                        .collect();
+                    if !po.is_empty() {
+                        raise!(
+                            TypeError,
+                            "{}() got some positional-only arguments passed as keyword arguments: '{}'",
+                            qualname(),
+                            po.join(", ")
+                        );
+                    }
                     let ks = pystr::to_string_lossy(key);
                     let suggestion = crate::modules::suggestions::suggest_keyword(&ks, &names[..total_named]);
                     match suggestion {
@@ -272,7 +346,7 @@ pub fn bind_arguments(func: &PyObject, frame: &mut Frame, args: &[*mut PyObject]
     }
     // too many positional
     if nargs > argcount && !has_varargs {
-        let defcount = if f.func_defaults.is_null() { 0 } else { tuple::tuple_len(unsafe { &*f.func_defaults }) };
+        let defcount = if f.func_defaults.is_null() { 0 } else { tuple::tuple_len(unsafe { &*f.func_defaults }) }.min(argcount);
         let kwonly_given = (argcount..total_named).filter(|&i| !slots[i].is_null()).count();
         let plural = |n: usize| if n == 1 { "" } else { "s" };
         let takes = if defcount > 0 {
@@ -304,7 +378,7 @@ pub fn bind_arguments(func: &PyObject, frame: &mut Frame, args: &[*mut PyObject]
     // defaults for positional
     if nargs < argcount {
         let defs = if f.func_defaults.is_null() { &[][..] } else { tuple::tuple_items(unsafe { &*f.func_defaults }) };
-        // more defaults than positional parameters: the last ones apply
+        // more defaults than parameters: the surplus leading ones are ignored
         let defs = &defs[defs.len().saturating_sub(argcount)..];
         let first_default = argcount - defs.len();
         let mut missing: Vec<String> = Vec::new();
@@ -378,9 +452,9 @@ pub fn eval_code(code: &PyObject, globals: &PyObject, locals: Option<&PyObject>)
             }
         }
         None => {
-            let b = crate::builtins::builtins_module();
+            let b = current_builtins();
             dict::set_item(globals, crate::name!("__builtins__"), &b)?;
-            crate::builtins::builtins_dict()
+            b
         }
     };
     let frame = Frame::new(code, None, globals, &builtins, locals);

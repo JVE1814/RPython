@@ -302,3 +302,29 @@ parsing) takes ~3 s in release mode.
   built incrementally (bounded stack size); `a and b or c` tests each operand once;
   assert failures are located at the test expression; relative `from .__future__` is a
   plain import; "is" literal warning for constant tuple displays.
+
+## Wordcode pipeline (D24, bc-compiler)
+
+A second back end emits CPython 3.15 public wordcode (`co_code` bytes, `co_linetable`,
+`co_exceptiontable` in CPython's formats). Selected at run time with `RPYTHON_WORDCODE=1`;
+the runtime translates the public form to its internal form (bc-vm). Interface notes and the
+3.15 specifics the VM relies on are in `notes/bytecode.md`.
+
+* `wordcode` (public): opcode numbers generated from `spec/Include/opcode_ids.h` by
+  `tools/gen_opcodes/gen.sh` into `wordcode/opcodes.rs`; metadata (has_arg/const/name/jump/
+  free/local/exc, cache sizes, stack effects, intrinsics, NB_* ops, common constants,
+  specialisation families); `CodeObject` / `Constant` (public layout); exception-table and
+  linetable encoders/decoders; `instructions()` decoder; `wordcode::dis` (debug text dump,
+  `cargo run --example wcdis -- file.py | -c 'src'`).
+* `compile_wordcode(module, opts) -> WordcodeOutput { code: CodeObject, warnings, future_flags }`.
+* `wc/` = codegen (`mod.rs`, `stmt.rs`, `expr.rs`, `pattern.rs`, CPython numbering + pseudo
+  ops, labels), `wc/ir.rs` (blocks), `wc/cfg.rs` (all CFG passes + assembler; folding is done
+  here, the AST pass only produces warnings / match values / %-format rewrites),
+  `wc/hooks.rs` (test hooks).
+* `hooks` (public): `codegen(module, opts) -> Seq` (unoptimised sequences, nested units,
+  constants), `optimize(instrs, &mut consts, nlocals)`, `assemble(instrs, AsmMeta)`.
+  Instruction lists are `SeqInstr { op, arg, loc: [line, col, end_line, end_col] }` with jump
+  targets as instruction indices; `Constant::Opaque(i)` stands for a caller-side constant the
+  compiler cannot represent. The runtime exposes them as `_testinternalcapi.compiler_codegen`
+  / `optimize_cfg` / `assemble_code_object` / `new_instruction_sequence`
+  (`crates/runtime/src/modules/compiler_hooks.rs`).

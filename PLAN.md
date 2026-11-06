@@ -83,6 +83,9 @@ Running (wave 10, after resume): jit3, numpy2, core3, perf2, tk (see PROGRESS.md
 Wave 11 (after run 5): bc-compiler + bc-vm (D24: CPython 3.15 wordcode as public code format), grind-lib
 (library-level suite failures). Finished: tk (_tkinter/tkinter/idlelib; test_idle 332 run/88 skipped = baseline).
 Coordination file for D24: notes/bytecode.md.
+D24 DONE (bc-compiler + bc-vm merged, master cd9478e): code objects hold CPython 3.15 wordcode, translated to the
+internal form on first use; test_dis 145/145, test_code passes. Remaining: legacy pipeline removal; bare local-name
+expression statement must stay a checked load (UnboundLocalError); settrace/monitoring event ordering.
 Finished: jit3 (tier 2 merged + on by default; wins on richards/nbody/spectral_norm). Running: jit4 (generators in tier 2, inlining).
 
 Unassigned: _testclinic re-implemented by us (spec lacks

@@ -25,6 +25,21 @@ fn surrogate_name(o: Option<&PyObject>) -> Option<&PyObject> {
     o.filter(|v| pystr::is_str(v) && pystr::str_data(v).iter().any(|c| (0xD800..0xE000).contains(&c)))
 }
 
+/// In development mode an explicitly given codec name and error handler are
+/// validated even when the data would never need them (e.g. empty input).
+fn dev_mode_check(enc: Option<&str>, errors: &str) -> PyResult<()> {
+    if !crate::modules::sys_full::config().dev_mode {
+        return Ok(());
+    }
+    if let Some(e) = enc {
+        _codecs::lookup(e)?;
+    }
+    if errors != "strict" {
+        _codecs::lookup_error(errors)?;
+    }
+    Ok(())
+}
+
 /// `str.encode(encoding='utf-8', errors='strict')`.
 pub fn encode_str(s: &PyObject, enc: Option<&PyObject>, errs: Option<&PyObject>) -> PyResult {
     if let Some(name) = surrogate_name(enc) {
@@ -33,6 +48,7 @@ pub fn encode_str(s: &PyObject, enc: Option<&PyObject>, errs: Option<&PyObject>)
     }
     let e = arg_string(enc, "utf-8", "encode:encoding")?;
     let errors = arg_string(errs, "strict", "encode:errors")?;
+    dev_mode_check(enc.map(|_| e.as_str()), &errors)?;
     _codecs::encode_text(s, &e, &errors)
 }
 
@@ -54,6 +70,7 @@ pub fn decode_object(o: &PyObject, enc: Option<&PyObject>, errs: Option<&PyObjec
     if pystr::is_str(o) {
         raise!(TypeError, "decoding str is not supported");
     }
+    dev_mode_check(if name.is_none() && enc.is_some() { Some(e.as_str()) } else { None }, &errors)?;
     let data = match tu::byte_data(o) {
         Some(d) => d,
         None => raise!(TypeError, "decoding to str: need a bytes-like object, {} found", tu::tname(o)),

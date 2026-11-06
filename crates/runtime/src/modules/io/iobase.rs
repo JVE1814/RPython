@@ -48,6 +48,8 @@ pub unsafe extern "C" fn iobase_finalize(op: *mut PyObject) {
                 clear_exc();
             }
             if call0(o, "close").is_err() {
+                // keep close()'s exception aside while repr() runs
+                let close_exc = take_exc();
                 let msg = format!(
                     "Exception ignored while finalizing file {}",
                     ab::repr_string(o).unwrap_or_else(|_| {
@@ -55,6 +57,9 @@ pub unsafe extern "C" fn iobase_finalize(op: *mut PyObject) {
                         "<object repr() failed>".into()
                     })
                 );
+                if let Some(e) = close_exc {
+                    set_exc(e);
+                }
                 crate::modules::sys::write_unraisable_with_obj(&msg, None);
             }
         }
@@ -203,7 +208,7 @@ fn iob_readline(o: &PyObject, args: &[&PyObject]) -> PyResult {
             let d = bytes::bytes_data(&ra);
             if !d.is_empty() {
                 let mut n = 0;
-                let lim = if limit >= 0 { (limit as usize).min(d.len()) } else { d.len() };
+                let lim = if limit >= 0 { (limit as usize - out.len()).min(d.len()) } else { d.len() };
                 while n < lim {
                     let c = d[n];
                     n += 1;
@@ -324,6 +329,10 @@ fn raw_read(o: &PyObject, args: &[&PyObject]) -> PyResult {
     let got = ab::index_as_ssize(&r, Some(crate::types::exceptions::OverflowError()))?;
     if got < 0 || got > n {
         raise!(ValueError, "readinto returned {} outside buffer size {}", got, n);
+    }
+    // shrinking fails with BufferError while readinto() still holds a view
+    if got < n {
+        crate::types::bytearray::resize(&b, got as usize)?;
     }
     let v = BufView::get(&b, false)?;
     Ok(new_bytes(&v.as_slice()[..got as usize]))

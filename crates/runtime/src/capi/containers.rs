@@ -26,6 +26,10 @@ pub unsafe extern "C" fn PyTuple_New(n: Py_ssize_t) -> *mut PyObject {
         if n == 0 {
             return tuple::empty_tuple().into_raw();
         }
+        if n as usize > (isize::MAX as usize - 256) / std::mem::size_of::<usize>() {
+            let _ = memory_error();
+            return std::ptr::null_mut();
+        }
         let op = tuple::alloc_tuple_of(tuple::tuple_type(), n as usize);
         if op.is_null() {
             let _ = memory_error();
@@ -45,6 +49,13 @@ pub unsafe extern "C" fn PyTuple_FromArray(items: *const *mut PyObject, n: Py_ss
         }
         if n == 0 {
             return tuple::empty_tuple().into_raw();
+        }
+        if n as usize > (isize::MAX as usize - 256) / std::mem::size_of::<usize>() || items.is_null() {
+            if items.is_null() && (n as usize) < 1 << 40 {
+                return null_arg();
+            }
+            let _ = memory_error();
+            return std::ptr::null_mut();
         }
         tuple::new_tuple_from_ptrs(std::slice::from_raw_parts(items, n as usize)).into_raw()
     }

@@ -177,7 +177,22 @@ fn repr_for_error(o: &PyObject) -> String {
 pub fn call_tp_call(callable: &PyObject, args: &PyObject, kw: Option<&PyObject>) -> PyResult {
     let f = match callable.ty().tp_call {
         Some(f) => f,
-        None => raise!(TypeError, "'{}' object is not callable", tname(callable)),
+        None => {
+            // `import mod; mod()` where `mod.mod` is the callable that was meant
+            if crate::types::module::is_module(callable) {
+                let d = crate::types::module::module_dict(callable);
+                if let Some(n) = crate::types::dict::get_item_rs(&d, "__name__").filter(|n| crate::types::str::is_str(n)) {
+                    if let Some(f) = crate::types::dict::get_item(&d, &n).ok().flatten() {
+                        if is_callable(&f) {
+                            let n = crate::types::str::to_string_lossy(&n);
+                            raise!(TypeError, "'{}' object is not callable. Did you mean: '{}.{}(...)'?", tname(callable), n, n);
+                        }
+                    }
+                }
+                crate::errors::clear_exc();
+            }
+            raise!(TypeError, "'{}' object is not callable", tname(callable))
+        }
     };
     let ts = crate::threads::current();
     if crate::interp::enter_recursive_call(ts, " while calling a Python object").is_err() {
@@ -192,7 +207,11 @@ pub fn call_tp_call(callable: &PyObject, args: &PyObject, kw: Option<&PyObject>)
 pub unsafe extern "C" fn vectorcall_call(callable: *mut PyObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
     unsafe {
         let c = &*callable;
-        let f = match vectorcall_func(c) {
+        // like PyVectorcall_Call: the slot at tp_vectorcall_offset, whether or not the type
+        // carries the vectorcall flag (heap subclasses inherit only the offset)
+        let off = c.ty().tp_vectorcall_offset;
+        let f = if off > 0 { *((callable as *mut u8).offset(off) as *const vectorcallfunc) } else { None };
+        let f = match f {
             Some(f) => f,
             None => {
                 return into_c(Err(err!(TypeError, "'{}' object does not support vectorcall", tname(c))));
@@ -476,8 +495,8 @@ fn do_richcompare(a: &PyObject, b: &PyObject, op: c_int) -> PyResult {
             TypeError,
             "'{}' not supported between instances of '{}' and '{}'",
             OPSTR[op as usize],
-            tname(a),
-            tname(b)
+            crate::types::typeobject::tp_name_of(a),
+            crate::types::typeobject::tp_name_of(b)
         ),
     }
 }

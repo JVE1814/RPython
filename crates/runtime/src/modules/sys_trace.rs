@@ -46,8 +46,12 @@ pub const LINE: usize = 5;
 pub const INSTRUCTION: usize = 6;
 pub const RAISE: usize = 11;
 pub const PY_UNWIND: usize = 13;
-/// Events that can be set per code object (and disabled per location).
-pub const LOCAL_EVENTS_MASK: u32 = (1 << 11) - 1 | (1 << 18);
+/// Events that can be set per code object (3.15: every event, the exception events and
+/// the ancillary C_RETURN/C_RAISE included).
+pub const LOCAL_EVENTS_MASK: u32 = (1 << 19) - 1;
+/// Events a callback may disable by returning DISABLE (per location for instrumented
+/// events, per code object for the exception events).
+pub const DISABLE_MASK: u32 = ((1 << 16) - 1) | (1 << 18);
 
 pub struct MonState {
     pub names: [Option<usize>; NTOOLS],
@@ -92,11 +96,6 @@ pub fn recompute_mon_any(m: &MonState) {
 
 pub static DISABLE_OBJ: std::sync::atomic::AtomicPtr<PyObject> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
-thread_local! {
-    /// frame address -> last executed instruction (for backward-jump line events)
-    static LAST: RefCell<HashMap<usize, u32>> = RefCell::new(HashMap::new());
-}
-
 fn frame_obj(f: &mut Frame) -> PyRef {
     unsafe { PyRef::from_borrowed(crate::interp::eval::frame_object(f)) }
 }
@@ -140,7 +139,7 @@ fn fire(ts: &ThreadState, f: &mut Frame, ev: usize, loc: u32, extra: &[&PyObject
         let tools = events_for(&m, code, ev);
         (0..NTOOLS)
             .filter(|t| tools & (1 << t) != 0)
-            .filter(|t| !m.disabled.contains(&(*t, code, loc, ev)))
+            .filter(|t| !m.disabled.contains(&(*t, code, loc, ev)) && !m.disabled.contains(&(*t, code, u32::MAX, ev)))
             .map(|t| (t, unsafe { PyRef::from_borrowed(m.callbacks[t][ev] as *mut PyObject) }))
             .collect()
     };
@@ -163,17 +162,19 @@ fn fire(ts: &ThreadState, f: &mut Frame, ev: usize, loc: u32, extra: &[&PyObject
         let r = r?;
         let dis = DISABLE_OBJ.load(Acquire);
         if !dis.is_null() && r.as_ptr() == dis {
-            if (1u32 << ev) & LOCAL_EVENTS_MASK == 0 {
+            if (1u32 << ev) & DISABLE_MASK == 0 {
                 crate::raise!(ValueError, "Cannot disable {} events. Callback removed.", EVENT_NAMES[ev]);
             }
-            MON.lock().unwrap().disabled.insert((tool, code, loc, ev));
+            // exception events are disabled for the whole code object (location u32::MAX)
+            let at = if ev >= 11 && ev <= 15 { u32::MAX } else { loc };
+            MON.lock().unwrap().disabled.insert((tool, code, at, ev));
         }
     }
     Ok(())
 }
 
 fn offset(f: &Frame) -> u32 {
-    f.lasti * 4
+    crate::types::code::lasti_bytes(f.code(), f.lasti as usize) as u32
 }
 
 // ------------------------------------------------------------------ settrace/setprofile helpers
@@ -242,10 +243,13 @@ pub fn trace_call(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
     if ts.tracing_depth.get() > 0 {
         return Ok(());
     }
-    let resume = f.next_instr > 0;
-    LAST.with(|l| {
-        l.borrow_mut().insert(f as *mut Frame as usize, u32::MAX);
-    });
+    let cd = crate::types::code::code_data(f.code());
+    if cd.eager_prologue && f.next_instr < cd.gen_start {
+        // the eager part of a generator prologue (before RETURN_GENERATOR) is not traced
+        return Ok(());
+    }
+    let resume = f.next_instr > cd.gen_start;
+    f.trace_last = u32::MAX;
     if !resume {
         f.trace_line = -1;
     }
@@ -267,9 +271,14 @@ pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
     if ts.tracing_depth.get() > 0 {
         return Ok(());
     }
+    {
+        let cd = crate::types::code::code_data(f.code());
+        if cd.eager_prologue && f.lasti < cd.gen_start {
+            return Ok(());
+        }
+    }
     let lasti = f.lasti;
-    let key = f as *mut Frame as usize;
-    let prev = LAST.with(|l| l.borrow_mut().insert(key, lasti)).unwrap_or(u32::MAX);
+    let prev = std::mem::replace(&mut f.trace_last, lasti);
     // instructions without a line number (artificial cleanup code) never start a line
     let line = match crate::types::code::code_data(f.code()).locations.get(lasti as usize) {
         Some(l) if l.lineno != 0 => l.lineno as i32,
@@ -291,7 +300,11 @@ pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
             fire(ts, f, LINE, line as u32, &[])?;
         }
     }
-    if MON_ANY.load(Relaxed) & (1 << INSTRUCTION) != 0 {
+    // one INSTRUCTION / opcode event per public instruction (an instruction may be
+    // implemented by several internal words)
+    let first_word = crate::types::code::code_data(f.code()).starts_public_instr(lasti as usize);
+    // RESUME produces no INSTRUCTION event
+    if first_word && !is_resume && MON_ANY.load(Relaxed) & (1 << INSTRUCTION) != 0 {
         fire(ts, f, INSTRUCTION, offset(f), &[])?;
     }
     if ts.trace_func.get().is_null() || f.f_trace.is_null() {
@@ -303,7 +316,7 @@ pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
         let r = call_trace(ts, ftr.as_ptr(), f, "line", none::none())?;
         set_f_trace(f, r);
     }
-    if f.f_trace_opcodes && !f.f_trace.is_null() {
+    if first_word && f.f_trace_opcodes && !f.f_trace.is_null() {
         let ftr = unsafe { PyRef::from_borrowed(f.f_trace) };
         let r = call_trace(ts, ftr.as_ptr(), f, "opcode", none::none())?;
         set_f_trace(f, r);
@@ -326,9 +339,7 @@ pub fn trace_exit(ts: &ThreadState, f: &mut Frame, e: &Exit) -> PyResult<()> {
         call_trace(ts, ftr.as_ptr(), f, "return", &v)?;
     }
     if !is_yield {
-        LAST.with(|l| {
-            l.borrow_mut().remove(&(f as *mut Frame as usize));
-        });
+        f.trace_last = u32::MAX;
     }
     Ok(())
 }
@@ -366,9 +377,7 @@ pub fn trace_unwind(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
         }
         Ok(())
     })();
-    LAST.with(|l| {
-        l.borrow_mut().remove(&(f as *mut Frame as usize));
-    });
+    f.trace_last = u32::MAX;
     match r {
         Ok(()) => {
             if let Some(e) = e {
@@ -535,7 +544,7 @@ pub fn fire_branch(ts: &ThreadState, f: &mut Frame, ev: usize, dest: usize) -> P
     if ts.tracing_depth.get() > 0 || MON_ANY.load(Relaxed) & (1 << ev) == 0 {
         return Ok(());
     }
-    let d = int::new_int(dest as i64 * 4);
+    let d = int::new_int(crate::types::code::lasti_bytes(f.code(), dest));
     let off = offset(f);
     fire(ts, f, ev, off, &[&d])
 }

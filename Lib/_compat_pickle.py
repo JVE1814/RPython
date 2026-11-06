@@ -137,7 +137,6 @@ IMPORT_MAPPING.update({
     'SimpleDialog': 'tkinter.simpledialog',
     'DocXMLRPCServer': 'xmlrpc.server',
     'SimpleHTTPServer': 'http.server',
-    'CGIHTTPServer': 'http.server',
     # Pickles written by early Python 3 versions with broken names.
     'UserDict': 'collections',
     'UserList': 'collections',
@@ -179,8 +178,6 @@ REVERSE_NAME_MAPPING.update({
         ('DocXMLRPCServer', 'DocCGIXMLRPCRequestHandler'),
     ('http.server', 'SimpleHTTPRequestHandler'):
         ('SimpleHTTPServer', 'SimpleHTTPRequestHandler'),
-    ('http.server', 'CGIHTTPRequestHandler'):
-        ('CGIHTTPServer', 'CGIHTTPRequestHandler'),
     ('_socket', 'socket'): ('socket', '_socketobject'),
 })
 

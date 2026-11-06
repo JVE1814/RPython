@@ -139,7 +139,14 @@ pub unsafe extern "C" fn object_richcompare(a: *mut PyObject, b: *mut PyObject, 
                             Err(_) => std::ptr::null_mut(),
                         }
                     }
-                    None => none::not_implemented().to_ref().into_raw(),
+                    // no comparison of its own: object's identity __eq__ applies
+                    None => {
+                        if a == b {
+                            crate::types::bool_::new_bool(false).into_raw()
+                        } else {
+                            none::not_implemented().to_ref().into_raw()
+                        }
+                    }
                 }
             }
             _ => none::not_implemented().to_ref().into_raw(),
@@ -616,7 +623,7 @@ fn check_set_special(o: &PyObject, v: Option<&PyObject>, attr: &str) -> PyResult
         raise!(TypeError, "cannot set '{}' attribute of immutable type '{}'", attr, type_name(unsafe { &*tp }));
     }
     if v.is_none() {
-        raise!(TypeError, "cannot delete '{}' attribute of immutable type '{}'", attr, type_name(unsafe { &*tp }));
+        raise!(TypeError, "cannot delete '{}' attribute of type '{}'", attr, type_name(unsafe { &*tp }));
     }
     Ok(())
 }
@@ -704,7 +711,7 @@ fn type_set_bases(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     if !compatible_for_assignment(unsafe { (*tp).tp_base }, new_base) {
         raise!(
             TypeError,
-            "__bases__ assignment: '{}' deallocator differs from '{}'",
+            "__bases__ assignment: '{}' object layout differs from '{}'",
             type_name(unsafe { &*new_base }),
             type_name(unsafe { &*(*tp).tp_base })
         );
@@ -715,10 +722,21 @@ fn type_set_bases(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         for b in tuple::tuple_items(&*old_bases) {
             remove_subclass(as_type(b), tp);
         }
-        (*tp).tp_bases = v.to_ref().into_raw();
+        let ours = v.to_ref().into_raw();
+        (*tp).tp_bases = ours;
         incref(new_base as *mut PyObject);
         (*tp).tp_base = new_base;
+        let tp_mro_before = (*tp).tp_mro;
+        xincref(tp_mro_before);
         let r = mro_internal(tp);
+        if r.is_err() && (*tp).tp_bases != ours {
+            // a re-entrant __bases__ assignment (from mro()) replaced ours and
+            // released the references we had installed: keep its result
+            decref(old_bases);
+            decref(old_base as *mut PyObject);
+            xdecref(tp_mro_before);
+            return r;
+        }
         if r.is_err() {
             let nb = (*tp).tp_bases;
             (*tp).tp_bases = old_bases;
@@ -728,15 +746,63 @@ fn type_set_bases(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
             for b in tuple::tuple_items(&*old_bases) {
                 add_subclass(as_type(b), tp);
             }
+            xdecref(tp_mro_before);
             return r;
         }
         for b in tuple::tuple_items(&*(*tp).tp_bases) {
             add_subclass(as_type(b), tp);
         }
-        // recompute subclass MROs
-        for sub in subclasses(tp) {
-            let _ = mro_internal(sub);
+        // recompute the MROs of all subclasses; if one fails (mro() raising, an MRO
+        // conflict), everything goes back to how it was and the error propagates
+        if (*tp).tp_bases == ours {
+            let mut changed: Vec<(*mut PyTypeObject, *mut PyObject)> = Vec::new();
+            let mut todo = subclasses(tp);
+            let mut seen = std::collections::HashSet::new();
+            let mut failed = false;
+            while let Some(sub) = todo.pop() {
+                if !seen.insert(sub as usize) {
+                    continue;
+                }
+                let before = (*sub).tp_mro;
+                xincref(before);
+                if mro_internal(sub).is_err() {
+                    xdecref(before);
+                    failed = true;
+                    break;
+                }
+                changed.push((sub, before));
+                todo.extend(subclasses(sub));
+            }
+            if failed {
+                let err = take_exc();
+                for (sub, before) in changed.into_iter().rev() {
+                    let now = std::mem::replace(&mut (*sub).tp_mro, before);
+                    xdecref(now);
+                    crate::types::slots::type_modified(sub);
+                }
+                for b in tuple::tuple_items(&*(*tp).tp_bases) {
+                    remove_subclass(as_type(b), tp);
+                }
+                let nb = std::mem::replace(&mut (*tp).tp_bases, old_bases);
+                decref(nb);
+                decref(new_base as *mut PyObject);
+                (*tp).tp_base = old_base;
+                for b in tuple::tuple_items(&*old_bases) {
+                    add_subclass(as_type(b), tp);
+                }
+                let now = std::mem::replace(&mut (*tp).tp_mro, tp_mro_before);
+                xdecref(now);
+                crate::types::slots::type_modified(tp);
+                if let Some(e) = err {
+                    set_exc(e);
+                }
+                return Err(PyErr);
+            }
+            for (_, before) in changed {
+                xdecref(before);
+            }
         }
+        xdecref(tp_mro_before);
         decref(old_bases);
         decref(old_base as *mut PyObject);
         crate::types::slots::fixup_slots(tp);
@@ -768,6 +834,9 @@ fn type_get_module(o: &PyObject) -> PyResult {
     let tp = t(o);
     if is_heap_type(tp) {
         match dict::get_item_str(type_dict(tp), name!("__module__")) {
+            Some(m) if crate::types::typeobject::module_is_instance_descr(&m) => {
+                Ok(pystr::new_str(&type_module(tp).unwrap_or_else(|| "builtins".into())))
+            }
             Some(m) => Ok(m),
             None => raise!(AttributeError, "__module__"),
         }
@@ -778,6 +847,8 @@ fn type_get_module(o: &PyObject) -> PyResult {
 fn type_set_module(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     check_set_special(o, v, "__module__")?;
     crate::types::slots::type_modified(t(o));
+    // the first line number belongs to the original module
+    dict::del_item(type_dict(t(o)), name!("__firstlineno__"))?;
     dict::set_item(type_dict(t(o)), name!("__module__"), v.unwrap())
 }
 fn type_get_dict(o: &PyObject) -> PyResult {
@@ -876,9 +947,6 @@ fn type_get_type_params(o: &PyObject) -> PyResult {
 fn type_set_type_params(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     check_set_special(o, v, "__type_params__")?;
     let v = v.unwrap();
-    if !tuple::is_tuple(v) {
-        raise!(TypeError, "__type_params__ must be set to a tuple, not {}", tname(v));
-    }
     crate::types::slots::type_modified(t(o));
     dict::set_item(type_dict(t(o)), name!("__type_params__"), v)
 }
@@ -891,11 +959,20 @@ fn type_itemsize(o: &PyObject) -> PyResult {
 fn type_flags(o: &PyObject) -> PyResult {
     Ok(int::new_int(unsafe { (*t(o)).tp_flags } as i64))
 }
+// Managed dict / weakref slots live in the pre-header; CPython reports them with its
+// sentinel offsets (-1 for the dict, minus two words for the weakref list), which Python
+// code compares against 0 to ask "do instances have a __dict__ / support weakrefs".
 fn type_weakrefoffset(o: &PyObject) -> PyResult {
-    Ok(int::new_int(unsafe { (*t(o)).tp_weaklistoffset } as i64))
+    let tp = t(o);
+    let off = unsafe { (*tp).tp_weaklistoffset };
+    let managed = unsafe { (*tp).tp_flags & Py_TPFLAGS_MANAGED_WEAKREF != 0 };
+    Ok(int::new_int(if off == 0 && managed { -2 * std::mem::size_of::<usize>() as i64 } else { off as i64 }))
 }
 fn type_dictoffset(o: &PyObject) -> PyResult {
-    Ok(int::new_int(unsafe { (*t(o)).tp_dictoffset } as i64))
+    let tp = t(o);
+    let off = unsafe { (*tp).tp_dictoffset };
+    let managed = unsafe { (*tp).tp_flags & Py_TPFLAGS_MANAGED_DICT != 0 };
+    Ok(int::new_int(if off == 0 && managed { -1 } else { off as i64 }))
 }
 
 fn type_mro_method(o: &PyObject) -> PyResult {
@@ -1046,7 +1123,7 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
     }
     if a.len() != 3 {
         if a.len() == 1 {
-            raise!(TypeError, "type() takes 1 or 3 arguments");
+            raise!(TypeError, "type.__new__() takes exactly 3 arguments (1 given)");
         }
         raise!(TypeError, "type() takes 1 or 3 arguments");
     }
@@ -1057,7 +1134,7 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
     if !tuple::is_tuple(bases) {
         raise!(TypeError, "type.__new__() argument 2 must be tuple, not {}", tname(bases));
     }
-    if !dict::is_dict(ns) {
+    if !dict::is_anydict(ns) {
         raise!(TypeError, "type.__new__() argument 3 must be dict, not {}", tname(ns));
     }
     // metaclass
@@ -1087,7 +1164,19 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
         bases.to_ref()
     };
     let base = best_base(&bases_owned)?;
-    let dict = dict::copy(ns)?;
+    // a dict subclass with its own iteration order (OrderedDict) is copied in
+    // that order
+    let dict = if dict::is_dict_exact(ns) || crate::types::frozendict::is_frozendict(ns) || unsafe { (*ns.type_ptr()).tp_iter } == unsafe { (*dict::dict_type()).tp_iter } {
+        dict::copy(ns)?
+    } else {
+        let d = dict::new_dict();
+        let keys = ab::call_method(ns, name!("keys"), &[])?;
+        for k in ab::collect_iterable(&keys)? {
+            let v = ab::getitem(ns, &k)?;
+            dict::set_item(&d, &k, &v)?;
+        }
+        d
+    };
     let name_s = pystr::to_string_lossy(nm);
     if pystr::as_utf8(nm)?.contains('\0') {
         raise!(ValueError, "type name must not contain null characters");
@@ -1098,6 +1187,7 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
     let mut add_dict = false;
     let mut add_weak = false;
     let mut slot_names: Vec<PyRef> = Vec::new();
+    let mut slot_docs: Vec<(String, String)> = Vec::new();
     let base_has_dict = unsafe { (*base).tp_dictoffset != 0 || (*base).tp_flags & Py_TPFLAGS_MANAGED_DICT != 0 };
     let base_has_weak = unsafe { (*base).tp_weaklistoffset != 0 || (*base).tp_flags & Py_TPFLAGS_MANAGED_WEAKREF != 0 };
     match &slots {
@@ -1148,10 +1238,37 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
                         raise!(ValueError, "'{}' in __slots__ conflicts with class variable", st);
                     }
                 }
+                if dict::is_dict(s) {
+                    // a dict of __slots__ maps names to member docstrings
+                    if let Some(doc) = dict::get_item(s, item)? {
+                        if pystr::is_str(&doc) {
+                            slot_docs.push((pystr::to_string_lossy(&mangled), pystr::to_string_lossy(&doc)));
+                        }
+                    }
+                }
                 slot_names.push(mangled);
             }
             slot_names.sort_by(|x, y| pystr::str_cmp(x, y));
             // if slots is a dict, keep it as slot docs; store the tuple of names
+            // other bases may still bring a __dict__ / __weakref__ (a plain mixin class
+            // next to a slotted base): instances keep them
+            for b in tuple::tuple_items(&bases_owned) {
+                if !is_type(b) {
+                    continue;
+                }
+                let bt = b.as_ptr() as *mut PyTypeObject;
+                if bt == base {
+                    continue;
+                }
+                unsafe {
+                    if !base_has_dict && !add_dict && ((*bt).tp_dictoffset != 0 || (*bt).tp_flags & Py_TPFLAGS_MANAGED_DICT != 0) {
+                        add_dict = true;
+                    }
+                    if !base_has_weak && !add_weak && ((*bt).tp_weaklistoffset != 0 || (*bt).tp_flags & Py_TPFLAGS_MANAGED_WEAKREF != 0) {
+                        add_weak = true;
+                    }
+                }
+            }
         }
     }
 
@@ -1209,7 +1326,8 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
         match dict::get_item_str(&dict, name!("__doc__")) {
             Some(d) => {
                 if pystr::is_str(&d) {
-                    let s = pystr::to_string_lossy(&d);
+                    // tp_doc is UTF-8: a docstring with lone surrogates is an error
+                    let s = pystr::as_utf8(&d)?.to_string();
                     let mut v = s.into_bytes();
                     v.push(0);
                     (*tp).tp_doc = Box::leak(v.into_boxed_slice()).as_ptr() as *const _;
@@ -1237,18 +1355,35 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
         let members_ptr = (tp_obj as *mut u8).add(std::mem::size_of::<PyHeapTypeObject>()) as *mut PyMemberDef;
         let mut mvec: Vec<PyMemberDef> = Vec::with_capacity(nslots + 1);
         for s in slot_names.iter() {
+            let sname = pystr::to_string_lossy(s);
+            let doc = match slot_docs.iter().find(|(n, _)| *n == sname) {
+                Some((_, d)) => crate::methods::cstr_static(d),
+                None => std::ptr::null(),
+            };
             mvec.push(PyMemberDef {
-                name: crate::methods::cstr_static(&pystr::to_string_lossy(s)),
+                name: crate::methods::cstr_static(&sname),
                 type_code: Py_T_OBJECT_EX,
                 offset: slotoffset as isize,
                 flags: 0,
-                doc: std::ptr::null(),
+                doc,
             });
             slotoffset += 8;
         }
         let _ = members_ptr;
         if nslots > 0 {
-            (*tp).tp_members = crate::methods::mbtable(mvec);
+            // like CPython, the slot members live in the type object's variable part, right
+            // after the metatype's fixed part (Py_SIZE(type) of them, then a zeroed sentinel):
+            // extensions such as msgspec read them from there
+            let item = (*meta).tp_itemsize as usize;
+            if item == std::mem::size_of::<PyMemberDef>() && var_size(&*tp_obj) as usize == nslots {
+                let inline = (tp_obj as *mut u8).add((*meta).tp_basicsize as usize) as *mut PyMemberDef;
+                for (i, m) in mvec.into_iter().enumerate() {
+                    std::ptr::write(inline.add(i), m);
+                }
+                (*tp).tp_members = inline;
+            } else {
+                (*tp).tp_members = crate::methods::mbtable(mvec);
+            }
         }
         (*h).ht_slots = if slots.is_some() { tuple::new_tuple(slot_names.clone()).into_raw() } else { std::ptr::null_mut() };
         if add_dict {
@@ -1263,6 +1398,14 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
         // inherit preheader flags from base
         (*tp).tp_flags |= (*base).tp_flags & Py_TPFLAGS_PREHEADER;
         (*tp).tp_flags |= (*base).tp_flags & Py_TPFLAGS_INLINE_VALUES;
+        // managed slots report CPython's sentinel offsets, which C extensions test against 0
+        // ("instances have a __dict__ / are weakly referenceable"; msgspec reads them)
+        if (*tp).tp_flags & Py_TPFLAGS_MANAGED_DICT != 0 && (*tp).tp_dictoffset == 0 {
+            (*tp).tp_dictoffset = -1;
+        }
+        if (*tp).tp_flags & Py_TPFLAGS_MANAGED_WEAKREF != 0 && (*tp).tp_weaklistoffset == 0 {
+            (*tp).tp_weaklistoffset = -2 * std::mem::size_of::<usize>() as isize;
+        }
         (*tp).tp_basicsize = slotoffset as isize;
         (*tp).tp_itemsize = (*base).tp_itemsize;
         (*tp).tp_dealloc = Some(subtype_dealloc);

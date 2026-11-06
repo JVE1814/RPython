@@ -133,14 +133,165 @@ pub unsafe extern "C" fn PyMethod_Self(m: *mut PyObject) -> *mut PyObject {
         fo::method_parts(&*m).1.as_ptr()
     }
 }
+// ---------------------------------------------------------------- instancemethod
+// classobject.h's PyInstanceMethodObject: a callable stored in a class that binds to the
+// instance like a Python function does (used by C code to put builtins in classes).
+
+#[repr(C)]
+struct InstanceMethodObject {
+    ob_base: PyObject,
+    func: *mut PyObject,
+}
+#[unsafe(no_mangle)]
+pub static mut PyInstanceMethod_Type: PyTypeObject = PyTypeObject::ZERO;
+
+fn im_type() -> *mut PyTypeObject {
+    &raw mut PyInstanceMethod_Type
+}
+unsafe fn im_func<'a>(o: *mut PyObject) -> &'a PyObject {
+    unsafe { &*(*(o as *mut InstanceMethodObject)).func }
+}
+fn new_instancemethod(f: &PyObject) -> PyRef {
+    unsafe {
+        let op = crate::alloc::alloc_object(im_type(), std::mem::size_of::<InstanceMethodObject>());
+        (*(op as *mut InstanceMethodObject)).func = f.to_ref().into_raw();
+        crate::gc::track(op);
+        PyRef::from_raw(op)
+    }
+}
+unsafe extern "C" fn im_new(_t: *mut PyTypeObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        if !kw.is_null() && dict::dict_len(&*kw) != 0 {
+            let _ = type_error("instancemethod() takes no keyword arguments");
+            return std::ptr::null_mut();
+        }
+        let a = tuple::tuple_to_vec(&*args);
+        if a.len() != 1 {
+            let _ = type_error(&format!("instancemethod expected 1 argument, got {}", a.len()));
+            return std::ptr::null_mut();
+        }
+        if !ab::is_callable(&a[0]) {
+            let _ = type_error("first argument must be callable");
+            return std::ptr::null_mut();
+        }
+        new_instancemethod(&a[0]).into_raw()
+    }
+}
+unsafe extern "C" fn im_dealloc(o: *mut PyObject) {
+    unsafe {
+        crate::gc::untrack(o);
+        xdecref(std::mem::replace(&mut (*(o as *mut InstanceMethodObject)).func, std::ptr::null_mut()));
+        crate::alloc::free_object(o);
+    }
+}
+unsafe extern "C" fn im_traverse(o: *mut PyObject, visit: visitproc, arg: *mut c_void) -> c_int {
+    unsafe {
+        let f = (*(o as *mut InstanceMethodObject)).func;
+        if !f.is_null() {
+            return visit.unwrap()(f, arg);
+        }
+        0
+    }
+}
+unsafe extern "C" fn im_clear(o: *mut PyObject) -> c_int {
+    unsafe {
+        xdecref(std::mem::replace(&mut (*(o as *mut InstanceMethodObject)).func, std::ptr::null_mut()));
+        0
+    }
+}
+unsafe extern "C" fn im_call(o: *mut PyObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
+    unsafe { ret(ab::call_with_kwargs_dict(im_func(o), &tuple::tuple_to_vec(&*args).iter().map(|x| &**x).collect::<Vec<_>>(), opt(kw))) }
+}
+/// Through the class: the callable itself; through an instance: a method bound to it.
+unsafe extern "C" fn im_descr_get(o: *mut PyObject, obj: *mut PyObject, _t: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        let f = im_func(o);
+        if obj.is_null() {
+            return f.to_ref().into_raw();
+        }
+        fo::new_method(f, &*obj).into_raw()
+    }
+}
+/// Attributes not defined by the type come from the wrapped callable.
+unsafe extern "C" fn im_getattro(o: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        match to::generic_getattr_opt(&*o, &*name, None) {
+            Ok(Some(v)) => v.into_raw(),
+            Ok(None) => ret(ab::getattr(im_func(o), &*name)),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+}
+unsafe extern "C" fn im_repr(o: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        let f = im_func(o);
+        let name = match ab::getattr_opt(f, crate::name!("__name__")) {
+            Ok(Some(n)) if pystr::is_str(&n) => pystr::to_string_lossy(&n),
+            Ok(_) => "?".to_string(),
+            Err(_) => return std::ptr::null_mut(),
+        };
+        ret(Ok(pystr::new_str(&format!("<instancemethod {} at {:#x}>", name, o as usize))))
+    }
+}
+unsafe extern "C" fn im_richcompare(a: *mut PyObject, b: *mut PyObject, op: c_int) -> *mut PyObject {
+    unsafe {
+        if (*b).type_ptr() != im_type() || (op != Py_EQ && op != Py_NE) {
+            return crate::types::none::not_implemented().to_ref().into_raw();
+        }
+        let same = (*(a as *mut InstanceMethodObject)).func == (*(b as *mut InstanceMethodObject)).func;
+        crate::types::bool_::new_bool(same == (op == Py_EQ)).into_raw()
+    }
+}
+fn im_get_doc(o: &PyObject) -> PyResult {
+    ab::getattr(unsafe { im_func(o.as_ptr()) }, crate::name!("__doc__"))
+}
+fn im_get_func(o: &PyObject) -> PyResult {
+    Ok(unsafe { im_func(o.as_ptr()) }.to_ref())
+}
+
+/// Make PyInstanceMethod_Type ready (before the first extension module loads).
+pub(crate) fn init_instancemethod_type() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        let t = &mut *im_type();
+        t.tp_name = c"instancemethod".as_ptr();
+        t.tp_basicsize = std::mem::size_of::<InstanceMethodObject>() as isize;
+        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC;
+        t.tp_new = Some(im_new);
+        t.tp_dealloc = Some(im_dealloc);
+        t.tp_traverse = Some(im_traverse);
+        t.tp_clear = Some(im_clear);
+        t.tp_call = Some(im_call);
+        t.tp_descr_get = Some(im_descr_get);
+        t.tp_getattro = Some(im_getattro);
+        t.tp_repr = Some(im_repr);
+        t.tp_richcompare = Some(im_richcompare);
+        t.tp_getset = crate::getset_table![("__doc__", im_get_doc), ("__func__", im_get_func)];
+        if super::typeobj::PyType_Ready(t) < 0 {
+            clear_exc();
+        }
+    });
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInstanceMethod_New(f: *mut PyObject) -> *mut PyObject {
-    // instancemethod behaves like the function itself when bound through a class
-    unsafe { (*f).to_ref().into_raw() }
+    unsafe {
+        if f.is_null() {
+            return null_arg();
+        }
+        init_instancemethod_type();
+        new_instancemethod(&*f).into_raw()
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInstanceMethod_Function(m: *mut PyObject) -> *mut PyObject {
-    m
+    unsafe {
+        if m.is_null() || (*m).type_ptr() != im_type() {
+            let _ = bad_internal();
+            return std::ptr::null_mut();
+        }
+        (*(m as *mut InstanceMethodObject)).func
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyStaticMethod_New(f: *mut PyObject) -> *mut PyObject {
@@ -350,20 +501,23 @@ pub unsafe extern "C" fn PyCode_GetFreevars(co: *mut PyObject) -> *mut PyObject 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyCode_Addr2Line(co: *mut PyObject, addr: c_int) -> c_int {
     unsafe {
-        if addr < 0 {
-            return ab::getattr_str(&*co, "co_firstlineno").ok().and_then(|v| int::as_i64(&v)).unwrap_or(-1) as c_int;
+        if co.is_null() || !code::is_code(&*co) {
+            return -1;
         }
-        code::line_for_instr(&*co, (addr / 2) as usize).map_or(-1, |l| l as c_int)
+        code::addr2line(&*co, addr as i64) as c_int
     }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyCode_Addr2Location(co: *mut PyObject, addr: c_int, sl: *mut c_int, sc: *mut c_int, el: *mut c_int, ec: *mut c_int) -> c_int {
     unsafe {
-        let l = PyCode_Addr2Line(co, addr);
+        if co.is_null() || !code::is_code(&*co) {
+            return 0;
+        }
+        let (l, c, e, x) = code::addr2location(&*co, addr as i64);
         *sl = l;
-        *el = l;
-        *sc = -1;
-        *ec = -1;
+        *sc = c;
+        *el = e;
+        *ec = x;
         1
     }
 }
@@ -371,22 +525,6 @@ pub unsafe extern "C" fn PyCode_Addr2Location(co: *mut PyObject, addr: c_int, sl
 pub unsafe extern "C" fn _PyCode_CheckLineNumber(addr: c_int, _bounds: *mut c_void) -> c_int {
     addr
 }
-/// Body shared by every code object created from C: it raises AssertionError when run
-/// (an "empty" code object must not crash the VM when executed). Built once by compiling
-/// `assert 0` and kept alive for the life of the process.
-fn c_code_stub() -> &'static PyObject {
-    static STUB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let p = *STUB.get_or_init(|| match crate::compile::compile_str("assert 0", "<C>", crate::compile::Mode::Exec, 0, 0) {
-        Ok(c) => c.code.into_raw() as usize,
-        Err(_) => {
-            clear_exc();
-            0
-        }
-    });
-    assert!(p != 0, "cannot build the stub body for C-created code objects");
-    unsafe { &*(p as *const PyObject) }
-}
-
 fn str_tuple(o: Option<&PyObject>, what: &str) -> PyResult<Vec<PyRef>> {
     let Some(o) = o else { return Ok(Vec::new()) };
     if !tuple::is_tuple(o) {
@@ -401,15 +539,16 @@ fn str_tuple(o: Option<&PyObject>, what: &str) -> PyResult<Vec<PyRef>> {
     Ok(v.into_iter().map(pystr::intern).collect())
 }
 
-/// What a C caller (PyUnstable_Code_New*, PyCode_NewEmpty) supplies. CPython-format
-/// bytecode, line tables and exception tables are accepted but not interpreted: these code
-/// objects carry metadata (names, flags, argument counts, file and first line) for
-/// tracebacks, frames and introspection; executing one raises AssertionError.
+/// What a C caller (PyUnstable_Code_New*, PyCode_NewEmpty) supplies. The bytecode,
+/// location table and exception table are CPython 3.15 public formats; the code object
+/// is executable (translated on first use like any other).
 pub(crate) struct CCodeArgs<'a> {
     pub argcount: i32,
     pub posonlyargcount: i32,
     pub kwonlyargcount: i32,
+    pub stacksize: i32,
     pub flags: i32,
+    pub code: Option<&'a PyObject>,
     pub consts: Option<&'a PyObject>,
     pub names: Option<&'a PyObject>,
     pub varnames: Option<&'a PyObject>,
@@ -419,6 +558,18 @@ pub(crate) struct CCodeArgs<'a> {
     pub name: &'a PyObject,
     pub qualname: Option<&'a PyObject>,
     pub firstlineno: i32,
+    pub linetable: Option<&'a PyObject>,
+    pub exceptiontable: Option<&'a PyObject>,
+}
+
+/// Body of PyCode_NewEmpty code objects: `RESUME 0; LOAD_COMMON_CONSTANT AssertionError;
+/// RAISE_VARARGS 1` (running one raises instead of crashing), all on the first line.
+fn empty_body(firstlineno: i32) -> (Vec<u8>, Vec<u8>) {
+    use crate::interp::wc::{self, op};
+    let code = vec![op::RESUME, 0, 0, 0, op::LOAD_COMMON_CONSTANT, 0, op::RAISE_VARARGS, 1];
+    let l = firstlineno.max(0) as u32;
+    let pos = wc::Position { lineno: Some(l), end_lineno: Some(l), col: None, end_col: None };
+    (code, wc::encode_linetable(&[(4, pos)], l))
 }
 
 pub(crate) fn new_code_from_c(a: CCodeArgs) -> PyResult {
@@ -437,9 +588,9 @@ pub(crate) fn new_code_from_c(a: CCodeArgs) -> PyResult {
         None => a.name,
     };
     let consts = match a.consts {
-        Some(c) if tuple::is_tuple(c) => c.to_ref(),
+        Some(c) if tuple::is_tuple(c) => tuple::tuple_to_vec(c),
         Some(_) => return Err(system_error("code: consts must be a tuple")),
-        None => tuple::new_tuple(Vec::new()),
+        None => Vec::new(),
     };
     let names = str_tuple(a.names, "names")?;
     let varnames = str_tuple(a.varnames, "varnames")?;
@@ -454,12 +605,19 @@ pub(crate) fn new_code_from_c(a: CCodeArgs) -> PyResult {
     let mut lpn: Vec<PyRef> = Vec::new();
     let mut kinds: Vec<u8> = Vec::new();
     for (i, n) in varnames.iter().enumerate() {
-        let k = if i < npos {
+        let k = if i < (a.posonlyargcount as usize).min(npos) {
             fast::LOCAL | fast::ARG_POS
+        } else if i < npos {
+            fast::LOCAL | fast::ARG_POS | fast::ARG_KW
         } else if i < npos + nkw {
             fast::LOCAL | fast::ARG_KW
         } else if i < npos + nkw + nstar {
-            fast::LOCAL | fast::ARG_VAR
+            let first_star = i == npos + nkw;
+            if first_star && flags & 0x4 != 0 {
+                fast::LOCAL | fast::ARG_VAR | fast::ARG_POS
+            } else {
+                fast::LOCAL | fast::ARG_VAR | fast::ARG_KW
+            }
         } else {
             fast::LOCAL
         };
@@ -479,61 +637,58 @@ pub(crate) fn new_code_from_c(a: CCodeArgs) -> PyResult {
         lpn.push(n.clone());
         kinds.push(fast::FREE);
     }
-    let stub = c_code_stub();
-    let sd = code::code_data(stub);
-    let line = a.firstlineno.max(0) as u32;
-    let locations: Vec<rpy_compiler::bytecode::Location> = sd
-        .locations
-        .iter()
-        .map(|_| rpy_compiler::bytecode::Location { lineno: line, end_lineno: line, col: u32::MAX, end_col: u32::MAX })
-        .collect();
-    let parts = code::CodeParts {
-        argcount: a.argcount as u32,
-        posonlyargcount: a.posonlyargcount as u32,
-        kwonlyargcount: a.kwonlyargcount as u32,
-        flags,
-        stacksize: code::code(stub).obj.co_stacksize as u32,
-        firstlineno: line,
-        code: sd.code.clone(),
-        lines: code::Lines::Decoded(&locations),
-        exception_table: sd.exception_table.clone(),
-        exctable_raw: None,
+    let bytes_or = |o: Option<&PyObject>, what: &str| -> PyResult<Option<PyRef>> {
+        match o {
+            None => Ok(None),
+            Some(b) if crate::types::bytes::is_bytes(b) => Ok(Some(b.to_ref())),
+            Some(_) => Err(system_error(&format!("code: {} must be bytes", what))),
+        }
+    };
+    let (code, linetable, stacksize) = match bytes_or(a.code, "code")? {
+        Some(c) => (c, bytes_or(a.linetable, "linetable")?.unwrap_or_else(|| crate::types::bytes::new_bytes(b"")), a.stacksize),
+        None => {
+            let (c, l) = empty_body(a.firstlineno);
+            (crate::types::bytes::new_bytes(&c), crate::types::bytes::new_bytes(&l), a.stacksize.max(1))
+        }
+    };
+    let exceptiontable = bytes_or(a.exceptiontable, "exceptiontable")?.unwrap_or_else(|| crate::types::bytes::new_bytes(b""));
+    code::new_code_from_public(code::PublicParts {
+        argcount: a.argcount,
+        posonlyargcount: a.posonlyargcount,
+        kwonlyargcount: a.kwonlyargcount,
+        stacksize,
+        flags: a.flags,
+        firstlineno: a.firstlineno,
+        code,
+        consts,
+        names,
+        localsplusnames: lpn,
         kinds,
         filename: a.filename.to_ref(),
-        consts: sd.consts.tuple().clone(),
-        names: sd.names.tuple().clone(),
-        localsplusnames: tuple::new_tuple(lpn),
         name: pystr::intern(a.name.to_ref()),
         qualname: qualname.to_ref(),
-    };
-    let r = code::new_code_from_parts(parts)?;
-    // co_consts / co_names show the caller's tuples; the stub body keeps its own
-    // constants and names in the code data.
-    unsafe {
-        let c = &mut *(r.as_ptr() as *mut code::PyCodeObject);
-        let old = std::mem::replace(&mut c.co_consts, consts.into_raw());
-        xdecref(old);
-        let old = std::mem::replace(&mut c.co_names, tuple::new_tuple(names).into_raw());
-        xdecref(old);
-    }
-    Ok(r)
+        linetable,
+        exceptiontable,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
 unsafe fn code_new_c(
-    a: c_int, p: c_int, k: c_int, f: c_int, consts: *mut PyObject, names: *mut PyObject, varnames: *mut PyObject,
-    freevars: *mut PyObject, cellvars: *mut PyObject, filename: *mut PyObject, name: *mut PyObject, qualname: *mut PyObject,
-    fl: c_int,
+    a: c_int, p: c_int, k: c_int, s: c_int, f: c_int, code: *mut PyObject, consts: *mut PyObject, names: *mut PyObject,
+    varnames: *mut PyObject, freevars: *mut PyObject, cellvars: *mut PyObject, filename: *mut PyObject, name: *mut PyObject,
+    qualname: *mut PyObject, fl: c_int, lt: *mut PyObject, et: *mut PyObject,
 ) -> *mut PyObject {
     unsafe {
-        if filename.is_null() || name.is_null() {
+        if filename.is_null() || name.is_null() || code.is_null() {
             return null_arg();
         }
         ret(new_code_from_c(CCodeArgs {
             argcount: a,
             posonlyargcount: p,
             kwonlyargcount: k,
+            stacksize: s,
             flags: f,
+            code: opt(code),
             consts: opt(consts),
             names: opt(names),
             varnames: opt(varnames),
@@ -543,6 +698,8 @@ unsafe fn code_new_c(
             name: &*name,
             qualname: opt(qualname),
             firstlineno: fl,
+            linetable: opt(lt),
+            exceptiontable: opt(et),
         }))
     }
 }
@@ -556,7 +713,9 @@ pub unsafe extern "C" fn PyCode_NewEmpty(filename: *const c_char, funcname: *con
             argcount: 0,
             posonlyargcount: 0,
             kwonlyargcount: 0,
+            stacksize: 0,
             flags: 0,
+            code: None,
             consts: None,
             names: None,
             varnames: None,
@@ -566,6 +725,8 @@ pub unsafe extern "C" fn PyCode_NewEmpty(filename: *const c_char, funcname: *con
             name: &name,
             qualname: None,
             firstlineno,
+            linetable: None,
+            exceptiontable: None,
         }))
     }
 }
@@ -575,46 +736,100 @@ pub unsafe extern "C" fn PyCode_Optimize(code: *mut PyObject, _c: *mut PyObject,
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_Code_New(
-    a: c_int, k: c_int, _n: c_int, _s: c_int, f: c_int, _code: *mut PyObject, consts: *mut PyObject, names: *mut PyObject,
+    a: c_int, k: c_int, _n: c_int, s: c_int, f: c_int, code: *mut PyObject, consts: *mut PyObject, names: *mut PyObject,
     varnames: *mut PyObject, freevars: *mut PyObject, cellvars: *mut PyObject, filename: *mut PyObject, name: *mut PyObject,
-    qualname: *mut PyObject, fl: c_int, _lt: *mut PyObject, _et: *mut PyObject,
+    qualname: *mut PyObject, fl: c_int, lt: *mut PyObject, et: *mut PyObject,
 ) -> *mut PyObject {
-    unsafe { code_new_c(a, 0, k, f, consts, names, varnames, freevars, cellvars, filename, name, qualname, fl) }
+    unsafe { code_new_c(a, 0, k, s, f, code, consts, names, varnames, freevars, cellvars, filename, name, qualname, fl, lt, et) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_Code_NewWithPosOnlyArgs(
-    a: c_int, p: c_int, k: c_int, _n: c_int, _s: c_int, f: c_int, _code: *mut PyObject, consts: *mut PyObject,
+    a: c_int, p: c_int, k: c_int, _n: c_int, s: c_int, f: c_int, code: *mut PyObject, consts: *mut PyObject,
     names: *mut PyObject, varnames: *mut PyObject, freevars: *mut PyObject, cellvars: *mut PyObject, filename: *mut PyObject,
-    name: *mut PyObject, qualname: *mut PyObject, fl: c_int, _lt: *mut PyObject, _et: *mut PyObject,
+    name: *mut PyObject, qualname: *mut PyObject, fl: c_int, lt: *mut PyObject, et: *mut PyObject,
 ) -> *mut PyObject {
-    unsafe { code_new_c(a, p, k, f, consts, names, varnames, freevars, cellvars, filename, name, qualname, fl) }
+    unsafe { code_new_c(a, p, k, s, f, code, consts, names, varnames, freevars, cellvars, filename, name, qualname, fl, lt, et) }
 }
+// co_extra (PEP 523 scratch space): the code object's `co_extra` slot (`_reserved[6]` in our
+// PyCodeObject, where CPython keeps it) points to a boxed vector of per-index values; the
+// free functions registered with PyUnstable_Eval_RequestCodeExtraIndex run when a value is
+// replaced and when the code object is deallocated.
 static CODE_EXTRA: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
-static CODE_EXTRA_DATA: std::sync::Mutex<Vec<(usize, isize, usize)>> = std::sync::Mutex::new(Vec::new());
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_Eval_RequestCodeExtraIndex(free: *mut c_void) -> Py_ssize_t {
     let mut g = CODE_EXTRA.lock().unwrap();
+    if g.len() >= 255 {
+        return -1;
+    }
     g.push(free as usize);
     (g.len() - 1) as Py_ssize_t
+}
+fn extra_free_fn(index: usize) -> Option<unsafe extern "C" fn(*mut c_void)> {
+    let f = *CODE_EXTRA.lock().unwrap().get(index)?;
+    if f == 0 { None } else { Some(unsafe { std::mem::transmute::<usize, unsafe extern "C" fn(*mut c_void)>(f) }) }
+}
+unsafe fn extra_slot(co: *mut PyObject) -> *mut usize {
+    unsafe { &mut (*(co as *mut code::PyCodeObject))._reserved[6] as *mut usize }
+}
+/// Called by the code object's deallocator.
+pub(crate) unsafe fn free_code_extras(co: *mut PyObject) {
+    unsafe {
+        let slot = extra_slot(co);
+        if *slot == 0 {
+            return;
+        }
+        let v = Box::from_raw(*slot as *mut Vec<usize>);
+        *slot = 0;
+        for (i, &x) in v.iter().enumerate() {
+            if x != 0 {
+                if let Some(f) = extra_free_fn(i) {
+                    f(x as *mut c_void);
+                }
+            }
+        }
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_Code_GetExtra(co: *mut PyObject, index: Py_ssize_t, extra: *mut *mut c_void) -> c_int {
     unsafe {
-        let g = CODE_EXTRA_DATA.lock().unwrap();
-        *extra = g.iter().find(|(c, i, _)| *c == co as usize && *i == index).map_or(std::ptr::null_mut(), |x| x.2 as *mut c_void);
+        if co.is_null() || !code::is_code(&*co) {
+            let _ = bad_internal();
+            return -1;
+        }
+        *extra = std::ptr::null_mut();
+        let slot = extra_slot(co);
+        if index >= 0 && *slot != 0 {
+            if let Some(&x) = (&*(*slot as *const Vec<usize>)).get(index as usize) {
+                *extra = x as *mut c_void;
+            }
+        }
         0
     }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_Code_SetExtra(co: *mut PyObject, index: Py_ssize_t, extra: *mut c_void) -> c_int {
-    if index < 0 || index as usize >= CODE_EXTRA.lock().unwrap().len() {
-        let _ = bad_internal();
-        return -1;
+    unsafe {
+        if co.is_null() || !code::is_code(&*co) || index < 0 || index as usize >= CODE_EXTRA.lock().unwrap().len() {
+            let _ = bad_internal();
+            return -1;
+        }
+        let slot = extra_slot(co);
+        if *slot == 0 {
+            *slot = Box::into_raw(Box::new(Vec::<usize>::new())) as usize;
+        }
+        let v = &mut *(*slot as *mut Vec<usize>);
+        let i = index as usize;
+        if v.len() <= i {
+            v.resize(i + 1, 0);
+        }
+        let old = std::mem::replace(&mut v[i], extra as usize);
+        if old != 0 {
+            if let Some(f) = extra_free_fn(i) {
+                f(old as *mut c_void);
+            }
+        }
+        0
     }
-    let mut g = CODE_EXTRA_DATA.lock().unwrap();
-    g.retain(|(c, i, _)| !(*c == co as usize && *i == index));
-    g.push((co as usize, index, extra as usize));
-    0
 }
 
 // ---------------------------------------------------------------- frames

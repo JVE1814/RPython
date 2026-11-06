@@ -9,7 +9,12 @@ _whitespace = '\t\n\x0b\x0c\r '
 
 
 class TextWrapper:
-    """Configurable text wrapper.
+    """
+    Object for wrapping/filling text.  The public interface consists of
+    the wrap() and fill() methods; the other methods are just there for
+    subclasses to override in order to tweak the default behaviour.
+    If you want to completely replace the main wrapping algorithm,
+    you'll probably have to override _wrap_chunks().
 
     Attributes (all settable as constructor keywords):
       width (default 70), initial_indent, subsequent_indent,

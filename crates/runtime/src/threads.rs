@@ -126,10 +126,41 @@ pub fn current_ptr() -> *mut ThreadState {
     CURRENT.with(|c| c.get())
 }
 
+/// Retires a thread state that was created implicitly (an OS thread the runtime
+/// did not start touched the VM) when that OS thread exits. Without it the state
+/// would stay registered, possibly in `InVm` mode, and every stop-the-world
+/// would wait for a thread that no longer exists.
+struct AutoAttached(Cell<*mut ThreadState>);
+impl Drop for AutoAttached {
+    fn drop(&mut self) {
+        let p = self.0.get();
+        if p.is_null() {
+            return;
+        }
+        let ts = unsafe { &*p };
+        if ts.exited.load(SeqCst) {
+            return; // retired properly (thread_exit)
+        }
+        ts.mode.0.store(ThreadMode::Blocked as u8, SeqCst);
+        {
+            let mut all = ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+            ts.alive.store(false, SeqCst);
+            ts.exited.store(true, SeqCst);
+            all.retain(|&t| t != p as usize);
+            crate::qsbr::note_threads(all.len());
+        }
+        // its memory is not reused: objects may still sit in its merge queue
+    }
+}
+thread_local! {
+    static AUTO_ATTACHED: AutoAttached = const { AutoAttached(Cell::new(std::ptr::null_mut())) };
+}
+
 #[cold]
 fn attach_new() -> &'static ThreadState {
     let ts = new_thread_state();
     CURRENT.with(|c| c.set(ts));
+    let _ = AUTO_ATTACHED.try_with(|g| g.0.set(ts));
     // new states start in a safe mode; entering the VM honours a stopped world
     unsafe { (*ts).mode.set(ThreadMode::InVm) };
     unsafe { &*ts }
@@ -287,6 +318,8 @@ pub fn thread_exit() {
             all.retain(|&t| t != p as usize);
             crate::qsbr::note_threads(all.len());
         }
+        // retired here: the exit-time guard must not touch the (reusable) memory
+        let _ = AUTO_ATTACHED.try_with(|g| g.0.set(std::ptr::null_mut()));
         FREE_STATES.lock().unwrap_or_else(|e| e.into_inner()).push(p as usize);
         set_current(std::ptr::null_mut());
     }
@@ -321,6 +354,8 @@ pub const EVAL_SAFEPOINT: usize = 1 << 1;
 pub const EVAL_SIGNALS: usize = 1 << 2;
 pub const EVAL_ASYNC_EXC: usize = 1 << 3;
 pub const EVAL_GC: usize = 1 << 4;
+/// Pending calls (Py_AddPendingCall) are queued for this thread (capi/pystate.rs).
+pub const EVAL_PENDING: usize = 1 << 6;
 
 /// Process pending merges for the current thread.
 pub fn process_merge_queue(ts: &ThreadState) {

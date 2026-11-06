@@ -18,6 +18,7 @@ pub mod compile;
 pub mod ffi;
 pub mod gc;
 pub mod gc_support;
+pub mod frozen;
 pub mod hash;
 pub mod import;
 pub mod import_spec;
@@ -89,6 +90,13 @@ pub fn initialize(cfg: &Config) -> PyResult<()> {
     modules::sys_full::post_init()?;
     // real std streams (and builtins.open) must exist before site runs .pth files
     modules::sys::init_stdio();
+    // -W options / PYTHONWARNINGS take effect through the warnings module's
+    // filters, so it is imported right away when there are any
+    if !modules::sys_full::config().warnoptions.is_empty() {
+        if import::import_absolute("warnings").is_err() {
+            errors::clear_exc();
+        }
+    }
     modules::sys_full::import_site()?;
     Ok(())
 }
@@ -123,10 +131,27 @@ pub fn handle_system_exit(e: &PyRef) -> i32 {
     }
     let c = unsafe { &*code };
     if types::int::is_int(c) {
-        return types::int::as_i64(c).unwrap_or(1) as i32;
+        // out of the C int range: -1, as CPython's failed conversion gives
+        return types::int::as_i64(c).and_then(|v| i32::try_from(v).ok()).unwrap_or(-1);
     }
-    let s = abstract_::str_string(c).unwrap_or_default();
-    modules::sys::write_stderr(&format!("{}\n", s));
+    // printed through sys.stderr (its error handler deals with surrogates)
+    let printed = match modules::sys::get_sys_attr("stderr") {
+        Some(err) if !err.is(types::none::none()) => (|| -> errors::PyResult<()> {
+            let s = abstract_::str(c)?;
+            abstract_::call_method_str(&err, "write", &[&s])?;
+            abstract_::call_method_str(&err, "write", &[&types::str::new_str("\n")])?;
+            let _ = abstract_::call_method_str(&err, "flush", &[]);
+            Ok(())
+        })()
+        .is_ok(),
+        _ => false,
+    };
+    if !printed {
+        errors::clear_exc();
+        let s = abstract_::str_string(c).unwrap_or_default();
+        modules::sys::write_stderr(&format!("{}\n", s));
+    }
+    errors::clear_exc();
     1
 }
 

@@ -138,6 +138,29 @@ fn fatal(msg: &str) -> ! {
 }
 
 fn main() {
+    // Prefer running the interpreter on the process's main thread (like CPython:
+    // tools such as strace without -f, signal delivery and thread ids all see the
+    // main thread).  Its stack may grow up to RLIMIT_STACK, so raise the soft limit
+    // to the stack size the interpreter wants; only if that is not permitted fall
+    // back to a big-stack thread (grind-lib).
+    const WANT: libc::rlim_t = 256 << 20;
+    let main_ok = unsafe {
+        let mut rl: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_STACK, &mut rl) != 0 {
+            false
+        } else if rl.rlim_cur == libc::RLIM_INFINITY || rl.rlim_cur >= WANT {
+            true
+        } else if rl.rlim_max == libc::RLIM_INFINITY || rl.rlim_max >= WANT {
+            rl.rlim_cur = WANT;
+            libc::setrlimit(libc::RLIMIT_STACK, &rl) == 0
+        } else {
+            false
+        }
+    };
+    if main_ok {
+        let code = real_main();
+        std::process::exit(code);
+    }
     // Keep process-directed signals away from the OS main thread (which only waits):
     // block them here, and restore the original mask in the interpreter thread.
     let mut old: libc::sigset_t = unsafe { std::mem::zeroed() };

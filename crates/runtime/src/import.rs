@@ -88,7 +88,7 @@ static EXTERNAL_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::At
 /// (`__pycache__/<stem>.rpython-boot`, marshal format) keyed on the source size and
 /// mtime and on the interpreter executable's size and mtime (a rebuilt compiler
 /// invalidates it). Any problem with the cache falls back to compiling.
-fn bootstrap_code(src: &[u8], file: &str, display: &str) -> PyResult {
+pub(crate) fn bootstrap_code(src: &[u8], file: &str, display: &str) -> PyResult {
     fn stamp(p: &std::path::Path) -> Option<(u64, u128)> {
         let m = std::fs::metadata(p).ok()?;
         let t = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
@@ -98,7 +98,7 @@ fn bootstrap_code(src: &[u8], file: &str, display: &str) -> PyResult {
     let key = (|| {
         let (sl, st) = stamp(path)?;
         let (el, et) = stamp(&std::env::current_exe().ok()?)?;
-        Some(format!("rpython-boot v1 {} {} {} {} {}\n", sl, st, el, et, display))
+        Some(format!("rpython-boot v1{} {} {} {} {} {}\n", if crate::types::code::public_mode() { "w" } else { "" }, sl, st, el, et, display))
     })();
     let cache = path.parent().map(|dir| {
         let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -145,7 +145,12 @@ fn exec_bootstrap_module(name: &str, file: &str, display: &str) -> PyResult {
     };
     let m = module::new_module(name)?;
     let d = module::module_dict(&m);
-    dict::set_item_str(&d, "__builtins__", &crate::builtins::builtins_module())?;
+    dict::set_item_str(&d, "__builtins__", &crate::builtins::builtins_dict())?;
+    // these count as frozen modules: FrozenImporter._fix_up_module reads (and
+    // removes) the original name when it gives them their spec
+    if let Some(orig) = display.strip_prefix("<frozen ").and_then(|s| s.strip_suffix('>')) {
+        dict::set_item_str(&d, "__origname__", &pystr::new_str(orig))?;
+    }
     dict::set_item_str(&crate::modules::sys::modules_dict(), name, &m)?;
     let r = (|| -> PyResult<()> {
         let code = bootstrap_code(&src, file, display)?;
@@ -196,8 +201,32 @@ pub fn install_importlib(stdlib: &str) -> PyResult<()> {
         return Ok(());
     }
     EXTERNAL_INSTALLED.store(true, std::sync::atomic::Ordering::Release);
+    if let Some(ext) = get_loaded_module("_frozen_importlib_external") {
+        give_frozen_spec(&ext);
+    }
     install_zipimport_hook();
     Ok(())
+}
+
+/// Give a module executed from frozen code the spec FrozenImporter would have
+/// produced (origin "frozen", loader_state with origname/filename). The module's
+/// `__origname__` (if any) names the original module. Best effort.
+pub fn give_frozen_spec(m: &PyObject) {
+    let Some(bs) = bootstrap() else { return };
+    let d = module::module_dict(m);
+    if matches!(dict::get_item_rs(&d, "__spec__"), Some(s) if !s.is(none::none())) {
+        return;
+    }
+    let r = (|| -> PyResult<()> {
+        let fi = ab::getattr_str(&bs, "FrozenImporter")?;
+        let spec = ab::call(&*ab::getattr_str(&bs, "_spec_from_module")?, &[m, &fi])?;
+        ab::call(&*ab::getattr_str(&bs, "_init_module_attrs")?, &[&spec, m])?;
+        ab::call(&*ab::getattr_str(&fi, "_fix_up_module")?, &[m])?;
+        Ok(())
+    })();
+    if r.is_err() {
+        clear_exc();
+    }
 }
 
 /// Put `zipimport.zipimporter` first in sys.path_hooks (as CPython does at startup);
@@ -261,7 +290,18 @@ pub fn cannot_import_name(module: &PyObject, pkgname: &PyObject, nm: &PyObject) 
     let file = ab::getattr_opt(module, name!("__file__")).ok().flatten();
     let n = pystr::to_string_lossy(nm);
     let p = pystr::to_string_lossy(pkgname);
-    if module_is_initializing(&crate::types::module::module_dict(module)) {
+    let d = crate::types::module::module_dict(module);
+    let initializing = module_is_initializing(&d);
+    if module::is_module(module) {
+        let modname = dict::get_item_str(&d, name!("__name__")).filter(|n| pystr::is_str(n));
+        if let Some(mn) = modname {
+            if let Some(h) = shadowing_hint(&d, &mn, initializing)? {
+                let msg = format!("cannot import name '{}' from '{}' {}", n, p, h);
+                return Err(import_error_with(&msg, Some(pkgname), file.as_deref(), Some(nm)));
+            }
+        }
+    }
+    if initializing {
         return Err(import_error_with(
             &format!(
                 "cannot import name '{}' from partially initialized module '{}' (most likely due to a circular import) ({})",
@@ -279,6 +319,108 @@ pub fn cannot_import_name(module: &PyObject, pkgname: &PyObject, nm: &PyObject) 
         _ => format!("cannot import name '{}' from '{}' (unknown location)", n, p),
     };
     Err(import_error_with(&msg, Some(pkgname), file.as_deref(), Some(nm)))
+}
+
+/// `__spec__.origin` of a module namespace, if it is a str.
+fn spec_origin(d: &PyObject) -> Option<String> {
+    let spec = dict::get_item_str(d, name!("__spec__")).filter(|s| !s.is(none::none()))?;
+    match ab::getattr_opt(&spec, &pystr::intern_str("origin")) {
+        Ok(Some(o)) if pystr::is_str(&o) => Some(pystr::to_string_lossy(&o)),
+        _ => {
+            clear_exc();
+            None
+        }
+    }
+}
+
+static SYS_PATH_0: Mutex<Option<String>> = Mutex::new(None);
+
+/// Record the directory start-up put in front of sys.path (script dir, cwd, '').
+pub fn set_sys_path_0(p: &str) {
+    *SYS_PATH_0.lock().unwrap_or_else(|e| e.into_inner()) = Some(p.to_string());
+}
+
+/// Is the module file at `origin` possibly shadowing another module, i.e. does it
+/// live in the directory of sys.path[0] (the script's directory or the cwd)?
+fn possibly_shadowing(origin: &str) -> bool {
+    let p = std::path::Path::new(origin);
+    let mut root = match p.parent() {
+        Some(r) => r.to_path_buf(),
+        None => return false,
+    };
+    if p.file_name().is_some_and(|f| f == "__init__.py") {
+        root = match root.parent() {
+            Some(r) => r.to_path_buf(),
+            None => return false,
+        };
+    }
+    // sys.path[0] as set up at start-up (later changes to sys.path do not count);
+    // sys.path must still look sane
+    let Some(path) = crate::modules::sys::get_sys_attr("path") else { return false };
+    if !list::is_list(&path) || !list::get(&path, 0).is_some_and(|f| pystr::is_str(&f)) {
+        return false;
+    }
+    let Some(first) = SYS_PATH_0.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return false };
+    // lexical comparison of absolute paths (no file system access: this runs on
+    // every failed module attribute lookup)
+    let first = if first.is_empty() { ".".to_string() } else { first };
+    let norm = |p: &std::path::Path| -> Option<std::path::PathBuf> {
+        let a = std::path::absolute(p).ok()?;
+        Some(a.components().collect())
+    };
+    match (norm(&root), norm(std::path::Path::new(&first))) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Hint appended to "has no attribute" / "cannot import name" errors when the
+/// module is a file of the user's that shadows a standard library module (or,
+/// while it is being initialized, some library it tried to import).
+/// Errors (e.g. an unhashable module name) propagate.
+pub fn shadowing_hint(d: &PyObject, modname: &PyObject, initializing: bool) -> PyResult<Option<String>> {
+    let Some(origin) = spec_origin(d) else { return Ok(None) };
+    if !possibly_shadowing(&origin) {
+        return Ok(None);
+    }
+    let stdlib = match crate::modules::sys::get_sys_attr("stdlib_module_names") {
+        Some(names) if !names.is(none::none()) => ab::contains(&names, modname)?,
+        _ => false,
+    };
+    if stdlib {
+        return Ok(Some(format!(
+            "(consider renaming '{}' since it has the same name as the standard library module named '{}' and prevents importing that standard library module)",
+            origin,
+            pystr::to_string_lossy(modname)
+        )));
+    }
+    if initializing {
+        return Ok(Some(format!("(consider renaming '{}' if it has the same name as a library you intended to import)", origin)));
+    }
+    Ok(None)
+}
+
+/// Message of the AttributeError for a missing module attribute.
+pub fn module_attribute_error(d: &PyObject, modname: &PyObject, attr: &PyObject) -> PyResult<String> {
+    let mns = pystr::to_string_lossy(modname);
+    let a = pystr::to_string_lossy(attr);
+    let initializing = module_is_initializing(d);
+    if let Some(h) = shadowing_hint(d, modname, initializing)? {
+        return Ok(format!("module '{}' has no attribute '{}' {}", mns, a, h));
+    }
+    if initializing {
+        return Ok(match spec_origin(d) {
+            Some(o) => format!("partially initialized module '{}' from '{}' has no attribute '{}' (most likely due to a circular import)", mns, o, a),
+            None => format!("partially initialized module '{}' has no attribute '{}' (most likely due to a circular import)", mns, a),
+        });
+    }
+    // a submodule that is still being imported
+    if let Some(sub) = get_loaded_module(&format!("{}.{}", mns, a)) {
+        if module::is_module(&sub) && module_is_initializing(&module::module_dict(&sub)) {
+            return Ok(format!("cannot access submodule '{}' of module '{}' (most likely due to a circular import)", a, mns));
+        }
+    }
+    Ok(format!("module '{}' has no attribute '{}'", mns, a))
 }
 
 pub fn module_is_initializing(d: &PyObject) -> bool {
@@ -392,6 +534,11 @@ fn resolve_name(nm: &str, globals: Option<&PyObject>, level: i64) -> PyResult<St
         _ => match spec.filter(|s| !s.is(none::none())) {
             Some(s) => pystr::to_string_lossy(&*ab::getattr(&s, name!("parent"))?),
             None => {
+                crate::modules::warnings::warn(
+                    crate::types::exceptions::ImportWarning(),
+                    "can't resolve package from __spec__ or __package__, falling back on __name__ and __path__",
+                    1,
+                )?;
                 let n = match dict::get_item_str(g, name!("__name__")) {
                     Some(n) => n,
                     None => raise!(KeyError, "'__name__' not in globals"),
@@ -428,6 +575,16 @@ pub fn import_module_level(nm: &PyObject, globals: Option<&PyObject>, fromlist: 
     }
     if level < 0 {
         raise!(ValueError, "level must be >= 0");
+    }
+    if level == 0 && pystr::to_string_strict(nm).is_none() {
+        // a name with lone surrogates has no Rust string form; it can only
+        // name a module already placed in sys.modules (grind-lib)
+        let modules = crate::modules::sys::modules_dict();
+        if let Some(m) = dict::get_item(&modules, nm)? {
+            if !m.is(none::none()) {
+                return Ok(m);
+            }
+        }
     }
     let n = pystr::to_string_lossy(nm);
     let abs = if level > 0 {
@@ -757,7 +914,7 @@ pub fn load_source(abs: &str, file: &std::path::Path, pkg_dir: Option<&std::path
             dict::set_item_str(&d, "__package__", &pystr::new_str(parent))?;
         }
     }
-    dict::set_item_str(&d, "__builtins__", &crate::builtins::builtins_module())?;
+    dict::set_item_str(&d, "__builtins__", &crate::builtins::builtins_dict())?;
     if let Some(spec) = crate::import_spec::make_spec(abs, Some(&fname), pkg_dir.is_some())? {
         dict::set_item_str(&d, "__spec__", &spec)?;
         if let Ok(Some(l)) = ab::getattr_opt(&spec, name!("loader")) {

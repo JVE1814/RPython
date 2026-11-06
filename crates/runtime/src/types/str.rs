@@ -160,6 +160,9 @@ pub fn try_alloc_str(len: usize, maxchar: u32) -> Option<PyRef> {
         (4, false)
     };
     let header = if ascii { std::mem::size_of::<PyASCIIObject>() } else { std::mem::size_of::<PyCompactUnicodeObject>() };
+    if len >= (isize::MAX as usize - header) / kind as usize - 1 {
+        return None; // no such string fits in memory (and the size would overflow)
+    }
     let size = header + (len + 1) * kind as usize;
     unsafe {
         let op = alloc::alloc_object(str_type(), size);

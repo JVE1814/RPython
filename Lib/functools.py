@@ -8,7 +8,7 @@ __all__ = ['update_wrapper', 'wraps', 'WRAPPER_ASSIGNMENTS', 'WRAPPER_UPDATES',
 from abc import get_cache_token
 from collections import namedtuple
 from reprlib import recursive_repr
-from types import GenericAlias, MethodType, MappingProxyType, UnionType
+from types import GenericAlias, MethodType, MappingProxyType, UnionType, FunctionType
 from _thread import RLock
 
 
@@ -53,65 +53,54 @@ def wraps(wrapped, assigned=WRAPPER_ASSIGNMENTS, updated=WRAPPER_UPDATES):
 # --------------------------------------------------------------------------
 # total_ordering
 
-def _derive(root, name):
-    # Build the comparison method *name* from the user supplied method *root*
-    # (and __eq__ where needed).  NotImplemented is passed through unchanged.
-    if root == '__lt__':
-        if name == '__gt__':
-            def op(self, other):
-                r = type(self).__lt__(self, other)
-                return r if r is NotImplemented else (not r and self != other)
-        elif name == '__le__':
-            def op(self, other):
-                r = type(self).__lt__(self, other)
-                return r if r is NotImplemented else (r or self == other)
-        else:
-            def op(self, other):
-                r = type(self).__lt__(self, other)
-                return r if r is NotImplemented else not r
-    elif root == '__le__':
-        if name == '__ge__':
-            def op(self, other):
-                r = type(self).__le__(self, other)
-                return r if r is NotImplemented else (not r or self == other)
-        elif name == '__lt__':
-            def op(self, other):
-                r = type(self).__le__(self, other)
-                return r if r is NotImplemented else (r and self != other)
-        else:
-            def op(self, other):
-                r = type(self).__le__(self, other)
-                return r if r is NotImplemented else not r
-    elif root == '__gt__':
-        if name == '__lt__':
-            def op(self, other):
-                r = type(self).__gt__(self, other)
-                return r if r is NotImplemented else (not r and self != other)
-        elif name == '__ge__':
-            def op(self, other):
-                r = type(self).__gt__(self, other)
-                return r if r is NotImplemented else (r or self == other)
-        else:
-            def op(self, other):
-                r = type(self).__gt__(self, other)
-                return r if r is NotImplemented else not r
-    else:  # __ge__
-        if name == '__le__':
-            def op(self, other):
-                r = type(self).__ge__(self, other)
-                return r if r is NotImplemented else (not r or self == other)
-        elif name == '__gt__':
-            def op(self, other):
-                r = type(self).__ge__(self, other)
-                return r if r is NotImplemented else (r and self != other)
-        else:
-            def op(self, other):
-                r = type(self).__ge__(self, other)
-                return r if r is NotImplemented else not r
-    op.__name__ = name
-    op.__qualname__ = name
-    op.__doc__ = f'Return the result of {name}, derived by @total_ordering from {root}.'
+# Each derived method is a module-level function (named _<name>_from_<root>)
+# so that it pickles by reference.  The table gives, for a root operation and
+# a wanted operation, how the wanted result follows from r = root(self, other).
+_DERIVE_RULES = {
+    '__lt__': {'__gt__': 'not_and_ne', '__le__': 'or_eq', '__ge__': 'not'},
+    '__le__': {'__ge__': 'not_or_eq', '__lt__': 'and_ne', '__gt__': 'not'},
+    '__gt__': {'__lt__': 'not_and_ne', '__ge__': 'or_eq', '__le__': 'not'},
+    '__ge__': {'__le__': 'not_or_eq', '__gt__': 'and_ne', '__lt__': 'not'},
+}
+
+
+def _make_derived(root, name, rule):
+    if rule == 'not_and_ne':
+        def op(self, other):
+            r = getattr(type(self), root)(self, other)
+            return r if r is NotImplemented else (not r and self != other)
+    elif rule == 'or_eq':
+        def op(self, other):
+            r = getattr(type(self), root)(self, other)
+            return r if r is NotImplemented else (r or self == other)
+    elif rule == 'not_or_eq':
+        def op(self, other):
+            r = getattr(type(self), root)(self, other)
+            return r if r is NotImplemented else (not r or self == other)
+    elif rule == 'and_ne':
+        def op(self, other):
+            r = getattr(type(self), root)(self, other)
+            return r if r is NotImplemented else (r and self != other)
+    else:
+        def op(self, other):
+            r = getattr(type(self), root)(self, other)
+            return r if r is NotImplemented else not r
+    fname = '_%s_from_%s' % (name.strip('_'), root.strip('_'))
+    op.__name__ = op.__qualname__ = fname
+    op.__doc__ = (f'Return the result of {name}, derived by @total_ordering '
+                  f'from {root}.')
+    globals()[fname] = op
     return op
+
+
+_DERIVED = {(root, name): _make_derived(root, name, rule)
+            for root, rules in _DERIVE_RULES.items()
+            for name, rule in rules.items()}
+
+
+def _derive(root, name):
+    return _DERIVED[root, name]
+
 
 _ORDER_OPS = ('__lt__', '__le__', '__gt__', '__ge__')
 
@@ -475,7 +464,8 @@ class _HashedSeq(list):
 _KWD_MARK = (object(),)
 _FAST_TYPES = frozenset({int, str})
 
-def _make_key(args, kwds, typed):
+def _make_key(args, kwds, typed, *, tuple=tuple, type=type, len=len):
+    # builtins are bound as defaults: a cached function may replace them
     """Flat, hashable cache key for a call with *args* and *kwds*."""
     key = args
     if kwds:
@@ -885,8 +875,26 @@ class _singledispatchmethod_get:
                                'singledispatchmethod method')
             raise TypeError(f'{funcname} requires at least '
                             '1 positional argument')
+        obj = self._obj
+        if obj is None and isinstance(self._unbound.func, FunctionType) \
+                and len(args) > 1:
+            # Called through the class with the instance passed explicitly:
+            # dispatch on the argument after it.
+            impl = self._dispatch(args[1].__class__)
+            if isinstance(impl, staticmethod):
+                return impl.__func__(*args[1:], **kwargs)
+            get = getattr(type(impl), '__get__', None)
+            meth = impl if get is None else get(impl, None, self._cls)
+            if isinstance(meth, MethodType):
+                # already bound (classmethod, foreign bound method)
+                return meth(*args[1:], **kwargs)
+            return meth(*args, **kwargs)
         impl = self._dispatch(args[0].__class__)
-        return impl.__get__(self._obj, self._cls)(*args, **kwargs)
+        get = getattr(type(impl), '__get__', None)
+        if get is None:
+            # plain callables are not bound to the instance
+            return impl(*args, **kwargs)
+        return get(impl, obj, self._cls)(*args, **kwargs)
 
     def __getattr__(self, name):
         if name in ('__name__', '__qualname__', '__isabstractmethod__',

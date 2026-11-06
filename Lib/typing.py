@@ -307,10 +307,11 @@ def _eval_type(t, globalns, localns, type_params=_sentinel, *, recursive_guard=f
             is_unpacked = t.__unpacked__
             if _should_unflatten_callable_args(t, args):
                 t = t.__origin__[(args[:-1], args[-1])]
-            else:
-                t = t.__origin__[args]
-            if is_unpacked:
-                t = Unpack[t]
+            elif any(a is not b for a, b in zip(args, t.__args__)):
+                # rebuild with the same alias class (subclasses are kept)
+                t = type(t)(t.__origin__, args)
+            if is_unpacked and not t.__unpacked__:
+                t = next(iter(t))
 
         ev_args = tuple(
             _eval_type(a, globalns, localns, type_params, recursive_guard=recursive_guard,
@@ -320,7 +321,10 @@ def _eval_type(t, globalns, localns, type_params=_sentinel, *, recursive_guard=f
         if ev_args == t.__args__:
             return t
         if isinstance(t, GenericAlias):
-            return GenericAlias(t.__origin__, ev_args)
+            new = type(t)(t.__origin__, ev_args)
+            if t.__unpacked__:
+                new = next(iter(new))
+            return new
         if isinstance(t, Union):
             return functools.reduce(operator.or_, ev_args)
         return t.copy_with(ev_args)
@@ -474,7 +478,8 @@ def Literal(self, *parameters):
     # the arguments are values, not types: no _type_check
     parameters = _flatten_literal_params(parameters)
     try:
-        parameters = tuple(p for p, _ in _deduplicate(list(_value_and_type_iter(parameters))))
+        parameters = tuple(p for p, _ in _deduplicate(
+            list(_value_and_type_iter(parameters)), unhashable_fallback=True))
     except TypeError:  # unhashable values
         pass
     return _LiteralGenericAlias(self, parameters)
@@ -540,7 +545,7 @@ def evaluate_forward_ref(forward_ref, *, owner=None, globals=None, locals=None,
                          type_params=None, format=None, _recursive_guard=frozenset()):
     """Evaluate a ForwardRef, also evaluating forward references nested in the result."""
     if format == _lazy_annotationlib.Format.STRING:
-        return forward_ref.__forward_arg__
+        return forward_ref.evaluate(format=format)
     if forward_ref.__forward_arg__ in _recursive_guard:
         return forward_ref
 
@@ -776,8 +781,13 @@ class _BaseGenericAlias(_Final, _root=True):
         return tuple(res)
 
     def __getattr__(self, attr):
+        if attr in {'__name__', '__qualname__'}:
+            return self._name or self.__origin__.__name__
         if attr in {'__origin__', '__args__'}:
             return super().__getattr__(attr)
+        if attr in {'__name__', '__qualname__'} and '__origin__' in self.__dict__:
+            # an alias is named after its typing name (List, Callable) or its origin
+            return self._name or self.__origin__.__name__
         # Forward non-dunder attributes to the origin (but be careful during
         # copy/pickle, when __origin__ may not be set yet).
         if '__origin__' in self.__dict__ and not _is_dunder(attr):
@@ -1330,6 +1340,7 @@ class _ProtocolMeta(ABCMeta):
                     "Instance and class checks can only be used with "
                     "@runtime_checkable protocols"
                 )
+            _warn_if_runtime_checkable_inherited(cls)
             if (
                 cls.__non_callable_proto_members__
                 and cls.__dict__.get("__subclasshook__") is _proto_hook
@@ -1355,6 +1366,8 @@ class _ProtocolMeta(ABCMeta):
         ):
             raise TypeError("Instance and class checks can only be used with"
                             " @runtime_checkable protocols")
+        if not _allow_reckless_class_checks():
+            _warn_if_runtime_checkable_inherited(cls)
 
         if _abc_instancecheck(cls, instance):
             return True
@@ -1372,6 +1385,20 @@ class _ProtocolMeta(ABCMeta):
             return True
 
         return False
+
+
+def _warn_if_runtime_checkable_inherited(cls):
+    # A protocol is only runtime-checkable if @runtime_checkable was applied
+    # to it; inheriting the flag from a base protocol is deprecated.
+    if (cls.__dict__.get('_is_runtime_protocol') is None
+            and getattr(cls, '_is_runtime_protocol', False)):
+        import warnings
+        warnings.warn(
+            f"{cls!r} isn't explicitly decorated with @runtime_checkable but "
+            "it is used in issubclass() or isinstance(). Instance and class "
+            "checks can only be used with @runtime_checkable protocols. "
+            "This will raise a TypeError in Python 3.20.",
+            DeprecationWarning, stacklevel=3)
 
 
 @classmethod
@@ -1559,7 +1586,13 @@ def get_type_hints(obj, globalns=None, localns=None, include_extras=False,
             for name, value in ann.items():
                 if isinstance(value, str):
                     value = _make_forward_ref(value, is_argument=False, is_class=True)
-                value = _eval_type(value, base_globals, base_locals, (),
+                # A ForwardRef bound to a module is evaluated in that module's
+                # namespace instead of the scope built above, so it needs the
+                # type parameters passed explicitly.
+                bound_to_module = (isinstance(value, _lazy_annotationlib.ForwardRef)
+                                   and value.__forward_module__ is not None)
+                value = _eval_type(value, base_globals, base_locals,
+                                   type_params if bound_to_module else (),
                                    format=format, owner=obj)
                 if value is None:
                     value = type(None)
@@ -1639,7 +1672,8 @@ def _strip_annotations(t):
         stripped_args = tuple(_strip_annotations(a) for a in t.__args__)
         if stripped_args == t.__args__:
             return t
-        return GenericAlias(t.__origin__, stripped_args)
+        new = type(t)(t.__origin__, stripped_args)
+        return next(iter(new)) if t.__unpacked__ else new
     if isinstance(t, Union):
         stripped_args = tuple(_strip_annotations(a) for a in t.__args__)
         if stripped_args == t.__args__:
@@ -2020,6 +2054,7 @@ def NamedTuple(typename, fields, /):
 
     or, equivalently, Employee = NamedTuple('Employee', [('name', str), ('id', int)]).
     """
+    fields = list(fields)
     types = {n: _type_check(t, f"field {n} annotation must be a type")
              for n, t in fields}
     field_names = [n for n, _ in fields]
@@ -2528,6 +2563,25 @@ def get_protocol_members(tp: type, /) -> frozenset[str]:
     return frozenset(tp.__protocol_attrs__)
 
 
+_byte_string_alias = None
+
+
+def _warn_byte_string():
+    import warnings
+    warnings._deprecated("typing.ByteString", remove=(3, 17))
+
+
+class _DeprecatedSpecialAlias(_SpecialGenericAlias, _root=True):
+    # typing.ByteString: every use in a class or instance check warns
+    def __instancecheck__(self, obj):
+        _warn_byte_string()
+        return super().__instancecheck__(obj)
+
+    def __subclasscheck__(self, cls):
+        _warn_byte_string()
+        return super().__subclasscheck__(cls)
+
+
 def __getattr__(attr):
     """Objects that are expensive to create are made on first access."""
     if attr == "ForwardRef":
@@ -2538,6 +2592,16 @@ def __getattr__(attr):
     elif attr in {"ContextManager", "AsyncContextManager"}:
         import contextlib
         obj = _alias(getattr(contextlib, f"Abstract{attr}"), 2, name=attr, defaults=(bool | None,))
+    elif attr == "ByteString":
+        # deprecated: warn on every access, so it is not stored in globals()
+        global _byte_string_alias
+        _warn_byte_string()
+        if _byte_string_alias is None:
+            import warnings
+            with warnings.catch_warnings(action="ignore", category=DeprecationWarning):
+                from collections.abc import ByteString as origin
+            _byte_string_alias = _DeprecatedSpecialAlias(origin, 0, name="ByteString")
+        return _byte_string_alias
     elif attr == "_collect_parameters":
         import warnings
 

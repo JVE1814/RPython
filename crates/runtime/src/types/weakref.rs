@@ -426,6 +426,27 @@ pub unsafe fn detach_weakrefs_for_gc(garbage: &[*mut PyObject], callbacks_only: 
                     r = next;
                 }
             }
+            // Weakrefs that are garbage themselves are cleared too: their referent
+            // may be garbage the collector cannot see (reachable only through an
+            // object without tp_traverse) and freed by tp_clear; its callback
+            // must not run then.
+            if !callbacks_only {
+                for &o in garbage {
+                    if !is_weakref(&*o) {
+                        continue;
+                    }
+                    let r = o as *mut PyWeakReference;
+                    if (*r).wr_object.is_null() || (*r).wr_object == none::none().as_ptr() {
+                        continue;
+                    }
+                    unlink(r);
+                    (*r).wr_object = none::none().as_ptr();
+                    let cb = std::mem::replace(&mut (*r).wr_callback, std::ptr::null_mut());
+                    if !cb.is_null() {
+                        dropped.push(PyRef::from_raw(cb));
+                    }
+                }
+            }
         }
         DetachedWeakrefs { pending, dropped }
     }

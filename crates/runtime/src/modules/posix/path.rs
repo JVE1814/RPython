@@ -313,5 +313,11 @@ pub fn retry_eintr<T: PartialEq + Copy>(fail: T, mut f: impl FnMut() -> T) -> Py
 
 /// Run pending signal handlers (PyErr_CheckSignals).
 pub fn check_signals() -> PyResult<()> {
-    crate::modules::signal::run_pending_handlers(crate::threads::current())
+    let ts = crate::threads::current();
+    crate::modules::signal::run_pending_handlers(ts)?;
+    // an exception queued by PyThreadState_SetAsyncExc also ends the wait
+    if ts.c.eval_breaker.load(std::sync::atomic::Ordering::Acquire) & crate::threads::EVAL_ASYNC_EXC != 0 {
+        crate::modules::thread::raise_async_exc(ts)?;
+    }
+    Ok(())
 }

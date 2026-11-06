@@ -66,11 +66,22 @@ run_suite() {
     local start=$SECONDS
     # run from an empty directory so that nothing local shadows the installed package
     # -v: the log names the running test if the process dies
-    (cd "$dir" && ulimit -v "$MEMKB" && timeout "$TMO" "$py" -m pytest --pyargs "$TESTPKG" -v -p no:cacheprovider -rfE \
-        --continue-on-collection-errors --junitxml="$dir/junit.xml" "$@" > "$dir/pytest.log" 2>&1)
+    # NPY_AVAILABLE_MEM pins numpy's requires_memory() skips (otherwise they depend on what
+    # other processes use at that moment). numpy's test_multithreading starts up to 250
+    # threads behind a barrier; under `ulimit -v` one can fail to start late in a run and the
+    # rest then wait forever (seen on the baseline too), so for numpy it runs separately
+    # without the limit.
+    local mt=()
+    [ "$TESTPKG" = numpy ] && mt=(-k "not test_multithreading")
+    (cd "$dir" && export NPY_AVAILABLE_MEM=4GB && ulimit -v "$MEMKB" && timeout "$TMO" "$py" -m pytest --pyargs "$TESTPKG" -v -p no:cacheprovider -rfE \
+        --continue-on-collection-errors "${mt[@]}" --junitxml="$dir/junit.xml" "$@" > "$dir/pytest.log" 2>&1)
     local rc=$?
     echo "$rc" > "$dir/exit_code"
-    grep -E '^(FAILED|ERROR) ' "$dir/pytest.log" | sed -E 's/ - .*//' | sort -u > "$dir/failed.txt"
+    : > "$dir/mt.log"
+    if [ "$TESTPKG" = numpy ]; then
+        (cd "$dir" && timeout 3600 "$py" -m pytest --pyargs numpy._core.tests.test_multithreading -v -p no:cacheprovider -rfE > "$dir/mt.log" 2>&1)
+    fi
+    cat "$dir/pytest.log" "$dir/mt.log" | grep -E '^(FAILED|ERROR) ' | sed -E 's/ - .*//' | sort -u > "$dir/failed.txt"
     local summary
     summary="$(grep -E '(passed|failed|error)s? in [0-9.]+s' "$dir/pytest.log" | tail -1)"
     if [ -z "$summary" ]; then

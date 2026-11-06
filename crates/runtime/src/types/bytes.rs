@@ -23,6 +23,14 @@ pub const MAX_SIZE: usize = (isize::MAX as usize) - HEADER - 64;
 
 /// Allocate an uninitialised (zeroed) exact bytes object of size `n`, or raise MemoryError.
 pub fn try_alloc_bytes(n: usize) -> PyResult<PyRef> {
+    if crate::capi::mem::hooked_alloc_refuses(HEADER + n + 1) {
+        return Err(memory_error());
+    }
+    alloc_bytes_unhooked(n)
+}
+
+/// `try_alloc_bytes` without consulting an installed allocator hook.
+fn alloc_bytes_unhooked(n: usize) -> PyResult<PyRef> {
     if n > MAX_SIZE {
         return Err(memory_error());
     }
@@ -39,20 +47,88 @@ pub fn try_alloc_bytes(n: usize) -> PyResult<PyRef> {
 
 /// Allocate a zeroed exact bytes object of size `n` (aborts on allocation failure).
 pub fn alloc_bytes(n: usize) -> PyRef {
-    match try_alloc_bytes(n) {
+    match alloc_bytes_unhooked(n) {
         Ok(r) => r,
         Err(_) => {
             clear_exc();
-            std::alloc::handle_alloc_error(std::alloc::Layout::from_size_align(n.max(1), 8).unwrap())
+            std::alloc::handle_alloc_error(std::alloc::Layout::from_size_align(n.max(1), 8).unwrap_or(std::alloc::Layout::new::<u64>()))
+        }
+    }
+}
+/// The shared (immortal) empty bytes object: every empty bytes result is this one.
+pub fn empty_bytes() -> PyRef {
+    static EMPTY: std::sync::atomic::AtomicPtr<PyObject> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
+    let p = EMPTY.load(Acquire);
+    if !p.is_null() {
+        return unsafe { PyRef::from_borrowed(p) };
+    }
+    let r = alloc_bytes(0);
+    let op = r.into_raw();
+    unsafe {
+        crate::object::make_immortal(op);
+        match EMPTY.compare_exchange(std::ptr::null_mut(), op, AcqRel, Acquire) {
+            Ok(_) => PyRef::from_raw(op),
+            // another thread won the race; the loser stays allocated (immortal)
+            Err(o) => PyRef::from_borrowed(o),
+        }
+    }
+}
+/// The shared (immortal) one-byte bytes object for `c`.
+pub fn single_byte(c: u8) -> PyRef {
+    static CACHE: [std::sync::atomic::AtomicPtr<PyObject>; 256] = [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; 256];
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
+    let slot = &CACHE[c as usize];
+    let p = slot.load(Acquire);
+    if !p.is_null() {
+        return unsafe { PyRef::from_borrowed(p) };
+    }
+    let r = alloc_bytes(1);
+    unsafe {
+        *bytes_ptr(&r) = c;
+        let op = r.into_raw();
+        crate::object::make_immortal(op);
+        match slot.compare_exchange(std::ptr::null_mut(), op, AcqRel, Acquire) {
+            Ok(_) => PyRef::from_raw(op),
+            Err(o) => PyRef::from_borrowed(o),
         }
     }
 }
 pub fn new_bytes(b: &[u8]) -> PyRef {
+    if b.len() <= 1 {
+        return if b.is_empty() { empty_bytes() } else { single_byte(b[0]) };
+    }
     let r = alloc_bytes(b.len());
     unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), bytes_ptr(&r), b.len()) };
     r
 }
+/// Shared bytes objects for b"" and the 256 one-byte values (CPython keeps such
+/// singletons; code constants and marshal return them). Created on first use, never freed.
+pub fn bytes_singleton(b: &[u8]) -> Option<PyRef> {
+    use std::sync::atomic::{AtomicPtr, Ordering};
+    static TABLE: [AtomicPtr<PyObject>; 257] = [const { AtomicPtr::new(std::ptr::null_mut()) }; 257];
+    let slot = match b {
+        [] => 256,
+        [x] => *x as usize,
+        _ => return None,
+    };
+    let p = TABLE[slot].load(Ordering::Acquire);
+    if !p.is_null() {
+        return Some(unsafe { PyRef::from_borrowed(p) });
+    }
+    let fresh = new_bytes(b).into_raw();
+    match TABLE[slot].compare_exchange(std::ptr::null_mut(), fresh, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => Some(unsafe { PyRef::from_borrowed(fresh) }),
+        Err(cur) => {
+            unsafe { crate::object::decref(fresh) };
+            Some(unsafe { PyRef::from_borrowed(cur) })
+        }
+    }
+}
 pub fn try_new_bytes(b: &[u8]) -> PyResult<PyRef> {
+    if b.len() <= 1 {
+        return Ok(if b.is_empty() { empty_bytes() } else { single_byte(b[0]) });
+    }
     let r = try_alloc_bytes(b.len())?;
     unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), bytes_ptr(&r), b.len()) };
     Ok(r)
@@ -119,7 +195,7 @@ pub fn bytes_hash(o: &PyObject) -> isize {
 /// object (unchanged) with MemoryError set.
 pub unsafe fn resize_unique(o: PyRef, n: usize) -> Result<PyRef, PyRef> {
     unsafe {
-        if n > MAX_SIZE {
+        if n > MAX_SIZE || crate::capi::mem::hooked_alloc_refuses(HEADER + n + 1) {
             let _ = memory_error();
             return Err(o);
         }

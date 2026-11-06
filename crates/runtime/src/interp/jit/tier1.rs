@@ -832,7 +832,7 @@ impl<'a> Gen<'a> {
             // instructions shared with the interpreter (eval::exec_misc)
             op if crate::interp::eval::is_misc(op) && super::misc_enabled() => {
                 let pops = match op {
-                    Op::LoadFromDictOrDeref | Op::LoadFromDictOrGlobals | Op::GetAiter | Op::GetAwaitable => 1,
+                    Op::LoadFromDictOrDeref | Op::LoadFromDictOrGlobals | Op::GetAiter | Op::GetAwaitable | Op::LoadSpecial => 1,
                     Op::PushExcInfo | Op::PopExcept | Op::CheckExcMatch | Op::BeforeWith | Op::BeforeAsyncWith => 1,
                     Op::EndAsyncFor | Op::CheckEgMatch | Op::ImportName | Op::BuildTemplate => 2,
                     Op::BuildInterpolation => 2 + (arg & 1) as i32,
@@ -1721,7 +1721,7 @@ pub fn compile(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crate::in
         if reachable && (i == 0 || an.is_target[i] || prev_yield) {
             entries[ins.start as usize] = g.a.pos() as u32;
         }
-        prev_yield = ins.op == Op::YieldValue;
+        prev_yield = ins.op == Op::YieldValue || ins.op == Op::ReturnGenerator;
         if !reachable {
             continue;
         }

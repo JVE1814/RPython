@@ -129,7 +129,20 @@ unsafe extern "C" fn mp_hash(o: *mut PyObject) -> Py_hash_t {
     }
 }
 unsafe extern "C" fn mp_richcompare(a: *mut PyObject, b: *mut PyObject, op: c_int) -> *mut PyObject {
-    unsafe { into_c(ab::rich_compare(m(&*a), &*b, op)) }
+    unsafe {
+        // only equality is defined; it compares the underlying mappings, a dict
+        // being lent out as a copy so that the other side cannot mutate it
+        if op != Py_EQ && op != Py_NE {
+            return none::not_implemented().to_ref().into_raw();
+        }
+        let r = (|| -> PyResult {
+            let mine = m(&*a);
+            let mine = if crate::types::dict::is_dict_exact(mine) { crate::types::dict::copy(mine)? } else { mine.to_ref() };
+            let other = if is_mappingproxy(&*b) { m(&*b).to_ref() } else { (*b).to_ref() };
+            ab::rich_compare(&mine, &other, op)
+        })();
+        into_c(r)
+    }
 }
 fn mp_or(a: &PyObject, b: &PyObject) -> PyResult {
     let a2 = if is_mappingproxy(a) { m(a).to_ref() } else { a.to_ref() };

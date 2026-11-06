@@ -229,6 +229,8 @@ pub fn call_fast(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwnames:
                 | rpy_compiler::bytecode::co::COROUTINE
                 | rpy_compiler::bytecode::co::ASYNC_GENERATOR)
             != 0
+        // (non-optimized code runs with its globals as locals: interpreter path)
+        || co.co_flags as u32 & rpy_compiler::bytecode::co::OPTIMIZED == 0
         || co.co_kwonlyargcount != 0
         || crate::modules::sys::tracing_active()
     {
@@ -536,9 +538,11 @@ pub fn generator_entry(f: &Frame) -> usize {
     if bump_invocations(cd) {
         opt::compile(f.code(), f.globals, f.builtins, 0);
     }
-    match opt_entry(cd, 0) {
+    // pc 0, or the instruction after an eager prologue's ReturnGenerator
+    let pc = f.next_instr as usize;
+    match opt_entry(cd, pc) {
         Some(t) => t,
-        None => match unsafe { (*c).entries.first() } {
+        None => match unsafe { (&(*c).entries).get(pc) } {
             Some(&o) if o != u32::MAX => unsafe { (*c).addr + o as usize },
             _ => 0,
         },

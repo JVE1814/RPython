@@ -218,6 +218,34 @@ try:
 except ZeroDivisionError as e:
     print("ZeroDivisionError", [f.name for f in traceback.extract_tb(e.__traceback__)])
 
+# the result of a branchy callee is tested right away (the continuation block starts
+# with a call while the result is still needed after it)
+def _single_bit(num):
+    return num > 0 and (num & (num - 1)) == 0
+
+class Mem:
+    def __init__(self, v):
+        self._value_ = v
+
+def flag_masks(holder, members):
+    singles = 0
+    everything = 0
+    for found in members.values():
+        value = found._value_
+        if isinstance(value, int) and value > 0:
+            everything |= value
+            if _single_bit(value):
+                singles |= value
+    type.__setattr__(holder, 'singles', singles)
+    type.__setattr__(holder, 'all_bits', (1 << everything.bit_length()) - 1)
+
+class Holder:
+    pass
+
+for k in range(60):
+    flag_masks(Holder, {i: Mem(1 << (i % 5) if i % 3 else "x") for i in range(k % 9)})
+print(Holder.singles, Holder.all_bits)
+
 # a finalizer run by a decref in compiled code changes the class the code is
 # specialised on: later accesses must see the change
 class K:

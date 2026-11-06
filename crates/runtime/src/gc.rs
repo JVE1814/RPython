@@ -209,14 +209,87 @@ fn wait_for_release() {
 pub fn enter_vm(cell: &crate::threads::ModeCell, safe: crate::threads::ThreadMode) {
     use crate::threads::ThreadMode;
     let safe = if safe == ThreadMode::InVm { ThreadMode::Blocked } else { safe };
+    let me = cell as *const _ as usize;
     loop {
         cell.0.store(ThreadMode::InVm as u8, SeqCst);
-        if RELEASE.load(SeqCst) || STW_OWNER.load(SeqCst) == cell as *const _ as usize {
+        if STW_OWNER.load(SeqCst) == me {
             return;
+        }
+        if RELEASE.load(SeqCst) {
+            if !PARK_ALL.load(SeqCst) || FINALIZER.load(SeqCst) == me {
+                return;
+            }
+            cell.0.store(safe as u8, SeqCst);
+            park_forever();
         }
         cell.0.store(safe as u8, SeqCst);
         wait_for_release();
     }
+}
+
+// ---------------------------------------------------------------- finalization
+//
+// Once the interpreter starts finalizing, every thread other than the finalizing
+// one is stopped for good: it may stay blocked in native code, but as soon as it
+// tries to run Python code again (leaving a blocking call, reaching a safepoint)
+// it parks forever. The process exits around it.
+
+static PARK_ALL: AtomicBool = AtomicBool::new(false);
+static FINALIZER: AtomicUsize = AtomicUsize::new(0);
+
+#[cold]
+fn park_forever() -> ! {
+    loop {
+        std::thread::park();
+    }
+}
+
+/// Have all other threads been stopped for good (interpreter finalization)?
+#[inline]
+pub fn others_parked() -> bool {
+    PARK_ALL.load(Relaxed)
+}
+
+/// Is the calling thread the one finalizing the interpreter?
+pub fn is_finalizer_thread() -> bool {
+    let p = crate::threads::current_ptr();
+    !p.is_null() && FINALIZER.load(Relaxed) == unsafe { &(*p).mode as *const _ as usize }
+}
+
+/// Stop every other thread permanently (each parks at its next transition into
+/// the VM). Called by the finalizing thread; returns once no other thread runs
+/// Python code.
+pub fn park_other_threads() {
+    let me = crate::threads::current_mut();
+    // a collection running on another thread finishes first
+    crate::threads::blocking(|| {
+        while COLLECTING.swap(true, AcqRel) {
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+    });
+    // A thread that never reaches a safepoint (stuck in native code that claims
+    // to be in the VM) must not hang the exit: after ~2 s carry on; such a thread
+    // parks at its next safepoint poll.
+    let mut stopped = false;
+    for _ in 0..20 {
+        if stop_the_world(me) {
+            stopped = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+    FINALIZER.store(unsafe { &(*me).mode as *const _ as usize }, SeqCst);
+    PARK_ALL.store(true, SeqCst);
+    if stopped {
+        start_the_world();
+    } else {
+        for &t in crate::threads::ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            if t != me as usize {
+                unsafe { &*(t as *const ThreadState) }.c.eval_breaker.fetch_or(crate::threads::EVAL_SAFEPOINT, SeqCst);
+            }
+        }
+    }
+    COLLECTING.store(false, Release);
 }
 
 /// Is a stop-the-world operation in progress?
@@ -228,7 +301,7 @@ pub fn world_stopped() -> bool {
 /// Called by threads at safepoints (backedges, function entry via the eval breaker).
 pub fn safepoint_poll(ts: &ThreadState) {
     ts.c.eval_breaker.fetch_and(!crate::threads::EVAL_SAFEPOINT, AcqRel);
-    if RELEASE.load(SeqCst) || STW_OWNER.load(SeqCst) == &ts.mode as *const _ as usize {
+    if (RELEASE.load(SeqCst) && !PARK_ALL.load(SeqCst)) || STW_OWNER.load(SeqCst) == &ts.mode as *const _ as usize {
         return;
     }
     if ts.mode.get() != crate::threads::ThreadMode::InVm {
@@ -503,6 +576,7 @@ fn collect_gen(young_only: bool) -> usize {
         crate::gc_support::DURATION_NS.fetch_add((t0.elapsed().as_nanos() as usize).max(1), Relaxed);
         ALLOCS_SINCE.store(0, Relaxed);
         LAST_LIVE.store(TRACKED.load(Relaxed).max(0) as usize, Relaxed);
+        crate::gc_support::LONG_LIVED_TOTAL.store(TRACKED.load(Relaxed).max(0) as usize + crate::gc_support::UNTRACKED_TUPLES.swap(0, Relaxed), Relaxed);
         if young_only {
             YOUNG_COLLECTIONS.fetch_add(1, Relaxed);
         } else {
@@ -534,14 +608,24 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
         mature_deferred();
         crate::object::merge_type_counts();
         // ---- phase 1 (stopped): find the unreachable objects
-        let objs = snapshot_gen(young_only);
+        let mut objs = snapshot_gen(young_only);
+        crate::gc_support::untrack_atomic_tuples(&mut objs);
         crate::gc_support::CANDIDATES.fetch_add(objs.len(), Relaxed);
         promote(&objs);
-        let unreachable = find_unreachable(objs);
+        let mut unreachable = find_unreachable(objs);
+        // cycles with legacy finalizers (tp_del) are left alone and reported
+        let legacy = crate::gc_support::split_legacy_finalizers(&mut unreachable);
         if unreachable.is_empty() {
             start_the_world();
-            return Some(0);
+            if legacy.is_empty() {
+                return Some(0);
+            }
+            let u = crate::gc_support::report_uncollectable(legacy);
+            UNCOLLECTABLE.fetch_add(u, Relaxed);
+            return Some(u);
         }
+        let n_legacy = if legacy.is_empty() { 0 } else { legacy.len() };
+        let mut legacy = Some(legacy);
         // keep the garbage alive while we work on it
         let garbage: Vec<PyRef> = unreachable.iter().map(|&o| PyRef::from_borrowed(o)).collect();
         // unreachable types stop per-thread counting (their bias goes; `garbage` keeps
@@ -568,7 +652,8 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
             start_the_world();
             // ---- phase 2 (running): callbacks and finalizers
             early.finish();
-            for g in &garbage {
+            for i in crate::gc_support::finalization_order(&garbage) {
+                let g = &garbage[i];
                 let op = g.as_ptr();
                 let tp = (*op).type_ptr();
                 if (*tp).tp_finalize.is_some() && !is_finalized(op) {
@@ -600,13 +685,16 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
             v
         };
         // ---- phase 4 (running): break the cycles (gc.DEBUG_SAVEALL keeps them)
+        if let Some(l) = legacy.take().filter(|l| !l.is_empty()) {
+            UNCOLLECTABLE.fetch_add(crate::gc_support::report_uncollectable(l), Relaxed);
+        }
         let countable = crate::gc_support::countable(&to_clear);
         let n = countable.len();
         if crate::gc_support::save_all(&countable) {
             drop(to_clear);
             drop(garbage);
             COLLECTED.fetch_add(n, Relaxed);
-            return Some(n);
+            return Some(n + n_legacy);
         }
         for g in &to_clear {
             let op = g.as_ptr();
@@ -624,7 +712,7 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
         drop(to_clear);
         drop(garbage);
         COLLECTED.fetch_add(n, Relaxed);
-        Some(n)
+        Some(n + n_legacy)
     }
 }
 

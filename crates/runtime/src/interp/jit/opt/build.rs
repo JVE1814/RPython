@@ -160,7 +160,7 @@ fn jumps(op: Op) -> bool {
 /// Block-ending instruction of the unit's CFG: a generator unit (`resumes` non-empty)
 /// leaves through `YieldValue` and comes back through a separate entry.
 fn ends_block(op: Op, is_gen: bool) -> bool {
-    is_terminator(op) || (is_gen && op == Op::YieldValue)
+    is_terminator(op) || (is_gen && matches!(op, Op::YieldValue | Op::ReturnGenerator))
 }
 
 /// Instruction indices where a generator unit is re-entered after a yield (empty for
@@ -171,7 +171,7 @@ fn resume_points(u: &Unit) -> Vec<usize> {
         return Vec::new();
     }
     let an = u.an;
-    (0..an.instrs.len()).filter(|&i| i > 0 && an.instrs[i - 1].op == Op::YieldValue && an.depth[i] >= 0 && an.depth[i - 1] >= 0).collect()
+    (0..an.instrs.len()).filter(|&i| i > 0 && matches!(an.instrs[i - 1].op, Op::YieldValue | Op::ReturnGenerator) && an.depth[i] >= 0 && an.depth[i - 1] >= 0).collect()
 }
 
 fn build_cfg(an: &Analysis, entry: usize, resumes: &[usize]) -> Cfg {
@@ -1406,6 +1406,12 @@ impl<'a> B<'a> {
                     Some(self.f.snaps.len() as SnapId - 1)
                 };
                 self.term(Term::Return(v, d, snap));
+            }
+            Op::ReturnGenerator if self.is_gen => {
+                // the eager prologue runs in the interpreter (interp::call_function);
+                // compiled code only ever resumes after it
+                let s = self.snap(i, SnapKind::Deopt);
+                self.term(Term::Deopt(s));
             }
             Op::YieldValue if self.is_gen && self.inl.is_none() => {
                 // suspend: everything goes to the frame; the next resumption enters

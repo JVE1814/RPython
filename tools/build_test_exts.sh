@@ -8,7 +8,7 @@
 # DECISIONS D2). tools/capi_shim/ holds project-written stand-ins for the few internal helpers
 # that Argument-Clinic output and the tests use (implemented with the public API only).
 # Parts that test genuinely internal behaviour are excluded and replaced by stub init functions:
-#   _testcapi/bytes.c      (pycore_bytesobject.h: private _PyBytesWriter API)
+#   (_testcapi/bytes.c builds against tools/capi_shim/pycore_bytesobject.h)
 #   _testcapi/immortal.c   (pycore_long.h immortality bits)
 #   _testcapi/monitoring.c (pycore_instruments.h)
 # _testmultiphase uses tools/capi_shim/clinic/_testmultiphase.c.h (hand-written wrappers).
@@ -23,7 +23,7 @@ cp "$ROOT/tools/pyconfig.h" "$INC/pyconfig.h"
 CFLAGS="-fPIC -g -O1 -fno-strict-aliasing -fwrapv -Wno-unused-result -std=c11 -D_GNU_SOURCE"
 CFLAGS="$CFLAGS -I$INC -I$ROOT/spec/Include -I$ROOT/tools/capi_shim ${EXTRA_CFLAGS:-}"
 M="$ROOT/spec/Modules"
-EXCLUDED="bytes immortal monitoring"
+EXCLUDED="immortal monitoring"
 
 sources() { # module name -> list of sources
   case "$1" in

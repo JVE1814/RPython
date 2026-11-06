@@ -10,6 +10,7 @@ pub mod bytes;
 pub mod bytes_methods;
 pub mod cfunction;
 pub mod code;
+pub mod code_introspect;
 pub mod complex;
 pub mod descr;
 pub mod dict;

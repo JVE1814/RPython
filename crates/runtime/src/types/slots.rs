@@ -629,6 +629,14 @@ pub fn fixup_slots_new_type(tp: *mut PyTypeObject) {
                 }
             }
             if !fallback {
+                // tp_richcompare and tp_hash are inherited as a pair: if the dict
+                // defines only one of them, type_ready inherited neither, so the
+                // other must be recomputed from the MRO as well (grind-lib).
+                for (a, b) in [(Slot::TpHash, Slot::TpRichcompare), (Slot::TpRichcompare, Slot::TpHash)] {
+                    if todo.contains(&a) && !todo.contains(&b) {
+                        todo.push(b);
+                    }
+                }
                 for s in todo {
                     update_one_slot(tp, s);
                 }
@@ -1315,7 +1323,16 @@ unsafe extern "C" fn slot_tp_finalize(s: *mut PyObject) {
         let saved = take_exc();
         if let Some(f) = lookup(s.type_ptr(), name!("__del__")) {
             if ab::call_unbound(&f, s, &[]).is_err() {
-                crate::modules::sys::write_unraisable_with_obj("Exception ignored while calling deallocator", Some(&f));
+                // the report names the __del__ in the message (object: None)
+                let exc = take_exc();
+                let r = ab::repr_string(&f).unwrap_or_else(|_| {
+                    clear_exc();
+                    "<object repr() failed>".into()
+                });
+                if let Some(e) = exc {
+                    set_exc(e);
+                }
+                crate::modules::sys::write_unraisable_with_obj(&format!("Exception ignored while calling deallocator {}", r), None);
             }
         }
         if let Some(e) = saved {

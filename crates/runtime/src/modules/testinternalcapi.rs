@@ -42,6 +42,16 @@ fn get_recursion_depth(_m: &PyObject) -> PyResult {
     Ok(int::new_int(crate::threads::current().recursion_depth.get() as i64))
 }
 
+/// Name of the memory allocator family in use (not pymalloc: plain malloc for
+/// large blocks, our own small-object allocator otherwise).
+fn pymem_getallocatorsname(_m: &PyObject) -> PyResult {
+    Ok(crate::types::str::new_str("malloc"))
+}
+
+fn get_long_lived_total(_m: &PyObject) -> PyResult {
+    Ok(int::new_int(crate::gc_support::LONG_LIVED_TOTAL.load(std::sync::atomic::Ordering::Relaxed) as i64))
+}
+
 /// Estimate of how many more interpreter-loop recursions fit on the native stack.
 fn get_c_recursion_remaining(_m: &PyObject) -> PyResult {
     let ts = crate::threads::current();
@@ -85,7 +95,7 @@ fn iframe_getline(_m: &PyObject, o: &PyObject) -> PyResult {
 }
 fn iframe_getlasti(_m: &PyObject, o: &PyObject) -> PyResult {
     let f = frame_arg(o)?;
-    Ok(int::new_int(f.lasti as i64 * 4))
+    Ok(int::new_int(crate::types::code::lasti_bytes(f.code(), f.lasti as usize)))
 }
 
 fn get_co_framesize(_m: &PyObject, o: &PyObject) -> PyResult {
@@ -160,10 +170,49 @@ class SelfInterruptingContextManager:
 
 def get_interp_settings(interp=None):
     return 0
-
-def code_returns_only_none(code):
-    return False
 "#;
+
+/// Runs a queued Python callable (the queue owns one reference to it).
+unsafe extern "C" fn run_pending_callable(arg: *mut std::ffi::c_void) -> std::ffi::c_int {
+    unsafe {
+        let f = PyRef::from_raw(arg as *mut PyObject);
+        match ab::call(&f, &[]) {
+            Ok(_) => 0,
+            Err(_) => -1,
+        }
+    }
+}
+
+/// pending_threadfunc(callback, num=1, *, blocking=False, ensure_added=False): queue
+/// `callback` `num` times as a pending call that any thread may run; returns how many
+/// were queued (the queue holds at most 300).
+fn pending_threadfunc(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
+    static P: crate::args::Params = crate::args::Params::new("pending_threadfunc", &["callback", "num", "blocking", "ensure_added"], 0, 1);
+    let [cb, num, _blocking, ensure] = crate::args::parse::<4>(&P, args, kw)?;
+    let cb = cb.unwrap();
+    let num = match num {
+        Some(n) => ab::as_i64(n)?.max(0) as u64,
+        None => 1,
+    };
+    let ensure = match ensure {
+        Some(e) => ab::is_true(e)?,
+        None => false,
+    };
+    let mut added = 0u64;
+    while added < num {
+        let p = cb.to_ref().into_raw() as *mut std::ffi::c_void;
+        if crate::capi::pystate::add_pending_call(run_pending_callable, p, false) < 0 {
+            unsafe { decref(p as *mut PyObject) };
+            if ensure {
+                std::thread::yield_now();
+                continue;
+            }
+            break;
+        }
+        added += 1;
+    }
+    Ok(int::new_int(added as i64))
+}
 
 pub fn init() -> PyResult {
     let m = crate::types::module::new_module("_testinternalcapi")?;
@@ -172,8 +221,11 @@ pub fn init() -> PyResult {
         &d,
         crate::mdefs![
             ("has_inline_values", O, has_inline_values),
+            ("pending_threadfunc", FASTKW, pending_threadfunc),
             ("has_split_table", O, has_split_table),
             ("get_recursion_depth", NOARGS, get_recursion_depth),
+            ("get_long_lived_total", NOARGS, get_long_lived_total),
+            ("pymem_getallocatorsname", NOARGS, pymem_getallocatorsname),
             ("get_c_recursion_remaining", NOARGS, get_c_recursion_remaining),
             ("get_stack_pointer", NOARGS, get_stack_pointer),
             ("get_stack_margin", NOARGS, get_stack_margin),
@@ -188,6 +240,12 @@ pub fn init() -> PyResult {
             ("is_specialization_enabled", NOARGS, is_specialization_enabled),
             ("get_rare_event_counters", NOARGS, get_rare_event_counters),
             ("reset_rare_event_counters", NOARGS, reset_rare_event_counters),
+            ("get_co_localskinds", O, crate::types::code_introspect::get_co_localskinds),
+            ("get_code_var_counts", FASTKW, crate::types::code_introspect::get_code_var_counts),
+            ("verify_stateless_code", FASTKW, crate::types::code_introspect::verify_stateless_code),
+            ("code_returns_only_none", O, crate::types::code_introspect::code_returns_only_none),
+            ("set_vectorcall_nop", O, crate::types::code_introspect::set_vectorcall_nop),
+            ("get_next_dict_keys_version", NOARGS, crate::types::code_introspect::get_next_dict_keys_version),
         ],
         Some(&m),
     )?;
@@ -196,17 +254,21 @@ pub fn init() -> PyResult {
         ("SIZEOF_MANAGED_PRE_HEADER", crate::alloc::MANAGED as i64),
         ("SIZEOF_PYOBJECT", std::mem::size_of::<PyObject>() as i64),
         ("SIZEOF_TIME_T", std::mem::size_of::<libc::time_t>() as i64),
-        ("SHARED_KEYS_MAX_SIZE", INLINE_VALUES_MAX as i64),
+        // CPython: an object reaching this many attributes leaves the shared-keys (inline)
+        // layout; ours holds INLINE_VALUES_MAX inline, so one more forces the dict
+        ("SHARED_KEYS_MAX_SIZE", INLINE_VALUES_MAX as i64 + 1),
         ("SPECIALIZATION_THRESHOLD", 2),
         ("SPECIALIZATION_COOLDOWN", 53),
         ("TIER2_THRESHOLD", 4096),
         ("TIER2_RESUME_THRESHOLD", 4096),
         ("_PY_NSMALLPOSINTS", 1025),
         ("_PY_NSMALLNEGINTS", 5),
+        ("_Py_MAX_UNICODE", 0x10ffff),
     ] {
         dict::set_item_str(&d, k, &int::new_int(v))?;
     }
     dict::set_item_str(&d, "__builtins__", &crate::builtins::builtins_module())?;
+    crate::modules::compiler_hooks::install(&d, &m)?;
     let code = crate::compile::compile_str(SRC, "<_testinternalcapi>", crate::compile::Mode::Exec, 0, -1)?;
     crate::interp::eval_code(&code.code, &d, Some(&d))?;
     let _ = tuple::new_tuple(vec![]);

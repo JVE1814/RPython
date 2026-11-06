@@ -392,14 +392,58 @@ fn set_hashcode(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     }
 }
 
+// The private `_days`/`_seconds`/`_microseconds` getsets serve the embedded pure-Python
+// methods. CPython's timedelta has no such attributes, so a subclass with an instance
+// dict may use the names itself (pandas' Timedelta assigns `self._seconds`): for those,
+// the instance dict wins, as it would without these descriptors.
+fn own_attr(o: &PyObject, name: &str) -> Option<PyRef> {
+    unsafe {
+        let slot = crate::types::typeobject::dict_slot(o.as_ptr());
+        if slot.is_null() || (*slot).is_null() {
+            return None;
+        }
+        crate::types::dict::get_item_rs(&**slot, name)
+    }
+}
+fn set_own_attr(o: &PyObject, name: &str, v: Option<&PyObject>) -> PyResult<()> {
+    let d = match crate::types::typeobject::instance_dict(o) {
+        Some(d) => d,
+        None => crate::raise!(AttributeError, "attribute '{}' of 'timedelta' objects is not writable", name),
+    };
+    match v {
+        Some(v) => crate::types::dict::set_item_str(&d, name, v),
+        None => {
+            crate::types::dict::del_item(&d, &pystr::new_str(name))?;
+            Ok(())
+        }
+    }
+}
 fn g_days(o: &PyObject) -> PyResult {
+    if let Some(v) = own_attr(o, "_days") {
+        return Ok(v);
+    }
     small_int(delta(o).days as i64)
 }
 fn g_seconds(o: &PyObject) -> PyResult {
+    if let Some(v) = own_attr(o, "_seconds") {
+        return Ok(v);
+    }
     small_int(delta(o).seconds as i64)
 }
 fn g_microseconds(o: &PyObject) -> PyResult {
+    if let Some(v) = own_attr(o, "_microseconds") {
+        return Ok(v);
+    }
     small_int(delta(o).microseconds as i64)
+}
+fn s_days(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
+    set_own_attr(o, "_days", v)
+}
+fn s_seconds(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
+    set_own_attr(o, "_seconds", v)
+}
+fn s_microseconds(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
+    set_own_attr(o, "_microseconds", v)
 }
 
 fn g_year(o: &PyObject) -> PyResult {
@@ -925,9 +969,9 @@ fn init_types() -> PyResult<()> {
             Some(delta_new),
             plain_dealloc,
             crate::getset_table![
-                ("_days", g_days),
-                ("_seconds", g_seconds),
-                ("_microseconds", g_microseconds),
+                ("_days", g_days, s_days),
+                ("_seconds", g_seconds, s_seconds),
+                ("_microseconds", g_microseconds, s_microseconds),
                 ("_hashcode", get_hashcode, set_hashcode),
             ],
         )?;
