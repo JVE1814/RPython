@@ -245,6 +245,8 @@ pub fn locals_dict(f: &Frame) -> PyResult {
     if !f.locals.is_null() {
         return Ok(unsafe { (*f.locals).to_ref() });
     }
+    // jit: unboxed locals of tier-2 code
+    crate::interp::jit::opt::sync_frame(f as *const Frame as *mut Frame);
     let d = dict::new_dict();
     let cd = crate::types::code::code_data(f.code());
     for i in 0..f.nlocalsplus {

@@ -9,7 +9,7 @@ from scratch (no codegen crates, no reference to other implementations' source).
 |---|---|---|
 | 0 | `interp/eval.rs` (+ `interp/specialize.rs`, `interp/cache.rs`) | the interpreter; it is the reference semantics |
 | 1 | `interp/jit/` | baseline "template" JIT for x86-64: every bytecode turns into a fixed machine-code sequence |
-| 2 | — | not done (see "Missing") |
+| 2 | `interp/jit/opt/` | optimizing JIT: typed IR from bytecode + profiles + inline caches, unboxing, guards with deopt, inlining (jit2 + jit3 sections below) |
 
 ### Tier 0 additions
 * **Side tables per code object** (`cache.rs`, the HotSpot MethodData analogue). They
@@ -224,7 +224,217 @@ cachegrind on generators shows 5× the D1 misses and 2× the branch mispredictio
 causes are full-heap GC traversal (since made generational) and malloc-heavy dict
 storage.
 
-## Missing / next steps
+## jit2 workstream (tier 2 + call path), status at pause
+
+Branch `worktree-agent-ae352a18b358600a1`.
+
+### Done
+* **Fast Python->Python calls** (tier 1): `Call` checks inline for a function whose
+  code has a published fast entry (`CodeCaches::fast_entry/fast_argc/fast_nlp/
+  fast_total`, set when tier 1 compiles a plain positional function) and calls
+  `jit::h_call_py`: arguments and the callable reference are *moved* into the callee
+  frame (no incref/decref pairs), the frame comes from a `#[thread_local]` pool
+  (`frame::alloc_call` / `recycle_call`; no RefCell, no memset, no Vec resize), the
+  recursion check is inline. Call micro (`f(i, 2)` in a loop, 300k): 268M -> 196M
+  instructions net of startup (CPython 194M).
+* **Type profiles** recorded by tier 1 (`Tables::profile` is now u16 per pc: operand
+  A bits low byte, B high byte; `cache::prof`, plus `IT_*` iterator kinds for ForIter).
+  Fast paths `or` the bits inline, slow paths call `h_prof` / `h_prof_iter`.
+* **Tier 2** (`interp/jit/opt/`, ~4k lines, all ours):
+  * `build.rs`: abstract interpretation of the bytecode (CFG, RPO, loop headers with
+    assumed entry states iterated to a fixed point) into a typed low-level IR
+    (`ir.rs`). Locals get a per-unit representation: boxed in the frame (always
+    current) or unboxed i64/f64 in a home vreg (chosen from the types stored to them;
+    frame slot synced lazily; definedness tracked statically, "maybe" via a None
+    placeholder in the slot). Stack entries are virtual (borrowed local refs with no
+    refcounting, owned temporaries, unboxed values, lazy conditions, constants) and
+    are only materialised at joins/templates/deopt. Native: int/float arithmetic with
+    overflow/zero guards (unboxed), int/float compares fused into branches, `is`,
+    ForIter over range/list/tuple (range counter unboxed), list/tuple subscript, list
+    store (per-object mutex), UnpackSequence of tuple/list, LoadGlobal folded to a
+    constant, float `**` via libm. Everything else is emitted by the **tier-1 template
+    generator embedded in tier 2** (`tier1::Gen::new_embedded`), so every opcode tier 1
+    handles works in tier 2 from day one.
+  * Deoptimisation: every guard carries a snapshot (stack + dirty unboxed locals);
+    `codegen.rs` emits a stub per snapshot that boxes/increfs values back into the
+    interpreter frame and resumes in tier 0 at the instruction start. Error / poll /
+    template exits sync dirty locals first.
+  * `regalloc.rs`: liveness + linear scan (rcx,rdx,rsi,rdi,r8,r9 caller-saved; r14,rbp
+    across calls; xmm2..14), spill slots in a native frame. Boxing/decref slow paths
+    are register-preserving routines, so only calls/templates clobber.
+  * Units: standard (pc 0, after `RPYTHON_JIT2_THRESHOLD` calls, default 1000) and OSR
+    (loop header; tier-1 backedge countdown -> `opt::h_backedge` compiles and jumps
+    straight into the tier-2 entry).
+  * Invalidation: folded globals watch the globals/builtins dicts (`_ma_watcher_tag ==
+    1`); a write invalidates dependents (flag checked at entry, after templates, at
+    backedges), unpublishes the code and republishes tier 1; invalidated code is
+    freed with the code object. After 3 invalidations globals are no longer folded;
+    after 200 deopts code is discarded; at most 4 compilations per code object.
+  * Debug: `RPYTHON_JIT_DEBUG=1`, `RPYTHON_JIT2_IR=<qualname>|*` dumps IR + allocation.
+* `tools/jit_tests/run.sh` now also runs tier 2 (thresholds 1/5/50) — all green.
+  `tools/bench/perloop.sh`: steady-state instructions per benchmark loop
+  ((I(L2)-I(L1))/(L2-L1)), removes startup and warm-up from comparisons.
+
+### Status
+The problems listed at the pause (crash, invalidation storms, stale locals, tier 2
+opt-in) were fixed by jit3; see the next section.
+
+### Steady-state per-loop instructions (millions, perloop.sh; before tier 2 / call path)
+| bench | CPython default | ours (start of jit2) |
+|---|---|---|
+| richards | 462.4 | 545.6 |
+| nbody | 1107.6 | 1287.3 |
+| float | 785.7 | 964.8 |
+| spectral_norm | 1200.2 | 1674.7 |
+| fannkuch | 4407.4 | 6596.0 |
+| hexiom | 58.0 | 67.8 |
+| deltablue | 36.8 | 69.8 |
+| chaos | 610.7 | 931.8 |
+| coroutines | 302.0 | 487.0 |
+| nqueens | 841.8 | 1543.4 |
+| go | 1131.6 | 2070.9 |
+| generators | 328.5 | 578.3 |
+| raytrace | 2757.1 | 5706.6 |
+| richards_super | 531.0 | 664.3 |
+(unpack_sequence/comprehensions need larger loop counts: -a 100 -b 300.)
+
+## jit3 workstream (tier 2 merged, on by default; attributes, inlining, call path)
+
+Branch `worktree-agent-a03d5179d8d7c7ce8`.
+
+### Merge of jit2 onto master's frame model
+* One frame pool (master's `#[thread_local]` `POOL`), one ownership rule: call frames
+  borrow `code`/`func` (`owns_fc = false`, `make_owned()` when a frame outlives the
+  call). jit2's `alloc_call`/`recycle_call`/`FPOOL` are gone; `Frame::new_call_raw`
+  (geometry cached per code object, only locals cleared) serves both the interpreter
+  call path and the JIT; `h_call_py` leaves the callable in the caller's stack slot
+  for the duration of the call (that reference keeps the borrowed frame valid).
+* `frame::recycle_call`: lean release of frames that returned normally in compiled
+  code (no frame object / trace function / locals mapping), falls back to
+  `frame_finished` otherwise.
+
+### Tier 2 fixes
+* (dict, key) dependencies for folded globals: `cache::on_dict_write(d, key)` (key
+  NULL = any key: clear/merge); `opt::DEPS` maps dict -> [(key, code)]; writes of other
+  keys do not invalidate (no storms from module-level loops). Folding looks the name
+  up directly (globals, then builtins: dependencies on both) and re-validates after
+  registering; names the code itself rebinds (StoreGlobal) are not folded. Module
+  attributes of folded module objects (`math.sqrt`) are folded the same way.
+* Frame introspection: a template with stale unboxed locals publishes a site
+  descriptor (`Frame::t2_site`, values in spill slots at `Frame::t2_sp`);
+  `f_locals`/`locals()` box them into the slots (`opt::sync_frame`) and the code
+  deoptimises when the template returns (writes through `f_locals` are honoured);
+  returns sync unboxed locals when a frame object outlives the activation.
+* Bugs fixed: spill slots read after pushes (sp_bias), snapshot values of calls /
+  templates were not kept live across the clobber, template jump edges missing from
+  the IR CFG (liveness; crash in bm_go), template-exit values not addressable
+  (bm_spectral_norm), values word read on objects without a managed dict.
+* The test_generators segfault noted at the pause no longer reproduces (it was not
+  a JIT bug: master's stability fixes); tier 2 is now on by default
+  (`RPYTHON_JIT2=0` disables it).
+* Tiering: the first OSR also compiles the standard unit (a function with a hot loop
+  called a few times then runs tier 2 on every call — nbody 1888M -> 367M per loop);
+  backedge counters are weighted by loop length (`1 + len/32`), so huge loop bodies
+  compile after a few iterations; tier-1 slow-path profiling is switched off while
+  tier-2 code is installed (`CodeCaches::t2_prof`); deopt limit 64.
+* `RPYTHON_JIT_DEBUG=2` logs every tier-2 deopt (`code -> pc`).
+
+### New tier-2 compilation
+* LoadAttr / StoreAttr / LoadMethod from the inline caches: monomorphic sites guard
+  the type version tag once (`Ty::Tag`, forgotten at templates) and deoptimise;
+  polymorphic sites switch on the tag (up to 4 cases). Inline values: values word
+  + shape key check, direct loads/stores (single-threaded; the locked runtime path
+  when `MULTI_THREADED`); attribute-adding stores (e.g. in `__init__`) compile to
+  "shape == parent and room left -> store, shape = child" (`shape::
+  transitions_adding`; StoreAttr cache entries now record the type in `c`); shape
+  misses call the generic cached path (`h2_load_attr` / `h2_store_attr`) instead of
+  deoptimising. Slots, class attributes (TYPE_ATTR / CLASS_ATTR) as constants.
+  METHOD_SHADOWABLE: per-site memo of a shape known to lack the name.
+* Inlining of small straight-line callees (constant functions, monomorphic methods,
+  <= 48 instructions, no jumps/handlers/cells): callee locals are abstract values
+  (no frame); a guard failing inside the callee rebuilds its frame and finishes it in
+  the interpreter (`InlineDeopt`/`InlineError` snapshots -> `h2_run_inlined`), then
+  compiled code continues after the call with the result, so exceptions and
+  tracebacks are unchanged. A callee that would need a template is not inlined (the
+  attempt is rolled back). `RPYTHON_JIT2_INLINE=0` disables it.
+* `len()` of list/tuple/dict/str inline (unboxed result).
+* setcc for integer SetCond; branches use the compare directly when possible.
+* Register allocation: bitset def sets, binary search for clobber crossings
+  (compile time of big units).
+
+### Tier 1
+* LoadMethod on inline-values objects no longer calls the helper: the cache entry
+  memoises the id of a shape known to lack the name (`Entry::memo`; shape ids are
+  unique and shapes immutable). StoreAttr of an existing inline attribute is done in
+  place (single-threaded).
+
+### Testing
+* `tools/jit_tests/run.sh PY`: 15 differential scripts (new: t_globals, t_introspect,
+  t_attrs, t_tjump, t_inline, t_builtins, t_floatloops), 6 configurations (tier 1 at
+  thresholds 0/2/50, tier 2 at 1/5/50): all pass. tools/bench/perf/t_shapes.py and
+  t_threads.py pass under the same configurations.
+* `tools/jit_tests/smoke.sh PY OUT`: spec smoke with JIT off / default / eager tier 2;
+  final run (14 modules: test_bool test_set test_list test_dict test_generators
+  test_coroutines test_descr test_class test_exceptions test_scope test_math
+  test_float test_int test_threading): identical results in all three
+  configurations. Pre-existing, not JIT-related (same with RPYTHON_JIT=0): test_descr
+  crashes (refcount underflow in type_dealloc -> tuple_dealloc), test_class crashes
+  (modules/testinternalcapi.rs has_inline_values dereferences the tagged values word
+  as a dict), test_threading times out; failures in test_list 1, test_dict 7,
+  test_generators 5, test_coroutines 6, test_exceptions 14, test_math 2.
+
+### Steady-state instructions per loop (millions, `tools/bench/perloop.sh`)
+Callgrind instructions per benchmark loop, steady state ((I(L2)-I(L1))/(L2-L1)), via
+tools/bench/jitshim. Ours: -a 2 -b 5 (deltablue/hexiom -a 5 -b 15, unpack_sequence
+-a 2000 -b 6000, comprehensions -a 1000 -b 3000, fannkuch 1/3); CPython 1/3
+(unpack_sequence/comprehensions 100/300). "start" = merged jit2 + master with tier 2
+on, before the jit3 work (tier 1 alone at that point: richards 594, nbody 1888,
+fannkuch 9209, hexiom 122). ratio = ours / best CPython build.
+
+| bench | CPython default | CPython ft | ours start | ours now | ratio |
+|---|---|---|---|---|---|
+| richards | 461.1 | 565.8 | 573.0 | **353.2** | 0.77 |
+| nbody | 1107.5 | 1401.5 | 1888.7 | **393.7** | 0.36 |
+| spectral_norm | 1207.8 | 1403.9 | 1130.5 | **818.4** | 0.68 |
+| float | 778.4 | 870.1 | 929.2 | 865.6 | 1.11 |
+| richards_super | 530.4 | 639.0 | 728.4 | 559.4 | 1.05 |
+| chaos | 610.7 | 682.6 | 878.4 | 722.6 | 1.18 |
+| raytrace | 2757.1 | 3200.8 | 5099.7 | 3640.1 | 1.32 |
+| hexiom | 58.1 | 65.7 | 126.0 | 78.2 | 1.35 |
+| deltablue | 29.1 | 42.4 | 72.4 | 49.3 | 1.70 |
+| go | 1138.4 | 1259.6 | 2301.6 | 2110.8 | 1.85 |
+| fannkuch | 4392.7 | 4962.9 | 8652.5 | 8646.7 | 1.97 |
+| coroutines | 294.4 | 299.9 | 605.2 | 605.2 | 2.06 |
+| generators | 337.1 | 372.4 | 768.6 | 810.3 | 2.40 |
+| nqueens | 841.8 | 942.5 | 2080.1 | 2085.9 | 2.48 |
+| comprehensions | 0.19 | 0.24 | 0.43 | 0.42 | 2.2 |
+| unpack_sequence | 0.25 | 0.15 | 1.36 | 0.37 | 2.5 |
+
+Small benchmarks (deltablue, hexiom) still include some compilation in the measured
+loops (tier 2 compiles after 1000 calls); their numbers vary by 10-20% between runs.
+The remaining gaps are generators/coroutines (resume path), runtime allocation/GC
+costs (fannkuch, nqueens) and call-heavy OO code with branchy methods (go, raytrace,
+deltablue: callees with branches are not inlined yet).
+
+### Known gaps / next steps
+* Generators and coroutines are not compiled by tier 2 and each resumption goes
+  through gen_send_ex -> eval_frame -> jit::resume -> run -> trampoline (~150
+  instructions per level of a `yield from`/`await` chain vs ~40 in CPython):
+  generators, coroutines, nqueens, comprehensions are ~2x CPython. Needs a leaner
+  resume path (direct entry from Send/ForIter into the generator's compiled code)
+  and generator frames in tier 2.
+* Runtime costs outside the JIT dominate fannkuch / nqueens: list item arrays and
+  frames' slot Vecs via malloc, GC track/untrack under a CAS spin lock
+  (`gc::with_list`; could be lock-free while single-threaded if the parent thread
+  set MULTI_THREADED before spawning), slice objects GC-tracked.
+* Inlining: callees with branches / calls (nested inlining needs multi-frame deopt),
+  virtual tuples (BuildTuple + UnpackSequence), more builtins (isinstance, min/max).
+* Tier-1 opcodes that still deoptimise to the interpreter (with, match, import,
+  raise/except bodies, async) — unchanged.
+* Each tier-2 unit carries its own copies of the boxing/decref routines (~2.4 KB per
+  unit): share them per process.
+
+## Missing / next steps (previous jit workstream)
 * Tier 2 (optimising JIT): SSA from bytecode plus profiles, type speculation with guards
   and deopt by materialising the frame (the frame layout is already shared), unboxed
   int/float in loops, inlining. Not started.

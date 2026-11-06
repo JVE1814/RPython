@@ -80,6 +80,11 @@ Finished also: ast (test_ast 217/220, unparse/tokenize/symtable/codeop/grammar a
 scratch, tarfile 779/781, zipimport, uuid), core-runtime (monitoring/setprofile, lazy imports PEP 810, gc policy,
 _testinternalcapi, _testmultiphase, many slot/type fixes).
 Running (wave 10, after resume): jit3, numpy2, core3, perf2, tk (see PROGRESS.md).
+Wave 11 (after run 5): bc-compiler + bc-vm (D24: CPython 3.15 wordcode as public code format), grind-lib
+(library-level suite failures). Finished: tk (_tkinter/tkinter/idlelib; test_idle 332 run/88 skipped = baseline).
+Coordination file for D24: notes/bytecode.md.
+Finished: jit3 (tier 2 merged + on by default; wins on richards/nbody/spectral_norm). Running: jit4 (generators in tier 2, inlining).
+
 Unassigned: _testclinic re-implemented by us (spec lacks
 internal headers / generated clinic files); subinterpreters (_interpreters/_interpqueues/_interpchannels,
 concurrent.interpreters, InterpreterPoolExecutor — CPython has them); no-GIL thread-safety audit; startup time (jit owns perf).

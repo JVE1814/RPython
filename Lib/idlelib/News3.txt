@@ -1,0 +1,27 @@
+What's New in IDLE 3.15
+=======================
+
+This IDLE is part of a re-implementation of Python 3.15.  Its
+behavior follows the IDLE of the reference implementation; the
+changes listed here are the ones visible to users.
+
+Editor and shell
+
+- Code coloring knows the soft keywords match, case, type and lazy.
+- Completion of attribute and file names, call tips and code context
+  work as before; completion lists can be opened with Ctrl+Space.
+- Long output in the shell can be squeezed into a button and expanded
+  again or viewed in a separate window.
+
+Configuration
+
+- Configuration files with errors are renamed (with the extension
+  .bad) and IDLE starts with the default settings, telling the user
+  which file was set aside.
+- Key bindings that Tk does not accept are reported once and ignored.
+
+Run
+
+- Run Module Customized accepts command line arguments and can run
+  without restarting the shell.
+- Tracebacks of exception groups are shown with their tree structure.

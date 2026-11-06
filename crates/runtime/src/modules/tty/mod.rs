@@ -8,6 +8,7 @@ pub mod input;
 pub mod readline;
 pub mod curses;
 pub mod panel;
+pub mod tkinter;
 
 pub fn register() {
     crate::import::register_builtin("_gdbm", dbm::init_gdbm);
@@ -15,4 +16,5 @@ pub fn register() {
     crate::import::register_builtin("readline", readline::init);
     crate::import::register_builtin("_curses", curses::init);
     crate::import::register_builtin("_curses_panel", panel::init);
+    crate::import::register_builtin("_tkinter", tkinter::init);
 }
