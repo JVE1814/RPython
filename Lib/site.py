@@ -519,42 +519,43 @@ def gethistoryfile():
     return os.path.join(os.path.expanduser('~'), '.python_history')
 
 
+def register_readline():
+    """The interactive hook: set up readline completion and history."""
+    import atexit
+    try:
+        import readline
+        import rlcompleter  # installs the completer
+    except ImportError:
+        return
+    if 'libedit' in (getattr(readline, '__doc__', '') or ''):
+        readline.parse_and_bind('bind ^I rl_complete')
+    else:
+        readline.parse_and_bind('tab: complete')
+    try:
+        readline.read_init_file()
+    except OSError:
+        pass
+    if readline.get_current_history_length() != 0:
+        # a startup file already set up the history
+        return
+    history = gethistoryfile()
+    try:
+        readline.read_history_file(history)
+    except (OSError, UnicodeError):
+        pass
+
+    def save_history():
+        try:
+            readline.write_history_file(history)
+        except OSError:
+            pass
+
+    atexit.register(save_history)
+
+
 def enablerlcompleter():
     """Arrange for the interactive interpreter to get tab completion and
     a persistent history through readline."""
-
-    def register_readline():
-        import atexit
-        try:
-            import readline
-            import rlcompleter  # installs the completer
-        except ImportError:
-            return
-        if 'libedit' in (getattr(readline, '__doc__', '') or ''):
-            readline.parse_and_bind('bind ^I rl_complete')
-        else:
-            readline.parse_and_bind('tab: complete')
-        try:
-            readline.read_init_file()
-        except OSError:
-            pass
-        if readline.get_current_history_length() != 0:
-            # a startup file already set up the history
-            return
-        history = gethistoryfile()
-        try:
-            readline.read_history_file(history)
-        except (OSError, UnicodeError):
-            pass
-
-        def save_history():
-            try:
-                readline.write_history_file(history)
-            except OSError:
-                pass
-
-        atexit.register(save_history)
-
     sys.__interactivehook__ = register_readline
 
 
