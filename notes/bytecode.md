@@ -286,3 +286,31 @@ Branch: **bc-vm = `worktree-agent-ae0417e805548192f`**.
   `crates/runtime/src/types/code.rs`; **bc-vm: please merge master, then I merge you.**
 * Still open for bc-vm (from round 1): generator throw/close at a yield-from YIELD_VALUE (push
   None first), JIT + translated code crash, co_positions on empty linetable.
+
+## bc-vm log (2026-11-06, round 2: switch-over)
+* **The wordcode pipeline is the default** (`types::code::public_mode()`; `RPYTHON_WORDCODE=0`
+  = legacy, only for comparison until bc-compiler deletes it). Pyc magic, marshal
+  `CODE_FORMAT` (4) and the importlib boot cache key differ per mode.
+* Merged master (perf2: lazy legacy bodies, marshal v3) and bc-compiler a7f1b19. Kept bc-vm's
+  code objects: public fields (co_consts, co_names, co_code, co_linetable...) are always valid
+  for C readers; only the internal form is lazy (translated on first use). Dropped master's
+  metadata-only `code_tp_new` (superseded by `types.CodeType` in code.rs).
+* JIT + translated code: fixed (tier-1 direct call checked a NULL `data`); verified with
+  tools/jit_tests/run.sh (all tier-1/tier-2 configs), `RPYTHON_JIT2_THRESHOLD=1` imports, and
+  test_unittest/test_contextlib/test_generators/test_coroutines/test_dataclasses/test_with
+  giving identical results with the JIT off, default and aggressive.
+* Open items from the bc-compiler log: throw()/close() pushes None first (done); co_positions on
+  an empty linetable keeps `end_line = firstlineno + 1` (test_code asserts it); per-compilation
+  merging of equal constants / co_consts tuples / line and exception tables (`ConstMerger` in
+  code.rs) plus process-wide sharing of simple constant tuples (test_compile
+  test_merge_constants/test_merge_code_attrs, test_code test_interned_constants).
+* Also: `_testinternalcapi` code helpers (get_co_localskinds, get_code_var_counts,
+  verify_stateless_code, code_returns_only_none, set_vectorcall_nop, get_next_dict_keys_version),
+  co_extra (PyUnstable_Code_Get/SetExtra with free callbacks), bytes singletons for b"" and
+  one-byte constants, marshal refuses recursive code/slice/frozendict, atomic generator claim
+  (no GIL), tp_subclasses lock (crash in test_opcache's race tests), adaptive view keeps the last
+  observation.
+* For jit3 (not changed by bc-vm): `specialize.rs` INSTANCE_DICT caches ignore a class
+  attribute of the same name that later becomes a data descriptor
+  (test_opcache test_descriptor_added_after_optimization); tier-1 direct calls of Python
+  functions bypass a replaced `vectorcall` (PyFunction_SetVectorcall).
