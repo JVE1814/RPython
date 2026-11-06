@@ -1190,13 +1190,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                         Op::DictUpdate => {
                             let o = popref!(f);
                             let d = peek!(f, arg as usize);
-                            if let Err(e) = crate::types::dict_methods::dict_update_from(unsafe { &*d }, &o) {
-                                if exc_matches(exc::AttributeError()) {
-                                    clear_exc();
-                                    raise!(TypeError, "'{}' object is not a mapping", tname(&o));
-                                }
-                                return Err(e);
-                            }
+                            crate::types::dict_methods::dict_update_display(unsafe { &*d }, &o)?;
                         }
                         Op::DictMerge => {
                             let o = popref!(f);
@@ -1493,6 +1487,9 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                                 Some(k) => Some(k.clone()),
                                 None => None,
                             };
+                            if let Some(d) = &kwd {
+                                check_kwargs_keys(d)?;
+                            }
                             let call_info = if crate::modules::sys::tracing_active() {
                                 crate::modules::sys_trace::before_call(ts, f, &callable, self_or_null.as_deref(), v.first().copied(), false)?
                             } else {
@@ -1910,6 +1907,17 @@ impl ReraiseMarker {
 pub(super) fn is_sequence_like(o: &PyObject) -> bool {
     let sq = o.ty().tp_as_sequence;
     !sq.is_null() && unsafe { (*sq).sq_item.is_some() }
+}
+
+/// `f(**mapping)`: keyword names must be strings (duplicates are reported
+/// before this, when the mappings are merged).
+pub(crate) fn check_kwargs_keys(d: &PyObject) -> PyResult<()> {
+    for k in dict::keys_vec(d) {
+        if !pystr::is_str(&k) {
+            raise!(TypeError, "keywords must be strings");
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn func_desc(o: &PyObject) -> String {

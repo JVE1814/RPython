@@ -476,8 +476,8 @@ fn do_richcompare(a: &PyObject, b: &PyObject, op: c_int) -> PyResult {
             TypeError,
             "'{}' not supported between instances of '{}' and '{}'",
             OPSTR[op as usize],
-            tname(a),
-            tname(b)
+            crate::types::typeobject::tp_name_of(a),
+            crate::types::typeobject::tp_name_of(b)
         ),
     }
 }

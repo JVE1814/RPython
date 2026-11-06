@@ -142,6 +142,37 @@ pub fn dict_merge_kwargs(d: &PyObject, o: &PyObject, func: *mut PyObject) -> PyR
     Ok(())
 }
 
+/// `{**o}` in a dict display: a mapping is anything with keys() and __getitem__;
+/// errors raised by those propagate unchanged.
+pub fn dict_update_display(d: &PyObject, o: &PyObject) -> PyResult<()> {
+    if is_plain_iter_dict(o) {
+        for (k, v) in dict::items_vec(o) {
+            dict::set_item(d, &k, &v)?;
+        }
+        return Ok(());
+    }
+    let keys_fn = match ab::getattr_opt(o, crate::name!("keys"))? {
+        Some(k) => k,
+        None => raise!(TypeError, "'{}' object is not a mapping", tname(o)),
+    };
+    let keys = ab::call(&keys_fn, &[])?;
+    let it = match ab::get_iter(&keys) {
+        Ok(it) => it,
+        Err(e) => {
+            if exc_matches(crate::types::exceptions::TypeError()) {
+                clear_exc();
+                raise!(TypeError, "{} must return an iterable, not {}", function_str(&keys_fn), tname(&keys));
+            }
+            return Err(e);
+        }
+    };
+    while let Some(k) = ab::iter_next(&it)? {
+        let v = ab::getitem(o, &k)?;
+        dict::set_item(d, &k, &v)?;
+    }
+    Ok(())
+}
+
 /// How error messages name a callable: `module.qualname()` for functions and
 /// methods (`qualname()` for builtins), else "'type' object".
 pub fn function_str(f: &PyObject) -> String {

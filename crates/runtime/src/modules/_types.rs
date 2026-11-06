@@ -97,7 +97,7 @@ def _capsule_type():
         mod = _sys.modules.get(modname)
         if mod is not None and hasattr(mod, attr):
             return type(getattr(mod, attr))
-    return getattr(_sys, '_capsule_type', None)
+    return globals().get('_rt_capsule_type')
 
 for _n in ('GenericAlias', 'UnionType'):
     if _n not in globals():
@@ -118,7 +118,7 @@ else:
     __all__.remove('LazyImportType')
 del _t
 
-del _sys, _f, _g, _C, _c, _ag, _cell_factory, _get_framelocalsproxy, _capsule_type
+del _sys, _f, _g, _C, _c, _ag, _cell_factory, _get_framelocalsproxy, _capsule_type, _rt_capsule_type
 "#;
 
 pub fn init_module() -> PyResult {
@@ -126,6 +126,7 @@ pub fn init_module() -> PyResult {
     let d = crate::types::module::module_dict(&m);
     dict::set_item_str(&d, "__builtins__", &crate::builtins::builtins_module())?;
     dict::set_item_str(&d, "SimpleNamespace", crate::types::typeobject::type_obj(crate::types::namespace::namespace_type()))?;
+    dict::set_item_str(&d, "_rt_capsule_type", crate::types::typeobject::type_obj(crate::capi::capsule::capsule_type()))?;
     let code = crate::compile::compile_str(SRC, "<_types>", crate::compile::Mode::Exec, 0, -1)?;
     crate::interp::eval_code(&code.code, &d, Some(&d))?;
     let _: Option<PyRef> = None;

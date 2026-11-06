@@ -622,7 +622,7 @@ fn check_set_special(o: &PyObject, v: Option<&PyObject>, attr: &str) -> PyResult
         raise!(TypeError, "cannot set '{}' attribute of immutable type '{}'", attr, type_name(unsafe { &*tp }));
     }
     if v.is_none() {
-        raise!(TypeError, "cannot delete '{}' attribute of immutable type '{}'", attr, type_name(unsafe { &*tp }));
+        raise!(TypeError, "cannot delete '{}' attribute of type '{}'", attr, type_name(unsafe { &*tp }));
     }
     Ok(())
 }
@@ -710,7 +710,7 @@ fn type_set_bases(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     if !compatible_for_assignment(unsafe { (*tp).tp_base }, new_base) {
         raise!(
             TypeError,
-            "__bases__ assignment: '{}' deallocator differs from '{}'",
+            "__bases__ assignment: '{}' object layout differs from '{}'",
             type_name(unsafe { &*new_base }),
             type_name(unsafe { &*(*tp).tp_base })
         );
@@ -1059,7 +1059,7 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
     }
     if a.len() != 3 {
         if a.len() == 1 {
-            raise!(TypeError, "type() takes 1 or 3 arguments");
+            raise!(TypeError, "type.__new__() takes exactly 3 arguments (1 given)");
         }
         raise!(TypeError, "type() takes 1 or 3 arguments");
     }
