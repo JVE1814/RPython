@@ -1263,7 +1263,7 @@ fn flush_std(name: &str) -> bool {
     if let Some(s) = crate::modules::sys::get_sys_attr(name) {
         if !s.is(none::none()) {
             if ab::call_method_str(&s, "flush", &[]).is_err() {
-                write_unraisable(Some(&format!("Exception ignored on flushing sys.{}", name)), None);
+                write_unraisable(Some(&format!("Exception ignored while flushing sys.{}", name)), None);
                 return false;
             }
         }
