@@ -428,7 +428,7 @@ pub(crate) fn compile_module(module: &Mod, opts: &CompileOptions) -> R<WordcodeO
     // fold a private copy of the AST
     let mut m = module.clone();
     let mut warnings = Vec::new();
-    crate::fold::fold_module(&mut m, opts.optimize, future, &mut warnings, opts.max_depth)?;
+    crate::fold::fold_module_ast_only(&mut m, opts.optimize, future, &mut warnings, opts.max_depth)?;
     let st = symtable::build(&m, future | (opts.flags & cf::PYCF_ALLOW_TOP_LEVEL_AWAIT), opts.max_depth)?;
     let mut c = Compiler {
         st,
@@ -701,12 +701,12 @@ impl<'a> Compiler<'a> {
                 self.emit_loc(O::RESUME, wordcode::resume::GENEXPR_START, NO_LOC);
                 self.emit_loc(O::LOAD_FAST, 0, gloc);
                 self.emit_loc(O::GET_ITER, 0, gloc);
-                self.emit_loc(O::RETURN_GENERATOR, 0, gloc);
-                self.emit_loc(O::POP_TOP, 0, gloc);
+                self.emit_loc(O::RETURN_GENERATOR, 0, start_loc);
+                self.emit_loc(O::POP_TOP, 0, start_loc);
                 let h = self.new_label();
                 self.emit_setup(O::SETUP_CLEANUP, h);
                 self.u().gen_handler = Some(h);
-                self.emit_loc(O::RESUME, 0, gloc);
+                self.emit_loc(O::RESUME, 0, start_loc);
                 return;
             }
             self.emit_loc(O::RETURN_GENERATOR, 0, start_loc);
@@ -1414,11 +1414,6 @@ impl<'a> Compiler<'a> {
                 self.u().flags |= co::HAS_DOCSTRING;
             }
             body = &body[1..];
-            if body.is_empty() {
-                // keep a line event for the docstring line
-                self.set_loc(f.body[0].loc);
-                self.emit(O::NOP, 0);
-            }
         }
         self.compile_function_statements(body)?;
         let code = self.exit_scope()?;

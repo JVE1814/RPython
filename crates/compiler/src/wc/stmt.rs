@@ -149,7 +149,7 @@ impl<'a> Compiler<'a> {
                     return Ok(());
                 }
                 self.compile_expr(value)?;
-                self.set_loc(s.loc);
+                self.set_loc(value.loc);
                 self.emit(O::POP_TOP, 0);
                 Ok(())
             }
@@ -957,6 +957,7 @@ impl<'a> Compiler<'a> {
                     return Err(self.error("cannot assign to __debug__", t.loc));
                 }
                 self.note_static_attribute(value, attr);
+                self.set_loc(super::expr::attr_loc(t.loc, t, attr));
                 let m = self.mangle(attr);
                 self.emit_name(O::STORE_ATTR, &m);
                 Ok(())
@@ -1061,14 +1062,15 @@ impl<'a> Compiler<'a> {
             }
             ExprKind::Attribute { value: obj, attr, .. } => {
                 self.compile_expr(obj)?;
-                self.set_loc(target.loc);
+                let aloc = super::expr::attr_loc(target.loc, target, attr);
+                self.set_loc(aloc);
                 self.emit(O::COPY, 1);
                 let m = self.mangle(attr);
                 self.emit_load_attr(&m, false);
                 self.compile_expr(value)?;
                 self.set_loc(s.loc);
                 self.emit(O::BINARY_OP, binop as u32);
-                self.set_loc(target.loc);
+                self.set_loc(aloc);
                 self.emit(O::SWAP, 2);
                 self.emit_name(O::STORE_ATTR, &m);
                 Ok(())
@@ -1178,7 +1180,8 @@ impl<'a> Compiler<'a> {
         if value.is_none() && !matches!(target.node, ExprKind::Name { .. }) {
             // nothing else
         }
-        if value.is_none() {
+        // an annotation without a value is no code in a function (a line marker elsewhere)
+        if value.is_none() && !self.ur().function_like {
             self.set_loc(s.loc);
             self.emit(O::NOP, 0);
         }

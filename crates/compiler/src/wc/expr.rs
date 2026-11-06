@@ -339,6 +339,20 @@ impl<'a> Compiler<'a> {
                     self.load_const(Constant::Str(Vec::new()));
                 } else if values.len() == 1 && matches!(values[0].node, ExprKind::FormattedValue { .. } | ExprKind::Interpolation { .. } | ExprKind::Constant { .. }) {
                     self.compile_expr(&values[0])?;
+                } else if values.len() > STACK_USE_GUIDELINE {
+                    // long f-strings: ''.join([...]) keeps the stack small
+                    self.load_const(Constant::Str(Vec::new()));
+                    self.emit_load_attr("join", true);
+                    self.emit(O::BUILD_LIST, 0);
+                    for v in values {
+                        match &v.node {
+                            ExprKind::Starred { .. } => return Err(self.error("can't use starred expression here", v.loc)),
+                            _ => self.compile_expr(v)?,
+                        }
+                        self.emit(O::LIST_APPEND, 1);
+                    }
+                    self.set_loc(e.loc);
+                    self.emit(O::CALL, 1);
                 } else {
                     for v in values {
                         match &v.node {
@@ -1182,7 +1196,7 @@ impl<'a> Compiler<'a> {
         };
         let async_outer = generators[0].is_async != 0;
         if kind == CompKind::Gen && !async_outer {
-            self.pending_genexpr = Some(loc_of(e.loc));
+            self.pending_genexpr = Some(loc_of(generators[0].iter.loc));
         }
         let r = self.enter_scope(name, UnitKind::Comprehension, sid, e.loc.lineno);
         self.pending_genexpr = None;
@@ -1205,9 +1219,12 @@ impl<'a> Compiler<'a> {
         }
         // (a synchronous genexpr's prologue already pushed [iterator, NULL])
         self.comprehension_generator(e, generators, 0, 0, elt, value, kind)?;
-        self.set_loc(e.loc);
         if kind == CompKind::Gen {
+            // the implicit return keeps the location of the loop exit
+            self.u().loc = NO_LOC;
             self.load_none();
+        } else {
+            self.set_loc(e.loc);
         }
         self.emit(O::RETURN_VALUE, 0);
         let code = self.exit_scope()?;

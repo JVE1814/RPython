@@ -297,6 +297,7 @@ pub(crate) fn optimize_cfg(cfg: &mut Cfg, consts: &mut Vec<Constant>, nlocals: u
             changed |= peephole_block(cfg, b, consts);
         }
         changed |= thread_jumps(cfg);
+        changed |= merge_fallthrough_blocks(cfg);
         remove_redundant_nops(cfg);
         changed |= remove_redundant_jumps(cfg);
         cfg.remove_unreachable();
@@ -672,7 +673,11 @@ fn duplicate_exits_without_lineno(cfg: &mut Cfg) {
             continue;
         }
         let tl = cfg.blocks[t as usize].instrs.last().copied();
-        if !tl.map(|i| is_exit_op(i.op)).unwrap_or(false) || cfg.blocks[t as usize].instrs.len() > MAX_COPY_SIZE {
+        let tlen = cfg.blocks[t as usize].instrs.len();
+        let exit = tl.map(|i| is_exit_op(i.op)).unwrap_or(false) && tlen <= MAX_COPY_SIZE;
+        // a lone synthetic jump (e.g. a loop back-edge reached from several places)
+        let lone_jump = tlen == 1 && tl.map(|i| is_uncond_jump(i.op)).unwrap_or(false);
+        if !exit && !lone_jump {
             continue;
         }
         if cfg.blocks[t as usize].instrs.iter().any(|i| is_pseudo_marker(i.op)) {
@@ -806,7 +811,60 @@ fn nb_operator(nb: i32) -> Option<ast::Operator> {
     })
 }
 
+/// Indices selected by `slice(start, stop, step)` on a sequence of length `len`.
+fn slice_indices(s: &[Constant; 3], len: usize) -> Option<Vec<usize>> {
+    let int = |c: &Constant| -> Option<Option<i64>> {
+        match c {
+            Constant::None => Some(None),
+            Constant::Int(i) => Some(Some(*i)),
+            Constant::Bool(b) => Some(Some(*b as i64)),
+            _ => None,
+        }
+    };
+    let step = int(&s[2])?.unwrap_or(1);
+    if step == 0 {
+        return None;
+    }
+    let len = len as i64;
+    let clamp = |v: Option<i64>, default: i64, lo: i64, hi: i64| -> i64 {
+        match v {
+            None => default,
+            Some(x) => {
+                let x = if x < 0 { x + len } else { x };
+                x.clamp(lo, hi)
+            }
+        }
+    };
+    let mut out = Vec::new();
+    if step > 0 {
+        let start = clamp(int(&s[0])?, 0, 0, len);
+        let stop = clamp(int(&s[1])?, len, 0, len);
+        let mut i = start;
+        while i < stop {
+            out.push(i as usize);
+            i += step;
+        }
+    } else {
+        let start = clamp(int(&s[0])?, len - 1, -1, len - 1);
+        let stop = clamp(int(&s[1])?, -1, -1, len - 1);
+        let mut i = start;
+        while i > stop {
+            out.push(i as usize);
+            i += step;
+        }
+    }
+    Some(out)
+}
+
 fn fold_subscr(container: &Constant, index: &Constant) -> Option<Constant> {
+    if let Constant::Slice(s) = index {
+        return match container {
+            Constant::Tuple(v) => Some(Constant::Tuple(slice_indices(s, v.len())?.into_iter().map(|i| v[i].clone()).collect())),
+            Constant::Str(t) => Some(Constant::Str(slice_indices(s, t.len())?.into_iter().map(|i| t[i]).collect())),
+            Constant::Bytes(b) => Some(Constant::Bytes(slice_indices(s, b.len())?.into_iter().map(|i| b[i]).collect())),
+            _ => None,
+        };
+    }
     let i = match index {
         Constant::Int(i) => *i,
         Constant::Bool(b) => *b as i64,
@@ -885,6 +943,8 @@ fn nop_out(ins: &mut Instr) {
     ins.op = O::NOP;
     ins.arg = 0;
     ins.target = NO_LABEL;
+    // folded-away instructions leave no line event behind
+    ins.loc = NO_POS;
 }
 
 /// Size limit for folded tuples/sets (same order as CPython's).
@@ -941,8 +1001,8 @@ fn fold_constants(cfg: &mut Cfg, b: Label, consts: &mut Vec<Constant>) -> bool {
                         }
                     }
                 }
-                if !changed && !is_set && matches!(next, Some((O::GET_ITER, _))) && n > 0 {
-                    // iterating over a list display: a tuple is cheaper
+                if !changed && !is_set && matches!(next, Some((O::GET_ITER, _)) | Some((O::CONTAINS_OP, _))) {
+                    // iterating over (or testing membership in) a list display: a tuple will do
                     instrs[k].op = O::BUILD_TUPLE;
                     changed = true;
                 }
@@ -1244,6 +1304,27 @@ fn peephole_block(cfg: &mut Cfg, b: Label, consts: &mut Vec<Constant>) -> bool {
                 if let (Some(nx), Some(c)) = (next, const_of(&ins, consts)) {
                     let nop = instrs[nx];
                     match nop.op {
+                        O::COPY if nop.arg == 1 => {
+                            // `const and x` / `const or x`: COPY 1; TO_BOOL; POP_JUMP_IF_x
+                            let tb = next_real(instrs, nx);
+                            let jp = tb.and_then(|t| next_real(instrs, t));
+                            if let (Some(tb), Some(jp)) = (tb, jp) {
+                                let jop = instrs[jp].op;
+                                if instrs[tb].op == O::TO_BOOL && matches!(jop, O::POP_JUMP_IF_FALSE | O::POP_JUMP_IF_TRUE) {
+                                    if let Some(t) = const_truth(&c) {
+                                        let taken = (jop == O::POP_JUMP_IF_TRUE) == t;
+                                        nop_out(&mut instrs[nx]);
+                                        nop_out(&mut instrs[tb]);
+                                        if taken {
+                                            instrs[jp].op = O::JUMP;
+                                        } else {
+                                            nop_out(&mut instrs[jp]);
+                                        }
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        }
                         O::POP_JUMP_IF_FALSE | O::POP_JUMP_IF_TRUE => {
                             if let Some(t) = const_truth(&c) {
                                 let jump = (nop.op == O::POP_JUMP_IF_TRUE) == t;
@@ -1376,48 +1457,61 @@ fn store_target(i: &Instr) -> Option<i32> {
 /// `SWAP n` followed by the stores that consume the swapped items: reorder the stores
 /// instead (when they are independent and on the same line).
 fn apply_static_swap(instrs: &mut [Instr], k: usize) -> bool {
-    let depth = instrs[k].arg as usize;
-    if depth < 2 {
+    // a run of SWAPs (NOPs in between are fine)
+    let mut swaps = vec![k];
+    let mut j = k;
+    while let Some(nx) = next_real(instrs, j) {
+        if instrs[nx].op != O::SWAP {
+            break;
+        }
+        swaps.push(nx);
+        j = nx;
+    }
+    let depth = swaps.iter().map(|&s| instrs[s].arg as usize).max().unwrap_or(0);
+    if depth < 2 || swaps.iter().any(|&s| instrs[s].arg < 2) {
         return false;
     }
-    // collect the following `depth` real instructions
-    let mut idx = Vec::new();
-    let mut j = k;
-    while idx.len() < depth {
+    // simulate: perm[p] = original slot now at position p (0 = top of stack)
+    let mut perm: Vec<usize> = (0..depth).collect();
+    for &s in &swaps {
+        let d = instrs[s].arg as usize;
+        perm.swap(0, d - 1);
+    }
+    // the stores that consume the permuted items
+    let mut stores = Vec::with_capacity(depth);
+    let mut j = *swaps.last().unwrap();
+    while stores.len() < depth {
         match next_real(instrs, j) {
-            Some(nx) => {
-                idx.push(nx);
+            Some(nx) if is_swappable_store(&instrs[nx]) => {
+                stores.push(nx);
                 j = nx;
             }
-            None => return false,
+            _ => return false,
         }
     }
-    if !idx.iter().all(|&x| is_swappable_store(&instrs[x])) {
+    let line = instrs[stores[0]].loc.line;
+    if stores.iter().any(|&x| instrs[x].loc.line != line) {
         return false;
     }
-    let line = instrs[idx[0]].loc.line;
-    if idx.iter().any(|&x| instrs[x].loc.line != line) {
+    // stores to the same local would change order: give up
+    let targets: Vec<i32> = stores.iter().filter_map(|&x| store_target(&instrs[x])).collect();
+    let mut sorted = targets.clone();
+    sorted.sort();
+    sorted.dedup();
+    if sorted.len() != targets.len() {
         return false;
     }
-    // stores to the same local in between must keep their order
-    let first = idx[0];
-    let last = idx[depth - 1];
-    let (ta, tb) = (store_target(&instrs[first]), store_target(&instrs[last]));
-    for &m in &idx[1..depth - 1] {
-        let t = store_target(&instrs[m]);
-        if t.is_some() && (t == ta || t == tb) {
-            return false;
-        }
+    // without the swaps, the i-th store pops original slot i; it must do what the store
+    // that consumed slot i did with the swaps
+    let old: Vec<Instr> = stores.iter().map(|&x| instrs[x]).collect();
+    for (i, &pos_i) in stores.iter().enumerate() {
+        let p = perm.iter().position(|&o| o == i).unwrap();
+        let loc = instrs[pos_i].loc;
+        instrs[pos_i] = Instr { loc, ..old[p] };
     }
-    if ta.is_some() && ta == tb {
-        return false;
+    for &s in &swaps {
+        nop_out(&mut instrs[s]);
     }
-    instrs.swap(first, last);
-    // locations stay with their positions
-    let (l1, l2) = (instrs[first].loc, instrs[last].loc);
-    instrs[first].loc = l2;
-    instrs[last].loc = l1;
-    nop_out(&mut instrs[k]);
     true
 }
 
@@ -1434,10 +1528,12 @@ fn convert_closure_loads(cfg: &mut Cfg) {
 }
 
 /// LOAD_FAST of a local that may be unbound at that point becomes LOAD_FAST_CHECK.
-fn add_checks_for_unbound_locals(cfg: &mut Cfg, nlocals: usize, bound: &[bool]) {
-    if nlocals == 0 {
+fn add_checks_for_unbound_locals(cfg: &mut Cfg, all_locals: usize, bound: &[bool]) {
+    if all_locals == 0 {
         return;
     }
+    // the first 64 slots are analysed over the whole CFG, the others only within a block
+    let nlocals = all_locals.min(64);
     let words = nlocals.div_ceil(64);
     let pos = cfg.positions();
     let nb = cfg.blocks.len();
@@ -1510,11 +1606,27 @@ fn add_checks_for_unbound_locals(cfg: &mut Cfg, nlocals: usize, bound: &[bool]) 
     }
     for &b in &cfg.order.clone() {
         let Some(mut s) = state[b as usize].clone() else { continue };
+        let mut known: std::collections::HashSet<i32> = std::collections::HashSet::new();
         for i in cfg.blocks[b as usize].instrs.iter_mut() {
+            let a = i.arg as usize;
             if i.op == O::LOAD_FAST {
-                let a = i.arg as usize;
-                if a < nlocals && s[a / 64] & (1 << (a % 64)) != 0 {
+                if a < nlocals {
+                    if s[a / 64] & (1 << (a % 64)) != 0 {
+                        i.op = O::LOAD_FAST_CHECK;
+                    }
+                } else if !known.contains(&i.arg) {
                     i.op = O::LOAD_FAST_CHECK;
+                }
+            }
+            if a >= nlocals && wordcode::has_local(i.op) {
+                match i.op {
+                    O::STORE_FAST | O::LOAD_FAST | O::LOAD_FAST_CHECK => {
+                        known.insert(i.arg);
+                    }
+                    O::DELETE_FAST | O::LOAD_FAST_AND_CLEAR | O::STORE_FAST_MAYBE_NULL => {
+                        known.remove(&i.arg);
+                    }
+                    _ => {}
                 }
             }
             transfer(&mut s, i);
@@ -2000,6 +2112,11 @@ fn finish(mut cfg: Cfg, info: UnitInfo, layout: Layout) -> R<CodeObject> {
             flat.push(Flat { op, arg: i.arg, target: i.target, loc: i.loc, handler: i.handler });
         }
     }
+    if let Some(last) = flat.last() {
+        if !is_terminator(last.op) {
+            return Err(ierr(&format!("control flow falls off the end of {}", info.qualname)));
+        }
+    }
     // a block's first instruction may be in a later block if it is empty
     let n = flat.len();
     let mut target_index = vec![n; cfg.blocks.len()];
@@ -2174,4 +2291,25 @@ fn exc_entry(cfg: &Cfg, target_index: &[usize], offset: &[u32], start: u32, end:
     }
     let depth = blk.depth - 1 - blk.preserve_lasti as i32;
     Ok(ExcEntry { start, end, target: offset[t], depth: depth.max(0) as u32, lasti: blk.preserve_lasti })
+}
+
+/// A block that falls through into a block with no other predecessor absorbs it (so that
+/// peepholes see both halves, e.g. after a constant condition was folded away).
+fn merge_fallthrough_blocks(cfg: &mut Cfg) -> bool {
+    let mut changed = false;
+    let preds = cfg.predecessor_counts();
+    for k in 0..cfg.order.len().saturating_sub(1) {
+        let b = cfg.order[k];
+        let n = cfg.order[k + 1];
+        if cfg.blocks[b as usize].instrs.is_empty() || !cfg.falls_through(b) || preds[n as usize] != 1 || cfg.blocks[n as usize].is_handler {
+            continue;
+        }
+        if cfg.blocks[b as usize].instrs.iter().any(|i| is_jump_edge(i.op)) || cfg.blocks[n as usize].instrs.is_empty() {
+            continue;
+        }
+        let moved = std::mem::take(&mut cfg.blocks[n as usize].instrs);
+        cfg.blocks[b as usize].instrs.extend(moved);
+        changed = true;
+    }
+    changed
 }

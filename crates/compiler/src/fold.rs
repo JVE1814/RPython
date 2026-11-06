@@ -44,6 +44,14 @@ pub fn fold_module(m: &mut Mod, optimize: i32, future: u32, warnings: &mut Vec<W
     f.fold_mod(m)
 }
 
+/// AST pass of the wordcode pipeline: warnings, match-value folding and `%`-format rewriting
+/// only (constant expressions are folded by the CFG optimiser, as in CPython 3.14+).
+pub fn fold_module_ast_only(m: &mut Mod, optimize: i32, future: u32, warnings: &mut Vec<Warning>, max_depth: u32) -> R {
+    let string_annotations = future & crate::cf::CO_FUTURE_ANNOTATIONS != 0;
+    let mut f = Folder { optimize, full: false, warnings: Some(warnings), depth: 0, max_depth, ctx: Vec::new(), string_annotations };
+    f.fold_mod(m)
+}
+
 pub fn optimize_ast(m: &mut Mod, optimize: i32, _flags: u32) -> R {
     if optimize <= 0 {
         return Ok(());
