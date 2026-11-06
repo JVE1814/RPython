@@ -468,7 +468,14 @@ fn fio_write(o: &PyObject, b: &PyObject) -> PyResult {
     let f = fio(o);
     check_writable(f)?;
     match raw_write(f.fd, view.as_slice())? {
-        Some(n) => Ok(int::new_int(n as i64)),
+        Some(n) => {
+            if n < view.as_slice().len() {
+                // a write cut short by a signal: let its handler run (and raise)
+                // now, as the interpreter would right after this call
+                crate::modules::posix::path::check_signals()?;
+            }
+            Ok(int::new_int(n as i64))
+        }
         None => Ok(none::none_ref()),
     }
 }

@@ -1314,6 +1314,16 @@ fn t_seekable(o: &PyObject) -> PyResult {
 fn t_reconfigure(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
     let [encoding, errors, newline, lb, wt] =
         crate::modules::posix::kwparse::<5>("reconfigure", &["encoding", "errors", "newline", "line_buffering", "write_through"], 0, 0, 5, args, kw)?;
+    // booleans are taken through __index__ (like the C argument converter),
+    // before anything is changed
+    let as_flag = |x: Option<&PyObject>| -> PyResult<Option<bool>> {
+        match x.filter(|x| !x.is(none::none())) {
+            None => Ok(None),
+            Some(v) => Ok(Some(ab::index_as_ssize(v, Some(crate::types::exceptions::OverflowError()))? != 0)),
+        }
+    };
+    let lb_val = as_flag(lb)?;
+    let wt_val = as_flag(wt)?;
     let st = state(o)?;
     let started = st.decoder.is_some() && (st.snapshot.is_some() || !st.decoded.is_empty());
     let encoding = encoding.filter(|x| !x.is(none::none()));
@@ -1388,11 +1398,11 @@ fn t_reconfigure(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyR
             }
         }
     }
-    if let Some(x) = lb.filter(|x| !x.is(none::none())) {
-        st.line_buffering = ab::is_true(x)?;
+    if let Some(v) = lb_val {
+        st.line_buffering = v;
     }
-    if let Some(x) = wt.filter(|x| !x.is(none::none())) {
-        st.write_through = ab::is_true(x)?;
+    if let Some(v) = wt_val {
+        st.write_through = v;
     }
     Ok(none::none_ref())
 }

@@ -151,6 +151,10 @@ pub fn os_write(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     if r < 0 {
         return Err(os_err());
     }
+    if (r as usize) < s.len() {
+        // a write cut short by a signal: let its handler run (and raise) now
+        check_signals()?;
+    }
     Ok(int::new_int(r as i64))
 }
 
