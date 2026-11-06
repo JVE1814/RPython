@@ -400,7 +400,7 @@ pub fn wconst_to_obj(c: &rpy_compiler::wordcode::Constant, filename: &PyRef) -> 
         C::Float(f) => crate::types::float::new_float(*f),
         C::Complex { real, imag } => crate::types::complex::new_complex(*real, *imag),
         C::Str(cps) => pystr::intern(pystr::from_codepoints(cps)),
-        C::Bytes(b) => bytes::new_bytes(b),
+        C::Bytes(b) => bytes::bytes_singleton(b).unwrap_or_else(|| bytes::new_bytes(b)),
         C::Tuple(items) => {
             let mut v = Vec::with_capacity(items.len());
             for it in items {

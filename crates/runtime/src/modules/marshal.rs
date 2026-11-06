@@ -173,8 +173,12 @@ impl Writer {
                 self.long(idx as i32);
                 return Ok(None);
             }
-            // An immutable container referring to itself: the reader could not resolve
-            // the reference, so write it again (this recurses until the depth limit).
+            // An object under construction referring to itself. Code objects, slices and
+            // frozendicts can only be built once their parts exist: refuse the loop.
+            if code_mod::is_code(v) || v.is_type(crate::types::slice::slice_type()) || crate::types::frozendict::is_frozendict(v) {
+                raise!(ValueError, "cannot marshal a recursive {} object", tname(v));
+            }
+            // Other immutable containers: write it again (recurses until the depth limit).
             return Ok(Some((0, None)));
         }
         let n = self.refs.len();
@@ -704,7 +708,7 @@ impl<'a> Reader<'a> {
                     return Err(bad("bytes object size out of range"));
                 }
                 let b = self.read(n as usize)?;
-                self.set_ref(flag, bytes::new_bytes(&b))
+                self.set_ref(flag, bytes::bytes_singleton(&b).unwrap_or_else(|| bytes::new_bytes(&b)))
             }
             TYPE_ASCII | TYPE_ASCII_INTERNED | TYPE_SHORT_ASCII | TYPE_SHORT_ASCII_INTERNED => {
                 let n = if ty == TYPE_ASCII || ty == TYPE_ASCII_INTERNED {
