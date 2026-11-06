@@ -1888,8 +1888,21 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                                 0 => type_ref(exc::AssertionError()),
                                 1 => type_ref(exc::NotImplementedError()),
                                 2 => type_ref(tuple::tuple_type()),
-                                3 => crate::builtins::builtin("all")?,
-                                4 => crate::builtins::builtin("any")?,
+                                3 | 4 => {
+                                    // the original builtins.all / builtins.any (identity is what the
+                                    // `all(genexpr)` fast path tests), captured on first use
+                                    static ORIG: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+                                    let (a, b) = *ORIG.get_or_init(|| {
+                                        let a = crate::builtins::builtin("all").map(|v| v.into_raw() as usize).unwrap_or(0);
+                                        let b = crate::builtins::builtin("any").map(|v| v.into_raw() as usize).unwrap_or(0);
+                                        (a, b)
+                                    });
+                                    let p = if arg == 3 { a } else { b };
+                                    if p == 0 {
+                                        raise!(SystemError, "builtins.all/any unavailable");
+                                    }
+                                    unsafe { PyRef::from_borrowed(p as *mut PyObject) }
+                                }
                                 5 => type_ref(list::list_type()),
                                 _ => type_ref(crate::types::set::set_type()),
                             };
