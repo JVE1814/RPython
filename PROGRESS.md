@@ -43,6 +43,20 @@ D2 extraction — revisit D2 for test_idle.
   warnings.warn, sys.excepthook (harness), enum (functional).
 
 ## C ABI / wheels
+**numpy 2.5.4 cp315t, full own test suite (numpy2, same wheels/pytest/hypothesis on ours and on py-ft):**
+| package | ours | CPython ft | failures only on ours |
+|---|---|---|---|
+| numpy (full) | 50,575 passed, 3 failed, 41 errors | 50,574 passed, 5 failed, 41 errors | **0** |
+| numpy test_multithreading | 34/34 | 34/34 | 0 |
+| bitarray 3.12.3 | 740 passed | 740 passed | 0 |
+| regex | 101 passed, 1 failed | same | 0 |
+| markupsafe 3.0.4 | 79 passed | 79 passed | 0 |
+| msgpack 1.2.4 | 160 passed | 160 passed | 0 |
+| msgspec 0.22.0 | 6,541 passed, 1 failed | 6,542 passed | 1 |
+| pandas 3.1.0 | crashes (use-after-free, stability2 investigating) | 182,561 passed | — |
+numpy suite wall time: ours 7m30s vs CPython ft 10m12s. pip installs from PyPI over the network (ssl) and builds sdists.
+
+### Earlier
 pip (bundled 26.2.2 via ensurepip) installs the unmodified numpy-2.5.4-cp315-cp315t-manylinux wheel in a venv on
 our interpreter; `import numpy` works (array math, linalg, fft, datetime64); numpy test_abc 5/5, test_api 59/59.
 Blockers being fixed (numpy workstream): Cython code objects (numpy.random), C-created frame f_locals.
