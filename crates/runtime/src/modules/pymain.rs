@@ -434,6 +434,10 @@ fn repl(quiet: bool) -> i32 {
             let _ = dict::set_item_str(&sd, "ps2", &pystr::new_str("... "));
         }
     }
+    // __main__ must exist before the hook runs (rlcompleter imports it)
+    if main_module().is_err() {
+        clear_exc();
+    }
     run_startup_file();
     run_interactive_hook();
     let use_readline = tty && unsafe { libc::isatty(1) } != 0;
