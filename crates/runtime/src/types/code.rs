@@ -388,6 +388,63 @@ pub fn new_code_from_unit(cu: &CodeUnit, filename: Option<&PyRef>) -> PyResult {
     new_code_from_parts(parts)
 }
 
+/// Constant tuples made only of simple immutable constants are shared between all code
+/// objects (like CPython's interned constants): key = a type-tagged rendering.
+static CONST_TUPLES: std::sync::Mutex<std::collections::HashMap<String, PyRef>> =
+    std::sync::Mutex::new(std::collections::HashMap::new());
+
+fn const_key(c: &rpy_compiler::wordcode::Constant) -> Option<String> {
+    use rpy_compiler::wordcode::Constant as C;
+    use std::fmt::Write;
+    fn go(c: &C, out: &mut String, depth: usize) -> bool {
+        if depth > 8 || out.len() > 4096 {
+            return false;
+        }
+        match c {
+            C::None => out.push('N'),
+            C::Ellipsis => out.push('E'),
+            C::Bool(b) => out.push(if *b { 'T' } else { 'F' }),
+            C::Int(i) => {
+                let _ = write!(out, "i{};", i);
+            }
+            C::BigInt { neg, decimal } => {
+                let _ = write!(out, "I{}{};", if *neg { "-" } else { "" }, decimal);
+            }
+            C::Float(f) => {
+                let _ = write!(out, "f{:x};", f.to_bits());
+            }
+            C::Complex { real, imag } => {
+                let _ = write!(out, "c{:x},{:x};", real.to_bits(), imag.to_bits());
+            }
+            C::Str(cps) => {
+                let _ = write!(out, "s{}:", cps.len());
+                for cp in cps {
+                    let _ = write!(out, "{:x},", cp);
+                }
+            }
+            C::Bytes(b) => {
+                let _ = write!(out, "b{}:", b.len());
+                for x in b {
+                    let _ = write!(out, "{:02x}", x);
+                }
+            }
+            C::Tuple(items) => {
+                let _ = write!(out, "({}:", items.len());
+                for it in items {
+                    if !go(it, out, depth + 1) {
+                        return false;
+                    }
+                }
+                out.push(')');
+            }
+            _ => return false,
+        }
+        true
+    }
+    let mut s = String::new();
+    if go(c, &mut s, 0) { Some(s) } else { None }
+}
+
 /// Convert a public-form compiler constant into an object.
 pub fn wconst_to_obj(c: &rpy_compiler::wordcode::Constant, filename: &PyRef) -> PyResult {
     use rpy_compiler::wordcode::Constant as C;
@@ -402,11 +459,21 @@ pub fn wconst_to_obj(c: &rpy_compiler::wordcode::Constant, filename: &PyRef) -> 
         C::Str(cps) => pystr::intern(pystr::from_codepoints(cps)),
         C::Bytes(b) => bytes::bytes_singleton(b).unwrap_or_else(|| bytes::new_bytes(b)),
         C::Tuple(items) => {
+            let key = const_key(c);
+            if let Some(k) = &key {
+                if let Some(t) = CONST_TUPLES.lock().unwrap().get(k) {
+                    return Ok(t.clone());
+                }
+            }
             let mut v = Vec::with_capacity(items.len());
             for it in items {
                 v.push(wconst_to_obj(it, filename)?);
             }
-            tuple::new_tuple(v)
+            let t = tuple::new_tuple(v);
+            if let Some(k) = key {
+                return Ok(CONST_TUPLES.lock().unwrap().entry(k).or_insert(t).clone());
+            }
+            t
         }
         C::FrozenSet(items) => {
             let mut v = Vec::with_capacity(items.len());
