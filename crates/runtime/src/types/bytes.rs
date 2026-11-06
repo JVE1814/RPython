@@ -55,7 +55,49 @@ pub fn alloc_bytes(n: usize) -> PyRef {
         }
     }
 }
+/// The shared (immortal) empty bytes object: every empty bytes result is this one.
+pub fn empty_bytes() -> PyRef {
+    static EMPTY: std::sync::atomic::AtomicPtr<PyObject> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
+    let p = EMPTY.load(Acquire);
+    if !p.is_null() {
+        return unsafe { PyRef::from_borrowed(p) };
+    }
+    let r = alloc_bytes(0);
+    let op = r.into_raw();
+    unsafe {
+        crate::object::make_immortal(op);
+        match EMPTY.compare_exchange(std::ptr::null_mut(), op, AcqRel, Acquire) {
+            Ok(_) => PyRef::from_raw(op),
+            // another thread won the race; the loser stays allocated (immortal)
+            Err(o) => PyRef::from_borrowed(o),
+        }
+    }
+}
+/// The shared (immortal) one-byte bytes object for `c`.
+pub fn single_byte(c: u8) -> PyRef {
+    static CACHE: [std::sync::atomic::AtomicPtr<PyObject>; 256] = [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; 256];
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
+    let slot = &CACHE[c as usize];
+    let p = slot.load(Acquire);
+    if !p.is_null() {
+        return unsafe { PyRef::from_borrowed(p) };
+    }
+    let r = alloc_bytes(1);
+    unsafe {
+        *bytes_ptr(&r) = c;
+        let op = r.into_raw();
+        crate::object::make_immortal(op);
+        match slot.compare_exchange(std::ptr::null_mut(), op, AcqRel, Acquire) {
+            Ok(_) => PyRef::from_raw(op),
+            Err(o) => PyRef::from_borrowed(o),
+        }
+    }
+}
 pub fn new_bytes(b: &[u8]) -> PyRef {
+    if b.len() <= 1 {
+        return if b.is_empty() { empty_bytes() } else { single_byte(b[0]) };
+    }
     let r = alloc_bytes(b.len());
     unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), bytes_ptr(&r), b.len()) };
     r
@@ -84,6 +126,9 @@ pub fn bytes_singleton(b: &[u8]) -> Option<PyRef> {
     }
 }
 pub fn try_new_bytes(b: &[u8]) -> PyResult<PyRef> {
+    if b.len() <= 1 {
+        return Ok(if b.is_empty() { empty_bytes() } else { single_byte(b[0]) });
+    }
     let r = try_alloc_bytes(b.len())?;
     unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), bytes_ptr(&r), b.len()) };
     Ok(r)

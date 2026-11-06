@@ -42,6 +42,16 @@ fn get_recursion_depth(_m: &PyObject) -> PyResult {
     Ok(int::new_int(crate::threads::current().recursion_depth.get() as i64))
 }
 
+/// Name of the memory allocator family in use (not pymalloc: plain malloc for
+/// large blocks, our own small-object allocator otherwise).
+fn pymem_getallocatorsname(_m: &PyObject) -> PyResult {
+    Ok(crate::types::str::new_str("malloc"))
+}
+
+fn get_long_lived_total(_m: &PyObject) -> PyResult {
+    Ok(int::new_int(crate::gc_support::LONG_LIVED_TOTAL.load(std::sync::atomic::Ordering::Relaxed) as i64))
+}
+
 /// Estimate of how many more interpreter-loop recursions fit on the native stack.
 fn get_c_recursion_remaining(_m: &PyObject) -> PyResult {
     let ts = crate::threads::current();
@@ -214,6 +224,8 @@ pub fn init() -> PyResult {
             ("pending_threadfunc", FASTKW, pending_threadfunc),
             ("has_split_table", O, has_split_table),
             ("get_recursion_depth", NOARGS, get_recursion_depth),
+            ("get_long_lived_total", NOARGS, get_long_lived_total),
+            ("pymem_getallocatorsname", NOARGS, pymem_getallocatorsname),
             ("get_c_recursion_remaining", NOARGS, get_c_recursion_remaining),
             ("get_stack_pointer", NOARGS, get_stack_pointer),
             ("get_stack_margin", NOARGS, get_stack_margin),

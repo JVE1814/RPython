@@ -11,6 +11,7 @@ pub mod _ast;
 pub mod _opcode;
 pub mod _symtable;
 pub mod sys_full;
+pub mod sys_finalize;
 pub mod sys_trace;
 pub mod traceback_print;
 pub mod ast_bridge;

@@ -663,18 +663,12 @@ pub unsafe extern "C" fn h_container_op(sp: *mut *mut PyObject, which: u64, arg:
                 5 => {
                     let o = take(sp.sub(1));
                     let d = *sp.sub(1 + arg);
-                    if crate::types::dict_methods::dict_update_from(&*d, &o).is_err() {
-                        if exc_matches(crate::types::exceptions::AttributeError()) {
-                            clear_exc();
-                            let _ = err!(TypeError, "'{}' object is not a mapping", tname(&o));
-                        }
-                        return Err(ERR);
-                    }
+                    st(crate::types::dict_methods::dict_update_display(&*d, &o))?;
                 }
                 _ => {
                     let o = take(sp.sub(1));
                     let d = *sp.sub(1 + arg);
-                    let func = *sp.sub(1 + arg + 2);
+                    let func = *sp.sub(1 + arg + 3); // callable, self-or-NULL, args, dict
                     st(crate::types::dict_methods::dict_merge_kwargs(&*d, &o, func))?;
                 }
             }
@@ -905,6 +899,9 @@ pub unsafe extern "C" fn h_call_ex(sp: *mut *mut PyObject) -> u64 {
                 Some(k) => Some(k.clone()),
                 None => None,
             };
+            if let Some(d) = &kwd {
+                st(eval::check_kwargs_keys(d))?;
+            }
             let r = st(ab::call_with_kwargs_dict(&callable, &v, kwd.as_deref()))?;
             put(sp.sub(4), r);
             Ok(OK)

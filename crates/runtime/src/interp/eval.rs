@@ -620,7 +620,16 @@ pub(super) fn call_intrinsic2(f: &mut Frame, which: u32, a: PyRef, b: PyRef) -> 
     let which: Intrinsic2 = unsafe { std::mem::transmute(which as u8) };
     let _ = f;
     match which {
-        Intrinsic2::PrepReraiseStar => crate::types::exceptiongroup::prep_reraise_star(&a, &b),
+        Intrinsic2::PrepReraiseStar => {
+            let r = crate::types::exceptiongroup::prep_reraise_star(&a, &b)?;
+            // a group made here (the wrapper of a naked exception, or a new
+            // combination) has not been raised yet: its traceback starts at
+            // this frame's except* statement
+            if exc::is_exception_instance(&r) && exc::exc_traceback(&r).is_none() {
+                add_traceback(f, &r);
+            }
+            Ok(r)
+        }
         Intrinsic2::TypeVarWithBound => crate::types::typevar::make_typevar(&a, Some(&b), None, false),
         Intrinsic2::TypeVarWithConstraints => crate::types::typevar::make_typevar(&a, None, Some(&b), false),
         Intrinsic2::SetFunctionTypeParams => {
@@ -862,6 +871,10 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             let n = arg as usize;
                             let func = f.func;
                             if func.is_null() {
+                                // exec(code, closure=...) placed the cells already
+                                if (f.nlocalsplus - n..f.nlocalsplus).all(|i| !f.slots[i].is_null()) {
+                                    continue;
+                                }
                                 return Err(system_error("CopyFreeVars without function"));
                             }
                             let clos = funcobject::func(unsafe { &*func }).func_closure;
@@ -1270,18 +1283,13 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                         Op::DictUpdate => {
                             let o = popref!(f);
                             let d = peek!(f, arg as usize);
-                            if let Err(e) = crate::types::dict_methods::dict_update_from(unsafe { &*d }, &o) {
-                                if exc_matches(exc::AttributeError()) {
-                                    clear_exc();
-                                    raise!(TypeError, "'{}' object is not a mapping", tname(&o));
-                                }
-                                return Err(e);
-                            }
+                            crate::types::dict_methods::dict_update_display(unsafe { &*d }, &o)?;
                         }
                         Op::DictMerge => {
                             let o = popref!(f);
                             let d = peek!(f, arg as usize);
-                            let func = peek!(f, arg as usize + 2);
+                            // stack: callable, self-or-NULL, positional args, ..., the dict
+                            let func = peek!(f, arg as usize + 3);
                             crate::types::dict_methods::dict_merge_kwargs(unsafe { &*d }, &o, func)?;
                         }
                         Op::UnpackSequence => {
@@ -1586,6 +1594,9 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                                 Some(k) => Some(k.clone()),
                                 None => None,
                             };
+                            if let Some(d) = &kwd {
+                                check_kwargs_keys(d)?;
+                            }
                             let call_info = if crate::modules::sys::tracing_active() {
                                 crate::modules::sys_trace::before_call(ts, f, &callable, self_or_null.as_deref(), v.first().copied(), false)?
                             } else {
@@ -2045,6 +2056,17 @@ impl ReraiseMarker {
 pub(super) fn is_sequence_like(o: &PyObject) -> bool {
     let sq = o.ty().tp_as_sequence;
     !sq.is_null() && unsafe { (*sq).sq_item.is_some() }
+}
+
+/// `f(**mapping)`: keyword names must be strings (duplicates are reported
+/// before this, when the mappings are merged).
+pub(crate) fn check_kwargs_keys(d: &PyObject) -> PyResult<()> {
+    for k in dict::keys_vec(d) {
+        if !pystr::is_str(&k) {
+            raise!(TypeError, "keywords must be strings");
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn func_desc(o: &PyObject) -> String {

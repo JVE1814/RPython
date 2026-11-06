@@ -64,6 +64,17 @@ pub fn new_frame_object(f: &mut Frame) -> *mut PyObject {
 }
 
 /// Transfer ownership of a finished frame to its frame object.
+/// Remember the caller's frame object as f_back of a frame object whose
+/// activation is finishing.
+pub unsafe fn set_back(fobj: *mut PyObject, back: *mut PyObject) {
+    unsafe {
+        let f = &mut *(fobj as *mut PyFrameObject);
+        incref(back);
+        let old = std::mem::replace(&mut f._f_back, back);
+        xdecref(old);
+    }
+}
+
 pub unsafe fn take_ownership(fobj: *mut PyObject, frame: Box<Frame>) {
     unsafe {
         let f = &mut *(fobj as *mut PyFrameObject);
@@ -90,6 +101,7 @@ unsafe extern "C" fn frame_dealloc(op: *mut PyObject) {
             (*f.frame).frame_obj = std::ptr::null_mut();
         }
         xdecref(f.locals_snapshot);
+        xdecref(std::mem::replace(&mut f._f_back, std::ptr::null_mut()));
         crate::alloc::free_object(op);
     }
 }
@@ -97,11 +109,17 @@ unsafe extern "C" fn frame_dealloc(op: *mut PyObject) {
 unsafe extern "C" fn frame_traverse(op: *mut PyObject, visit: visitproc, arg: *mut c_void) -> c_int {
     unsafe {
         let f = &*(op as *mut PyFrameObject);
+        let v = visit.unwrap();
+        if !f._f_back.is_null() {
+            let r = v(f._f_back, arg);
+            if r != 0 {
+                return r;
+            }
+        }
         if f.owned.is_null() {
             return 0;
         }
         let fr = &*f.owned;
-        let v = visit.unwrap();
         for i in 0..fr.stack_top {
             let p = fr.slots[i];
             if !p.is_null() {
@@ -135,6 +153,7 @@ unsafe extern "C" fn frame_clear_slot(op: *mut PyObject) -> c_int {
         if !f.owned.is_null() {
             (*f.owned).clear_locals();
         }
+        xdecref(std::mem::replace(&mut f._f_back, std::ptr::null_mut()));
         0
     }
 }
@@ -194,7 +213,11 @@ fn f_lasti(o: &PyObject) -> PyResult {
 fn f_back(o: &PyObject) -> PyResult {
     let f = need(o)?;
     if f.prev.is_null() {
-        // a suspended/finished frame has no back frame; a running one might be the top
+        // a finished frame remembers its caller; a suspended one has none
+        let fo = unsafe { &*(o.as_ptr() as *const PyFrameObject) };
+        if !fo._f_back.is_null() && f.state == crate::interp::frame::FrameState::Completed {
+            return Ok(unsafe { PyRef::from_borrowed(fo._f_back) });
+        }
         return Ok(none::none_ref());
     }
     let p = crate::interp::eval::frame_object(unsafe { &mut *f.prev });

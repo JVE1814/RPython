@@ -155,7 +155,12 @@ pub fn init_stdio() {
 fn create_stdio(fd: i32, write: bool, name: &str, errors: &str, unbuffered: bool, force_line: bool) -> PyResult<PyRef> {
     // PYTHONIOENCODING=encoding[:errors] (errors do not apply to stderr)
     let (enc, errs) = io_encoding();
-    let errors: &str = if fd != 2 { errs.as_deref().unwrap_or(errors) } else { errors };
+    // an explicitly chosen encoding without an error handler is strict
+    let errors: &str = if fd != 2 {
+        errs.as_deref().unwrap_or(if enc.is_some() { "strict" } else { errors })
+    } else {
+        errors
+    };
     use crate::abstract_ as ab;
     use crate::types::bool_;
     // closed / invalid descriptor -> None

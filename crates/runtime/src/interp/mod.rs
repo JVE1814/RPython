@@ -73,6 +73,19 @@ pub fn current_globals() -> Option<PyRef> {
     unsafe { Some(PyRef::from_borrowed((*f).globals)) }
 }
 
+/// builtins mapping of the currently executing frame, else the builtins dict
+/// (PyEval_GetBuiltins).
+pub fn current_builtins() -> PyRef {
+    let f = crate::threads::current().frame.get();
+    if !f.is_null() {
+        let b = unsafe { (*f).builtins };
+        if !b.is_null() {
+            return unsafe { PyRef::from_borrowed(b) };
+        }
+    }
+    crate::builtins::builtins_dict()
+}
+
 pub fn current_frame_ptr() -> *mut Frame {
     crate::threads::current().frame.get()
 }
@@ -102,6 +115,11 @@ pub fn call_function(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwna
     let flags = code::code(co).flags();
     // plain calls borrow code/func from the caller (perf-runtime, frame.rs `owns_fc`)
     let mut frame = Frame::new_call(co, func, unsafe { &*f.func_globals }, unsafe { &*f.func_builtins });
+    if flags & bc::co::OPTIMIZED == 0 && frame.locals.is_null() {
+        // a function made from module-level code (FunctionType(compile(...)))
+        // stores its names into its globals
+        frame.locals = unsafe { (*f.func_globals).to_ref().into_raw() };
+    }
     if let Err(e) = bind_arguments(func, &mut frame, args, nargs, kwnames) {
         frame::recycle(frame);
         return Err(e);
@@ -165,6 +183,12 @@ pub fn frame_finished(mut frame: Box<Frame>) {
     frame.state = frame::FrameState::Completed;
     frame.clear_stack();
     if !frame.frame_obj.is_null() {
+        // the frame object outlives the activation: it keeps its caller as f_back
+        let caller = crate::threads::current().frame.get();
+        if !caller.is_null() && !std::ptr::eq(caller, &*frame) {
+            let back = eval::frame_object(unsafe { &mut *caller });
+            unsafe { crate::types::frameobject::set_back(frame.frame_obj, back) };
+        }
         frame.make_owned();
         unsafe { crate::types::frameobject::take_ownership(frame.frame_obj, frame) };
     } else {
@@ -407,9 +431,9 @@ pub fn eval_code(code: &PyObject, globals: &PyObject, locals: Option<&PyObject>)
             }
         }
         None => {
-            let b = crate::builtins::builtins_module();
+            let b = current_builtins();
             dict::set_item(globals, crate::name!("__builtins__"), &b)?;
-            crate::builtins::builtins_dict()
+            b
         }
     };
     let frame = Frame::new(code, None, globals, &builtins, locals);

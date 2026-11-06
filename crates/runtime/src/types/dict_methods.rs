@@ -110,34 +110,30 @@ pub fn dict_merge_kwargs(d: &PyObject, o: &PyObject, func: *mut PyObject) -> PyR
         if func.is_null() {
             return "function".into();
         }
-        let f = unsafe { &*func };
-        match ab::getattr_opt(f, crate::name!("__qualname__")) {
-            Ok(Some(q)) if pystr::is_str(&q) => format!("{}()", pystr::to_string_lossy(&q)),
-            _ => {
-                clear_exc();
-                format!("{} object", tname(f))
-            }
-        }
+        function_str(unsafe { &*func })
     };
-    // A plain dict source carries its keys' hashes: reuse them so that a
-    // key's __hash__ is not re-run while merging (grind-lib).
+    // A plain dict source carries its keys' hashes: reuse them so that a key's
+    // __hash__ is not re-run while merging (grind-lib). Keys need not be strings here:
+    // a callable taking **kwargs as a mapping accepts any (binding rejects them later).
     if is_plain_iter_dict(o) {
         for (k, v, h) in dict::items_hash_vec(o) {
-            if !pystr::is_str(&k) {
-                raise!(TypeError, "keywords must be strings");
-            }
             if dict::contains_hash(d, &k, h)? {
-                raise!(TypeError, "{} got multiple values for keyword argument '{}'", fname(), pystr::to_string_lossy(&k));
+                let ks = ab::str_string(&k).unwrap_or_default();
+                raise!(TypeError, "{} got multiple values for keyword argument '{}'", fname(), ks);
             }
             dict::set_item_hash(d, &k, h, &v)?;
         }
         return Ok(());
     }
     let pairs: Vec<(PyRef, PyRef)> = {
-        let keys = match ab::getattr_opt(o, crate::name!("keys"))? {
-            Some(k) => ab::call(&k, &[])?,
+        let keys_fn = match ab::getattr_opt(o, crate::name!("keys"))? {
+            Some(k) => k,
             None => raise!(TypeError, "Value after ** must be a mapping, not {}", tname(o)),
         };
+        let keys = ab::call(&keys_fn, &[])?;
+        if keys.ty().tp_iter.is_none() && !crate::types::list::is_list(&keys) && !crate::types::tuple::is_tuple(&keys) && ab::getattr_opt(&keys, crate::name!("__getitem__"))?.is_none() {
+            raise!(TypeError, "{} must return an iterable, not {}", function_str(&keys_fn), tname(&keys));
+        }
         let mut v = Vec::new();
         for k in ab::collect_iterable(&keys)? {
             let val = ab::getitem(o, &k)?;
@@ -145,17 +141,72 @@ pub fn dict_merge_kwargs(d: &PyObject, o: &PyObject, func: *mut PyObject) -> PyR
         }
         v
     };
+    // (keys need not be strings here: a callable taking **kwargs as a mapping
+    // accepts any; binding to parameters rejects them later)
     for (k, v) in pairs {
-        if !pystr::is_str(&k) {
-            raise!(TypeError, "keywords must be strings");
-        }
         let h = dict::hash_of(&k)?;
         if dict::contains_hash(d, &k, h)? {
-            raise!(TypeError, "{} got multiple values for keyword argument '{}'", fname(), pystr::to_string_lossy(&k));
+            let ks = ab::str_string(&k).unwrap_or_default();
+            raise!(TypeError, "{} got multiple values for keyword argument '{}'", fname(), ks);
         }
         dict::set_item_hash(d, &k, h, &v)?;
     }
     Ok(())
+}
+
+/// `{**o}` in a dict display: a mapping is anything with keys() and __getitem__;
+/// errors raised by those propagate unchanged.
+pub fn dict_update_display(d: &PyObject, o: &PyObject) -> PyResult<()> {
+    if is_plain_iter_dict(o) {
+        for (k, v) in dict::items_vec(o) {
+            dict::set_item(d, &k, &v)?;
+        }
+        return Ok(());
+    }
+    let keys_fn = match ab::getattr_opt(o, crate::name!("keys"))? {
+        Some(k) => k,
+        None => raise!(TypeError, "'{}' object is not a mapping", tname(o)),
+    };
+    let keys = ab::call(&keys_fn, &[])?;
+    let it = match ab::get_iter(&keys) {
+        Ok(it) => it,
+        Err(e) => {
+            if exc_matches(crate::types::exceptions::TypeError()) {
+                clear_exc();
+                raise!(TypeError, "{} must return an iterable, not {}", function_str(&keys_fn), tname(&keys));
+            }
+            return Err(e);
+        }
+    };
+    while let Some(k) = ab::iter_next(&it)? {
+        let v = ab::getitem(o, &k)?;
+        dict::set_item(d, &k, &v)?;
+    }
+    Ok(())
+}
+
+/// How error messages name a callable: `module.qualname()` for functions and
+/// methods (`qualname()` for builtins), else "'type' object".
+pub fn function_str(f: &PyObject) -> String {
+    match ab::getattr_opt(f, crate::name!("__qualname__")) {
+        Ok(Some(q)) if pystr::is_str(&q) => {
+            let module = match ab::getattr_opt(f, crate::name!("__module__")) {
+                Ok(Some(m)) if pystr::is_str(&m) => Some(pystr::to_string_lossy(&m)),
+                _ => {
+                    clear_exc();
+                    None
+                }
+            };
+            match module {
+                Some(m) if m != "builtins" => format!("{}.{}()", m, pystr::to_string_lossy(&q)),
+                _ => format!("{}()", pystr::to_string_lossy(&q)),
+            }
+        }
+        _ => {
+            clear_exc();
+            format!("{} object", tname(f))
+        }
+    }
 }
 
 // ------------------------------------------------------------------ shared helpers (dict + frozendict)

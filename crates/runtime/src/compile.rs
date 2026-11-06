@@ -182,9 +182,18 @@ pub(crate) fn compile_error(e: &rpy_compiler::CompileError, filename: &str, src:
         K::SystemError => return err!(SystemError, "{}", e.msg),
         K::MemoryError => return memory_error(),
     };
-    let text = src.and_then(|s| source_line(s, e.lineno));
+    // errors found after parsing (symtable, code generation) take their text from
+    // the file, as CPython does: none for compile()d strings
+    let text = crate::modules::sys_full::source_line(filename, e.lineno).map(|t| {
+        if e.lineno == 1 { t.trim_start_matches('\u{feff}').to_string() } else { t }
+    });
+    let have_text = text.is_some();
     let to_offset = |line: i32, col: i32| -> i32 {
-        // convert byte column to 1-based char offset
+        // byte column -> 1-based character offset; without the text to convert
+        // with, the offset stays in bytes (as CPython reports it)
+        if !have_text {
+            return col + 1;
+        }
         match src.and_then(|s| source_line(s, line)) {
             Some(l) => {
                 let b = (col.max(0) as usize).min(l.len());

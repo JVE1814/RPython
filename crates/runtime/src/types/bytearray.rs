@@ -139,6 +139,16 @@ unsafe fn set_storage(o: &PyObject, storage: Option<PyRef>, start: usize, size: 
                 b.ob_base.ob_size = 0;
             }
             Some(s) => {
+                // the shared empty / one-byte bytes objects must never become
+                // (mutable) bytearray storage
+                let s = if s.is_immortal() {
+                    let n = bytes::bytes_len(&s);
+                    let f = bytes::alloc_bytes(n);
+                    std::ptr::copy_nonoverlapping(bytes::bytes_ptr(&s), bytes::bytes_ptr(&f), n);
+                    f
+                } else {
+                    s
+                };
                 b.ob_alloc = var_size(&s);
                 b.ob_bytes = bytes::bytes_ptr(&s);
                 b.ob_start = b.ob_bytes.add(start);

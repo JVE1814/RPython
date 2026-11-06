@@ -121,7 +121,19 @@ fn run_handlers() -> PyResult<()> {
             continue;
         }
         let fr = frame();
-        if ab::call(&h, &[&int::new_int(sig as i64), &fr]).is_err() {
+        // Handlers run between two instructions of whatever frame is current,
+        // possibly one right at the recursion limit: give the call some headroom
+        // so that the signal is not consumed by a RecursionError instead.
+        let ts = crate::threads::current();
+        let headroom = !ts.recursion_headroom_active();
+        if headroom {
+            ts.set_recursion_headroom(true);
+        }
+        let r = ab::call(&h, &[&int::new_int(sig as i64), &fr]);
+        if headroom {
+            ts.set_recursion_headroom(false);
+        }
+        if r.is_err() {
             IS_TRIPPED.store(true, Release);
             if let Some(m) = crate::threads::main_thread_state() {
                 m.c.eval_breaker.fetch_or(crate::threads::EVAL_SIGNALS, Release);

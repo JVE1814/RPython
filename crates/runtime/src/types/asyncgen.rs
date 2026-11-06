@@ -686,7 +686,74 @@ pub fn init_types() -> PyResult<()> {
     Ok(())
 }
 /// anext(it, default): awaitable that returns `default` on StopAsyncIteration (pending full impl).
+/// anext(it, default): an awaitable that delegates to `aw` and turns its
+/// StopAsyncIteration into the default value (send/throw/close go through).
 pub fn anext_with_default(aw: crate::object::PyRef, default: crate::object::PyRef) -> crate::errors::PyResult {
-    let _ = default;
-    Ok(aw)
+    static CLS: std::sync::atomic::AtomicPtr<crate::ffi::PyObject> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+    const SRC: &str = "\
+class anext_awaitable:
+    __slots__ = ('_aw', '_default', '_it')
+    def __init__(self, aw, default):
+        self._aw = aw
+        self._default = default
+        self._it = None
+    def _inner(self):
+        it = self._it
+        if it is None:
+            aw = self._aw
+            t = type(aw)
+            code = getattr(aw, 'gi_code', None)
+            if code is not None and code.co_flags & 0x100:
+                it = aw  # generator-based coroutine (types.coroutine)
+            elif hasattr(t, '__await__'):
+                it = t.__await__(aw)
+                if not hasattr(type(it), '__next__') or hasattr(type(it), 'cr_code'):
+                    kind = 'coroutine' if hasattr(type(it), 'cr_code') else type(it).__name__
+                    raise TypeError(f'__await__() must return an iterator, not {kind}')
+            else:
+                raise TypeError(f\"'{t.__name__}' object can't be awaited\")
+            self._it = it
+        return it
+    def _step(self, f, *args):
+        try:
+            return f(*args)
+        except StopAsyncIteration:
+            raise StopIteration(self._default) from None
+    def __await__(self):
+        return self
+    def __iter__(self):
+        return self
+    def __next__(self):
+        it = self._inner()
+        return self._step(type(it).__next__, it)
+    def send(self, value):
+        it = self._inner()
+        if value is None and not hasattr(it, 'send'):
+            return self._step(type(it).__next__, it)
+        return self._step(it.send, value)
+    def throw(self, *args):
+        return self._step(self._inner().throw, *args)
+    def close(self):
+        close = getattr(self._inner(), 'close', None)
+        if close is not None:
+            close()
+";
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
+    let mut cls = CLS.load(Acquire);
+    if cls.is_null() {
+        let d = crate::types::dict::new_dict();
+        crate::types::dict::set_item_str(&d, "__name__", &crate::types::str::new_str("builtins"))?;
+        let code = crate::compile::compile_str(SRC, "<anext>", crate::compile::Mode::Exec, 0, -1)?;
+        crate::interp::eval_code(&code.code, &d, Some(&d))?;
+        let c = crate::types::dict::get_item_rs(&d, "anext_awaitable").expect("anext_awaitable defined");
+        let raw = c.into_raw();
+        match CLS.compare_exchange(std::ptr::null_mut(), raw, AcqRel, Acquire) {
+            Ok(_) => cls = raw,
+            Err(o) => {
+                unsafe { crate::object::decref(raw) };
+                cls = o;
+            }
+        }
+    }
+    crate::abstract_::call(unsafe { &*cls }, &[&aw, &default])
 }
