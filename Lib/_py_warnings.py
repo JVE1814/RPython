@@ -69,6 +69,8 @@ class _Context:
         context = _Context(self._filters[:])
         if self.log is not None:
             context.log = self.log
+            context._showwarning_at_record = getattr(
+                self, '_showwarning_at_record', None)
         return context
 
     def _record_warning(self, msg):
@@ -253,9 +255,13 @@ _showwarning_orig = showwarning
 
 def _showwarnmsg(msg):
     """Hook to write a warning to a file; replace if you like."""
-    # recording (catch_warnings(record=True)) wins over a replaced
-    # showwarning()
-    if _wm._get_context().log is not None:
+    # recording (catch_warnings(record=True)) wins over a showwarning()
+    # replacement made before the recording started; one installed while
+    # recording (numpy's suppress_warnings does that) is called instead
+    context = _wm._get_context()
+    if (context.log is not None
+            and getattr(context, '_showwarning_at_record', None)
+                is getattr(_wm, 'showwarning', None)):
         _wm._showwarnmsg_impl(msg)
         return
     try:
@@ -729,6 +735,8 @@ class catch_warnings(object):
             if self._record:
                 if _use_context:
                     context.log = log = []
+                    context._showwarning_at_record = getattr(
+                        self._module, 'showwarning', None)
                 else:
                     log = []
                     self._module._showwarnmsg_impl = log.append
