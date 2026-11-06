@@ -1344,6 +1344,16 @@ fn peephole_block(cfg: &mut Cfg, b: Label, consts: &mut Vec<Constant>) -> bool {
                     changed = true;
                 }
             }
+            O::STORE_FAST => {
+                // a store immediately overwritten by another store to the same local
+                if let Some(nx) = next {
+                    if instrs[nx].op == O::STORE_FAST && instrs[nx].arg == ins.arg && instrs[nx].loc.line == ins.loc.line {
+                        instrs[k].op = O::POP_TOP;
+                        instrs[k].arg = 0;
+                        changed = true;
+                    }
+                }
+            }
             _ => {}
         }
         k += 1;
@@ -1623,6 +1633,11 @@ fn optimize_load_fast(cfg: &mut Cfg) {
                     stack.push(v);
                     stack.push(None);
                 }
+                O::LOAD_SPECIAL => {
+                    let v = stack.pop().flatten();
+                    stack.push(None);
+                    stack.push(v);
+                }
                 O::LOAD_ATTR if i.arg & 1 != 0 => {
                     let v = stack.pop().flatten();
                     stack.push(None);
@@ -1703,9 +1718,8 @@ fn push_cold_blocks_to_end(cfg: &mut Cfg) {
         }
         let Some(&n) = order.get(k + 1) else { continue };
         if warm[b as usize] != warm[n as usize] {
-            let loc = NO_POS;
-            let handler = cfg.blocks[b as usize].instrs.last().map(|i| i.handler).unwrap_or(NO_LABEL);
-            cfg.blocks[b as usize].instrs.push(Instr { op: O::JUMP_NO_INTERRUPT, arg: 0, target: n, loc, handler });
+            // (the added jump is not covered by any handler)
+            cfg.blocks[b as usize].instrs.push(Instr { op: O::JUMP_NO_INTERRUPT, arg: 0, target: n, loc: NO_POS, handler: NO_LABEL });
         }
     }
     let _ = pos;

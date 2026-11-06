@@ -307,7 +307,7 @@ pub fn stack_effect(code: u16, oparg: i32, jump: Option<bool>) -> Option<i32> {
         CLEANUP_THROW => -1,
         DELETE_SUBSCR => -2,
         END_FOR => -1,
-        END_SEND => -1,
+        END_SEND => -2,
         EXIT_INIT_CHECK => -1,
         FORMAT_SIMPLE => 0,
         FORMAT_WITH_SPEC => -1,
