@@ -1444,6 +1444,16 @@ unsafe extern "C" fn code_new(_tp: *mut PyTypeObject, args: *mut PyObject, kw: *
     }
 }
 
+/// Name of localsplus slot `oparg` (used by dis).
+fn code_varname_from_oparg(o: &PyObject, i: &PyObject) -> PyResult {
+    let names = unsafe { PyRef::from_borrowed(get(o).co_localsplusnames) };
+    let k = crate::abstract_::as_i64(i)?;
+    if k < 0 || k as usize >= tuple::tuple_len(&names) {
+        raise!(IndexError, "tuple index out of range");
+    }
+    Ok(tuple::tuple_to_vec(&names)[k as usize].clone())
+}
+
 fn code_sizeof(o: &PyObject) -> PyResult {
     let m = code_meta(o);
     Ok(int::new_int((std::mem::size_of::<PyCodeObject>() + bytes::bytes_data(&m.co_code).len()) as i64))

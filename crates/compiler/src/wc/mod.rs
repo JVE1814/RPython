@@ -541,6 +541,17 @@ impl<'a> Compiler<'a> {
             u.cellkinds.push(fast::CELL);
             u.cell_arg.push(arg);
         }
+        // module code keeps `__conditional_annotations__` in a cell as well (it is only
+        // accessed by name, but CPython 3.15 code objects list it in co_cellvars)
+        if kind == UnitKind::Module && sc.has_conditional_annotations && self.future & cf::CO_FUTURE_ANNOTATIONS == 0 {
+            let n = "__conditional_annotations__".to_string();
+            if !u.cell_map.contains_key(&n) {
+                u.cell_map.insert(n.clone(), u.cellvars.len() as u32);
+                u.cellvars.push(n);
+                u.cellkinds.push(fast::CELL);
+                u.cell_arg.push(None);
+            }
+        }
         for (i, fname) in self.st.freevars(scope).into_iter().enumerate() {
             u.free_map.insert(fname.clone(), i as u32);
             u.freevars.push(fname);

@@ -528,17 +528,6 @@ impl<'a> Compiler<'a> {
                 self.use_label(end);
                 return Ok(());
             }
-            ExprKind::Constant { value, .. } => {
-                if let Some(t) = const_truth(value) {
-                    self.set_loc(e.loc);
-                    if t == cond {
-                        self.emit_jump(O::JUMP, target);
-                    } else {
-                        self.emit(O::NOP, 0);
-                    }
-                    return Ok(());
-                }
-            }
             ExprKind::Compare { left, ops, comparators } if ops.len() == 1 => {
                 // `x is None` / `x is not None` -> PopJumpIfNone/NotNone
                 let is_none = |x: &Expr| matches!(x.node, ExprKind::Constant { value: ast::Constant::None, .. });
