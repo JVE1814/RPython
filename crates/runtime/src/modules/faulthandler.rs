@@ -202,6 +202,89 @@ pub fn dump_traceback_fd(fd: i32, all_threads: bool, max_threads: usize) {
     }
 }
 
+/// True when `o` is a str whose characters are exactly `b`.
+fn str_is(o: *mut PyObject, b: &[u8]) -> bool {
+    if o.is_null() {
+        return false;
+    }
+    let o = unsafe { &*o };
+    if !crate::types::str::is_str(o) {
+        return false;
+    }
+    let d = crate::types::str::str_data(o);
+    d.len() == b.len() && (0..b.len()).all(|i| d.get(i) == b[i] as u32)
+}
+
+/// Value stored under the str key `name`, scanning the entries directly
+/// (no locking: this runs on the crash path).
+fn dict_find_raw(d: &PyObject, name: &[u8]) -> *mut PyObject {
+    let t = crate::types::dict::table(d);
+    for e in t.entries() {
+        if !e.key.is_null() && str_is(e.key, name) {
+            return e.value;
+        }
+    }
+    std::ptr::null_mut()
+}
+
+/// After a fatal error, list the natively implemented modules that are loaded
+/// and not part of the standard library (they are the usual suspects).
+fn dump_ext_modules(fd: i32) {
+    let modules = crate::modules::sys::modules_dict();
+    if modules.as_ptr().is_null() || !crate::types::dict::is_dict(&modules) {
+        return;
+    }
+    let stdlib = {
+        let sp = crate::modules::sys::sys_module();
+        if sp.as_ptr().is_null() {
+            std::ptr::null_mut()
+        } else {
+            let md = crate::types::module::m(&sp).md_dict;
+            if md.is_null() { std::ptr::null_mut() } else { dict_find_raw(unsafe { &*md }, b"stdlib_module_names") }
+        }
+    };
+    let stdlib_names: Vec<PyRef> = if !stdlib.is_null() && crate::types::set::is_anyset(unsafe { &*stdlib }) {
+        crate::types::set::set_items(unsafe { &*stdlib })
+    } else {
+        Vec::new()
+    };
+    let in_stdlib = |name: &PyObject| -> bool {
+        let d = crate::types::str::str_data(name);
+        // compare the top-level package part only
+        let top = (0..d.len()).find(|&i| d.get(i) == '.' as u32).unwrap_or(d.len());
+        stdlib_names.iter().any(|s| {
+            let sd = crate::types::str::str_data(s);
+            sd.len() == top && (0..top).all(|i| sd.get(i) == d.get(i))
+        })
+    };
+    let mut count = 0usize;
+    for e in crate::types::dict::table(&modules).entries() {
+        if e.key.is_null() || e.value.is_null() {
+            continue;
+        }
+        let (k, v) = unsafe { (&*e.key, &*e.value) };
+        if !crate::types::str::is_str(k) || !crate::types::module::is_module(v) {
+            continue;
+        }
+        // modules executed from Python code always carry __builtins__
+        let md = crate::types::module::m(v).md_dict;
+        if md.is_null() || !dict_find_raw(unsafe { &*md }, b"__builtins__").is_null() {
+            continue;
+        }
+        if in_stdlib(k) {
+            continue;
+        }
+        wr(fd, if count == 0 { b"\nExtension modules: " } else { b", " });
+        wr_pystr(fd, k);
+        count += 1;
+    }
+    if count > 0 {
+        wr(fd, b" (total: ");
+        wr_dec(fd, count as u64);
+        wr(fd, b")\n");
+    }
+}
+
 fn dump_c_stack_fd(fd: i32) {
     wr(fd, b"Current thread's C stack trace (most recent call first):\n");
     wr(fd, b"  <cannot get C stack on this system>\n");
@@ -323,6 +406,7 @@ extern "C" fn fatal_handler(sig: libc::c_int) {
         wr(fd, b"<Cannot show all threads while the GIL is disabled>\n");
     }
     dump_traceback_fd(fd, false, 1);
+    dump_ext_modules(fd);
     if FATAL_C_STACK.load(Relaxed) {
         dump_c_stack_fd(fd);
     }
@@ -330,6 +414,13 @@ extern "C" fn fatal_handler(sig: libc::c_int) {
         *libc::__errno_location() = saved;
         // re-deliver to the previous handler (default: terminate)
         libc::raise(sig);
+        if sig == libc::SIGSEGV || sig == libc::SIGBUS {
+            // Rust's stack-overflow guard handler ignores faults outside the
+            // guard page when the signal was raised rather than caused by an
+            // access: still alive means nobody terminated us, so do it now.
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
     }
 }
 
@@ -521,6 +612,9 @@ static USER: Mutex<Vec<(i32, UserSig)>> = Mutex::new(Vec::new());
 const AU: AtomicI32 = AtomicI32::new(-1);
 static USER_FD: [AtomicI32; 65] = [AU; 65];
 static USER_FLAGS: [AtomicI32; 65] = [AU; 65];
+#[allow(clippy::declare_interior_mutable_const)]
+const AZ: AtomicUsize = AtomicUsize::new(0);
+static USER_MAXT: [AtomicUsize; 65] = [AZ; 65];
 
 extern "C" fn user_handler(sig: libc::c_int) {
     let saved = unsafe { *libc::__errno_location() };
@@ -533,7 +627,8 @@ extern "C" fn user_handler(sig: libc::c_int) {
         return;
     }
     let all = flags & 1 != 0;
-    dump_traceback_fd(fd, all, DEFAULT_MAX_THREADS);
+    let maxt = USER_MAXT[sig as usize].load(Acquire);
+    dump_traceback_fd(fd, all, if maxt == 0 { DEFAULT_MAX_THREADS } else { maxt });
     if flags & 2 != 0 {
         // chain: call the previous handler
         if let Ok(g) = USER.try_lock() {
@@ -551,8 +646,8 @@ extern "C" fn user_handler(sig: libc::c_int) {
 }
 
 fn fh_register(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
-    static P: crate::args::Params = crate::args::Params::new("register", &["signum", "file", "all_threads", "chain"], 0, 1);
-    let [s, f, a, c] = crate::args::parse::<4>(&P, args, kw)?;
+    static P: crate::args::Params = crate::args::Params::new("register", &["signum", "file", "all_threads", "chain", "max_threads"], 0, 1);
+    let [s, f, a, c, m] = crate::args::parse::<5>(&P, args, kw)?;
     let sig = ab::as_i64(s.unwrap())? as i32;
     if FATAL.iter().any(|x| x.signum == sig) {
         raise!(RuntimeError, "signal {} cannot be registered, use enable() instead", sig);
@@ -569,6 +664,17 @@ fn fh_register(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRe
         Some(c) => ab::is_true(c)?,
         None => false,
     };
+    let maxt = match m {
+        Some(m) => {
+            let n = ab::as_i64(m)?;
+            if n < 1 {
+                raise!(ValueError, "max_threads must be >= 1");
+            }
+            n as usize
+        }
+        None => DEFAULT_MAX_THREADS,
+    };
+    USER_MAXT[sig as usize].store(maxt, Release);
     let mut g = USER.lock().unwrap();
     let keep_p = keep.map_or(0, |k| k.into_raw() as usize);
     USER_FD[sig as usize].store(fd, Release);
@@ -628,6 +734,7 @@ pub fn fatal_error(func: Option<&str>, msg: &str) -> ! {
     wr(fd, msg.as_bytes());
     wr(fd, b"\nPython runtime state: initialized\n\n");
     dump_traceback_fd(fd, false, 1);
+    dump_ext_modules(fd);
     if FATAL_C_STACK.load(Relaxed) {
         dump_c_stack_fd(fd);
     }
