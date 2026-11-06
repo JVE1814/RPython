@@ -97,6 +97,32 @@ fn run_code_in_main(src: &[u8], filename: &str) -> Outcome {
     }
 }
 
+/// Run a compiled script (the marshalled code after a .pyc header): the code
+/// keeps the file name it was compiled with.
+fn run_pyc_in_main(data: &[u8], path: &str) -> Outcome {
+    let r = (|| -> PyResult<()> {
+        let m = main_module()?;
+        let d = module::module_dict(&m);
+        dict::set_item_str(&d, "__file__", &pystr::new_str(path))?;
+        dict::set_item_str(&d, "__cached__", none::none())?;
+        if let Some(bs) = crate::import::get_loaded_module("_frozen_importlib_external") {
+            let cls = ab::getattr_str(&bs, "SourcelessFileLoader")?;
+            let l = ab::call(&cls, &[&pystr::new_str("__main__"), &pystr::new_str(path)])?;
+            dict::set_item_str(&d, "__loader__", &l)?;
+        }
+        let code = crate::modules::marshal::loads_slice(data, true)?;
+        if !crate::types::code::is_code(&code) {
+            crate::raise!(RuntimeError, "Bad code object in .pyc file");
+        }
+        crate::interp::eval_code(&code, &d, Some(&d))?;
+        Ok(())
+    })();
+    match r {
+        Ok(()) => Outcome::Ok,
+        Err(_) => Outcome::Exit(handle_error()),
+    }
+}
+
 fn abspath(p: &str) -> String {
     let pb = std::path::Path::new(p);
     if pb.is_absolute() {
@@ -182,6 +208,9 @@ fn run_script(path: &str, opts: &MainOptions) -> Outcome {
     // the script path is made absolute (like CPython 3.9+): __file__ and code filenames
     let abs = abspath(path);
     let path = abs.as_str();
+    if src.len() >= 16 && src[..4] == crate::modules::_imp::MAGIC.to_le_bytes() {
+        return run_pyc_in_main(&src[16..], path);
+    }
     let r = (|| -> PyResult<()> {
         let m = main_module()?;
         let d = module::module_dict(&m);
