@@ -200,6 +200,20 @@ fn gc_get_referrers(_m: &PyObject, args: &[&PyObject]) -> PyResult {
 }
 
 fn gc_is_tracked(_m: &PyObject, o: &PyObject) -> PyResult {
+    if crate::types::typeobject::is_type(o) {
+        // Types of extension modules (dotted tp_name) are statically allocated
+        // here but are collectable heap types in the reference implementation;
+        // report them as tracked like any heap type.
+        let tp = o.as_ptr() as *mut PyTypeObject;
+        unsafe {
+            if (*tp).tp_flags & Py_TPFLAGS_HEAPTYPE == 0 && !(*tp).tp_name.is_null() {
+                let name = std::ffi::CStr::from_ptr((*tp).tp_name).to_bytes();
+                if name.contains(&b'.') && !name.starts_with(b"builtins.") {
+                    return Ok(bool_::new_bool(true));
+                }
+            }
+        }
+    }
     Ok(bool_::new_bool(crate::gc::is_tracked(o)))
 }
 fn gc_is_finalized(_m: &PyObject, o: &PyObject) -> PyResult {

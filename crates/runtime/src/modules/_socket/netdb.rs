@@ -295,11 +295,9 @@ fn f_getaddrinfo(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> Py
     let port: Option<Vec<u8>> = if none::is_none(pobj) {
         None
     } else if int::is_int(pobj) {
-        let v = match int::as_i64(pobj) {
-            Some(v) => v,
-            None => raise!(OverflowError, "Python int too large to convert to C long"),
-        };
-        Some(v.to_string().into_bytes())
+        // any int goes to the C library as its decimal text; range errors
+        // are the resolver's business
+        Some(crate::types::int_methods::to_decimal_string(pobj)?.into_bytes())
     } else if pystr::is_str(pobj) {
         let s = pystr::as_utf8(pobj)?;
         Some(s.as_bytes().to_vec())
