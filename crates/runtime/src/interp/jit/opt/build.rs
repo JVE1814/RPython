@@ -2483,6 +2483,9 @@ impl<'a> B<'a> {
                 return None;
             }
             let f = crate::types::funcobject::func(fo);
+            if f.func_code.is_null() || f.vectorcall.map(|v| v as usize) != Some(crate::interp::function_vectorcall as usize) {
+                return None; // replaced vectorcall (C API): the call must go through it
+            }
             let code = &*f.func_code;
             let cd = crate::types::code::code_data(code);
             if std::ptr::eq(cd, self.u.cd) || self.inl_cds.contains(&(cd as *const CodeData as usize)) || cd.caches.jit.load(std::sync::atomic::Ordering::Acquire).is_null() {

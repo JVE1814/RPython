@@ -124,14 +124,30 @@ pub fn on_dict_write(d: &PyObject, key: *mut PyObject) {
         if tag == crate::interp::jit::opt::WATCH_TAG {
             crate::interp::jit::opt::dict_written(d, key);
         } else {
-            type_dict_written(tag as *mut PyTypeObject);
+            type_dict_written(tag as *mut PyTypeObject, key);
         }
     }
 }
 
 #[cold]
-fn type_dict_written(tp: *mut PyTypeObject) {
+fn type_dict_written(tp: *mut PyTypeObject, key: *mut PyObject) {
     crate::types::slots::type_modified(tp);
+    // A class that gains or loses __get__/__set__/__delete__ changes how instances
+    // of it behave as attributes of *other* classes, whose version tags would not
+    // change: cached lookups there (instance attributes shadowing it, class
+    // attributes, constants folded by tier 2) must all be redone. Rare: invalidate
+    // the tags of every class.
+    let descr_key = key.is_null()
+        || unsafe {
+            let k = &*key;
+            crate::types::str::is_str(k)
+                && (crate::types::str::str_eq(k, crate::name!("__get__"))
+                    || crate::types::str::str_eq(k, crate::name!("__set__"))
+                    || crate::types::str::str_eq(k, crate::name!("__delete__")))
+        };
+    if descr_key {
+        crate::types::slots::type_modified(crate::types::typeobject::object_type());
+    }
 }
 
 // ------------------------------------------------------------------ global method cache

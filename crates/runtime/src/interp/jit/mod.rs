@@ -210,6 +210,9 @@ pub fn call_fast(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwnames:
         return None;
     }
     let f = crate::types::funcobject::func(func);
+    if f.func_code.is_null() {
+        return None;
+    }
     let code = unsafe { &*f.func_code };
     let cd = crate::types::code::code_data(code);
     let c = cd.caches.jit.load(Acquire);

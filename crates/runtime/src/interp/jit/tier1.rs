@@ -68,6 +68,7 @@ const E_KIND: i32 = offset_of!(crate::interp::cache::Entry, kind) as i32;
 const E_MEMO: i32 = offset_of!(crate::interp::cache::Entry, memo) as i32;
 
 const FUNC_CODE: i32 = offset_of!(crate::types::funcobject::PyFunctionObject, func_code) as i32;
+const FUNC_VECTORCALL: i32 = offset_of!(crate::types::funcobject::PyFunctionObject, vectorcall) as i32;
 const CODE_DATA: i32 = offset_of!(crate::types::code::PyCodeObject, data) as i32;
 const CD_FAST_ENTRY: i32 = (offset_of!(CodeData, caches) + offset_of!(crate::interp::cache::CodeCaches, fast_entry)) as i32;
 
@@ -768,7 +769,13 @@ impl<'a> Gen<'a> {
                 self.a.mov_ri(Rcx, crate::types::funcobject::function_type() as i64);
                 self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
                 self.a.jcc(Cc::NE, generic);
+                // a replaced vectorcall (C API) must be honoured
+                self.a.mov_ri(Rcx, crate::interp::function_vectorcall as usize as i64);
+                self.a.cmp_rm(Rcx, M(Rax, FUNC_VECTORCALL));
+                self.a.jcc(Cc::NE, generic);
                 self.a.load(Rcx, M(Rax, FUNC_CODE));
+                self.a.test_rr(Rcx, Rcx);
+                self.a.jcc(Cc::E, generic);
                 self.a.load(Rcx, M(Rcx, CODE_DATA));
                 // body not unmarshalled yet (perf2 lazy code): the generic path loads it
                 self.a.test_rr(Rcx, Rcx);
