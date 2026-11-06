@@ -247,10 +247,14 @@ def _annotation_head(text):
     return [part.strip() for part in found.group(1).split('.')]
 
 
-def _string_names(text, cls, module, test):
+_LAZY_IMPORT_TYPE = getattr(types, 'LazyImportType', None)
+
+
+def _string_names(text, cls, module_name, test):
     """For a string annotation: does its leading name, resolved in the
     namespace of the module defining *cls* (following attributes for a
-    dotted name), satisfy *test*?"""
+    dotted name), satisfy *test* (called with the value and the module
+    *module_name*)?"""
     parts = _annotation_head(text)
     if not parts:
         return False
@@ -259,6 +263,18 @@ def _string_names(text, cls, module, test):
         return False
     # resolve e.g. "ClassVar", "typing.ClassVar" or "proxy.Nested.ClassVar"
     value = home.__dict__.get(parts[0])
+    if type(value) is _LAZY_IMPORT_TYPE:
+        # a lazy import names the object only once it is imported: do that
+        # through the module, which then holds the real object; a module that
+        # fails to import cannot name a pseudo-field
+        try:
+            value = getattr(home, parts[0])
+        except Exception:
+            return False
+    # looked up only now: resolving a lazy import may have imported it
+    module = sys.modules.get(module_name)
+    if module is None:
+        return False
     for part in parts[1:]:
         value = getattr(value, part, None)
     return test(value, module)
@@ -281,15 +297,16 @@ def _is_kw_only(annotation, dataclasses):
 def _annotation_kind(cls, annotation):
     """Return _FIELD, _FIELD_CLASSVAR or _FIELD_INITVAR for *annotation*."""
     typing = sys.modules.get('typing')
-    if typing is not None:
-        if _is_classvar(annotation, typing):
-            return _FIELD_CLASSVAR
-        if isinstance(annotation, str) and _string_names(annotation, cls, typing, _is_classvar):
-            return _FIELD_CLASSVAR
+    if typing is not None and _is_classvar(annotation, typing):
+        return _FIELD_CLASSVAR
+    # with typing not imported yet, only a lazy import in the class's module
+    # can still name typing.ClassVar (resolving it imports typing)
+    if isinstance(annotation, str) and _string_names(annotation, cls, 'typing', _is_classvar):
+        return _FIELD_CLASSVAR
     this = sys.modules[__name__]
     if _is_initvar(annotation, this):
         return _FIELD_INITVAR
-    if isinstance(annotation, str) and _string_names(annotation, cls, this, _is_initvar):
+    if isinstance(annotation, str) and _string_names(annotation, cls, __name__, _is_initvar):
         return _FIELD_INITVAR
     return _FIELD
 
@@ -298,7 +315,7 @@ def _marks_kw_only(cls, annotation):
     this = sys.modules[__name__]
     if _is_kw_only(annotation, this):
         return True
-    return isinstance(annotation, str) and _string_names(annotation, cls, this, _is_kw_only)
+    return isinstance(annotation, str) and _string_names(annotation, cls, __name__, _is_kw_only)
 
 
 def _make_field(cls, name, annotation, kw_only_default):
@@ -832,6 +849,10 @@ def _add_slots(cls, is_frozen, weakref_slot, fields):
     names = [f.name for f in fields.values() if f._field_type is _FIELD]
     known = _inherited_slots(cls)
     new_slots = [name for name in names if name not in known]
+    if ('__dict__' in new_slots
+            and any(base.__dictoffset__ for base in cls.__mro__[1:-1])):
+        # instances of a base already carry a __dict__
+        new_slots.remove('__dict__')
     if weakref_slot and '__weakref__' not in known and not _provides_weakref(cls):
         new_slots.append('__weakref__')
     docs = {f.name: f.doc for f in fields.values()

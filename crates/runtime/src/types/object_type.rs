@@ -1098,6 +1098,7 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
     let mut add_dict = false;
     let mut add_weak = false;
     let mut slot_names: Vec<PyRef> = Vec::new();
+    let mut slot_docs: Vec<(String, String)> = Vec::new();
     let base_has_dict = unsafe { (*base).tp_dictoffset != 0 || (*base).tp_flags & Py_TPFLAGS_MANAGED_DICT != 0 };
     let base_has_weak = unsafe { (*base).tp_weaklistoffset != 0 || (*base).tp_flags & Py_TPFLAGS_MANAGED_WEAKREF != 0 };
     match &slots {
@@ -1146,6 +1147,14 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
                     let is_qual = st == "__qualname__" || st == "__classcell__";
                     if !is_qual {
                         raise!(ValueError, "'{}' in __slots__ conflicts with class variable", st);
+                    }
+                }
+                if dict::is_dict(s) {
+                    // a dict of __slots__ maps names to member docstrings
+                    if let Some(doc) = dict::get_item(s, item)? {
+                        if pystr::is_str(&doc) {
+                            slot_docs.push((pystr::to_string_lossy(&mangled), pystr::to_string_lossy(&doc)));
+                        }
                     }
                 }
                 slot_names.push(mangled);
@@ -1237,12 +1246,17 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
         let members_ptr = (tp_obj as *mut u8).add(std::mem::size_of::<PyHeapTypeObject>()) as *mut PyMemberDef;
         let mut mvec: Vec<PyMemberDef> = Vec::with_capacity(nslots + 1);
         for s in slot_names.iter() {
+            let sname = pystr::to_string_lossy(s);
+            let doc = match slot_docs.iter().find(|(n, _)| *n == sname) {
+                Some((_, d)) => crate::methods::cstr_static(d),
+                None => std::ptr::null(),
+            };
             mvec.push(PyMemberDef {
-                name: crate::methods::cstr_static(&pystr::to_string_lossy(s)),
+                name: crate::methods::cstr_static(&sname),
                 type_code: Py_T_OBJECT_EX,
                 offset: slotoffset as isize,
                 flags: 0,
-                doc: std::ptr::null(),
+                doc,
             });
             slotoffset += 8;
         }
