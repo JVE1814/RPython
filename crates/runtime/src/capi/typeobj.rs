@@ -542,15 +542,19 @@ pub(crate) unsafe fn type_from_desc(desc: TypeDesc, token: *mut c_void) -> PyRes
         if !has_token_slot {
             tok = std::ptr::null_mut();
         }
-        let bases: PyRef = if !desc.bases.is_null() {
-            if tuple::is_tuple(&*desc.bases) { (*desc.bases).to_ref() } else { tuple::new_tuple(vec![(*desc.bases).to_ref()]) }
-        } else if !bases_slot.is_null() {
-            (*(bases_slot as *mut PyObject)).to_ref()
-        } else if !base_slot.is_null() {
-            tuple::new_tuple(vec![(*(base_slot as *mut PyObject)).to_ref()])
-        } else {
-            tuple::new_tuple(vec![type_ref(to::object_type())])
+        // bases come from the argument, else Py_tp_bases, else Py_tp_base; each may be a
+        // tuple or a single type, and None counts as not given
+        let given = |p: *mut PyObject| -> Option<PyRef> {
+            if p.is_null() || (*p).is(crate::types::none::none()) {
+                return None;
+            }
+            Some(if tuple::is_tuple(&*p) { (*p).to_ref() } else { tuple::new_tuple(vec![(*p).to_ref()]) })
         };
+        let bases: PyRef = given(desc.bases)
+            .or_else(|| given(bases_slot as *mut PyObject))
+            .or_else(|| given(base_slot as *mut PyObject))
+            .filter(|t| tuple::tuple_len(t) > 0)
+            .unwrap_or_else(|| tuple::new_tuple(vec![type_ref(to::object_type())]));
         // the best base
         let mut base: *mut PyTypeObject = std::ptr::null_mut();
         for b in tuple::tuple_items(&bases) {

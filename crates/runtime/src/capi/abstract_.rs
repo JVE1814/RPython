@@ -574,7 +574,19 @@ pub unsafe extern "C" fn PySequence_InPlaceRepeat(a: *mut PyObject, n: Py_ssize_
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PySequence_Contains(o: *mut PyObject, v: *mut PyObject) -> c_int {
-    unsafe { ret_b(ab::contains(&*o, &*v)) }
+    unsafe {
+        if o.is_null() || v.is_null() {
+            // an empty sequence never compares, so a NULL item is only noticed otherwise
+            if !o.is_null() && ab::length(&*o).ok() == Some(0) {
+                clear_exc();
+                return 0;
+            }
+            clear_exc();
+            let _ = null_arg();
+            return -1;
+        }
+        ret_b(ab::contains(&*o, &*v))
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PySequence_In(o: *mut PyObject, v: *mut PyObject) -> c_int {

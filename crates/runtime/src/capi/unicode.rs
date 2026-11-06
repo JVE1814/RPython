@@ -550,10 +550,14 @@ pub unsafe extern "C" fn PyUnicode_DecodeUTF8Stateful(s: *const c_char, size: Py
             // leave an incomplete trailing sequence undecoded
             let cut = incomplete_utf8_tail(data);
             data = &data[..data.len() - cut];
-            *consumed = data.len() as Py_ssize_t;
         }
         let err = opt_cstr(errors);
-        ret(decode_utf8(data, err.as_deref()))
+        let r = decode_utf8(data, err.as_deref());
+        // *consumed is written only when decoding succeeds
+        if r.is_ok() && !consumed.is_null() {
+            *consumed = data.len() as Py_ssize_t;
+        }
+        ret(r)
     }
 }
 /// Number of bytes at the end of `b` that form an incomplete (but so far valid) UTF-8 sequence.
@@ -940,6 +944,9 @@ pub unsafe extern "C" fn PyUnicode_Translate(s: *mut PyObject, table: *mut PyObj
 pub unsafe extern "C" fn PyUnicode_Format(format: *mut PyObject, args: *mut PyObject) -> *mut PyObject {
     unsafe {
         let Ok(f) = ustr(format) else { return std::ptr::null_mut() };
+        if args.is_null() {
+            return null_arg();
+        }
         ret(ab::binary_op(f, &*args, ab::NbSlot::Mod))
     }
 }

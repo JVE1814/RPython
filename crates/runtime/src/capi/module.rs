@@ -308,6 +308,27 @@ pub unsafe extern "C" fn PyModule_FromDefAndSpec2(def: *mut PyModuleDef, spec: *
                         }
                         seen_gil = true;
                     }
+                    // slots that restate a PyModuleDef field must agree with it
+                    id @ (100..=106 | 110) => {
+                        let d = &*def;
+                        let (field, slot_name): (usize, &str) = match id {
+                            100 => (d.m_name as usize, "Py_mod_name"),
+                            101 => (d.m_doc as usize, "Py_mod_doc"),
+                            102 => (d.m_size as usize, "Py_mod_state_size"),
+                            103 => (d.m_methods as usize, "Py_mod_methods"),
+                            104 => (d.m_traverse.map_or(0, |f| f as usize), "Py_mod_state_traverse"),
+                            105 => (d.m_clear.map_or(0, |f| f as usize), "Py_mod_state_clear"),
+                            106 => (d.m_free.map_or(0, |f| f as usize), "Py_mod_state_free"),
+                            _ => (def as usize, "Py_mod_token"),
+                        };
+                        if (*s).value as usize != field {
+                            return Err(system_error(&format!(
+                                "module {}: {} slot contradicts the PyModuleDef field",
+                                pystr::to_string_lossy(&name),
+                                slot_name
+                            )));
+                        }
+                    }
                     other if other >= 0 && other <= 110 => {}
                     other => {
                         return Err(system_error(&format!("module {} uses unknown slot ID {}", pystr::to_string_lossy(&name), other)));
