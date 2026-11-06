@@ -96,11 +96,6 @@ pub fn recompute_mon_any(m: &MonState) {
 
 pub static DISABLE_OBJ: std::sync::atomic::AtomicPtr<PyObject> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
-thread_local! {
-    /// frame address -> last executed instruction (for backward-jump line events)
-    static LAST: RefCell<HashMap<usize, u32>> = RefCell::new(HashMap::new());
-}
-
 fn frame_obj(f: &mut Frame) -> PyRef {
     unsafe { PyRef::from_borrowed(crate::interp::eval::frame_object(f)) }
 }
@@ -254,9 +249,7 @@ pub fn trace_call(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
         return Ok(());
     }
     let resume = f.next_instr > cd.gen_start;
-    LAST.with(|l| {
-        l.borrow_mut().insert(f as *mut Frame as usize, u32::MAX);
-    });
+    f.trace_last = u32::MAX;
     if !resume {
         f.trace_line = -1;
     }
@@ -285,8 +278,7 @@ pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
         }
     }
     let lasti = f.lasti;
-    let key = f as *mut Frame as usize;
-    let prev = LAST.with(|l| l.borrow_mut().insert(key, lasti)).unwrap_or(u32::MAX);
+    let prev = std::mem::replace(&mut f.trace_last, lasti);
     // instructions without a line number (artificial cleanup code) never start a line
     let line = match crate::types::code::code_data(f.code()).locations.get(lasti as usize) {
         Some(l) if l.lineno != 0 => l.lineno as i32,
@@ -347,9 +339,7 @@ pub fn trace_exit(ts: &ThreadState, f: &mut Frame, e: &Exit) -> PyResult<()> {
         call_trace(ts, ftr.as_ptr(), f, "return", &v)?;
     }
     if !is_yield {
-        LAST.with(|l| {
-            l.borrow_mut().remove(&(f as *mut Frame as usize));
-        });
+        f.trace_last = u32::MAX;
     }
     Ok(())
 }
@@ -387,9 +377,7 @@ pub fn trace_unwind(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
         }
         Ok(())
     })();
-    LAST.with(|l| {
-        l.borrow_mut().remove(&(f as *mut Frame as usize));
-    });
+    f.trace_last = u32::MAX;
     match r {
         Ok(()) => {
             if let Some(e) = e {
