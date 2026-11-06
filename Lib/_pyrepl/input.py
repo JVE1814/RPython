@@ -8,7 +8,6 @@ one at a time and queues ``(command, [keys])`` results.
 
 from __future__ import annotations
 
-import unicodedata
 from collections import deque
 
 from .keymap import parse_keys
@@ -40,7 +39,10 @@ def _build_tree(keymap) -> dict:
 
 
 def _is_character(key: str) -> bool:
-    return len(key) == 1 and not unicodedata.category(key).startswith("C")
+    # any single character without a binding of its own is text, control
+    # and format characters included (they are displayed escaped); line
+    # ends never are (an unbound one ends a mode such as incremental search)
+    return len(key) == 1 and key not in "\r\n"
 
 
 class KeymapTranslator:

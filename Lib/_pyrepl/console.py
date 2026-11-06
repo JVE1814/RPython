@@ -101,6 +101,14 @@ class Console(ABC):
         return None
 
 
+def _looks_like_pip_command(source):
+    """True if *source* is a shell pip invocation typed at the prompt."""
+    words = source.strip().split()
+    if len(words) >= 3 and words[1] == '-m' and words[0] in ('python', 'python3'):
+        words = words[2:]
+    return len(words) >= 2 and words[0] in ('pip', 'pip3')
+
+
 class InteractiveColoredConsole(code.InteractiveConsole):
     """An InteractiveConsole that colours tracebacks and runs every
     statement of a multi-statement input on its own (only the last one
@@ -113,7 +121,13 @@ class InteractiveColoredConsole(code.InteractiveConsole):
         self.can_colorize = _colorize.can_colorize()
 
     def showsyntaxerror(self, filename=None, **kwargs):
+        source = kwargs.get('source')
         super().showsyntaxerror(filename=filename, colorize=self.can_colorize, **kwargs)
+        if source and _looks_like_pip_command(source):
+            self.write(
+                "\nThe Python package manager (pip) can only be used outside "
+                "of the Python REPL.\nTry the 'pip' command in a separate "
+                "terminal or command prompt.\n")
 
     def showtraceback(self):
         typ, value, tb = sys.exc_info()

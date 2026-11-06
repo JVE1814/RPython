@@ -110,7 +110,12 @@ pub fn print_exception_and_clear() {
         if abstract_::call(&hook, &[&t, &e, &tb]).is_ok() {
             return;
         }
-        clear_exc();
+        // a broken hook: report its own failure, then the original error
+        if let Some(hook_err) = take_exc() {
+            modules::sys::write_stderr("Error in sys.excepthook:\n");
+            modules::traceback_print::print_exception(&hook_err);
+            modules::sys::write_stderr("\nOriginal exception was:\n");
+        }
     }
     modules::traceback_print::print_exception(&e);
 }

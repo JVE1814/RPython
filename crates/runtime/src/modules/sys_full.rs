@@ -359,7 +359,9 @@ fn sys_excepthook(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     crate::args::check_pos("excepthook", args, 3, 3)?;
     let v = args[1];
     if crate::types::exceptions::is_exception_instance(v) {
-        print_exception_full(v);
+        // the interpreter's own report (sys.tracebacklimit keeps the
+        // innermost entries, colours when stderr is a terminal)
+        crate::modules::traceback_print::print_exception(v);
     } else {
         crate::modules::sys::write_stderr(&format!(
             "TypeError: print_exception(): Exception expected for value, {} found\n",

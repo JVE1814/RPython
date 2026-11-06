@@ -698,6 +698,9 @@ fn setup(a: &RlApi) {
         if libc::isatty(1) == 0 {
             (a.rl_variable_bind)(c"enable-meta-key".as_ptr(), c"off".as_ptr());
         }
+        // The line-at-a-time REPL handles pasted text itself; bracketed-paste
+        // mode would wrap every prompt in terminal mode switches.
+        (a.rl_variable_bind)(c"enable-bracketed-paste".as_ptr(), c"off".as_ptr());
     }
 }
 
