@@ -223,17 +223,37 @@ pub unsafe extern "C" fn PyErr_NormalizeException(t: *mut *mut PyObject, v: *mut
 }
 
 pub(crate) fn given_matches(given: &PyObject, exc_: &PyObject) -> bool {
-    if tuple::is_tuple(exc_) {
-        // nested tuples recurse: a RecursionError is reported as unraisable (core-runtime)
-        let ts = crate::threads::current();
-        if crate::interp::enter_recursive_call(ts, " in PyErr_GivenExceptionMatches").is_err() {
+    match given_matches_nested(given, exc_) {
+        Ok(r) => r,
+        Err(_) => {
+            // nesting too deep: reported as unraisable once back at the caller's depth
             crate::modules::sys_full::write_unraisable(None, None);
-            return false;
+            false
         }
-        let r = tuple::tuple_items(exc_).iter().any(|e| given_matches(given, e));
+    }
+}
+
+fn given_matches_nested(given: &PyObject, exc_: &PyObject) -> PyResult<bool> {
+    if tuple::is_tuple(exc_) {
+        let ts = crate::threads::current();
+        crate::interp::enter_recursive_call(ts, " in PyErr_GivenExceptionMatches")?;
+        let mut r = Ok(false);
+        for e in tuple::tuple_items(exc_) {
+            match given_matches_nested(given, e) {
+                Ok(false) => {}
+                other => {
+                    r = other;
+                    break;
+                }
+            }
+        }
         crate::interp::leave_recursive_call(ts);
         return r;
     }
+    Ok(given_matches_leaf(given, exc_))
+}
+
+fn given_matches_leaf(given: &PyObject, exc_: &PyObject) -> bool {
     let g = if exc::is_exception_instance(given) { typeobject::type_obj(given.type_ptr()) } else { given };
     if is_exc_class(g) && is_exc_class(exc_) {
         return typeobject::is_subtype(typeobject::as_type(g), typeobject::as_type(exc_));

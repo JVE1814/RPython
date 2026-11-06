@@ -7,7 +7,7 @@ use crate::ffi::{PyObject, PyTypeObject};
 use crate::modules::sys_structseq as ss;
 use crate::object::*;
 use crate::raise;
-use crate::types::{bool_, dict, float, int, list, none, str as pystr, tuple};
+use crate::types::{bool_, bytes, dict, float, int, list, none, str as pystr, tuple};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering::*};
 use std::sync::{Mutex, OnceLock};
 
@@ -106,8 +106,54 @@ pub fn source_line(filename: &str, lineno: i32) -> Option<String> {
         return None;
     }
     let data = std::fs::read(filename).ok()?;
-    let s = String::from_utf8_lossy(&data);
+    let s = decode_source_file(&data);
     s.split('\n').nth((lineno - 1) as usize).map(|l| l.trim_end_matches('\r').to_string())
+}
+
+/// Text of a source file: a UTF-8 BOM is dropped, a PEP 263 coding declaration in
+/// the first two lines selects the codec, UTF-8 otherwise (undecodable bytes are
+/// replaced).
+fn decode_source_file(data: &[u8]) -> String {
+    if let Some(rest) = data.strip_prefix(b"\xef\xbb\xbf") {
+        return String::from_utf8_lossy(rest).into_owned();
+    }
+    let mut enc: Option<String> = None;
+    for line in data.split(|&b| b == b'\n').take(2) {
+        let l = String::from_utf8_lossy(line);
+        let t = l.trim_start();
+        if !t.starts_with('#') {
+            if t.is_empty() {
+                continue;
+            }
+            break;
+        }
+        if let Some(i) = t.find("coding") {
+            let r = &t[i + 6..];
+            if let Some(r) = r.strip_prefix(':').or_else(|| r.strip_prefix('=')) {
+                let name: String = r.trim_start().chars().take_while(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.')).collect();
+                if !name.is_empty() {
+                    enc = Some(name);
+                    break;
+                }
+            }
+        }
+    }
+    match enc.map(|e| e.to_ascii_lowercase().replace('_', "-")) {
+        None => String::from_utf8_lossy(data).into_owned(),
+        Some(e) if e == "utf-8" || e == "utf8" || e.starts_with("utf-8-") => String::from_utf8_lossy(data).into_owned(),
+        Some(e) if matches!(e.as_str(), "latin-1" | "latin1" | "iso-8859-1" | "iso8859-1" | "l1") => data.iter().map(|&b| b as char).collect(),
+        Some(e) => {
+            // any other codec: through the codec machinery
+            let b = bytes::new_bytes(data);
+            match ab::call_method_str(&b, "decode", &[&pystr::new_str(&e), &pystr::new_str("replace")]) {
+                Ok(t) => pystr::to_string_lossy(&t),
+                Err(_) => {
+                    clear_exc();
+                    String::from_utf8_lossy(data).into_owned()
+                }
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------------ global state

@@ -561,21 +561,51 @@ fn sysexit_init(o: &PyObject, args: &PyObject) -> PyResult<()> {
 
 fn importerror_init(o: &PyObject, args: &PyObject, kw: Option<&PyObject>) -> PyResult<()> {
     let e = unsafe { &mut *(o.as_ptr() as *mut ImportErrorExc) };
-    if let Some(kw) = kw {
-        for (k, v) in dict::items_vec(kw) {
-            let ks = pystr::to_string_lossy(&k);
-            match ks.as_str() {
-                "name" => set_field(&mut e.name, Some(&v)),
-                "path" => set_field(&mut e.path, Some(&v)),
-                "name_from" => set_field(&mut e.name_from, Some(&v)),
-                _ => raise!(TypeError, "'{}' is an invalid keyword argument for {}()", ks, type_name(o.ty())),
-            }
+    let items = kw.map(dict::items_vec).unwrap_or_default();
+    for (k, _) in &items {
+        let ks = pystr::to_string_lossy(k);
+        if !matches!(ks.as_str(), "name" | "path" | "name_from") {
+            raise!(TypeError, "{}() got an unexpected keyword argument '{}'", type_name(o.ty()), ks);
+        }
+    }
+    // (re-)initialisation resets what is not given
+    set_field(&mut e.name, None);
+    set_field(&mut e.path, None);
+    set_field(&mut e.name_from, None);
+    set_field(&mut e.msg, None);
+    for (k, v) in &items {
+        match pystr::to_string_lossy(k).as_str() {
+            "name" => set_field(&mut e.name, Some(v)),
+            "path" => set_field(&mut e.path, Some(v)),
+            _ => set_field(&mut e.name_from, Some(v)),
         }
     }
     if tuple::tuple_len(args) == 1 {
         set_field(&mut e.msg, Some(tuple::tuple_get(args, 0)));
     }
     Ok(())
+}
+
+/// `ImportError('msg', name=..., path=...)`: the positional arguments, then the
+/// name and path that are set.
+unsafe extern "C" fn importerror_repr(op: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        let o = &*op;
+        let e = &*(op as *const ImportErrorExc);
+        let r = (|| -> PyResult<PyRef> {
+            let mut parts: Vec<String> = Vec::new();
+            for a in tuple::tuple_items(&exc_args(o)) {
+                parts.push(ab::repr_string(a)?);
+            }
+            for (label, p) in [("name", e.name), ("path", e.path)] {
+                if !p.is_null() && !(*p).is(crate::types::none::none()) {
+                    parts.push(format!("{}={}", label, ab::repr_string(&*p)?));
+                }
+            }
+            Ok(pystr::new_str(&format!("{}({})", type_name(o.ty()), parts.join(", "))))
+        })();
+        into_c(r)
+    }
 }
 
 fn syntaxerror_init(o: &PyObject, args: &PyObject) -> PyResult<()> {
@@ -587,17 +617,23 @@ fn syntaxerror_init(o: &PyObject, args: &PyObject) -> PyResult<()> {
     if n == 2 {
         let info = ab::sequence_tuple(tuple::tuple_get(args, 1))?;
         let m = tuple::tuple_len(&info);
-        if m < 4 || m > 6 {
-            raise!(IndexError, "tuple index out of range");
+        if m < 4 {
+            raise!(TypeError, "function takes at least 4 arguments ({} given)", m);
+        }
+        if m > 6 {
+            raise!(TypeError, "function takes at most 6 arguments ({} given)", m);
+        }
+        if m == 5 {
+            raise!(TypeError, "end_offset must be provided when end_lineno is provided");
         }
         let it = tuple::tuple_items(&info);
         set_field(&mut e.filename, Some(it[0]));
         set_field(&mut e.lineno, Some(it[1]));
         set_field(&mut e.offset, Some(it[2]));
         set_field(&mut e.text, Some(it[3]));
-        if m > 4 {
-            set_field(&mut e.end_lineno, Some(it[4]));
-        }
+        // a shorter tuple on re-initialisation clears the end position
+        set_field(&mut e.end_lineno, if m > 4 { Some(it[4]) } else { None });
+        set_field(&mut e.end_offset, None);
         if m > 5 {
             set_field(&mut e.end_offset, Some(it[5]));
         }
@@ -1202,6 +1238,7 @@ pub fn init_types() {
                 Layout::ImportError if idx as usize == Idx::ImportError as usize => {
                     t.tp_init = Some(special_init);
                     t.tp_str = Some(importerror_str);
+                    t.tp_repr = Some(importerror_repr);
                     t.tp_members = crate::member_table![
                         ("msg", Py_T_OBJECT, std::mem::offset_of!(ImportErrorExc, msg), 0; "exception message"),
                         ("name", Py_T_OBJECT, std::mem::offset_of!(ImportErrorExc, name), 0; "module name"),

@@ -1315,7 +1315,16 @@ unsafe extern "C" fn slot_tp_finalize(s: *mut PyObject) {
         let saved = take_exc();
         if let Some(f) = lookup(s.type_ptr(), name!("__del__")) {
             if ab::call_unbound(&f, s, &[]).is_err() {
-                crate::modules::sys::write_unraisable_with_obj("Exception ignored while calling deallocator", Some(&f));
+                // the report names the __del__ in the message (object: None)
+                let exc = take_exc();
+                let r = ab::repr_string(&f).unwrap_or_else(|_| {
+                    clear_exc();
+                    "<object repr() failed>".into()
+                });
+                if let Some(e) = exc {
+                    set_exc(e);
+                }
+                crate::modules::sys::write_unraisable_with_obj(&format!("Exception ignored while calling deallocator {}", r), None);
             }
         }
         if let Some(e) = saved {

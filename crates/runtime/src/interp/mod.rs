@@ -149,6 +149,12 @@ pub fn frame_finished(mut frame: Box<Frame>) {
     frame.state = frame::FrameState::Completed;
     frame.clear_stack();
     if !frame.frame_obj.is_null() {
+        // the frame object outlives the activation: it keeps its caller as f_back
+        let caller = crate::threads::current().frame.get();
+        if !caller.is_null() && !std::ptr::eq(caller, &*frame) {
+            let back = eval::frame_object(unsafe { &mut *caller });
+            unsafe { crate::types::frameobject::set_back(frame.frame_obj, back) };
+        }
         frame.make_owned();
         unsafe { crate::types::frameobject::take_ownership(frame.frame_obj, frame) };
     } else {
