@@ -318,10 +318,11 @@ fn build_exec(c: &PyCodeObject, m: &CodeMeta) -> CodeData {
     }
 }
 
-/// `RPYTHON_WORDCODE=1`: the compiler emits public wordcode (D24 switch-over flag).
+/// The compiler emits public CPython 3.15 wordcode (D24; the default since the switch-over).
+/// `RPYTHON_WORDCODE=0` selects the legacy pipeline (comparison only, until it is deleted).
 pub fn public_mode() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var_os("RPYTHON_WORDCODE").is_some_and(|v| v != "0" && !v.is_empty()))
+    *V.get_or_init(|| std::env::var_os("RPYTHON_WORDCODE").is_none_or(|v| v != "0"))
 }
 
 /// Convert a compiler constant into an object.
