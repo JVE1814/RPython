@@ -3064,13 +3064,35 @@ impl<'a> B<'a> {
         let (pa, _) = self.prof(i);
         let is_list = pa == prof::LIST;
         let is_tuple = pa == prof::TUPLE;
-        if !(is_list || is_tuple) || n == 0 || n > 16 {
+        let both = pa == prof::LIST | prof::TUPLE;
+        if !(is_list || is_tuple || both) || n == 0 || n > 16 {
             self.template(i);
             return;
         }
-        let tp = if is_list { list_t() } else { tuple_t() };
         let snap = self.snap(i, SnapKind::Deopt);
         let s = self.peek_ptr(1);
+        if both {
+            // tuple or list: items inline or behind ob_item; ob_size at the same offset
+            let ty = self.v(Class::G);
+            self.emit(Inst::Load(ty, Base::V(s), OB_TYPE));
+            let tt = self.imm(tuple_t() as i64);
+            let items = self.v(Class::G);
+            let (bt, bl, join) = (self.new_block(u32::MAX), self.new_block(u32::MAX), self.new_block(u32::MAX));
+            self.term(Term::Branch(Cond::Cmp(ty, Opnd::V(tt), Cc::E), bt, bl));
+            self.switch_to(bt);
+            self.emit(Inst::Alu(Alu::Add, items, s, Opnd::I(TUPLE_ITEMS as i64)));
+            self.term(Term::Jump(join));
+            self.switch_to(bl);
+            let lt = self.imm(list_t() as i64);
+            self.emit(Inst::Guard(Cond::Cmp(ty, Opnd::V(lt), Cc::NE), snap));
+            self.emit(Inst::Load(items, Base::V(s), LIST_ITEMS));
+            self.term(Term::Jump(join));
+            self.switch_to(join);
+            self.emit(Inst::Guard(Cond::CmpMem(Base::V(s), LIST_SIZE, n as i64, Cc::NE), snap));
+            self.unpack_items(n, (items, 0));
+            return;
+        }
+        let tp = if is_list { list_t() } else { tuple_t() };
         if !self.ty_of(&self.peek(1)).is(tp as *mut PyTypeObject) {
             let t = self.imm(tp as i64);
             let ty = self.v(Class::G);
@@ -3085,6 +3107,12 @@ impl<'a> B<'a> {
         } else {
             (s, TUPLE_ITEMS)
         };
+        self.unpack_items(n, base);
+    }
+
+    /// Push the n items at `base` (incref'd, last item deepest) in place of the
+    /// sequence on top of the stack.
+    fn unpack_items(&mut self, n: usize, base: (V, i32)) {
         let mut vals = Vec::with_capacity(n);
         for k in 0..n {
             let x = self.v(Class::G);
