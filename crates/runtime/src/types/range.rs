@@ -444,6 +444,11 @@ unsafe extern "C" fn range_iter(o: *mut PyObject) -> *mut PyObject {
         if ro.fast != 0 && i64_of(obj(ro.stop)).is_some() {
             return new_fast_iter(ro.fstart, ro.fstep, ro.flen).into_raw();
         }
+        // the machine-int iterator only needs start, step and length to fit (the
+        // stop of a pickled iterator's range can lie just outside)
+        if let (Some(s), Some(st), Some(l)) = (i64_of(obj(ro.start)), i64_of(obj(ro.step)), i64_of(obj(ro.length))) {
+            return new_fast_iter(s, st, l).into_raw();
+        }
         into_c(new_long_iter(obj(ro.start).to_ref(), obj(ro.step).to_ref(), obj(ro.length).to_ref()))
     }
 }

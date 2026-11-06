@@ -103,7 +103,7 @@ pub fn init_types() {
         let t = &mut *bool_type();
         t.tp_name = c"bool".as_ptr();
         t.tp_base = int::int_type();
-        t.tp_basicsize = std::mem::size_of::<PyLongObject>() as isize;
+        t.tp_basicsize = std::mem::offset_of!(PyLongObject, ob_digit) as isize;
         t.tp_itemsize = 4;
         t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_LONG_SUBCLASS;
         t.tp_repr = Some(bool_repr);

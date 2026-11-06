@@ -25,6 +25,13 @@ pub unsafe extern "C" fn PyBytes_FromStringAndSize(s: *const c_char, n: Py_ssize
             let _ = system_error("Negative size passed to PyBytes_FromStringAndSize");
             return std::ptr::null_mut();
         }
+        if n == 0 {
+            return bytes::empty_bytes().into_raw();
+        }
+        if n == 1 && !s.is_null() {
+            // (with s == NULL the caller fills the object in: it must be fresh)
+            return bytes::single_byte(*(s as *const u8)).into_raw();
+        }
         const HEADER: usize = std::mem::offset_of!(PyBytesObject, ob_sval);
         if n as usize >= isize::MAX as usize - HEADER - 1 {
             let _ = overflow_error("byte string is too large");

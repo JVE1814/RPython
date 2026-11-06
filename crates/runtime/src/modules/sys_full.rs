@@ -7,7 +7,7 @@ use crate::ffi::{PyObject, PyTypeObject};
 use crate::modules::sys_structseq as ss;
 use crate::object::*;
 use crate::raise;
-use crate::types::{bool_, dict, float, int, list, none, str as pystr, tuple};
+use crate::types::{bool_, bytes, dict, float, int, list, none, str as pystr, tuple};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering::*};
 use std::sync::{Mutex, OnceLock};
 
@@ -106,8 +106,54 @@ pub fn source_line(filename: &str, lineno: i32) -> Option<String> {
         return None;
     }
     let data = std::fs::read(filename).ok()?;
-    let s = String::from_utf8_lossy(&data);
+    let s = decode_source_file(&data);
     s.split('\n').nth((lineno - 1) as usize).map(|l| l.trim_end_matches('\r').to_string())
+}
+
+/// Text of a source file: a UTF-8 BOM is dropped, a PEP 263 coding declaration in
+/// the first two lines selects the codec, UTF-8 otherwise (undecodable bytes are
+/// replaced).
+fn decode_source_file(data: &[u8]) -> String {
+    if let Some(rest) = data.strip_prefix(b"\xef\xbb\xbf") {
+        return String::from_utf8_lossy(rest).into_owned();
+    }
+    let mut enc: Option<String> = None;
+    for line in data.split(|&b| b == b'\n').take(2) {
+        let l = String::from_utf8_lossy(line);
+        let t = l.trim_start();
+        if !t.starts_with('#') {
+            if t.is_empty() {
+                continue;
+            }
+            break;
+        }
+        if let Some(i) = t.find("coding") {
+            let r = &t[i + 6..];
+            if let Some(r) = r.strip_prefix(':').or_else(|| r.strip_prefix('=')) {
+                let name: String = r.trim_start().chars().take_while(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.')).collect();
+                if !name.is_empty() {
+                    enc = Some(name);
+                    break;
+                }
+            }
+        }
+    }
+    match enc.map(|e| e.to_ascii_lowercase().replace('_', "-")) {
+        None => String::from_utf8_lossy(data).into_owned(),
+        Some(e) if e == "utf-8" || e == "utf8" || e.starts_with("utf-8-") => String::from_utf8_lossy(data).into_owned(),
+        Some(e) if matches!(e.as_str(), "latin-1" | "latin1" | "iso-8859-1" | "iso8859-1" | "l1") => data.iter().map(|&b| b as char).collect(),
+        Some(e) => {
+            // any other codec: through the codec machinery
+            let b = bytes::new_bytes(data);
+            match ab::call_method_str(&b, "decode", &[&pystr::new_str(&e), &pystr::new_str("replace")]) {
+                Ok(t) => pystr::to_string_lossy(&t),
+                Err(_) => {
+                    clear_exc();
+                    String::from_utf8_lossy(data).into_owned()
+                }
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------------ global state
@@ -202,6 +248,12 @@ fn sys_addaudithook(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) ->
 fn sys_exit(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     crate::args::check_pos("exit", args, 0, 1)?;
     match args.first() {
+        // a tuple is the exception's argument list (sys.exit((42,)) exits with 42)
+        Some(c) if tuple::is_tuple(c) => {
+            let e = ab::call(&crate::types::typeobject::type_ref(crate::types::exceptions::SystemExit()), tuple::tuple_items(c))?;
+            set_exc(e);
+            Err(PyErr)
+        }
         Some(c) => Err(set_err_obj(crate::types::exceptions::SystemExit(), c.to_ref())),
         None => Err(set_err_noargs(crate::types::exceptions::SystemExit())),
     }
@@ -356,9 +408,9 @@ fn sys_displayhook(_m: &PyObject, o: &PyObject) -> PyResult {
     Ok(none::none_ref())
 }
 
-fn sys_excepthook(_m: &PyObject, args: &[&PyObject]) -> PyResult {
-    crate::args::check_pos("excepthook", args, 3, 3)?;
-    let v = args[1];
+/// Print an exception (with traceback and chained exceptions) to sys.stderr, as
+/// sys.excepthook and PyErr_Display do; a non-exception is reported as such.
+pub fn display_exception(v: &PyObject) {
     if crate::types::exceptions::is_exception_instance(v) {
         // the interpreter's own report (sys.tracebacklimit keeps the
         // innermost entries, colours when stderr is a terminal)
@@ -369,6 +421,11 @@ fn sys_excepthook(_m: &PyObject, args: &[&PyObject]) -> PyResult {
             crate::types::typeobject::tname(v)
         ));
     }
+}
+
+fn sys_excepthook(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    crate::args::check_pos("excepthook", args, 3, 3)?;
+    display_exception(args[1]);
     Ok(none::none_ref())
 }
 
@@ -384,8 +441,20 @@ pub fn print_exception_full(v: &PyObject) {
         if let Ok(f) = ab::getattr_str(&tbm, "print_exception") {
             if let Some(err) = crate::modules::sys::get_sys_attr("stderr") {
                 if !err.is(none::none()) {
-                    let kwn = tuple::new_tuple(vec![pystr::new_str("file")]);
-                    if ab::call_kw(&f, &[v, &err], Some(&kwn)).is_ok() {
+                    // sys.tracebacklimit keeps the innermost entries (<= 0: none)
+                    let limit = match crate::modules::sys::get_sys_attr("tracebacklimit") {
+                        Some(l) if int::is_int(&l) => match int::as_i64(&l) {
+                            Some(n) if n <= 0 => int::new_int(0),
+                            Some(n) if n < (1 << 31) => int::new_int(-n),
+                            Some(_) => none::none_ref(),
+                            None => {
+                                if int::sign(&l) < 0 { int::new_int(0) } else { none::none_ref() }
+                            }
+                        },
+                        _ => none::none_ref(),
+                    };
+                    let kwn = tuple::new_tuple(vec![pystr::new_str("file"), pystr::new_str("limit")]);
+                    if ab::call_kw(&f, &[v, &err, &limit], Some(&kwn)).is_ok() {
                         return;
                     }
                 }
@@ -414,7 +483,7 @@ fn sys_breakpointhook(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) 
     let hook = match r {
         Ok(h) => h,
         Err(_) => {
-            if exc_matches(crate::types::exceptions::ImportError()) || exc_matches(crate::types::exceptions::AttributeError()) {
+            if exc_matches(crate::types::exceptions::ImportError()) || exc_matches(crate::types::exceptions::AttributeError()) || exc_matches(crate::types::exceptions::ValueError()) {
                 clear_exc();
                 crate::modules::warnings::warn(
                     crate::types::exceptions::RuntimeWarning(),
@@ -512,15 +581,35 @@ fn sys_unraisablehook(_m: &PyObject, a: &PyObject) -> PyResult {
 
 /// PyErr_WriteUnraisable / PyErr_FormatUnraisable implementation.
 pub fn write_unraisable(err_msg: Option<&str>, obj: Option<&PyObject>) {
+    write_unraisable_obj(err_msg.map(pystr::new_str), obj)
+}
+
+/// As write_unraisable, with the message as a str object (None: the hook's
+/// default wording). An exception without a traceback gets one for the current
+/// frame, so that the report says where it happened.
+pub fn write_unraisable_obj(err_msg: Option<PyRef>, obj: Option<&PyObject>) {
     let e = take_exc();
+    if let Some(e) = &e {
+        if crate::types::exceptions::is_exception_instance(e) && crate::types::exceptions::exc_traceback(e).is_none() {
+            let f = crate::interp::current_frame_ptr();
+            if !f.is_null() {
+                unsafe {
+                    let fo = crate::interp::eval::frame_object(&mut *f);
+                    let tb = crate::types::traceback::new_traceback(None, &*fo, (*f).lasti as i32, (*f).lineno());
+                    crate::types::exceptions::set_exc_traceback(e, Some(&tb));
+                }
+            }
+        }
+    }
     let tp = unraisable_args_type();
     let et = e.as_ref().map(|e| crate::types::typeobject::type_ref(e.type_ptr())).unwrap_or_else(none::none_ref);
     let ev = e.clone().unwrap_or_else(none::none_ref);
     let tb = e.as_ref().and_then(|e| crate::types::exceptions::exc_traceback(e)).unwrap_or_else(none::none_ref);
-    let m = err_msg.map(pystr::new_str).unwrap_or_else(none::none_ref);
+    let msg_text = err_msg.as_ref().map(|m| pystr::to_string_lossy(m));
+    let m = err_msg.unwrap_or_else(none::none_ref);
     let o = obj.map(|o| o.to_ref()).unwrap_or_else(none::none_ref);
     if tp.is_null() {
-        crate::modules::sys::write_stderr(&format!("{}\n", err_msg.unwrap_or("Exception ignored")));
+        crate::modules::sys::write_stderr(&format!("{}\n", msg_text.as_deref().unwrap_or("Exception ignored")));
         if let Some(e) = &e {
             crate::modules::traceback_print::print_exception(e);
         }
@@ -603,28 +692,30 @@ fn sys_getsizeof(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> Py
     static P: crate::args::Params = crate::args::Params::new("getsizeof", &["object", "default"], 0, 1);
     let [o, default] = crate::args::parse::<2>(&P, args, kw)?;
     let o = o.unwrap();
-    match ab::call_special_opt(o, crate::name!("__sizeof__"), &[]) {
-        Ok(Some(r)) => {
-            if !int::is_int(&r) {
-                raise!(TypeError, "an integer is required");
-            }
-            let n = match int::as_i64(&r) {
-                Some(n) => n,
-                None => {
-                    if int::sign(&r) < 0 {
-                        raise!(ValueError, "__sizeof__() should return >= 0");
-                    }
-                    raise!(OverflowError, "Python int too large to convert to C ssize_t");
-                }
-            };
-            if n < 0 {
-                raise!(ValueError, "__sizeof__() should return >= 0");
-            }
-            // like the free-threaded build: no GC header is reported (ours is internal),
-            // only the managed __dict__/__weakref__ pre-header
-            let extra = if unsafe { (*o.type_ptr()).tp_flags } & crate::ffi::Py_TPFLAGS_PREHEADER != 0 { crate::alloc::MANAGED as i64 } else { 0 };
-            Ok(int::new_int(n + extra))
+    let sized = ab::call_special_opt(o, crate::name!("__sizeof__"), &[]).and_then(|r| {
+        let Some(r) = r else { return Ok(None) };
+        if !int::is_int(&r) {
+            raise!(TypeError, "an integer is required");
         }
+        let n = match int::as_i64(&r) {
+            Some(n) => n,
+            None => {
+                if int::sign(&r) < 0 {
+                    raise!(ValueError, "__sizeof__() should return >= 0");
+                }
+                raise!(OverflowError, "Python int too large to convert to C ssize_t");
+            }
+        };
+        if n < 0 {
+            raise!(ValueError, "__sizeof__() should return >= 0");
+        }
+        // like the free-threaded build: no GC header is reported (ours is internal),
+        // only the managed __dict__/__weakref__ pre-header
+        let extra = if unsafe { (*o.type_ptr()).tp_flags } & crate::ffi::Py_TPFLAGS_PREHEADER != 0 { crate::alloc::MANAGED as i128 } else { 0 };
+        Ok(Some(int::new_int_i128(n as i128 + extra)))
+    });
+    match sized {
+        Ok(Some(r)) => Ok(r),
         Ok(None) => match default {
             Some(d) => Ok(d.to_ref()),
             None => raise!(TypeError, "Type {} doesn't define __sizeof__", crate::types::typeobject::tname(o)),
@@ -752,7 +843,16 @@ fn sys_getunicodeinternedsize(_m: &PyObject, args: &[&PyObject], kw: Option<&PyO
     let _ = crate::args::parse::<1>(&P, args, kw)?;
     Ok(int::new_int(0))
 }
+/// Allocator statistics on the C stderr. There is no pymalloc and there are no
+/// per-type free lists in this runtime (the small-object allocator keeps
+/// per-thread caches instead), so the free-list counts are all zero.
 fn sys_debugmallocstats(_m: &PyObject) -> PyResult {
+    let mut s = String::from("Small-object allocator: per-thread caches over 64 KiB pages (no pymalloc arenas)\n");
+    s.push_str(&format!("{:>10} tracked GC objects\n", crate::gc::tracked_count()));
+    for name in ["PyDictObjects", "PyListObjects", "PyFloatObjects", "PyTupleObjects"] {
+        s.push_str(&format!("{:>10} free {}\n", 0, name));
+    }
+    crate::modules::sys::write_fd(2, s.as_bytes());
     Ok(none::none_ref())
 }
 fn sys_get_coroutine_origin_tracking_depth(_m: &PyObject) -> PyResult {
@@ -1245,7 +1345,7 @@ pub fn import_site() -> PyResult<()> {
     Ok(())
 }
 
-fn call_module_func(module: &str, func: &str) {
+pub(crate) fn call_module_func(module: &str, func: &str) {
     if let Some(m) = crate::import::get_loaded_module(module) {
         let r = ab::getattr_str(&m, func).and_then(|f| ab::call(&f, &[]));
         if r.is_err() {
@@ -1259,7 +1359,7 @@ fn call_module_func(module: &str, func: &str) {
 }
 
 /// Flush a standard stream; returns false on failure (exception reported).
-fn flush_std(name: &str) -> bool {
+pub(crate) fn flush_std(name: &str) -> bool {
     if let Some(s) = crate::modules::sys::get_sys_attr(name) {
         if !s.is(none::none()) {
             if ab::call_method_str(&s, "flush", &[]).is_err() {
@@ -1273,12 +1373,7 @@ fn flush_std(name: &str) -> bool {
 
 /// Interpreter shutdown. Returns false if flushing sys.stdout failed (exit status 120).
 pub fn finalize() -> bool {
-    call_module_func("threading", "_shutdown");
-    call_module_func("atexit", "_run_exitfuncs");
-    FINALIZING.store(true, Release);
-    let ok = flush_std("stdout");
-    flush_std("stderr");
-    ok
+    crate::modules::sys_finalize::finalize()
 }
 
 pub fn populate(d: &PyObject) -> PyResult<()> {
@@ -1366,7 +1461,7 @@ pub fn populate(d: &PyObject) -> PyResult<()> {
         ),
     )?;
     let ti = ss::make_type("sys.thread_info", &["name", "lock", "version"], 3, false)?;
-    set("thread_info", &ss::new_instance(ti, vec![s("pthread"), s("mutex+cond"), thread_lib_version()]))?;
+    set("thread_info", &ss::new_instance(ti, vec![s("pthread"), s("pymutex"), thread_lib_version()]))?;
     let ua = ss::make_type("UnraisableHookArgs", &["exc_type", "exc_value", "exc_traceback", "err_msg", "object"], 5, false)?;
     UNRAISABLE_ARGS_TYPE.store(ua, Release);
     set("UnraisableHookArgs", crate::types::typeobject::type_obj(ua))?;

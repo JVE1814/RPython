@@ -501,20 +501,23 @@ pub unsafe extern "C" fn PyCode_GetFreevars(co: *mut PyObject) -> *mut PyObject 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyCode_Addr2Line(co: *mut PyObject, addr: c_int) -> c_int {
     unsafe {
-        if addr < 0 {
-            return ab::getattr_str(&*co, "co_firstlineno").ok().and_then(|v| int::as_i64(&v)).unwrap_or(-1) as c_int;
+        if co.is_null() || !code::is_code(&*co) {
+            return -1;
         }
-        code::line_for_instr(&*co, (addr / 2) as usize).map_or(-1, |l| l as c_int)
+        code::addr2line(&*co, addr as i64) as c_int
     }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyCode_Addr2Location(co: *mut PyObject, addr: c_int, sl: *mut c_int, sc: *mut c_int, el: *mut c_int, ec: *mut c_int) -> c_int {
     unsafe {
-        let l = PyCode_Addr2Line(co, addr);
+        if co.is_null() || !code::is_code(&*co) {
+            return 0;
+        }
+        let (l, c, e, x) = code::addr2location(&*co, addr as i64);
         *sl = l;
-        *el = l;
-        *sc = -1;
-        *ec = -1;
+        *sc = c;
+        *el = e;
+        *ec = x;
         1
     }
 }
@@ -522,22 +525,6 @@ pub unsafe extern "C" fn PyCode_Addr2Location(co: *mut PyObject, addr: c_int, sl
 pub unsafe extern "C" fn _PyCode_CheckLineNumber(addr: c_int, _bounds: *mut c_void) -> c_int {
     addr
 }
-/// Body shared by every code object created from C: it raises AssertionError when run
-/// (an "empty" code object must not crash the VM when executed). Built once by compiling
-/// `assert 0` and kept alive for the life of the process.
-fn c_code_stub() -> &'static PyObject {
-    static STUB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let p = *STUB.get_or_init(|| match crate::compile::compile_str("assert 0", "<C>", crate::compile::Mode::Exec, 0, 0) {
-        Ok(c) => c.code.into_raw() as usize,
-        Err(_) => {
-            clear_exc();
-            0
-        }
-    });
-    assert!(p != 0, "cannot build the stub body for C-created code objects");
-    unsafe { &*(p as *const PyObject) }
-}
-
 fn str_tuple(o: Option<&PyObject>, what: &str) -> PyResult<Vec<PyRef>> {
     let Some(o) = o else { return Ok(Vec::new()) };
     if !tuple::is_tuple(o) {
@@ -552,15 +539,16 @@ fn str_tuple(o: Option<&PyObject>, what: &str) -> PyResult<Vec<PyRef>> {
     Ok(v.into_iter().map(pystr::intern).collect())
 }
 
-/// What a C caller (PyUnstable_Code_New*, PyCode_NewEmpty) supplies. CPython-format
-/// bytecode, line tables and exception tables are accepted but not interpreted: these code
-/// objects carry metadata (names, flags, argument counts, file and first line) for
-/// tracebacks, frames and introspection; executing one raises AssertionError.
+/// What a C caller (PyUnstable_Code_New*, PyCode_NewEmpty) supplies. The bytecode,
+/// location table and exception table are CPython 3.15 public formats; the code object
+/// is executable (translated on first use like any other).
 pub(crate) struct CCodeArgs<'a> {
     pub argcount: i32,
     pub posonlyargcount: i32,
     pub kwonlyargcount: i32,
+    pub stacksize: i32,
     pub flags: i32,
+    pub code: Option<&'a PyObject>,
     pub consts: Option<&'a PyObject>,
     pub names: Option<&'a PyObject>,
     pub varnames: Option<&'a PyObject>,
@@ -570,90 +558,18 @@ pub(crate) struct CCodeArgs<'a> {
     pub name: &'a PyObject,
     pub qualname: Option<&'a PyObject>,
     pub firstlineno: i32,
-    /// CPython-format location table (bytes), if the caller supplied one.
     pub linetable: Option<&'a PyObject>,
+    pub exceptiontable: Option<&'a PyObject>,
 }
 
-/// Decode a location table in CPython's published code-object format into one location per
-/// 2-byte code unit. Each entry starts with a byte that has bit 7 set; bits 3-6 hold the
-/// entry kind and bits 0-2 the number of code units minus one. Kinds 0-9 keep the line and
-/// carry the start column in the kind (high bits) and the next byte (low 3 bits, then the
-/// width); 10-12 move the line by 0-2 and carry both columns in two bytes; 13 moves the line
-/// (signed varint) without columns; 14 moves the line and gives the end-line delta and both
-/// columns plus one as varints; 15 has no location. Varints are 6-bit groups, low group
-/// first, bit 6 meaning "more follows". Returns None for a malformed table.
-fn decode_location_table(t: &[u8], firstlineno: i32) -> Option<Vec<rpy_compiler::bytecode::Location>> {
-    use rpy_compiler::bytecode::Location;
-    let mut pos = 0usize;
-    let next = |pos: &mut usize| -> Option<u8> {
-        let b = *t.get(*pos)?;
-        *pos += 1;
-        Some(b)
-    };
-    let varint = |pos: &mut usize| -> Option<u64> {
-        let mut v = 0u64;
-        let mut shift = 0;
-        loop {
-            let b = next(pos)?;
-            v |= ((b & 63) as u64) << shift;
-            if b & 64 == 0 {
-                return Some(v);
-            }
-            shift += 6;
-            if shift > 60 {
-                return None;
-            }
-        }
-    };
-    let svarint = |pos: &mut usize| -> Option<i64> {
-        let u = varint(pos)?;
-        Some(if u & 1 != 0 { -((u >> 1) as i64) } else { (u >> 1) as i64 })
-    };
-    let mut line = firstlineno as i64;
-    let mut out = Vec::new();
-    while pos < t.len() {
-        let head = next(&mut pos)?;
-        if head & 0x80 == 0 {
-            return None;
-        }
-        let kind = (head >> 3) & 15;
-        let len = (head & 7) as usize + 1;
-        let as_u32 = |x: i64| if x <= 0 { 0 } else { x.min(u32::MAX as i64 - 1) as u32 };
-        let loc = match kind {
-            0..=9 => {
-                let b = next(&mut pos)?;
-                let col = (kind as u32) * 8 + ((b >> 4) & 7) as u32;
-                let l = as_u32(line);
-                Location { lineno: l, end_lineno: l, col, end_col: col + (b & 15) as u32 }
-            }
-            10..=12 => {
-                line += (kind - 10) as i64;
-                let c0 = next(&mut pos)? as u32;
-                let c1 = next(&mut pos)? as u32;
-                let l = as_u32(line);
-                Location { lineno: l, end_lineno: l, col: c0, end_col: c1 }
-            }
-            13 => {
-                line += svarint(&mut pos)?;
-                let l = as_u32(line);
-                Location { lineno: l, end_lineno: l, col: u32::MAX, end_col: u32::MAX }
-            }
-            14 => {
-                line += svarint(&mut pos)?;
-                let end = line + varint(&mut pos)? as i64;
-                let c0 = varint(&mut pos)?;
-                let c1 = varint(&mut pos)?;
-                let col = |c: u64| if c == 0 { u32::MAX } else { (c - 1).min(u32::MAX as u64 - 1) as u32 };
-                Location { lineno: as_u32(line), end_lineno: as_u32(end), col: col(c0), end_col: col(c1) }
-            }
-            _ => Location { lineno: 0, end_lineno: 0, col: u32::MAX, end_col: u32::MAX },
-        };
-        if out.len() + len > 1 << 20 {
-            return None;
-        }
-        out.extend(std::iter::repeat_n(loc, len));
-    }
-    Some(out)
+/// Body of PyCode_NewEmpty code objects: `RESUME 0; LOAD_COMMON_CONSTANT AssertionError;
+/// RAISE_VARARGS 1` (running one raises instead of crashing), all on the first line.
+fn empty_body(firstlineno: i32) -> (Vec<u8>, Vec<u8>) {
+    use crate::interp::wc::{self, op};
+    let code = vec![op::RESUME, 0, 0, 0, op::LOAD_COMMON_CONSTANT, 0, op::RAISE_VARARGS, 1];
+    let l = firstlineno.max(0) as u32;
+    let pos = wc::Position { lineno: Some(l), end_lineno: Some(l), col: None, end_col: None };
+    (code, wc::encode_linetable(&[(4, pos)], l))
 }
 
 pub(crate) fn new_code_from_c(a: CCodeArgs) -> PyResult {
@@ -672,9 +588,9 @@ pub(crate) fn new_code_from_c(a: CCodeArgs) -> PyResult {
         None => a.name,
     };
     let consts = match a.consts {
-        Some(c) if tuple::is_tuple(c) => c.to_ref(),
+        Some(c) if tuple::is_tuple(c) => tuple::tuple_to_vec(c),
         Some(_) => return Err(system_error("code: consts must be a tuple")),
-        None => tuple::new_tuple(Vec::new()),
+        None => Vec::new(),
     };
     let names = str_tuple(a.names, "names")?;
     let varnames = str_tuple(a.varnames, "varnames")?;
@@ -689,12 +605,19 @@ pub(crate) fn new_code_from_c(a: CCodeArgs) -> PyResult {
     let mut lpn: Vec<PyRef> = Vec::new();
     let mut kinds: Vec<u8> = Vec::new();
     for (i, n) in varnames.iter().enumerate() {
-        let k = if i < npos {
+        let k = if i < (a.posonlyargcount as usize).min(npos) {
             fast::LOCAL | fast::ARG_POS
+        } else if i < npos {
+            fast::LOCAL | fast::ARG_POS | fast::ARG_KW
         } else if i < npos + nkw {
             fast::LOCAL | fast::ARG_KW
         } else if i < npos + nkw + nstar {
-            fast::LOCAL | fast::ARG_VAR
+            let first_star = i == npos + nkw;
+            if first_star && flags & 0x4 != 0 {
+                fast::LOCAL | fast::ARG_VAR | fast::ARG_POS
+            } else {
+                fast::LOCAL | fast::ARG_VAR | fast::ARG_KW
+            }
         } else {
             fast::LOCAL
         };
@@ -714,73 +637,58 @@ pub(crate) fn new_code_from_c(a: CCodeArgs) -> PyResult {
         lpn.push(n.clone());
         kinds.push(fast::FREE);
     }
-    let stub = c_code_stub();
-    let sd = code::code_data(stub);
-    let line = a.firstlineno.max(0) as u32;
-    let first = rpy_compiler::bytecode::Location { lineno: line, end_lineno: line, col: u32::MAX, end_col: u32::MAX };
-    let mut code_words = sd.code.clone();
-    let mut locations = vec![first; sd.locations.len()];
-    // With a location table (Cython emits one per function), instruction i reports the
-    // table's entry for code unit i, so co_lines()/co_positions() give the source lines.
-    // The padding instructions after the stub's own are never reached.
-    if let Some(lt) = a.linetable.filter(|t| crate::types::bytes::is_bytes(t)) {
-        if let Some(units) = decode_location_table(crate::types::bytes::bytes_data(lt), a.firstlineno) {
-            while code_words.len() < units.len() {
-                code_words.push(rpy_compiler::bytecode::encode(rpy_compiler::bytecode::Op::Nop, 0));
-                locations.push(first);
-            }
-            for (slot, u) in locations.iter_mut().zip(units) {
-                *slot = u;
-            }
+    let bytes_or = |o: Option<&PyObject>, what: &str| -> PyResult<Option<PyRef>> {
+        match o {
+            None => Ok(None),
+            Some(b) if crate::types::bytes::is_bytes(b) => Ok(Some(b.to_ref())),
+            Some(_) => Err(system_error(&format!("code: {} must be bytes", what))),
         }
-    }
-    let parts = code::CodeParts {
-        argcount: a.argcount as u32,
-        posonlyargcount: a.posonlyargcount as u32,
-        kwonlyargcount: a.kwonlyargcount as u32,
-        flags,
-        stacksize: code::code(stub).obj.co_stacksize as u32,
-        firstlineno: line,
-        code: code_words,
-        lines: code::Lines::Decoded(&locations),
-        exception_table: sd.exception_table.clone(),
-        exctable_raw: None,
+    };
+    let (code, linetable, stacksize) = match bytes_or(a.code, "code")? {
+        Some(c) => (c, bytes_or(a.linetable, "linetable")?.unwrap_or_else(|| crate::types::bytes::new_bytes(b"")), a.stacksize),
+        None => {
+            let (c, l) = empty_body(a.firstlineno);
+            (crate::types::bytes::new_bytes(&c), crate::types::bytes::new_bytes(&l), a.stacksize.max(1))
+        }
+    };
+    let exceptiontable = bytes_or(a.exceptiontable, "exceptiontable")?.unwrap_or_else(|| crate::types::bytes::new_bytes(b""));
+    code::new_code_from_public(code::PublicParts {
+        argcount: a.argcount,
+        posonlyargcount: a.posonlyargcount,
+        kwonlyargcount: a.kwonlyargcount,
+        stacksize,
+        flags: a.flags,
+        firstlineno: a.firstlineno,
+        code,
+        consts,
+        names,
+        localsplusnames: lpn,
         kinds,
         filename: a.filename.to_ref(),
-        consts: sd.consts.tuple().clone(),
-        names: sd.names.tuple().clone(),
-        localsplusnames: tuple::new_tuple(lpn),
         name: pystr::intern(a.name.to_ref()),
         qualname: qualname.to_ref(),
-    };
-    let r = code::new_code_from_parts(parts)?;
-    // co_consts / co_names show the caller's tuples; the stub body keeps its own
-    // constants and names in the code data.
-    unsafe {
-        let c = &mut *(r.as_ptr() as *mut code::PyCodeObject);
-        let old = std::mem::replace(&mut c.co_consts, consts.into_raw());
-        xdecref(old);
-        let old = std::mem::replace(&mut c.co_names, tuple::new_tuple(names).into_raw());
-        xdecref(old);
-    }
-    Ok(r)
+        linetable,
+        exceptiontable,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
 unsafe fn code_new_c(
-    a: c_int, p: c_int, k: c_int, f: c_int, consts: *mut PyObject, names: *mut PyObject, varnames: *mut PyObject,
-    freevars: *mut PyObject, cellvars: *mut PyObject, filename: *mut PyObject, name: *mut PyObject, qualname: *mut PyObject,
-    fl: c_int, lt: *mut PyObject,
+    a: c_int, p: c_int, k: c_int, s: c_int, f: c_int, code: *mut PyObject, consts: *mut PyObject, names: *mut PyObject,
+    varnames: *mut PyObject, freevars: *mut PyObject, cellvars: *mut PyObject, filename: *mut PyObject, name: *mut PyObject,
+    qualname: *mut PyObject, fl: c_int, lt: *mut PyObject, et: *mut PyObject,
 ) -> *mut PyObject {
     unsafe {
-        if filename.is_null() || name.is_null() {
+        if filename.is_null() || name.is_null() || code.is_null() {
             return null_arg();
         }
         ret(new_code_from_c(CCodeArgs {
             argcount: a,
             posonlyargcount: p,
             kwonlyargcount: k,
+            stacksize: s,
             flags: f,
+            code: opt(code),
             consts: opt(consts),
             names: opt(names),
             varnames: opt(varnames),
@@ -791,87 +699,9 @@ unsafe fn code_new_c(
             qualname: opt(qualname),
             firstlineno: fl,
             linetable: opt(lt),
+            exceptiontable: opt(et),
         }))
     }
-}
-
-/// `types.CodeType(argcount, posonlyargcount, kwonlyargcount, nlocals, stacksize, flags,
-/// codestring, constants, names, varnames, filename, name, qualname, firstlineno, linetable,
-/// exceptiontable, freevars=(), cellvars=(), /)`. Like the C constructors, the result carries
-/// the given metadata over the shared stub body (the bytecode argument is checked for type
-/// only); used e.g. by limited-API Cython modules for their functions' `__code__`.
-pub(crate) unsafe extern "C" fn code_tp_new(_t: *mut PyTypeObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
-    unsafe { ret(code_new_impl(&*args, opt(kw))) }
-}
-
-fn code_new_impl(args: &PyObject, kw: Option<&PyObject>) -> PyResult {
-    if let Some(k) = kw {
-        if dict::dict_len(k) != 0 {
-            raise!(TypeError, "code() takes no keyword arguments");
-        }
-    }
-    let a = tuple::tuple_to_vec(args);
-    if a.len() < 16 || a.len() > 18 {
-        let (what, n) = if a.len() < 16 { ("at least", 16) } else { ("at most", 18) };
-        raise!(TypeError, "code expected {} {} arguments, got {}", what, n, a.len());
-    }
-    let int_arg = |i: usize, what: &str| -> PyResult<i32> {
-        if !int::is_int(&a[i]) {
-            raise!(TypeError, "code() argument {} must be int, not {}", i + 1, tname(&a[i]));
-        }
-        let v = ab::as_i64(&a[i])?;
-        if v < i32::MIN as i64 || v > i32::MAX as i64 {
-            raise!(OverflowError, "code: {} is out of range", what);
-        }
-        Ok(v as i32)
-    };
-    let typed = |i: usize, ok: bool, tn: &str| -> PyResult<()> {
-        if !ok {
-            raise!(TypeError, "code() argument {} must be {}, not {}", i + 1, tn, tname(&a[i]));
-        }
-        Ok(())
-    };
-    let argcount = int_arg(0, "argcount")?;
-    let posonly = int_arg(1, "posonlyargcount")?;
-    let kwonly = int_arg(2, "kwonlyargcount")?;
-    let nlocals = int_arg(3, "nlocals")?;
-    let _stacksize = int_arg(4, "stacksize")?;
-    let flags = int_arg(5, "flags")?;
-    typed(6, crate::types::bytes::is_bytes(&a[6]), "bytes")?;
-    for i in [7, 8, 9] {
-        typed(i, tuple::is_tuple(&a[i]), "tuple")?;
-    }
-    for i in [10, 11, 12] {
-        typed(i, pystr::is_str(&a[i]), "str")?;
-    }
-    let firstlineno = int_arg(13, "firstlineno")?;
-    typed(14, crate::types::bytes::is_bytes(&a[14]), "bytes")?;
-    typed(15, crate::types::bytes::is_bytes(&a[15]), "bytes")?;
-    for i in 16..a.len() {
-        typed(i, tuple::is_tuple(&a[i]), "tuple")?;
-    }
-    if argcount < posonly || posonly < 0 || kwonly < 0 || nlocals < 0 {
-        raise!(ValueError, "code: argcount must not be negative");
-    }
-    if nlocals as usize != tuple::tuple_len(&a[9]) {
-        raise!(ValueError, "code: co_nlocals != len(co_varnames)");
-    }
-    new_code_from_c(CCodeArgs {
-        argcount,
-        posonlyargcount: posonly,
-        kwonlyargcount: kwonly,
-        flags,
-        consts: Some(&a[7]),
-        names: Some(&a[8]),
-        varnames: Some(&a[9]),
-        freevars: a.get(16).map(|x| &**x),
-        cellvars: a.get(17).map(|x| &**x),
-        filename: &a[10],
-        name: &a[11],
-        qualname: Some(&a[12]),
-        firstlineno,
-        linetable: Some(&a[14]),
-    })
 }
 
 #[unsafe(no_mangle)]
@@ -883,7 +713,9 @@ pub unsafe extern "C" fn PyCode_NewEmpty(filename: *const c_char, funcname: *con
             argcount: 0,
             posonlyargcount: 0,
             kwonlyargcount: 0,
+            stacksize: 0,
             flags: 0,
+            code: None,
             consts: None,
             names: None,
             varnames: None,
@@ -894,6 +726,7 @@ pub unsafe extern "C" fn PyCode_NewEmpty(filename: *const c_char, funcname: *con
             qualname: None,
             firstlineno,
             linetable: None,
+            exceptiontable: None,
         }))
     }
 }
@@ -903,46 +736,100 @@ pub unsafe extern "C" fn PyCode_Optimize(code: *mut PyObject, _c: *mut PyObject,
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_Code_New(
-    a: c_int, k: c_int, _n: c_int, _s: c_int, f: c_int, _code: *mut PyObject, consts: *mut PyObject, names: *mut PyObject,
+    a: c_int, k: c_int, _n: c_int, s: c_int, f: c_int, code: *mut PyObject, consts: *mut PyObject, names: *mut PyObject,
     varnames: *mut PyObject, freevars: *mut PyObject, cellvars: *mut PyObject, filename: *mut PyObject, name: *mut PyObject,
-    qualname: *mut PyObject, fl: c_int, _lt: *mut PyObject, _et: *mut PyObject,
+    qualname: *mut PyObject, fl: c_int, lt: *mut PyObject, et: *mut PyObject,
 ) -> *mut PyObject {
-    unsafe { code_new_c(a, 0, k, f, consts, names, varnames, freevars, cellvars, filename, name, qualname, fl, _lt) }
+    unsafe { code_new_c(a, 0, k, s, f, code, consts, names, varnames, freevars, cellvars, filename, name, qualname, fl, lt, et) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_Code_NewWithPosOnlyArgs(
-    a: c_int, p: c_int, k: c_int, _n: c_int, _s: c_int, f: c_int, _code: *mut PyObject, consts: *mut PyObject,
+    a: c_int, p: c_int, k: c_int, _n: c_int, s: c_int, f: c_int, code: *mut PyObject, consts: *mut PyObject,
     names: *mut PyObject, varnames: *mut PyObject, freevars: *mut PyObject, cellvars: *mut PyObject, filename: *mut PyObject,
-    name: *mut PyObject, qualname: *mut PyObject, fl: c_int, _lt: *mut PyObject, _et: *mut PyObject,
+    name: *mut PyObject, qualname: *mut PyObject, fl: c_int, lt: *mut PyObject, et: *mut PyObject,
 ) -> *mut PyObject {
-    unsafe { code_new_c(a, p, k, f, consts, names, varnames, freevars, cellvars, filename, name, qualname, fl, _lt) }
+    unsafe { code_new_c(a, p, k, s, f, code, consts, names, varnames, freevars, cellvars, filename, name, qualname, fl, lt, et) }
 }
+// co_extra (PEP 523 scratch space): the code object's `co_extra` slot (`_reserved[6]` in our
+// PyCodeObject, where CPython keeps it) points to a boxed vector of per-index values; the
+// free functions registered with PyUnstable_Eval_RequestCodeExtraIndex run when a value is
+// replaced and when the code object is deallocated.
 static CODE_EXTRA: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
-static CODE_EXTRA_DATA: std::sync::Mutex<Vec<(usize, isize, usize)>> = std::sync::Mutex::new(Vec::new());
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_Eval_RequestCodeExtraIndex(free: *mut c_void) -> Py_ssize_t {
     let mut g = CODE_EXTRA.lock().unwrap();
+    if g.len() >= 255 {
+        return -1;
+    }
     g.push(free as usize);
     (g.len() - 1) as Py_ssize_t
+}
+fn extra_free_fn(index: usize) -> Option<unsafe extern "C" fn(*mut c_void)> {
+    let f = *CODE_EXTRA.lock().unwrap().get(index)?;
+    if f == 0 { None } else { Some(unsafe { std::mem::transmute::<usize, unsafe extern "C" fn(*mut c_void)>(f) }) }
+}
+unsafe fn extra_slot(co: *mut PyObject) -> *mut usize {
+    unsafe { &mut (*(co as *mut code::PyCodeObject))._reserved[6] as *mut usize }
+}
+/// Called by the code object's deallocator.
+pub(crate) unsafe fn free_code_extras(co: *mut PyObject) {
+    unsafe {
+        let slot = extra_slot(co);
+        if *slot == 0 {
+            return;
+        }
+        let v = Box::from_raw(*slot as *mut Vec<usize>);
+        *slot = 0;
+        for (i, &x) in v.iter().enumerate() {
+            if x != 0 {
+                if let Some(f) = extra_free_fn(i) {
+                    f(x as *mut c_void);
+                }
+            }
+        }
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_Code_GetExtra(co: *mut PyObject, index: Py_ssize_t, extra: *mut *mut c_void) -> c_int {
     unsafe {
-        let g = CODE_EXTRA_DATA.lock().unwrap();
-        *extra = g.iter().find(|(c, i, _)| *c == co as usize && *i == index).map_or(std::ptr::null_mut(), |x| x.2 as *mut c_void);
+        if co.is_null() || !code::is_code(&*co) {
+            let _ = bad_internal();
+            return -1;
+        }
+        *extra = std::ptr::null_mut();
+        let slot = extra_slot(co);
+        if index >= 0 && *slot != 0 {
+            if let Some(&x) = (&*(*slot as *const Vec<usize>)).get(index as usize) {
+                *extra = x as *mut c_void;
+            }
+        }
         0
     }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_Code_SetExtra(co: *mut PyObject, index: Py_ssize_t, extra: *mut c_void) -> c_int {
-    if index < 0 || index as usize >= CODE_EXTRA.lock().unwrap().len() {
-        let _ = bad_internal();
-        return -1;
+    unsafe {
+        if co.is_null() || !code::is_code(&*co) || index < 0 || index as usize >= CODE_EXTRA.lock().unwrap().len() {
+            let _ = bad_internal();
+            return -1;
+        }
+        let slot = extra_slot(co);
+        if *slot == 0 {
+            *slot = Box::into_raw(Box::new(Vec::<usize>::new())) as usize;
+        }
+        let v = &mut *(*slot as *mut Vec<usize>);
+        let i = index as usize;
+        if v.len() <= i {
+            v.resize(i + 1, 0);
+        }
+        let old = std::mem::replace(&mut v[i], extra as usize);
+        if old != 0 {
+            if let Some(f) = extra_free_fn(i) {
+                f(old as *mut c_void);
+            }
+        }
+        0
     }
-    let mut g = CODE_EXTRA_DATA.lock().unwrap();
-    g.retain(|(c, i, _)| !(*c == co as usize && *i == index));
-    g.push((co as usize, index, extra as usize));
-    0
 }
 
 // ---------------------------------------------------------------- frames

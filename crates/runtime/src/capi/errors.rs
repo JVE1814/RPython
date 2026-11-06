@@ -228,17 +228,37 @@ pub unsafe extern "C" fn PyErr_NormalizeException(t: *mut *mut PyObject, v: *mut
 }
 
 pub(crate) fn given_matches(given: &PyObject, exc_: &PyObject) -> bool {
-    if tuple::is_tuple(exc_) {
-        // nested tuples recurse: a RecursionError is reported as unraisable (core-runtime)
-        let ts = crate::threads::current();
-        if crate::interp::enter_recursive_call(ts, " in PyErr_GivenExceptionMatches").is_err() {
+    match given_matches_nested(given, exc_) {
+        Ok(r) => r,
+        Err(_) => {
+            // nesting too deep: reported as unraisable once back at the caller's depth
             crate::modules::sys_full::write_unraisable(None, None);
-            return false;
+            false
         }
-        let r = tuple::tuple_items(exc_).iter().any(|e| given_matches(given, e));
+    }
+}
+
+fn given_matches_nested(given: &PyObject, exc_: &PyObject) -> PyResult<bool> {
+    if tuple::is_tuple(exc_) {
+        let ts = crate::threads::current();
+        crate::interp::enter_recursive_call(ts, " in PyErr_GivenExceptionMatches")?;
+        let mut r = Ok(false);
+        for e in tuple::tuple_items(exc_) {
+            match given_matches_nested(given, e) {
+                Ok(false) => {}
+                other => {
+                    r = other;
+                    break;
+                }
+            }
+        }
         crate::interp::leave_recursive_call(ts);
         return r;
     }
+    Ok(given_matches_leaf(given, exc_))
+}
+
+fn given_matches_leaf(given: &PyObject, exc_: &PyObject) -> bool {
     let g = if exc::is_exception_instance(given) { typeobject::type_obj(given.type_ptr()) } else { given };
     if is_exc_class(g) && is_exc_class(exc_) {
         return typeobject::is_subtype(typeobject::as_type(g), typeobject::as_type(exc_));
@@ -805,56 +825,16 @@ pub unsafe extern "C" fn PyErr_WarnExplicitFormat(
 // ---------------------------------------------------------------- unraisable / display
 
 pub(crate) fn write_unraisable_msg(msg: Option<PyRef>, obj: *mut PyObject) {
-    let Some(e) = take_exc() else { return };
-    let r = (|| -> PyResult<()> {
-        let hook = crate::modules::sys::get_sys_attr("unraisablehook");
-        let tb = exc::exc_traceback(&e).unwrap_or_else(none::none_ref);
-        let t = type_ref(e.type_ptr());
-        let m = msg.clone().unwrap_or_else(none::none_ref);
-        let o = unsafe { opt(obj) }.map(|o| o.to_ref()).unwrap_or_else(none::none_ref);
-        if let Some(hook) = hook {
-            // build a simple namespace-like object: types.SimpleNamespace if available
-            let ns = match crate::import::import_absolute("types").and_then(|t| ab::getattr_str(&t, "SimpleNamespace")) {
-                Ok(sn) => {
-                    let kw = dict::new_dict();
-                    dict::set_item_str(&kw, "exc_type", &t)?;
-                    dict::set_item_str(&kw, "exc_value", &e)?;
-                    dict::set_item_str(&kw, "exc_traceback", &tb)?;
-                    dict::set_item_str(&kw, "err_msg", &m)?;
-                    dict::set_item_str(&kw, "object", &o)?;
-                    ab::call_with_kwargs_dict(&sn, &[], Some(&kw))?
-                }
-                Err(_) => {
-                    clear_exc();
-                    return Err(PyErr);
-                }
-            };
-            ab::call(&hook, &[&ns])?;
-            return Ok(());
-        }
-        Err(PyErr)
-    })();
-    if r.is_err() {
-        clear_exc();
-        let text = match &msg {
-            Some(m) => pystr::to_string_lossy(m),
-            None => "Exception ignored in".to_string(),
-        };
-        let o = unsafe { opt(obj) };
-        let line = match o {
-            Some(o) => format!("{}: {}\n", text, ab::repr_string(o).unwrap_or_else(|_| "<object repr() failed>".into())),
-            None => format!("{}:\n", text),
-        };
-        clear_exc();
-        crate::modules::sys::write_stderr(&line);
-        crate::modules::traceback_print::print_exception(&e);
+    if !err_occurred() {
+        return;
     }
+    crate::modules::sys_full::write_unraisable_obj(msg, unsafe { opt(obj) });
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyErr_WriteUnraisable(obj: *mut PyObject) {
-    let msg = if obj.is_null() { None } else { Some(pystr::new_str("Exception ignored in")) };
-    write_unraisable_msg(msg, obj)
+    // the hook gets err_msg=None and words the report itself
+    write_unraisable_msg(None, obj)
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyErr_FormatUnraisable(fmt: *const c_char, mut args: ...) {
@@ -881,14 +861,16 @@ pub unsafe extern "C" fn PyErr_FormatUnraisable(fmt: *const c_char, mut args: ..
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyErr_DisplayException(e: *mut PyObject) {
     unsafe {
-        crate::modules::traceback_print::print_exception(&*e);
+        if !e.is_null() {
+            crate::modules::sys_full::display_exception(&*e);
+        }
     }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyErr_Display(_t: *mut PyObject, v: *mut PyObject, _tb: *mut PyObject) {
     unsafe {
         if !v.is_null() {
-            crate::modules::traceback_print::print_exception(&*v);
+            crate::modules::sys_full::display_exception(&*v);
         }
     }
 }

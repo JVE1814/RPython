@@ -171,7 +171,7 @@ fn parse_error(e: &rpy_parser::SyntaxError, filename: &str) -> PyErr {
     raise_syntax_error(class, &e.msg, filename, e.lineno, e.offset, e.text.as_deref(), e.end_lineno, e.end_offset)
 }
 
-fn compile_error(e: &rpy_compiler::CompileError, filename: &str, src: Option<&str>) -> PyErr {
+pub(crate) fn compile_error(e: &rpy_compiler::CompileError, filename: &str, src: Option<&str>) -> PyErr {
     use rpy_compiler::ErrorKind as K;
     let class = match e.kind {
         K::SyntaxError => crate::types::exceptions::SyntaxError(),
@@ -182,9 +182,18 @@ fn compile_error(e: &rpy_compiler::CompileError, filename: &str, src: Option<&st
         K::SystemError => return err!(SystemError, "{}", e.msg),
         K::MemoryError => return memory_error(),
     };
-    let text = src.and_then(|s| source_line(s, e.lineno));
+    // errors found after parsing (symtable, code generation) take their text from
+    // the file, as CPython does: none for compile()d strings
+    let text = crate::modules::sys_full::source_line(filename, e.lineno).map(|t| {
+        if e.lineno == 1 { t.trim_start_matches('\u{feff}').to_string() } else { t }
+    });
+    let have_text = text.is_some();
     let to_offset = |line: i32, col: i32| -> i32 {
-        // convert byte column to 1-based char offset
+        // byte column -> 1-based character offset; without the text to convert
+        // with, the offset stays in bytes (as CPython reports it)
+        if !have_text {
+            return col + 1;
+        }
         match src.and_then(|s| source_line(s, line)) {
             Some(l) => {
                 let b = (col.max(0) as usize).min(l.len());
@@ -384,11 +393,29 @@ pub fn compile_mod(module: &rpy_parser::ast::Mod, o: &Opts, src: Option<&str>) -
     let mut copts = CompileOptions::new(filename, o.mode.c());
     copts.flags = o.flags;
     copts.optimize = if o.optimize < 0 { crate::modules::sys::optimize_flag() } else { o.optimize };
-    let out = match rpy_compiler::compile(module, &copts) {
-        Ok(o) => o,
-        Err(e) => return Err(compile_error(&e, filename, src)),
+    // D24: RPYTHON_WORDCODE=1 selects the CPython 3.15 wordcode pipeline
+    let (legacy, wcode, warnings, future_flags) = if crate::types::code::public_mode() {
+        match rpy_compiler::compile_wordcode(module, &copts) {
+            Ok(o) => (None, Some(o.code), o.warnings, o.future_flags),
+            // transition: an internal error of the new pipeline falls back to the legacy one
+            Err(e) if matches!(e.kind, rpy_compiler::error::ErrorKind::SystemError) => {
+                if std::env::var_os("RPYTHON_TRANSLATE_CHECK").is_some() {
+                    eprintln!("WORDCODE-COMPILE-ERROR {}: {}", filename, e.msg);
+                }
+                match rpy_compiler::compile(module, &copts) {
+                    Ok(o) => (Some(o.code), None, o.warnings, o.future_flags),
+                    Err(e) => return Err(compile_error(&e, filename, src)),
+                }
+            }
+            Err(e) => return Err(compile_error(&e, filename, src)),
+        }
+    } else {
+        match rpy_compiler::compile(module, &copts) {
+            Ok(o) => (Some(o.code), None, o.warnings, o.future_flags),
+            Err(e) => return Err(compile_error(&e, filename, src)),
+        }
     };
-    for w in &out.warnings {
+    for w in &warnings {
         let cat = format!("{:?}", w.category);
         let text = src.and_then(|s| source_line(s, w.lineno));
         let off = match &text {
@@ -409,8 +436,12 @@ pub fn compile_mod(module: &rpy_parser::ast::Mod, o: &Opts, src: Option<&str>) -
         emit_warning_m(&cat, &w.msg, &w.msg, filename, w.lineno, off, text.as_deref(), o.module, (Some(w.end_lineno), Some(end_off)))?;
     }
     let fname = pystr::intern_str(filename);
-    let code = crate::types::code::new_code_from_unit(&out.code, Some(&fname))?;
-    Ok(Compiled { code, future_flags: out.future_flags })
+    let code = match (&legacy, &wcode) {
+        (Some(cu), _) => crate::types::code::new_code_from_unit(cu, Some(&fname))?,
+        (_, Some(co)) => crate::types::code::new_code_from_wordcode(co, Some(&fname))?,
+        _ => unreachable!(),
+    };
+    Ok(Compiled { code, future_flags })
 }
 
 /// AST-level optimization of `ast.parse(..., optimize=N)` / PyCF_OPTIMIZED_AST.

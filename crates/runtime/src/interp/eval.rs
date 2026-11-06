@@ -242,7 +242,7 @@ fn add_traceback(f: &mut Frame, e: &PyObject) {
     let fo = frame_object(f);
     let prev = exc::exc_traceback(e);
     let lineno = f.lineno();
-    let tb = crate::types::traceback::new_traceback(prev.as_deref(), unsafe { &*fo }, f.lasti as i32, lineno);
+    let tb = crate::types::traceback::new_traceback(prev.as_deref(), unsafe { &*fo }, crate::types::code::lasti_bytes(f.code(), f.lasti as usize) as i32, lineno);
     exc::set_exc_traceback(e, Some(&tb));
 }
 
@@ -620,7 +620,16 @@ pub(super) fn call_intrinsic2(f: &mut Frame, which: u32, a: PyRef, b: PyRef) -> 
     let which: Intrinsic2 = unsafe { std::mem::transmute(which as u8) };
     let _ = f;
     match which {
-        Intrinsic2::PrepReraiseStar => crate::types::exceptiongroup::prep_reraise_star(&a, &b),
+        Intrinsic2::PrepReraiseStar => {
+            let r = crate::types::exceptiongroup::prep_reraise_star(&a, &b)?;
+            // a group made here (the wrapper of a naked exception, or a new
+            // combination) has not been raised yet: its traceback starts at
+            // this frame's except* statement
+            if exc::is_exception_instance(&r) && exc::exc_traceback(&r).is_none() {
+                add_traceback(f, &r);
+            }
+            Ok(r)
+        }
         Intrinsic2::TypeVarWithBound => crate::types::typevar::make_typevar(&a, Some(&b), None, false),
         Intrinsic2::TypeVarWithConstraints => crate::types::typevar::make_typevar(&a, None, Some(&b), false),
         Intrinsic2::SetFunctionTypeParams => {
@@ -665,6 +674,43 @@ fn get_awaitable(o: &PyObject, where_: u32) -> PyResult {
     }
 }
 
+/// LOAD_SPECIAL: look up a context-manager method on type(o). Returns (callable,
+/// self_or_null) like LoadMethod.
+pub(super) fn load_special(o: &PyObject, which: u32) -> PyResult<(PyRef, Option<PyRef>)> {
+    let names = [name!("__enter__"), name!("__exit__"), name!("__aenter__"), name!("__aexit__")];
+    let nm = names[(which & 3) as usize];
+    match lookup(o.type_ptr(), nm) {
+        Some(m) => {
+            if m.ty().tp_flags & Py_TPFLAGS_METHOD_DESCRIPTOR != 0 {
+                return Ok((m, Some(o.to_ref())));
+            }
+            let bound = match m.ty().tp_descr_get {
+                Some(g) => unsafe { from_c(g(m.as_ptr(), o.as_ptr(), o.type_ptr() as *mut PyObject))? },
+                None => m,
+            };
+            Ok((bound, None))
+        }
+        None => {
+            let sync = which < 2;
+            let kind = if sync { "" } else { "asynchronous " };
+            let (oe, ox, hint) = if sync {
+                (name!("__aenter__"), name!("__aexit__"), " but it supports the asynchronous context manager protocol. Did you mean to use 'async with'?")
+            } else {
+                (name!("__enter__"), name!("__exit__"), " but it supports the context manager protocol. Did you mean to use 'with'?")
+            };
+            let other = lookup(o.type_ptr(), oe).is_some() && lookup(o.type_ptr(), ox).is_some();
+            raise!(
+                TypeError,
+                "'{}' object does not support the {}context manager protocol (missed {} method){}",
+                tname(o),
+                kind,
+                pystr::to_string_lossy(nm),
+                if other { hint } else { "" }
+            );
+        }
+    }
+}
+
 /// Run (or resume) a frame. `throw`: an exception to raise at the resume point.
 pub fn eval_frame(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult<Exit> {
     let prev = ts.frame.get();
@@ -690,6 +736,22 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
     let cd = crate::types::code::code_data(&code_obj);
     let code: &[u32] = &cd.code;
     let caches = cd.caches.tables(code); // jit workstream: inline caches / profiles
+    // bc-vm: specialisation view of public code (interp/adaptive.rs); `adapt_once` for
+    // classifications too costly to repeat
+    macro_rules! adapt {
+        ($e:expr) => {
+            if super::adaptive::active(cd) {
+                super::adaptive::note(cd, f.lasti as usize, $e);
+            }
+        };
+    }
+    macro_rules! adapt_once {
+        ($e:expr) => {
+            if super::adaptive::active(cd) && !super::adaptive::seen(cd, f.lasti as usize) {
+                super::adaptive::note(cd, f.lasti as usize, $e);
+            }
+        };
+    }
     let mut pc: usize = f.next_instr as usize;
     f.yield_from_send = -1;
     let tracing = crate::modules::sys::tracing_active();
@@ -745,6 +807,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                     }
                     match op {
                         Op::Nop | Op::Resume => {
+                            if op == Op::Resume { adapt!(rpy_compiler::wordcode::opcodes::RESUME_CHECK); }
                             let eb = ts.c.eval_breaker.load(std::sync::atomic::Ordering::Relaxed);
                             if eb != 0 {
                                 handle_eval_breaker(ts)?;
@@ -808,6 +871,10 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             let n = arg as usize;
                             let func = f.func;
                             if func.is_null() {
+                                // exec(code, closure=...) placed the cells already
+                                if (f.nlocalsplus - n..f.nlocalsplus).all(|i| !f.slots[i].is_null()) {
+                                    continue;
+                                }
                                 return Err(system_error("CopyFreeVars without function"));
                             }
                             let clos = funcobject::func(unsafe { &*func }).func_closure;
@@ -918,6 +985,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                         }
                         Op::LoadGlobal => {
                             let nm = &cd.names[arg as usize];
+                            adapt_once!(super::adaptive::load_global(f.globals(), f.builtins(), nm));
                             let v = super::specialize::load_global(f, nm, caches.entry(f.lasti as usize))?;
                             push!(f, v.into_raw());
                         }
@@ -942,17 +1010,20 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                         }
                         Op::LoadAttr => {
                             let o = popref!(f);
+                            adapt!(super::adaptive::load_attr(&o, &cd.names[arg as usize], false));
                             let v = super::specialize::load_attr(&o, &cd.names[arg as usize], caches.poly(f.lasti as usize))?;
                             push!(f, v.into_raw());
                         }
                         Op::LoadMethod => {
                             let o = popref!(f);
+                            adapt!(super::adaptive::load_attr(&o, &cd.names[arg as usize], true));
                             let (m, s) = super::specialize::load_method(&o, &cd.names[arg as usize], caches.poly(f.lasti as usize))?;
                             push!(f, m.into_raw());
                             push!(f, s.map_or(std::ptr::null_mut(), |s| s.into_raw()));
                         }
                         Op::StoreAttr => {
                             let o = popref!(f);
+                            adapt!(super::adaptive::store_attr(&o, &cd.names[arg as usize]));
                             let v = popref!(f);
                             super::specialize::store_attr(&o, &cd.names[arg as usize], &v, caches.poly(f.lasti as usize))?;
                         }
@@ -961,6 +1032,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             ab::delattr(&o, &cd.names[arg as usize])?;
                         }
                         Op::LoadSuperAttr => {
+                            adapt!(super::adaptive::load_super_attr(unsafe { &*peek!(f, 3) }, arg & 1 != 0));
                             let slf = popref!(f);
                             let cls = popref!(f);
                             let gsuper = popref!(f);
@@ -982,6 +1054,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             }
                         }
                         Op::BinaryOp => {
+                            adapt!(super::adaptive::binary(arg, unsafe { &*peek!(f, 2) }, unsafe { &*peek!(f, 1) }));
                             let b = popref!(f);
                             let a = popref!(f);
                             let r = binary_op_on_stack(BINOPS[arg as usize], &a, &b)?;
@@ -1010,11 +1083,13 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             push!(f, bool_::new_bool(!t).into_raw());
                         }
                         Op::ToBool => {
+                            adapt!(super::adaptive::to_bool(unsafe { &*peek!(f, 1) }));
                             let a = popref!(f);
                             let t = ab::is_true(&a)?;
                             push!(f, bool_::new_bool(t).into_raw());
                         }
                         Op::CompareOp => {
+                            adapt!(super::adaptive::compare(arg & 15, unsafe { &*peek!(f, 2) }, unsafe { &*peek!(f, 1) }));
                             let b = popref!(f);
                             let a = popref!(f);
                             let cop = (arg & 15) as std::ffi::c_int;
@@ -1032,12 +1107,14 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             push!(f, bool_::new_bool(a.is(&b) != (arg == 1)).into_raw());
                         }
                         Op::ContainsOp => {
+                            adapt!(super::adaptive::contains(unsafe { &*peek!(f, 1) }));
                             let b = popref!(f);
                             let a = popref!(f);
                             let r = ab::contains(&b, &a)?;
                             push!(f, bool_::new_bool(r != (arg == 1)).into_raw());
                         }
                         Op::BinarySubscr => {
+                            adapt!(super::adaptive::binary(26, unsafe { &*peek!(f, 2) }, unsafe { &*peek!(f, 1) }));
                             let k = popref!(f);
                             let c = popref!(f);
                             let r = if list::is_list_exact(&c) && int::is_int_exact(&k) && int::is_compact(&k) {
@@ -1069,6 +1146,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             push!(f, r.into_raw());
                         }
                         Op::StoreSubscr => {
+                            adapt!(super::adaptive::store_subscr(unsafe { &*peek!(f, 2) }, unsafe { &*peek!(f, 1) }));
                             let k = popref!(f);
                             let c = popref!(f);
                             let v = popref!(f);
@@ -1205,21 +1283,17 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                         Op::DictUpdate => {
                             let o = popref!(f);
                             let d = peek!(f, arg as usize);
-                            if let Err(e) = crate::types::dict_methods::dict_update_from(unsafe { &*d }, &o) {
-                                if exc_matches(exc::AttributeError()) {
-                                    clear_exc();
-                                    raise!(TypeError, "'{}' object is not a mapping", tname(&o));
-                                }
-                                return Err(e);
-                            }
+                            crate::types::dict_methods::dict_update_display(unsafe { &*d }, &o)?;
                         }
                         Op::DictMerge => {
                             let o = popref!(f);
                             let d = peek!(f, arg as usize);
-                            let func = peek!(f, arg as usize + 2);
+                            // stack: callable, self-or-NULL, positional args, ..., the dict
+                            let func = peek!(f, arg as usize + 3);
                             crate::types::dict_methods::dict_merge_kwargs(unsafe { &*d }, &o, func)?;
                         }
                         Op::UnpackSequence => {
+                            adapt!(super::adaptive::unpack(unsafe { &*peek!(f, 1) }, arg));
                             let seq = popref!(f);
                             let n = arg as usize;
                             let mut items = Vec::with_capacity(n);
@@ -1238,6 +1312,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             }
                         }
                         Op::Jump => {
+                            if (arg as usize) < pc { adapt!(rpy_compiler::wordcode::opcodes::JUMP_BACKWARD_NO_JIT); }
                             if crate::modules::sys::tracing_active() {
                                 crate::modules::sys_trace::fire_branch(ts, f, crate::modules::sys_trace::JUMP, arg as usize)?;
                             }
@@ -1318,10 +1393,12 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             }
                         }
                         Op::GetIter => {
+                            adapt!(super::adaptive::get_iter(unsafe { &*peek!(f, 1) }));
                             let o = popref!(f);
                             push!(f, ab::get_iter(&o)?.into_raw());
                         }
                         Op::ForIter => {
+                            adapt_once!(super::adaptive::for_iter(unsafe { &*peek!(f, 1) }));
                             let it = unsafe { &*top!(f) };
                             match ab::iter_next(it)? {
                                 Some(v) => push!(f, v.into_raw()),
@@ -1375,6 +1452,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             push!(f, r.into_raw());
                         }
                         Op::Send => {
+                            adapt!(super::adaptive::send(unsafe { &*peek!(f, 2) }));
                             let v = popref!(f);
                             let recv = unsafe { &*top!(f) };
                             match crate::types::genobject::send_to(recv, &v)? {
@@ -1416,6 +1494,15 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             return Ok(Some(Exit::Return(v)));
                         }
                         Op::Call | Op::CallKw => {
+                            if super::adaptive::active(cd) {
+                                let nk = if op == Op::CallKw { 1 } else { 0 };
+                                let n = arg as usize;
+                                let base = f.stack_top - n - 2 - nk;
+                                let c = unsafe { &*f.slots[base] };
+                                let s = f.slots[base + 1];
+                                let so = if s.is_null() { None } else { Some(unsafe { &*s }) };
+                                if op == Op::CallKw { adapt!(super::adaptive::call_kw(c, so)); } else { adapt!(super::adaptive::call(c, so, n)); }
+                            }
                             let (n, kwnames) = if op == Op::CallKw {
                                 (arg as usize, Some(popref!(f)))
                             } else {
@@ -1470,6 +1557,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             push!(f, r);
                         }
                         Op::CallFunctionEx => {
+                            adapt!(super::adaptive::call_ex(unsafe { &*peek!(f, 4) }));
                             let kw = popopt!(f);
                             let args = popref!(f);
                             let self_or_null = popopt!(f);
@@ -1506,6 +1594,9 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                                 Some(k) => Some(k.clone()),
                                 None => None,
                             };
+                            if let Some(d) = &kwd {
+                                check_kwargs_keys(d)?;
+                            }
                             let call_info = if crate::modules::sys::tracing_active() {
                                 crate::modules::sys_trace::before_call(ts, f, &callable, self_or_null.as_deref(), v.first().copied(), false)?
                             } else {
@@ -1578,7 +1669,20 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                         Op::Reraise => {
                             f.unwind_pc = (pc - 1) as i32;
                             let e = popref!(f);
-                            if arg != 0 {
+                            if arg & 0x100 != 0 {
+                                // translated RERAISE n: the n values stay on the stack; the
+                                // deepest one (n > 0) is the lasti the handler pushed
+                                let n = (arg & 0xff) as usize;
+                                if n > 0 && f.stack_top >= f.nlocalsplus + n {
+                                    let v = peek!(f, n);
+                                    if !v.is_null() && int::is_int_exact(unsafe { &*v }) && int::is_compact(unsafe { &*v }) {
+                                        let li = int::compact_value(unsafe { &*v });
+                                        if li >= 0 && (li as usize) < code.len() {
+                                            f.lasti = li as u32;
+                                        }
+                                    }
+                                }
+                            } else if arg != 0 {
                                 // CPython restores frame->instr_ptr from lasti, but the handler
                                 // lookup uses the RERAISE position: keep f.lasti (used by
                                 // find_handler) pointing at this instruction.
@@ -1638,6 +1742,17 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                                 ab::call(unsafe { &*exit_func }, &[unsafe { &*exit_self }, &tp, v, &tb])?
                             };
                             push!(f, r.into_raw());
+                        }
+                        Op::LoadSpecial => {
+                            let o = popref!(f);
+                            let (m, s) = load_special(&o, arg)?;
+                            push!(f, m.into_raw());
+                            push!(f, s.map_or(std::ptr::null_mut(), |s| s.into_raw()));
+                        }
+                        Op::ReturnGenerator => {
+                            // end of the eager generator prologue (see interp::call_function)
+                            f.next_instr = pc as u32;
+                            return Ok(Some(Exit::Yield(none::none_ref())));
                         }
                         Op::BeforeWith | Op::BeforeAsyncWith => {
                             let mgr = popref!(f);
@@ -1811,13 +1926,31 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                                 0 => type_ref(exc::AssertionError()),
                                 1 => type_ref(exc::NotImplementedError()),
                                 2 => type_ref(tuple::tuple_type()),
-                                3 => crate::builtins::builtin("all")?,
-                                _ => crate::builtins::builtin("any")?,
+                                3 | 4 => {
+                                    // the original builtins.all / builtins.any (identity is what the
+                                    // `all(genexpr)` fast path tests), captured on first use
+                                    static ORIG: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+                                    let (a, b) = *ORIG.get_or_init(|| {
+                                        let a = crate::builtins::builtin("all").map(|v| v.into_raw() as usize).unwrap_or(0);
+                                        let b = crate::builtins::builtin("any").map(|v| v.into_raw() as usize).unwrap_or(0);
+                                        (a, b)
+                                    });
+                                    let p = if arg == 3 { a } else { b };
+                                    if p == 0 {
+                                        raise!(SystemError, "builtins.all/any unavailable");
+                                    }
+                                    unsafe { PyRef::from_borrowed(p as *mut PyObject) }
+                                }
+                                5 => type_ref(list::list_type()),
+                                _ => type_ref(crate::types::set::set_type()),
                             };
                             push!(f, v.into_raw());
                         }
                         Op::ExtendedArg => unreachable!(),
-                        Op::Unused1 | Op::Unused2 | Op::Unused3 => raise!(SystemError, "unknown opcode {}", op as u8),
+                        Op::Unused1 | Op::Unused2 | Op::Unused3 => match &cd.invalid {
+                            Some(msg) => raise!(SystemError, "{}", msg),
+                            None => raise!(SystemError, "unknown opcode {}", op as u8),
+                        },
                     }
                 }
             })();
@@ -1923,6 +2056,17 @@ impl ReraiseMarker {
 pub(super) fn is_sequence_like(o: &PyObject) -> bool {
     let sq = o.ty().tp_as_sequence;
     !sq.is_null() && unsafe { (*sq).sq_item.is_some() }
+}
+
+/// `f(**mapping)`: keyword names must be strings (duplicates are reported
+/// before this, when the mappings are merged).
+pub(crate) fn check_kwargs_keys(d: &PyObject) -> PyResult<()> {
+    for k in dict::keys_vec(d) {
+        if !pystr::is_str(&k) {
+            raise!(TypeError, "keywords must be strings");
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn func_desc(o: &PyObject) -> String {

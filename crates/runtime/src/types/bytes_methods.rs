@@ -1832,7 +1832,7 @@ fn bytes_new_impl(tp: *mut PyTypeObject, x: Option<&PyObject>, enc: Option<&PyOb
                     raise!(ValueError, "negative count");
                 }
                 if tp == bytes::bytes_type() {
-                    return bytes::try_alloc_bytes(n as usize);
+                    return if n == 0 { Ok(bytes::empty_bytes()) } else { bytes::try_alloc_bytes(n as usize) };
                 }
                 let v = vec_zeroed(n as usize)?;
                 return bytes::new_bytes_of_type(tp, &v);

@@ -424,9 +424,10 @@ pub fn init_types() {
             ("__getnewargs__", NOARGS, complex_getnewargs),
             ("from_number", O, complex_from_number, "from_number($type, number, /)\n--\n\nConvert number to a complex floating-point number."; METH_CLASS),
         ];
-        t.tp_getset = crate::getset_table![
-            ("real", get_real; "the real part of a complex number"),
-            ("imag", get_imag; "the imaginary part of a complex number"),
+        // plain read-only members, as in CPython (complex.real is a member_descriptor)
+        t.tp_members = crate::member_table![
+            ("real", Py_T_DOUBLE, std::mem::offset_of!(PyComplexObject, cval) + std::mem::offset_of!(Py_complex, real), Py_READONLY; "the real part of a complex number"),
+            ("imag", Py_T_DOUBLE, std::mem::offset_of!(PyComplexObject, cval) + std::mem::offset_of!(Py_complex, imag), Py_READONLY; "the imaginary part of a complex number"),
         ];
     }
 }

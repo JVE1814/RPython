@@ -1468,10 +1468,8 @@ def _attribute_hint(exc_value, tb):
             return hint
     suggestion = _compute_suggestion_error(exc_value, tb, wrong_name)
     if suggestion:
-        text = f'. Did you mean {_quoted_name(suggestion, ".")}'
-        if _normalize_name(wrong_name) == suggestion != wrong_name:
-            text += f' instead of {_quoted_name(wrong_name, ".")}'
-        return text + '?'
+        return (f'. Did you mean {_quoted_name(suggestion, ".")}'
+                f' instead of {_quoted_name(wrong_name, ".")}?')
     if obj is not _sentinel:
         nested = _nested_attribute(obj, wrong_name)
         if nested:

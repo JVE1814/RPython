@@ -53,7 +53,7 @@ pub fn init_type() {
         let _ = crate::types::typeobject::type_ready(t);
     });
 }
-fn capsule_type() -> *mut PyTypeObject {
+pub fn capsule_type() -> *mut PyTypeObject {
     init_type();
     &raw mut PyCapsule_Type
 }

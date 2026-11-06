@@ -11,6 +11,7 @@ pub mod _ast;
 pub mod _opcode;
 pub mod _symtable;
 pub mod sys_full;
+pub mod sys_finalize;
 pub mod sys_trace;
 pub mod traceback_print;
 pub mod ast_bridge;
@@ -96,6 +97,7 @@ pub mod _tracemalloc;
 pub mod _csv;
 pub mod _multiprocessing;
 pub mod testinternalcapi;
+pub mod compiler_hooks;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
 pub fn register_all() {

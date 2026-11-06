@@ -269,7 +269,7 @@ pub struct Frozen {
 unsafe impl Sync for Frozen {}
 unsafe impl Sync for InittabEntry {}
 
-static FROZEN_END: [Frozen; 1] = [Frozen { name: std::ptr::null(), code: std::ptr::null(), size: 0, is_package: 0 }];
+pub(crate) static FROZEN_END: [Frozen; 1] = [Frozen { name: std::ptr::null(), code: std::ptr::null(), size: 0, is_package: 0 }];
 #[unsafe(no_mangle)]
 pub static mut PyImport_FrozenModules: *const Frozen = FROZEN_END.as_ptr();
 static INITTAB_END: [InittabEntry; 1] = [InittabEntry { name: std::ptr::null(), initfunc: None }];

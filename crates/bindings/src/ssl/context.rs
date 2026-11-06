@@ -9,6 +9,9 @@ pub struct Ctx {
     pub check_hostname: bool,
     pub post_handshake_auth: bool,
     pub sni_callback: Option<PyRef>,
+    /// guards `sni_callback`: the OpenSSL servername callback runs on handshake threads
+    /// while Python code may replace the attribute (no GIL)
+    pub cb_lock: std::sync::Mutex<()>,
     pub msg_callback: Option<PyRef>,
     pub keylog_filename: Option<PyRef>,
     pub alpn: Vec<u8>,
@@ -106,6 +109,7 @@ fn ctx_new_impl(tp: *mut PyTypeObject, a: &fc::VcArgs) -> PyResult {
             check_hostname: is_client,
             post_handshake_auth: false,
             sni_callback: None,
+            cb_lock: std::sync::Mutex::new(()),
             msg_callback: None,
             keylog_filename: None,
             alpn: Vec::new(),
@@ -358,8 +362,21 @@ fn set_pha(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     Ok(())
 }
 
+fn sni_snapshot(c: &Ctx) -> Option<PyRef> {
+    let _g = c.cb_lock.lock().unwrap_or_else(|e| e.into_inner());
+    c.sni_callback.clone()
+}
+
+fn sni_replace(c: &mut Ctx, new: Option<PyRef>) {
+    let old = {
+        let _g = c.cb_lock.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::replace(&mut c.sni_callback, new)
+    };
+    drop(old); // outside the lock: releasing it may run arbitrary code
+}
+
 fn get_sni(o: &PyObject) -> PyResult {
-    Ok(ctx(o).sni_callback.clone().unwrap_or_else(none))
+    Ok(sni_snapshot(ctx(o)).unwrap_or_else(none))
 }
 
 fn set_sni(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
@@ -371,13 +388,13 @@ fn set_sni(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         raise!(ValueError, "sni_callback cannot be set on TLS_CLIENT context");
     }
     match v {
-        None => c.sni_callback = None,
-        Some(v) if is_none(v) => c.sni_callback = None,
+        None => sni_replace(c, None),
+        Some(v) if is_none(v) => sni_replace(c, None),
         Some(v) => {
             if !rpy_runtime::abstract_::is_callable(v) {
                 raise!(TypeError, "not a callable object");
             }
-            c.sni_callback = Some(v.to_ref());
+            sni_replace(c, Some(v.to_ref()));
         }
     }
     Ok(())
@@ -478,8 +495,8 @@ unsafe extern "C" fn servername_cb(ssl: *mut c_void, al: *mut c_int, _arg: *mut 
             }
             let ctxref = super::socket::ss(&*sock).context.clone();
             let o = ctxref.as_ptr();
-            let cb = match &ctx(&*o).sni_callback {
-                Some(cb) => cb.clone(),
+            let cb = match sni_snapshot(ctx(&*o)) {
+                Some(cb) => cb,
                 None => return 0,
             };
             // a dead owner (SSLObject/SSLSocket collected) fails the handshake
