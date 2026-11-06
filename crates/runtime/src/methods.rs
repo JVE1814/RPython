@@ -114,6 +114,18 @@ pub fn def(name: &str, meth: *const c_void, flags: i32, doc: &str) -> PyMethodDe
     }
 }
 
+/// As `def`, for NUL-terminated static name and doc (`mdefs!` passes literals with a
+/// "\0" appended at compile time): no copies at startup (perf2).
+pub fn def_static(name: &'static str, meth: *const c_void, flags: i32, doc: &'static str) -> PyMethodDef {
+    debug_assert!(name.ends_with('\0') && (doc.is_empty() || doc.ends_with('\0')));
+    PyMethodDef {
+        ml_name: name.as_ptr() as *const c_char,
+        ml_meth: meth,
+        ml_flags: flags,
+        ml_doc: if doc.len() <= 1 { std::ptr::null() } else { doc.as_ptr() as *const c_char },
+    }
+}
+
 /// Finalise a table (adds the NULL sentinel, leaks it).
 pub fn table(mut v: Vec<PyMethodDef>) -> *mut PyMethodDef {
     v.push(PyMethodDef { ml_name: std::ptr::null(), ml_meth: std::ptr::null(), ml_flags: 0, ml_doc: std::ptr::null() });
@@ -123,7 +135,7 @@ pub fn table(mut v: Vec<PyMethodDef>) -> *mut PyMethodDef {
 /// `mdefs![ ("name", O, func, "doc"), ... ]`
 #[macro_export]
 macro_rules! mdefs {
-    ($( ($name:expr, $kind:ident, $f:expr $(, $doc:expr)? $(; $extra:expr)?) ),* $(,)?) => {{
+    ($( ($name:literal, $kind:ident, $f:expr $(, $doc:literal)? $(; $extra:expr)?) ),* $(,)?) => {{
         let mut v: Vec<$crate::ffi::PyMethodDef> = Vec::new();
         $(
             v.push($crate::mdefs!(@one $name, $kind, $f, ($($doc)?), ($($extra)?)));
@@ -131,19 +143,19 @@ macro_rules! mdefs {
         $crate::methods::table(v)
     }};
     (@one $name:expr, NOARGS, $f:expr, ($($doc:expr)?), ($($extra:expr)?)) => {
-        $crate::methods::def($name, $crate::methods::noargs($f), $crate::ffi::METH_NOARGS $(| $extra)?, $crate::mdefs!(@doc $($doc)?))
+        $crate::methods::def_static(concat!($name, "\0"), $crate::methods::noargs($f), $crate::ffi::METH_NOARGS $(| $extra)?, $crate::mdefs!(@doc $($doc)?))
     };
     (@one $name:expr, O, $f:expr, ($($doc:expr)?), ($($extra:expr)?)) => {
-        $crate::methods::def($name, $crate::methods::o($f), $crate::ffi::METH_O $(| $extra)?, $crate::mdefs!(@doc $($doc)?))
+        $crate::methods::def_static(concat!($name, "\0"), $crate::methods::o($f), $crate::ffi::METH_O $(| $extra)?, $crate::mdefs!(@doc $($doc)?))
     };
     (@one $name:expr, FAST, $f:expr, ($($doc:expr)?), ($($extra:expr)?)) => {
-        $crate::methods::def($name, $crate::methods::fast($f), $crate::ffi::METH_FASTCALL $(| $extra)?, $crate::mdefs!(@doc $($doc)?))
+        $crate::methods::def_static(concat!($name, "\0"), $crate::methods::fast($f), $crate::ffi::METH_FASTCALL $(| $extra)?, $crate::mdefs!(@doc $($doc)?))
     };
     (@one $name:expr, FASTKW, $f:expr, ($($doc:expr)?), ($($extra:expr)?)) => {
-        $crate::methods::def($name, $crate::methods::fastkw($f), $crate::ffi::METH_FASTCALL | $crate::ffi::METH_KEYWORDS $(| $extra)?, $crate::mdefs!(@doc $($doc)?))
+        $crate::methods::def_static(concat!($name, "\0"), $crate::methods::fastkw($f), $crate::ffi::METH_FASTCALL | $crate::ffi::METH_KEYWORDS $(| $extra)?, $crate::mdefs!(@doc $($doc)?))
     };
     (@doc) => { "" };
-    (@doc $d:expr) => { $d };
+    (@doc $d:literal) => { concat!($d, "\0") };
 }
 
 pub fn method_name(ml: *const PyMethodDef) -> String {

@@ -107,7 +107,8 @@ pub(crate) fn bootstrap_code(src: &[u8], file: &str, display: &str) -> PyResult 
     if let (Some(key), Some(cache)) = (&key, &cache) {
         if let Ok(data) = std::fs::read(cache) {
             if data.len() > key.len() && &data[..key.len()] == key.as_bytes() {
-                match crate::modules::marshal::loads_slice(&data[key.len()..], true) {
+                let body = crate::types::bytes::new_bytes(&data[key.len()..]);
+                match crate::modules::marshal::loads_bytes(&body, true) {
                     Ok(c) if crate::types::code::is_code(&c) => return Ok(c),
                     Ok(_) => {}
                     Err(_) => clear_exc(),

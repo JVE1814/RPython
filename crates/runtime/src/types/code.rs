@@ -37,20 +37,35 @@ pub struct PyCodeObject {
     pub co_linetable: *mut PyObject,
     pub co_weakreflist: *mut PyObject,
     pub _reserved: [usize; 8],
-    /// Rust side data (owned Box).
+    /// Rust side data (owned Box); null while the body is not loaded yet.
     pub data: *mut CodeData,
+    /// Where to load the body from (perf2: lazily unmarshalled code; owned Box).
+    pub lazy: *mut LazyBody,
+    /// Docstring of a code object whose body is not loaded (owned; else null).
+    pub doc: *mut PyObject,
+}
+
+/// A marshalled code body not unmarshalled yet: most functions of an imported module
+/// never run, so their bytecode, constants and names are only built on first use
+/// (`code_data`). `src` is the bytes object the module was loaded from.
+pub struct LazyBody {
+    pub src: PyRef,
+    pub off: usize,
+    pub len: usize,
+    pub allow_code: bool,
 }
 
 /// Executable representation.
 pub struct CodeData {
     pub code: Vec<u32>,
-    pub locations: Vec<Location>,
+    /// Source positions (compact encoding shared with `co_linetable`).
+    pub locations: LineTable,
     pub exception_table: Vec<ExceptionEntry>,
-    /// Constants as objects (same as co_consts, kept as a Vec for fast indexing).
-    pub consts: Vec<PyRef>,
+    /// Constants: a view of the code's own constants tuple (also `co_consts`).
+    pub consts: RefTuple,
     /// Names (interned str objects).
-    pub names: Vec<PyRef>,
-    pub localsplusnames: Vec<PyRef>,
+    pub names: RefTuple,
+    pub localsplusnames: RefTuple,
     pub localspluskinds: Vec<u8>,
     pub co_name: PyRef,
     pub co_qualname: PyRef,
@@ -63,6 +78,318 @@ pub struct CodeData {
     /// Per-instruction inline caches (owned by the interpreter).
     pub caches: crate::interp::cache::CodeCaches,
 }
+
+/// An owned exact tuple seen as a slice of owned references (perf2: code objects keep
+/// one copy of their constants and names instead of a tuple plus a vector).
+pub struct RefTuple(PyRef);
+
+impl RefTuple {
+    /// `t` must be an exact tuple.
+    pub fn new(t: PyRef) -> RefTuple {
+        debug_assert!(tuple::is_tuple_exact(&t));
+        RefTuple(t)
+    }
+    pub fn from_vec(v: Vec<PyRef>) -> RefTuple {
+        RefTuple(tuple::new_tuple(v))
+    }
+    pub fn tuple(&self) -> &PyRef {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for RefTuple {
+    type Target = [PyRef];
+    #[inline(always)]
+    fn deref(&self) -> &[PyRef] {
+        let items = tuple::tuple_items(&self.0);
+        // tuple items are non-null object pointers; PyRef is a transparent non-null pointer
+        unsafe { std::slice::from_raw_parts(items.as_ptr() as *const PyRef, items.len()) }
+    }
+}
+
+// ---------------------------------------------------------------- line table
+//
+// Source positions are stored once, in the `co_linetable` bytes object, in the
+// location-table format that test_code.py's `parse_location_table` reads (perf2; it
+// replaced 2 x 16 bytes per instruction). Entries describe runs of code units (one of
+// our 4-byte instructions counts as two 2-byte units, like `co_positions` reports):
+//
+//   first byte: 0x80 | code << 3 | (units - 1), units <= 8
+//   code 15      no location
+//   code 14      svarint line delta, varint end-line delta, varint col+1, varint end_col+1
+//   code 13      svarint line delta, no columns
+//   code 10..12  line delta = code - 10, then column and end column bytes
+//   code 0..9    same line; column = code << 3 | (next byte >> 4),
+//                end column = column + (next byte & 15)
+//
+// Varints are little-endian groups of 6 bits, bit 6 = continuation; signed ones keep
+// the sign in bit 0. Lines are relative to the previous entry, starting at
+// co_firstlineno. Random access (`get`) uses checkpoints built on first use.
+
+const LT_CHUNK: usize = 32;
+
+#[inline]
+fn put_varint(v: &mut Vec<u8>, mut x: u64) {
+    while x >= 64 {
+        v.push((x & 63) as u8 | 64);
+        x >>= 6;
+    }
+    v.push(x as u8);
+}
+#[inline]
+fn put_svarint(v: &mut Vec<u8>, x: i64) {
+    put_varint(v, if x < 0 { ((x.unsigned_abs()) << 1) | 1 } else { (x as u64) << 1 });
+}
+#[inline]
+fn get_varint(b: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut c = *b.get(*pos)?;
+    *pos += 1;
+    let mut x = (c & 63) as u64;
+    let mut shift = 0;
+    while c & 64 != 0 {
+        c = *b.get(*pos)?;
+        *pos += 1;
+        shift += 6;
+        if shift > 60 {
+            return None;
+        }
+        x |= ((c & 63) as u64) << shift;
+    }
+    Some(x)
+}
+#[inline]
+fn get_svarint(b: &[u8], pos: &mut usize) -> Option<i64> {
+    let u = get_varint(b, pos)?;
+    Some(if u & 1 != 0 { -((u >> 1) as i64) } else { (u >> 1) as i64 })
+}
+
+/// Encode positions (one per instruction) in the location-table format.
+pub fn encode_lines(locs: &[Location], firstlineno: u32) -> Vec<u8> {
+    let mut v = Vec::with_capacity(locs.len() * 2 + 4);
+    let mut line = firstlineno as i64;
+    let mut i = 0;
+    while i < locs.len() {
+        let l = locs[i];
+        let mut n = 1;
+        while n < 4 && i + n < locs.len() && locs[i + n] == l {
+            n += 1;
+        }
+        i += n;
+        let units = (2 * n - 1) as u8;
+        if l.lineno == 0 {
+            v.push(0x80 | 15 << 3 | units);
+            continue;
+        }
+        let delta = l.lineno as i64 - line;
+        let same_line = l.end_lineno == l.lineno;
+        let cols = l.col != u32::MAX && l.end_col != u32::MAX;
+        if same_line && !cols && l.col == u32::MAX && l.end_col == u32::MAX {
+            v.push(0x80 | 13 << 3 | units);
+            put_svarint(&mut v, delta);
+        } else if same_line && cols && delta == 0 && l.col < 80 && l.end_col >= l.col && l.end_col - l.col < 16 {
+            v.push(0x80 | ((l.col >> 3) as u8) << 3 | units);
+            v.push(((l.col & 7) as u8) << 4 | (l.end_col - l.col) as u8);
+        } else if same_line && cols && (0..3).contains(&delta) && l.col < 128 && l.end_col < 128 {
+            v.push(0x80 | (10 + delta as u8) << 3 | units);
+            v.push(l.col as u8);
+            v.push(l.end_col as u8);
+        } else {
+            v.push(0x80 | 14 << 3 | units);
+            put_svarint(&mut v, delta);
+            put_varint(&mut v, (l.end_lineno as i64 - l.lineno as i64).max(0) as u64);
+            put_varint(&mut v, if l.col == u32::MAX { 0 } else { l.col as u64 + 1 });
+            put_varint(&mut v, if l.end_col == u32::MAX { 0 } else { l.end_col as u64 + 1 });
+        }
+        line = l.lineno as i64;
+    }
+    v
+}
+
+/// One decoded entry: (code units, position).
+#[inline]
+fn decode_entry(b: &[u8], pos: &mut usize, line: &mut i64) -> Option<(usize, Location)> {
+    let first = *b.get(*pos)?;
+    *pos += 1;
+    let code = (first >> 3) & 15;
+    let units = (first & 7) as usize + 1;
+    let none = u32::MAX;
+    let loc = match code {
+        15 => Location { lineno: 0, end_lineno: 0, col: none, end_col: none },
+        14 => {
+            *line += get_svarint(b, pos)?;
+            let end = *line + get_varint(b, pos)? as i64;
+            let c = get_varint(b, pos)?;
+            let e = get_varint(b, pos)?;
+            Location {
+                lineno: *line as u32,
+                end_lineno: end as u32,
+                col: if c == 0 { none } else { (c - 1) as u32 },
+                end_col: if e == 0 { none } else { (e - 1) as u32 },
+            }
+        }
+        13 => {
+            *line += get_svarint(b, pos)?;
+            Location { lineno: *line as u32, end_lineno: *line as u32, col: none, end_col: none }
+        }
+        10..=12 => {
+            *line += (code - 10) as i64;
+            let c = *b.get(*pos)? as u32;
+            let e = *b.get(*pos + 1)? as u32;
+            *pos += 2;
+            Location { lineno: *line as u32, end_lineno: *line as u32, col: c, end_col: e }
+        }
+        _ => {
+            let s = *b.get(*pos)?;
+            *pos += 1;
+            let c = (code as u32) << 3 | (s >> 4) as u32;
+            Location { lineno: *line as u32, end_lineno: *line as u32, col: c, end_col: c + (s & 15) as u32 }
+        }
+    };
+    Some((units, loc))
+}
+
+/// Decoded positions for a code object (a view of its `co_linetable`).
+pub struct LineTable {
+    raw: PyRef,
+    n: u32,
+    firstlineno: u32,
+    /// `-X no_debug_ranges`: report no columns.
+    strip_cols: bool,
+    /// (byte offset, first code unit, line before the entry) about every LT_CHUNK
+    /// instructions, built on the first random access.
+    chunks: std::sync::OnceLock<Box<[(u32, u32, i64)]>>,
+}
+
+impl LineTable {
+    /// Check that `raw` is a well-formed table for `ninstr` instructions.
+    pub fn from_bytes(raw: PyRef, ninstr: usize, firstlineno: u32, strip_cols: bool) -> Option<LineTable> {
+        let b = bytes::bytes_data(&raw);
+        let (mut pos, mut line, mut units) = (0, firstlineno as i64, 0usize);
+        while pos < b.len() {
+            if b[pos] & 0x80 == 0 {
+                return None;
+            }
+            units += decode_entry(b, &mut pos, &mut line)?.0;
+        }
+        if units != 2 * ninstr {
+            return None;
+        }
+        Some(LineTable { raw, n: ninstr as u32, firstlineno, strip_cols, chunks: std::sync::OnceLock::new() })
+    }
+    pub fn from_locations(locs: &[Location], firstlineno: u32, strip_cols: bool) -> LineTable {
+        let raw = bytes::new_bytes(&encode_lines(locs, firstlineno));
+        LineTable::from_bytes(raw, locs.len(), firstlineno, strip_cols).expect("fresh line table")
+    }
+    /// The encoded table (`co_linetable`).
+    pub fn raw(&self) -> &PyRef {
+        &self.raw
+    }
+    pub fn len(&self) -> usize {
+        self.n as usize
+    }
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+    #[inline]
+    fn adjust(&self, l: Location) -> Location {
+        if self.strip_cols { Location { col: u32::MAX, end_col: u32::MAX, ..l } } else { l }
+    }
+    fn chunks(&self) -> &[(u32, u32, i64)] {
+        self.chunks.get_or_init(|| {
+            let b = bytes::bytes_data(&self.raw);
+            let mut v = Vec::with_capacity(self.n as usize / LT_CHUNK + 1);
+            let (mut pos, mut line, mut unit) = (0usize, self.firstlineno as i64, 0usize);
+            let mut next_mark = 0;
+            while pos < b.len() {
+                if unit >= next_mark {
+                    v.push((pos as u32, unit as u32, line));
+                    next_mark = unit + 2 * LT_CHUNK;
+                }
+                match decode_entry(b, &mut pos, &mut line) {
+                    Some((u, _)) => unit += u,
+                    None => break,
+                }
+            }
+            v.into_boxed_slice()
+        })
+    }
+    /// Position of instruction `i`.
+    pub fn get(&self, i: usize) -> Option<Location> {
+        if i >= self.n as usize {
+            return None;
+        }
+        let want = 2 * i;
+        let ch = self.chunks();
+        let k = ch.partition_point(|c| c.1 as usize <= want).max(1) - 1;
+        let (off, unit0, line0) = *ch.get(k)?;
+        let b = bytes::bytes_data(&self.raw);
+        let (mut pos, mut line, mut unit) = (off as usize, line0, unit0 as usize);
+        loop {
+            let (u, l) = decode_entry(b, &mut pos, &mut line)?;
+            if want < unit + u {
+                return Some(self.adjust(l));
+            }
+            unit += u;
+        }
+    }
+    pub fn iter(&self) -> LineIter<'_> {
+        LineIter { t: self, pos: 0, line: self.firstlineno as i64, cur: None, left: 0, emitted: 0 }
+    }
+}
+
+/// Positions of the instructions in order.
+pub struct LineIter<'a> {
+    t: &'a LineTable,
+    pos: usize,
+    line: i64,
+    cur: Option<Location>,
+    /// code units of `cur` not yet reported
+    left: usize,
+    emitted: u32,
+}
+
+impl Iterator for LineIter<'_> {
+    type Item = Location;
+    fn next(&mut self) -> Option<Location> {
+        if self.emitted >= self.t.n {
+            return None;
+        }
+        while self.left < 2 {
+            let b = bytes::bytes_data(&self.t.raw);
+            let (u, l) = decode_entry(b, &mut self.pos, &mut self.line)?;
+            // a unit left over from the previous entry belongs to this instruction
+            self.left += u;
+            self.cur = Some(l);
+        }
+        self.left -= 2;
+        self.emitted += 1;
+        self.cur.map(|l| self.t.adjust(l))
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let r = (self.t.n - self.emitted) as usize;
+        (r, Some(r))
+    }
+}
+
+impl<'a> IntoIterator for &'a LineTable {
+    type Item = Location;
+    type IntoIter = LineIter<'a>;
+    fn into_iter(self) -> LineIter<'a> {
+        self.iter()
+    }
+}
+
+/// Convert the previous fixed-width position format (16 bytes per instruction:
+/// lineno, end_lineno, col, end_col as u32 LE), still found in older cached bytecode.
+pub fn lines_from_fixed(b: &[u8]) -> Vec<Location> {
+    b.chunks_exact(16)
+        .map(|c| {
+            let w = |k: usize| u32::from_le_bytes([c[k], c[k + 1], c[k + 2], c[k + 3]]);
+            Location { lineno: w(0), end_lineno: w(4), col: w(8), end_col: w(12) }
+        })
+        .collect()
+}
+
 
 /// Convenience accessor bundle.
 pub struct CodeRef<'a> {
@@ -103,15 +430,67 @@ pub fn is_code(o: &PyObject) -> bool {
 
 pub fn code(o: &PyObject) -> CodeRef<'_> {
     unsafe {
+        let d = code_data(o);
         let c = &*(o.as_ptr() as *const PyCodeObject);
-        let d = &*c.data;
         CodeRef { obj: c, d, co_name: &d.co_name, co_qualname: &d.co_qualname }
     }
 }
 
 #[inline(always)]
 pub fn code_data(o: &PyObject) -> &CodeData {
-    unsafe { &*(*(o.as_ptr() as *const PyCodeObject)).data }
+    unsafe {
+        let p = std::sync::atomic::AtomicPtr::from_ptr(&raw mut (*(o.as_ptr() as *mut PyCodeObject)).data).load(std::sync::atomic::Ordering::Acquire);
+        if !p.is_null() { &*p } else { load_body(o) }
+    }
+}
+
+/// Name, qualified name and docstring without loading a lazy body (function creation).
+pub fn code_name(o: &PyObject) -> PyRef {
+    unsafe { PyRef::from_borrowed((*(o.as_ptr() as *const PyCodeObject)).co_name) }
+}
+pub fn code_qualname(o: &PyObject) -> PyRef {
+    unsafe { PyRef::from_borrowed((*(o.as_ptr() as *const PyCodeObject)).co_qualname) }
+}
+pub fn code_docstring(o: &PyObject) -> Option<PyRef> {
+    unsafe {
+        let c = &*(o.as_ptr() as *const PyCodeObject);
+        if c.data.is_null() {
+            return if c.doc.is_null() { None } else { Some(PyRef::from_borrowed(c.doc)) };
+        }
+    }
+    code(o).docstring()
+}
+
+/// Unmarshal the body of a lazily loaded code object (once; concurrent callers wait).
+#[cold]
+#[inline(never)]
+fn load_body(o: &PyObject) -> &CodeData {
+    unsafe {
+        let c = o.as_ptr() as *mut PyCodeObject;
+        let _g = crate::types::dict::ob_lock(o);
+        if (*c).data.is_null() {
+            let lazy = (*c).lazy;
+            if lazy.is_null() {
+                crate::capi::refcount::fatal("code object without a body");
+            }
+            let saved = crate::errors::take_exc();
+            match crate::modules::marshal::read_lazy_body(o, &*lazy) {
+                Ok(parts) => fill_code(c, parts),
+                Err(_) => {
+                    crate::errors::clear_exc();
+                    crate::capi::refcount::fatal("corrupt marshal data in a code object body");
+                }
+            }
+            if let Some(e) = saved {
+                crate::errors::set_exc(e);
+            }
+            (*c).lazy = std::ptr::null_mut();
+            drop(Box::from_raw(lazy));
+            let d = std::mem::replace(&mut (*c).doc, std::ptr::null_mut());
+            xdecref(d);
+        }
+        &*(*c).data
+    }
 }
 
 /// Convert a compiler constant into an object.
@@ -164,22 +543,30 @@ pub fn new_code_from_unit(cu: &CodeUnit, filename: Option<&PyRef>) -> PyResult {
         stacksize: cu.stacksize,
         firstlineno: cu.firstlineno,
         code: cu.code.clone(),
-        locations: cu.locations.clone(),
+        lines: Lines::Decoded(&cu.locations),
         exception_table: cu.exception_table.clone(),
+        exctable_raw: None,
         kinds: cu.localspluskinds.clone(),
         filename,
-        consts,
-        names,
-        localsplusnames: lpn,
+        consts: tuple::new_tuple(consts),
+        names: tuple::new_tuple(names),
+        localsplusnames: tuple::new_tuple(lpn),
         name: pystr::intern_str(&cu.name),
         qualname: pystr::intern_str(&cu.qualname),
     };
     new_code_from_parts(parts)
 }
 
+/// Source positions handed to `new_code_from_parts`.
+pub enum Lines<'a> {
+    Decoded(&'a [Location]),
+    /// An already encoded table (`encode_lines` format) of the right length.
+    Encoded(LineTable),
+}
+
 /// Everything a code object is made of, with the object-valued parts already built
 /// (used by the compiler path above and by marshal, which reads objects directly).
-pub struct CodeParts {
+pub struct CodeParts<'a> {
     pub argcount: u32,
     pub posonlyargcount: u32,
     pub kwonlyargcount: u32,
@@ -187,88 +574,140 @@ pub struct CodeParts {
     pub stacksize: u32,
     pub firstlineno: u32,
     pub code: Vec<u32>,
-    pub locations: Vec<Location>,
+    pub lines: Lines<'a>,
     pub exception_table: Vec<ExceptionEntry>,
+    /// `co_exceptiontable` if the caller already has it encoded.
+    pub exctable_raw: Option<PyRef>,
     pub kinds: Vec<u8>,
     pub filename: PyRef,
-    pub consts: Vec<PyRef>,
-    /// interned names
-    pub names: Vec<PyRef>,
-    pub localsplusnames: Vec<PyRef>,
+    /// exact tuple
+    pub consts: PyRef,
+    /// exact tuple of interned names
+    pub names: PyRef,
+    /// exact tuple of interned names
+    pub localsplusnames: PyRef,
     pub name: PyRef,
     pub qualname: PyRef,
 }
 
 pub fn new_code_from_parts(p: CodeParts) -> PyResult {
+    unsafe {
+        let op = crate::alloc::alloc_object(code_type(), std::mem::size_of::<PyCodeObject>()) as *mut PyCodeObject;
+        fill_header(op, p.argcount, p.posonlyargcount, p.kwonlyargcount, p.flags, p.stacksize, p.firstlineno, &p.kinds);
+        let c = &mut *op;
+        c.co_localspluskinds = bytes::new_bytes(&p.kinds).into_raw();
+        c.co_filename = p.filename.clone().into_raw();
+        c.co_name = p.name.clone().into_raw();
+        c.co_qualname = p.qualname.clone().into_raw();
+        fill_code(op, p);
+        Ok(PyRef::from_raw(op as *mut PyObject))
+    }
+}
+
+/// The scalar header fields of a fresh code object.
+#[allow(clippy::too_many_arguments)]
+unsafe fn fill_header(op: *mut PyCodeObject, argc: u32, posonly: u32, kwonly: u32, flags: u32, stacksize: u32, firstlineno: u32, kinds: &[u8]) {
+    unsafe {
+        let c = &mut *op;
+        c.co_flags = flags as c_int;
+        c.co_argcount = argc as c_int;
+        c.co_posonlyargcount = posonly as c_int;
+        c.co_kwonlyargcount = kwonly as c_int;
+        c.co_stacksize = stacksize as c_int;
+        c.co_firstlineno = firstlineno as c_int;
+        c.co_nlocalsplus = kinds.len() as c_int;
+        c.co_framesize = (kinds.len() + stacksize as usize) as c_int;
+        c.co_nlocals = kinds.iter().filter(|&&k| k & bc::fast::LOCAL != 0).count() as c_int;
+        c.co_ncellvars = kinds.iter().filter(|&&k| k & bc::fast::CELL != 0).count() as c_int;
+        c.co_nfreevars = kinds.iter().filter(|&&k| k & bc::fast::FREE != 0).count() as c_int;
+        c.co_version = 1;
+    }
+}
+
+/// Header fields of a code object whose body stays marshalled until first use.
+pub struct LazyHeader {
+    pub argcount: u32,
+    pub posonlyargcount: u32,
+    pub kwonlyargcount: u32,
+    pub flags: u32,
+    pub stacksize: u32,
+    pub firstlineno: u32,
+    /// `co_localspluskinds` (bytes)
+    pub kinds: PyRef,
+    pub filename: PyRef,
+    pub name: PyRef,
+    pub qualname: PyRef,
+    /// docstring (or None)
+    pub doc: PyRef,
+}
+
+/// A code object whose body is loaded from `body` on first use (`code_data`).
+pub fn new_code_lazy(h: LazyHeader, body: LazyBody) -> PyRef {
+    unsafe {
+        let op = crate::alloc::alloc_object(code_type(), std::mem::size_of::<PyCodeObject>()) as *mut PyCodeObject;
+        fill_header(op, h.argcount, h.posonlyargcount, h.kwonlyargcount, h.flags, h.stacksize, h.firstlineno, bytes::bytes_data(&h.kinds));
+        let c = &mut *op;
+        c.co_localspluskinds = h.kinds.into_raw();
+        c.co_filename = h.filename.into_raw();
+        c.co_name = h.name.into_raw();
+        c.co_qualname = h.qualname.into_raw();
+        if !h.doc.is(none::none()) {
+            c.doc = h.doc.into_raw();
+        }
+        c.lazy = Box::into_raw(Box::new(body));
+        PyRef::from_raw(op as *mut PyObject)
+    }
+}
+
+/// Install the body (`data` and the object-valued fields) of a code object whose
+/// header is set. The data pointer is published last.
+unsafe fn fill_code(op: *mut PyCodeObject, p: CodeParts) {
     let kinds = p.kinds;
-    let nlocals = kinds.iter().filter(|&&k| k & bc::fast::LOCAL != 0).count();
-    let ncell = kinds.iter().filter(|&&k| k & bc::fast::CELL != 0).count();
-    let nfree = kinds.iter().filter(|&&k| k & bc::fast::FREE != 0).count();
     let cell_slots: Vec<u32> =
         kinds.iter().enumerate().filter(|(_, k)| **k & bc::fast::CELL != 0).map(|(i, _)| i as u32).collect();
-    let exctable = encode_exception_table(&p.exception_table);
-    let linetable = encode_locations(&p.locations);
+    let exctable = match p.exctable_raw {
+        Some(b) => b,
+        None => bytes::new_bytes(&encode_exception_table(&p.exception_table)),
+    };
+    let lines = match p.lines {
+        Lines::Encoded(t) => t,
+        Lines::Decoded(locs) => LineTable::from_locations(locs, p.firstlineno, false),
+    };
+    let linetable = lines.raw().clone();
     let ninstr = p.code.len();
+    let mut code = p.code;
+    code.shrink_to_fit();
     let data = Box::new(CodeData {
-        code: p.code,
-        locations: p.locations,
+        code,
+        locations: lines,
         exception_table: p.exception_table,
-        consts: p.consts.clone(),
-        names: p.names.clone(),
-        localsplusnames: p.localsplusnames.clone(),
-        localspluskinds: kinds.clone(),
-        co_name: p.name.clone(),
-        co_qualname: p.qualname.clone(),
-        filename: p.filename.clone(),
+        consts: RefTuple::new(p.consts.clone()),
+        names: RefTuple::new(p.names.clone()),
+        localsplusnames: RefTuple::new(p.localsplusnames.clone()),
+        localspluskinds: kinds,
+        co_name: p.name,
+        co_qualname: p.qualname,
+        filename: p.filename,
         cell_slots,
         invocation_count: std::sync::atomic::AtomicU32::new(0),
         backedge_count: std::sync::atomic::AtomicU32::new(0),
         caches: crate::interp::cache::CodeCaches::new(ninstr),
     });
     unsafe {
-        let op = crate::alloc::alloc_object(code_type(), std::mem::size_of::<PyCodeObject>());
-        let c = &mut *(op as *mut PyCodeObject);
-        c.co_consts = tuple::new_tuple(p.consts).into_raw();
-        c.co_names = tuple::new_tuple(p.names).into_raw();
-        c.co_exceptiontable = bytes::new_bytes(&exctable).into_raw();
-        c.co_flags = p.flags as c_int;
-        c.co_argcount = p.argcount as c_int;
-        c.co_posonlyargcount = p.posonlyargcount as c_int;
-        c.co_kwonlyargcount = p.kwonlyargcount as c_int;
-        c.co_stacksize = p.stacksize as c_int;
-        c.co_firstlineno = p.firstlineno as c_int;
-        c.co_nlocalsplus = kinds.len() as c_int;
-        c.co_framesize = (kinds.len() + p.stacksize as usize) as c_int;
-        c.co_nlocals = nlocals as c_int;
-        c.co_ncellvars = ncell as c_int;
-        c.co_nfreevars = nfree as c_int;
-        c.co_version = 1;
-        c.co_localsplusnames = tuple::new_tuple(p.localsplusnames).into_raw();
-        c.co_localspluskinds = bytes::new_bytes(&kinds).into_raw();
-        c.co_filename = p.filename.into_raw();
-        c.co_name = p.name.into_raw();
-        c.co_qualname = p.qualname.into_raw();
-        c.co_linetable = bytes::new_bytes(&linetable).into_raw();
-        c.data = Box::into_raw(data);
-        Ok(PyRef::from_raw(op))
+        let c = &mut *op;
+        c.co_consts = p.consts.into_raw();
+        c.co_names = p.names.into_raw();
+        c.co_exceptiontable = exctable.into_raw();
+        c.co_localsplusnames = p.localsplusnames.into_raw();
+        c.co_linetable = linetable.into_raw();
+        std::sync::atomic::AtomicPtr::from_ptr(&raw mut c.data).store(Box::into_raw(data), std::sync::atomic::Ordering::Release);
     }
 }
 
-fn encode_exception_table(t: &[ExceptionEntry]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(t.len() * 16);
+pub fn encode_exception_table(t: &[ExceptionEntry]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(t.len() * 20);
     for e in t {
         for x in [e.start, e.end, e.target, e.depth, e.lasti as u32] {
-            v.extend_from_slice(&x.to_le_bytes());
-        }
-    }
-    v
-}
-
-/// Our own linetable encoding: per instruction (lineno, end_lineno, col, end_col) as u32 LE.
-fn encode_locations(locs: &[Location]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(locs.len() * 16);
-    for l in locs {
-        for x in [l.lineno, l.end_lineno, l.col, l.end_col] {
             v.extend_from_slice(&x.to_le_bytes());
         }
     }
@@ -306,11 +745,15 @@ unsafe extern "C" fn code_dealloc(op: *mut PyObject) {
             c.co_name,
             c.co_qualname,
             c.co_linetable,
+            c.doc,
         ] {
             xdecref(p);
         }
         if !c.data.is_null() {
             drop(Box::from_raw(c.data));
+        }
+        if !c.lazy.is_null() {
+            drop(Box::from_raw(c.lazy));
         }
         crate::alloc::free_object(op);
     }
@@ -341,8 +784,8 @@ unsafe extern "C" fn code_richcompare(a: *mut PyObject, b: *mut PyObject, op: c_
             if a == b {
                 return Ok(true);
             }
-            let dx = &*x.data;
-            let dy = &*y.data;
+            let dx = code_data(&*a);
+            let dy = code_data(&*b);
             if dx.code != dy.code
                 || x.co_flags != y.co_flags
                 || x.co_argcount != y.co_argcount
@@ -384,7 +827,7 @@ unsafe extern "C" fn code_richcompare(a: *mut PyObject, b: *mut PyObject, op: c_
 unsafe extern "C" fn code_hash(op: *mut PyObject) -> Py_hash_t {
     unsafe {
         let c = &*(op as *mut PyCodeObject);
-        let d = &*c.data;
+        let d = code_data(&*op);
         let mut h = crate::hash::TupleHasher::new(4);
         h.add(pystr::str_hash(&*c.co_name));
         h.add(d.code.len() as isize);
@@ -434,12 +877,13 @@ fn co_code(o: &PyObject) -> PyResult {
 fn co_lines(o: &PyObject) -> PyResult {
     // (start_offset, end_offset, lineno) with offsets in bytes (4 per instruction)
     let d = code_data(o);
+    let lines: Vec<u32> = d.locations.iter().map(|l| l.lineno).collect();
     let mut out: Vec<PyRef> = Vec::new();
     let mut i = 0;
-    while i < d.locations.len() {
-        let line = d.locations[i].lineno;
+    while i < lines.len() {
+        let line = lines[i];
         let mut j = i + 1;
-        while j < d.locations.len() && d.locations[j].lineno == line {
+        while j < lines.len() && lines[j] == line {
             j += 1;
         }
         let l = if line == 0 { none::none_ref() } else { int::new_int(line as i64) };
@@ -490,15 +934,19 @@ fn co_filename_get(o: &PyObject) -> PyResult {
     borrowed(get(o).co_filename)
 }
 fn co_consts_get(o: &PyObject) -> PyResult {
+    code_data(o);
     borrowed(get(o).co_consts)
 }
 fn co_names_get(o: &PyObject) -> PyResult {
+    code_data(o);
     borrowed(get(o).co_names)
 }
 fn co_linetable_get(o: &PyObject) -> PyResult {
+    code_data(o);
     borrowed(get(o).co_linetable)
 }
 fn co_exceptiontable_get(o: &PyObject) -> PyResult {
+    code_data(o);
     borrowed(get(o).co_exceptiontable)
 }
 fn int_field(v: c_int) -> PyResult {
@@ -540,7 +988,7 @@ fn code_replace(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRe
         flags: c.co_flags as u32,
         stacksize: c.co_stacksize as u32,
         code: d.code.clone(),
-        locations: d.locations.clone(),
+        locations: d.locations.iter().collect(),
         consts: Vec::new(),
         names: d.names.iter().map(|n| pystr::to_string_lossy(n)).collect(),
         localsplusnames: d.localsplusnames.iter().map(|n| pystr::to_string_lossy(n)).collect(),
@@ -585,13 +1033,13 @@ fn code_replace(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRe
             Some(c) => crate::abstract_::sequence_tuple(&c)?,
             None => PyRef::from_borrowed(c.co_consts),
         };
-        rd.consts = tuple::tuple_to_vec(&consts);
+        rd.consts = RefTuple::from_vec(tuple::tuple_to_vec(&consts));
         let old = rc.co_consts;
         rc.co_consts = consts.into_raw();
         xdecref(old);
         if let Some(n) = new_names {
             let t = crate::abstract_::sequence_tuple(&n)?;
-            rd.names = tuple::tuple_to_vec(&t);
+            rd.names = RefTuple::from_vec(tuple::tuple_to_vec(&t));
             let old = rc.co_names;
             rc.co_names = t.into_raw();
             xdecref(old);

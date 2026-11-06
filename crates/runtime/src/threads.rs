@@ -290,6 +290,7 @@ pub fn thread_exit() {
         }
         process_merge_queue(ts);
         crate::qsbr::thread_exit();
+        crate::object::thread_exit_type_counts();
         crate::interp::frame::drain_pool();
         crate::gc::flush_thread_counts();
         // Nobody queues objects for this owner once `alive` is false (checked under

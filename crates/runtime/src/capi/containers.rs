@@ -153,7 +153,7 @@ pub unsafe extern "C" fn PyList_New(n: Py_ssize_t) -> *mut PyObject {
         let l = list::new_list_empty();
         if n > 0 {
             let lp = l.as_ptr() as *mut PyListObject;
-            let arr = crate::alloc::raw_calloc(n as usize * 8) as *mut *mut PyObject;
+            let arr = crate::alloc::buf_calloc(n as usize * 8) as *mut *mut PyObject;
             if arr.is_null() {
                 let _ = memory_error();
                 return std::ptr::null_mut();
@@ -228,7 +228,9 @@ pub unsafe extern "C" fn PyList_SetItem(o: *mut PyObject, i: Py_ssize_t, v: *mut
         };
         match old {
             Some(old) => {
-                xdecref(old);
+                if !old.is_null() {
+                    crate::qsbr::decref_deferred(old); // lock-free readers (list.rs)
+                }
                 0
             }
             None => {

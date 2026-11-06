@@ -24,7 +24,11 @@ pub fn new_slice(start: &PyObject, stop: &PyObject, step: &PyObject) -> PyRef {
         s.start = start.to_ref().into_raw();
         s.stop = stop.to_ref().into_raw();
         s.step = step.to_ref().into_raw();
-        crate::gc::track(op);
+        // only slices holding GC objects can be part of a cycle (perf2: the common
+        // int/None slices are not tracked)
+        if [start, stop, step].iter().any(|x| crate::alloc::type_is_gc(x.type_ptr())) {
+            crate::gc::track(op);
+        }
         PyRef::from_raw(op)
     }
 }

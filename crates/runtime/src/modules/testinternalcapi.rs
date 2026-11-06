@@ -16,8 +16,21 @@ use crate::types::{bool_, dict, int, list, none, str as pystr, tuple};
 pub const INLINE_VALUES_MAX: usize = 30;
 
 fn has_inline_values(_m: &PyObject, o: &PyObject) -> PyResult {
-    // the managed-dict word may hold a tagged values pointer (shape.rs): ask shape
-    Ok(bool_::new_bool(crate::shape::has_inline_values(o)))
+    let r = unsafe {
+        let tp = o.type_ptr();
+        if (*tp).tp_flags & Py_TPFLAGS_INLINE_VALUES == 0 || !crate::alloc::has_managed(o.as_ptr()) {
+            false
+        } else if o.ob_gc_bits.load(std::sync::atomic::Ordering::Relaxed) & crate::alloc::GC_BIT_DICT_DETACHED != 0 {
+            false
+        } else if crate::shape::has_inline_values(o) {
+            true
+        } else {
+            // the dict materialised from the inline values (shape.rs)
+            let d = *crate::alloc::managed_dict_slot(o.as_ptr());
+            d.is_null() || (d as usize & 1 == 0 && dict::dict_len(&*d) <= INLINE_VALUES_MAX)
+        }
+    };
+    Ok(bool_::new_bool(r))
 }
 
 fn has_split_table(_m: &PyObject, _o: &PyObject) -> PyResult {
