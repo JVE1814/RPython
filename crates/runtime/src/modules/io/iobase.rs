@@ -48,6 +48,8 @@ pub unsafe extern "C" fn iobase_finalize(op: *mut PyObject) {
                 clear_exc();
             }
             if call0(o, "close").is_err() {
+                // keep close()'s exception aside while repr() runs
+                let close_exc = take_exc();
                 let msg = format!(
                     "Exception ignored while finalizing file {}",
                     ab::repr_string(o).unwrap_or_else(|_| {
@@ -55,6 +57,9 @@ pub unsafe extern "C" fn iobase_finalize(op: *mut PyObject) {
                         "<object repr() failed>".into()
                     })
                 );
+                if let Some(e) = close_exc {
+                    set_exc(e);
+                }
                 crate::modules::sys::write_unraisable_with_obj(&msg, None);
             }
         }

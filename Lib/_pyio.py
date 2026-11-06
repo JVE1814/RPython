@@ -583,14 +583,17 @@ class BytesIO(BufferedIOBase):
             raise ValueError("write to closed file")
         if isinstance(b, str):
             raise TypeError("can't write str to binary stream")
+        # export b once; obtaining the export may run code that closes us
         with memoryview(b) as view:
+            if self.closed:
+                raise ValueError("write to closed file")
             n = view.nbytes
-        if n == 0:
-            return 0
-        pos = self._pos
-        if pos > len(self._buffer):
-            self._buffer.resize(pos)
-        self._buffer[pos:pos + n] = b
+            if n == 0:
+                return 0
+            pos = self._pos
+            if pos > len(self._buffer):
+                self._buffer.resize(pos)
+            self._buffer[pos:pos + n] = view
         self._pos += n
         return n
 
@@ -793,7 +796,8 @@ class BufferedReader(_BufferedIOMixin):
     def tell(self):
         pos = _BufferedIOMixin.tell(self) - len(self._read_buf) + self._read_pos
         if pos < 0:
-            raise OSError("tell() returned an invalid position")
+            # a raw stream that always reports 0 (character devices)
+            pos = 0
         return pos
 
     def seek(self, pos, whence=0):
@@ -1490,7 +1494,7 @@ class TextIOWrapper(TextIOBase):
         if errors is None:
             errors = "strict"
         elif not isinstance(errors, str):
-            raise TypeError("invalid errors: %r" % errors)
+            raise ValueError("invalid errors: %r" % errors)
         elif _CHECK_ERRORS:
             codecs.lookup_error(errors)
         self._buffer = buffer

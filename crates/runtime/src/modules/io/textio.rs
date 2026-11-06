@@ -773,20 +773,34 @@ fn t_write(o: &PyObject, text: &PyObject) -> PyResult {
     }
     let needflush = st.line_buffering && (has_lf || pystr::str_data(text).iter().any(|c| c == CR));
     let b = st.encoder.as_ref().unwrap().encode(&text_obj)?;
+    let data = bytes::bytes_data(&b);
+    // Pending bytes that would overflow the chunk are written out first
+    // (repeatedly: a write() of the buffer may re-enter and add more).
+    loop {
+        let st = state(o)?;
+        if st.pending.is_empty() || st.pending.len() + data.len() <= st.chunk_size {
+            break;
+        }
+        flush_pending(st)?;
+    }
     let st = state(o)?;
-    st.pending.extend_from_slice(bytes::bytes_data(&b));
-    if st.pending.len() > st.chunk_size || needflush || st.write_through {
+    st.pending.extend_from_slice(data);
+    if st.pending.len() >= st.chunk_size || needflush || st.write_through {
         flush_pending(st)?;
     }
     if needflush {
         call0(&state(o)?.buffer, "flush")?;
     }
     let st = state(o)?;
-    st.decoded.clear();
-    st.used = 0;
-    st.snapshot = None;
-    if let Some(d) = &mut st.decoder {
-        d.reset()?;
+    // read-ahead is stale once the position moved; a non-seekable stream
+    // (e.g. BufferedRWPair) reads and writes independently and keeps it
+    if st.seekable {
+        st.decoded.clear();
+        st.used = 0;
+        st.snapshot = None;
+        if let Some(d) = &mut st.decoder {
+            d.reset()?;
+        }
     }
     Ok(int::new_int(n as i64))
 }
@@ -1334,6 +1348,7 @@ fn t_reconfigure(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyR
             if !pystr::is_str(e) {
                 raise!(TypeError, "reconfigure() argument 'errors' must be str or None, not {}", tname(e));
             }
+            pystr::as_utf8(e)?;
             Some(e.to_ref())
         }
         None => {
@@ -1344,6 +1359,10 @@ fn t_reconfigure(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyR
             }
         }
     };
+    // an unknown codec must leave the stream unchanged
+    if let Some(e) = &new_enc {
+        lookup_codec(pystr::as_utf8(e)?)?;
+    }
     call0(o, "flush")?;
     let st = state(o)?;
     if let Some(n) = new_newline {

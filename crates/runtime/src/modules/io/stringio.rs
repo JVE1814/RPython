@@ -237,7 +237,9 @@ fn s_read(o: &PyObject, args: &[&PyObject]) -> PyResult {
     let start = s.pos.min(len);
     let avail = len - start;
     let n = if n < 0 { avail } else { (n as usize).min(avail) };
-    s.pos = start + n;
+    if n > 0 {
+        s.pos = start + n; // reading at or past the end leaves the position alone
+    }
     Ok(pystr::from_codepoints(&s.buf[start..start + n]))
 }
 

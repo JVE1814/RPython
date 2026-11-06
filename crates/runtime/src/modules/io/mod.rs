@@ -382,7 +382,8 @@ fn open_impl(
             line_buffering = true;
         }
         if buffering < 0 {
-            buffering = fileio::blksize(&raw) as isize;
+            // the file system block size, bounded to [DEFAULT_BUFFER_SIZE, 8 MiB]
+            buffering = (fileio::blksize(&raw) as isize).min(8192 * 1024).max(DEFAULT_BUFFER_SIZE as isize);
         }
         if buffering < 0 {
             raise!(ValueError, "invalid buffering size");

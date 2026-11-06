@@ -584,7 +584,8 @@ fn readinto_impl(o: &PyObject, b: &PyObject, one: bool) -> PyResult {
     dst[..take].copy_from_slice(&st.rbuf[st.rpos..st.rpos + take]);
     st.rpos += take;
     written += take;
-    if written == n || (one && written > 0) {
+    // readinto1 adds one raw read only when the rest would not fit the buffer
+    if written == n || (one && written > 0 && n - written <= st.buffer_size) {
         return Ok(int::new_int(written as i64));
     }
     st.reset_read();
@@ -741,8 +742,12 @@ fn flush_impl(o: &PyObject) -> PyResult<()> {
     if st.writable && !st.wbuf.is_empty() {
         flush_writes(&raw, st)?;
     }
-    if st.readable && st.writable && st.unread() > 0 {
-        rewind_read(&raw, st)?;
+    if st.readable && st.writable {
+        if st.unread() > 0 {
+            rewind_read(&raw, st)?;
+        }
+        // flush() always drops the read buffer of a random-access stream
+        st.reset_read();
     }
     Ok(())
 }
@@ -789,7 +794,7 @@ fn b_seek(o: &PyObject, args: &[&PyObject]) -> PyResult {
         let cur_raw = raw_tell(&raw)?;
         let buf_start = cur_raw - st.rbuf.len() as i64;
         let target = if whence == 0 { pos } else { cur_raw - st.unread() as i64 + pos };
-        if target >= buf_start && target <= cur_raw {
+        if target >= 0 && target >= buf_start && target <= cur_raw {
             st.rpos = (target - buf_start) as usize;
             return Ok(int::new_int(target));
         }
@@ -849,6 +854,12 @@ fn b_close(o: &PyObject) -> PyResult {
     }
     let flush_res = call0(o, "flush");
     let flush_exc = if flush_res.is_err() { take_exc() } else { None };
+    // the raw stream is closed under the buffer lock: a write() from another
+    // thread waits and then sees a closed file
+    let guard = match lock(o) {
+        Ok(g) => g,
+        Err(e) => return Err(e),
+    };
     {
         let b = bf(o);
         if !b.st.is_null() {
@@ -857,6 +868,7 @@ fn b_close(o: &PyObject) -> PyResult {
         }
     }
     let close_res = call0(&raw, "close");
+    drop(guard);
     match (close_res, flush_exc) {
         (Ok(_), None) => Ok(none::none_ref()),
         (Ok(_), Some(fe)) => {
@@ -959,7 +971,20 @@ fn b_sizeof(o: &PyObject) -> PyResult {
     let mut n = unsafe { (*o.type_ptr()).tp_basicsize } as usize;
     let b = bf(o);
     if !b.st.is_null() {
-        n += unsafe { (*b.st).buffer_size };
+        // a closed stream no longer owns its buffer
+        let closed = match parts(o) {
+            Ok((raw, _)) => raw_closed(&raw).unwrap_or_else(|_| {
+                clear_exc();
+                false
+            }),
+            Err(_) => {
+                clear_exc();
+                false
+            }
+        };
+        if !closed {
+            n += unsafe { (*b.st).buffer_size };
+        }
     }
     Ok(int::new_int(n as i64))
 }
