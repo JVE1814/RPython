@@ -214,6 +214,13 @@ pub fn format_exception(e: &PyObject) -> String {
 }
 
 pub fn print_exception(e: &PyObject) {
+    if !crate::types::exceptions::is_exception_instance(e) {
+        crate::modules::sys::write_stderr(&format!(
+            "TypeError: print_exception(): Exception expected for value, {} found\n",
+            crate::types::typeobject::tname(e)
+        ));
+        return;
+    }
     // Like CPython, prefer `traceback._print_exception_bltin` (carets,
     // suggestions, colours); fall back to the built-in printer when the
     // traceback module is unavailable or fails.
