@@ -41,6 +41,15 @@ fn main_module() -> PyResult {
     let m = module::new_module("__main__")?;
     let d = module::module_dict(&m);
     dict::set_item_str(&d, "__builtins__", &crate::builtins::builtins_module())?;
+    // like CPython, __main__ starts out with the built-in importer as its
+    // loader (a script run later replaces it) (grind-lib)
+    if let Some(bi) = crate::import::get_loaded_module("_frozen_importlib")
+        .or_else(|| crate::import::get_loaded_module("importlib._bootstrap"))
+        .and_then(|m| ab::getattr_str(&m, "BuiltinImporter").ok())
+    {
+        dict::set_item_str(&d, "__loader__", &bi)?;
+    }
+    clear_exc();
     dict::set_item_str(&d, "__annotations__", &dict::new_dict()).ok();
     dict::del_item(&d, &pystr::new_str("__annotations__")).ok();
     dict::set_item_str(&crate::modules::sys::modules_dict(), "__main__", &m)?;
@@ -69,6 +78,16 @@ fn run_code_in_main(src: &[u8], filename: &str) -> Outcome {
         let m = main_module()?;
         let d = module::module_dict(&m);
         let code = crate::compile::compile_bytes(src, filename, crate::compile::Mode::Exec, 0, -1)?;
+        if filename == "<string>" {
+            // make the -c source available to tracebacks (grind-lib)
+            let reg = crate::import::import_absolute("linecache").and_then(|lc| {
+                let s = pystr::new_str(&String::from_utf8_lossy(src));
+                ab::call_method_str(&lc, "_register_code", &[&code.code, &s, &pystr::new_str(filename)])
+            });
+            if reg.is_err() {
+                clear_exc();
+            }
+        }
         crate::interp::eval_code(&code.code, &d, Some(&d))?;
         Ok(())
     })();
@@ -160,6 +179,9 @@ fn run_script(path: &str, opts: &MainOptions) -> Outcome {
             None => src.clear(),
         }
     }
+    // the script path is made absolute (like CPython 3.9+): __file__ and code filenames
+    let abs = abspath(path);
+    let path = abs.as_str();
     let r = (|| -> PyResult<()> {
         let m = main_module()?;
         let d = module::module_dict(&m);
@@ -553,6 +575,12 @@ pub fn run_main(opts: MainOptions) -> i32 {
     let cfg = crate::modules::sys_full::config();
     if cfg.verbose == 0 {
         // nothing
+    }
+    // -W / PYTHONWARNINGS options are applied (and invalid ones reported) by
+    // the warnings module, so it is imported up front when there are any
+    // (grind-lib)
+    if !cfg.warnoptions.is_empty() && crate::import::import_absolute("warnings").is_err() {
+        crate::print_exception_and_clear();
     }
     let mut code = match &opts.mode {
         RunMode::Command(c) => {

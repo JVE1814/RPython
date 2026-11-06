@@ -224,7 +224,15 @@ def _is_bound_method(fn):
         return True
     if inspect.isbuiltin(fn):
         bound = getattr(fn, '__self__', None)
-        return bound is not None and not inspect.ismodule(bound)
+        if bound is None or inspect.ismodule(bound):
+            return False
+        if inspect.isclass(bound):
+            # a builtin static method carries its class as __self__ too
+            name = getattr(fn, '__name__', None)
+            entry = vars(bound).get(name) if isinstance(name, str) else None
+            if isinstance(entry, staticmethod):
+                return False
+        return True
     return False
 
 
@@ -309,9 +317,13 @@ def _signature_text(obj):
         text = getattr(obj, '__text_signature__', None)
         if not text:
             return text
-        if text.startswith('($'):
+        has_self = text.startswith('($')
+        if has_self:
             text = '(' + text[2:]
-        if getattr(obj, '__self__', None) is not None:
+        # a builtin without a $-marked first parameter (a static method)
+        # takes no bound argument
+        if (getattr(obj, '__self__', None) is not None
+                and (has_self or not inspect.isbuiltin(obj))):
             # bound: drop the first parameter (and a '/' right after it)
             m = re.match(r'\(\w+(?:(?=\))|,\s*(?:/(?:(?=\))|,\s*))?)', text)
             if m:
@@ -972,7 +984,8 @@ def _module_members(module):
                if belongs(value) and visiblename(key, names, module)]
     functions = [(key, value)
                  for key, value in inspect.getmembers(module, inspect.isroutine)
-                 if belongs(value) and visiblename(key, names, module)]
+                 if (inspect.isbuiltin(value) or belongs(value))
+                 and visiblename(key, names, module)]
     data = [(key, value)
             for key, value in inspect.getmembers(module, isdata)
             if visiblename(key, names, module)]

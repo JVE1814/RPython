@@ -1045,6 +1045,8 @@ pub fn init_module() -> PyResult {
     )?;
     fc::add_type(&d, "deque", deque_type())?;
     fc::add_type(&d, "defaultdict", defaultdict_type())?;
+    crate::modules::odict::init_types()?;
+    fc::add_type(&d, "OrderedDict", crate::modules::odict::odict_type())?;
     fc::add_type(&d, "_deque_iterator", dequeiter_type())?;
     fc::add_type(&d, "_deque_reverse_iterator", dequereviter_type())?;
     fc::add_type(&d, "_tuplegetter", tuplegetter_type())?;

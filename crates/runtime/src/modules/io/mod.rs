@@ -318,13 +318,14 @@ fn open_impl(
     opener: Option<&PyObject>,
 ) -> PyResult {
     let is_fd = int::is_int(file);
-    if !is_fd && !pystr::is_str(file) && !crate::types::bytes::is_bytes(file) {
-        // must be path-like
-        if crate::modules::posix::path::fspath(file).is_err() {
-            clear_exc();
-            raise!(TypeError, "invalid file: {}", ab::repr_string(file)?);
-        }
-    }
+    let fspathed;
+    let file = if !is_fd && !pystr::is_str(file) && !crate::types::bytes::is_bytes(file) {
+        // must be path-like: errors raised by __fspath__ propagate
+        fspathed = crate::modules::posix::path::fspath(file)?;
+        &*fspathed
+    } else {
+        file
+    };
     let m = parse_open_mode(mode)?;
     if m.text && m.binary {
         raise!(ValueError, "can't have text and binary mode at once");
@@ -371,16 +372,18 @@ fn open_impl(
         rawmode.push('+');
     }
     let raw = fileio::new_fileio(file, &rawmode, closefd, opener)?;
-    let result = raw.clone();
+    // the outermost layer built so far: closed (with everything below) on error
+    let mut result = raw.clone();
     let r = (|| -> PyResult {
         let mut buffering = buffering;
         let mut line_buffering = false;
-        if buffering == 1 || (buffering < 0 && ab::is_true(&*call0(&raw, "isatty")?)?) {
+        if buffering == 1 || (buffering < 0 && ab::is_true(&*call0(&raw, "_isatty_open_only")?)?) {
             buffering = -1;
             line_buffering = true;
         }
         if buffering < 0 {
-            buffering = fileio::blksize(&raw) as isize;
+            // the file system block size, bounded to [DEFAULT_BUFFER_SIZE, 8 MiB]
+            buffering = (fileio::blksize(&raw) as isize).min(8192 * 1024).max(DEFAULT_BUFFER_SIZE as isize);
         }
         if buffering < 0 {
             raise!(ValueError, "invalid buffering size");
@@ -399,6 +402,7 @@ fn open_impl(
         } else {
             ab::call(&type_ref(bufferedio::bufreader_type()), &[&raw, &bsize])?
         };
+        result = buffer.clone();
         if m.binary {
             return Ok(buffer);
         }
@@ -407,6 +411,7 @@ fn open_impl(
         let nl = newline.map(|e| e.to_ref()).unwrap_or_else(none::none_ref);
         let lb = bool_::new_bool(line_buffering);
         let wrapper = ab::call(&type_ref(textio::textiowrapper_type()), &[&buffer, &enc, &err, &nl, &lb])?;
+        result = wrapper.clone();
         ab::setattr(&wrapper, crate::name!("mode"), &pystr::new_str(mode))?;
         Ok(wrapper)
     })();
@@ -543,6 +548,7 @@ pub fn init() -> PyResult {
         ("BufferedRWPair", bufferedio::bufrwpair_type()),
         ("TextIOWrapper", textio::textiowrapper_type()),
         ("IncrementalNewlineDecoder", textio::nldecoder_type()),
+        ("_BytesIOBuffer", &raw mut bytesio::BYTESIOBUF_TYPE),
     ] {
         dict::set_item_str(&d, n, &type_ref(t))?;
     }

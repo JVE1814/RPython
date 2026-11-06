@@ -199,7 +199,7 @@ fn values_offset(tp: *mut PyTypeObject) -> usize {
 pub unsafe fn type_enable(tp: *mut PyTypeObject, hint: usize) {
     unsafe {
         let f = (*tp).tp_flags;
-        if f & Py_TPFLAGS_MANAGED_DICT == 0 || f & Py_TPFLAGS_HEAPTYPE == 0 || (*tp).tp_itemsize != 0 || (*tp).tp_dictoffset != 0 {
+        if f & Py_TPFLAGS_MANAGED_DICT == 0 || f & Py_TPFLAGS_HEAPTYPE == 0 || (*tp).tp_itemsize != 0 || (*tp).tp_dictoffset > 0 {
             return;
         }
         if (*tp).tp_alloc.map(|a| a as usize) != Some(crate::types::typeobject::generic_alloc as usize) {

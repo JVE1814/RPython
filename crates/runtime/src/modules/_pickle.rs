@@ -467,6 +467,8 @@ struct PicklerObj {
     dict: *mut PyObject,
     weakreflist: *mut PyObject,
     st: *mut PState,
+    /// unused: keeps the instance size of the C implementation (sys.getsizeof)
+    _pad: [usize; 14],
 }
 
 static mut PICKLER_TYPE: PyTypeObject = PyTypeObject::ZERO;
@@ -579,7 +581,7 @@ fn pickler_setup(o: &PyObject, file: Option<&PyObject>, protocol: Option<&PyObje
     st.fix_imports = fix && proto < 3;
     st.buffer_callback = cb;
     st.memo = Memo::new();
-    st.out.clear();
+    st.out = Vec::with_capacity(4096); // the initial write buffer
     st.initialized = true;
     Ok(())
 }
@@ -1567,6 +1569,25 @@ impl<'a> P<'a> {
                 None => ab::getattr(o, name!("__name__"))?,
             },
         };
+        // Names are handled as Rust strings below, which cannot hold lone
+        // surrogates: such a name can never be written (protocol 3+ uses
+        // UTF-8), so report it now (grind-lib).
+        if self.st.proto >= 3 {
+            let module_attr = ab::getattr_opt(o, &pystr::intern_str("__module__"))?;
+            for (what, s) in [("module", module_attr.filter(|m| pystr::is_str(m))), ("global", Some(name.clone()))] {
+                if let Some(s) = s {
+                    if pystr::as_utf8(&s).is_err() {
+                        let ctx = take_exc();
+                        let r = ab::repr_string(&s)?;
+                        return Err(raise_with_context(
+                            &globals().pickling_error,
+                            &format!("can't pickle {} identifier {} using pickle protocol {}", what, r, self.st.proto),
+                            ctx,
+                        ));
+                    }
+                }
+            }
+        }
         let name_s = pystr::to_string_lossy(&name);
         let module_name = whichmodule(o, &name, &name_s)?;
         let module_s = pystr::to_string_lossy(&module_name);
@@ -1712,6 +1733,8 @@ impl<'a> P<'a> {
         r2?;
         if self.st.write.is_some() {
             self.flush()?;
+            // the write buffer is released after every dump()
+            self.st.out = Vec::new();
         }
         Ok(())
     }
@@ -1889,9 +1912,24 @@ fn pickler_persistent_id(_o: &PyObject, _obj: &PyObject) -> PyResult {
 }
 
 fn pickler_sizeof(o: &PyObject) -> PyResult {
+    // Reported like the C pickler: a memo hash table (header + 16-byte entries,
+    // starting at 8 slots and growing 4x when 2/3 full) and the write buffer.
     let st = pstate(o);
     let base = unsafe { (*o.type_ptr()).tp_basicsize } as usize;
-    Ok(int::new_int((base + st.memo.map.capacity() * 24 + st.out.capacity()) as i64))
+    let mut slots = 8usize;
+    for n in 1..=st.memo.map.len() {
+        if n * 3 >= (slots - 1) * 2 {
+            let want = if n > 50000 { n * 2 } else { n * 4 };
+            while slots < want {
+                slots <<= 1;
+            }
+        }
+    }
+    let mut size = base + 32 + slots * 16;
+    if st.out.capacity() > 0 {
+        size += unsafe { (*crate::types::bytes::bytes_type()).tp_basicsize } as usize + st.out.capacity();
+    }
+    Ok(int::new_int(size as i64))
 }
 
 fn int_attr(v: Option<&PyObject>) -> PyResult<i64> {
@@ -2028,6 +2066,10 @@ struct UState {
     memo: Vec<Option<PyRef>>,
     memo_sparse: HashMap<usize, PyRef>,
     memo_len: usize,
+    /// table sizes the C unpickler would have allocated (for __sizeof__)
+    memo_cap: usize,
+    marks_cap: usize,
+    line_copy: usize,
     proto: i64,
     encoding: String,
     errors: String,
@@ -2052,6 +2094,9 @@ impl UState {
             memo: Vec::new(),
             memo_sparse: HashMap::new(),
             memo_len: 0,
+            memo_cap: 32,
+            marks_cap: 0,
+            line_copy: 0,
             proto: 0,
             encoding: "ASCII".into(),
             errors: "strict".into(),
@@ -2068,6 +2113,9 @@ impl UState {
     }
 
     fn memo_put(&mut self, i: usize, v: PyRef) {
+        while i >= self.memo_cap {
+            self.memo_cap *= 2;
+        }
         if i < self.memo.len() {
             if self.memo[i].is_none() {
                 self.memo_len += 1;
@@ -2099,6 +2147,8 @@ struct UnpicklerObj {
     dict: *mut PyObject,
     weakreflist: *mut PyObject,
     st: *mut UState,
+    /// unused: keeps the instance size of the C implementation (sys.getsizeof)
+    _pad: [usize; 33],
 }
 
 fn ustate(o: &PyObject) -> &mut UState {
@@ -2321,6 +2371,8 @@ impl<'a> U<'a> {
         if !data.ends_with(b"\n") {
             return Err(truncated());
         }
+        // the C unpickler keeps a NUL-terminated copy of the last line read from a file
+        self.st.line_copy = data.len() + 1;
         Ok(data)
     }
 
@@ -2737,6 +2789,9 @@ impl<'a> U<'a> {
             op::MARK => {
                 let n = self.st.stack.len();
                 self.st.marks.push(n);
+                if self.st.marks.len() > self.st.marks_cap {
+                    self.st.marks_cap = (self.st.marks_cap << 1) + 20;
+                }
             }
             op::GET => {
                 let body = self.line_body()?;
@@ -3085,7 +3140,7 @@ fn unpickler_persistent_load(_o: &PyObject, _pid: &PyObject) -> PyResult {
 fn unpickler_sizeof(o: &PyObject) -> PyResult {
     let st = ustate(o);
     let base = unsafe { (*o.type_ptr()).tp_basicsize } as usize;
-    Ok(int::new_int((base + st.memo.capacity() * 8 + st.marks.capacity() * 8 + st.encoding.len() + 1 + st.errors.len() + 1) as i64))
+    Ok(int::new_int((base + st.memo_cap * 8 + st.marks_cap * 8 + st.line_copy + st.encoding.len() + 1 + st.errors.len() + 1) as i64))
 }
 
 fn umemo_copy(o: &PyObject) -> PyResult {

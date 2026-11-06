@@ -42,6 +42,8 @@ pub struct BytesIO {
     pub hdr: IoHeader,
     pub st: *mut State,
     pub exports: isize,
+    /// unused; keeps the instance size equal to the free-threaded C layout
+    pub _reserved: isize,
 }
 
 pub static mut BYTESIO_TYPE: PyTypeObject = PyTypeObject::ZERO;
@@ -151,7 +153,9 @@ fn read_n(s: &mut State, n: isize) -> &[u8] {
     let start = s.pos.min(len);
     let avail = len - start;
     let n = if n < 0 { avail } else { (n as usize).min(avail) };
-    s.pos = start + n;
+    if n > 0 {
+        s.pos = start + n; // reading at or past the end leaves the position alone
+    }
     &s.bytes()[start..start + n]
 }
 
@@ -541,7 +545,7 @@ pub fn init_types() -> PyResult<()> {
         let t = &mut *(&raw mut BYTESIOBUF_TYPE);
         t.tp_name = c"_io._BytesIOBuffer".as_ptr();
         t.tp_basicsize = std::mem::size_of::<BytesIOBuffer>() as isize;
-        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC;
+        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC | Py_TPFLAGS_IMMUTABLETYPE | Py_TPFLAGS_DISALLOW_INSTANTIATION;
         t.tp_dealloc = Some(buf_dealloc);
         t.tp_traverse = Some(buf_traverse);
         t.tp_as_buffer = &raw mut BUF_PROCS;

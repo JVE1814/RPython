@@ -429,6 +429,16 @@ pub fn import_module_level(nm: &PyObject, globals: Option<&PyObject>, fromlist: 
     if level < 0 {
         raise!(ValueError, "level must be >= 0");
     }
+    if level == 0 && pystr::to_string_strict(nm).is_none() {
+        // a name with lone surrogates has no Rust string form; it can only
+        // name a module already placed in sys.modules (grind-lib)
+        let modules = crate::modules::sys::modules_dict();
+        if let Some(m) = dict::get_item(&modules, nm)? {
+            if !m.is(none::none()) {
+                return Ok(m);
+            }
+        }
+    }
     let n = pystr::to_string_lossy(nm);
     let abs = if level > 0 {
         resolve_name(&n, globals, level)?

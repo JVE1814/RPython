@@ -335,7 +335,12 @@ def _bless_my_loader(module_globals):
     missing = object()
     loader = module_globals.get('__loader__', None)
     spec = module_globals.get('__spec__', missing)
+    if spec is missing and loader is None:
+        # neither is given: there is simply no loader to use
+        return None
     spec_loader = getattr(spec, 'loader', missing) if spec is not missing else missing
+    if spec is None:
+        spec_loader = None
     if spec_loader is missing or spec_loader is None:
         if loader is None:
             if spec_loader is missing:

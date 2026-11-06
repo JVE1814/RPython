@@ -237,7 +237,9 @@ fn s_read(o: &PyObject, args: &[&PyObject]) -> PyResult {
     let start = s.pos.min(len);
     let avail = len - start;
     let n = if n < 0 { avail } else { (n as usize).min(avail) };
-    s.pos = start + n;
+    if n > 0 {
+        s.pos = start + n; // reading at or past the end leaves the position alone
+    }
     Ok(pystr::from_codepoints(&s.buf[start..start + n]))
 }
 
@@ -448,8 +450,8 @@ fn s_setstate(o: &PyObject, st: &PyObject) -> PyResult {
     }
     let items = tuple::tuple_items(st);
     let value = items[0];
-    if !pystr::is_str(value) {
-        raise!(TypeError, "initial_value must be str, not {}", tname(value));
+    if !pystr::is_str(value) && !value.is(none::none()) {
+        raise!(TypeError, "initial_value must be str or None, not {}", tname(value));
     }
     let nl = parse_newline(Some(items[1]))?;
     let posobj = items[2];
@@ -465,7 +467,7 @@ fn s_setstate(o: &PyObject, st: &PyObject) -> PyResult {
         raise!(TypeError, "fourth item of state should be a dict, got a {}", tname(d));
     }
     let mut new = configure(nl);
-    new.buf = str_cps(value);
+    new.buf = if value.is(none::none()) { Default::default() } else { str_cps(value) };
     new.pos = pos as usize;
     let s = sio(o);
     if !s.st.is_null() {

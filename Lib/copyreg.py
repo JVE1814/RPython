@@ -23,21 +23,13 @@ def constructor(object):
         raise TypeError("constructors must be callable")
 
 
-# complex and union types have no reduce method of their own.
+# complex has no reduce method of its own (unions reduce themselves).
 
 def pickle_complex(c):
     return complex, (c.real, c.imag)
 
 pickle(complex, pickle_complex, complex)
 
-def pickle_union(obj):
-    import functools, operator
-    return functools.reduce, (operator.or_, obj.__args__)
-
-try:
-    pickle(type(int | str), pickle_union)
-except TypeError:
-    pass
 
 def pickle_super(obj):
     return super, (obj.__thisclass__, obj.__self__)
@@ -49,7 +41,11 @@ pickle(super, pickle_super)
 
 def _reconstructor(cls, base, state):
     if base is object:
-        obj = object.__new__(cls)
+        try:
+            obj = object.__new__(cls)
+        except TypeError:
+            # a native base passed over by _reduce_ex needs its own allocator
+            obj = cls.__new__(cls)
     else:
         obj = base.__new__(cls, state)
         if base.__init__ != object.__init__:
@@ -64,7 +60,12 @@ def _reduce_ex(self, proto):
     cls = self.__class__
     # Find the first base that is not a heap type (i.e. implemented natively).
     for base in cls.__mro__:
-        if hasattr(base, '__flags__') and not base.__flags__ & _HEAPTYPE:
+        native = hasattr(base, '__flags__') and not base.__flags__ & _HEAPTYPE
+        if native and base is not cls and base.__module__ != 'builtins':
+            # Types of extension modules (_io, typing.Generic, ...) are heap
+            # types in CPython and are passed over like Python classes.
+            continue
+        if native:
             break
         new = base.__new__
         if isinstance(new, _new_type) and new.__self__ is base:

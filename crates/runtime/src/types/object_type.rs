@@ -768,6 +768,9 @@ fn type_get_module(o: &PyObject) -> PyResult {
     let tp = t(o);
     if is_heap_type(tp) {
         match dict::get_item_str(type_dict(tp), name!("__module__")) {
+            Some(m) if crate::types::typeobject::module_is_instance_descr(&m) => {
+                Ok(pystr::new_str(&type_module(tp).unwrap_or_else(|| "builtins".into())))
+            }
             Some(m) => Ok(m),
             None => raise!(AttributeError, "__module__"),
         }
@@ -891,11 +894,20 @@ fn type_itemsize(o: &PyObject) -> PyResult {
 fn type_flags(o: &PyObject) -> PyResult {
     Ok(int::new_int(unsafe { (*t(o)).tp_flags } as i64))
 }
+// Managed dict / weakref slots live in the pre-header; CPython reports them with its
+// sentinel offsets (-1 for the dict, minus two words for the weakref list), which Python
+// code compares against 0 to ask "do instances have a __dict__ / support weakrefs".
 fn type_weakrefoffset(o: &PyObject) -> PyResult {
-    Ok(int::new_int(unsafe { (*t(o)).tp_weaklistoffset } as i64))
+    let tp = t(o);
+    let off = unsafe { (*tp).tp_weaklistoffset };
+    let managed = unsafe { (*tp).tp_flags & Py_TPFLAGS_MANAGED_WEAKREF != 0 };
+    Ok(int::new_int(if off == 0 && managed { -2 * std::mem::size_of::<usize>() as i64 } else { off as i64 }))
 }
 fn type_dictoffset(o: &PyObject) -> PyResult {
-    Ok(int::new_int(unsafe { (*t(o)).tp_dictoffset } as i64))
+    let tp = t(o);
+    let off = unsafe { (*tp).tp_dictoffset };
+    let managed = unsafe { (*tp).tp_flags & Py_TPFLAGS_MANAGED_DICT != 0 };
+    Ok(int::new_int(if off == 0 && managed { -1 } else { off as i64 }))
 }
 
 fn type_mro_method(o: &PyObject) -> PyResult {
@@ -1098,6 +1110,7 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
     let mut add_dict = false;
     let mut add_weak = false;
     let mut slot_names: Vec<PyRef> = Vec::new();
+    let mut slot_docs: Vec<(String, String)> = Vec::new();
     let base_has_dict = unsafe { (*base).tp_dictoffset != 0 || (*base).tp_flags & Py_TPFLAGS_MANAGED_DICT != 0 };
     let base_has_weak = unsafe { (*base).tp_weaklistoffset != 0 || (*base).tp_flags & Py_TPFLAGS_MANAGED_WEAKREF != 0 };
     match &slots {
@@ -1148,10 +1161,37 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
                         raise!(ValueError, "'{}' in __slots__ conflicts with class variable", st);
                     }
                 }
+                if dict::is_dict(s) {
+                    // a dict of __slots__ maps names to member docstrings
+                    if let Some(doc) = dict::get_item(s, item)? {
+                        if pystr::is_str(&doc) {
+                            slot_docs.push((pystr::to_string_lossy(&mangled), pystr::to_string_lossy(&doc)));
+                        }
+                    }
+                }
                 slot_names.push(mangled);
             }
             slot_names.sort_by(|x, y| pystr::str_cmp(x, y));
             // if slots is a dict, keep it as slot docs; store the tuple of names
+            // other bases may still bring a __dict__ / __weakref__ (a plain mixin class
+            // next to a slotted base): instances keep them
+            for b in tuple::tuple_items(&bases_owned) {
+                if !is_type(b) {
+                    continue;
+                }
+                let bt = b.as_ptr() as *mut PyTypeObject;
+                if bt == base {
+                    continue;
+                }
+                unsafe {
+                    if !base_has_dict && !add_dict && ((*bt).tp_dictoffset != 0 || (*bt).tp_flags & Py_TPFLAGS_MANAGED_DICT != 0) {
+                        add_dict = true;
+                    }
+                    if !base_has_weak && !add_weak && ((*bt).tp_weaklistoffset != 0 || (*bt).tp_flags & Py_TPFLAGS_MANAGED_WEAKREF != 0) {
+                        add_weak = true;
+                    }
+                }
+            }
         }
     }
 
@@ -1237,18 +1277,35 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
         let members_ptr = (tp_obj as *mut u8).add(std::mem::size_of::<PyHeapTypeObject>()) as *mut PyMemberDef;
         let mut mvec: Vec<PyMemberDef> = Vec::with_capacity(nslots + 1);
         for s in slot_names.iter() {
+            let sname = pystr::to_string_lossy(s);
+            let doc = match slot_docs.iter().find(|(n, _)| *n == sname) {
+                Some((_, d)) => crate::methods::cstr_static(d),
+                None => std::ptr::null(),
+            };
             mvec.push(PyMemberDef {
-                name: crate::methods::cstr_static(&pystr::to_string_lossy(s)),
+                name: crate::methods::cstr_static(&sname),
                 type_code: Py_T_OBJECT_EX,
                 offset: slotoffset as isize,
                 flags: 0,
-                doc: std::ptr::null(),
+                doc,
             });
             slotoffset += 8;
         }
         let _ = members_ptr;
         if nslots > 0 {
-            (*tp).tp_members = crate::methods::mbtable(mvec);
+            // like CPython, the slot members live in the type object's variable part, right
+            // after the metatype's fixed part (Py_SIZE(type) of them, then a zeroed sentinel):
+            // extensions such as msgspec read them from there
+            let item = (*meta).tp_itemsize as usize;
+            if item == std::mem::size_of::<PyMemberDef>() && var_size(&*tp_obj) as usize == nslots {
+                let inline = (tp_obj as *mut u8).add((*meta).tp_basicsize as usize) as *mut PyMemberDef;
+                for (i, m) in mvec.into_iter().enumerate() {
+                    std::ptr::write(inline.add(i), m);
+                }
+                (*tp).tp_members = inline;
+            } else {
+                (*tp).tp_members = crate::methods::mbtable(mvec);
+            }
         }
         (*h).ht_slots = if slots.is_some() { tuple::new_tuple(slot_names.clone()).into_raw() } else { std::ptr::null_mut() };
         if add_dict {
@@ -1263,6 +1320,14 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
         // inherit preheader flags from base
         (*tp).tp_flags |= (*base).tp_flags & Py_TPFLAGS_PREHEADER;
         (*tp).tp_flags |= (*base).tp_flags & Py_TPFLAGS_INLINE_VALUES;
+        // managed slots report CPython's sentinel offsets, which C extensions test against 0
+        // ("instances have a __dict__ / are weakly referenceable"; msgspec reads them)
+        if (*tp).tp_flags & Py_TPFLAGS_MANAGED_DICT != 0 && (*tp).tp_dictoffset == 0 {
+            (*tp).tp_dictoffset = -1;
+        }
+        if (*tp).tp_flags & Py_TPFLAGS_MANAGED_WEAKREF != 0 && (*tp).tp_weaklistoffset == 0 {
+            (*tp).tp_weaklistoffset = -2 * std::mem::size_of::<usize>() as isize;
+        }
         (*tp).tp_basicsize = slotoffset as isize;
         (*tp).tp_itemsize = (*base).tp_itemsize;
         (*tp).tp_dealloc = Some(subtype_dealloc);

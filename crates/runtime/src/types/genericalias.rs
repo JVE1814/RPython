@@ -293,7 +293,9 @@ fn subs_one(arg: &PyObject, params: &[PyRef], argitems: &[PyRef]) -> PyResult {
         if let Some(ip) = tuple_index(params, arg) {
             return ab::call(&subst, &[&argitems[ip]]);
         }
-        return Ok(arg.to_ref());
+        // __parameters__ was computed when the alias was created; an argument
+        // that became substitutable later is not one of them (grind-lib)
+        raise!(TypeError, "{} not found in __parameters__", crate::abstract_::repr_string(arg)?);
     }
     subs_tvars(arg, params, argitems)
 }

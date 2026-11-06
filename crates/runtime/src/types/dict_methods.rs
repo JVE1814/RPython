@@ -119,12 +119,24 @@ pub fn dict_merge_kwargs(d: &PyObject, o: &PyObject, func: *mut PyObject) -> PyR
             }
         }
     };
-    let pairs: Vec<(PyRef, PyRef)> = if is_plain_iter_dict(o) {
-        dict::items_vec(o)
-    } else {
+    // A plain dict source carries its keys' hashes: reuse them so that a
+    // key's __hash__ is not re-run while merging (grind-lib).
+    if is_plain_iter_dict(o) {
+        for (k, v, h) in dict::items_hash_vec(o) {
+            if !pystr::is_str(&k) {
+                raise!(TypeError, "keywords must be strings");
+            }
+            if dict::contains_hash(d, &k, h)? {
+                raise!(TypeError, "{} got multiple values for keyword argument '{}'", fname(), pystr::to_string_lossy(&k));
+            }
+            dict::set_item_hash(d, &k, h, &v)?;
+        }
+        return Ok(());
+    }
+    let pairs: Vec<(PyRef, PyRef)> = {
         let keys = match ab::getattr_opt(o, crate::name!("keys"))? {
             Some(k) => ab::call(&k, &[])?,
-            None => raise!(TypeError, "{} argument after ** must be a mapping, not {}", fname(), tname(o)),
+            None => raise!(TypeError, "Value after ** must be a mapping, not {}", tname(o)),
         };
         let mut v = Vec::new();
         for k in ab::collect_iterable(&keys)? {
@@ -137,10 +149,11 @@ pub fn dict_merge_kwargs(d: &PyObject, o: &PyObject, func: *mut PyObject) -> PyR
         if !pystr::is_str(&k) {
             raise!(TypeError, "keywords must be strings");
         }
-        if dict::contains(d, &k)? {
+        let h = dict::hash_of(&k)?;
+        if dict::contains_hash(d, &k, h)? {
             raise!(TypeError, "{} got multiple values for keyword argument '{}'", fname(), pystr::to_string_lossy(&k));
         }
-        dict::set_item(d, &k, &v)?;
+        dict::set_item_hash(d, &k, h, &v)?;
     }
     Ok(())
 }

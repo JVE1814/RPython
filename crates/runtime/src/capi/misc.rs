@@ -547,7 +547,8 @@ pub unsafe extern "C" fn PyFile_WriteObject(v: *mut PyObject, f: *mut PyObject, 
             return -1;
         }
         ret_i((|| -> PyResult<()> {
-            let s = if flags & 1 != 0 { ab::str(&*v)? } else { ab::repr(&*v)? };
+            // a NULL object is written as <NULL>, like PyObject_Str/Repr(NULL)
+            let s = if v.is_null() { pystr::new_str("<NULL>") } else if flags & 1 != 0 { ab::str(&*v)? } else { ab::repr(&*v)? };
             ab::call_method_str(&*f, "write", &[&s])?;
             Ok(())
         })())

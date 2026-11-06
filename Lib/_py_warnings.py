@@ -161,15 +161,12 @@ def _showwarnmsg_impl(msg):
     if file is None:
         file = sys.stderr
         if file is None:
-            # sys.stderr is None when run with pythonw.exe:
-            # warnings get lost
-            return
+            return  # no stderr at all: nowhere to show it
     text = _wm._formatwarnmsg(msg)
     try:
         file.write(text)
     except OSError:
-        # the file (probably stderr) is invalid - this warning gets lost.
-        pass
+        pass  # an unusable stream drops the warning
 
 
 def _formatwarnmsg_impl(msg):
@@ -256,6 +253,11 @@ _showwarning_orig = showwarning
 
 def _showwarnmsg(msg):
     """Hook to write a warning to a file; replace if you like."""
+    # recording (catch_warnings(record=True)) wins over a replaced
+    # showwarning()
+    if _wm._get_context().log is not None:
+        _wm._showwarnmsg_impl(msg)
+        return
     try:
         sw = _wm.showwarning
     except AttributeError:
@@ -546,17 +548,44 @@ def warn(message, category=None, stacklevel=1, source=None,
     )
 
 
+def _module_names_of_path(filename):
+    # The dotted module names a file path can stand for:
+    # "/a/pkg/mod.py" -> "mod", "pkg.mod", "a.pkg.mod"; "pkg/__init__.py"
+    # stands for "pkg".  Other extensions stay part of the last name.
+    name = filename
+    if name.endswith('.py'):
+        name = name[:-3]
+        if name.endswith('/__init__'):
+            name = name[:-len('/__init__')]
+    parts = name.split('/')
+    for i in range(len(parts) - 1, -1, -1):
+        if not parts[i]:
+            break
+        yield '.'.join(parts[i:])
+
+
+def _filter_module_matches(pattern, module, filename):
+    if pattern is None or pattern.match(module):
+        return True
+    if isinstance(filename, str):
+        return any(pattern.match(name)
+                   for name in _module_names_of_path(filename))
+    return False
+
+
 def warn_explicit(message, category, filename, lineno,
                   module=None, registry=None, module_globals=None,
                   source=None):
     lineno = int(lineno)
     if module is None:
+        # without a module name, the file name (minus ".py") stands in
         module = filename or "<unknown>"
         if module[-3:].lower() == ".py":
-            module = module[:-3]  # XXX What about leading pathname?
+            module = module[:-3]
     if registry is None:
         registry = {}
     with _wm._lock:
+        # a registry from before the filters last changed is stale
         if registry.get('version', 0) != _wm._filters_version:
             registry.clear()
             registry['version'] = _wm._filters_version
@@ -567,26 +596,22 @@ def warn_explicit(message, category, filename, lineno,
             text = message
             message = category(message)
         key = (text, category, lineno)
-        # Quick test for common case
         if registry.get(key):
-            return
-        # Search the filters
+            return  # already shown from this location
+        # the first matching filter decides
         for item in _wm._get_filters():
             action, msg, cat, mod, ln = item
             if ((msg is None or msg.match(text)) and
-                issubclass(category, cat) and
-                (mod is None or mod.match(module)) and
-                (ln == 0 or lineno == ln)):
+                    issubclass(category, cat) and
+                    _filter_module_matches(mod, module, filename) and
+                    (ln == 0 or lineno == ln)):
                 break
         else:
             action = _wm.defaultaction
-        # Early exit actions
         if action == "ignore":
             return
-
         if action == "error":
             raise message
-        # Other actions
         if action == "once":
             registry[key] = 1
             oncekey = (text, category)
@@ -604,28 +629,27 @@ def warn_explicit(message, category, filename, lineno,
         elif action == "default":
             registry[key] = 1
         else:
-            # Unrecognized actions are errors
             raise RuntimeError(
                   "Unrecognized action (%r) in warnings.filters:\n %s" %
                   (action, item))
 
-    # Prime the linecache for formatting, in case the
-    # "file" is actually in a zipfile or something.
+    # Fill the line cache now (module_globals may name a loader that can
+    # provide the source, e.g. for a module inside a zip file).
     import linecache
     linecache.getlines(filename, module_globals)
 
-    # Print message and context
-    msg = _wm.WarningMessage(message, category, filename, lineno, source=source)
+    msg = _wm.WarningMessage(message, category, filename, lineno,
+                             source=source, module=module)
     _wm._showwarnmsg(msg)
 
 
 class WarningMessage(object):
 
     _WARNING_DETAILS = ("message", "category", "filename", "lineno", "file",
-                        "line", "source")
+                        "line", "source", "module")
 
     def __init__(self, message, category, filename, lineno, file=None,
-                 line=None, source=None):
+                 line=None, source=None, module=None):
         self.message = message
         self.category = category
         self.filename = filename
@@ -633,6 +657,7 @@ class WarningMessage(object):
         self.file = file
         self.line = line
         self.source = source
+        self.module = module
         self._category_name = category.__name__ if category else None
 
     def __str__(self):

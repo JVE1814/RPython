@@ -139,26 +139,10 @@ pub unsafe extern "C" fn PyObject_DelAttr(o: *mut PyObject, n: *mut PyObject) ->
 pub unsafe extern "C" fn PyObject_DelAttrString(o: *mut PyObject, n: *const c_char) -> c_int {
     unsafe { PyObject_SetAttrString(o, n, std::ptr::null_mut()) }
 }
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyObject_GenericGetAttr(o: *mut PyObject, n: *mut PyObject) -> *mut PyObject {
-    unsafe {
-        if !pystr::is_str(&*n) {
-            let _ = type_error(&format!("attribute name must be string, not '{}'", tname(&*n)));
-            return std::ptr::null_mut();
-        }
-        ret(to::generic_getattr(&*o, &*n))
-    }
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyObject_GenericSetAttr(o: *mut PyObject, n: *mut PyObject, v: *mut PyObject) -> c_int {
-    unsafe {
-        if !pystr::is_str(&*n) {
-            let _ = type_error(&format!("attribute name must be string, not '{}'", tname(&*n)));
-            return -1;
-        }
-        ret_i(to::generic_setattr(&*o, &*n, opt(v)))
-    }
-}
+// PyObject_GenericGetAttr / PyObject_GenericSetAttr are object's own tp_getattro /
+// tp_setattro (typeobject.rs), so `tp->tp_getattro == PyObject_GenericGetAttr` holds for
+// ordinary classes as in CPython.
+pub use crate::types::typeobject::{object_generic_getattro as PyObject_GenericGetAttr, object_generic_setattro as PyObject_GenericSetAttr};
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _PyObject_GenericGetAttrWithDict(o: *mut PyObject, n: *mut PyObject, d: *mut PyObject, suppress: c_int) -> *mut PyObject {
     unsafe {
@@ -236,6 +220,9 @@ pub unsafe extern "C" fn PyObject_GetItemData(o: *mut PyObject) -> *mut c_void {
 pub unsafe extern "C" fn PyObject_GetItemData_DuringGC(o: *mut PyObject) -> *mut c_void {
     unsafe {
         let tp = (*o).type_ptr();
+        if (*tp).tp_flags & Py_TPFLAGS_ITEMS_AT_END == 0 {
+            return std::ptr::null_mut();
+        }
         (o as *mut u8).offset((*tp).tp_basicsize) as *mut c_void
     }
 }
@@ -695,17 +682,48 @@ pub unsafe extern "C" fn PyUnstable_Object_EnableDeferredRefcount(_o: *mut PyObj
     0
 }
 #[unsafe(no_mangle)]
+/// Owned by this thread with exactly one reference. CPython 3.14+ pushes locals onto the value
+/// stack without a new reference, so `x.resize(...)` on a local `x` sees refcount 1 there. Our
+/// interpreter's LoadFast takes a reference, so for a caller that is a Python frame, stack
+/// copies of a local of that same frame are not counted (at most one per local slot holding
+/// the object); references from anything else still count.
 pub unsafe extern "C" fn PyUnstable_Object_IsUniquelyReferenced(o: *mut PyObject) -> c_int {
     unsafe {
+        use std::sync::atomic::Ordering::Relaxed;
         let ob = &*o;
-        (ob.ob_tid.load(std::sync::atomic::Ordering::Relaxed) == thread_id()
-            && ob.ob_ref_local.load(std::sync::atomic::Ordering::Relaxed) == 1
-            && ob.ob_ref_shared.load(std::sync::atomic::Ordering::Relaxed) == 0) as c_int
+        if ob.ob_tid.load(Relaxed) != thread_id() || ob.ob_ref_shared.load(Relaxed) != 0 {
+            return 0;
+        }
+        let local = ob.ob_ref_local.load(Relaxed) as usize;
+        if local == 1 {
+            return 1;
+        }
+        if local == 0 || local > 64 {
+            return 0;
+        }
+        let f = crate::interp::current_frame_ptr();
+        if f.is_null() {
+            return 0;
+        }
+        let f = &*f;
+        let n = f.nlocalsplus.min(f.slots.len());
+        let in_locals = f.slots[..n].iter().filter(|&&p| p == o).count();
+        let on_stack = f.slots[n..].iter().filter(|&&p| p == o).count();
+        (local - in_locals.min(on_stack) == 1) as c_int
     }
 }
 #[unsafe(no_mangle)]
+/// A uniquely referenced object that is also an operand the interpreter took off a frame's
+/// value stack for the binary operation now being dispatched (numpy reuses such arrays for the
+/// result). An object that only C code holds, e.g. a Cython temporary passed to
+/// PyNumber_Add, is not a stack temporary.
 pub unsafe extern "C" fn PyUnstable_Object_IsUniqueReferencedTemporary(o: *mut PyObject) -> c_int {
-    unsafe { PyUnstable_Object_IsUniquelyReferenced(o) }
+    unsafe {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ob = &*o;
+        let sole = ob.ob_tid.load(Relaxed) == thread_id() && ob.ob_ref_local.load(Relaxed) == 1 && ob.ob_ref_shared.load(Relaxed) == 0;
+        (sole && crate::interp::eval::is_stack_temporary(o)) as c_int
+    }
 }
 
 #[allow(dead_code)]

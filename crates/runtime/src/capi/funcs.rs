@@ -133,14 +133,165 @@ pub unsafe extern "C" fn PyMethod_Self(m: *mut PyObject) -> *mut PyObject {
         fo::method_parts(&*m).1.as_ptr()
     }
 }
+// ---------------------------------------------------------------- instancemethod
+// classobject.h's PyInstanceMethodObject: a callable stored in a class that binds to the
+// instance like a Python function does (used by C code to put builtins in classes).
+
+#[repr(C)]
+struct InstanceMethodObject {
+    ob_base: PyObject,
+    func: *mut PyObject,
+}
+#[unsafe(no_mangle)]
+pub static mut PyInstanceMethod_Type: PyTypeObject = PyTypeObject::ZERO;
+
+fn im_type() -> *mut PyTypeObject {
+    &raw mut PyInstanceMethod_Type
+}
+unsafe fn im_func<'a>(o: *mut PyObject) -> &'a PyObject {
+    unsafe { &*(*(o as *mut InstanceMethodObject)).func }
+}
+fn new_instancemethod(f: &PyObject) -> PyRef {
+    unsafe {
+        let op = crate::alloc::alloc_object(im_type(), std::mem::size_of::<InstanceMethodObject>());
+        (*(op as *mut InstanceMethodObject)).func = f.to_ref().into_raw();
+        crate::gc::track(op);
+        PyRef::from_raw(op)
+    }
+}
+unsafe extern "C" fn im_new(_t: *mut PyTypeObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        if !kw.is_null() && dict::dict_len(&*kw) != 0 {
+            let _ = type_error("instancemethod() takes no keyword arguments");
+            return std::ptr::null_mut();
+        }
+        let a = tuple::tuple_to_vec(&*args);
+        if a.len() != 1 {
+            let _ = type_error(&format!("instancemethod expected 1 argument, got {}", a.len()));
+            return std::ptr::null_mut();
+        }
+        if !ab::is_callable(&a[0]) {
+            let _ = type_error("first argument must be callable");
+            return std::ptr::null_mut();
+        }
+        new_instancemethod(&a[0]).into_raw()
+    }
+}
+unsafe extern "C" fn im_dealloc(o: *mut PyObject) {
+    unsafe {
+        crate::gc::untrack(o);
+        xdecref(std::mem::replace(&mut (*(o as *mut InstanceMethodObject)).func, std::ptr::null_mut()));
+        crate::alloc::free_object(o);
+    }
+}
+unsafe extern "C" fn im_traverse(o: *mut PyObject, visit: visitproc, arg: *mut c_void) -> c_int {
+    unsafe {
+        let f = (*(o as *mut InstanceMethodObject)).func;
+        if !f.is_null() {
+            return visit.unwrap()(f, arg);
+        }
+        0
+    }
+}
+unsafe extern "C" fn im_clear(o: *mut PyObject) -> c_int {
+    unsafe {
+        xdecref(std::mem::replace(&mut (*(o as *mut InstanceMethodObject)).func, std::ptr::null_mut()));
+        0
+    }
+}
+unsafe extern "C" fn im_call(o: *mut PyObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
+    unsafe { ret(ab::call_with_kwargs_dict(im_func(o), &tuple::tuple_to_vec(&*args).iter().map(|x| &**x).collect::<Vec<_>>(), opt(kw))) }
+}
+/// Through the class: the callable itself; through an instance: a method bound to it.
+unsafe extern "C" fn im_descr_get(o: *mut PyObject, obj: *mut PyObject, _t: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        let f = im_func(o);
+        if obj.is_null() {
+            return f.to_ref().into_raw();
+        }
+        fo::new_method(f, &*obj).into_raw()
+    }
+}
+/// Attributes not defined by the type come from the wrapped callable.
+unsafe extern "C" fn im_getattro(o: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        match to::generic_getattr_opt(&*o, &*name, None) {
+            Ok(Some(v)) => v.into_raw(),
+            Ok(None) => ret(ab::getattr(im_func(o), &*name)),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+}
+unsafe extern "C" fn im_repr(o: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        let f = im_func(o);
+        let name = match ab::getattr_opt(f, crate::name!("__name__")) {
+            Ok(Some(n)) if pystr::is_str(&n) => pystr::to_string_lossy(&n),
+            Ok(_) => "?".to_string(),
+            Err(_) => return std::ptr::null_mut(),
+        };
+        ret(Ok(pystr::new_str(&format!("<instancemethod {} at {:#x}>", name, o as usize))))
+    }
+}
+unsafe extern "C" fn im_richcompare(a: *mut PyObject, b: *mut PyObject, op: c_int) -> *mut PyObject {
+    unsafe {
+        if (*b).type_ptr() != im_type() || (op != Py_EQ && op != Py_NE) {
+            return crate::types::none::not_implemented().to_ref().into_raw();
+        }
+        let same = (*(a as *mut InstanceMethodObject)).func == (*(b as *mut InstanceMethodObject)).func;
+        crate::types::bool_::new_bool(same == (op == Py_EQ)).into_raw()
+    }
+}
+fn im_get_doc(o: &PyObject) -> PyResult {
+    ab::getattr(unsafe { im_func(o.as_ptr()) }, crate::name!("__doc__"))
+}
+fn im_get_func(o: &PyObject) -> PyResult {
+    Ok(unsafe { im_func(o.as_ptr()) }.to_ref())
+}
+
+/// Make PyInstanceMethod_Type ready (before the first extension module loads).
+pub(crate) fn init_instancemethod_type() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        let t = &mut *im_type();
+        t.tp_name = c"instancemethod".as_ptr();
+        t.tp_basicsize = std::mem::size_of::<InstanceMethodObject>() as isize;
+        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC;
+        t.tp_new = Some(im_new);
+        t.tp_dealloc = Some(im_dealloc);
+        t.tp_traverse = Some(im_traverse);
+        t.tp_clear = Some(im_clear);
+        t.tp_call = Some(im_call);
+        t.tp_descr_get = Some(im_descr_get);
+        t.tp_getattro = Some(im_getattro);
+        t.tp_repr = Some(im_repr);
+        t.tp_richcompare = Some(im_richcompare);
+        t.tp_getset = crate::getset_table![("__doc__", im_get_doc), ("__func__", im_get_func)];
+        if super::typeobj::PyType_Ready(t) < 0 {
+            clear_exc();
+        }
+    });
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInstanceMethod_New(f: *mut PyObject) -> *mut PyObject {
-    // instancemethod behaves like the function itself when bound through a class
-    unsafe { (*f).to_ref().into_raw() }
+    unsafe {
+        if f.is_null() {
+            return null_arg();
+        }
+        init_instancemethod_type();
+        new_instancemethod(&*f).into_raw()
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInstanceMethod_Function(m: *mut PyObject) -> *mut PyObject {
-    m
+    unsafe {
+        if m.is_null() || (*m).type_ptr() != im_type() {
+            let _ = bad_internal();
+            return std::ptr::null_mut();
+        }
+        (*(m as *mut InstanceMethodObject)).func
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyStaticMethod_New(f: *mut PyObject) -> *mut PyObject {
@@ -551,6 +702,85 @@ unsafe fn code_new_c(
             exceptiontable: opt(et),
         }))
     }
+}
+
+/// `types.CodeType(argcount, posonlyargcount, kwonlyargcount, nlocals, stacksize, flags,
+/// codestring, constants, names, varnames, filename, name, qualname, firstlineno, linetable,
+/// exceptiontable, freevars=(), cellvars=(), /)`. Like the C constructors, the result carries
+/// the given metadata over the shared stub body (the bytecode argument is checked for type
+/// only); used e.g. by limited-API Cython modules for their functions' `__code__`.
+pub(crate) unsafe extern "C" fn code_tp_new(_t: *mut PyTypeObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
+    unsafe { ret(code_new_impl(&*args, opt(kw))) }
+}
+
+fn code_new_impl(args: &PyObject, kw: Option<&PyObject>) -> PyResult {
+    if let Some(k) = kw {
+        if dict::dict_len(k) != 0 {
+            raise!(TypeError, "code() takes no keyword arguments");
+        }
+    }
+    let a = tuple::tuple_to_vec(args);
+    if a.len() < 16 || a.len() > 18 {
+        let (what, n) = if a.len() < 16 { ("at least", 16) } else { ("at most", 18) };
+        raise!(TypeError, "code expected {} {} arguments, got {}", what, n, a.len());
+    }
+    let int_arg = |i: usize, what: &str| -> PyResult<i32> {
+        if !int::is_int(&a[i]) {
+            raise!(TypeError, "code() argument {} must be int, not {}", i + 1, tname(&a[i]));
+        }
+        let v = ab::as_i64(&a[i])?;
+        if v < i32::MIN as i64 || v > i32::MAX as i64 {
+            raise!(OverflowError, "code: {} is out of range", what);
+        }
+        Ok(v as i32)
+    };
+    let typed = |i: usize, ok: bool, tn: &str| -> PyResult<()> {
+        if !ok {
+            raise!(TypeError, "code() argument {} must be {}, not {}", i + 1, tn, tname(&a[i]));
+        }
+        Ok(())
+    };
+    let argcount = int_arg(0, "argcount")?;
+    let posonly = int_arg(1, "posonlyargcount")?;
+    let kwonly = int_arg(2, "kwonlyargcount")?;
+    let nlocals = int_arg(3, "nlocals")?;
+    let _stacksize = int_arg(4, "stacksize")?;
+    let flags = int_arg(5, "flags")?;
+    typed(6, crate::types::bytes::is_bytes(&a[6]), "bytes")?;
+    for i in [7, 8, 9] {
+        typed(i, tuple::is_tuple(&a[i]), "tuple")?;
+    }
+    for i in [10, 11, 12] {
+        typed(i, pystr::is_str(&a[i]), "str")?;
+    }
+    let firstlineno = int_arg(13, "firstlineno")?;
+    typed(14, crate::types::bytes::is_bytes(&a[14]), "bytes")?;
+    typed(15, crate::types::bytes::is_bytes(&a[15]), "bytes")?;
+    for i in 16..a.len() {
+        typed(i, tuple::is_tuple(&a[i]), "tuple")?;
+    }
+    if argcount < posonly || posonly < 0 || kwonly < 0 || nlocals < 0 {
+        raise!(ValueError, "code: argcount must not be negative");
+    }
+    if nlocals as usize != tuple::tuple_len(&a[9]) {
+        raise!(ValueError, "code: co_nlocals != len(co_varnames)");
+    }
+    new_code_from_c(CCodeArgs {
+        argcount,
+        posonlyargcount: posonly,
+        kwonlyargcount: kwonly,
+        flags,
+        consts: Some(&a[7]),
+        names: Some(&a[8]),
+        varnames: Some(&a[9]),
+        freevars: a.get(16).map(|x| &**x),
+        cellvars: a.get(17).map(|x| &**x),
+        filename: &a[10],
+        name: &a[11],
+        qualname: Some(&a[12]),
+        firstlineno,
+        linetable: Some(&a[14]),
+    })
 }
 
 #[unsafe(no_mangle)]

@@ -166,6 +166,11 @@ pub unsafe extern "C" fn PyErr_Restore(t: *mut PyObject, v: *mut PyObject, tb: *
         };
         if let Some(tb) = tbr {
             if !none::is_none(&tb) {
+                if !crate::types::traceback::is_traceback(&tb) {
+                    // the pending exception becomes this TypeError (as raising it would)
+                    let _ = type_error("__traceback__ must be a traceback or None");
+                    return;
+                }
                 exc::set_exc_traceback(&e, Some(&tb));
             }
         }

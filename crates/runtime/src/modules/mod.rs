@@ -32,6 +32,7 @@ pub mod _functools;
 pub mod _abc;
 pub mod itertools;
 pub mod _collections;
+pub mod odict;
 pub mod _types;
 pub mod _asyncio;
 pub mod _heapq;

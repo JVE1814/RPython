@@ -73,6 +73,10 @@ pub unsafe extern "C" fn Py_CompileString(s: *const c_char, filename: *const c_c
 }
 
 fn ensure_builtins(globals: &PyObject) -> PyResult<()> {
+    // every C entry point that runs code needs a real dict for globals
+    if !dict::is_dict(globals) {
+        return Err(system_error("globals must be a dict"));
+    }
     if dict::is_dict(globals) && dict::get_item_rs(globals, "__builtins__").is_none() {
         dict::set_item_str(globals, "__builtins__", &crate::builtins::builtins_module())?;
     }

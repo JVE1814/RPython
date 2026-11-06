@@ -516,7 +516,7 @@ fn m_setblocking(o: &PyObject, v: &PyObject) -> PyResult {
 
 fn m_getblocking(o: &PyObject) -> PyResult {
     let t = sk(o).timeout.load(Ordering::Relaxed);
-    Ok(bool_::new_bool(t < 0))
+    Ok(bool_::new_bool(t != 0))
 }
 
 fn m_bind(o: &PyObject, a: &PyObject) -> PyResult {
@@ -949,7 +949,8 @@ fn get_cmsg_len(n: usize) -> Option<usize> {
 }
 fn get_cmsg_space(n: usize) -> Option<usize> {
     let base = cmsg_align(CMSG_HDR);
-    if n > SOCKLEN_T_LIMIT - base {
+    // the bound leaves room for the worst-case alignment padding of `n`
+    if n > SOCKLEN_T_LIMIT - (base + cmsg_align(1)) {
         return None;
     }
     let r = base + cmsg_align(n);
@@ -1128,9 +1129,14 @@ fn sendmsg_iovec(o: &PyObject, fname: &str) -> PyResult<(Vec<BufferView>, Vec<li
             raise!(TypeError, "{}() argument 1 must be an iterable", fname);
         }
     };
-    let mut views = Vec::new();
+    // snapshot the items first: a __buffer__ hook may mutate the sequence
+    let mut items = Vec::new();
     while let Some(item) = ab::iter_next(&it)? {
-        views.push(BufferView::get(&item, PyBUF_SIMPLE)?);
+        items.push(item);
+    }
+    let mut views = Vec::with_capacity(items.len());
+    for item in &items {
+        views.push(BufferView::get(item, PyBUF_SIMPLE)?);
     }
     if views.len() > libc::UIO_MAXIOV as usize {
         raise!(OSError, "{}() argument 1 is too long", fname);
@@ -1354,7 +1360,7 @@ fn u_arg(o: &PyObject, fname: &str, bits: u32) -> PyResult<u64> {
         raise!(TypeError, "expected int, {} found", tname(o));
     }
     if int::sign(o) < 0 {
-        raise!(OverflowError, "{}: can't convert negative Python int to C {}-bit unsigned integer", fname, bits);
+        raise!(ValueError, "{}: can't convert negative Python int to C {}-bit unsigned integer", fname, bits);
     }
     match int::as_i128(o) {
         Some(v) if v <= ((1u128 << bits) - 1) as i128 => Ok(v as u64),

@@ -308,6 +308,27 @@ pub unsafe extern "C" fn PyModule_FromDefAndSpec2(def: *mut PyModuleDef, spec: *
                         }
                         seen_gil = true;
                     }
+                    // slots that restate a PyModuleDef field must agree with it
+                    id @ (100..=106 | 110) => {
+                        let d = &*def;
+                        let (field, slot_name): (usize, &str) = match id {
+                            100 => (d.m_name as usize, "Py_mod_name"),
+                            101 => (d.m_doc as usize, "Py_mod_doc"),
+                            102 => (d.m_size as usize, "Py_mod_state_size"),
+                            103 => (d.m_methods as usize, "Py_mod_methods"),
+                            104 => (d.m_traverse.map_or(0, |f| f as usize), "Py_mod_state_traverse"),
+                            105 => (d.m_clear.map_or(0, |f| f as usize), "Py_mod_state_clear"),
+                            106 => (d.m_free.map_or(0, |f| f as usize), "Py_mod_state_free"),
+                            _ => (def as usize, "Py_mod_token"),
+                        };
+                        if (*s).value as usize != field {
+                            return Err(system_error(&format!(
+                                "module {}: {} slot contradicts the PyModuleDef field",
+                                pystr::to_string_lossy(&name),
+                                slot_name
+                            )));
+                        }
+                    }
                     other if other >= 0 && other <= 110 => {}
                     other => {
                         return Err(system_error(&format!("module {} uses unknown slot ID {}", pystr::to_string_lossy(&name), other)));
@@ -424,6 +445,36 @@ pub unsafe extern "C" fn PyModule_FromSlotsAndSpec(slots: *const super::typeobj:
         let def: *mut PyModuleDef = Box::into_raw(Box::new(std::mem::zeroed::<PyModuleDef>()));
         let mut mslots: Vec<PyModuleDef_Slot> = Vec::new();
         let mut token: *mut c_void = std::ptr::null_mut();
+        // the slots standing for PyModuleDef fields (and exec) may appear once, and only the
+        // state size may be NULL/0
+        let slot_name = |id: u16| -> Option<&'static str> {
+            Some(match id {
+                85 => "Py_mod_exec",
+                100 => "Py_mod_name",
+                101 => "Py_mod_doc",
+                102 => "Py_mod_state_size",
+                103 => "Py_mod_methods",
+                104 => "Py_mod_state_traverse",
+                105 => "Py_mod_state_clear",
+                106 => "Py_mod_state_free",
+                110 => "Py_mod_token",
+                _ => return None,
+            })
+        };
+        let mut seen: Vec<u16> = Vec::new();
+        for &(id, _, p) in &flat {
+            if let Some(n) = slot_name(id as u16) {
+                if seen.contains(&(id as u16)) {
+                    let _ = system_error(&format!("module has multiple {} slots", n));
+                    return std::ptr::null_mut();
+                }
+                seen.push(id as u16);
+                if p.is_null() && id != 102 {
+                    let _ = system_error(&format!("module slot {} must not be NULL", n));
+                    return std::ptr::null_mut();
+                }
+            }
+        }
         for (id, flags, p) in flat {
             match id {
                 84..=87 => mslots.push(PyModuleDef_Slot { slot: id as c_int, value: p }),

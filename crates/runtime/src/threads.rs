@@ -321,6 +321,8 @@ pub const EVAL_SAFEPOINT: usize = 1 << 1;
 pub const EVAL_SIGNALS: usize = 1 << 2;
 pub const EVAL_ASYNC_EXC: usize = 1 << 3;
 pub const EVAL_GC: usize = 1 << 4;
+/// Pending calls (Py_AddPendingCall) are queued for this thread (capi/pystate.rs).
+pub const EVAL_PENDING: usize = 1 << 6;
 
 /// Process pending merges for the current thread.
 pub fn process_merge_queue(ts: &ThreadState) {

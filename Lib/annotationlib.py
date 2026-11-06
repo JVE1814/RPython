@@ -48,6 +48,7 @@ _SLOTS = (
     "__cell__",
     "__owner__",
     "__stringifier_dict__",
+    "__resolved_str_cache__",
 )
 
 _NAME_ERROR_MSG = "name {name!r} is not defined"
@@ -86,9 +87,24 @@ class ForwardRef:
         self.__code__ = None
         self.__cell__ = None
         self.__stringifier_dict__ = None
+        self.__resolved_str_cache__ = None
 
     def __init_subclass__(cls, /, *args, **kwds):
         raise TypeError("Cannot subclass ForwardRef")
+
+    def _source_with_names_resolved(self):
+        # The source text, with the placeholder names standing for real
+        # objects replaced by those objects' annotation reprs (computed once).
+        extra = self.__extra_names__
+        if not extra:
+            return self.__forward_arg__
+        cached = self.__resolved_str_cache__
+        if cached is None:
+            cached = self.__forward_arg__
+            for name, value in extra.items():
+                cached = cached.replace(name, type_repr(value))
+            self.__resolved_str_cache__ = cached
+        return cached
 
     def evaluate(self, *, globals=None, locals=None, type_params=None, owner=None,
                  format=Format.VALUE):
@@ -101,7 +117,7 @@ class ForwardRef:
         unchanged; Format.STRING returns the source string.
         """
         if format == Format.STRING:
-            return self.__forward_arg__
+            return self._source_with_names_resolved()
         if format == Format.VALUE:
             is_forwardref_format = False
         elif format == Format.FORWARDREF:
@@ -169,10 +185,17 @@ class ForwardRef:
 
         arg = self.__forward_arg__
         if arg.isidentifier() and not keyword.iskeyword(arg):
-            if arg in locals:
-                return locals[arg]
-            elif arg in globals:
-                return globals[arg]
+            if arg in locals or arg in globals:
+                value = locals[arg] if arg in locals else globals[arg]
+                if type(value) is _LazyImportType:
+                    # a lazy import is resolved like a name load would
+                    try:
+                        value = value.resolve()
+                    except Exception:
+                        if is_forwardref_format:
+                            return self
+                        raise
+                return value
             elif hasattr(builtins, arg):
                 return getattr(builtins, arg)
             elif is_forwardref_format:
@@ -285,7 +308,7 @@ class ForwardRef:
             extra.append(", is_class=True")
         if self.__owner__ is not None:
             extra.append(f", owner={self.__owner__!r}")
-        return f"ForwardRef({self.__forward_arg__!r}{''.join(extra)})"
+        return f"ForwardRef({self._source_with_names_resolved()!r}{''.join(extra)})"
 
 
 def _union_of(a, b):
@@ -369,14 +392,44 @@ def _value_source(value, sdict):
         return "{" + ", ".join(_render(v, _PREC_TUPLE + 1, sdict) for v in value) + "}"
     if isinstance(value, (str, bytes, int, float, complex, bool, type(None))):
         return repr(value)
-    # a real object embedded in the expression: refer to it by a fresh name
-    if isinstance(value, type) and value.__module__ == "builtins":
-        name = value.__qualname__
-        if getattr(builtins, name, None) is value:
-            return name
-    if sdict is not None:
+    if isinstance(value, _Template):
+        source = _template_source(value, sdict)
+        if source is not None:
+            return source
+    # A real object inside an expression.  For FORWARDREF it is referred to
+    # by a fresh name (bound in __extra_names__) so the expression can be
+    # evaluated later; as a string there is nothing better than its repr.
+    if sdict is not None and sdict.format == Format.FORWARDREF:
         return sdict.create_unique_name(value)
     return repr(value)
+
+
+_Template = type(t"")
+_Interpolation = type(t"{0}".interpolations[0])
+
+
+def _template_source(template, sdict):
+    """t-string source text for a Template, or None if an interpolation's
+    expression text cannot be put back between braces."""
+    pieces = []
+    for item in template:
+        if isinstance(item, str):
+            pieces.append(item.replace("{", "{{").replace("}", "}}"))
+            continue
+        expr = item.expression
+        if not expr.strip() or "!" in expr.replace("!=", ""):
+            return None
+        piece = "{" + expr
+        if item.conversion is not None:
+            piece += "!" + item.conversion
+        if item.format_spec:
+            piece += ":" + item.format_spec
+        pieces.append(piece + "}")
+    body = "".join(pieces)
+    if "\n" in body:
+        return 't"""' + body + '"""'
+    quoted = repr(body)
+    return "t" + quoted
 
 
 def _subscript_source(key, sdict):
@@ -406,6 +459,7 @@ class _Stringifier:
         self.__owner__ = owner
         self.__stringifier_dict__ = stringifier_dict
         self.__extra_names__ = extra_names
+        self.__resolved_str_cache__ = None
         _PRECS[id(self)] = prec
 
 
@@ -546,7 +600,10 @@ class _StringifierDict(dict):
             obj.__class__ = ForwardRef
             obj.__stringifier_dict__ = None
             obj.__code__ = None
-            obj.__cell__ = cell_dict
+            # a proxy for one closure variable keeps that cell; everything
+            # else can refer to any of the captured cells
+            if not isinstance(obj.__cell__, types.CellType):
+                obj.__cell__ = cell_dict
             _PRECS.pop(id(obj), None)
 
     def create_unique_name(self, value):
@@ -604,13 +661,9 @@ def _stringify_single(anno):
         return anno
     if isinstance(anno, _Stringifier):
         return object.__getattribute__(anno, "__arg__")
-    if isinstance(anno, (tuple, list, dict, slice)):
+    if isinstance(anno, (tuple, list, dict, slice, _Template)):
         return _value_source(anno, None)
     return repr(anno)
-
-
-def _is_function_like(annotate):
-    return isinstance(annotate, types.FunctionType) and hasattr(annotate, "__code__")
 
 
 def _make_fake_function(annotate, globals, closure):
@@ -623,11 +676,32 @@ def _make_fake_function(annotate, globals, closure):
     )
 
 
+def _accepts_fake_globals(annotate):
+    # Probe with the real environment.  Only NotImplementedError means the
+    # function does not implement VALUE_WITH_FAKE_GLOBALS; any other failure
+    # (typically a NameError) is what the fake environment is there for.
+    try:
+        annotate(Format.VALUE_WITH_FAKE_GLOBALS)
+    except NotImplementedError:
+        return False
+    except Exception:
+        pass
+    return True
+
+
+def _value_as_strings(annotate, is_evaluate):
+    value = annotate(Format.VALUE)
+    if is_evaluate:
+        return value if isinstance(value, str) else type_repr(value)
+    return annotations_to_string(value)
+
+
 def call_annotate_function(annotate, format, *, owner=None, _is_evaluate=False):
     """Call an __annotate__ function in the requested format.
 
     Formats the function does not implement itself (FORWARDREF and STRING)
-    are computed by calling it with fake globals and closure cells.
+    are computed by running its code with fake globals and closure cells
+    (format VALUE_WITH_FAKE_GLOBALS), or from VALUE if that is not supported.
     """
     if format == Format.VALUE_WITH_FAKE_GLOBALS:
         raise ValueError("The VALUE_WITH_FAKE_GLOBALS format is for internal use only")
@@ -636,34 +710,43 @@ def call_annotate_function(annotate, format, *, owner=None, _is_evaluate=False):
     except NotImplementedError:
         pass
 
+    is_class = isinstance(owner, type)
     if format == Format.STRING:
+        if (not _accepts_fake_globals(annotate)
+                or getattr(annotate, "__code__", None) is None):
+            return _value_as_strings(annotate, _is_evaluate)
         # every name lookup produces a _Stringifier
         globals = _StringifierDict({}, format=format)
-        is_class = isinstance(owner, type)
-        if not _is_function_like(annotate):
-            if not getattr(annotate, "__code__", None):
-                raise NotImplementedError(format)
-        closure, _ = _build_closure(annotate, owner, is_class, globals, allow_evaluation=False)
+        closure, _ = _build_closure(annotate, owner, is_class, globals,
+                                    allow_evaluation=False)
         func = _make_fake_function(annotate, globals, closure)
         annos = func(Format.VALUE_WITH_FAKE_GLOBALS)
         if _is_evaluate:
             return _stringify_single(annos)
         return {key: _stringify_single(val) for key, val in annos.items()}
     elif format == Format.FORWARDREF:
-        # The real values where they can be computed, ForwardRefs elsewhere.
-        try:
+        if not _accepts_fake_globals(annotate):
             return annotate(Format.VALUE)
-        except Exception:
-            pass
-        if not _is_function_like(annotate):
-            return annotate(Format.VALUE)
-
-        is_class = isinstance(owner, type)
+        # Real values where they can be computed, ForwardRefs elsewhere.
+        real_builtins = annotate.__builtins__
+        real_globals = annotate.__globals__
         globals = _StringifierDict(
-            {}, globals=annotate.__globals__, owner=owner, is_class=is_class, format=format,
+            {}, globals=real_globals, owner=owner, is_class=is_class, format=format,
         )
-        globals.update(_fake_globals_base(annotate))
-        closure, cell_dict = _build_closure(annotate, owner, is_class, globals, allow_evaluation=True)
+        if isinstance(real_builtins, types.ModuleType):
+            real_builtins = real_builtins.__dict__
+        globals.update(real_builtins)
+        for name, value in real_globals.items():
+            if type(value) is _LazyImportType:
+                # resolve now; a failing lazy import becomes a ForwardRef
+                try:
+                    value = value.resolve()
+                except Exception:
+                    globals.pop(name, None)
+                    continue
+            globals[name] = value
+        closure, cell_dict = _build_closure(annotate, owner, is_class, globals,
+                                            allow_evaluation=True)
         func = _make_fake_function(annotate, globals, closure)
         try:
             result = func(Format.VALUE_WITH_FAKE_GLOBALS)
@@ -676,9 +759,10 @@ def call_annotate_function(annotate, format, *, owner=None, _is_evaluate=False):
         # Second attempt: no real values at all (some operations on real
         # objects may fail when combined with proxies).
         globals = _StringifierDict(
-            {}, globals=annotate.__globals__, owner=owner, is_class=is_class, format=format,
+            {}, globals=real_globals, owner=owner, is_class=is_class, format=format,
         )
-        closure, cell_dict = _build_closure(annotate, owner, is_class, globals, allow_evaluation=False)
+        closure, cell_dict = _build_closure(annotate, owner, is_class, globals,
+                                            allow_evaluation=False)
         func = _make_fake_function(annotate, globals, closure)
         result = func(Format.VALUE_WITH_FAKE_GLOBALS)
         globals.transmogrify(cell_dict)
@@ -695,18 +779,6 @@ def call_annotate_function(annotate, format, *, owner=None, _is_evaluate=False):
         raise RuntimeError("annotate function does not support VALUE format")
     else:
         raise ValueError(f"Invalid format: {format!r}")
-
-
-def _fake_globals_base(annotate):
-    # the real globals and builtins, so that defined names evaluate normally
-    ns = {}
-    b = annotate.__globals__.get("__builtins__", builtins)
-    if isinstance(b, types.ModuleType):
-        b = b.__dict__
-    if isinstance(b, dict):
-        ns.update(b)
-    ns.update(annotate.__globals__)
-    return ns
 
 
 def call_evaluate_function(evaluate, format, *, owner=None):
@@ -737,6 +809,9 @@ def get_annotations(obj, *, globals=None, locals=None, eval_str=False, format=Fo
         raise ValueError("The VALUE_WITH_FAKE_GLOBALS format is for internal use only")
     elif format == Format.VALUE:
         ann = _get_dunder_annotations(obj)
+        if ann is None:
+            # no __annotations__: an __annotate__ alone also counts
+            ann = _get_and_call_annotate(obj, format)
     elif format == Format.FORWARDREF:
         # prefer stored annotations when they exist and evaluate cleanly
         try:
@@ -797,10 +872,12 @@ def get_annotations(obj, *, globals=None, locals=None, eval_str=False, format=Fo
         if unwrap is not None:
             # follow __wrapped__ chains and functools.partial objects
             seen = {id(unwrap)}
+            functools = sys.modules.get("functools")
+            partial_type = getattr(functools, "partial", None)
             while True:
                 if hasattr(unwrap, "__wrapped__"):
                     candidate = unwrap.__wrapped__
-                elif type(unwrap).__name__ == "partial" and hasattr(unwrap, "func"):
+                elif partial_type is not None and isinstance(unwrap, partial_type):
                     candidate = unwrap.func
                 else:
                     break
@@ -816,30 +893,60 @@ def get_annotations(obj, *, globals=None, locals=None, eval_str=False, format=Fo
         if locals is None:
             locals = obj_locals
 
-    # "Inject" type parameters into the local namespace
-    # (unless they are shadowed by assignments *in* the local namespace),
-    # as a way of emulating annotation scopes when calling `eval()`
+    # eval() has no annotation scope: make the object's type parameters
+    # visible as locals, with real locals taking precedence.
     if type_params := getattr(obj, "__type_params__", ()):
         if locals is None:
             locals = {}
         locals = {param.__name__: param for param in type_params} | locals
 
-    return_value = {
-        key: value if not isinstance(value, str) else eval(value, globals, locals)
+    return {
+        key: _eval_annotation_str(value, globals, locals)
+        if isinstance(value, str) else value
         for key, value in ann.items()
     }
-    return return_value
+
+
+def _eval_annotation_str(value, globals, locals):
+    if value.lstrip().startswith("*"):
+        # a starred annotation (*args: *Ts) is only valid inside a tuple
+        return eval(f"({value},)", globals, locals)[0]
+    return eval(value, globals, locals)
 
 
 def type_repr(value):
     """Repr of an object as it should appear in an annotation string."""
     if isinstance(value, (type, types.FunctionType, types.BuiltinFunctionType)):
-        if value.__module__ == "builtins":
+        module = value.__module__
+        if module is None:
+            # methods of builtin and extension types: use the owner's module
+            owner = getattr(value, "__self__", None)
+            if owner is not None:
+                cls = owner if isinstance(owner, type) else type(owner)
+                module = cls.__module__
+        if module == "builtins" or module is None:
             return value.__qualname__
-        return f"{value.__module__}.{value.__qualname__}"
+        return f"{module}.{value.__qualname__}"
+    elif isinstance(value, types.MethodType):
+        owner = value.__self__
+        cls = owner if isinstance(owner, type) else type(owner)
+        if not cls.__flags__ & _TPFLAGS_HEAPTYPE:
+            # methods of native types whose code is Python here (datetime)
+            # are shown like the builtin methods they are in C
+            return f"{cls.__module__}.{value.__qualname__}"
+    elif isinstance(value, _Template):
+        source = _template_source(value, None)
+        if source is not None:
+            return source
+        # no usable expression text: spell it as a constructor call
+        return "Template(" + ", ".join(map(repr, value)) + ")"
     elif value is ...:
         return "..."
     return repr(value)
+
+
+_TPFLAGS_HEAPTYPE = 1 << 9
+_LazyImportType = getattr(types, "LazyImportType", None)
 
 
 def annotations_to_string(annotations):

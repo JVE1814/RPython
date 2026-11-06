@@ -102,6 +102,13 @@ pub(crate) unsafe fn cs<'a>(p: *const c_char) -> std::borrow::Cow<'a, str> {
 /// C string -> new str object (UTF-8 decoding with surrogateescape-free strict semantics).
 pub(crate) unsafe fn cstr_obj(p: *const c_char) -> PyResult {
     unsafe {
+        if p.is_null() {
+            // CPython's null_error(): a NULL name is a SystemError, not a crash
+            if !err_occurred() {
+                return Err(system_error("null argument to internal routine"));
+            }
+            return Err(PyErr);
+        }
         let b = CStr::from_ptr(p).to_bytes();
         crate::capi::unicode::decode_utf8(b, None)
     }

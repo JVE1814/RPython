@@ -37,21 +37,46 @@ fn view_tp(k: Kind) -> *mut PyTypeObject {
         Kind::Items => &raw mut PyDictItems_Type,
     }
 }
+// The view types have native subtypes (collections.OrderedDict's odict_keys,
+// ...), which iterate in their own order; hence the subtype checks (grind-lib).
+fn of_type(o: &PyObject, t: *mut PyTypeObject) -> bool {
+    o.is_type(t) || is_subtype(o.type_ptr(), t)
+}
 fn kind_of(o: &PyObject) -> Kind {
-    if o.is_type(&raw mut PyDictKeys_Type) {
+    if of_type(o, &raw mut PyDictKeys_Type) {
         Kind::Keys
-    } else if o.is_type(&raw mut PyDictValues_Type) {
+    } else if of_type(o, &raw mut PyDictValues_Type) {
         Kind::Values
     } else {
         Kind::Items
     }
 }
 pub fn is_view(o: &PyObject) -> bool {
-    o.is_type(&raw mut PyDictKeys_Type) || o.is_type(&raw mut PyDictValues_Type) || o.is_type(&raw mut PyDictItems_Type)
+    of_type(o, &raw mut PyDictKeys_Type) || of_type(o, &raw mut PyDictValues_Type) || of_type(o, &raw mut PyDictItems_Type)
 }
 /// keys or items view (set-like).
 pub fn is_setlike_view(o: &PyObject) -> bool {
-    o.is_type(&raw mut PyDictKeys_Type) || o.is_type(&raw mut PyDictItems_Type)
+    of_type(o, &raw mut PyDictKeys_Type) || of_type(o, &raw mut PyDictItems_Type)
+}
+fn is_view_exact(o: &PyObject) -> bool {
+    o.is_type(&raw mut PyDictKeys_Type) || o.is_type(&raw mut PyDictValues_Type) || o.is_type(&raw mut PyDictItems_Type)
+}
+fn subtype_view_items(o: &PyObject) -> PyResult<Vec<PyRef>> {
+    let it = ab::get_iter(o)?;
+    let mut v = Vec::new();
+    while let Some(x) = ab::iter_next(&it)? {
+        v.push(x);
+    }
+    Ok(v)
+}
+/// Allocate a view of `dct` with the given (sub)type of a dict view type.
+pub fn new_view_of_type(dct: &PyObject, tp: *mut PyTypeObject) -> PyResult {
+    unsafe {
+        let op = crate::alloc::alloc_object(tp, std::mem::size_of::<DictView>());
+        (*(op as *mut DictView)).dict = dct.to_ref().into_raw();
+        crate::gc::track(op);
+        Ok(PyRef::from_raw(op))
+    }
 }
 fn vd(o: &PyObject) -> &PyObject {
     unsafe { &*(*(o.as_ptr() as *mut DictView)).dict }
@@ -70,6 +95,13 @@ pub fn new_view(dct: &PyObject, k: Kind) -> PyResult {
 /// Snapshot of the view's elements.
 pub fn view_items(o: &PyObject) -> Vec<PyRef> {
     let dd = vd(o);
+    if !is_view_exact(o) {
+        // a subtype view defines its own iteration order
+        return subtype_view_items(o).unwrap_or_else(|_| {
+            clear_exc();
+            Vec::new()
+        });
+    }
     match kind_of(o) {
         Kind::Keys => dict::keys_vec(dd),
         Kind::Values => dict::values_vec(dd),
@@ -142,7 +174,8 @@ unsafe extern "C" fn view_repr(o: *mut PyObject) -> *mut PyObject {
                 let mut sb = pystr::StrBuilder::new();
                 sb.push_str(&tname(o));
                 sb.push_str("([");
-                for (i, it) in view_items(o).iter().enumerate() {
+                let items = if is_view_exact(o) { view_items(o) } else { subtype_view_items(o)? };
+                for (i, it) in items.iter().enumerate() {
                     if i > 0 {
                         sb.push_str(", ");
                     }
