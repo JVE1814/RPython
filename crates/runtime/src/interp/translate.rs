@@ -521,7 +521,10 @@ impl<'a> Ctx<'a> {
             }
             RERAISE => {
                 need_real(&s, 1)?;
-                em.op(Op::Reraise, (arg != 0) as u32);
+                // RERAISE leaves the values below the exception on the stack (handlers below
+                // still need them, e.g. the previous exception for POP_EXCEPT): internal
+                // `Reraise 0` pops only the exception
+                em.op(Op::Reraise, 0);
                 s.truncate(n - 1 - arg as usize);
             }
             PUSH_EXC_INFO => simple!(Op::PushExcInfo, 0, 1, 2),
