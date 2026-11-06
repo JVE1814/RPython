@@ -788,6 +788,7 @@ unsafe extern "C" fn code_dealloc(op: *mut PyObject) {
     unsafe {
         let c = &mut *(op as *mut PyCodeObject);
         crate::types::weakref::clear_weakrefs_at(op, &mut c.co_weakreflist);
+        crate::capi::funcs::free_code_extras(op);
         for p in [
             c.co_consts,
             c.co_names,
