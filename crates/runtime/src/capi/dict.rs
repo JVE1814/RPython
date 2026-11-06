@@ -510,21 +510,21 @@ pub unsafe extern "C" fn PyDictProxy_New(m: *mut PyObject) -> *mut PyObject {
 }
 
 // ordered dict (collections.OrderedDict)
-unsafe fn odict_type() -> PyResult {
-    let c = crate::import::import_absolute("collections")?;
-    ab::getattr_str(&c, "OrderedDict")
-}
+// (native type in modules/odict.rs)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyODict_New() -> *mut PyObject {
-    unsafe { ret(odict_type().and_then(|t| ab::call(&t, &[]))) }
+    unsafe {
+        ret(crate::modules::odict::init_types()
+            .and_then(|_| ab::call(crate::types::typeobject::type_obj(crate::modules::odict::odict_type()), &[])))
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyODict_SetItem(o: *mut PyObject, k: *mut PyObject, v: *mut PyObject) -> c_int {
-    unsafe { ret_i(ab::setitem(&*o, &*k, Some(&*v))) }
+    unsafe { ret_i(crate::modules::odict::setitem(&*o, &*k, &*v)) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyODict_DelItem(o: *mut PyObject, k: *mut PyObject) -> c_int {
-    unsafe { ret_i(ab::setitem(&*o, &*k, None)) }
+    unsafe { ret_i(crate::modules::odict::delitem(&*o, &*k)) }
 }
 
 #[allow(dead_code)]

@@ -37,11 +37,6 @@ macro_rules! placeholder_types {
 }
 placeholder_types!(
     (PyInstanceMethod_Type, "instancemethod"),
-    (PyODictItems_Type, "odict_items"),
-    (PyODictIter_Type, "odict_iterator"),
-    (PyODictKeys_Type, "odict_keys"),
-    (PyODictValues_Type, "odict_values"),
-    (PyODict_Type, "collections.OrderedDict"),
     (PyPickleBuffer_Type, "pickle.PickleBuffer"),
     (PyStdPrinter_Type, "stderrprinter"),
 );

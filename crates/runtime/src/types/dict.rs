@@ -932,6 +932,13 @@ pub fn entry_at(d: &PyObject, pos: usize) -> Option<(PyRef, PyRef)> {
 }
 
 /// Approximate memory used by the table (for __sizeof__).
+/// Number of hash index slots (a power of two) — used by OrderedDict's
+/// size accounting (grind-lib).
+pub fn index_slots(d: &PyObject) -> usize {
+    let _g = ob_lock(d);
+    table(d).size
+}
+
 pub fn table_sizeof(d: &PyObject) -> usize {
     let _g = ob_lock(d);
     let t = table(d);
