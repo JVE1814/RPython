@@ -114,6 +114,8 @@ fn insert_path0(p: &str) {
     if let Some(path) = crate::modules::sys::get_sys_attr("path") {
         list::insert(&path, 0, pystr::new_str(p));
     }
+    // remembered for the "consider renaming" hints (sys.path may change later)
+    crate::import::set_sys_path_0(p);
 }
 
 fn run_script(path: &str, opts: &MainOptions) -> Outcome {

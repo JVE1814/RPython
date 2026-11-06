@@ -112,7 +112,12 @@ fn imp_create_builtin(_m: &PyObject, spec: &PyObject) -> PyResult {
             crate::import::note_builtin_module(&name, &m);
             Ok(m)
         }
-        None => Err(crate::import::import_error_with(&format!("no built-in module named {}", name), Some(&n), None, None)),
+        None => {
+            if name.is_empty() {
+                raise!(ValueError, "name must not be empty");
+            }
+            Err(crate::import::import_error_typed(crate::types::exceptions::ModuleNotFoundError(), &format!("no built-in module named {}", name), Some(&n), None, None))
+        }
     }
 }
 fn imp_exec_builtin(_m: &PyObject, _module: &PyObject) -> PyResult {
@@ -273,6 +278,9 @@ fn imp_create_dynamic(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     let spec = args[0];
     let n = ab::getattr_str(spec, "name")?;
     let name = pystr::to_string_lossy(&n);
+    if name.contains('\0') {
+        raise!(ValueError, "embedded null character");
+    }
     if let Some(m) = crate::import::get_loaded_module(&name) {
         if crate::import::is_builtin_module_object(&m, &name) {
             return Ok(m);
@@ -280,6 +288,9 @@ fn imp_create_dynamic(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     }
     let origin = ab::getattr_str(spec, "origin")?;
     let path = crate::modules::os_fspath::fsdecode(&origin)?;
+    if path.contains('\0') {
+        raise!(ValueError, "embedded null character");
+    }
     crate::modules::sys_full::audit("import", &[&n, &origin, none::none(), none::none(), none::none()])?;
     crate::capi_ext::load_extension(&name, std::path::Path::new(&path))
 }
@@ -297,7 +308,33 @@ fn imp_fix_co_filename(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     if !pystr::is_str(args[1]) {
         raise!(TypeError, "_fix_co_filename() argument 2 must be str, not {}", crate::types::typeobject::tname(args[1]));
     }
+    // a .pyc compiled under another name: point the code (and every nested code
+    // object) at the file it was loaded for
+    let old = crate::types::code::code_data(args[0]).filename.clone();
+    if !ab::rich_compare_bool(&old, args[1], crate::ffi::Py_EQ)? {
+        set_co_filename(args[0], &old, args[1]);
+    }
     Ok(none::none_ref())
+}
+
+fn set_co_filename(co: &PyObject, old: &PyObject, new: &PyObject) {
+    let cd = crate::types::code::code_data(co);
+    if !cd.filename.is(old) && pystr::to_string_lossy(&cd.filename) != pystr::to_string_lossy(old) {
+        return;
+    }
+    unsafe {
+        // freshly unmarshalled code, not yet shared with any other thread
+        let cdm = cd as *const crate::types::code::CodeData as *mut crate::types::code::CodeData;
+        (*cdm).filename = new.to_ref();
+        let c = co.as_ptr() as *mut crate::types::code::PyCodeObject;
+        let prev = std::mem::replace(&mut (*c).co_filename, new.to_ref().into_raw());
+        xdecref(prev);
+    }
+    for k in cd.consts.clone() {
+        if crate::types::code::is_code(&k) {
+            set_co_filename(&k, old, new);
+        }
+    }
 }
 
 fn imp_source_hash(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {

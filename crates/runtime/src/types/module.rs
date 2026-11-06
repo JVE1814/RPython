@@ -153,19 +153,10 @@ unsafe extern "C" fn module_getattro(op: *mut PyObject, nm: *mut PyObject) -> *m
         }
         let modname = dict::get_item_str(&d, name!("__name__"));
         let msg = match modname {
-            Some(mn) if pystr::is_str(&mn) => {
-                let mns = pystr::to_string_lossy(&mn);
-                let initializing = crate::import::module_is_initializing(&d);
-                if initializing {
-                    format!(
-                        "partially initialized module '{}' has no attribute '{}' (most likely due to a circular import)",
-                        mns,
-                        pystr::to_string_lossy(n)
-                    )
-                } else {
-                    format!("module '{}' has no attribute '{}'", mns, pystr::to_string_lossy(n))
-                }
-            }
+            Some(mn) if pystr::is_str(&mn) => match crate::import::module_attribute_error(&d, &mn, n) {
+                Ok(m) => m,
+                Err(_) => return std::ptr::null_mut(),
+            },
             _ => format!("module has no attribute '{}'", pystr::to_string_lossy(n)),
         };
         let _ = crate::types::exceptions::attribute_error_with(&msg, o, n);
