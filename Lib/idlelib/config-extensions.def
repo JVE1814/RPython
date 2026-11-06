@@ -1,0 +1,37 @@
+# IDLE extensions and their settings.
+#
+# An extension is a module in idlelib (or on sys.path) defining a class of
+# the same name; it is loaded for editor windows and/or the shell.  For an
+# extension NAME:
+#   [NAME]               enable, enable_editor, enable_shell, and options
+#   [NAME_cfgBindings]   virtual event = key sequences (user-changeable)
+#   [NAME_bindings]      virtual event = key sequences (fixed)
+# User settings are stored in ~/.idlerc/config-extensions.cfg.
+#
+# The first sections hold the options of former extensions that are now
+# built into IDLE.
+
+[AutoComplete]
+popupwait= 2000
+
+[CodeContext]
+maxlines= 15
+
+[FormatParagraph]
+max-width= 72
+
+[ParenMatch]
+style= expression
+flash-delay= 500
+bell= True
+
+# A demonstration extension (disabled by default).
+[ZzDummy]
+enable= False
+enable_shell= False
+enable_editor= True
+z-text= Z
+[ZzDummy_cfgBindings]
+z-in= <Control-Shift-KeyRelease-Insert>
+[ZzDummy_bindings]
+z-out= <Control-Shift-KeyRelease-Delete>

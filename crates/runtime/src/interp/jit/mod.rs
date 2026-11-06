@@ -25,6 +25,7 @@
 pub mod analysis;
 pub mod helpers;
 pub mod mem;
+pub mod opt;
 pub mod tier1;
 pub mod x64;
 
@@ -124,6 +125,14 @@ pub fn try_run(ts: &ThreadState, f: &mut Frame, cd: &CodeData, pc: usize) -> Run
         }
         return try_run(ts, f, cd, pc);
     }
+    if pc == 0 {
+        let cc = &cd.caches;
+        let t = cc.t2_calls.load(Relaxed);
+        cc.t2_calls.store(t.wrapping_sub(1), Relaxed);
+        if t == 1 {
+            opt::compile(f.code(), f.globals, f.builtins, 0);
+        }
+    }
     run(ts, f, unsafe { &*c }, pc)
 }
 
@@ -146,21 +155,40 @@ pub fn osr_check(f: &mut Frame, cd: &CodeData, target: usize) -> bool {
     compile(f, cd) && osr_check(f, cd, target)
 }
 
+/// Tier-2 entry for `pc`, if any (standard unit at 0, OSR unit at its header).
+#[inline]
+fn opt_entry(cd: &CodeData, pc: usize) -> Option<usize> {
+    let p = if pc == 0 { cd.caches.opt.load(Acquire) } else { cd.caches.osr.load(Acquire) };
+    if p.is_null() {
+        return None;
+    }
+    unsafe { (*p).entry(pc) }
+}
+
 #[inline]
 fn run(ts: &ThreadState, f: &mut Frame, c: &Compiled, pc: usize) -> Run {
-    let off = match c.entries.get(pc) {
-        Some(&o) if o != u32::MAX => o,
-        _ => return Run::NotRun,
+    let cd: &CodeData = unsafe { &*(crate::types::code::code_data(f.code()) as *const CodeData) };
+    let (target, t2) = match opt_entry(cd, pc) {
+        Some(t) => (t, true),
+        None => match c.entries.get(pc) {
+            Some(&o) if o != u32::MAX => (c.addr + o as usize, false),
+            _ => return Run::NotRun,
+        },
     };
     crate::tlab::ensure_registered();
     let entry: EntryFn = unsafe { std::mem::transmute(c.addr) };
     let mut out: *mut PyObject = std::ptr::null_mut();
-    let st = unsafe { entry(f, f.slots.as_mut_ptr(), ts, c.addr + off as usize, &mut out) };
+    let st = unsafe { entry(f, f.slots.as_mut_ptr(), ts, target, &mut out) };
     match st {
         tier1::ST_RETURN => Run::Return(unsafe { PyRef::from_raw(out) }),
         tier1::ST_ERROR => Run::Error,
         tier1::ST_YIELD => Run::Yield(unsafe { PyRef::from_raw(out) }),
-        _ => Run::Deopt(f.next_instr as usize),
+        _ => {
+            if t2 {
+                opt::note_deopt(&cd.caches, f);
+            }
+            Run::Deopt(f.next_instr as usize)
+        }
     }
 }
 
@@ -204,54 +232,190 @@ pub fn call_fast(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwnames:
 }
 
 fn call_compiled(func: &PyObject, code: &PyObject, cd: &CodeData, c: &Compiled, off: u32, args: &[*mut PyObject]) -> PyResult {
-    use crate::interp::frame::FrameState;
     let f = crate::types::funcobject::func(func);
     let ts = crate::threads::current();
-    // perf-runtime: borrowed code/func (frame.rs `new_call`), pooled frame
+    crate::interp::enter_recursive_call(ts, "")?;
+    // borrowed code/func (frame.rs `new_call`): the caller keeps `func` alive
     let mut frame = Frame::new_call(code, func, unsafe { &*f.func_globals }, unsafe { &*f.func_builtins });
     for (i, &a) in args.iter().enumerate() {
         unsafe { incref(a) };
         frame.slots[i] = a;
     }
-    cd.invocation_count.fetch_add(1, Relaxed);
-    crate::interp::enter_recursive_call(ts, "")?;
+    let mut target = c.addr + off as usize;
+    if bump_invocations(cd) {
+        if let Some(t) = opt::compile(code, f.func_globals, f.func_builtins, 0) {
+            target = t;
+        }
+    } else if let Some(t) = opt_entry(cd, 0) {
+        target = t;
+    }
+    crate::tlab::ensure_registered();
+    let r = run_call_frame(ts, frame, c.addr, target);
+    crate::interp::leave_recursive_call(ts);
+    r
+}
+
+/// Non-atomic hotness counters (a lost update only delays tiering). True when the
+/// tier-2 call countdown expires.
+#[inline(always)]
+fn bump_invocations(cd: &CodeData) -> bool {
+    let n = cd.invocation_count.load(Relaxed);
+    cd.invocation_count.store(n.wrapping_add(1), Relaxed);
+    let t = cd.caches.t2_calls.load(Relaxed);
+    cd.caches.t2_calls.store(t.wrapping_sub(1), Relaxed);
+    t == 1
+}
+
+/// Run a freshly set up call frame in compiled code (arguments stored) and release
+/// it. Deopt or an exception hands the rest of the activation to the interpreter.
+#[inline]
+fn run_call_frame(ts: &ThreadState, mut frame: Box<Frame>, tramp: usize, target: usize) -> PyResult {
+    use crate::interp::frame::FrameState;
     let prev = ts.frame.get();
     frame.prev = prev;
-    ts.frame.set(&mut *frame as *mut Frame);
-    frame.state = FrameState::Executing;
-    crate::tlab::ensure_registered();
-    let entry: EntryFn = unsafe { std::mem::transmute(c.addr) };
-    let mut out: *mut PyObject = std::ptr::null_mut();
     let fp: *mut Frame = &mut *frame;
-    let st = unsafe { entry(fp, frame.slots.as_mut_ptr(), ts, c.addr + off as usize, &mut out) };
-    let r = match st {
-        tier1::ST_RETURN => {
-            ts.frame.set(prev);
-            frame.prev = std::ptr::null_mut();
-            frame.state = FrameState::Completed;
-            frame.clear_stack();
-            Ok(unsafe { PyRef::from_raw(out) })
-        }
-        _ => {
-            // let the interpreter finish this activation (unwinding or deopt)
-            ts.frame.set(prev);
-            frame.prev = std::ptr::null_mut();
-            let throw = if st == tier1::ST_ERROR {
-                frame.next_instr = frame.lasti + 1;
-                crate::errors::take_exc()
-            } else {
-                None
-            };
-            match crate::interp::eval::eval_frame(ts, &mut frame, throw) {
-                Ok(crate::interp::Exit::Return(v)) => Ok(v),
-                Ok(crate::interp::Exit::Yield(_)) => Err(crate::errors::system_error("yield from a non-generator frame")),
-                Err(e) => Err(e),
-            }
-        }
+    ts.frame.set(fp);
+    frame.state = FrameState::Executing;
+    let entry: EntryFn = unsafe { std::mem::transmute(tramp) };
+    let mut out: *mut PyObject = std::ptr::null_mut();
+    let st = unsafe { entry(fp, frame.slots.as_mut_ptr(), ts, target, &mut out) };
+    ts.frame.set(prev);
+    frame.prev = std::ptr::null_mut();
+    if st == tier1::ST_RETURN {
+        crate::interp::frame::recycle_call(frame);
+        return Ok(unsafe { PyRef::from_raw(out) });
+    }
+    finish_in_interp(ts, frame, st)
+}
+
+#[cold]
+#[inline(never)]
+fn finish_in_interp(ts: &ThreadState, mut frame: Box<Frame>, st: u32) -> PyResult {
+    if st == tier1::ST_DEOPT {
+        opt::note_deopt(&crate::types::code::code_data(frame.code()).caches, &frame);
+    }
+    // let the interpreter finish this activation (unwinding or deopt)
+    let throw = if st == tier1::ST_ERROR {
+        frame.next_instr = frame.lasti + 1;
+        crate::errors::take_exc()
+    } else {
+        None
     };
-    crate::interp::leave_recursive_call(ts);
+    let r = match crate::interp::eval::eval_frame(ts, &mut frame, throw) {
+        Ok(crate::interp::Exit::Return(v)) => Ok(v),
+        Ok(crate::interp::Exit::Yield(_)) => Err(crate::errors::system_error("yield from a non-generator frame")),
+        Err(e) => Err(e),
+    };
     crate::interp::frame_finished(frame);
     r
+}
+
+/// Deoptimisation inside a callee inlined by tier 2 (opt/build.rs `try_inline`):
+/// build its frame from `buf` (owned references: `nloc` locals, then `nstack` stack
+/// entries; NULL = unbound), resume it in the interpreter at `resume` (or raise the
+/// pending exception at `lasti` when `error`), and return its result (new reference)
+/// or NULL with an exception set.
+pub unsafe extern "C" fn h2_run_inlined(func: *mut PyObject, buf: *mut *mut PyObject, counts: u64, resume: u64, lasti: u64, error: u64) -> *mut PyObject {
+    unsafe {
+        let (nloc, nstack) = ((counts & 0xffff_ffff) as usize, (counts >> 32) as usize);
+        let f = crate::types::funcobject::func(&*func);
+        let code = f.func_code;
+        let co = crate::types::code::code(&*code).obj;
+        let nlp = co.co_nlocalsplus as usize;
+        let total = nlp + co.co_stacksize as usize + 1;
+        let mut frame = Frame::new_call_raw(code, func, f.func_globals, f.func_builtins, nlp, total);
+        // the function object is only borrowed from a constant in compiled code
+        frame.make_owned();
+        let s = frame.slots.as_mut_ptr();
+        for k in 0..nloc.min(nlp) {
+            *s.add(k) = *buf.add(k);
+        }
+        for k in 0..nstack {
+            *s.add(nlp + k) = *buf.add(nloc + k);
+        }
+        frame.stack_top = nlp + nstack;
+        frame.lasti = lasti as u32;
+        frame.next_instr = resume as u32;
+        let throw = if error != 0 {
+            frame.next_instr = lasti as u32 + 1;
+            crate::errors::take_exc()
+        } else {
+            None
+        };
+        let ts = crate::threads::current();
+        let r = match crate::interp::enter_recursive_call(ts, "") {
+            Ok(()) => {
+                let r = crate::interp::eval::eval_frame(ts, &mut frame, throw);
+                crate::interp::leave_recursive_call(ts);
+                match r {
+                    Ok(crate::interp::Exit::Return(v)) => v.into_raw(),
+                    Ok(crate::interp::Exit::Yield(_)) => {
+                        let _ = crate::errors::system_error("yield from an inlined frame");
+                        std::ptr::null_mut()
+                    }
+                    Err(_) => std::ptr::null_mut(),
+                }
+            }
+            Err(_) => std::ptr::null_mut(),
+        };
+        crate::interp::frame_finished(frame);
+        r
+    }
+}
+
+/// Tier-1 `Call` of a Python function: [callable, self_or_null, args..] at `base`
+/// (n = argument count without self). The arguments (and self) are moved into the
+/// callee frame, the callable reference becomes the frame's `func`. Result in
+/// `*base`; status like the other helpers. Falls back to the generic call.
+pub unsafe extern "C" fn h_call_py(base: *mut *mut PyObject, n: u64) -> u64 {
+    unsafe {
+        let callable = *base;
+        let self_ = *base.add(1);
+        let (argp, nargs) = if self_.is_null() { (base.add(2), n as usize) } else { (base.add(1), n as usize + 1) };
+        let f = callable as *mut crate::types::funcobject::PyFunctionObject;
+        let code = (*f).func_code;
+        let cd = crate::types::code::code_data(&*code);
+        let cc = &cd.caches;
+        let target = cc.fast_entry.load(Acquire);
+        let ts = crate::threads::current();
+        let depth = ts.recursion_depth.get() + 1;
+        if target == 0
+            || cc.fast_argc.load(Relaxed) as usize != nargs
+            || crate::modules::sys::tracing_active()
+            || depth > ts.c.py_recursion_limit
+            || crate::interp::stack_pointer() < ts.stack_soft_limit()
+        {
+            return helpers::h_call(base.add(n as usize + 2), n, 0);
+        }
+        let c = &*cd.caches.jit.load(Acquire);
+        ts.recursion_depth.set(depth);
+        let (nlp, total) = (cc.fast_nlp.load(Relaxed) as usize, cc.fast_total.load(Relaxed) as usize);
+        // the callable stays in the caller's stack slot for the duration of the call:
+        // that reference keeps func/code alive for the borrowed frame (frame.rs `owns_fc`)
+        let mut frame = Frame::new_call_raw(code, callable, (*f).func_globals, (*f).func_builtins, nlp, total);
+        let s = frame.slots.as_mut_ptr();
+        for i in 0..nargs {
+            *s.add(i) = *argp.add(i);
+            *argp.add(i) = std::ptr::null_mut();
+        }
+        let mut target = target;
+        if bump_invocations(cd) {
+            if let Some(t) = opt::compile(&*code, (*f).func_globals, (*f).func_builtins, 0) {
+                target = t;
+            }
+        }
+        let r = run_call_frame(ts, frame, c.addr, target);
+        ts.recursion_depth.set(depth - 1);
+        *base = std::ptr::null_mut();
+        decref(callable);
+        match r {
+            Ok(v) => {
+                *base = v.into_raw();
+                helpers::OK
+            }
+            Err(_) => helpers::ERR,
+        }
+    }
 }
 
 /// Resume/start a frame directly in compiled code, bypassing the interpreter prelude
@@ -294,6 +458,27 @@ pub fn resume(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> Result<P
     }
 }
 
+/// Publish the fast-call descriptor of a code object (see CodeCaches::fast_entry).
+fn publish_fast_entry(code: &PyObject, cd: &CodeData, target: usize) {
+    use rpy_compiler::bytecode::co;
+    let co_ = crate::types::code::code(code).obj;
+    let flags = co_.co_flags as u32;
+    if target == 0
+        || flags & (co::VARARGS | co::VARKEYWORDS | co::GENERATOR | co::COROUTINE | co::ASYNC_GENERATOR | co::ITERABLE_COROUTINE) != 0
+        || flags & co::OPTIMIZED == 0
+        || co_.co_kwonlyargcount != 0
+    {
+        return;
+    }
+    let cc = &cd.caches;
+    let nlp = co_.co_nlocalsplus as u32;
+    cc.fast_argc.store(co_.co_argcount as u32, Relaxed);
+    cc.fast_nlp.store(nlp, Relaxed);
+    cc.fast_total.store(nlp + co_.co_stacksize as u32 + 1, Relaxed);
+    cc.fast_argc_ok.store(true, Relaxed);
+    cc.fast_entry.store(target, Release);
+}
+
 /// Compile the frame's code object (tier 1). Returns true if code is installed.
 #[cold]
 fn compile(f: &Frame, cd: &CodeData) -> bool {
@@ -329,9 +514,13 @@ fn compile(f: &Frame, cd: &CodeData) -> bool {
                             code.len()
                         );
                     }
+                    let entry0 = out.entries.first().copied().unwrap_or(u32::MAX);
                     let c = Box::into_raw(Box::new(Compiled { addr, len: code.len(), entries: out.entries }));
                     cd.caches.jit.store(c, Release);
                     cd.caches.tier_state.store(tier::COMPILED, Release);
+                    cd.caches.t2_calls.store(opt::call_threshold(), Relaxed);
+                    cd.caches.t2_backedge.store(opt::backedge_threshold(), Relaxed);
+                    publish_fast_entry(f.code(), cd, if entry0 == u32::MAX { 0 } else { addr + entry0 as usize });
                     true
                 }
                 None => {
