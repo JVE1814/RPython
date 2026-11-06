@@ -43,7 +43,7 @@ pub fn alloc_bytes(n: usize) -> PyRef {
         Ok(r) => r,
         Err(_) => {
             clear_exc();
-            std::alloc::handle_alloc_error(std::alloc::Layout::from_size_align(n.max(1), 8).unwrap())
+            std::alloc::handle_alloc_error(std::alloc::Layout::from_size_align(n.max(1), 8).unwrap_or(std::alloc::Layout::new::<u64>()))
         }
     }
 }

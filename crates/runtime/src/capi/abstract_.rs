@@ -782,6 +782,10 @@ pub unsafe extern "C" fn PyMapping_GetItemString(o: *mut PyObject, k: *const c_c
 pub unsafe extern "C" fn PyMapping_GetOptionalItem(o: *mut PyObject, k: *mut PyObject, result: *mut *mut PyObject) -> c_int {
     unsafe {
         *result = std::ptr::null_mut();
+        if o.is_null() || k.is_null() {
+            let _ = null_arg();
+            return -1;
+        }
         if dict::is_dict_exact(&*o) {
             return match dict::get_item(&*o, &*k) {
                 Ok(Some(v)) => {

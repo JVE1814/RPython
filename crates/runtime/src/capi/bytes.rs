@@ -157,7 +157,10 @@ pub unsafe extern "C" fn PyBytes_DecodeEscape(s: *const c_char, len: Py_ssize_t,
         ret((|| -> PyResult {
             let c = crate::import::import_absolute("_codecs")?;
             let f = ab::getattr_str(&c, "escape_decode")?;
-            let b = bytes::new_bytes(std::slice::from_raw_parts(s as *const u8, len.max(0) as usize));
+            if len > (bytes::MAX_SIZE / 4) as Py_ssize_t {
+                return Err(crate::err!(OverflowError, "excessive input length for escape decoding"));
+            }
+            let b = if s.is_null() { bytes::new_bytes(b"") } else { bytes::try_new_bytes(std::slice::from_raw_parts(s as *const u8, len.max(0) as usize))? };
             let err = if errors.is_null() { none::none_ref() } else { cstr_obj(errors)? };
             let r = ab::call(&f, &[&b, &err])?;
             Ok(crate::types::tuple::tuple_get(&r, 0).to_ref())
