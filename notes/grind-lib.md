@@ -21,16 +21,17 @@ them ("failures=").
 | test_pickle | 0 (57 skips) | 11 | 0 (57 skips) | |
 | test_bytes | 0 | 13 | 0 | |
 | test_str | 0 | 2 | 0 | |
-| test_io | 0 | 47 | 5 | shutdown finalization (create_at_shutdown), see below |
+| test_io | 0 | 47 | 2 | shutdown finalization (create_at_shutdown), see below |
 | test_warnings | 0 | 16 | 3 | finalization-time warnings |
 | test_socket | 0 (286 skips) | 7 | 0 (+1 VSOCK env error) | skips equal baseline |
 | test_faulthandler | 0 | 11 | 0 | |
 | test_pydoc | 0 | 7 | 1 | `_datetime` methods are Python functions |
-| test_pyrepl | 1 | 24 | 3 (JIT2 off) | crashes in the tier-2 JIT with JIT2 on, see below |
+| test_pyrepl | 1 | 24 | 2 (JIT2 off) | crashes in the tier-2 JIT with JIT2 on, see below |
 | test_repl | 0 | 11 | 3 | pyrepl over a pipe, `__phello__` |
 | test_compileall | 0 | 14 | 0 | |
 | test_audit | 0 | 17 | 4 | |
 | test_dataclasses | 0 | 1 | 0 | |
+| test_marshal | 0 | 4 | 1 | |
 | test_traceback | 0 | CRASH | 18 | crash fixed; rest is frames/carets/lazy-import suggestions |
 | test_lazy_import | 0 | 14 | 14 | core lazy-import semantics, not started |
 | test_cmd_line | 0 | 33 | 33 | not started (launcher/argv/startup) |
