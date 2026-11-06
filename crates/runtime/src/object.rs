@@ -372,7 +372,187 @@ pub unsafe fn init_header(op: *mut PyObject, tp: *mut PyTypeObject) {
         o.ob_ref_shared.store(0, Relaxed);
         o.ob_type.store(tp, Relaxed);
         if (*tp).tp_flags & Py_TPFLAGS_HEAPTYPE != 0 {
-            incref(tp as *mut PyObject);
+            incref_type(tp);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- per-thread type refcounts
+//
+// Every instance holds a reference to its heap type, so threads that allocate and free
+// instances of one class hammer the type's shared refcount (an atomic on a cache line
+// all cores fight over). Heap types therefore get a small id (`unique_id`) and, while
+// they have one, references taken and dropped by instance creation/destruction on
+// threads other than the type's owner go to a plain per-thread counter array instead
+// (perf2; CPython's free-threaded build does the same). The true count is the sum of
+// the object's fields and every thread's counter; a type with an id also carries one
+// extra "bias" reference so that the fields alone never drop to zero. Counters are
+// merged into the type at every collection (world stopped) and at thread exit; the
+// cycle collector discounts the bias, and when it finds the type unreachable it gives
+// up the id and the bias (heap types are always in a cycle through their MRO, so they
+// were only ever freed by the collector anyway).
+
+struct TypeCounts {
+    /// Every live thread's counter array (owner key, array).
+    arrays: Vec<(usize, *mut Vec<isize>)>,
+    /// id -> type (0 = free slot); ids start at 1.
+    types: Vec<usize>,
+    free_ids: Vec<usize>,
+}
+unsafe impl Send for TypeCounts {}
+static TYPE_COUNTS: std::sync::Mutex<TypeCounts> =
+    std::sync::Mutex::new(TypeCounts { arrays: Vec::new(), types: Vec::new(), free_ids: Vec::new() });
+
+#[thread_local]
+static mut MY_COUNTS: *mut Vec<isize> = std::ptr::null_mut();
+
+#[inline(always)]
+unsafe fn type_id(tp: *mut PyTypeObject) -> usize {
+    unsafe { (*(tp as *mut crate::ffi::PyHeapTypeObject)).unique_id as usize }
+}
+
+/// Give heap type `tp` an id (enables per-thread counting). Called by type creation.
+pub unsafe fn assign_type_id(tp: *mut PyTypeObject) {
+    unsafe {
+        if (*tp).tp_flags & Py_TPFLAGS_HEAPTYPE == 0 || type_id(tp) != 0 {
+            return;
+        }
+        let mut g = TYPE_COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+        let id = match g.free_ids.pop() {
+            Some(i) => i,
+            None => {
+                if g.types.is_empty() {
+                    g.types.push(0);
+                }
+                g.types.push(0);
+                g.types.len() - 1
+            }
+        };
+        g.types[id] = tp as usize;
+        (*tp.cast::<PyObject>()).ob_ref_shared.fetch_add(1 << REF_SHARED_SHIFT, Relaxed); // bias
+        (*(tp as *mut crate::ffi::PyHeapTypeObject)).unique_id = id as isize;
+    }
+}
+
+/// Fold every thread's counters into the types (world stopped, or the caller is the
+/// only thread).
+pub fn merge_type_counts() {
+    let g = TYPE_COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(_, arr) in g.arrays.iter() {
+        unsafe { merge_array(&g, &mut *arr) };
+    }
+}
+
+unsafe fn merge_array(g: &TypeCounts, arr: &mut Vec<isize>) {
+    for (id, c) in arr.iter_mut().enumerate() {
+        if *c != 0 {
+            let tp = g.types.get(id).copied().unwrap_or(0);
+            if tp != 0 {
+                unsafe { (*(tp as *mut PyObject)).ob_ref_shared.fetch_add(*c << REF_SHARED_SHIFT, Relaxed) };
+            }
+            *c = 0;
+        }
+    }
+}
+
+/// The calling thread is exiting: fold its counters in and forget its array.
+pub fn thread_exit_type_counts() {
+    unsafe {
+        let mine = MY_COUNTS;
+        if mine.is_null() {
+            return;
+        }
+        let mut g = TYPE_COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+        merge_array(&g, &mut *mine);
+        g.arrays.retain(|&(_, a)| a != mine);
+        MY_COUNTS = std::ptr::null_mut();
+        drop(Box::from_raw(mine));
+    }
+}
+
+/// Is `op` a type with per-thread counting (its fields include the bias)?
+#[inline]
+pub unsafe fn has_type_id(op: *mut PyObject) -> bool {
+    unsafe {
+        let t = (*op).type_ptr();
+        ((*t).tp_flags & Py_TPFLAGS_TYPE_SUBCLASS != 0)
+            && (*(op as *mut PyTypeObject)).tp_flags & Py_TPFLAGS_HEAPTYPE != 0
+            && type_id(op as *mut PyTypeObject) != 0
+    }
+}
+
+/// Stop per-thread counting for `tp` (collector found it unreachable, or it is being
+/// deallocated): drop the bias and recycle the id. Counters must have been merged.
+pub unsafe fn release_type_id(tp: *mut PyTypeObject, drop_bias: bool) {
+    unsafe {
+        let id = type_id(tp);
+        if id == 0 {
+            return;
+        }
+        {
+            let mut g = TYPE_COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+            if g.types.get(id).copied() == Some(tp as usize) {
+                g.types[id] = 0;
+                g.free_ids.push(id);
+            }
+            (*(tp as *mut crate::ffi::PyHeapTypeObject)).unique_id = 0;
+        }
+        if drop_bias {
+            decref(tp as *mut PyObject);
+        }
+    }
+}
+
+#[cold]
+unsafe fn counts_slot(id: usize) -> *mut isize {
+    unsafe {
+        if MY_COUNTS.is_null() {
+            let b = Box::into_raw(Box::new(Vec::<isize>::new()));
+            TYPE_COUNTS.lock().unwrap_or_else(|e| e.into_inner()).arrays.push((thread_id(), b));
+            MY_COUNTS = b;
+        }
+        let v = &mut *MY_COUNTS;
+        if v.len() <= id {
+            // resized while holding the registry lock: the collector may be reading it
+            let _g = TYPE_COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+            v.resize((id + 1).next_power_of_two().max(64), 0);
+        }
+        v.as_mut_ptr().add(id)
+    }
+}
+
+/// Reference to heap type `tp` taken on behalf of a new instance.
+#[inline(always)]
+pub unsafe fn incref_type(tp: *mut PyTypeObject) {
+    unsafe {
+        let id = type_id(tp);
+        let o = &*(tp as *mut PyObject);
+        if id == 0 || o.ob_tid.load(Relaxed) == thread_id() {
+            return incref(tp as *mut PyObject);
+        }
+        let v = MY_COUNTS;
+        if !v.is_null() && id < (*v).len() {
+            *(*v).as_mut_ptr().add(id) += 1;
+        } else {
+            *counts_slot(id) += 1;
+        }
+    }
+}
+
+/// Drop a reference to heap type `tp` held by a dying instance.
+#[inline(always)]
+pub unsafe fn decref_type(tp: *mut PyTypeObject) {
+    unsafe {
+        let id = type_id(tp);
+        let o = &*(tp as *mut PyObject);
+        if id == 0 || o.ob_tid.load(Relaxed) == thread_id() {
+            return decref(tp as *mut PyObject);
+        }
+        let v = MY_COUNTS;
+        if !v.is_null() && id < (*v).len() {
+            *(*v).as_mut_ptr().add(id) -= 1;
+        } else {
+            *counts_slot(id) -= 1;
         }
     }
 }

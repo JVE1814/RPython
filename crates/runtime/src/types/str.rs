@@ -551,31 +551,73 @@ impl StrBuilder {
 
 // ---------------- interning ----------------
 
-use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// The keys are already well-mixed str hashes.
-#[derive(Default)]
-struct IdentityHasher(u64);
-impl std::hash::Hasher for IdentityHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = self.0.rotate_left(8) ^ b as u64;
+/// Interned strs: an open-addressing set of object pointers keyed on their (cached)
+/// hash, linear probing, load factor <= 1/2 (perf2: one flat array instead of a hash
+/// map of per-hash vectors — no allocation per interned string).
+struct InternTable {
+    slots: Vec<usize>,
+    len: usize,
+}
+
+impl InternTable {
+    /// Slot index holding a str equal to the probe (`eq`), or the empty slot to use.
+    #[inline]
+    fn find(&self, h: isize, eq: impl Fn(&PyObject) -> bool) -> Result<usize, usize> {
+        let mask = self.slots.len() - 1;
+        let mut i = (h as usize ^ (h as usize >> 29)) & mask;
+        loop {
+            let p = self.slots[i];
+            if p == 0 {
+                return Err(i);
+            }
+            let o = unsafe { &*(p as *mut PyObject) };
+            if ascii_obj(o).hash == h && eq(o) {
+                return Ok(i);
+            }
+            i = (i + 1) & mask;
         }
     }
-    fn write_isize(&mut self, v: isize) {
-        self.0 = v as u64;
+    fn insert_at(&mut self, i: usize, p: usize) {
+        self.slots[i] = p;
+        self.len += 1;
+        if self.len * 2 > self.slots.len() {
+            let n2 = self.slots.len() * 2;
+            let old = std::mem::replace(&mut self.slots, vec![0; n2]);
+            let mask = self.slots.len() - 1;
+            for q in old.into_iter().filter(|&q| q != 0) {
+                let h = ascii_obj(unsafe { &*(q as *mut PyObject) }).hash;
+                let mut j = (h as usize ^ (h as usize >> 29)) & mask;
+                while self.slots[j] != 0 {
+                    j = (j + 1) & mask;
+                }
+                self.slots[j] = q;
+            }
+        }
     }
 }
 
-struct InternTable {
-    // keyed on the (cached) str hash; buckets hold the interned objects (no key copies)
-    map: HashMap<isize, Vec<usize>, std::hash::BuildHasherDefault<IdentityHasher>>,
+static INTERNED: Mutex<InternTable> = Mutex::new(InternTable { slots: Vec::new(), len: 0 });
+
+#[inline]
+fn interned_table() -> std::sync::MutexGuard<'static, InternTable> {
+    let mut g = INTERNED.lock().unwrap_or_else(|e| e.into_inner());
+    if g.slots.is_empty() {
+        g.slots = vec![0; 8192];
+    }
+    g
 }
-static INTERNED: Mutex<Option<InternTable>> = Mutex::new(None);
+
+/// Make `s` the canonical interned instance (caller holds the table lock and checked
+/// that no equal str is interned).
+unsafe fn adopt_interned(t: &mut InternTable, slot: usize, s: &PyRef) {
+    unsafe {
+        make_immortal(s.as_ptr());
+        (*(s.as_ptr() as *mut PyASCIIObject)).state |= 2; // SSTATE_INTERNED_IMMORTAL
+    }
+    t.insert_at(slot, s.as_ptr() as usize);
+}
 
 /// Intern a str object; returns the canonical (immortal) instance.
 pub fn intern(s: PyRef) -> PyRef {
@@ -586,18 +628,28 @@ pub fn intern(s: PyRef) -> PyRef {
         return s;
     }
     let key = str_hash(&s);
-    let mut g = INTERNED.lock().unwrap();
-    let t = g.get_or_insert_with(|| InternTable { map: HashMap::default() });
-    if let Some(&p) = t.map.get(&key).and_then(|b| b.iter().find(|&&p| str_eq(unsafe { &*(p as *mut PyObject) }, &s))) {
-        return unsafe { PyRef::from_borrowed(p as *mut PyObject) };
+    let mut t = interned_table();
+    match t.find(key, |o| str_eq(o, &s)) {
+        Ok(i) => unsafe { PyRef::from_borrowed(t.slots[i] as *mut PyObject) },
+        Err(i) => {
+            unsafe { adopt_interned(&mut t, i, &s) };
+            s
+        }
     }
-    unsafe {
-        str_hash(&s);
-        make_immortal(s.as_ptr());
-        (*(s.as_ptr() as *mut PyASCIIObject)).state |= 2; // SSTATE_INTERNED_IMMORTAL
+}
+
+/// Interned str with the given Latin-1 content (marshal, names in code objects): an
+/// already interned instance is returned without allocating a new object.
+pub fn intern_latin1(b: &[u8]) -> PyRef {
+    let h = crate::hash::hash_bytes(b);
+    let eq = |o: &PyObject| str_kind(o) == 1 && str_len(o) == b.len() && unsafe { std::slice::from_raw_parts(str_data_ptr(o), b.len()) } == b;
+    {
+        let t = interned_table();
+        if let Ok(i) = t.find(h, eq) {
+            return unsafe { PyRef::from_borrowed(t.slots[i] as *mut PyObject) };
+        }
     }
-    t.map.entry(key).or_default().push(s.as_ptr() as usize);
-    s
+    intern(from_latin1(b))
 }
 
 /// The interned instance equal to exact str `s`, without interning `s` itself
@@ -610,9 +662,8 @@ pub fn lookup_interned(s: &PyObject) -> Option<*mut PyObject> {
         return None;
     }
     let key = str_hash(s);
-    let g = INTERNED.lock().unwrap();
-    let t = g.as_ref()?;
-    t.map.get(&key).and_then(|b| b.iter().find(|&&p| str_eq(unsafe { &*(p as *mut PyObject) }, s))).map(|&p| p as *mut PyObject)
+    let t = interned_table();
+    t.find(key, |o| str_eq(o, s)).ok().map(|i| t.slots[i] as *mut PyObject)
 }
 
 pub fn intern_str(s: &str) -> PyRef {

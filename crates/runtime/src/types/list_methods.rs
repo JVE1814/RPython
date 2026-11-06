@@ -64,10 +64,7 @@ fn sort_m(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
 fn reverse_m(o: &PyObject) -> PyResult {
     let mut v = list::take_items(o);
     v.reverse();
-    let extra = list::restore_items(o, v);
-    for p in extra {
-        unsafe { decref(p) };
-    }
+    list::release_items(list::restore_items(o, v));
     Ok(none::none_ref())
 }
 fn index_m(o: &PyObject, args: &[&PyObject]) -> PyResult {
@@ -806,10 +803,7 @@ pub fn sort_list(l: &PyObject, key: Option<&PyObject>, reverse: bool) -> PyResul
             match ab::call(k, &[unsafe { &*it }]) {
                 Ok(v) => keys_owned.push(v),
                 Err(e) => {
-                    let extra = list::restore_items(l, items);
-                    for p in extra {
-                        unsafe { decref(p) };
-                    }
+                    list::release_items(list::restore_items(l, items));
                     return Err(e);
                 }
             }
@@ -838,9 +832,7 @@ pub fn sort_list(l: &PyObject, key: Option<&PyObject>, reverse: bool) -> PyResul
     let saved_exc = if failed { take_exc() } else { None };
     let extra = list::restore_items(l, items);
     drop(keys_owned);
-    for p in extra {
-        unsafe { decref(p) };
-    }
+    list::release_items(extra);
     if let Some(e) = saved_exc {
         set_exc(e);
         return Err(PyErr);
