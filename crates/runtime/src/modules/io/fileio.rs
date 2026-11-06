@@ -22,6 +22,8 @@ pub struct FileIO {
     pub blksize: i64,
     /// Estimated file size at open time (-1 unknown), used by readall().
     pub size_estimate: i64,
+    /// fstat at open time: 1 character device, 0 something else, -1 unknown
+    pub is_chr: i8,
 }
 
 pub static mut FILEIO_TYPE: PyTypeObject = PyTypeObject::ZERO;
@@ -73,6 +75,7 @@ unsafe extern "C" fn fileio_new(tp: *mut PyTypeObject, _a: *mut PyObject, _k: *m
             f.closefd = true;
             f.blksize = 0;
             f.size_estimate = -1;
+            f.is_chr = -1;
         }
         op
     }
@@ -199,6 +202,7 @@ fn fileio_init_impl(o: &PyObject, file: &PyObject, mode: &str, closefd: bool, op
     f.truncating = truncating;
     f.seekable = -1;
     f.blksize = 0;
+    f.is_chr = -1;
     let fd_is_own;
     if fd >= 0 {
         fd_is_own = false;
@@ -252,14 +256,17 @@ fn fileio_init_impl(o: &PyObject, file: &PyObject, mode: &str, closefd: bool, op
         }
     } else {
         if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
-            let _ = internal_close(f);
-            if !fd_is_own {
+            // a descriptor passed in by the caller stays open
+            if fd_is_own {
+                let _ = internal_close(f);
+            } else {
                 f.fd = -1;
             }
             return Err(crate::types::exceptions::os_error_from_errno(libc::EISDIR, Some(file), None));
         }
         f.blksize = if st.st_blksize > 1 { st.st_blksize } else { DEFAULT_BUFFER_SIZE as i64 };
         f.size_estimate = if st.st_mode & libc::S_IFMT == libc::S_IFREG { st.st_size } else { -1 };
+        f.is_chr = (st.st_mode & libc::S_IFMT == libc::S_IFCHR) as i8;
     }
     if let Err(e) = ab::setattr(o, crate::name!("name"), file) {
         fail(fio(o));
@@ -395,7 +402,10 @@ fn fio_readinto(o: &PyObject, b: &PyObject) -> PyResult {
 
 pub fn readall_fd(f: &mut FileIO) -> PyResult<Option<Vec<u8>>> {
     let mut est = f.size_estimate;
-    if est > 0 {
+    if est > 0 && est <= 65536 {
+        // small file: read size+1 bytes without asking for the position
+        est += 1;
+    } else if est > 0 {
         let pos = unsafe { libc::lseek(f.fd, 0, libc::SEEK_CUR) };
         if pos >= 0 && est >= pos {
             est = est - pos + 1;
@@ -428,7 +438,7 @@ pub fn readall_fd(f: &mut FileIO) -> PyResult<Option<Vec<u8>>> {
 
 fn fio_readall(o: &PyObject) -> PyResult {
     let f = fio(o);
-    check_open(f)?;
+    check_readable(f)?;
     match readall_fd(f)? {
         Some(v) => Ok(new_bytes(&v)),
         None => Ok(none::none_ref()),
@@ -485,6 +495,10 @@ fn fio_tell(o: &PyObject) -> PyResult {
     let r = unsafe { libc::lseek(f.fd, 0, libc::SEEK_CUR) };
     if r < 0 {
         return Err(os_error());
+    }
+    // a successful lseek also answers seekable() (saves a syscall later)
+    if f.seekable < 0 {
+        f.seekable = 1;
     }
     Ok(int::new_int(r))
 }
@@ -545,6 +559,16 @@ fn fio_fileno(o: &PyObject) -> PyResult {
 fn fio_isatty(o: &PyObject) -> PyResult {
     let f = fio(o);
     check_open(f)?;
+    Ok(bool_::new_bool(unsafe { libc::isatty(f.fd) } == 1))
+}
+/// isatty() for open(): a descriptor that fstat() at open time showed not to be
+/// a character device cannot be a terminal, so no ioctl is needed.
+fn fio_isatty_open_only(o: &PyObject) -> PyResult {
+    let f = fio(o);
+    check_open(f)?;
+    if f.is_chr == 0 {
+        return Ok(bool_::new_bool(false));
+    }
     Ok(bool_::new_bool(unsafe { libc::isatty(f.fd) } == 1))
 }
 
@@ -687,6 +711,7 @@ pub fn init_types() -> PyResult<()> {
             ("writable", NOARGS, fio_writable),
             ("fileno", NOARGS, fio_fileno),
             ("isatty", NOARGS, fio_isatty),
+            ("_isatty_open_only", NOARGS, fio_isatty_open_only),
             ("_dealloc_warn", O, fio_dealloc_warn),
             ("__getstate__", NOARGS, fio_getstate),
         ];

@@ -748,6 +748,14 @@ fn flush_impl(o: &PyObject) -> PyResult<()> {
 }
 
 fn b_flush(o: &PyObject) -> PyResult {
+    // A reader has nothing of its own to flush: forward to the raw stream
+    // without taking the buffer lock (flush() may come from inside a read).
+    {
+        let (raw, st) = parts(o)?;
+        if !st.writable {
+            return call0(&raw, "flush");
+        }
+    }
     let _g = lock(o)?;
     flush_impl(o)?;
     Ok(none::none_ref())

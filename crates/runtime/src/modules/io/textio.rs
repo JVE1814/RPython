@@ -399,11 +399,18 @@ fn tio(o: &PyObject) -> &mut TextIO {
 }
 
 fn state(o: &PyObject) -> PyResult<&mut State> {
+    if tio(o).detached {
+        raise!(ValueError, "underlying buffer has been detached");
+    }
+    state_any(o)
+}
+
+/// The state even after detach() (which keeps encoding, errors, ... and only
+/// drops the buffer); used by attributes that outlive the buffer and by an
+/// operation that was already running when the buffer got detached.
+fn state_any(o: &PyObject) -> PyResult<&mut State> {
     let t = tio(o);
     if t.st.is_null() {
-        if t.detached {
-            raise!(ValueError, "underlying buffer has been detached");
-        }
         raise!(ValueError, "I/O operation on uninitialized object");
     }
     Ok(unsafe { &mut *t.st })
@@ -461,7 +468,7 @@ fn resolve_encoding(enc: Option<&PyObject>) -> PyResult<PyRef> {
             .and_then(|v| int::as_i64(&v))
             .unwrap_or(0);
         if warn != 0 {
-            crate::modules::warnings::warn(crate::types::exceptions::EncodingWarning(), "'encoding' argument not specified", 2)?;
+            crate::modules::warnings::warn(crate::types::exceptions::EncodingWarning(), "'encoding' argument not specified", 1)?;
         }
         clear_exc_if_attr();
         return Ok(pystr::new_str("utf-8"));
@@ -469,7 +476,8 @@ fn resolve_encoding(enc: Option<&PyObject>) -> PyResult<PyRef> {
     if !pystr::is_str(&e) {
         raise!(TypeError, "TextIOWrapper() argument 'encoding' must be str or None, not {}", tname(&e));
     }
-    let s = pystr::to_string_lossy(&e);
+    // like the C API, the name must be encodable (surrogates raise UnicodeEncodeError)
+    let s = pystr::as_utf8(&e)?.to_string();
     if s.contains('\0') {
         raise!(ValueError, "embedded null character");
     }
@@ -583,8 +591,14 @@ fn textio_init_impl(
             if !pystr::is_str(e) {
                 raise!(TypeError, "TextIOWrapper() argument 'errors' must be str or None, not {}", tname(e));
             }
-            if pystr::to_string_lossy(e).contains('\0') {
+            if pystr::as_utf8(e)?.contains('\0') {
                 raise!(ValueError, "embedded null character");
+            }
+            // development mode validates the handler name up front
+            if crate::modules::sys_full::config().dev_mode {
+                let codecs = crate::import::import_absolute("codecs")?;
+                let lookup: PyRef = ab::getattr_str(&codecs, "lookup_error")?;
+                ab::call(&lookup, &[e])?;
             }
             e.to_ref()
         }
@@ -798,7 +812,8 @@ fn read_chunk(st: &mut State, size_hint: usize) -> PyResult<bool> {
         size = size.max(est);
     }
     let method = if st.has_read1 { "read1" } else { "read" };
-    let chunk = ab::call_method_str(&st.buffer, method, &[&int::new_int(size as i64)])?;
+    let buf = st.buffer.clone();
+    let chunk = ab::call_method_str(&buf, method, &[&int::new_int(size as i64)])?;
     if !BufView::has_buffer(&chunk) {
         raise!(TypeError, "underlying {}() should have returned a bytes-like object, not '{}'", method, tname(&chunk));
     }
@@ -835,7 +850,8 @@ fn t_read(o: &PyObject, args: &[&PyObject]) -> PyResult {
     flush_pending(st)?;
     let st = state(o)?;
     if n < 0 {
-        let data = call0(&st.buffer, "read")?;
+        let buf = st.buffer.clone();
+        let data = call0(&buf, "read")?;
         if data.is(none::none()) {
             raise!(BlockingIOError, "Read returned None.");
         }
@@ -843,7 +859,7 @@ fn t_read(o: &PyObject, args: &[&PyObject]) -> PyResult {
             raise!(TypeError, "underlying read() should have returned a bytes object, not '{}'", tname(&data));
         }
         let view = BufView::get(&data, false)?;
-        let st = state(o)?;
+        let st = state_any(o)?;
         let mut out: Vec<u32> = st.decoded[st.used.min(st.decoded.len())..].to_vec();
         let more = st.decoder.as_mut().unwrap().decode(view.as_slice(), true)?;
         out.extend_from_slice(&more);
@@ -855,13 +871,13 @@ fn t_read(o: &PyObject, args: &[&PyObject]) -> PyResult {
     let n = n as usize;
     let mut out: Vec<u32> = take_decoded(st, n).to_vec();
     while out.len() < n {
-        let st = state(o)?;
+        let st = state_any(o)?;
         if !read_chunk(st, n - out.len())? {
-            let st = state(o)?;
+            let st = state_any(o)?;
             out.extend_from_slice(take_decoded(st, n - out.len()));
             break;
         }
-        let st = state(o)?;
+        let st = state_any(o)?;
         let need = n - out.len();
         out.extend_from_slice(take_decoded(st, need));
     }
@@ -910,7 +926,7 @@ fn readline_impl(o: &PyObject, limit: isize) -> PyResult {
     let mut line: Vec<u32> = Vec::new();
     let mut pending_cr = false;
     loop {
-        let st = state(o)?;
+        let st = state_any(o)?;
         let chunk = &st.decoded[st.used.min(st.decoded.len())..];
         if pending_cr {
             // previous chunk ended with '\r' in universal mode
@@ -947,9 +963,9 @@ fn readline_impl(o: &PyObject, limit: isize) -> PyResult {
         if limit >= 0 && line.len() >= limit as usize {
             break;
         }
-        let st = state(o)?;
+        let st = state_any(o)?;
         if !read_chunk(st, 0)? {
-            let st = state(o)?;
+            let st = state_any(o)?;
             // EOF: take whatever is left (decoder may have emitted final chars)
             let rest = &st.decoded[st.used..];
             if !rest.is_empty() && !pending_cr {
@@ -1220,7 +1236,8 @@ fn t_close(o: &PyObject) -> PyResult {
     let st = state(o)?;
     let buf = st.buffer.clone();
     let c = ab::getattr(&buf, crate::name!("closed"))?;
-    if ab::is_true(&c)? {
+    // the buffer's `closed` may have detached us: nothing left to close
+    if ab::is_true(&c)? || tio(o).detached {
         return Ok(none::none_ref());
     }
     if tio(o).finalizing || hdr(o).ioflags & F_FINALIZING != 0 {
@@ -1255,11 +1272,11 @@ fn t_close(o: &PyObject) -> PyResult {
 fn t_detach(o: &PyObject) -> PyResult {
     state(o)?;
     call0(o, "flush")?;
-    let t = tio(o);
-    let st = unsafe { Box::from_raw(t.st) };
-    t.st = std::ptr::null_mut();
-    t.detached = true;
-    Ok(st.buffer.clone())
+    // flush() may itself have detached us
+    let st = state(o)?;
+    let buf = std::mem::replace(&mut st.buffer, none::none_ref());
+    tio(o).detached = true;
+    Ok(buf)
 }
 
 macro_rules! fwd {
@@ -1295,7 +1312,21 @@ fn t_reconfigure(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyR
         None => None,
     };
     let new_enc = match encoding {
-        Some(e) => Some(resolve_encoding(Some(e))?),
+        Some(e) => {
+            if !pystr::is_str(e) {
+                raise!(TypeError, "reconfigure() argument 'encoding' must be str or None, not {}", tname(e));
+            }
+            // validated by the codec lookup below; as in C the name ends at a NUL
+            // ("locale\0" is looked up as the codec "locale", a LookupError)
+            let s = pystr::as_utf8(e)?;
+            Some(if s == "locale" {
+                pystr::new_str("utf-8")
+            } else if let Some(i) = s.find('\0') {
+                pystr::new_str(&s[..i])
+            } else {
+                e.to_ref()
+            })
+        }
         None => None,
     };
     let new_errors = match errors_given {
@@ -1329,6 +1360,14 @@ fn t_reconfigure(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyR
         let readable = st.decoder.is_some();
         let writable = st.encoder.is_some();
         build_codecs(st, readable, writable)?;
+        // a new encoder in the middle of the stream must not emit a BOM
+        if writable && st.seekable {
+            let buf = st.buffer.clone();
+            let pos = call0(&buf, "tell")?;
+            if !int::is_int(&pos) || int::as_i64(&pos) != Some(0) {
+                reset_encoder(state(o)?, false)?;
+            }
+        }
     }
     if let Some(x) = lb.filter(|x| !x.is(none::none())) {
         st.line_buffering = ab::is_true(x)?;
@@ -1340,19 +1379,19 @@ fn t_reconfigure(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyR
 }
 
 fn get_encoding(o: &PyObject) -> PyResult {
-    Ok(state(o)?.encoding.clone())
+    Ok(state_any(o)?.encoding.clone())
 }
 fn get_errors(o: &PyObject) -> PyResult {
-    Ok(state(o)?.errors.clone())
+    Ok(state_any(o)?.errors.clone())
 }
 fn get_buffer(o: &PyObject) -> PyResult {
     Ok(state(o)?.buffer.clone())
 }
 fn get_line_buffering(o: &PyObject) -> PyResult {
-    Ok(bool_::new_bool(state(o)?.line_buffering))
+    Ok(bool_::new_bool(state_any(o)?.line_buffering))
 }
 fn get_write_through(o: &PyObject) -> PyResult {
-    Ok(bool_::new_bool(state(o)?.write_through))
+    Ok(bool_::new_bool(state_any(o)?.write_through))
 }
 fn get_closed(o: &PyObject) -> PyResult {
     let buf = state(o)?.buffer.clone();
@@ -1383,10 +1422,11 @@ fn get_chunk_size(o: &PyObject) -> PyResult {
 }
 fn set_chunk_size(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     let v = match v {
-        None => raise!(AttributeError, "cannot delete attribute"),
+        None => raise!(AttributeError, "_CHUNK_SIZE cannot be deleted"),
         Some(v) => v,
     };
-    let n = ssize_arg(v)?;
+    // out-of-range values are a ValueError like non-positive ones
+    let n = ab::index_as_ssize(v, Some(crate::types::exceptions::ValueError()))?;
     if n <= 0 {
         raise!(ValueError, "a strictly positive integer is required");
     }
@@ -1416,7 +1456,7 @@ unsafe extern "C" fn textio_repr(op: *mut PyObject) -> *mut PyObject {
         let r = (|| -> PyResult {
             let full = crate::types::typeobject::type_fqname(o.type_ptr());
             if tio(o).st.is_null() {
-                return Ok(pystr::new_str(&format!("<{}>", full)));
+                raise!(ValueError, "I/O operation on uninitialized object");
             }
             if crate::modules::reprlib_guard::enter(o) {
                 raise!(RuntimeError, "reentrant call inside {}.__repr__", full);
@@ -1443,7 +1483,7 @@ unsafe extern "C" fn textio_repr(op: *mut PyObject) -> *mut PyObject {
             if let Some(m) = ab::getattr_opt(o, &pystr::intern_str("mode"))? {
                 s.push_str(&format!(" mode={}", ab::repr_string(&m)?));
             }
-            s.push_str(&format!(" encoding={}>", ab::repr_string(&state(o)?.encoding)?));
+            s.push_str(&format!(" encoding={}>", ab::repr_string(&state_any(o)?.encoding)?));
             Ok(pystr::new_str(&s))
         })();
         into_c(r)

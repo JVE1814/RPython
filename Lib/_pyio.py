@@ -48,6 +48,9 @@ def text_encoding(encoding, stacklevel=2):
     return encoding
 
 
+# A staticmethod, so that storing it as a class attribute (open = _pyio.open)
+# does not turn it into a method.
+@staticmethod
 def open(file, mode="r", buffering=-1, encoding=None, errors=None,
          newline=None, closefd=True, opener=None):
     r"""Open file and return a stream.  Raise OSError upon failure.
@@ -139,7 +142,13 @@ def open(file, mode="r", buffering=-1, encoding=None, errors=None,
 
 
 def _open_code_with_warning(path):
-    """Open the file at path for reading as bytes (no hooks are applied)."""
+    """Open the file at path for reading as bytes (no hooks are applied).
+
+    Used only when io.open_code is missing: warn that a hook installed with
+    PyFile_SetOpenCodeHook() would be bypassed."""
+    import warnings
+    warnings.warn("_pyio.open_code() may not be using hooks",
+                  RuntimeWarning, 2)
     return open(path, "rb")
 
 
@@ -203,13 +212,14 @@ class IOBase(metaclass=abc.ABCMeta):
             return
         if closed:
             return
-        if _IOBASE_EMITS_UNRAISABLE:
-            self.close()
-        else:
-            try:
-                self.close()
-            except:
-                pass
+        # Wrappers forward to the raw file, which warns about the object
+        # actually being dropped (this one).
+        dealloc_warn = getattr(self, "_dealloc_warn", None)
+        if dealloc_warn is not None:
+            dealloc_warn(self)
+        # an exception from close() is reported as unraisable by the caller
+        # of __del__ (like the C implementation does)
+        self.close()
 
     def seekable(self):
         """Return whether random access is supported (default False)."""
@@ -273,7 +283,7 @@ class IOBase(metaclass=abc.ABCMeta):
                     return 1
                 n = (readahead.find(b"\n") + 1) or len(readahead)
                 if size >= 0:
-                    n = min(n, size)
+                    n = min(n, size - len(res))
                 return n
         else:
             def nreadahead():
@@ -470,6 +480,11 @@ class _BufferedIOMixin(BufferedIOBase):
     @property
     def raw(self):
         return self._raw
+
+    def _dealloc_warn(self, source):
+        dealloc_warn = getattr(self.raw, "_dealloc_warn", None)
+        if dealloc_warn is not None:
+            dealloc_warn(source)
 
     @property
     def closed(self):
@@ -1047,6 +1062,7 @@ class FileIO(RawIOBase):
     _appending = False
     _seekable = None
     _closefd = True
+    _truncating = False
 
     def __init__(self, file, mode='r', closefd=True, opener=None):
         """Open a file for raw unbuffered I/O.
@@ -1079,6 +1095,8 @@ class FileIO(RawIOBase):
 
         (self._created, self._readable, self._writable, self._appending,
          flags) = _mode_flags(mode)
+        # "w+" files are reported as "wb+" rather than "rb+"
+        self._truncating = "w" in mode
 
         fd_is_own = False
         try:
@@ -1092,7 +1110,8 @@ class FileIO(RawIOBase):
                     if not isinstance(fd, int):
                         raise TypeError('expected integer from opener')
                     if fd < 0:
-                        raise OSError('Negative file descriptor')
+                        # (a negative fd without errno would be meaningless)
+                        raise ValueError(f'opener returned {fd}')
                     os.set_inheritable(fd, False)
                 fd_is_own = True
             self._closefd = closefd
@@ -1319,7 +1338,7 @@ class FileIO(RawIOBase):
                 return 'ab'
         elif self._readable:
             if self._writable:
-                return 'rb+'
+                return 'wb+' if self._truncating else 'rb+'
             else:
                 return 'rb'
         else:
@@ -1565,6 +1584,11 @@ class TextIOWrapper(TextIOBase):
     def buffer(self):
         return self._buffer
 
+    def _dealloc_warn(self, source):
+        dealloc_warn = getattr(self.buffer, "_dealloc_warn", None)
+        if dealloc_warn is not None:
+            dealloc_warn(source)
+
     def reconfigure(self, *,
                     encoding=None, errors=None, newline=Ellipsis,
                     line_buffering=None, write_through=None):
@@ -1590,6 +1614,8 @@ class TextIOWrapper(TextIOBase):
         if encoding is None:
             encoding = self._encoding
         else:
+            if not isinstance(encoding, str):
+                raise TypeError("invalid encoding: %r" % encoding)
             encoding = self._check_encoding(encoding)
 
         if newline is Ellipsis:
@@ -1980,6 +2006,9 @@ class TextIOWrapper(TextIOBase):
                 break
             if end == -2:
                 scanned = len(text) - 1
+            elif not self._readtranslate and not self._readuniversal:
+                # a "\r\n" terminator may straddle the chunk boundary
+                scanned = max(0, len(text) - len(self._readnl) + 1)
             else:
                 scanned = len(text)
             if 0 <= size <= len(text):

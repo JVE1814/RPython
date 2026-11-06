@@ -154,14 +154,13 @@ pub fn lookup(encoding: &str) -> PyResult {
     raise!(LookupError, "unknown encoding: {}", encoding)
 }
 
-/// `codecs.lookup(name)` for a str object.  A name with lone surrogates has
-/// no UTF-8 form, so no codec can be registered under it: after the
-/// non-ASCII deprecation warning it is an unknown encoding.
+/// `codecs.lookup(name)` for a str object.  The name is converted to UTF-8
+/// first, so a name with lone surrogates raises UnicodeEncodeError (grind-lib).
 pub fn lookup_obj(name: &PyObject) -> PyResult {
     if let Some(s) = pystr::to_string_strict(name) {
         return lookup(&s);
     }
-    tu::warn(exc::DeprecationWarning(), "Support for non-ascii encoding names will be removed in 3.17", 1)?;
+    pystr::as_utf8(name)?;
     raise!(LookupError, "unknown encoding: {}", pystr::to_string_lossy(name))
 }
 

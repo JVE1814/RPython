@@ -541,7 +541,7 @@ pub fn init_types() -> PyResult<()> {
         let t = &mut *(&raw mut BYTESIOBUF_TYPE);
         t.tp_name = c"_io._BytesIOBuffer".as_ptr();
         t.tp_basicsize = std::mem::size_of::<BytesIOBuffer>() as isize;
-        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC;
+        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC | Py_TPFLAGS_IMMUTABLETYPE | Py_TPFLAGS_DISALLOW_INSTANTIATION;
         t.tp_dealloc = Some(buf_dealloc);
         t.tp_traverse = Some(buf_traverse);
         t.tp_as_buffer = &raw mut BUF_PROCS;

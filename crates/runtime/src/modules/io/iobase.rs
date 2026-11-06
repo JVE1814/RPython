@@ -203,7 +203,7 @@ fn iob_readline(o: &PyObject, args: &[&PyObject]) -> PyResult {
             let d = bytes::bytes_data(&ra);
             if !d.is_empty() {
                 let mut n = 0;
-                let lim = if limit >= 0 { (limit as usize).min(d.len()) } else { d.len() };
+                let lim = if limit >= 0 { (limit as usize - out.len()).min(d.len()) } else { d.len() };
                 while n < lim {
                     let c = d[n];
                     n += 1;
@@ -324,6 +324,10 @@ fn raw_read(o: &PyObject, args: &[&PyObject]) -> PyResult {
     let got = ab::index_as_ssize(&r, Some(crate::types::exceptions::OverflowError()))?;
     if got < 0 || got > n {
         raise!(ValueError, "readinto returned {} outside buffer size {}", got, n);
+    }
+    // shrinking fails with BufferError while readinto() still holds a view
+    if got < n {
+        crate::types::bytearray::resize(&b, got as usize)?;
     }
     let v = BufView::get(&b, false)?;
     Ok(new_bytes(&v.as_slice()[..got as usize]))

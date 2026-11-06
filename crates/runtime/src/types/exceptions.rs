@@ -663,19 +663,22 @@ fn oserror_fill(o: &PyObject, args: &PyObject) -> PyResult<()> {
     if a.len() >= 2 && a.len() <= 5 {
         set_field(&mut e.myerrno, Some(a[0]));
         set_field(&mut e.strerror, Some(a[1]));
-        if a.len() >= 3 {
-            set_field(&mut e.filename, Some(a[2]));
-            if a.len() >= 5 {
-                set_field(&mut e.filename2, Some(a[4]));
-            }
-            // args is reduced to (errno, strerror)
-            let t = tuple::new_tuple(vec![a[0].to_ref(), a[1].to_ref()]);
-            set_field(&mut exc(o).args, Some(&t));
-        }
-        if o.is_type(BlockingIOError()) || is_subtype(o.type_ptr(), BlockingIOError()) {
-            if a.len() >= 3 && !a[2].is(none::none()) {
-                e.written = ab::index_as_ssize(a[2], None)?;
-                set_field(&mut e.filename, None);
+        if a.len() >= 3 && !a[2].is(none::none()) {
+            let third = a[2];
+            let n = third.ty().tp_as_number;
+            let numeric = !n.is_null()
+                && unsafe { (*n).nb_index.is_some() || (*n).nb_int.is_some() || (*n).nb_float.is_some() };
+            if o.is_type(BlockingIOError()) && numeric {
+                // BlockingIOError(errno, strerror, characters_written): args kept whole
+                e.written = ab::index_as_ssize(third, Some(ValueError()))?;
+            } else {
+                set_field(&mut e.filename, Some(third));
+                if a.len() >= 5 && !a[4].is(none::none()) {
+                    set_field(&mut e.filename2, Some(a[4]));
+                }
+                // args is reduced to (errno, strerror)
+                let t = tuple::new_tuple(vec![a[0].to_ref(), a[1].to_ref()]);
+                set_field(&mut exc(o).args, Some(&t));
             }
         }
     }
