@@ -1416,7 +1416,7 @@ impl<'a> B<'a> {
             Op::LoadMethod => self.load_method(i),
             Op::StoreAttr => self.store_attr(i),
             Op::Call => {
-                if !self.try_builtin(i) && !self.try_inline(i)? {
+                if !self.try_builtin(i) && !self.try_inline(i)? && !self.try_inline_new(i)? {
                     self.template(i);
                 }
             }
@@ -2855,6 +2855,98 @@ impl<'a> B<'a> {
         Ok(true)
     }
 
+    /// Call instruction i of a constant class whose instances are made by
+    /// object.__new__ and a Python `__init__`: allocate the instance, then inline
+    /// `__init__` as a method call on it (the class's version tag guards both).
+    /// False: nothing was emitted.
+    fn try_inline_new(&mut self, i: usize) -> Result<bool, String> {
+        if !inline_enabled() || self.inl_outer.len() + self.inl.is_some() as usize >= 3 {
+            return Ok(false);
+        }
+        let n = self.u.an.instrs[i].arg as usize;
+        let d = self.st.stack.len();
+        let AV::Const(tpo) = self.st.stack[d - n - 2] else { return Ok(false) };
+        if !matches!(self.st.stack[d - n - 1], AV::Null) {
+            return Ok(false);
+        }
+        let tp = tpo as *mut PyTypeObject;
+        let (init, tag) = unsafe {
+            let o = &*(tpo as *mut PyObject);
+            if !o.is_type(&raw mut crate::types::typeobject::PyType_Type) {
+                return Ok(false); // not a class, or a metaclass that may override __call__
+            }
+            if (*tp).tp_new != Some(crate::types::object_type::object_new)
+                || (*tp).tp_init != Some(crate::types::slots::slot_tp_init)
+                || (*tp).tp_flags & Py_TPFLAGS_IS_ABSTRACT != 0
+                || (*tp).tp_version_tag == 0
+            {
+                return Ok(false);
+            }
+            let Some(init) = crate::types::typeobject::lookup(tp, crate::name!("__init__")) else { return Ok(false) };
+            if !crate::types::funcobject::is_function(&init) {
+                return Ok(false);
+            }
+            (init.as_ptr() as usize, (*tp).tp_version_tag)
+        };
+        // rollback point (try_inline rolls back only its own part)
+        let save_st = self.st.clone();
+        let save_cur = self.cur;
+        let save_insts = self.f.blocks[self.cur as usize].insts.len();
+        let save_term = self.f.blocks[self.cur as usize].term.clone();
+        let save_tsuccs = self.f.blocks[self.cur as usize].tsuccs.len();
+        let (save_nblocks, save_nsnaps, save_ncls) = (self.f.blocks.len(), self.f.snaps.len(), self.f.classes.len());
+        let save_closed = self.closed;
+        // the class must still be the one compiled against (attributes, __init__)
+        let snap = self.snap(i, SnapKind::Deopt);
+        let tv = self.imm(tpo as i64);
+        self.emit(Inst::Guard(Cond::CmpMem32(Base::V(tv), TP_TAG, tag as i64, Cc::NE), snap));
+        let obj = self.v(Class::G);
+        self.emit(Inst::Call { addr: h2_alloc_instance as usize, args: vec![Opnd::V(tv)], fargs: vec![], ret: Some(obj), fret: None });
+        self.emit(Inst::Guard(Cond::Test(obj, Opnd::V(obj), Cc::E), snap));
+        // one reference for the result, one moved into __init__'s `self`. The result
+        // reference sits on the stack below the call (in the slot of the class), so
+        // error exits of the inlined __init__ release it with the rest of the stack.
+        self.emit(Inst::Incref(obj));
+        self.st.stack.insert(d - n - 2, AV::Obj(obj, Own::Owned, Ty::Exact(tpo)));
+        self.st.stack[d - n - 1] = AV::Const(init);
+        self.st.stack[d - n] = AV::Obj(obj, Own::Owned, Ty::Exact(tpo));
+        let ok = self.try_inline(i)?;
+        if !ok {
+            self.st = save_st;
+            self.f.blocks.truncate(save_nblocks);
+            self.cur = save_cur;
+            let b = &mut self.f.blocks[save_cur as usize];
+            b.insts.truncate(save_insts);
+            b.term = save_term;
+            b.tsuccs.truncate(save_tsuccs);
+            self.f.snaps.truncate(save_nsnaps);
+            self.f.classes.truncate(save_ncls);
+            self.closed = save_closed;
+            return Ok(false);
+        }
+        // __init__'s result must be None
+        let k = self.st.stack.len() - 1;
+        match self.pop() {
+            AV::Const(p) if p == none_p() => {}
+            a => {
+                let es = if self.inl.is_some() { self.snap(i, SnapKind::Error) } else {
+                    let stack = self.st.stack.iter().map(|x| self.mat_of(x)).collect();
+                    let locals = self.dirty_locals();
+                    let ins = self.u.an.instrs[i];
+                    self.f.snaps.push(Snapshot { resume: ins.start, lasti: ins.pc, stack, locals, kind: SnapKind::Error, inl: None });
+                    self.f.snaps.len() as SnapId - 1
+                };
+                let _ = k;
+                let r = self.obj_owned(a);
+                let st = self.v(Class::G);
+                self.emit(Inst::Call { addr: h2_init_done as usize, args: vec![Opnd::V(r)], fargs: vec![], ret: Some(st), fret: None });
+                self.emit(Inst::Guard(Cond::Test(st, Opnd::V(st), Cc::NE), es));
+            }
+        }
+        // the instance is on top of the stack
+        Ok(true)
+    }
+
     fn binary_subscr(&mut self, i: usize) {
         let (pa, pb) = self.prof(i);
         let is_list = pa == prof::LIST;
@@ -3044,6 +3136,33 @@ pub unsafe extern "C" fn h2_len(o: *mut PyObject) -> i64 {
 
 /// Generic attribute load through the inline cache (slow path of tier-2 LoadAttr):
 /// new reference, or NULL with an exception set.
+/// New instance of the class `tp` for an inlined constructor call (tp_alloc), or
+/// NULL with no exception set (the code deoptimises and the interpreter retries).
+pub unsafe extern "C" fn h2_alloc_instance(tp: *mut PyTypeObject) -> *mut PyObject {
+    unsafe {
+        let alloc = (*tp).tp_alloc.unwrap_or(crate::types::typeobject::generic_alloc);
+        let o = alloc(tp, 0);
+        if o.is_null() {
+            crate::errors::clear_exc();
+        }
+        o
+    }
+}
+
+/// Result `r` (owned) of an inlined `__init__`: 0 if it is None, else TypeError (as
+/// type.__call__ reports it) and 1.
+pub unsafe extern "C" fn h2_init_done(r: *mut PyObject) -> u64 {
+    unsafe {
+        if r == none_p() as *mut PyObject {
+            crate::object::decref(r);
+            return 0;
+        }
+        let _ = crate::err!(TypeError, "__init__() should return None, not '{}'", crate::types::typeobject::type_name((*r).ty()));
+        crate::object::decref(r);
+        1
+    }
+}
+
 /// Truth value of `o` for compiled ToBool / UnaryNot: 1, 0, or -1 with an exception set.
 pub unsafe extern "C" fn h2_truth(o: *mut PyObject) -> i64 {
     unsafe {

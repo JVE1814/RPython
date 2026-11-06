@@ -218,6 +218,53 @@ try:
 except ZeroDivisionError as e:
     print("ZeroDivisionError", [f.name for f in traceback.extract_tb(e.__traceback__)])
 
+# inlined constructors: object.__new__ + inlined __init__
+class P:
+    alive = 0
+    def __init__(self, x, y):
+        if x < 0:
+            raise ValueError("negative %d" % x)
+        self.x = x
+        self.y = y
+        P.alive += 1
+
+    def __del__(self):
+        P.alive -= 1
+
+    def plus(self, o):
+        return P(self.x + o.x, self.y + o.y)
+
+def build(n):
+    acc = P(0, 0)
+    for i in range(n):
+        acc = acc.plus(P(i, 1))
+    return acc.x, acc.y
+
+for k in range(60):
+    r = build(30)
+print(r, P.alive)
+def bad(n):
+    out = []
+    for i in range(n):
+        try:
+            out.append(P(i - 3, 0).x)
+        except ValueError as e:
+            out.append(str(e))
+    return out
+for k in range(60):
+    r = bad(6)
+print(r, P.alive)
+P.__init__ = lambda self, x, y: 5
+try:
+    build(3)
+except TypeError as e:
+    print("TypeError", e)
+def init2(self, x, y):
+    self.x = x * 10
+    self.y = y
+P.__init__ = init2
+print(build(5), P.alive)
+
 for k in range(60):
     r = use_half(list(range(20)))
 print(r, use_half([1.5, 2, 3.25, 4, 5]))
