@@ -24,6 +24,7 @@ fn const_repr(c: &Constant) -> String {
         Constant::FrozenSet(v) => format!("frozenset({{{}}})", v.iter().map(const_repr).collect::<Vec<_>>().join(", ")),
         Constant::Slice(s) => format!("slice({}, {}, {})", const_repr(&s[0]), const_repr(&s[1]), const_repr(&s[2])),
         Constant::Code(c) => format!("<code object {}, line {}>", c.name, c.firstlineno),
+        Constant::Opaque(i) => format!("<const #{}>", i),
     }
 }
 

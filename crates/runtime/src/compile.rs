@@ -171,7 +171,7 @@ fn parse_error(e: &rpy_parser::SyntaxError, filename: &str) -> PyErr {
     raise_syntax_error(class, &e.msg, filename, e.lineno, e.offset, e.text.as_deref(), e.end_lineno, e.end_offset)
 }
 
-fn compile_error(e: &rpy_compiler::CompileError, filename: &str, src: Option<&str>) -> PyErr {
+pub(crate) fn compile_error(e: &rpy_compiler::CompileError, filename: &str, src: Option<&str>) -> PyErr {
     use rpy_compiler::ErrorKind as K;
     let class = match e.kind {
         K::SyntaxError => crate::types::exceptions::SyntaxError(),
