@@ -91,6 +91,20 @@ fn run_code_in_main(src: &[u8], filename: &str) -> Outcome {
     }
 }
 
+/// The magic number importlib writes into .pyc headers.
+fn pyc_magic() -> [u8; 4] {
+    let token = crate::import::import_absolute("_imp")
+        .and_then(|m| ab::getattr_str(&m, "pyc_magic_number_token"))
+        .and_then(|t| ab::as_i64(&t));
+    match token {
+        Ok(t) => (t as u32).to_le_bytes(),
+        Err(_) => {
+            clear_exc();
+            crate::modules::_imp::MAGIC.to_le_bytes()
+        }
+    }
+}
+
 /// Run a compiled script (the marshalled code after a .pyc header): the code
 /// keeps the file name it was compiled with.
 fn run_pyc_in_main(data: &[u8], path: &str) -> Outcome {
@@ -204,7 +218,7 @@ fn run_script(path: &str, opts: &MainOptions) -> Outcome {
     // the script path is made absolute (like CPython 3.9+): __file__ and code filenames
     let abs = abspath(path);
     let path = abs.as_str();
-    if src.len() >= 16 && src[..4] == crate::modules::_imp::MAGIC.to_le_bytes() {
+    if src.len() >= 16 && src[..4] == pyc_magic() {
         return run_pyc_in_main(&src[16..], path);
     }
     let r = (|| -> PyResult<()> {
