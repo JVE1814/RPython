@@ -271,7 +271,16 @@ pub fn trace_call(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
 }
 
 fn is_line_start(code: &PyObject, i: usize, line: i32) -> bool {
-    i == 0 || crate::types::code::line_for_instr(code, i - 1).map(|l| l as i32) != Some(line)
+    if i == 0 {
+        return true;
+    }
+    // the start RESUME does not count as executing its line: code after it on the same
+    // line (a class body's first line) still reports that line
+    let prev = crate::types::code::code_data(code).code.get(i - 1).copied().unwrap_or(0);
+    if (prev & 0xff) as u8 == rpy_compiler::bytecode::Op::Resume as u8 && (prev >> 8) == 0 {
+        return true;
+    }
+    crate::types::code::frame_line(code, i - 1).map(|l| l as i32) != Some(line)
 }
 
 pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
@@ -287,10 +296,7 @@ pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
     let lasti = f.lasti;
     let prev = std::mem::replace(&mut f.trace_last, lasti);
     // instructions without a line number (artificial cleanup code) never start a line
-    let line = match crate::types::code::code_data(f.code()).locations.get(lasti as usize) {
-        Some(l) if l.lineno != 0 => l.lineno as i32,
-        _ => -1,
-    };
+    let line = crate::types::code::frame_line(f.code(), lasti as usize).map_or(-1, |l| l as i32);
     // A line event fires on the first instruction of a line (entered by falling
     // through or by a jump, including a backward jump to the same line); never on
     // RESUME (the `def` line) and not when resuming in the middle of a line.
