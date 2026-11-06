@@ -1201,7 +1201,8 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                         Op::DictMerge => {
                             let o = popref!(f);
                             let d = peek!(f, arg as usize);
-                            let func = peek!(f, arg as usize + 2);
+                            // stack: callable, self-or-NULL, positional args, ..., the dict
+                            let func = peek!(f, arg as usize + 3);
                             crate::types::dict_methods::dict_merge_kwargs(unsafe { &*d }, &o, func)?;
                         }
                         Op::UnpackSequence => {
@@ -1468,8 +1469,8 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                                             clear_exc();
                                             raise!(
                                                 TypeError,
-                                                "{} argument after * must be an iterable, not {}",
-                                                func_desc(&callable),
+                                                "Value after * must be an iterable, not {}",
+
                                                 tname(&args)
                                             );
                                         }

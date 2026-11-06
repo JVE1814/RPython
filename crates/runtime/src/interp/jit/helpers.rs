@@ -614,7 +614,7 @@ pub unsafe extern "C" fn h_container_op(sp: *mut *mut PyObject, which: u64, arg:
                 _ => {
                     let o = take(sp.sub(1));
                     let d = *sp.sub(1 + arg);
-                    let func = *sp.sub(1 + arg + 2);
+                    let func = *sp.sub(1 + arg + 3); // callable, self-or-NULL, args, dict
                     st(crate::types::dict_methods::dict_merge_kwargs(&*d, &o, func))?;
                 }
             }
@@ -823,8 +823,8 @@ pub unsafe extern "C" fn h_call_ex(sp: *mut *mut PyObject) -> u64 {
                             clear_exc();
                             let _ = err!(
                                 TypeError,
-                                "{} argument after * must be an iterable, not {}",
-                                eval::func_desc(&callable),
+                                "Value after * must be an iterable, not {}",
+
                                 tname(&args)
                             );
                         }

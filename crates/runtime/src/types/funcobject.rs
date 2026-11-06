@@ -530,7 +530,9 @@ unsafe extern "C" fn method_vectorcall(
         let mut v: Vec<*mut PyObject> = Vec::with_capacity(total + 2);
         v.push(std::ptr::null_mut());
         v.push(s.as_ptr());
-        v.extend_from_slice(std::slice::from_raw_parts(args, total));
+        if total > 0 {
+            v.extend_from_slice(std::slice::from_raw_parts(args, total));
+        }
         ab::vectorcall_raw(f, v.as_ptr().add(1), (nargs + 1) | PY_VECTORCALL_ARGUMENTS_OFFSET, kwnames)
     }
 }
