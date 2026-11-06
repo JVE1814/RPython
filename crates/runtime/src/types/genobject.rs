@@ -115,8 +115,10 @@ fn kind_name(o: &PyObject) -> &'static str {
 
 /// Resume a generator. `exc`: throw this exception at the suspension point.
 pub fn gen_send_ex(o: &PyObject, arg: Option<&PyObject>, throw: Option<PyRef>, closing: bool) -> PyResult<SendResult> {
+    // no GIL: claiming the generator must be atomic (two threads may resume it at once)
     let gn = g(o);
-    if gn.running {
+    let flag = unsafe { &*(&raw mut gn.running as *const std::sync::atomic::AtomicBool) };
+    if flag.compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire).is_err() {
         let msg = if is_coroutine_exact(o) {
             "coroutine already executing"
         } else if is_asyncgen(o) {
@@ -126,6 +128,13 @@ pub fn gen_send_ex(o: &PyObject, arg: Option<&PyObject>, throw: Option<PyRef>, c
         };
         raise!(ValueError, "{}", msg);
     }
+    let r = gen_send_claimed(o, arg, throw, closing);
+    flag.store(false, std::sync::atomic::Ordering::Release);
+    r
+}
+
+fn gen_send_claimed(o: &PyObject, arg: Option<&PyObject>, throw: Option<PyRef>, closing: bool) -> PyResult<SendResult> {
+    let gn = g(o);
     if gn.frame.is_null() || unsafe { (*gn.frame).state == FrameState::Completed || (*gn.frame).state == FrameState::Cleared } {
         if is_coroutine_exact(o) && !closing {
             raise!(RuntimeError, "cannot reuse already awaited coroutine");
@@ -160,13 +169,11 @@ pub fn gen_send_ex(o: &PyObject, arg: Option<&PyObject>, throw: Option<PyRef>, c
         gn.exc_state.previous_item = (*ts_mut).c.exc_info;
         (*ts_mut).c.exc_info = &mut gn.exc_state;
     }
-    gn.running = true;
     let r = crate::interp::enter_recursive_call(ts, "").and_then(|_| {
         let r = eval_frame(ts, frame, throw);
         crate::interp::leave_recursive_call(ts);
         r
     });
-    gn.running = false;
     unsafe {
         let ts_mut = ts as *const _ as *mut crate::threads::ThreadState;
         (*ts_mut).c.exc_info = gn.exc_state.previous_item;
