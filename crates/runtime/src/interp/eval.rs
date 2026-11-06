@@ -703,7 +703,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
     // classifications too costly to repeat
     macro_rules! adapt {
         ($e:expr) => {
-            if super::adaptive::active(cd) && !super::adaptive::is_generic(cd, f.lasti as usize) {
+            if super::adaptive::active(cd) {
                 super::adaptive::note(cd, f.lasti as usize, $e);
             }
         };

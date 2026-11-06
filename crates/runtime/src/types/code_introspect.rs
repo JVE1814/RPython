@@ -10,6 +10,26 @@ use crate::types::{bool_, code, dict, funcobject, int, str as pystr};
 use rpy_compiler::bytecode::fast;
 use rpy_compiler::wordcode::{self as wc, opcodes as o};
 
+unsafe extern "C" fn vectorcall_nop(_c: *mut PyObject, _a: *const *mut PyObject, _n: usize, _k: *mut PyObject) -> *mut PyObject {
+    crate::types::none::none_ref().into_raw()
+}
+
+/// `set_vectorcall_nop(func)`: calls of `func` through vectorcall return None without
+/// running it (test_opcache: such functions must not be specialised as Python calls).
+pub fn set_vectorcall_nop(_m: &PyObject, f: &PyObject) -> PyResult {
+    if !funcobject::is_function(f) {
+        raise!(TypeError, "expected a function");
+    }
+    funcobject::func(f).vectorcall = Some(vectorcall_nop);
+    Ok(crate::types::none::none_ref())
+}
+
+/// `get_next_dict_keys_version()`: our caches use 64-bit dict version stamps, so the
+/// version space never runs out (CPython's u16 keys versions can).
+pub fn get_next_dict_keys_version(_m: &PyObject) -> PyResult {
+    Ok(int::new_int(1))
+}
+
 fn code_of(x: &PyObject) -> PyResult<(PyRef, Option<PyRef>)> {
     if code::is_code(x) {
         return Ok((x.to_ref(), None));

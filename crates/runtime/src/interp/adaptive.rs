@@ -3,9 +3,9 @@
 //! CPython rewrites generic instructions into specialised ones as it observes operand
 //! types. Our interpreter specialises differently (side-table inline caches, JIT tiers),
 //! so the specialised *names* are only a view: tier 0 records, per internal instruction,
-//! the specialised CPython opcode its operands would have selected (one byte). The first
-//! observation sticks; a later observation that would select something else marks the
-//! instruction generic for good (CPython's deoptimisation after a failed guard).
+//! the specialised CPython opcode its operands would have selected (one byte; the last
+//! observation wins, so operands no specialisation covers show the generic name again,
+//! like CPython after a failed guard).
 //! `adaptive_code` writes the recorded opcodes into a copy of co_code.
 
 use crate::ffi::*;
@@ -26,7 +26,7 @@ pub fn note(cd: &CodeData, pc: usize, k: u16) {
         let old = s.load(Relaxed);
         let k = k as u8;
         if old != k {
-            s.store(if old == 0 { k } else { GENERIC }, Relaxed);
+            s.store(k, Relaxed);
         }
     }
 }

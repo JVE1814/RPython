@@ -189,6 +189,8 @@ pub fn init() -> PyResult {
             ("get_code_var_counts", FASTKW, crate::types::code_introspect::get_code_var_counts),
             ("verify_stateless_code", FASTKW, crate::types::code_introspect::verify_stateless_code),
             ("code_returns_only_none", O, crate::types::code_introspect::code_returns_only_none),
+            ("set_vectorcall_nop", O, crate::types::code_introspect::set_vectorcall_nop),
+            ("get_next_dict_keys_version", NOARGS, crate::types::code_introspect::get_next_dict_keys_version),
         ],
         Some(&m),
     )?;
