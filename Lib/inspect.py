@@ -2034,7 +2034,11 @@ def _signature_from_callable(obj, *,
                 return _signature_fromstr(sigcls, base, text)
 
         if type not in obj.__mro__:
-            if obj.__init__ is object.__init__ and obj.__new__ is object.__new__:
+            obj_init, obj_new = obj.__init__, obj.__new__
+            if follow_wrapper_chains:
+                # e.g. a __new__ wrapped by @warnings.deprecated
+                obj_init, obj_new = unwrap(obj_init), unwrap(obj_new)
+            if obj_init is object.__init__ and obj_new is object.__new__:
                 return sigcls.from_callable(object)
             raise ValueError('no signature found for builtin type {!r}'.format(obj))
 

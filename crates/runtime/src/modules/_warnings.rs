@@ -186,8 +186,44 @@ fn check_matched(obj: &PyObject, arg: &PyObject) -> PyResult<bool> {
     ab::is_true(&r)
 }
 
+/// Dotted module names a file path can stand for: "/a/b/pkg/mod.py" gives
+/// "mod", "pkg.mod", "b.pkg.mod" and "a.b.pkg.mod" ("pkg/__init__.py" counts
+/// as "pkg"); an extension other than ".py" is kept as part of the name.
+pub fn module_names_of_path(filename: &str) -> Vec<String> {
+    let mut name = filename;
+    if let Some(stem) = name.strip_suffix(".py") {
+        name = stem.strip_suffix("/__init__").unwrap_or(stem);
+    }
+    let parts: Vec<&str> = name.split('/').collect();
+    let mut out = Vec::new();
+    for i in (0..parts.len()).rev() {
+        if parts[i].is_empty() {
+            break;
+        }
+        out.push(parts[i..].join("."));
+    }
+    out
+}
+
+/// A filter's module pattern matches the module name, or (for a warning
+/// located in a file) one of the dotted names the file path stands for.
+fn module_matches(pattern: &PyObject, module: &PyObject, filename: &PyObject) -> PyResult<bool> {
+    if check_matched(pattern, module)? {
+        return Ok(true);
+    }
+    if pattern.is(none::none()) || !pystr::is_str(filename) {
+        return Ok(false);
+    }
+    for cand in module_names_of_path(&pystr::to_string_lossy(filename)) {
+        if check_matched(pattern, &pystr::new_str(&cand))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Returns (action, matching filter item or None).
-fn get_filter(category: &PyObject, text: &PyObject, lineno: i64, module: &PyObject) -> PyResult<(PyRef, PyRef)> {
+fn get_filter(category: &PyObject, text: &PyObject, lineno: i64, module: &PyObject, filename: &PyObject) -> PyResult<(PyRef, PyRef)> {
     let filters = get_filters()?;
     let mut i = 0;
     while i < list::list_len(&filters) {
@@ -213,7 +249,7 @@ fn get_filter(category: &PyObject, text: &PyObject, lineno: i64, module: &PyObje
         if !ab::issubclass(category, &cat)? {
             continue;
         }
-        if !check_matched(&modu, module)? {
+        if !module_matches(&modu, module, filename)? {
             continue;
         }
         let ln_v = ab::as_i64(&ln)?;
@@ -320,6 +356,7 @@ fn call_show_warning(
     lineno: i64,
     source_line: Option<&PyObject>,
     source: Option<&PyObject>,
+    module: &PyObject,
 ) -> PyResult<()> {
     let show_fn = warnings_attr("_showwarnmsg", true)?;
     let show_fn = match show_fn {
@@ -336,7 +373,8 @@ fn call_show_warning(
     let nn = none::none_ref();
     let line = source_line.map(|l| l.to_ref()).unwrap_or_else(none::none_ref);
     let src = source.map(|s| s.to_ref()).unwrap_or_else(none::none_ref);
-    let msg = ab::call(&cls, &[message, category, filename, &int::new_int(lineno), &nn, &line, &src])?;
+    let kwn = tuple::new_tuple(vec![pystr::new_str("module")]);
+    let msg = ab::call_kw(&cls, &[message, category, filename, &int::new_int(lineno), &nn, &line, &src, module], Some(&kwn))?;
     ab::call(&show_fn, &[&msg])?;
     Ok(())
 }
@@ -349,7 +387,13 @@ fn get_source_line(module_globals: &PyObject, lineno: i64) -> PyResult<Option<Py
     if loader.is(none::none()) {
         return Ok(None);
     }
-    let name = match dict::get_item_rs(module_globals, "__name__") {
+    // the spec's name is the one the loader knows (__name__ is "__main__"
+    // for a module run with -m)
+    let spec_name = match dict::get_item_rs(module_globals, "__spec__") {
+        Some(s) if !s.is(none::none()) => ab::getattr_opt(&s, &pystr::new_str("name"))?.filter(|n| pystr::is_str(n)),
+        _ => None,
+    };
+    let name = match spec_name.or_else(|| dict::get_item_rs(module_globals, "__name__")) {
         Some(n) => n,
         None => return Ok(None),
     };
@@ -357,7 +401,18 @@ fn get_source_line(module_globals: &PyObject, lineno: i64) -> PyResult<Option<Py
         Some(g) => g,
         None => return Ok(None),
     };
-    let src = ab::call(&get_source, &[&name])?;
+    let src = match ab::call(&get_source, &[&name]) {
+        Ok(s) => s,
+        Err(e) => {
+            // a loader that cannot provide this module's source (e.g. the
+            // built-in importer for "-c" code) just means no source line
+            if exc_matches(crate::types::exceptions::ImportError()) {
+                clear_exc();
+                return Ok(None);
+            }
+            return Err(e);
+        }
+    };
     if src.is(none::none()) {
         return Ok(None);
     }
@@ -415,7 +470,7 @@ fn warn_explicit_impl(
         if already_warned(registry, &key, false)? {
             return Ok(());
         }
-        let (action, item) = get_filter(&category, &text, lineno, &module)?;
+        let (action, item) = get_filter(&category, &text, lineno, &module, filename)?;
         let a = pystr::to_string_lossy(&action);
         match a.as_str() {
             "error" => {
@@ -457,7 +512,7 @@ fn warn_explicit_impl(
         Some(g) if dict::is_dict(g) => get_source_line(g, lineno)?,
         _ => None,
     };
-    call_show_warning(&category, &text, &message, filename, lineno, source_line.as_deref(), source)
+    call_show_warning(&category, &text, &message, filename, lineno, source_line.as_deref(), source, &module)
 }
 
 fn is_internal_filename(f: &str) -> bool {
