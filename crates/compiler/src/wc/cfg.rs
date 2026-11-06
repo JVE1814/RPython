@@ -806,7 +806,60 @@ fn nb_operator(nb: i32) -> Option<ast::Operator> {
     })
 }
 
+/// Indices selected by `slice(start, stop, step)` on a sequence of length `len`.
+fn slice_indices(s: &[Constant; 3], len: usize) -> Option<Vec<usize>> {
+    let int = |c: &Constant| -> Option<Option<i64>> {
+        match c {
+            Constant::None => Some(None),
+            Constant::Int(i) => Some(Some(*i)),
+            Constant::Bool(b) => Some(Some(*b as i64)),
+            _ => None,
+        }
+    };
+    let step = int(&s[2])?.unwrap_or(1);
+    if step == 0 {
+        return None;
+    }
+    let len = len as i64;
+    let clamp = |v: Option<i64>, default: i64, lo: i64, hi: i64| -> i64 {
+        match v {
+            None => default,
+            Some(x) => {
+                let x = if x < 0 { x + len } else { x };
+                x.clamp(lo, hi)
+            }
+        }
+    };
+    let mut out = Vec::new();
+    if step > 0 {
+        let start = clamp(int(&s[0])?, 0, 0, len);
+        let stop = clamp(int(&s[1])?, len, 0, len);
+        let mut i = start;
+        while i < stop {
+            out.push(i as usize);
+            i += step;
+        }
+    } else {
+        let start = clamp(int(&s[0])?, len - 1, -1, len - 1);
+        let stop = clamp(int(&s[1])?, -1, -1, len - 1);
+        let mut i = start;
+        while i > stop {
+            out.push(i as usize);
+            i += step;
+        }
+    }
+    Some(out)
+}
+
 fn fold_subscr(container: &Constant, index: &Constant) -> Option<Constant> {
+    if let Constant::Slice(s) = index {
+        return match container {
+            Constant::Tuple(v) => Some(Constant::Tuple(slice_indices(s, v.len())?.into_iter().map(|i| v[i].clone()).collect())),
+            Constant::Str(t) => Some(Constant::Str(slice_indices(s, t.len())?.into_iter().map(|i| t[i]).collect())),
+            Constant::Bytes(b) => Some(Constant::Bytes(slice_indices(s, b.len())?.into_iter().map(|i| b[i]).collect())),
+            _ => None,
+        };
+    }
     let i = match index {
         Constant::Int(i) => *i,
         Constant::Bool(b) => *b as i64,
@@ -941,8 +994,8 @@ fn fold_constants(cfg: &mut Cfg, b: Label, consts: &mut Vec<Constant>) -> bool {
                         }
                     }
                 }
-                if !changed && !is_set && matches!(next, Some((O::GET_ITER, _))) && n > 0 {
-                    // iterating over a list display: a tuple is cheaper
+                if !changed && !is_set && matches!(next, Some((O::GET_ITER, _)) | Some((O::CONTAINS_OP, _))) {
+                    // iterating over (or testing membership in) a list display: a tuple will do
                     instrs[k].op = O::BUILD_TUPLE;
                     changed = true;
                 }
@@ -1376,48 +1429,61 @@ fn store_target(i: &Instr) -> Option<i32> {
 /// `SWAP n` followed by the stores that consume the swapped items: reorder the stores
 /// instead (when they are independent and on the same line).
 fn apply_static_swap(instrs: &mut [Instr], k: usize) -> bool {
-    let depth = instrs[k].arg as usize;
-    if depth < 2 {
+    // a run of SWAPs (NOPs in between are fine)
+    let mut swaps = vec![k];
+    let mut j = k;
+    while let Some(nx) = next_real(instrs, j) {
+        if instrs[nx].op != O::SWAP {
+            break;
+        }
+        swaps.push(nx);
+        j = nx;
+    }
+    let depth = swaps.iter().map(|&s| instrs[s].arg as usize).max().unwrap_or(0);
+    if depth < 2 || swaps.iter().any(|&s| instrs[s].arg < 2) {
         return false;
     }
-    // collect the following `depth` real instructions
-    let mut idx = Vec::new();
-    let mut j = k;
-    while idx.len() < depth {
+    // simulate: perm[p] = original slot now at position p (0 = top of stack)
+    let mut perm: Vec<usize> = (0..depth).collect();
+    for &s in &swaps {
+        let d = instrs[s].arg as usize;
+        perm.swap(0, d - 1);
+    }
+    // the stores that consume the permuted items
+    let mut stores = Vec::with_capacity(depth);
+    let mut j = *swaps.last().unwrap();
+    while stores.len() < depth {
         match next_real(instrs, j) {
-            Some(nx) => {
-                idx.push(nx);
+            Some(nx) if is_swappable_store(&instrs[nx]) => {
+                stores.push(nx);
                 j = nx;
             }
-            None => return false,
+            _ => return false,
         }
     }
-    if !idx.iter().all(|&x| is_swappable_store(&instrs[x])) {
+    let line = instrs[stores[0]].loc.line;
+    if stores.iter().any(|&x| instrs[x].loc.line != line) {
         return false;
     }
-    let line = instrs[idx[0]].loc.line;
-    if idx.iter().any(|&x| instrs[x].loc.line != line) {
+    // stores to the same local would change order: give up
+    let targets: Vec<i32> = stores.iter().filter_map(|&x| store_target(&instrs[x])).collect();
+    let mut sorted = targets.clone();
+    sorted.sort();
+    sorted.dedup();
+    if sorted.len() != targets.len() {
         return false;
     }
-    // stores to the same local in between must keep their order
-    let first = idx[0];
-    let last = idx[depth - 1];
-    let (ta, tb) = (store_target(&instrs[first]), store_target(&instrs[last]));
-    for &m in &idx[1..depth - 1] {
-        let t = store_target(&instrs[m]);
-        if t.is_some() && (t == ta || t == tb) {
-            return false;
-        }
+    // without the swaps, the i-th store pops original slot i; it must do what the store
+    // that consumed slot i did with the swaps
+    let old: Vec<Instr> = stores.iter().map(|&x| instrs[x]).collect();
+    for (i, &pos_i) in stores.iter().enumerate() {
+        let p = perm.iter().position(|&o| o == i).unwrap();
+        let loc = instrs[pos_i].loc;
+        instrs[pos_i] = Instr { loc, ..old[p] };
     }
-    if ta.is_some() && ta == tb {
-        return false;
+    for &s in &swaps {
+        nop_out(&mut instrs[s]);
     }
-    instrs.swap(first, last);
-    // locations stay with their positions
-    let (l1, l2) = (instrs[first].loc, instrs[last].loc);
-    instrs[first].loc = l2;
-    instrs[last].loc = l1;
-    nop_out(&mut instrs[k]);
     true
 }
 
