@@ -1,5 +1,8 @@
 # PROGRESS
 
+## Status 2026-11-06
+All agents stopped 2026-11-02 when the account's weekly API limit was hit; resumed after the reset (Nov 5).
+
 ## RESUMED (2026-11-01, 22:15 UTC) after a pause at user request
 Wave 10 running: jit3 (merge+enable tier 2, perf), numpy2 (numpy/other wheels own test suites vs baseline),
 core3 (finalization, frozen modules, settrace, core failures), perf2 (startup, memory, scaling, shapes),
@@ -46,7 +49,7 @@ Blockers being fixed (numpy workstream): Cython code objects (numpy.random), C-c
 
 ## Regression suite
 Reference after the D21 rebuild (zstd + Tk; still no _decimal), ft: 414 PASS, 20 FAIL; tests run 51,220, failures 24,
-skipped 3,276 (/opt/baseline/results/ft2). Default-build re-run: /opt/baseline/results/default2.
+skipped 3,276 (/opt/baseline/results/ft2). Default build (rebuilt): 414 PASS, 20 FAIL; run 51,147, failures 24, skipped 3,257.
 Original Reference (CPython 3.15.2 free-threaded, this machine, tools/run_tests.sh):
 434 modules: 416 PASS, 18 FAIL; tests run 50,649, failures 24, skipped 3,371.
 (tools/baseline_ft_results.tsv). Default-build reference: 416 PASS, 18 FAIL; run 50,576, failures 24, skipped 3,353.
