@@ -883,8 +883,7 @@ pub unsafe extern "C" fn h_call_ex(sp: *mut *mut PyObject) -> u64 {
                             clear_exc();
                             let _ = err!(
                                 TypeError,
-                                "{} argument after * must be an iterable, not {}",
-                                eval::func_desc(&callable),
+                                "Value after * must be an iterable, not {}",
                                 tname(&args)
                             );
                         }

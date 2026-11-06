@@ -136,7 +136,7 @@ pub fn dict_merge_kwargs(d: &PyObject, o: &PyObject, func: *mut PyObject) -> PyR
     let pairs: Vec<(PyRef, PyRef)> = {
         let keys = match ab::getattr_opt(o, crate::name!("keys"))? {
             Some(k) => ab::call(&k, &[])?,
-            None => raise!(TypeError, "{} argument after ** must be a mapping, not {}", fname(), tname(o)),
+            None => raise!(TypeError, "Value after ** must be a mapping, not {}", tname(o)),
         };
         let mut v = Vec::new();
         for k in ab::collect_iterable(&keys)? {

@@ -1456,8 +1456,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                                             clear_exc();
                                             raise!(
                                                 TypeError,
-                                                "{} argument after * must be an iterable, not {}",
-                                                func_desc(&callable),
+                                                "Value after * must be an iterable, not {}",
                                                 tname(&args)
                                             );
                                         }
