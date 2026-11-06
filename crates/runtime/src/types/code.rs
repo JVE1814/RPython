@@ -390,8 +390,8 @@ pub fn new_code_from_unit(cu: &CodeUnit, filename: Option<&PyRef>) -> PyResult {
 
 /// Constant tuples made only of simple immutable constants are shared between all code
 /// objects (like CPython's interned constants): key = a type-tagged rendering.
-static CONST_TUPLES: std::sync::Mutex<std::collections::HashMap<String, PyRef>> =
-    std::sync::Mutex::new(std::collections::HashMap::new());
+static CONST_TUPLES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, PyRef>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 fn const_key(c: &rpy_compiler::wordcode::Constant) -> Option<String> {
     use rpy_compiler::wordcode::Constant as C;
