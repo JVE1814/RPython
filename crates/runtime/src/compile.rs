@@ -388,6 +388,16 @@ pub fn compile_mod(module: &rpy_parser::ast::Mod, o: &Opts, src: Option<&str>) -
     let (legacy, wcode, warnings, future_flags) = if crate::types::code::public_mode() {
         match rpy_compiler::compile_wordcode(module, &copts) {
             Ok(o) => (None, Some(o.code), o.warnings, o.future_flags),
+            // transition: an internal error of the new pipeline falls back to the legacy one
+            Err(e) if matches!(e.kind, rpy_compiler::error::ErrorKind::SystemError) => {
+                if std::env::var_os("RPYTHON_TRANSLATE_CHECK").is_some() {
+                    eprintln!("WORDCODE-COMPILE-ERROR {}: {}", filename, e.msg);
+                }
+                match rpy_compiler::compile(module, &copts) {
+                    Ok(o) => (Some(o.code), None, o.warnings, o.future_flags),
+                    Err(e) => return Err(compile_error(&e, filename, src)),
+                }
+            }
             Err(e) => return Err(compile_error(&e, filename, src)),
         }
     } else {

@@ -644,7 +644,7 @@ pub fn new_code_from_public(p: PublicParts) -> PyResult {
         co_qualname: p.qualname,
         filename: p.filename,
     };
-    unsafe {
+    let r: PyResult = unsafe {
         Ok(alloc_code(
             p.argcount,
             p.posonlyargcount,
@@ -658,7 +658,17 @@ pub fn new_code_from_public(p: PublicParts) -> PyResult {
             p.exceptiontable,
             p.linetable,
         ))
-    }
+    };
+    r.inspect(|r| {
+        // RPYTHON_TRANSLATE_CHECK=1: translate eagerly and report failures (translator tests)
+        static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *CHECK.get_or_init(|| std::env::var_os("RPYTHON_TRANSLATE_CHECK").is_some()) {
+            if let Some(e) = &code_data(r).invalid {
+                let m = code_meta(r);
+                eprintln!("TRANSLATE-ERROR {}:{} {}: {}", pystr::to_string_lossy(&m.filename), get(r).co_firstlineno, pystr::to_string_lossy(&m.co_qualname), e);
+            }
+        }
+    })
 }
 
 fn encode_exception_table(t: &[ExceptionEntry]) -> Vec<u8> {

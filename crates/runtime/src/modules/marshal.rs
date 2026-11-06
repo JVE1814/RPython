@@ -988,9 +988,6 @@ fn no_debug_ranges() -> bool {
 /// Does the serialized code object use the legacy internal layout (32-bit words, 16-byte
 /// location records, 20-byte exception entries)? (D24 transition only.)
 fn looks_legacy(p: &CodeParts) -> bool {
-    if code_mod::public_mode() {
-        return false;
-    }
     if !bytes::is_bytes(p.code) || !bytes::is_bytes(p.linetable) || !bytes::is_bytes(p.exctable) {
         return true; // let the legacy validator report it
     }
