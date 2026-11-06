@@ -99,6 +99,9 @@ fn finalize_modules() {
             }
         }
     }
+    // imports from here on fail quietly ("sys.meta_path is None, Python is likely shutting
+    // down") instead of warning about an empty meta_path on every attempt
+    set_none(&sysd, "meta_path");
     if let Some(c) = dict::get_item_rs(&sysd, "path_importer_cache") {
         if dict::is_dict(&c) {
             dict::clear(&c);

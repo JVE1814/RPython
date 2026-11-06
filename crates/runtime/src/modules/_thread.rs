@@ -1350,3 +1350,27 @@ pub fn init_module() -> PyResult {
     let _ = (&MAIN_HANDLE, AtomicI64::new(0), type_ref(&raw mut LOCK_TYPE));
     Ok(m)
 }
+
+/// In a forked child: drop the thread-local values of every thread except `keep` (those
+/// threads do not exist in the child; their values' finalizers run now).
+pub fn clear_foreign_thread_locals(keep: u64) {
+    let mut drop_list: Vec<usize> = Vec::new();
+    {
+        let g = LIVE_LOCALS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = g.as_ref() {
+            for &lp in m.values() {
+                let l = unsafe { &*(lp as *const LocalObject) };
+                let mut dicts = l.dicts.lock().unwrap_or_else(|e| e.into_inner());
+                let gone: Vec<u64> = dicts.keys().copied().filter(|&k| k != keep).collect();
+                for k in gone {
+                    if let Some(d) = dicts.remove(&k) {
+                        drop_list.push(d);
+                    }
+                }
+            }
+        }
+    }
+    for d in drop_list {
+        unsafe { decref(d as *mut PyObject) };
+    }
+}

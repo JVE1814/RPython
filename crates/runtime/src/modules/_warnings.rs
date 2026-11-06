@@ -728,3 +728,19 @@ pub fn warn_explicit(category: *mut PyTypeObject, msg: &PyObject, filename: &PyO
     let cat = crate::types::typeobject::type_ref(category);
     warn_explicit_impl(Some(&cat), msg, filename, lineno, module, registry, None, None)
 }
+
+/// In a forked child only the forking thread survives: a warnings lock held by any other
+/// thread at fork time is released (its owner no longer exists).
+pub fn after_fork_child() {
+    let me = crate::object::thread_id();
+    let mut g = match LOCK.state.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        // the inner mutex is only held for a few instructions; a fork inside that window
+        // leaves the lock as it is
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    if g.1 != 0 && g.0 != me {
+        *g = (0, 0);
+    }
+}
