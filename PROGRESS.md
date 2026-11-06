@@ -89,6 +89,16 @@ array (24), socket (17), pathlib (16), http (14), multiprocessing, decimal, date
 | unpack_sequence | 0.25 | 0.15 | 0.37 | 2.5 |
 Next: generators/coroutines in tier 2 + deeper inlining (jit4); runtime costs in fannkuch/nqueens (perf2).
 
+Startup and memory (perf2, quiet machine after reboot):
+| metric | ours | py-default | py-ft |
+|---|---|---|---|
+| `-c pass` instructions | **35.0M** | 40.6M | 50.9M |
+| `-c pass` wall, best of 30 | **13.4 ms** | 14.5 ms | 16.9 ms |
+| `-c pass` peak RSS | 9.76 MB | **9.08 MB** | 10.64 MB |
+| 200k small instances peak RSS | **35.2 MB** | 35.9 MB | 42.2 MB |
+Scaling: not yet measured reliably (needs an idle machine and longer per-thread work); py-ft scaled
+1/1.96/2.70/2.40 at 1-4 threads in a short quiet window.
+
 ### Earlier table (jit workstream)
 Callgrind instructions, whole process, millions (machine heavily loaded, so instruction counts
 are the primary metric; jit workstream, before generational GC / dict storage changes except float
