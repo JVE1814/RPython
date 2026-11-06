@@ -50,6 +50,54 @@ macro_rules! helper {
     }};
 }
 
+// ------------------------------------------------------------------ profiling
+
+/// Record operand types (slow paths of tier-1 code): `a` in the low byte of the
+/// profile word, `b` (may be NULL) in the high byte.
+pub unsafe extern "C" fn h_prof(p: *const std::sync::atomic::AtomicU16, a: *mut PyObject, b: *mut PyObject) {
+    unsafe {
+        let mut bits = if a.is_null() { 0 } else { specialize::profile_bits(&*a) as u16 };
+        if !b.is_null() {
+            bits |= (specialize::profile_bits(&*b) as u16) << 8;
+        }
+        let p = &*p;
+        let old = p.load(std::sync::atomic::Ordering::Relaxed);
+        if old | bits != old {
+            p.store(old | bits, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Iterator-kind profile bits for ForIter (`cache::prof::IT_*`).
+pub fn iter_profile_bits(it: &PyObject) -> u8 {
+    use crate::interp::cache::prof;
+    let t = it.type_ptr();
+    if t == &raw mut crate::types::range::PyRangeIter_Type {
+        prof::IT_RANGE
+    } else if t == &raw mut list::PyListIter_Type {
+        prof::IT_LIST
+    } else if t == &raw mut tuple::PyTupleIter_Type {
+        prof::IT_TUPLE
+    } else if t == crate::types::genobject::gen_type() {
+        prof::IT_GEN
+    } else if t == crate::types::enumerate::enumerate_type() {
+        prof::IT_ENUM
+    } else {
+        prof::OTHER
+    }
+}
+
+pub unsafe extern "C" fn h_prof_iter(p: *const std::sync::atomic::AtomicU16, it: *mut PyObject) {
+    unsafe {
+        let bits = iter_profile_bits(&*it) as u16;
+        let p = &*p;
+        let old = p.load(std::sync::atomic::Ordering::Relaxed);
+        if old | bits != old {
+            p.store(old | bits, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 // ------------------------------------------------------------------ refcounts / boxing
 
 pub unsafe extern "C" fn h_decref(o: *mut PyObject) {
@@ -95,7 +143,7 @@ pub unsafe extern "C" fn h_dict_replace(d: *mut PyObject, ix: u64, name: *mut Py
             Some(e) if e.key == name => {
                 let old = std::mem::replace(&mut e.value, v);
                 t.version = crate::interp::cache::next_dict_version();
-                crate::interp::cache::on_dict_write(&*d);
+                crate::interp::cache::on_dict_write(&*d, name);
                 drop(g);
                 crate::qsbr::decref_deferred(old); // perf-runtime: lock-free readers (D6)
                 0
@@ -198,6 +246,18 @@ pub unsafe extern "C" fn h_delete_attr(sp: *mut *mut PyObject, name: *mut PyObje
             Ok(()) => OK,
             Err(_) => ERR,
         }
+    }
+}
+
+/// LoadMethod on an object with inline values (jit3): does shape `sh` lack the
+/// interned `name`? If so, remember the shape's id in the cache entry's memo. 1/0.
+pub unsafe extern "C" fn h_shape_lacks_memo(sh: *const crate::shape::Shape, name: *mut PyObject, memo: *const std::sync::atomic::AtomicU32) -> u64 {
+    unsafe {
+        if (*sh).keys().contains(&name) {
+            return 0;
+        }
+        (*memo).store((*sh).id, std::sync::atomic::Ordering::Relaxed);
+        1
     }
 }
 

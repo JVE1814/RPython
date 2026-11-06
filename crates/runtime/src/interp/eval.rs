@@ -1242,8 +1242,9 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                                 crate::modules::sys_trace::fire_branch(ts, f, crate::modules::sys_trace::JUMP, arg as usize)?;
                             }
                             if (arg as usize) < pc {
-                                // backedge: safepoint poll + tiering counter
-                                cd.backedge_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                // backedge: safepoint poll + tiering counter (weighted by the loop
+                                // length: long loop bodies get compiled after fewer iterations)
+                                cd.backedge_count.fetch_add(1 + ((pc - arg as usize) / 32) as u32, std::sync::atomic::Ordering::Relaxed);
                                 let eb = ts.c.eval_breaker.load(std::sync::atomic::Ordering::Relaxed);
                                 if eb != 0 {
                                     handle_eval_breaker(ts)?;

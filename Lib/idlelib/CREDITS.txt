@@ -1,0 +1,14 @@
+IDLE credits
+============
+
+IDLE was created by Guido van Rossum and has been maintained and
+extended by many contributors to Python over the years, among them
+the members of the IDLEfork project.  Their work defined the behavior
+that this version of IDLE reproduces.
+
+This version of the idlelib package was written for a re-implementation
+of Python 3.15 from the published tests and documentation.
+
+Thanks to everyone who reported problems, suggested improvements and
+wrote tests -- in São Paulo, Zürich, Kraków, Reykjavík and everywhere
+else.

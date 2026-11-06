@@ -171,3 +171,27 @@ The original extraction (D2) kept only Lib/test, so test_idle could never match 
 (332 run, 88 skipped). The idle_test directory was copied (mechanically, unread) from the pinned
 v3.15.2 checkout into spec/Lib/idlelib/idle_test. No other test packages live outside Lib/test in
 3.15. tools/snapshot.sh installs it into our idlelib package; our idlelib is written from scratch.
+
+## D24 — CPython 3.15 bytecode is the public code format (HotSpot: class-file bytecode as contract)
+Finding (suite run 5): ~500 failures come from tests that observe bytecode directly — test_dis
+(exact disassembly listings), test_peepholer, test_compile, test_code, test__opcode, test_opcache,
+the offsets in test_sys_settrace/test_monitoring, code.replace(co_code=...) / types.CodeType(...)
+with hand-built bytecode — and the public header spec/Include/opcode_ids.h fixes the 3.15 opcode
+numbering (CACHE=0 ... HAVE_ARGUMENT=41, MIN_INSTRUMENTED_OPCODE=233). Our compiler's private
+32-bit instruction format cannot satisfy them.
+Decision: like the JVM's class-file bytecode vs. HotSpot's internal templates/IR, the *public*
+representation of a code object is CPython 3.15 wordcode: co_code (2-byte units with inline CACHE
+entries per opcode), co_consts/co_names/co_localsplusnames/kinds layout, co_linetable (3.11+
+location table), co_exceptiontable (varint format), flags, co_qualname etc. The compiler emits it,
+matching the shapes the tests expect (derived from the tests' expected listings and documented
+`dis` semantics — never from CPython's compiler source). Execution: the runtime translates
+public bytecode into the existing internal format on first execution (quickening, like HotSpot's
+bytecode rewriting), so the interpreter tiers and the JIT keep working on the internal form;
+code objects created from Python (CodeType/replace) or C (PyUnstable_Code_New*) with arbitrary
+valid wordcode therefore execute too. f_lasti, tracing/monitoring offsets, tb_lasti and
+co_positions are in public units. dis's adaptive view maps our inline-cache specialisations to
+CPython's specialized instruction names. Our pyc format carries the public form.
+- 2026-11-02 → 11-05: all agents stopped when the account's weekly API limit was reached; their
+  worktrees kept the work and they were resumed after the reset. To spread usage over the
+  remaining budget, at most ~7 agents run at once and finished agents are not immediately
+  replaced unless the work is on the critical path (suite pass rate, benchmarks, numpy).

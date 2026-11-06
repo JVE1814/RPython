@@ -355,9 +355,9 @@ pub fn table(d: &PyObject) -> &mut DictTable {
 }
 
 #[inline(always)]
-fn set_used(d: &PyObject, n: usize) {
+fn set_used(d: &PyObject, n: usize, key: *mut PyObject) {
     unsafe { AtomicIsizePtr::store(&raw mut (*(d.as_ptr() as *mut PyDictObject)).ma_used, n as isize) }
-    crate::interp::cache::on_dict_write(d); // jit: type-dict writes invalidate caches
+    crate::interp::cache::on_dict_write(d, key); // jit: type-dict writes invalidate caches
 }
 struct AtomicIsizePtr;
 impl AtomicIsizePtr {
@@ -627,7 +627,7 @@ pub fn set_item_hash(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) -
             let old = t.entries()[ix].value;
             t.entries_mut()[ix].value = value.as_ptr();
             t.version = next_version();
-            crate::interp::cache::on_dict_write(d); // jit
+            crate::interp::cache::on_dict_write(d, key.as_ptr()); // jit
             drop(g);
             // perf-runtime (D6): lock-free readers may still hold `old`
             unsafe { crate::qsbr::decref_deferred(old) };
@@ -635,7 +635,7 @@ pub fn set_item_hash(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) -
         Found::Missing => {
             unsafe { incref(key.as_ptr()) };
             t.insert_new(h, key.as_ptr(), value.as_ptr());
-            set_used(d, t.used);
+            set_used(d, t.used, key.as_ptr());
             drop(g);
         }
     }
@@ -651,7 +651,7 @@ pub fn insert_unique(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) {
         incref(value.as_ptr());
     }
     t.insert_new(h, key.as_ptr(), value.as_ptr());
-    set_used(d, t.used);
+    set_used(d, t.used, key.as_ptr());
     drop(g);
 }
 
@@ -672,7 +672,7 @@ pub fn setdefault_hash(d: &PyObject, key: &PyObject, h: isize, default: &PyObjec
                 incref(default.as_ptr());
             }
             t.insert_new(h, key.as_ptr(), default.as_ptr());
-            set_used(d, t.used);
+            set_used(d, t.used, key.as_ptr());
             default.to_ref()
         }
     };
@@ -700,7 +700,7 @@ pub fn pop_item_hash(d: &PyObject, key: &PyObject, h: isize) -> PyResult<Option<
         Found::At(ix) => {
             let t = table(d);
             let (k, v) = t.remove(ix);
-            set_used(d, t.used);
+            set_used(d, t.used, key.as_ptr());
             drop(g);
             unsafe {
                 crate::qsbr::decref_deferred(k);
@@ -725,7 +725,7 @@ pub fn pop_item(d: &PyObject, key: &PyObject) -> PyResult<Option<PyRef>> {
 pub fn remove_at(d: &PyObject, ix: usize, _h: isize) -> (*mut PyObject, *mut PyObject) {
     let t = table(d);
     let r = t.remove(ix);
-    set_used(d, t.used);
+    set_used(d, t.used, r.0);
     r
 }
 
@@ -738,7 +738,7 @@ pub fn clear(d: &PyObject) {
     let mut fresh = DictTable::new(0);
     fresh.version = next_version();
     let old = std::mem::replace(t, fresh);
-    set_used(d, 0);
+    set_used(d, 0, std::ptr::null_mut());
     drop(g);
     for e in old.entries().iter() {
         if !e.key.is_null() {
@@ -848,7 +848,7 @@ pub fn copy(d: &PyObject) -> PyResult<PyRef> {
         for (k, v, h) in items {
             t.insert_new(h, k.into_raw(), v.into_raw());
         }
-        set_used(&n, t.used);
+        set_used(&n, t.used, std::ptr::null_mut());
     }
     Ok(n)
 }
@@ -870,7 +870,7 @@ pub fn merge_dict(d: &PyObject, other: &PyObject, overwrite: bool) -> PyResult<(
             for (k, v, h) in items {
                 t.insert_new(h, k.into_raw(), v.into_raw());
             }
-            set_used(d, t.used);
+            set_used(d, t.used, std::ptr::null_mut());
             return Ok(());
         }
         drop(g);
@@ -922,7 +922,7 @@ pub fn pop_last(d: &PyObject) -> Option<(PyRef, PyRef)> {
         if !e.key.is_null() {
             let (k, v) = t.remove(ix);
             t.nentries = ix;
-            set_used(d, t.used);
+            set_used(d, t.used, k);
             drop(g);
             return unsafe { Some((PyRef::from_raw(k), PyRef::from_raw(v))) };
         }

@@ -50,6 +50,13 @@ pub struct Frame {
     /// outlive their call (generators, frame objects) are switched to owned first
     /// (`make_owned`).
     pub owns_fc: bool,
+    /// Tier 2 (jit/opt): while compiled code runs a call or template with unboxed
+    /// locals whose frame slots are stale, the descriptor of their native locations
+    /// (`opt::Site`); 1 after `opt::sync_frame` refreshed the slots (the compiled code
+    /// must not use its unboxed copies any more); 0 otherwise.
+    pub t2_site: usize,
+    /// Tier 2: rsp of the running compiled code (base of its spill slots).
+    pub t2_sp: usize,
 }
 
 fn borrows_globals(func: Option<&PyObject>, globals: &PyObject, builtins: &PyObject) -> bool {
@@ -80,40 +87,77 @@ impl Frame {
         let cd = crate::types::code::code(code);
         let nlp = cd.obj.co_nlocalsplus as usize;
         let total = nlp + cd.obj.co_stacksize as usize + 1;
-        match unsafe { (*(&raw mut POOL)).pop() } {
-            Some(mut f) => {
-                unsafe { f.slots.set_len(0) };
-                f.slots.resize(total, std::ptr::null_mut());
-                f.code = code.as_ptr();
-                f.func = func.as_ptr();
-                f.owns_fc = false;
-                f.borrowed_gb = true;
-                f.globals = globals.as_ptr();
-                f.builtins = builtins.as_ptr();
-                f.nlocalsplus = nlp;
-                f.stack_top = nlp;
-                // everything else was reset by `release`
-                f
-            }
-            None => {
-                let mut f = Frame::new(code, Some(func), globals, builtins, None);
-                f.make_borrowed_call();
-                f
+        unsafe { Self::new_call_raw(code.as_ptr(), func.as_ptr(), globals.as_ptr(), builtins.as_ptr(), nlp, total) }
+    }
+
+    /// `new_call` with the frame geometry precomputed (the JIT's call path caches
+    /// `nlp`/`total` per code object). Locals are NULL; the value-stack part above
+    /// `stack_top` is not cleared (every stack slot is written before it is read).
+    ///
+    /// Safety: `func` must stay alive for the call (the caller holds it; it holds
+    /// code/globals/builtins); `nlp`/`total` must match `code`.
+    #[inline]
+    pub unsafe fn new_call_raw(code: *mut PyObject, func: *mut PyObject, globals: *mut PyObject, builtins: *mut PyObject, nlp: usize, total: usize) -> Box<Frame> {
+        unsafe {
+            match (*(&raw mut POOL)).pop() {
+                Some(mut f) => {
+                    if f.slots.capacity() < total {
+                        f.slots.reserve(total - f.slots.len());
+                    }
+                    f.slots.set_len(total);
+                    let s = f.slots.as_mut_ptr();
+                    // (volatile: a few stores are cheaper than the memset call the
+                    // compiler would otherwise emit)
+                    for i in 0..nlp {
+                        std::ptr::write_volatile(s.add(i), std::ptr::null_mut());
+                    }
+                    f.code = code;
+                    f.func = func;
+                    f.owns_fc = false;
+                    f.borrowed_gb = true;
+                    f.globals = globals;
+                    f.builtins = builtins;
+                    f.nlocalsplus = nlp;
+                    f.stack_top = nlp;
+                    // everything else was reset by `release` + `reset`
+                    f
+                }
+                None => Self::new_call_slow(code, func, globals, builtins, nlp, total),
             }
         }
     }
 
-    /// Convert a fresh `Frame::new` call frame to the borrowed form of `new_call`.
-    fn make_borrowed_call(&mut self) {
-        if self.owns_fc && self.borrowed_gb {
-            unsafe {
-                xdecref(self.code);
-                xdecref(self.func);
-            }
-            self.owns_fc = false;
-        } else {
-            self.make_owned();
-        }
+    #[cold]
+    #[inline(never)]
+    fn new_call_slow(code: *mut PyObject, func: *mut PyObject, globals: *mut PyObject, builtins: *mut PyObject, nlp: usize, total: usize) -> Box<Frame> {
+        Box::new(Frame {
+            code,
+            func,
+            globals,
+            builtins,
+            borrowed_gb: true,
+            owns_fc: false,
+            locals: std::ptr::null_mut(),
+            prev: std::ptr::null_mut(),
+            lasti: 0,
+            next_instr: 0,
+            nlocalsplus: nlp,
+            slots: vec![std::ptr::null_mut(); total],
+            stack_top: nlp,
+            frame_obj: std::ptr::null_mut(),
+            generator: std::ptr::null_mut(),
+            state: FrameState::Created,
+            trace_line: -1,
+            f_trace: std::ptr::null_mut(),
+            f_trace_lines: true,
+            f_trace_opcodes: false,
+            yield_from_send: -1,
+            unwind_pc: -1,
+            trace_event: 0,
+            jump_to: -1,
+            t2_site: 0,
+            t2_sp: 0,
+        })
     }
 
     /// Take owned references to `code` and `func` (the frame is about to outlive the
@@ -163,6 +207,7 @@ impl Frame {
             f.unwind_pc = -1;
             f.trace_event = 0;
             f.jump_to = -1;
+            f.t2_site = 0;
             return f;
         }
         let slots = vec![std::ptr::null_mut::<PyObject>(); total];
@@ -192,6 +237,8 @@ impl Frame {
             unwind_pc: -1,
             trace_event: 0,
             jump_to: -1,
+            t2_site: 0,
+            t2_sp: 0,
         })
     }
 
@@ -297,6 +344,9 @@ impl Frame {
         self.f_trace_opcodes = false;
         self.yield_from_send = -1;
         self.unwind_pc = -1;
+        self.trace_event = 0;
+        self.jump_to = -1;
+        self.t2_site = 0;
     }
 }
 
@@ -323,6 +373,46 @@ pub fn recycle(mut f: Box<Frame>) {
         let pool = &mut *(&raw mut POOL);
         if pool.len() < POOL_MAX {
             f.reset();
+            pool.push(f);
+        }
+    }
+}
+
+/// Recycle a `new_call` frame whose activation returned normally in compiled code:
+/// no frame object, locals mapping or trace function (else the general path). Only
+/// the slots and the fields compiled code changes are reset.
+#[inline]
+pub fn recycle_call(mut f: Box<Frame>) {
+    if !f.frame_obj.is_null() || !f.locals.is_null() || !f.f_trace.is_null() || f.owns_fc || !f.borrowed_gb {
+        f.state = FrameState::Completed;
+        crate::interp::frame_finished(f);
+        return;
+    }
+    unsafe {
+        let s = f.slots.as_mut_ptr();
+        let top = f.stack_top.max(f.nlocalsplus).min(f.slots.len());
+        for i in 0..top {
+            let p = *s.add(i);
+            if !p.is_null() {
+                *s.add(i) = std::ptr::null_mut();
+                decref(p);
+            }
+        }
+        f.stack_top = f.nlocalsplus;
+        f.code = std::ptr::null_mut();
+        f.func = std::ptr::null_mut();
+        f.globals = std::ptr::null_mut();
+        f.builtins = std::ptr::null_mut();
+        f.prev = std::ptr::null_mut();
+        f.lasti = 0;
+        f.next_instr = 0;
+        f.state = FrameState::Created;
+        f.t2_site = 0;
+        if f.slots.capacity() > 4096 {
+            return;
+        }
+        let pool = &mut *(&raw mut POOL);
+        if pool.len() < POOL_MAX {
             pool.push(f);
         }
     }
