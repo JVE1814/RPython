@@ -297,6 +297,7 @@ pub(crate) fn optimize_cfg(cfg: &mut Cfg, consts: &mut Vec<Constant>, nlocals: u
             changed |= peephole_block(cfg, b, consts);
         }
         changed |= thread_jumps(cfg);
+        changed |= merge_fallthrough_blocks(cfg);
         remove_redundant_nops(cfg);
         changed |= remove_redundant_jumps(cfg);
         cfg.remove_unreachable();
@@ -1299,6 +1300,27 @@ fn peephole_block(cfg: &mut Cfg, b: Label, consts: &mut Vec<Constant>) -> bool {
                 if let (Some(nx), Some(c)) = (next, const_of(&ins, consts)) {
                     let nop = instrs[nx];
                     match nop.op {
+                        O::COPY if nop.arg == 1 => {
+                            // `const and x` / `const or x`: COPY 1; TO_BOOL; POP_JUMP_IF_x
+                            let tb = next_real(instrs, nx);
+                            let jp = tb.and_then(|t| next_real(instrs, t));
+                            if let (Some(tb), Some(jp)) = (tb, jp) {
+                                let jop = instrs[jp].op;
+                                if instrs[tb].op == O::TO_BOOL && matches!(jop, O::POP_JUMP_IF_FALSE | O::POP_JUMP_IF_TRUE) {
+                                    if let Some(t) = const_truth(&c) {
+                                        let taken = (jop == O::POP_JUMP_IF_TRUE) == t;
+                                        nop_out(&mut instrs[nx]);
+                                        nop_out(&mut instrs[tb]);
+                                        if taken {
+                                            instrs[jp].op = O::JUMP;
+                                        } else {
+                                            nop_out(&mut instrs[jp]);
+                                        }
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        }
                         O::POP_JUMP_IF_FALSE | O::POP_JUMP_IF_TRUE => {
                             if let Some(t) = const_truth(&c) {
                                 let jump = (nop.op == O::POP_JUMP_IF_TRUE) == t;
@@ -2086,6 +2108,11 @@ fn finish(mut cfg: Cfg, info: UnitInfo, layout: Layout) -> R<CodeObject> {
             flat.push(Flat { op, arg: i.arg, target: i.target, loc: i.loc, handler: i.handler });
         }
     }
+    if let Some(last) = flat.last() {
+        if !is_terminator(last.op) {
+            return Err(ierr(&format!("control flow falls off the end of {}", info.qualname)));
+        }
+    }
     // a block's first instruction may be in a later block if it is empty
     let n = flat.len();
     let mut target_index = vec![n; cfg.blocks.len()];
@@ -2260,4 +2287,25 @@ fn exc_entry(cfg: &Cfg, target_index: &[usize], offset: &[u32], start: u32, end:
     }
     let depth = blk.depth - 1 - blk.preserve_lasti as i32;
     Ok(ExcEntry { start, end, target: offset[t], depth: depth.max(0) as u32, lasti: blk.preserve_lasti })
+}
+
+/// A block that falls through into a block with no other predecessor absorbs it (so that
+/// peepholes see both halves, e.g. after a constant condition was folded away).
+fn merge_fallthrough_blocks(cfg: &mut Cfg) -> bool {
+    let mut changed = false;
+    let preds = cfg.predecessor_counts();
+    for k in 0..cfg.order.len().saturating_sub(1) {
+        let b = cfg.order[k];
+        let n = cfg.order[k + 1];
+        if cfg.blocks[b as usize].instrs.is_empty() || !cfg.falls_through(b) || preds[n as usize] != 1 || cfg.blocks[n as usize].is_handler {
+            continue;
+        }
+        if cfg.blocks[b as usize].instrs.iter().any(|i| is_jump_edge(i.op)) || cfg.blocks[n as usize].instrs.is_empty() {
+            continue;
+        }
+        let moved = std::mem::take(&mut cfg.blocks[n as usize].instrs);
+        cfg.blocks[b as usize].instrs.extend(moved);
+        changed = true;
+    }
+    changed
 }

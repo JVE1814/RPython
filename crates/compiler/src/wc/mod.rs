@@ -428,7 +428,7 @@ pub(crate) fn compile_module(module: &Mod, opts: &CompileOptions) -> R<WordcodeO
     // fold a private copy of the AST
     let mut m = module.clone();
     let mut warnings = Vec::new();
-    crate::fold::fold_module(&mut m, opts.optimize, future, &mut warnings, opts.max_depth)?;
+    crate::fold::fold_module_ast_only(&mut m, opts.optimize, future, &mut warnings, opts.max_depth)?;
     let st = symtable::build(&m, future | (opts.flags & cf::PYCF_ALLOW_TOP_LEVEL_AWAIT), opts.max_depth)?;
     let mut c = Compiler {
         st,
