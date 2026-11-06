@@ -409,7 +409,23 @@ impl<'a> B<'a> {
         self.f.new_v(c)
     }
     fn emit(&mut self, i: Inst) {
+        // a decref may free the object and run arbitrary code (__del__, weakref
+        // callbacks) that mutates classes: type facts guarded earlier no longer hold
+        let forget = matches!(i, Inst::Decref(_) | Inst::XDecref(_));
         self.f.blocks[self.cur as usize].insts.push(i);
+        if forget {
+            self.forget_tags();
+        }
+    }
+    /// Decref of a value whose type is known to free without running Python code.
+    fn emit_leaf_decref(&mut self, v: V) {
+        self.f.blocks[self.cur as usize].insts.push(Inst::Decref(v));
+    }
+    fn leaf_type(t: Ty) -> bool {
+        match t {
+            Ty::Exact(p) => p == int_t() || p == float_t() || p == bool_t() || p == crate::types::str::str_type() as usize,
+            _ => false,
+        }
     }
     fn new_block(&mut self, instr: u32) -> BlockId {
         self.f.blocks.push(Block { insts: Vec::new(), term: Term::None, instr, tsuccs: Vec::new() });
@@ -646,6 +662,7 @@ impl<'a> B<'a> {
                 self.emit(Inst::Load(v, Base::Slots, off));
                 self.emit(Inst::XDecref(v));
             }
+            AV::Obj(v, Own::Owned, t) if Self::leaf_type(t) => self.emit_leaf_decref(v),
             AV::Obj(v, Own::Owned, _) => self.emit(Inst::Decref(v)),
             _ => {}
         }

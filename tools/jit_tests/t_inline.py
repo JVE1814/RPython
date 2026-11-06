@@ -218,6 +218,37 @@ try:
 except ZeroDivisionError as e:
     print("ZeroDivisionError", [f.name for f in traceback.extract_tb(e.__traceback__)])
 
+# a finalizer run by a decref in compiled code changes the class the code is
+# specialised on: later accesses must see the change
+class K:
+    def val(self):
+        return 1
+    scale = 10
+
+class Trap:
+    def __del__(self):
+        K.val = lambda self: 2
+        K.scale = 1000
+
+def del_trap(n):
+    k = K()
+    t = 0
+    trap = None
+    for i in range(n):
+        t += k.val() * K.scale
+        if i == n - 2:
+            trap = Trap()
+        if i == n - 1:
+            trap = None   # decref -> __del__ mutates K
+        t += k.val() * K.scale
+    return t
+
+for _ in range(60):
+    K.val = lambda self: 1
+    K.scale = 10
+    r = del_trap(20)
+print(r)
+
 # inlined constructors: object.__new__ + inlined __init__
 class P:
     alive = 0
