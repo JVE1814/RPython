@@ -1400,6 +1400,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                         Op::ForIter => {
                             adapt_once!(super::adaptive::for_iter(unsafe { &*peek!(f, 1) }));
                             let it = unsafe { &*top!(f) };
+                            let gen_iter = crate::modules::sys::tracing_active() && crate::types::genobject::is_generator_exact(it);
                             match ab::iter_next(it)? {
                                 Some(v) => push!(f, v.into_raw()),
                                 None => {
@@ -1408,7 +1409,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                                 }
                             }
                             if crate::modules::sys::tracing_active() {
-                                for_iter_event(ts, f, pc == arg as usize, pc)?;
+                                for_iter_event(ts, f, pc == arg as usize, gen_iter, pc)?;
                             }
                         }
                         Op::GetAiter => {
@@ -1455,9 +1456,14 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             adapt!(super::adaptive::send(unsafe { &*peek!(f, 2) }));
                             let v = popref!(f);
                             let recv = unsafe { &*top!(f) };
+                            let gen_recv = crate::modules::sys::tracing_active()
+                                && (crate::types::genobject::is_coroutine_exact(recv) || recv.is_type(crate::types::genobject::gen_type()) || is_subtype(recv.type_ptr(), crate::types::genobject::gen_type()));
                             match crate::types::genobject::send_to(recv, &v)? {
                                 crate::types::genobject::SendResult::Yield(r) => push!(f, r.into_raw()),
                                 crate::types::genobject::SendResult::Return(r) => {
+                                    if gen_recv {
+                                        crate::modules::sys_trace::stop_iteration_event(ts, f, &r, arg as usize)?;
+                                    }
                                     unsafe { decref(pop!(f)) };
                                     push!(f, r.into_raw());
                                     pc = arg as usize;
@@ -2289,9 +2295,9 @@ fn branch_event(ts: &ThreadState, f: &mut Frame, taken: bool, dest: usize) -> Py
 /// FOR_ITER: continuing the loop is the left branch, leaving it the right one; an
 /// exhausted generator reports STOP_ITERATION (no exception is raised for it).
 #[cold]
-fn for_iter_event(ts: &ThreadState, f: &mut Frame, exhausted: bool, dest: usize) -> PyResult<()> {
+fn for_iter_event(ts: &ThreadState, f: &mut Frame, exhausted: bool, gen_iter: bool, dest: usize) -> PyResult<()> {
     use crate::modules::sys_trace as st;
-    if exhausted && st::wants(st::STOP_ITERATION) {
+    if exhausted && gen_iter && st::wants(st::STOP_ITERATION) {
         let si = ab::call(type_obj(exc::StopIteration()), &[])?;
         st::fire_exc_event(ts, f, st::STOP_ITERATION, &si)?;
     }

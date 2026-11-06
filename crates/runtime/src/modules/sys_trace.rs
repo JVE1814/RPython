@@ -566,3 +566,36 @@ pub fn fire_branch(ts: &ThreadState, f: &mut Frame, ev: usize, dest: usize) -> P
 pub fn wants(ev: usize) -> bool {
     MON_ANY.load(Relaxed) & (1 << ev) != 0
 }
+
+/// A generator or coroutine driven by FOR_ITER / SEND finished (no exception is raised
+/// for it): sys.monitoring sees STOP_ITERATION, a legacy trace function an 'exception'
+/// event, both at `at` (internal pc of the instruction that consumes the result).
+pub fn stop_iteration_event(ts: &ThreadState, f: &mut Frame, value: &PyObject, at: usize) -> PyResult<()> {
+    if ts.tracing_depth.get() > 0 {
+        return Ok(());
+    }
+    let want_mon = MON_ANY.load(Relaxed) & (1 << STOP_ITERATION) != 0;
+    let want_legacy = !ts.trace_func.get().is_null() && !f.f_trace.is_null();
+    if !want_mon && !want_legacy {
+        return Ok(());
+    }
+    let saved_lasti = f.lasti;
+    f.lasti = at as u32;
+    let r = (|| -> PyResult<()> {
+        let si = ab::call(crate::types::typeobject::type_obj(crate::types::exceptions::StopIteration()), &[value])?;
+        if want_mon {
+            let off = offset(f);
+            fire(ts, f, STOP_ITERATION, off, &[&si])?;
+        }
+        if want_legacy && !f.f_trace.is_null() {
+            let t = crate::types::typeobject::type_ref(si.type_ptr());
+            let arg = tuple::new_tuple(vec![t, si.clone(), none::none_ref()]);
+            let ftr = unsafe { PyRef::from_borrowed(f.f_trace) };
+            let r = call_trace(ts, ftr.as_ptr(), f, "exception", &arg)?;
+            set_f_trace(f, r);
+        }
+        Ok(())
+    })();
+    f.lasti = saved_lasti;
+    r
+}
