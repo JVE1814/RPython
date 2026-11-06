@@ -314,3 +314,18 @@ Branch: **bc-vm = `worktree-agent-ae0417e805548192f`**.
   attribute of the same name that later becomes a data descriptor
   (test_opcache test_descriptor_added_after_optimization); tier-1 direct calls of Python
   functions bypass a replaced `vectorcall` (PyFunction_SetVectorcall).
+
+### bc-vm status at hand-off (2026-11-06)
+Default (wordcode) mode vs legacy (`RPYTHON_WORDCODE=0`), same binary, failures:
+test_code 22->0 (PASS), test_dis crash->PASS (145), test_compile 14->3, test_sys_settrace
+206->86, test_monitoring 62->52, test_exceptions 14->9, test_marshal 4->1, test_patma 8->4,
+test_inspect 19->15, test_traceback 8->7, test_generators 5->4, test_warnings 17->4,
+test_extcall 16->8, test_class/test_descr/test_opcache crash->run, test_peepholer 0->0;
+no regressions on a 107-module sample (test_ssl crashes in both modes: jit/mod.rs call_fast
+reads a NULL func_code from a callback in a thread; pre-existing, for jit3/bindings).
+tools/jit_tests/run.sh passes in both modes (tier 1 and tier 2 configs).
+Open (bc-vm): test_monitoring (52: mostly branch/line event ordering and C_RETURN/C_RAISE),
+test_sys_settrace (86: line events of `with`/`async with` exits, jumps into/out of blocks),
+test_frame (4), adaptive-view corner cases in test_opcache (STORE_ATTR_WITH_HINT race test,
+instance-dict tests that need `_testinternalcapi.get_object_dict_values`), memory: CodeData
+keeps its own copy of names/consts vectors and 16-byte locations per internal word.
