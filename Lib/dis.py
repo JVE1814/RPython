@@ -645,7 +645,7 @@ def _disassemble_bytes(code, lasti=-1, linestarts=None, *, line_offset=0, except
         lineno_width = _lineno_width({k: (None if v is None else v + line_offset)
                                       for k, v in linestarts.items()})
     positions_width = 0
-    if show_positions and any(i.positions is not None and any(p is not None for p in i.positions)
+    if show_positions and any(i.positions is not None and i.positions.lineno is not None
                               for i in instrs):
         positions_width = max(len(_Formatter._positions_text(i.positions)) for i in instrs)
     offset_width = 0

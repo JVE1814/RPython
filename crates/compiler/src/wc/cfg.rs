@@ -309,9 +309,9 @@ pub(crate) fn optimize_cfg(cfg: &mut Cfg, consts: &mut Vec<Constant>, nlocals: u
     convert_constant_loads(cfg, consts);
     remove_unused_consts(cfg, consts);
     add_checks_for_unbound_locals(cfg, nlocals, bound);
-    convert_closure_loads(cfg);
-    optimize_load_fast(cfg);
     insert_superinstructions(cfg);
+    optimize_load_fast(cfg);
+    convert_closure_loads(cfg);
     remove_redundant_nops(cfg);
     Ok(())
 }
@@ -1580,33 +1580,69 @@ fn stack_io(op: u16, arg: i32) -> (usize, usize) {
 /// block before the local can change (and is not stored into a local itself). Only blocks
 /// reachable without exception edges are considered.
 fn optimize_load_fast(cfg: &mut Cfg) {
-    let warm = cfg.mark_reachable(false);
-    #[derive(Clone, Copy)]
+    // Abstract interpretation over the blocks reachable without exception edges. Each stack
+    // slot records the LOAD_FAST (block, index) that produced it. A load is unsafe (stays a
+    // strong LOAD_FAST) when its reference is stored into a local, is still on the stack
+    // when its local changes, is on the stack across a yield, reaches a join point with a
+    // different stack, or is still on the stack when the frame returns or raises.
+    #[derive(Clone, Copy, PartialEq, Eq)]
     struct Ref {
+        block: Label,
         instr: usize,
         local: i32,
     }
-    for &b in &cfg.order.clone() {
-        if !warm[b as usize] || cfg.blocks[b as usize].is_handler {
-            continue;
+    type Stack = Vec<Option<Ref>>;
+    let pos = cfg.positions();
+    let n = cfg.blocks.len();
+    let mut unsafe_: std::collections::HashSet<(Label, usize)> = std::collections::HashSet::new();
+    let mut entry: Vec<Option<Stack>> = vec![None; n];
+    let start = cfg.order[0];
+    entry[start as usize] = Some(Vec::new());
+    let mut work = vec![start];
+    let mark_all = |s: &Stack, u: &mut std::collections::HashSet<(Label, usize)>| {
+        for r in s.iter().flatten() {
+            u.insert((r.block, r.instr));
         }
-        let instrs = &mut cfg.blocks[b as usize].instrs;
-        let mut unsafe_ = vec![false; instrs.len()];
-        let mut stack: Vec<Option<Ref>> = Vec::new();
-        let kill = |stack: &[Option<Ref>], unsafe_: &mut [bool], local: i32| {
+    };
+    while let Some(b) = work.pop() {
+        let mut stack = entry[b as usize].clone().unwrap_or_default();
+        let instrs = cfg.blocks[b as usize].instrs.clone();
+        let mut outs: Vec<(Label, Stack)> = Vec::new();
+        let kill = |stack: &Stack, u: &mut std::collections::HashSet<(Label, usize)>, local: i32| {
             for r in stack.iter().flatten() {
                 if r.local == local {
-                    unsafe_[r.instr] = true;
+                    u.insert((r.block, r.instr));
                 }
             }
         };
-        for k in 0..instrs.len() {
-            let i = instrs[k];
+        let mut terminated = false;
+        for (k, i) in instrs.iter().enumerate() {
+            // successor state for jumps is the state after the jump's own pops
             match i.op {
-                O::LOAD_FAST => stack.push(Some(Ref { instr: k, local: i.arg })),
+                O::LOAD_FAST | O::LOAD_CLOSURE => stack.push(Some(Ref { block: b, instr: k, local: i.arg })),
+                O::LOAD_FAST_LOAD_FAST => {
+                    stack.push(Some(Ref { block: b, instr: k, local: i.arg >> 4 }));
+                    stack.push(Some(Ref { block: b, instr: k, local: i.arg & 15 }));
+                }
+                O::STORE_FAST_LOAD_FAST => {
+                    if let Some(Some(r)) = stack.pop() {
+                        unsafe_.insert((r.block, r.instr));
+                    }
+                    kill(&stack, &mut unsafe_, i.arg >> 4);
+                    stack.push(None);
+                }
+                O::STORE_FAST_STORE_FAST => {
+                    for _ in 0..2 {
+                        if let Some(Some(r)) = stack.pop() {
+                            unsafe_.insert((r.block, r.instr));
+                        }
+                    }
+                    kill(&stack, &mut unsafe_, i.arg >> 4);
+                    kill(&stack, &mut unsafe_, i.arg & 15);
+                }
                 O::STORE_FAST | O::STORE_FAST_MAYBE_NULL => {
                     if let Some(Some(r)) = stack.pop() {
-                        unsafe_[r.instr] = true;
+                        unsafe_.insert((r.block, r.instr));
                     }
                     kill(&stack, &mut unsafe_, i.arg);
                 }
@@ -1645,11 +1681,17 @@ fn optimize_load_fast(cfg: &mut Cfg) {
                 }
                 O::YIELD_VALUE => {
                     // a suspended frame must not hold borrowed references
-                    for r in stack.iter().flatten() {
-                        unsafe_[r.instr] = true;
-                    }
+                    mark_all(&stack, &mut unsafe_);
                     stack.pop();
                     stack.push(None);
+                }
+                O::RETURN_VALUE | O::RAISE_VARARGS | O::RERAISE => {
+                    let (pops, _) = stack_io(i.op, i.arg);
+                    for _ in 0..pops {
+                        stack.pop();
+                    }
+                    mark_all(&stack, &mut unsafe_);
+                    terminated = true;
                 }
                 _ => {
                     let (pops, pushes) = stack_io(i.op, i.arg);
@@ -1661,14 +1703,49 @@ fn optimize_load_fast(cfg: &mut Cfg) {
                     }
                 }
             }
+            if is_jump_edge(i.op) {
+                outs.push((i.target, stack.clone()));
+            }
+            if is_terminator(i.op) && !is_exit_op(i.op) {
+                terminated = true;
+            }
         }
-        // references still on the stack at the end of the block escape it
-        for r in stack.iter().flatten() {
-            unsafe_[r.instr] = true;
+        if !terminated && cfg.falls_through(b) {
+            if let Some(nb) = cfg.next_in_order(&pos, b) {
+                outs.push((nb, stack.clone()));
+            }
         }
-        for k in 0..instrs.len() {
-            if instrs[k].op == O::LOAD_FAST && !unsafe_[k] {
-                instrs[k].op = O::LOAD_FAST_BORROW;
+        for (t, s) in outs {
+            if cfg.blocks[t as usize].is_handler {
+                mark_all(&s, &mut unsafe_);
+                continue;
+            }
+            match &entry[t as usize] {
+                None => {
+                    entry[t as usize] = Some(s);
+                    work.push(t);
+                }
+                Some(old) => {
+                    if *old != s {
+                        mark_all(old, &mut unsafe_);
+                        mark_all(&s, &mut unsafe_);
+                    }
+                }
+            }
+        }
+    }
+    for &b in &cfg.order.clone() {
+        if entry[b as usize].is_none() {
+            continue;
+        }
+        for (k, ins) in cfg.blocks[b as usize].instrs.iter_mut().enumerate() {
+            if unsafe_.contains(&(b, k)) {
+                continue;
+            }
+            match ins.op {
+                O::LOAD_FAST | O::LOAD_CLOSURE => ins.op = O::LOAD_FAST_BORROW,
+                O::LOAD_FAST_LOAD_FAST => ins.op = O::LOAD_FAST_BORROW_LOAD_FAST_BORROW,
+                _ => {}
             }
         }
     }
@@ -1874,6 +1951,7 @@ fn finish(mut cfg: Cfg, info: UnitInfo, layout: Layout) -> R<CodeObject> {
     duplicate_exits_without_lineno(&mut cfg);
     propagate_line_numbers(&mut cfg);
     normalize_jumps(&mut cfg);
+    remove_redundant_nops(&mut cfg);
     // prefix: COPY_FREE_VARS, MAKE_CELL for every (non-hidden) cell
     {
         let mut pre: Vec<Instr> = Vec::new();
