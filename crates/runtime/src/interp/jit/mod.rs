@@ -156,13 +156,20 @@ pub fn osr_check(f: &mut Frame, cd: &CodeData, target: usize) -> bool {
 }
 
 /// Tier-2 entry for `pc`, if any (standard unit at 0, OSR unit at its header).
+/// (Generator units also have entries after each yield in the standard unit.)
 #[inline]
 fn opt_entry(cd: &CodeData, pc: usize) -> Option<usize> {
-    let p = if pc == 0 { cd.caches.opt.load(Acquire) } else { cd.caches.osr.load(Acquire) };
-    if p.is_null() {
-        return None;
+    let o = cd.caches.opt.load(Acquire);
+    if pc == 0 {
+        return if o.is_null() { None } else { unsafe { (*o).entry(0) } };
     }
-    unsafe { (*p).entry(pc) }
+    let p = cd.caches.osr.load(Acquire);
+    if !p.is_null() {
+        if let Some(e) = unsafe { (*p).entry(pc) } {
+            return Some(e);
+        }
+    }
+    if o.is_null() { None } else { unsafe { (*o).entry(pc) } }
 }
 
 #[inline]
@@ -490,11 +497,16 @@ pub fn trampoline() -> usize {
 
 /// Machine-code entry of a newly created generator frame of `code` (0 if its code is
 /// not compiled): the frame's first resumption enters it directly (`Frame::resume`).
+/// Counts the creation towards tier-2 compilation of the generator's code.
 #[inline]
-pub fn generator_entry(cd: &CodeData) -> usize {
+pub fn generator_entry(f: &Frame) -> usize {
+    let cd = crate::types::code::code_data(f.code());
     let c = cd.caches.jit.load(Acquire);
     if c.is_null() || crate::modules::sys::tracing_active() {
         return 0;
+    }
+    if bump_invocations(cd) {
+        opt::compile(f.code(), f.globals, f.builtins, 0);
     }
     match opt_entry(cd, 0) {
         Some(t) => t,

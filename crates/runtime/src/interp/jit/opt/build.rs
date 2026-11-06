@@ -157,17 +157,38 @@ fn jumps(op: Op) -> bool {
     op.is_jump()
 }
 
-fn build_cfg(an: &Analysis, entry: usize) -> Cfg {
+/// Block-ending instruction of the unit's CFG: a generator unit (`resumes` non-empty)
+/// leaves through `YieldValue` and comes back through a separate entry.
+fn ends_block(op: Op, is_gen: bool) -> bool {
+    is_terminator(op) || (is_gen && op == Op::YieldValue)
+}
+
+/// Instruction indices where a generator unit is re-entered after a yield (empty for
+/// other units).
+fn resume_points(u: &Unit) -> Vec<usize> {
+    use rpy_compiler::bytecode::co as cof;
+    if u.entry != 0 || u.flags & (cof::GENERATOR | cof::COROUTINE | cof::ASYNC_GENERATOR | cof::ITERABLE_COROUTINE) == 0 {
+        return Vec::new();
+    }
+    let an = u.an;
+    (0..an.instrs.len()).filter(|&i| i > 0 && an.instrs[i - 1].op == Op::YieldValue && an.depth[i] >= 0 && an.depth[i - 1] >= 0).collect()
+}
+
+fn build_cfg(an: &Analysis, entry: usize, resumes: &[usize]) -> Cfg {
     let n = an.instrs.len();
+    let is_gen = !resumes.is_empty();
     let mut leader = vec![false; n + 1];
     leader[0] = true;
     leader[entry] = true;
+    for &r in resumes {
+        leader[r] = true;
+    }
     for i in 0..n {
         let ins = an.instrs[i];
         if an.is_target[i] {
             leader[i] = true;
         }
-        if jumps(ins.op) || is_terminator(ins.op) {
+        if jumps(ins.op) || ends_block(ins.op, is_gen) {
             leader[i + 1] = true;
             if jumps(ins.op) {
                 leader[an.index_of[ins.arg as usize] as usize] = true;
@@ -195,33 +216,40 @@ fn build_cfg(an: &Analysis, entry: usize) -> Cfg {
         if jumps(ins.op) {
             s.push(block_of[an.index_of[ins.arg as usize] as usize] as usize);
         }
-        if !is_terminator(ins.op) && blocks[b].last + 1 < n {
+        if !ends_block(ins.op, is_gen) && blocks[b].last + 1 < n {
             s.push(block_of[blocks[b].last + 1] as usize);
         }
         blocks[b].succs = s;
     }
-    // reverse postorder from the entry block; backedges mark loop headers
+    // reverse postorder from the entry blocks (resume entries first, so the main
+    // entry comes first in the order); backedges mark loop headers
     let eb = block_of[entry] as usize;
     let mut post = Vec::new();
     let mut state = vec![0u8; blocks.len()]; // 0 new, 1 on stack, 2 done
-    let mut stack: Vec<(usize, usize)> = vec![(eb, 0)];
-    state[eb] = 1;
-    while let Some(&mut (b, ref mut k)) = stack.last_mut() {
-        if *k < blocks[b].succs.len() {
-            let s = blocks[b].succs[*k];
-            *k += 1;
-            match state[s] {
-                0 => {
-                    state[s] = 1;
-                    stack.push((s, 0));
+    let roots: Vec<usize> = resumes.iter().rev().map(|&r| block_of[r] as usize).chain(std::iter::once(eb)).collect();
+    for root in roots {
+        if state[root] != 0 {
+            continue;
+        }
+        let mut stack: Vec<(usize, usize)> = vec![(root, 0)];
+        state[root] = 1;
+        while let Some(&mut (b, ref mut k)) = stack.last_mut() {
+            if *k < blocks[b].succs.len() {
+                let s = blocks[b].succs[*k];
+                *k += 1;
+                match state[s] {
+                    0 => {
+                        state[s] = 1;
+                        stack.push((s, 0));
+                    }
+                    1 => blocks[s].header = true,
+                    _ => {}
                 }
-                1 => blocks[s].header = true,
-                _ => {}
+            } else {
+                state[b] = 2;
+                post.push(b);
+                stack.pop();
             }
-        } else {
-            state[b] = 2;
-            post.push(b);
-            stack.pop();
         }
     }
     post.reverse();
@@ -237,6 +265,10 @@ fn build_cfg(an: &Analysis, entry: usize) -> Cfg {
     if blocks[eb].header || entry != 0 {
         // the entry is also reached from outside
         blocks[eb].npreds += 1;
+    }
+    for &r in resumes {
+        // entered from a synthetic resume-entry block
+        blocks[block_of[r] as usize].npreds += 1;
     }
     Cfg { blocks, block_of, order: post }
 }
@@ -281,6 +313,8 @@ struct B<'a> {
     /// callee analyses / units referenced through `u` while inlining
     inl_an: Vec<Box<Analysis>>,
     inl_units: Vec<Box<Unit<'static>>>,
+    /// generator unit: YieldValue suspends natively and resumes at its own entry
+    is_gen: bool,
 }
 
 /// State of an inlined call being built.
@@ -951,15 +985,19 @@ impl<'a> B<'a> {
 
     // ------------------------------------------------------------ control flow
     fn initial_state(&mut self) -> State {
+        self.initial_state_at(self.u.entry)
+    }
+    /// State when the unit is entered at instruction `at` (everything in the frame).
+    fn initial_state_at(&mut self, at: usize) -> State {
         let n = self.u.nlp;
         let mut locals = Vec::with_capacity(n);
         for i in 0..n {
             locals.push(match self.reps[i] {
                 Rep::Frame => LS::Frame(Ty::Unknown),
-                _ => LS::Unboxed { dirty: false, def: if self.u.entry == 0 { Def::No } else { Def::Maybe } },
+                _ => LS::Unboxed { dirty: false, def: if at == 0 { Def::No } else { Def::Maybe } },
             });
         }
-        let d = self.u.an.depth[self.u.entry].max(0) as usize;
+        let d = self.u.an.depth[at].max(0) as usize;
         State { stack: vec![AV::InFrame(Ty::Unknown); d], locals, ptr: vec![None; n], unb: vec![None; n] }
     }
 
@@ -1354,6 +1392,27 @@ impl<'a> B<'a> {
                     Some(self.f.snaps.len() as SnapId - 1)
                 };
                 self.term(Term::Return(v, d, snap));
+            }
+            Op::YieldValue if self.is_gen && self.inl.is_none() => {
+                // suspend: everything goes to the frame; the next resumption enters
+                // this unit at the instruction after the yield (`resume_points`)
+                let (v, own, _) = self.pop_obj();
+                let v = match own {
+                    Own::Owned => v,
+                    _ => {
+                        self.emit(Inst::Incref(v));
+                        v
+                    }
+                };
+                self.materialize_stack();
+                let d = self.st.stack.len() as u32;
+                let locals = self.dirty_locals();
+                let ins = self.u.an.instrs[i];
+                let next = self.u.an.instrs.get(i + 1).map_or(ins.pc + 1, |n| n.start);
+                let yfs = if i > 0 && self.u.an.instrs[i - 1].op == Op::Send { self.u.an.instrs[i - 1].pc as i32 } else { -1 };
+                self.f.snaps.push(Snapshot { resume: next, lasti: ins.pc, stack: Vec::new(), locals, kind: SnapKind::TemplateExit, inl: None });
+                let snap = self.f.snaps.len() as SnapId - 1;
+                self.term(Term::Yield(v, d, snap, yfs));
             }
             Op::BinarySubscr => self.binary_subscr(i),
             Op::LoadAttr => self.load_attr(i),
@@ -2836,7 +2895,8 @@ fn unbox_candidates(u: &Unit) -> Vec<bool> {
 }
 
 fn build_once(u: &Unit, reps: &[Rep], assume: &mut Vec<Option<State>>) -> Result<(Built, bool, Vec<u8>), String> {
-    let cfg = build_cfg(u.an, u.entry);
+    let resumes = resume_points(u);
+    let cfg = build_cfg(u.an, u.entry, &resumes);
     let nb = cfg.blocks.len();
     let mut f = Func { blocks: Vec::new(), classes: Vec::new(), snaps: Vec::new(), order: Vec::new(), entries: Vec::new() };
     let mut ir_block = vec![u32::MAX; nb];
@@ -2877,27 +2937,35 @@ fn build_once(u: &Unit, reps: &[Rep], assume: &mut Vec<Option<State>>) -> Result
         inl: None,
         inl_an: Vec::new(),
         inl_units: Vec::new(),
+        is_gen: !resumes.is_empty(),
     };
-    // OSR unit: a separate entry block unboxes the unboxed locals from the frame and
-    // jumps to the loop header
-    let mut entry_block = b.ir_block[b.cfg.block_of[u.entry] as usize];
-    if u.entry != 0 {
+    // OSR unit / generator resumption: a separate entry block unboxes the unboxed
+    // locals from the frame and jumps to the loop header / instruction after the yield
+    let synthetic_entry = |b: &mut B, at: usize| -> BlockId {
         let eb = b.new_block(u32::MAX);
-        entry_block = eb;
         b.cur = eb;
         b.closed = false;
-        b.st = b.initial_state();
+        b.st = b.initial_state_at(at);
         for li in 0..u.nlp {
             if b.reps[li] != Rep::Frame {
-                let snap = b.snap(u.entry, SnapKind::Deopt);
+                let snap = b.snap(at, SnapKind::Deopt);
                 let k = if b.reps[li] == Rep::F64 { BoxK::Float } else { BoxK::Int };
                 let home = b.homes[li];
                 b.emit(Inst::LoadLocalUnboxed { home, slot: li as u32, k, snap });
             }
         }
-        let hb = b.cfg.block_of[u.entry] as usize;
+        let hb = b.cfg.block_of[at] as usize;
         let t = b.edge(hb);
         b.term(Term::Jump(t));
+        eb
+    };
+    let mut entry_block = b.ir_block[b.cfg.block_of[u.entry] as usize];
+    if u.entry != 0 {
+        entry_block = synthetic_entry(&mut b, u.entry);
+    }
+    let mut resume_blocks = Vec::new();
+    for &r in &resumes {
+        resume_blocks.push((u.an.instrs[r].start, synthetic_entry(&mut b, r)));
     }
     for &bb in &order {
         b.build_block(bb)?;
@@ -2912,6 +2980,7 @@ fn build_once(u: &Unit, reps: &[Rep], assume: &mut Vec<Option<State>>) -> Result
     }
     let mut f = b.f;
     f.entries.push((u.an.instrs[u.entry].start, entry_block));
+    f.entries.extend(resume_blocks);
     // emission order: creation order (bytecode RPO with synthetic blocks appended)
     f.order = (0..f.blocks.len() as u32).collect();
     let sk = b.store_kinds;
@@ -2921,7 +2990,12 @@ fn build_once(u: &Unit, reps: &[Rep], assume: &mut Vec<Option<State>>) -> Result
 /// Build the IR of a unit: choose local representations, iterate loop-header
 /// assumptions to a fixed point.
 pub fn build(u: &Unit) -> Result<Built, String> {
-    let cand = unbox_candidates(u);
+    let mut cand = unbox_candidates(u);
+    if !resume_points(u).is_empty() {
+        // generator units keep locals boxed: every suspension would have to box the
+        // unboxed ones into the frame and every resumption unbox them again
+        cand.iter_mut().for_each(|c| *c = false);
+    }
     let mut reps = vec![Rep::Frame; u.nlp];
     let mut assume: Vec<Option<State>> = Vec::new();
     let mut chose_reps = false;

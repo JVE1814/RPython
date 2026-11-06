@@ -74,7 +74,7 @@ pub fn allocate(f: &Func) -> Alloc {
         }
         u.clear();
         f.blocks[b].term.uses(&mut u);
-        if let Term::Deopt(s) | Term::Return(_, _, Some(s)) = f.blocks[b].term {
+        if let Term::Deopt(s) | Term::Return(_, _, Some(s)) | Term::Yield(_, _, s, _) = f.blocks[b].term {
             f.snaps[s as usize].vregs(&mut u);
         }
         for &x in &u {
@@ -172,7 +172,7 @@ pub fn allocate(f: &Func) -> Alloc {
         }
         u.clear();
         f.blocks[bi].term.uses(&mut u);
-        if let Term::Deopt(s) | Term::Return(_, _, Some(s)) = f.blocks[bi].term {
+        if let Term::Deopt(s) | Term::Return(_, _, Some(s)) | Term::Yield(_, _, s, _) = f.blocks[bi].term {
             f.snaps[s as usize].vregs(&mut u);
         }
         for &x in &u {

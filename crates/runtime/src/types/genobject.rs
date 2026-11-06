@@ -89,7 +89,7 @@ pub fn new_generator_for(frame: Box<Frame>, func: &PyObject, flags: u32) -> PyRe
         let fp = Box::into_raw(frame);
         (*fp).generator = op;
         // jit4: first resumption enters compiled code directly when there is some
-        (*fp).resume = crate::interp::jit::generator_entry(crate::types::code::code_data((*fp).code()));
+        (*fp).resume = crate::interp::jit::generator_entry(&*fp);
         gn.frame = fp;
         if tp == coro_type() {
             // coroutines keep their origin (sys.set_coroutine_origin_tracking_depth) here

@@ -500,9 +500,20 @@ impl<'a> Gen<'a> {
                 if !self.no_fuse && i + 1 < self.ilabel.len() {
                     // the next resumption enters the continuation directly
                     // (genobject.rs `gen_send_fast`)
+                    // (unless tier-2 code is installed: the general resumption path
+                    // moves the activation there)
                     let cont = self.ilabel[i + 1];
+                    let t2 = self.a.label();
+                    let done = self.a.label();
+                    self.a.mov_ri(Rdx, &self.cd.caches.opt as *const _ as i64);
+                    self.a.cmp_mi(M(Rdx, 0), 0);
+                    self.a.jcc(Cc::NE, t2);
                     self.a.mov_r_label_addr(Rcx, cont);
                     self.a.store(M(Rbx, RESUME), Rcx);
+                    self.a.jmp(done);
+                    self.a.bind(t2);
+                    self.a.store_i(M(Rbx, RESUME), 0);
+                    self.a.bind(done);
                 }
                 self.a.mov_ri(Rax, ST_YIELD as i64);
                 self.a.jmp(self.exit);
