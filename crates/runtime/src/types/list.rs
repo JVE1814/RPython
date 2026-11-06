@@ -4,6 +4,18 @@
 //!
 //! Mutations take the per-object lock (`dict::ob_lock`); old items are released
 //! only after the lock is dropped (their deallocation may run Python code).
+//!
+//! Lock-free readers (perf2, DECISIONS D6): `get_signed` and the JIT's inline list
+//! subscript read `ob_size`, then `ob_item`, then the item, without the lock. While
+//! more than one thread runs (`qsbr::multi_threaded`) writers keep that safe:
+//! * an item array is never shrunk or reallocated in place: growing copies into a
+//!   fresh zero-filled array which is published (release) before the new size, and the
+//!   old array is freed after a grace period (`qsbr::free_deferred`); clearing
+//!   publishes size 0 and then a null array;
+//! * items leaving a list (replaced, deleted, popped, cleared) are released through
+//!   `qsbr::decref_deferred`, so a reader that loaded the pointer can still incref it;
+//! * readers treat a null array or a null slot as "index out of range" (a racy read).
+//! Single-threaded processes use plain realloc/free and immediate decrefs.
 
 use crate::abstract_ as ab;
 use crate::alloc;
@@ -66,7 +78,81 @@ pub fn list_to_vec(o: &PyObject) -> Vec<PyRef> {
 }
 
 unsafe fn alloc_items(n: usize) -> *mut *mut PyObject {
-    unsafe { alloc::raw_malloc(n * 8) as *mut *mut PyObject }
+    unsafe { alloc::buf_calloc(n * 8) as *mut *mut PyObject }
+}
+
+/// Lock-free readers may exist (see the module docs).
+#[inline(always)]
+fn shared() -> bool {
+    crate::qsbr::multi_threaded()
+}
+
+unsafe fn free_items_now(p: *mut u8) {
+    unsafe { alloc::buf_free(p) }
+}
+
+/// Free an item array that lock-free readers may still be looking at.
+#[inline]
+unsafe fn free_items(arr: *mut *mut PyObject) {
+    if !arr.is_null() {
+        unsafe { crate::qsbr::free_deferred(arr as *mut u8, free_items_now) }
+    }
+}
+
+/// Release an item that left a list (deferred while readers may hold the pointer).
+#[inline]
+unsafe fn release_item(p: *mut PyObject) {
+    if !p.is_null() {
+        unsafe { crate::qsbr::decref_deferred(p) }
+    }
+}
+
+#[inline(always)]
+unsafe fn publish_items(l: *mut PyListObject, arr: *mut *mut PyObject) {
+    unsafe { std::sync::atomic::AtomicPtr::from_ptr(&raw mut (*l).ob_item).store(arr, std::sync::atomic::Ordering::Release) }
+}
+#[inline(always)]
+unsafe fn publish_size(l: *mut PyListObject, n: usize) {
+    unsafe {
+        std::sync::atomic::AtomicIsize::from_ptr(&raw mut (*l).ob_base.ob_size).store(n as isize, std::sync::atomic::Ordering::Release)
+    }
+}
+
+/// Room for `need` items (CPython's over-allocation), size unchanged. Lock held.
+unsafe fn reserve_locked(l: *mut PyListObject, need: usize) -> bool {
+    unsafe {
+        if need <= (*l).allocated.max(0) as usize {
+            return true;
+        }
+        grow_items(l, (need + (need >> 3) + 6) & !3usize)
+    }
+}
+
+/// Give the list an array of capacity `cap` (> current size) keeping the items.
+/// Lock held. While shared, the old array is copied and retired, never reallocated.
+unsafe fn grow_items(l: *mut PyListObject, cap: usize) -> bool {
+    unsafe {
+        let old = (*l).ob_item;
+        let arr = if shared() {
+            let a = alloc::buf_calloc(cap * 8) as *mut *mut PyObject;
+            if !a.is_null() && !old.is_null() {
+                let n = ((*l).ob_base.ob_size.max(0) as usize).min((*l).allocated.max(0) as usize);
+                std::ptr::copy_nonoverlapping(old, a, n);
+            }
+            a
+        } else {
+            alloc::buf_realloc(old as *mut u8, cap * 8) as *mut *mut PyObject
+        };
+        if arr.is_null() {
+            return false;
+        }
+        publish_items(l, arr);
+        (*l).allocated = cap as isize;
+        if shared() && !old.is_null() {
+            free_items(old);
+        }
+        true
+    }
 }
 
 pub fn new_list(items: Vec<PyRef>) -> PyRef {
@@ -129,13 +215,21 @@ fn resize_locked(o: &PyObject, newsize: usize) {
         if newsize == 0 {
             new_alloc = 0;
         }
+        if shared() {
+            // never shrink while lock-free readers may exist
+            if newsize > allocated && !grow_items(l, new_alloc.max(newsize)) {
+                return;
+            }
+            publish_size(l, newsize);
+            return;
+        }
         let arr = if new_alloc == 0 {
             if !(*l).ob_item.is_null() {
-                alloc::raw_free((*l).ob_item as *mut u8);
+                alloc::buf_free((*l).ob_item as *mut u8);
             }
             std::ptr::null_mut()
         } else {
-            alloc::raw_realloc((*l).ob_item as *mut u8, new_alloc * 8) as *mut *mut PyObject
+            alloc::buf_realloc((*l).ob_item as *mut u8, new_alloc * 8) as *mut *mut PyObject
         };
         (*l).ob_item = arr;
         (*l).allocated = new_alloc as isize;
@@ -151,9 +245,7 @@ pub fn reserve(o: &PyObject, n: usize) {
         if (*l).allocated.max(0) as usize >= n {
             return;
         }
-        let arr = alloc::raw_realloc((*l).ob_item as *mut u8, n * 8) as *mut *mut PyObject;
-        (*l).ob_item = arr;
-        (*l).allocated = n as isize;
+        grow_items(l, n);
     }
 }
 
@@ -165,28 +257,39 @@ pub fn append(o: &PyObject, item: PyRef) {
         let n = (*l).ob_base.ob_size as usize;
         if (n as isize) < (*l).allocated {
             *(*l).ob_item.add(n) = item.into_raw();
-            (*l).ob_base.ob_size = (n + 1) as isize;
+            publish_size(l, n + 1);
             return;
         }
-        resize_locked(o, n + 1);
+        if !reserve_locked(l, n + 1) {
+            return;
+        }
         *(*l).ob_item.add(n) = item.into_raw();
+        publish_size(l, n + 1);
     }
 }
 
-/// Item `i` (negative counts from the end) for interpreter/JIT fast paths. The
-/// item array can be replaced and freed by a concurrent writer, so the read is
-/// done under the list lock once the process has more than one thread.
+/// Item `i` (negative counts from the end) for interpreter/JIT fast paths: a
+/// lock-free read (size, then array, then item; see the module docs). A racing
+/// writer can make it report "out of range".
 #[inline]
 pub fn get_signed(o: &PyObject, i: i64) -> Option<PyRef> {
-    let _g = if crate::threads::multi_threaded() { Some(ob_lock(o)) } else { None };
+    use std::sync::atomic::{AtomicIsize, AtomicPtr, Ordering::Acquire};
     unsafe {
         let l = lp(o);
-        let n = (*l).ob_base.ob_size as i64;
+        let n = AtomicIsize::from_ptr(&raw mut (*l).ob_base.ob_size).load(Acquire) as i64;
         let i = if i < 0 { i + n } else { i };
         if i < 0 || i >= n {
             return None;
         }
-        Some(PyRef::from_borrowed(*(*l).ob_item.add(i as usize)))
+        let arr = AtomicPtr::from_ptr(&raw mut (*l).ob_item).load(Acquire);
+        if arr.is_null() {
+            return None;
+        }
+        let it = AtomicPtr::from_ptr(arr.add(i as usize)).load(Acquire);
+        if it.is_null() {
+            return None;
+        }
+        Some(PyRef::from_borrowed(it))
     }
 }
 
@@ -206,7 +309,6 @@ pub fn get(o: &PyObject, i: usize) -> Option<PyRef> {
     items.get(i).map(|x| x.to_ref())
 }
 
-/// Replace item `i` (must be in range).
 /// Replace item `i` (negative counts from the end); `false` if out of range.
 pub fn set_index(o: &PyObject, i: isize, v: PyRef) -> bool {
     let old = {
@@ -220,29 +322,19 @@ pub fn set_index(o: &PyObject, i: isize, v: PyRef) -> bool {
             }
             let slot = (*l).ob_item.add(i as usize);
             let old = *slot;
-            *slot = v.into_raw();
+            std::sync::atomic::AtomicPtr::from_ptr(slot).store(v.into_raw(), std::sync::atomic::Ordering::Release);
             old
         }
     };
-    unsafe { xdecref(old) };
+    unsafe { release_item(old) };
     true
 }
 
+/// Replace item `i` (must be in range).
 pub fn set(o: &PyObject, i: usize, v: PyRef) {
-    let old = {
-        let _g = ob_lock(o);
-        unsafe {
-            let l = lp(o);
-            if i >= (*l).ob_base.ob_size as usize {
-                return;
-            }
-            let slot = (*l).ob_item.add(i);
-            let old = *slot;
-            *slot = v.into_raw();
-            old
-        }
-    };
-    unsafe { xdecref(old) };
+    if i <= isize::MAX as usize {
+        set_index(o, i as isize, v);
+    }
 }
 
 /// Replace the full contents.
@@ -254,22 +346,35 @@ pub fn set_contents(o: &PyObject, items: Vec<PyRef>) {
             let old_n = (*l).ob_base.ob_size as usize;
             let old_arr = (*l).ob_item;
             let n = items.len();
-            let arr = if n > 0 { alloc_items(n) } else { std::ptr::null_mut() };
+            let arr = if n > 0 { if shared() { alloc::buf_calloc(n * 8) as *mut *mut PyObject } else { alloc_items(n) } } else { std::ptr::null_mut() };
             for (i, it) in items.into_iter().enumerate() {
                 *arr.add(i) = it.into_raw();
             }
-            (*l).ob_item = arr;
+            if shared() {
+                // readers holding the old size must not index past the new array
+                publish_size(l, 0);
+            }
+            publish_items(l, arr);
             (*l).allocated = n as isize;
-            (*l).ob_base.ob_size = n as isize;
+            publish_size(l, n);
             (old_arr, old_n)
         }
     };
-    release_array(old_arr, old_n);
+    release_array(old_arr, old_n, true);
 }
 
-fn release_array(arr: *mut *mut PyObject, n: usize) {
+/// Release the first `n` items and the array (`shared`: readers may still look at
+/// them, see the module docs).
+fn release_array(arr: *mut *mut PyObject, n: usize, shared_ok: bool) {
     unsafe {
         if arr.is_null() {
+            return;
+        }
+        if shared_ok && shared() {
+            for i in (0..n).rev() {
+                release_item(*arr.add(i));
+            }
+            free_items(arr);
             return;
         }
         // decref back to front like CPython's list_clear
@@ -278,7 +383,7 @@ fn release_array(arr: *mut *mut PyObject, n: usize) {
             i -= 1;
             xdecref(*arr.add(i));
         }
-        alloc::raw_free(arr as *mut u8);
+        alloc::buf_free(arr as *mut u8);
     }
 }
 
@@ -296,23 +401,29 @@ pub fn splice(o: &PyObject, lo: usize, hi: usize, items: Vec<PyRef>) {
             let removed: Vec<*mut PyObject> = (lo..hi).map(|i| *(*l).ob_item.add(i)).collect();
             let newsize = n - d + k;
             if k > d {
-                resize_locked(o, newsize);
+                // make room first; the new size is published only once the slots are
+                // filled (readers see the old size meanwhile)
+                if !reserve_locked(l, newsize) {
+                    return;
+                }
                 let arr = (*l).ob_item;
                 std::ptr::copy(arr.add(hi), arr.add(lo + k), n - hi);
             } else if k < d {
                 let arr = (*l).ob_item;
                 std::ptr::copy(arr.add(hi), arr.add(lo + k), n - hi);
-                resize_locked(o, newsize);
             }
             let arr = (*l).ob_item;
             for (i, it) in items.into_iter().enumerate() {
                 *arr.add(lo + i) = it.into_raw();
             }
+            if newsize != n {
+                resize_locked(o, newsize);
+            }
             removed
         }
     };
     for p in removed {
-        unsafe { xdecref(p) };
+        unsafe { release_item(p) };
     }
 }
 
@@ -332,6 +443,12 @@ pub fn pop_index(o: &PyObject, i: isize) -> Result<PyRef, usize> {
         let it = *arr.add(i);
         std::ptr::copy(arr.add(i + 1), arr.add(i), n - i - 1);
         resize_locked(o, n - 1);
+        if shared() {
+            // a lock-free reader may have loaded `it` just before: keep it alive
+            // for a grace period even if the caller drops it at once
+            incref(it);
+            release_item(it);
+        }
         Ok(PyRef::from_raw(it))
     }
 }
@@ -350,10 +467,13 @@ pub fn insert(o: &PyObject, i: usize, v: PyRef) {
         let l = lp(o);
         let n = (*l).ob_base.ob_size as usize;
         let i = i.min(n);
-        resize_locked(o, n + 1);
+        if !reserve_locked(l, n + 1) {
+            return;
+        }
         let arr = (*l).ob_item;
         std::ptr::copy(arr.add(i), arr.add(i + 1), n - i);
         *arr.add(i) = v.into_raw();
+        publish_size(l, n + 1);
     }
 }
 
@@ -363,13 +483,13 @@ pub fn clear(o: &PyObject) {
         unsafe {
             let l = lp(o);
             let r = ((*l).ob_item, (*l).ob_base.ob_size as usize);
-            (*l).ob_item = std::ptr::null_mut();
-            (*l).ob_base.ob_size = 0;
+            publish_size(l, 0);
+            publish_items(l, std::ptr::null_mut());
             (*l).allocated = 0;
             r
         }
     };
-    release_array(arr, n);
+    release_array(arr, n, true);
 }
 
 /// Take the item array out of the list (leaving it empty). Used by sort.
@@ -379,35 +499,46 @@ pub fn take_items(o: &PyObject) -> Vec<*mut PyObject> {
         let l = lp(o);
         let n = (*l).ob_base.ob_size as usize;
         let v = (0..n).map(|i| *(*l).ob_item.add(i)).collect();
-        if !(*l).ob_item.is_null() {
-            alloc::raw_free((*l).ob_item as *mut u8);
+        let arr = (*l).ob_item;
+        publish_size(l, 0);
+        publish_items(l, std::ptr::null_mut());
+        if !arr.is_null() {
+            if shared() { free_items(arr) } else { alloc::buf_free(arr as *mut u8) }
         }
-        (*l).ob_item = std::ptr::null_mut();
-        (*l).ob_base.ob_size = 0;
         (*l).allocated = -1;
         v
     }
 }
 /// Put an owned item array back (the list must be empty); returns the items
-/// that were in the list meanwhile (owned) so the caller can release them.
+/// that were in the list meanwhile (owned) so the caller can release them (with
+/// `release_items`).
 pub fn restore_items(o: &PyObject, items: Vec<*mut PyObject>) -> Vec<*mut PyObject> {
     let _g = ob_lock(o);
     unsafe {
         let l = lp(o);
         let n0 = (*l).ob_base.ob_size as usize;
         let old: Vec<*mut PyObject> = (0..n0).map(|i| *(*l).ob_item.add(i)).collect();
-        if !(*l).ob_item.is_null() {
-            alloc::raw_free((*l).ob_item as *mut u8);
-        }
+        let old_arr = (*l).ob_item;
+        publish_size(l, 0);
         let n = items.len();
         let arr = if n > 0 { alloc_items(n) } else { std::ptr::null_mut() };
         for (i, p) in items.into_iter().enumerate() {
             *arr.add(i) = p;
         }
-        (*l).ob_item = arr;
-        (*l).ob_base.ob_size = n as isize;
+        publish_items(l, arr);
         (*l).allocated = n as isize;
+        publish_size(l, n);
+        if !old_arr.is_null() {
+            if shared() { free_items(old_arr) } else { alloc::buf_free(old_arr as *mut u8) }
+        }
         old
+    }
+}
+
+/// Release items removed from a list (see `restore_items`).
+pub fn release_items(items: Vec<*mut PyObject>) {
+    for p in items {
+        unsafe { release_item(p) };
     }
 }
 
@@ -419,7 +550,7 @@ pub unsafe extern "C" fn list_dealloc(op: *mut PyObject) {
         let arr = (*l).ob_item;
         (*l).ob_item = std::ptr::null_mut();
         (*l).ob_base.ob_size = 0;
-        release_array(arr, n);
+        release_array(arr, n, false);
         let tp = (*op).type_ptr();
         crate::types::typeobject::generic_free_and_type_decref(op, tp);
     }
@@ -465,11 +596,15 @@ pub fn extend(o: &PyObject, it: &PyObject) -> PyResult<()> {
         unsafe {
             let l = lp(o);
             let n = (*l).ob_base.ob_size as usize;
-            resize_locked(o, n + items.len());
+            let k = items.len();
+            if !reserve_locked(l, n + k) {
+                return Err(memory_error());
+            }
             let arr = (*l).ob_item;
             for (i, x) in items.into_iter().enumerate() {
                 *arr.add(n + i) = x.into_raw();
             }
+            publish_size(l, n + k);
         }
         return Ok(());
     }
@@ -481,10 +616,7 @@ pub fn extend(o: &PyObject, it: &PyObject) -> PyResult<()> {
         unsafe {
             let l = lp(o);
             if ((*l).allocated.max(0) as usize) < n + hint {
-                let want = n + hint.min(1 << 24);
-                let arr = alloc::raw_realloc((*l).ob_item as *mut u8, want * 8) as *mut *mut PyObject;
-                (*l).ob_item = arr;
-                (*l).allocated = want as isize;
+                grow_items(l, n + hint.min(1 << 24));
             }
         }
     }

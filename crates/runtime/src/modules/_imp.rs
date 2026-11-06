@@ -253,8 +253,9 @@ fn imp_rpy_read_file(_m: &PyObject, p: &PyObject) -> PyResult {
 
 /// pyc magic: 3690..3699 (the top of the 3.15 range, 2900+50*15, unlikely to collide
 /// with CPython's own) selected by a hash of the compiler sources (stale caches written
-/// by an older compiler are never reused), then "\r\n".
-pub const MAGIC: u32 = (3690 + rpy_compiler::BYTECODE_HASH % 10) | ((b'\r' as u32) << 16) | ((b'\n' as u32) << 24);
+/// by an older compiler are never reused) and by the marshal layout of code objects
+/// (`marshal::CODE_FORMAT`), then "\r\n".
+pub const MAGIC: u32 = (3690 + (rpy_compiler::BYTECODE_HASH % 10 + crate::modules::marshal::CODE_FORMAT) % 10) | ((b'\r' as u32) << 16) | ((b'\n' as u32) << 24);
 
 pub fn init_module() -> PyResult {
     let m = crate::types::module::new_module("_imp")?;

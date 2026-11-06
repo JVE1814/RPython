@@ -715,6 +715,16 @@ pub fn line_for_instr(co: &PyObject, i: usize) -> Option<u32> {
     }
 }
 
+pub fn code_name(o: &PyObject) -> PyRef {
+    code_meta(o).co_name.clone()
+}
+pub fn code_qualname(o: &PyObject) -> PyRef {
+    code_meta(o).co_qualname.clone()
+}
+pub fn code_docstring(o: &PyObject) -> Option<PyRef> {
+    code(o).docstring()
+}
+
 /// Line of internal pc `i` as frames report it (f_lineno, tracebacks): for public code
 /// exactly the line co_lines() gives the instruction (None for artificial ones); legacy
 /// code walks back over artificial instructions.

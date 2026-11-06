@@ -31,6 +31,9 @@ use rpy_compiler::bytecode::{self as bc, CodeUnit, ExceptionEntry, Location};
 use std::collections::HashMap;
 
 pub const VERSION: i32 = 6;
+/// Layout generation of serialized code objects (part of the pyc magic): 4 = D24 public
+/// wordcode objects (bc-vm).
+pub const CODE_FORMAT: u32 = 4;
 const MAX_DEPTH: usize = 2000;
 const SIZE32_MAX: i64 = 0x7fff_ffff;
 
@@ -1161,6 +1164,11 @@ pub fn loads_slice(data: &[u8], allow_code: bool) -> PyResult {
 }
 
 /// Load from bytes; also returns the number of bytes consumed.
+/// Load one object from a bytes object.
+pub fn loads_bytes(data: &PyObject, allow_code: bool) -> PyResult {
+    loads_slice(bytes::bytes_data(data), allow_code)
+}
+
 pub fn loads_prefix(data: &[u8], allow_code: bool) -> PyResult<(PyRef, usize)> {
     let mut r = Reader { src: Source::Mem { data, pos: 0 }, refs: Vec::new(), depth: 0, allow_code };
     let v = match r.object()? {

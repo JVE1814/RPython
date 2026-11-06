@@ -1181,13 +1181,22 @@ pub fn collect_iterable(o: &PyObject) -> PyResult<Vec<PyRef>> {
 }
 
 pub fn length_hint(o: &PyObject, default: usize) -> PyResult<usize> {
-    if let Ok(n) = length(o) {
-        return Ok(n);
+    // only types with a length slot are asked for len() (perf2: building and
+    // discarding a TypeError per generator was expensive)
+    let has_len = unsafe {
+        let t = o.ty();
+        (!t.tp_as_sequence.is_null() && (*t.tp_as_sequence).sq_length.is_some())
+            || (!t.tp_as_mapping.is_null() && (*t.tp_as_mapping).mp_length.is_some())
+    };
+    if has_len {
+        if let Ok(n) = length(o) {
+            return Ok(n);
+        }
+        if !exc_matches(crate::types::exceptions::TypeError()) {
+            return Err(PyErr);
+        }
+        clear_exc();
     }
-    if !exc_matches(crate::types::exceptions::TypeError()) {
-        return Err(PyErr);
-    }
-    clear_exc();
     match call_special_opt(o, name!("__length_hint__"), &[])? {
         None => Ok(default),
         Some(r) => {

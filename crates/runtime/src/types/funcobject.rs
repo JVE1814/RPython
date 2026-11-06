@@ -91,13 +91,13 @@ pub fn new_function(code: &PyObject, globals: &PyObject, qualname: Option<&PyObj
     unsafe {
         let op = crate::alloc::alloc_object(function_type(), std::mem::size_of::<PyFunctionObject>());
         let f = &mut *(op as *mut PyFunctionObject);
-        let co = crate::types::code::code(code);
+        // header-only accessors: a lazily loaded body stays unloaded until called
         f.func_code = code.to_ref().into_raw();
         f.func_globals = globals.to_ref().into_raw();
-        f.func_name = co.co_name.clone().into_raw();
+        f.func_name = crate::types::code::code_name(code).into_raw();
         f.func_qualname = match qualname {
             Some(q) => q.to_ref().into_raw(),
-            None => co.co_qualname.clone().into_raw(),
+            None => crate::types::code::code_qualname(code).into_raw(),
         };
         // __builtins__ from globals, else the builtins module dict
         let b = match dict::get_item_str(globals, name!("__builtins__")) {
@@ -111,7 +111,7 @@ pub fn new_function(code: &PyObject, globals: &PyObject, qualname: Option<&PyObj
             None => crate::builtins::builtins_dict(),
         };
         f.func_builtins = b.into_raw();
-        f.func_doc = match co.docstring() {
+        f.func_doc = match crate::types::code::code_docstring(code) {
             Some(d) => d.into_raw(),
             None => none::none_ref().into_raw(),
         };
