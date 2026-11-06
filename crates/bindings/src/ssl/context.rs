@@ -901,6 +901,10 @@ fn m_load_verify_locations(o: &PyObject, args: &[&PyObject], kw: Option<&PyObjec
 
 fn m_load_dh_params(o: &PyObject, path: &PyObject) -> PyResult {
     let p = path_cstring(path)?;
+    rpy_runtime::modules::sys_full::audit(
+        "open",
+        &[path, &rpy_runtime::types::str::new_str("rb"), &rpy_runtime::types::int::new_int(0)],
+    )?;
     let bio = cr!(BIO_new_file(p.as_ptr(), cs!("r")));
     if bio.is_null() {
         cr!(ERR_clear_error());

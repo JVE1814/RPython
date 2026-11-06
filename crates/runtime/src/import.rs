@@ -534,6 +534,9 @@ pub fn import_absolute(abs: &str) -> PyResult {
     }
     if active {
         let bs = bootstrap().unwrap();
+        if get_loaded_module(abs).is_none() {
+            audit_import(abs)?;
+        }
         let f = ab::getattr_str(&bs, "_find_and_load")?;
         let imp = crate::builtins::builtin("__import__")?;
         return ab::call(&f, &[&pystr::new_str(abs), &imp]).map_err(|e| {
@@ -675,10 +678,24 @@ pub fn remove_importlib_frames() {
     set_exc(e);
 }
 
+/// The "import" audit event raised before a module not yet in sys.modules is
+/// searched for.
+fn audit_import(abs: &str) -> PyResult<()> {
+    if !crate::modules::sys_full::HAVE_AUDIT_HOOKS.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(());
+    }
+    let attr = |n: &str| crate::modules::sys::get_sys_attr(n).unwrap_or_else(none::none_ref);
+    crate::modules::sys_full::audit(
+        "import",
+        &[&pystr::new_str(abs), none::none(), &attr("path"), &attr("meta_path"), &attr("path_hooks")],
+    )
+}
+
 fn find_and_load(abs: &str, path: Option<&PyObject>) -> PyResult {
     // 1. importlib (only builtin modules until the path finders are installed)
     if let Some(bs) = bootstrap() {
         if importlib_active() || (path.is_none() && find_builtin(abs).is_some()) {
+            audit_import(abs)?;
             let f = ab::getattr_str(&bs, "_find_and_load")?;
             let imp = crate::builtins::builtin("__import__")?;
             return ab::call(&f, &[&pystr::new_str(abs), &imp]);

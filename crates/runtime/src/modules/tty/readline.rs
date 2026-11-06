@@ -161,6 +161,16 @@ fn opt_path(o: Option<&PyObject>) -> PyResult<Option<CString>> {
     }
 }
 
+/// The "open" audit event for a file readline is about to open (`default`
+/// names the file used when no file name was given).
+fn audit_open(arg: Option<&PyObject>, default: &str, mode: &str) -> PyResult<()> {
+    let name = match arg {
+        Some(x) if !x.is(none::none()) => x.to_ref(),
+        _ => crate::types::str::new_str(default),
+    };
+    crate::modules::sys_full::audit("open", &[&name, &crate::types::str::new_str(mode), &crate::types::int::new_int(0)])
+}
+
 fn cptr(c: &Option<CString>) -> *const c_char {
     c.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null())
 }
@@ -194,6 +204,7 @@ fn parse_and_bind(_m: &PyObject, s: &PyObject) -> PyResult {
 fn read_init_file(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     crate::args::check_pos("read_init_file", args, 0, 1)?;
     let p = opt_path(args.first().copied())?;
+    audit_open(args.first().copied(), "<readline_init_file>", "r")?;
     let r = unsafe { (api().rl_read_init_file)(cptr(&p)) };
     if r != 0 {
         return Err(errno_err(r));
@@ -204,6 +215,7 @@ fn read_init_file(_m: &PyObject, args: &[&PyObject]) -> PyResult {
 fn read_history_file(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     crate::args::check_pos("read_history_file", args, 0, 1)?;
     let p = opt_path(args.first().copied())?;
+    audit_open(args.first().copied(), "~/.history", "r")?;
     let _g = RL_LOCK.lock();
     let r = unsafe { (api().read_history)(cptr(&p)) };
     if r != 0 {
@@ -215,6 +227,7 @@ fn read_history_file(_m: &PyObject, args: &[&PyObject]) -> PyResult {
 fn write_history_file(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     crate::args::check_pos("write_history_file", args, 0, 1)?;
     let p = opt_path(args.first().copied())?;
+    audit_open(args.first().copied(), "~/.history", "w")?;
     let a = api();
     let _g = RL_LOCK.lock();
     let mut r = unsafe { (a.write_history)(cptr(&p)) };
@@ -235,6 +248,7 @@ fn append_history_file(_m: &PyObject, args: &[&PyObject]) -> PyResult {
         raise!(ValueError, "nelements must be non-negative");
     }
     let p = opt_path(args.get(1).copied())?;
+    audit_open(args.get(1).copied(), "~/.history", "a")?;
     let a = api();
     let _g = RL_LOCK.lock();
     let mut r = unsafe { (a.append_history)(n, cptr(&p)) };
