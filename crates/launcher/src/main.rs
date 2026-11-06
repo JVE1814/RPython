@@ -217,8 +217,16 @@ fn parse_int_max_str_digits(v: &str, from_env: bool) -> i32 {
 }
 
 fn real_main() -> i32 {
-    let args: Vec<String> = std::env::args().collect();
+    // Arguments are bytes on POSIX: options are parsed from a lossy UTF-8 view, while the
+    // exact bytes travel to sys.argv / sys.orig_argv (decoded there with surrogateescape).
+    let raw: Vec<Vec<u8>> = std::env::args_os().map(|a| std::os::unix::ffi::OsStringExt::into_vec(a)).collect();
+    let args: Vec<String> = raw.iter().map(|b| String::from_utf8_lossy(b).into_owned()).collect();
+    let any_undecodable = raw.iter().any(|b| std::str::from_utf8(b).is_err());
     let mut cfg = RtConfig { orig_argv: args.clone(), ..Default::default() };
+    if any_undecodable {
+        cfg.orig_argv_bytes = raw.clone();
+    }
+    let mut cmd_undecodable: Option<Vec<u8>> = None;
     let mut cmd: Option<String> = None;
     let mut module: Option<String> = None;
     let mut warn_cli: Vec<String> = Vec::new();
@@ -295,6 +303,12 @@ fn real_main() -> i32 {
                 i += 1;
                 match c {
                     'c' => {
+                        if std::str::from_utf8(&raw[i - 1]).is_err() {
+                            // the command itself (an attached `-cCMD` carries the option prefix)
+                            let whole = &raw[i - 1];
+                            let skip = if args[i - 1] != val { whole.iter().position(|&b| b == b'c').map_or(0, |p| p + 1) } else { 0 };
+                            cmd_undecodable = Some(whole[skip..].to_vec());
+                        }
                         cmd = Some(val);
                         break 'outer;
                     }
@@ -480,26 +494,44 @@ fn real_main() -> i32 {
         },
         None => None,
     };
+    if let Some(b) = &cmd_undecodable {
+        // the command must be valid source text: report the first undecodable byte the way
+        // encoding the surrogateescape-decoded text back to UTF-8 fails
+        let (pos, byte) = first_undecodable(b);
+        eprintln!("Unable to decode the command from the command line:");
+        eprintln!("UnicodeEncodeError: 'utf-8' codec can't encode character '\\udc{:02x}' in position {}: surrogates not allowed", byte, pos);
+        return 1;
+    }
     let rest: Vec<String> = args[i.min(args.len())..].to_vec();
+    let rest_raw: Vec<Vec<u8>> = raw[i.min(raw.len())..].to_vec();
     let mut argv: Vec<String> = Vec::new();
+    let mut argv_bytes: Vec<Vec<u8>> = Vec::new();
     let mode;
     if let Some(c) = &cmd {
         argv.push("-c".into());
         argv.extend(rest.iter().cloned());
+        argv_bytes.push(b"-c".to_vec());
+        argv_bytes.extend(rest_raw.iter().cloned());
         mode = RunMode::Command(c.clone());
     } else if let Some(m) = &module {
         argv.push("-m".into());
         argv.extend(rest.iter().cloned());
+        argv_bytes.push(b"-m".to_vec());
+        argv_bytes.extend(rest_raw.iter().cloned());
         mode = RunMode::Module(m.clone());
     } else if !rest.is_empty() && !stdin_dash {
         argv.extend(rest.iter().cloned());
+        argv_bytes.extend(rest_raw.iter().cloned());
         mode = RunMode::Script(rest[0].clone());
     } else {
         if stdin_dash {
             argv.push("-".into());
             argv.extend(args[i + 1..].iter().cloned());
+            argv_bytes.push(b"-".to_vec());
+            argv_bytes.extend(raw[i + 1..].iter().cloned());
         } else {
             argv.push(String::new());
+            argv_bytes.push(Vec::new());
         }
         let tty = unsafe { libc::isatty(0) } != 0;
         mode = if tty || cfg.inspect > 0 && !stdin_dash { RunMode::Repl } else { RunMode::Stdin };
@@ -520,7 +552,10 @@ fn real_main() -> i32 {
     let quiet = cfg.quiet != 0;
     let safe_path = cfg.safe_path;
     let opt = cfg.optimize;
-    let rcfg = rpy_runtime::Config { argv, hash_seed: seed, optimize: opt, sys: cfg, pth_paths: pth_paths.map(|p| p.0) };
+    if !any_undecodable {
+        argv_bytes.clear();
+    }
+    let rcfg = rpy_runtime::Config { argv, argv_bytes, hash_seed: seed, optimize: opt, sys: cfg, pth_paths: pth_paths.map(|p| p.0) };
     rpy_bindings::register();
     if rpy_runtime::initialize(&rcfg).is_err() {
         eprintln!("Fatal Python error: initialization failed");
@@ -535,4 +570,17 @@ fn real_main() -> i32 {
         safe_path,
         program_name: prog_name(),
     })
+}
+
+/// (character position, byte) of the first byte that is not part of valid UTF-8 in `b`,
+/// counting characters the way surrogateescape decoding produces them.
+fn first_undecodable(b: &[u8]) -> (usize, u8) {
+    match std::str::from_utf8(b) {
+        Ok(_) => (0, 0),
+        Err(e) => {
+            let valid = e.valid_up_to();
+            let chars = std::str::from_utf8(&b[..valid]).map_or(0, |s| s.chars().count());
+            (chars, b[valid])
+        }
+    }
 }
