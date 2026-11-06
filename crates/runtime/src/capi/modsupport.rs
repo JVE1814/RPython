@@ -114,27 +114,43 @@ pub unsafe extern "C" fn PyABIInfo_Check(info: *mut PyABIInfo, module_name: *con
             return 0;
         }
         let i = &*info;
-        let name = if module_name.is_null() { "<unknown>".into() } else { cs(module_name).into_owned() };
-        if i.abiinfo_major_version != 1 {
-            let _ = crate::err!(ImportError, "module {} uses unsupported PyABIInfo version {}", name, i.abiinfo_major_version);
-            return -1;
+        // messages are "<module>: <problem>", or just the problem without a module name
+        let fail = |msg: String| -> c_int {
+            let full = if module_name.is_null() { msg } else { format!("{}: {}", cs(module_name), msg) };
+            let _ = crate::err!(ImportError, "{}", full);
+            -1
+        };
+        match i.abiinfo_major_version {
+            0 => return 0, // no information
+            1 => {}
+            _ => return fail("PyABIInfo version too high".into()),
         }
-        let ft = i.flags & (ABI_GIL | ABI_FREETHREADED);
-        if ft == ABI_GIL {
-            let _ = crate::err!(ImportError, "module {} was built for a GIL-enabled build of Python, not free-threaded", name);
-            return -1;
+        if i.flags & (ABI_GIL | ABI_FREETHREADED) == ABI_GIL {
+            return fail("incompatible with free-threaded CPython".into());
         }
-        if i.flags & ABI_STABLE == 0 {
-            // version-specific ABI: must be 3.15
-            if i.abi_version >> 16 != 0x030f {
-                let _ = crate::err!(ImportError, "module {}: incompatible ABI version {:#x}", name, i.abi_version);
-                return -1;
+        let ours = crate::modules::sys_full::HEXVERSION as u32;
+        let v = i.abi_version;
+        let mm = |x: u32| format!("{}.{}", x >> 24, (x >> 16) & 0xff);
+        if v == 0 {
+            return 0;
+        }
+        if i.flags & ABI_INTERNAL != 0 {
+            // the internal ABI is tied to the exact build
+            if v != ours {
+                return fail(format!("incompatible internal ABI (0x{:x} != 0x{:x})", v, ours));
             }
-        } else if i.abi_version > 0x030f02f0 {
-            let _ = crate::err!(ImportError, "module {} needs a newer stable ABI ({:#x})", name, i.abi_version);
-            return -1;
+        } else if i.flags & ABI_STABLE != 0 {
+            // the stable ABI exists since 3.2; newer feature releases are not available yet
+            if v < 0x0302_0000 {
+                return fail(format!("invalid stable ABI version ({})", mm(v)));
+            }
+            if v & 0xffff_0000 > ours & 0xffff_0000 {
+                return fail(format!("incompatible future stable ABI version ({})", mm(v)));
+            }
+        } else if v & 0xffff_0000 != ours & 0xffff_0000 {
+            // a version-specific ABI must be this feature release
+            return fail(format!("incompatible ABI version ({})", mm(v)));
         }
-        let _ = ABI_INTERNAL;
         0
     }
 }
