@@ -606,7 +606,7 @@ pub(super) fn call_intrinsic2(f: &mut Frame, which: u32, a: PyRef, b: PyRef) -> 
     }
 }
 
-fn get_awaitable(o: &PyObject, where_: u32) -> PyResult {
+pub(crate) fn get_awaitable(o: &PyObject, where_: u32) -> PyResult {
     match crate::types::genobject::get_awaitable_iter(o) {
         Ok(r) => {
             if crate::types::genobject::is_coroutine_exact(&r) && crate::types::genobject::coro_is_running_await(&r) {

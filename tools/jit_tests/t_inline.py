@@ -118,3 +118,77 @@ print(r, divs(10))
 def who():
     return sys._getframe().f_code.co_name
 print(who())
+
+# callees with branches (paths duplicated, results meet in one value)
+def sign(x):
+    if x > 0:
+        return 1
+    elif x < 0:
+        return -1
+    return 0
+
+def pick(o, a, b):
+    if o is None:
+        return a
+    if o:
+        return b
+    return a + b
+
+class Dir:
+    def __init__(self, fwd, v1, v2):
+        self.fwd = fwd
+        self.v1 = v1
+        self.v2 = v2
+
+    def out(self):
+        if self.fwd:
+            return self.v2
+        else:
+            return self.v1
+
+    def scaled(self, k):
+        if k == 0:
+            return None
+        r = self.v1 * k
+        if r > 100:
+            r = 100
+        return r
+
+def branchy(n):
+    t = 0
+    ds = [Dir(i % 2 == 0, i, -i) for i in range(5)]
+    for i in range(n):
+        t += sign(i - n // 2)
+        t += pick(None if i % 3 == 0 else i % 2 == 0, i, 2)
+        d = ds[i % 5]
+        t += d.out()
+        s = d.scaled(i % 4)
+        if s is not None:
+            t += s
+    return t
+
+for k in range(60):
+    r = branchy(50)
+print(r, branchy(51))
+Dir.out = lambda self: 1000
+print(branchy(50))
+
+# type change inside one path of an inlined branchy callee (deopt), then exceptions
+def half(x, big):
+    if big:
+        return x / 2
+    return x // 2
+
+def use_half(vals):
+    t = 0
+    for i, v in enumerate(vals):
+        t += half(v, i % 2 == 0)
+    return t
+
+for k in range(60):
+    r = use_half(list(range(20)))
+print(r, use_half([1.5, 2, 3.25, 4, 5]))
+try:
+    print(use_half([1, 2, None]))
+except TypeError as e:
+    print("TypeError", [f.name for f in traceback.extract_tb(e.__traceback__)])

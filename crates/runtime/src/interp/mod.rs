@@ -91,12 +91,29 @@ pub unsafe extern "C" fn function_vectorcall(
 
 /// Call a Python function with vectorcall-style arguments.
 pub fn call_function(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwnames: Option<&PyObject>) -> PyResult {
-    if let Some(r) = jit::call_fast(func, args, nargs, kwnames) {
-        return r; // jit workstream: compiled callee, direct entry
-    }
     let f: &PyFunctionObject = funcobject::func(func);
     let co = unsafe { &*f.func_code };
-    let flags = code::code(co).flags();
+    let cobj = code::code(co).obj;
+    let flags = cobj.co_flags as u32;
+    if flags & (bc::co::GENERATOR | bc::co::COROUTINE | bc::co::ASYNC_GENERATOR) != 0 {
+        // jit4: exact positional call of a generator function: arguments copied
+        // straight into the generator's frame
+        if kwnames.is_none()
+            && nargs == cobj.co_argcount as usize
+            && flags & (bc::co::VARARGS | bc::co::VARKEYWORDS) == 0
+            && cobj.co_kwonlyargcount == 0
+        {
+            let mut frame = Frame::new_call(co, func, unsafe { &*f.func_globals }, unsafe { &*f.func_builtins });
+            for (i, &a) in args[..nargs].iter().enumerate() {
+                unsafe { incref(a) };
+                frame.slots[i] = a;
+            }
+            frame.make_owned();
+            return crate::types::genobject::new_generator_for(frame, func, flags);
+        }
+    } else if let Some(r) = jit::call_fast(func, args, nargs, kwnames) {
+        return r; // jit workstream: compiled callee, direct entry
+    }
     // plain calls borrow code/func from the caller (perf-runtime, frame.rs `owns_fc`)
     let mut frame = Frame::new_call(co, func, unsafe { &*f.func_globals }, unsafe { &*f.func_builtins });
     if let Err(e) = bind_arguments(func, &mut frame, args, nargs, kwnames) {

@@ -818,6 +818,7 @@ impl<'a> Gen<'a> {
                 let name = self.cd.names[(arg >> 2) as usize].as_ptr() as i64;
                 self.helper_sp(&ins, d, addr!(h::h_load_super_attr), Some(arg as i64), Some(name), d - 3);
             }
+            Op::GetAwaitable => self.helper_sp(&ins, d, addr!(h::h_get_awaitable), Some(arg as i64), None, d - 1),
             // instructions shared with the interpreter (eval::exec_misc)
             op if crate::interp::eval::is_misc(op) => {
                 let pops = match op {

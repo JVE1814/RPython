@@ -1302,34 +1302,7 @@ impl<'a> B<'a> {
             },
             Op::PopJumpIfFalse | Op::PopJumpIfTrue => {
                 let on_true = ins.op == Op::PopJumpIfTrue;
-                let c = match self.peek(1) {
-                    AV::Cond(c) => {
-                        self.pop();
-                        Some(c)
-                    }
-                    AV::Bool(v) => {
-                        self.pop();
-                        Some(Cond::Test(v, Opnd::V(v), Cc::NE))
-                    }
-                    AV::I64(v) => {
-                        self.pop();
-                        Some(Cond::Test(v, Opnd::V(v), Cc::NE))
-                    }
-                    AV::Const(p) if p == true_p() || p == false_p() || p == none_p() => {
-                        self.pop();
-                        let v = self.imm((p == true_p()) as i64);
-                        Some(Cond::Test(v, Opnd::V(v), Cc::NE))
-                    }
-                    AV::InFrame(t) | AV::Obj(_, _, t) if t.is(crate::types::bool_::bool_type()) => {
-                        let p = self.peek_ptr(1);
-                        let tv = self.imm(true_p() as i64);
-                        let k = self.st.stack.len() - 1;
-                        let a = self.pop();
-                        self.discard(a, k);
-                        Some(Cond::Cmp(p, Opnd::V(tv), Cc::E))
-                    }
-                    _ => None,
-                };
+                let c = self.pop_truth_cond();
                 match c {
                     Some(c) => {
                         let tb = self.target_block(i);
@@ -1460,6 +1433,35 @@ impl<'a> B<'a> {
     fn peek_ptr_if_inframe(&mut self, n: usize) {
         if let AV::InFrame(_) = self.peek(n) {
             self.peek_ptr(n);
+        }
+    }
+
+    /// Truth value of the top of the stack as a condition, popping it, when it can be
+    /// tested natively (None: nothing popped).
+    fn pop_truth_cond(&mut self) -> Option<Cond> {
+        match self.peek(1) {
+            AV::Cond(c) => {
+                self.pop();
+                Some(c)
+            }
+            AV::Bool(v) | AV::I64(v) => {
+                self.pop();
+                Some(Cond::Test(v, Opnd::V(v), Cc::NE))
+            }
+            AV::Const(p) if p == true_p() || p == false_p() || p == none_p() => {
+                self.pop();
+                let v = self.imm((p == true_p()) as i64);
+                Some(Cond::Test(v, Opnd::V(v), Cc::NE))
+            }
+            AV::InFrame(t) | AV::Obj(_, _, t) if t.is(crate::types::bool_::bool_type()) => {
+                let p = self.peek_ptr(1);
+                let tv = self.imm(true_p() as i64);
+                let k = self.st.stack.len() - 1;
+                let a = self.pop();
+                self.discard(a, k);
+                Some(Cond::Cmp(p, Opnd::V(tv), Cc::E))
+            }
+            _ => None,
         }
     }
 
@@ -2424,13 +2426,16 @@ impl<'a> B<'a> {
                 return None;
             }
             let an = super::super::analysis::analyze(&cd.code, &cd.exception_table).ok()?;
-            if an.instrs.len() > 48 {
+            if an.instrs.len() > 64 {
                 return None;
             }
             for (k, ins) in an.instrs.iter().enumerate() {
-                let last = k + 1 == an.instrs.len();
                 let ok = match ins.op {
-                    Op::ReturnValue => last,
+                    Op::ReturnValue => true,
+                    // forward branches only (callee paths are duplicated, no loops)
+                    Op::PopJumpIfFalse | Op::PopJumpIfTrue | Op::PopJumpIfNone | Op::PopJumpIfNotNone | Op::Jump => {
+                        an.index_of[ins.arg as usize] as usize > k
+                    }
                     Op::Nop | Op::ExtendedArg | Op::LoadFast | Op::LoadFastCheck | Op::StoreFast | Op::LoadConst | Op::PopTop | Op::PushNull | Op::Copy | Op::Swap => true,
                     Op::LoadGlobal | Op::LoadAttr | Op::StoreAttr | Op::BinaryOp | Op::CompareOp | Op::IsOp | Op::UnaryNegative | Op::UnaryNot | Op::ToBool => true,
                     Op::BinarySubscr | Op::StoreSubscr | Op::UnpackSequence | Op::Call => true,
@@ -2524,9 +2529,26 @@ impl<'a> B<'a> {
         let up: &'a Unit<'a> = unsafe { &*(&**self.inl_units.last().unwrap() as *const Unit<'static> as *const Unit<'a>) };
         self.u = up;
         self.inl = Some(InlCtx { func: fp, base, locals, cont, res, err, failed: false, snapped: false });
+        // Callees with forward branches are compiled path by path (no joins: the
+        // code after a branch is duplicated per path, bounded by `steps`); every path
+        // ends in its own return, which moves the result into `res` and jumps to
+        // `cont`. Straight-line callees keep their result as an abstract value.
+        let branchy = an_ref.instrs.iter().any(|x| jumps(x.op));
         let mut ok = true;
         let mut result: Option<AV> = None;
-        for j in 0..an_ref.instrs.len() {
+        let mut work: Vec<(usize, State, Vec<AV>, BlockId)> = Vec::new();
+        let (mut steps, mut paths) = (0usize, 1usize);
+        let mut j = 0usize;
+        'paths: loop {
+            if j >= an_ref.instrs.len() {
+                ok = false;
+                break;
+            }
+            steps += 1;
+            if steps > 160 {
+                ok = false;
+                break;
+            }
             let ci = an_ref.instrs[j];
             match ci.op {
                 Op::Resume | Op::Nop | Op::ExtendedArg => {}
@@ -2547,6 +2569,7 @@ impl<'a> B<'a> {
                     let k = ci.arg as usize;
                     let mut a = self.pop();
                     let slot = self.st.stack.len();
+                    let mut same = false;
                     match a {
                         AV::InFrame(t) => {
                             let v = self.v(Class::G);
@@ -2564,25 +2587,95 @@ impl<'a> B<'a> {
                             self.emit(Inst::Incref(v));
                             a = AV::Obj(v, Own::Owned, t);
                         }
-                        AV::Obj(_, Own::Inl(_), _) => continue, // x = x
+                        AV::Obj(_, Own::Inl(_), _) => same = true, // x = x
                         _ => {}
                     }
-                    // stack entries borrowed from the old value become owned
-                    for s in 0..self.st.stack.len() {
-                        if let AV::Obj(v, Own::Inl(o), t) = self.st.stack[s] {
-                            if o as usize == k {
-                                self.emit(Inst::Incref(v));
-                                self.st.stack[s] = AV::Obj(v, Own::Owned, t);
+                    if !same {
+                        // stack entries borrowed from the old value become owned
+                        for s in 0..self.st.stack.len() {
+                            if let AV::Obj(v, Own::Inl(o), t) = self.st.stack[s] {
+                                if o as usize == k {
+                                    self.emit(Inst::Incref(v));
+                                    self.st.stack[s] = AV::Obj(v, Own::Owned, t);
+                                }
                             }
                         }
-                    }
-                    let old = std::mem::replace(&mut self.inl.as_mut().unwrap().locals[k], a);
-                    if let AV::Obj(v, Own::Owned, _) = old {
-                        self.emit(Inst::Decref(v));
+                        let old = std::mem::replace(&mut self.inl.as_mut().unwrap().locals[k], a);
+                        if let AV::Obj(v, Own::Owned, _) = old {
+                            self.emit(Inst::Decref(v));
+                        }
                     }
                 }
-                Op::ReturnValue => {
+                Op::ReturnValue if !branchy => {
                     result = Some(self.pop());
+                    break;
+                }
+                Op::ReturnValue => {
+                    // finish this path: result into `res`, release the callee locals
+                    let r = self.pop();
+                    if self.st.stack.len() != base {
+                        ok = false;
+                        break;
+                    }
+                    let v = self.obj_owned(r);
+                    let locals = self.inl.as_ref().unwrap().locals.clone();
+                    for a in locals {
+                        if let AV::Obj(x, Own::Owned, _) = a {
+                            self.emit(Inst::Decref(x));
+                        }
+                    }
+                    self.emit(Inst::Mov(res, v));
+                    self.term(Term::Jump(cont));
+                    match work.pop() {
+                        None => break 'paths,
+                        Some((nj, st, locals, blk)) => {
+                            self.st = st;
+                            self.inl.as_mut().unwrap().locals = locals;
+                            self.cur = blk;
+                            self.closed = false;
+                            j = nj;
+                            continue;
+                        }
+                    }
+                }
+                Op::Jump => {
+                    // forward only (inline_candidate)
+                    j = an_ref.index_of[ci.arg as usize] as usize;
+                    continue;
+                }
+                Op::PopJumpIfFalse | Op::PopJumpIfTrue | Op::PopJumpIfNone | Op::PopJumpIfNotNone => {
+                    paths += 1;
+                    if paths > 8 {
+                        ok = false;
+                        break;
+                    }
+                    let (c, jump_if) = match ci.op {
+                        Op::PopJumpIfNone | Op::PopJumpIfNotNone => {
+                            let (v, own, _) = self.pop_obj();
+                            let nv = self.imm(none_p() as i64);
+                            let r = self.v(Class::G);
+                            self.emit(Inst::SetCond(r, Cond::Cmp(v, Opnd::V(nv), Cc::E)));
+                            self.release(v, own);
+                            (Cond::Test(r, Opnd::V(r), Cc::NE), ci.op == Op::PopJumpIfNone)
+                        }
+                        _ => match self.pop_truth_cond() {
+                            Some(c) => (c, ci.op == Op::PopJumpIfTrue),
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        },
+                    };
+                    let r = self.v(Class::G);
+                    self.emit(Inst::SetCond(r, c));
+                    let (jb, fb) = (self.new_block(u32::MAX), self.new_block(u32::MAX));
+                    let c2 = Cond::Test(r, Opnd::V(r), if jump_if { Cc::NE } else { Cc::E });
+                    self.term(Term::Branch(c2, jb, fb));
+                    let target = an_ref.index_of[ci.arg as usize] as usize;
+                    let locals = self.inl.as_ref().unwrap().locals.clone();
+                    work.push((target, self.st.clone(), locals, jb));
+                    self.cur = fb;
+                    self.closed = false;
                 }
                 _ => {
                     self.instr(j, j)?;
@@ -2592,10 +2685,12 @@ impl<'a> B<'a> {
                 ok = false;
                 break;
             }
+            j += 1;
         }
         let ctx = self.inl.take().unwrap();
         self.u = caller_u;
-        if !ok || result.is_none() || self.st.stack.len() != base {
+        let bad = if branchy { !ok } else { !ok || result.is_none() || self.st.stack.len() != base };
+        if bad {
             // roll back everything emitted for the attempt
             self.st = save_st;
             self.f.blocks.truncate(save_nblocks);
@@ -2612,6 +2707,18 @@ impl<'a> B<'a> {
             self.has_deps = save_has_deps;
             self.closed = save_closed;
             return Ok(false);
+        }
+        if branchy {
+            // every path returned into `res`; the caller's state is what it was
+            // before the call, without the call operands (the callee cannot change
+            // caller locals, and vregs defined before the call dominate `cont`)
+            let mut st = save_st;
+            st.stack.truncate(base);
+            self.st = st;
+            self.cur = cont;
+            self.closed = false;
+            self.push(AV::Obj(res, Own::Owned, Ty::Unknown));
+            return Ok(true);
         }
         // the result: owned (or a value needing no reference); release the callee locals
         let mut r = result.unwrap();

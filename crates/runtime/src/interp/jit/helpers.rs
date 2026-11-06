@@ -1037,6 +1037,25 @@ pub unsafe extern "C" fn h_load_super_attr(sp: *mut *mut PyObject, arg: u64, nam
 
 // ------------------------------------------------------------------ shared instructions
 
+/// GetAwaitable: [o] -> [awaitable]. A coroutine that is not suspended in an await
+/// is its own awaitable (the common `await coro()` case needs no further work).
+pub unsafe extern "C" fn h_get_awaitable(sp: *mut *mut PyObject, arg: u64) -> u64 {
+    unsafe {
+        let o = &**sp.sub(1);
+        if crate::types::genobject::is_coroutine_exact(o) && !crate::types::genobject::coro_is_running_await(o) {
+            return OK;
+        }
+        let o = take(sp.sub(1));
+        match eval::get_awaitable(&o, arg as u32) {
+            Ok(r) => {
+                put(sp.sub(1), r);
+                OK
+            }
+            Err(_) => ERR,
+        }
+    }
+}
+
 /// Instructions implemented once in `eval::exec_misc` (exception handlers, with,
 /// async iteration, imports, pattern matching, ...). `oparg` = op | arg << 8; the
 /// value stack ends at `sp`. On error the stack is cut back to `err_top` (absolute

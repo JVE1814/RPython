@@ -634,7 +634,8 @@ unsafe extern "C" fn gen_dealloc(o: *mut PyObject) {
         crate::gc::untrack(o);
         let gn = &mut *(o as *mut GenObject);
         crate::types::weakref::clear_weakrefs_at(o, &mut gn.weakreflist);
-        if !crate::gc::is_finalized(o) {
+        // (a finished generator has nothing to finalize: skip the resurrection dance)
+        if !gn.frame.is_null() && !crate::gc::is_finalized(o) {
             crate::gc::set_finalized(o);
             // resurrect temporarily for the finalizer
             (*o).ob_ref_local.store(1, std::sync::atomic::Ordering::Relaxed);
