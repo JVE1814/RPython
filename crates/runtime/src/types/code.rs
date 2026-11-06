@@ -106,6 +106,8 @@ pub struct CodeData {
     /// Public objects: line of each internal word's public instruction (-1 = none);
     /// empty for legacy objects.
     pub pub_lines: Vec<i32>,
+    /// Public objects: observed CPython specialisation per internal word (interp::adaptive).
+    pub spec: Box<[std::sync::atomic::AtomicU8]>,
 }
 
 impl CodeData {
@@ -288,6 +290,7 @@ fn build_exec(c: &PyCodeObject, m: &CodeMeta) -> CodeData {
         gen_start: 0,
         invalid: None,
         pub_lines: Vec::new(),
+        spec: Box::new([]),
     };
     match crate::interp::translate::translate(&inp) {
         Ok(out) => {
@@ -300,6 +303,7 @@ fn build_exec(c: &PyCodeObject, m: &CodeMeta) -> CodeData {
             d.eager_prologue = out.eager_prologue;
             d.gen_start = out.gen_start;
             d.pub_lines = d.pub_of_internal.iter().map(|&u| positions.get(u as usize).and_then(|p| p.lineno).map_or(-1, |l| l as i32)).collect();
+            d.spec = (0..d.code.len()).map(|_| std::sync::atomic::AtomicU8::new(0)).collect();
             d
         }
         Err(msg) => {
@@ -582,6 +586,7 @@ pub fn new_code_from_parts(p: CodeParts) -> PyResult {
         gen_start: 0,
         invalid: None,
         pub_lines: Vec::new(),
+        spec: Box::new([]),
     });
     unsafe {
         let r = alloc_code(
@@ -971,7 +976,7 @@ fn co_code(o: &PyObject) -> PyResult {
     Ok(code_meta(o).co_code.clone())
 }
 fn co_code_adaptive(o: &PyObject) -> PyResult {
-    Ok(code_meta(o).co_code.clone())
+    Ok(bytes::new_bytes(&crate::interp::adaptive::adaptive_code(o)))
 }
 
 /// (start, end, line) byte ranges, consecutive entries with the same line merged.

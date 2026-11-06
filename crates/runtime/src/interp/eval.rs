@@ -699,6 +699,22 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
     let cd = crate::types::code::code_data(&code_obj);
     let code: &[u32] = &cd.code;
     let caches = cd.caches.tables(code); // jit workstream: inline caches / profiles
+    // bc-vm: specialisation view of public code (interp/adaptive.rs); `adapt_once` for
+    // classifications too costly to repeat
+    macro_rules! adapt {
+        ($e:expr) => {
+            if super::adaptive::active(cd) && !super::adaptive::is_generic(cd, f.lasti as usize) {
+                super::adaptive::note(cd, f.lasti as usize, $e);
+            }
+        };
+    }
+    macro_rules! adapt_once {
+        ($e:expr) => {
+            if super::adaptive::active(cd) && !super::adaptive::seen(cd, f.lasti as usize) {
+                super::adaptive::note(cd, f.lasti as usize, $e);
+            }
+        };
+    }
     let mut pc: usize = f.next_instr as usize;
     f.yield_from_send = -1;
     let tracing = crate::modules::sys::tracing_active();
@@ -754,6 +770,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                     }
                     match op {
                         Op::Nop | Op::Resume => {
+                            if op == Op::Resume { adapt!(rpy_compiler::wordcode::opcodes::RESUME_CHECK); }
                             let eb = ts.c.eval_breaker.load(std::sync::atomic::Ordering::Relaxed);
                             if eb != 0 {
                                 handle_eval_breaker(ts)?;
@@ -927,6 +944,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                         }
                         Op::LoadGlobal => {
                             let nm = &cd.names[arg as usize];
+                            adapt_once!(super::adaptive::load_global(f.globals(), f.builtins(), nm));
                             let v = super::specialize::load_global(f, nm, caches.entry(f.lasti as usize))?;
                             push!(f, v.into_raw());
                         }
@@ -951,17 +969,20 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                         }
                         Op::LoadAttr => {
                             let o = popref!(f);
+                            adapt!(super::adaptive::load_attr(&o, &cd.names[arg as usize], false));
                             let v = super::specialize::load_attr(&o, &cd.names[arg as usize], caches.poly(f.lasti as usize))?;
                             push!(f, v.into_raw());
                         }
                         Op::LoadMethod => {
                             let o = popref!(f);
+                            adapt!(super::adaptive::load_attr(&o, &cd.names[arg as usize], true));
                             let (m, s) = super::specialize::load_method(&o, &cd.names[arg as usize], caches.poly(f.lasti as usize))?;
                             push!(f, m.into_raw());
                             push!(f, s.map_or(std::ptr::null_mut(), |s| s.into_raw()));
                         }
                         Op::StoreAttr => {
                             let o = popref!(f);
+                            adapt!(super::adaptive::store_attr(&o, &cd.names[arg as usize]));
                             let v = popref!(f);
                             super::specialize::store_attr(&o, &cd.names[arg as usize], &v, caches.poly(f.lasti as usize))?;
                         }
@@ -970,6 +991,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             ab::delattr(&o, &cd.names[arg as usize])?;
                         }
                         Op::LoadSuperAttr => {
+                            adapt!(super::adaptive::load_super_attr(unsafe { &*peek!(f, 3) }, arg & 1 != 0));
                             let slf = popref!(f);
                             let cls = popref!(f);
                             let gsuper = popref!(f);
@@ -991,6 +1013,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             }
                         }
                         Op::BinaryOp => {
+                            adapt!(super::adaptive::binary(arg, unsafe { &*peek!(f, 2) }, unsafe { &*peek!(f, 1) }));
                             let b = popref!(f);
                             let a = popref!(f);
                             let r = binary_op(BINOPS[arg as usize], &a, &b)?;
@@ -1019,11 +1042,13 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             push!(f, bool_::new_bool(!t).into_raw());
                         }
                         Op::ToBool => {
+                            adapt!(super::adaptive::to_bool(unsafe { &*peek!(f, 1) }));
                             let a = popref!(f);
                             let t = ab::is_true(&a)?;
                             push!(f, bool_::new_bool(t).into_raw());
                         }
                         Op::CompareOp => {
+                            adapt!(super::adaptive::compare(arg & 15, unsafe { &*peek!(f, 2) }, unsafe { &*peek!(f, 1) }));
                             let b = popref!(f);
                             let a = popref!(f);
                             let cop = (arg & 15) as std::ffi::c_int;
@@ -1041,12 +1066,14 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             push!(f, bool_::new_bool(a.is(&b) != (arg == 1)).into_raw());
                         }
                         Op::ContainsOp => {
+                            adapt!(super::adaptive::contains(unsafe { &*peek!(f, 1) }));
                             let b = popref!(f);
                             let a = popref!(f);
                             let r = ab::contains(&b, &a)?;
                             push!(f, bool_::new_bool(r != (arg == 1)).into_raw());
                         }
                         Op::BinarySubscr => {
+                            adapt!(super::adaptive::binary(26, unsafe { &*peek!(f, 2) }, unsafe { &*peek!(f, 1) }));
                             let k = popref!(f);
                             let c = popref!(f);
                             let r = if list::is_list_exact(&c) && int::is_int_exact(&k) && int::is_compact(&k) {
@@ -1078,6 +1105,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             push!(f, r.into_raw());
                         }
                         Op::StoreSubscr => {
+                            adapt!(super::adaptive::store_subscr(unsafe { &*peek!(f, 2) }, unsafe { &*peek!(f, 1) }));
                             let k = popref!(f);
                             let c = popref!(f);
                             let v = popref!(f);
@@ -1229,6 +1257,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             crate::types::dict_methods::dict_merge_kwargs(unsafe { &*d }, &o, func)?;
                         }
                         Op::UnpackSequence => {
+                            adapt!(super::adaptive::unpack(unsafe { &*peek!(f, 1) }, arg));
                             let seq = popref!(f);
                             let n = arg as usize;
                             let mut items = Vec::with_capacity(n);
@@ -1247,6 +1276,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             }
                         }
                         Op::Jump => {
+                            if (arg as usize) < pc { adapt!(rpy_compiler::wordcode::opcodes::JUMP_BACKWARD_NO_JIT); }
                             if crate::modules::sys::tracing_active() {
                                 crate::modules::sys_trace::fire_branch(ts, f, crate::modules::sys_trace::JUMP, arg as usize)?;
                             }
@@ -1327,10 +1357,12 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             }
                         }
                         Op::GetIter => {
+                            adapt!(super::adaptive::get_iter(unsafe { &*peek!(f, 1) }));
                             let o = popref!(f);
                             push!(f, ab::get_iter(&o)?.into_raw());
                         }
                         Op::ForIter => {
+                            adapt_once!(super::adaptive::for_iter(unsafe { &*peek!(f, 1) }));
                             let it = unsafe { &*top!(f) };
                             match ab::iter_next(it)? {
                                 Some(v) => push!(f, v.into_raw()),
@@ -1384,6 +1416,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             push!(f, r.into_raw());
                         }
                         Op::Send => {
+                            adapt!(super::adaptive::send(unsafe { &*peek!(f, 2) }));
                             let v = popref!(f);
                             let recv = unsafe { &*top!(f) };
                             match crate::types::genobject::send_to(recv, &v)? {
@@ -1425,6 +1458,15 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             return Ok(Some(Exit::Return(v)));
                         }
                         Op::Call | Op::CallKw => {
+                            if super::adaptive::active(cd) {
+                                let nk = if op == Op::CallKw { 1 } else { 0 };
+                                let n = arg as usize;
+                                let base = f.stack_top - n - 2 - nk;
+                                let c = unsafe { &*f.slots[base] };
+                                let s = f.slots[base + 1];
+                                let so = if s.is_null() { None } else { Some(unsafe { &*s }) };
+                                if op == Op::CallKw { adapt!(super::adaptive::call_kw(c, so)); } else { adapt!(super::adaptive::call(c, so, n)); }
+                            }
                             let (n, kwnames) = if op == Op::CallKw {
                                 (arg as usize, Some(popref!(f)))
                             } else {
@@ -1479,6 +1521,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             push!(f, r);
                         }
                         Op::CallFunctionEx => {
+                            adapt!(super::adaptive::call_ex(unsafe { &*peek!(f, 4) }));
                             let kw = popopt!(f);
                             let args = popref!(f);
                             let self_or_null = popopt!(f);
