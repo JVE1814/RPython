@@ -521,7 +521,10 @@ impl<'a> Ctx<'a> {
             }
             RERAISE => {
                 need_real(&s, 1)?;
-                em.op(Op::Reraise, (arg != 0) as u32);
+                // the n values below the exception stay on the stack (the handler search
+                // truncates to its depth); the internal Reraise only pops the exception
+                // (bc-compiler fix: Reraise 1 popped `prev` for RERAISE 2 in `with`)
+                em.op(Op::Reraise, 0);
                 s.truncate(n - 1 - arg as usize);
             }
             PUSH_EXC_INFO => simple!(Op::PushExcInfo, 0, 1, 2),

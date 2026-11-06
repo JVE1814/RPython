@@ -742,11 +742,11 @@ impl<'a> Compiler<'a> {
         let exit = self.new_label();
         let cleanup = self.new_label();
         self.compile_expr(&item.context_expr)?;
-        self.u().loc = loc_of(s.loc);
+        self.u().loc = loc_of(item.context_expr.loc);
         self.emit_with_enter(false);
         self.emit_setup(O::SETUP_WITH, final_);
         self.use_label(block);
-        self.push_fblock(FbKind::With, block, final_, loc_of(s.loc))?;
+        self.push_fblock(FbKind::With, block, final_, loc_of(item.context_expr.loc))?;
         match &item.optional_vars {
             Some(v) => self.compile_store(v)?,
             None => self.emit(O::POP_TOP, 0),
@@ -759,13 +759,13 @@ impl<'a> Compiler<'a> {
         self.u().fblocks.pop();
         self.pop_block();
         // normal exit: __exit__(None, None, None)
-        self.u().loc = loc_of(s.loc);
+        self.u().loc = loc_of(item.context_expr.loc);
         self.call_exit_with_nones();
         self.emit(O::POP_TOP, 0);
         self.emit_jump(O::JUMP_NO_INTERRUPT, exit);
         // exceptional exit
         self.use_label(final_);
-        self.u().loc = loc_of(s.loc);
+        self.u().loc = loc_of(item.context_expr.loc);
         self.emit_setup(O::SETUP_CLEANUP, cleanup);
         self.emit(O::PUSH_EXC_INFO, 0);
         self.emit(O::WITH_EXCEPT_START, 0);
@@ -810,13 +810,13 @@ impl<'a> Compiler<'a> {
         let exit = self.new_label();
         let cleanup = self.new_label();
         self.compile_expr(&item.context_expr)?;
-        self.u().loc = loc_of(s.loc);
+        self.u().loc = loc_of(item.context_expr.loc);
         self.emit_with_enter(true);
         self.emit(O::GET_AWAITABLE, 1);
         self.emit_await()?;
         self.emit_setup(O::SETUP_WITH, final_);
         self.use_label(block);
-        self.push_fblock(FbKind::AsyncWith, block, final_, loc_of(s.loc))?;
+        self.push_fblock(FbKind::AsyncWith, block, final_, loc_of(item.context_expr.loc))?;
         match &item.optional_vars {
             Some(v) => self.compile_store(v)?,
             None => self.emit(O::POP_TOP, 0),
@@ -828,14 +828,14 @@ impl<'a> Compiler<'a> {
         }
         self.u().fblocks.pop();
         self.pop_block();
-        self.u().loc = loc_of(s.loc);
+        self.u().loc = loc_of(item.context_expr.loc);
         self.call_exit_with_nones();
         self.emit(O::GET_AWAITABLE, 2);
         self.emit_await()?;
         self.emit(O::POP_TOP, 0);
         self.emit_jump(O::JUMP_NO_INTERRUPT, exit);
         self.use_label(final_);
-        self.u().loc = loc_of(s.loc);
+        self.u().loc = loc_of(item.context_expr.loc);
         self.emit_setup(O::SETUP_CLEANUP, cleanup);
         self.emit(O::PUSH_EXC_INFO, 0);
         self.emit(O::WITH_EXCEPT_START, 0);
