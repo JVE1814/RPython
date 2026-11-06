@@ -107,6 +107,10 @@ pub fn print_exception_and_clear() {
     if let Some(hook) = modules::sys::get_sys_attr("excepthook") {
         let t = types::typeobject::type_ref(e.type_ptr());
         let tb = types::exceptions::exc_traceback(&e).unwrap_or_else(types::none::none_ref);
+        if modules::sys_full::audit("sys.excepthook", &[&hook, &t, &e, &tb]).is_err() {
+            // a failing audit hook does not stop the report
+            errors::clear_exc();
+        }
         if abstract_::call(&hook, &[&t, &e, &tb]).is_ok() {
             return;
         }

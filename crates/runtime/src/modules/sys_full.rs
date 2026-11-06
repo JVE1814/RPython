@@ -227,9 +227,10 @@ fn sys_getframe(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     if f.is_null() {
         raise!(ValueError, "call stack is not deep enough");
     }
-    audit("sys._getframe", &[])?;
     let fo = crate::interp::eval::frame_object(unsafe { &mut *f });
-    Ok(unsafe { PyRef::from_borrowed(fo) })
+    let fo = unsafe { PyRef::from_borrowed(fo) };
+    audit("sys._getframe", &[&fo])?;
+    Ok(fo)
 }
 
 fn sys_getframemodulename(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {

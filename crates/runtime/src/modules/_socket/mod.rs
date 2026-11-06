@@ -321,6 +321,10 @@ unsafe extern "C" fn sock_init(op: *mut PyObject, args: *mut PyObject, kw: *mut 
             let mut ty = match a[1] { Some(o) => int_arg(o)?, None => -1 };
             let mut proto = match a[2] { Some(o) => int_arg(o)?, None => -1 };
             let fdobj = a[3].filter(|o| !none::is_none(o));
+            crate::modules::sys_full::audit(
+                "socket.__new__",
+                &[&*op, &int::new_int(family as i64), &int::new_int(ty as i64), &int::new_int(proto as i64)],
+            )?;
             let s = &mut *(op as *mut SockObj);
             let fd;
             if let Some(fo) = fdobj {
