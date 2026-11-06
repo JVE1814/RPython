@@ -477,8 +477,14 @@ pub unsafe extern "C" fn subtype_dealloc(op: *mut PyObject) {
         let tp = (*op).type_ptr();
         // finalizer (__del__)
         if (*tp).tp_finalize.is_some() && !crate::gc::is_finalized(op) {
-            if crate::gc::call_finalizer_from_dealloc(op) {
-                return; // resurrected
+            let resurrected = crate::gc::call_finalizer_from_dealloc(op);
+            if (*tp).tp_flags & Py_TPFLAGS_HAVE_GC == 0 {
+                // only GC objects remember being finalized: a resurrected non-GC
+                // object runs __del__ again when it dies again
+                (*op).ob_gc_bits.fetch_and(!crate::alloc::GC_BIT_FINALIZED, std::sync::atomic::Ordering::Relaxed);
+            }
+            if resurrected {
+                return;
             }
         }
         // __del__ may have assigned __class__: use the current type from here on
@@ -486,6 +492,29 @@ pub unsafe extern "C" fn subtype_dealloc(op: *mut PyObject) {
         crate::gc::untrack(op);
         // clear weakrefs
         crate::types::weakref::clear_weakrefs(op);
+        // legacy finalizer (tp_del), after the weakrefs are gone; it may resurrect
+        if let Some(del) = (*tp).tp_del {
+            // called with a zero count (the slot resurrects temporarily itself)
+            // and with the object tracked again, as a live object would be
+            let o = &*op;
+            o.ob_tid.store(crate::object::thread_id(), std::sync::atomic::Ordering::Relaxed);
+            let gc_type = (*tp).tp_flags & Py_TPFLAGS_HAVE_GC != 0;
+            if gc_type {
+                crate::gc::track(op);
+            }
+            let saved = crate::errors::take_exc();
+            del(op);
+            if let Some(e) = saved {
+                crate::errors::set_exc(e);
+            }
+            let local = o.ob_ref_local.load(std::sync::atomic::Ordering::Relaxed);
+            if local != 0 || (o.ob_ref_shared.load(std::sync::atomic::Ordering::Relaxed) >> 2) != 0 {
+                return; // resurrected
+            }
+            if gc_type {
+                crate::gc::untrack(op);
+            }
+        }
         // clear __slots__ members
         let mut base = tp;
         while !base.is_null() && is_heap_type(base) {

@@ -177,7 +177,22 @@ fn repr_for_error(o: &PyObject) -> String {
 pub fn call_tp_call(callable: &PyObject, args: &PyObject, kw: Option<&PyObject>) -> PyResult {
     let f = match callable.ty().tp_call {
         Some(f) => f,
-        None => raise!(TypeError, "'{}' object is not callable", tname(callable)),
+        None => {
+            // `import mod; mod()` where `mod.mod` is the callable that was meant
+            if crate::types::module::is_module(callable) {
+                let d = crate::types::module::module_dict(callable);
+                if let Some(n) = crate::types::dict::get_item_rs(&d, "__name__").filter(|n| crate::types::str::is_str(n)) {
+                    if let Some(f) = crate::types::dict::get_item(&d, &n).ok().flatten() {
+                        if is_callable(&f) {
+                            let n = crate::types::str::to_string_lossy(&n);
+                            raise!(TypeError, "'{}' object is not callable. Did you mean: '{}.{}(...)'?", tname(callable), n, n);
+                        }
+                    }
+                }
+                crate::errors::clear_exc();
+            }
+            raise!(TypeError, "'{}' object is not callable", tname(callable))
+        }
     };
     let ts = crate::threads::current();
     if crate::interp::enter_recursive_call(ts, " while calling a Python object").is_err() {

@@ -562,6 +562,9 @@ fn sysexit_init(o: &PyObject, args: &PyObject) -> PyResult<()> {
 fn importerror_init(o: &PyObject, args: &PyObject, kw: Option<&PyObject>) -> PyResult<()> {
     let e = unsafe { &mut *(o.as_ptr() as *mut ImportErrorExc) };
     let items = kw.map(dict::items_vec).unwrap_or_default();
+    if items.len() > 3 {
+        raise!(TypeError, "{}() takes at most 3 keyword arguments ({} given)", type_name(o.ty()), items.len());
+    }
     for (k, _) in &items {
         let ks = pystr::to_string_lossy(k);
         if !matches!(ks.as_str(), "name" | "path" | "name_from") {
