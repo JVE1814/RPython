@@ -1555,6 +1555,12 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                                 return Err(PyErr);
                             }
                             push!(f, r);
+                            // periodic check after a call (as CPython does after calls into C):
+                            // e.g. references other threads queued for this owner while it
+                            // waited in a join() are merged before the next statement runs
+                            if ts.c.eval_breaker.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+                                handle_eval_breaker(ts)?;
+                            }
                         }
                         Op::CallFunctionEx => {
                             adapt!(super::adaptive::call_ex(unsafe { &*peek!(f, 4) }));
