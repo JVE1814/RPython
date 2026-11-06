@@ -434,6 +434,74 @@ deltablue: callees with branches are not inlined yet).
 * Each tier-2 unit carries its own copies of the boxing/decref routines (~2.4 KB per
   unit): share them per process.
 
+## jit4 workstream (generators, deeper inlining, tier-1 coverage)
+
+Branch `worktree-agent-a478005f2fd2e5fa4`. Note: jit3's work was on branch `core`, not
+yet in master when jit4 started; it was merged from there (master has it since).
+
+### Tier 1
+* Instructions that used to deoptimise (exception handlers: PushExcInfo/PopExcept/
+  CheckExcMatch/CheckEgMatch; with/async with; GetAwaitable/GetAiter/GetAnext/
+  EndAsyncFor/CleanupThrow; ImportName/ImportFrom; Match*; LoadFromDictOrDeref,
+  DeleteDeref, DeleteGlobal, LoadBuildClass, BuildTemplate/BuildInterpolation, GetLen,
+  LoadCommonConstant) now run compiled. Their bodies moved out of `eval_inner` into
+  `eval::exec_misc` (`is_misc`), which the interpreter dispatches to and tier-1 code
+  calls through `helpers::h_misc` (stack_top set to the static depth while it runs and
+  restored afterwards; on error the stack is cut to the depth the unwinder expects).
+  RaiseVarargs/Reraise still deoptimise (the interpreter unwinds; handlers are entry
+  points, so the handler body runs compiled again). `RPYTHON_JIT1_MISC=0` turns the
+  shared path off. GetAwaitable has its own helper (a coroutine not suspended in an
+  await is its own awaitable).
+* Generator resumption without the interpreter prelude: compiled `YieldValue` stores
+  the machine address of its continuation in `Frame::resume` (0 when tier-2 code is
+  installed for the code object, so the general path moves the activation to tier 2);
+  `genobject::gen_send_fast` (used by Send/yield from, ForIter via tp_iternext, send())
+  enters it through a process-wide trampoline (`jit::trampoline`/`jit::enter`): push
+  the sent value, link exc_info/frame, recursion check, call, unlink. Deopt/error
+  continue in `eval_inner` (`jit::continue_in_interp`). Created frames get their entry
+  in `new_generator_for` (`jit::generator_entry`, which also counts the creation
+  towards tier-2 compilation). `gen_send_ex` (throw/close/tracing) resets `resume`.
+  `RPYTHON_JIT_GENFAST=0` disables it.
+* Generator-function calls (exact positional) build the generator frame directly in
+  `call_function`; finished generators skip the finalizer dance in dealloc.
+
+### Tier 2
+* Generator/coroutine bodies (standard unit only): `build::resume_points` = the
+  instruction after every YieldValue; YieldValue ends a CFG block, each resume point
+  gets a synthetic entry block (like an OSR entry: stack in frame, unboxed locals
+  reloaded) and an entry in `OptCode::entries`. `Term::Yield` stores the result,
+  syncs dirty locals, writes lasti/next_instr/yield_from_send/stack_top and the address
+  of the tier-2 resume entry into `Frame::resume`, and exits. Locals stay boxed in
+  generator units (boxing every unboxed local at each yield and unboxing at each resume
+  cost more than it saved). No OSR units for generators. `RPYTHON_JIT2_GEN=0` disables.
+  `jit::opt_entry` looks resume pcs up in the standard unit.
+* Inlining: callees with forward branches (paths duplicated up to 8 paths/160
+  instructions, each return moves its result into one vreg and jumps to the
+  continuation; the caller's state after the call is its state before it), nested
+  inlining up to 3 levels (an exception in an inner callee raises in the rebuilt
+  enclosing callee frame: InlineError chain), LoadMethod in callees, constructor
+  calls of plain classes (`try_inline_new`: class tag guard, `h2_alloc_instance`,
+  `__init__` inlined as a method call, result reference kept on the stack below the
+  call so error exits release it, `h2_init_done` checks for None).
+* ToBool/UnaryNot of any object (inline True/False/None, `h2_truth` otherwise).
+* UnpackSequence of sites that see tuples and lists.
+* Correctness (jit3 gap): any emitted decref that may run Python code (__del__,
+  weakref callbacks) drops version-tag facts and heap exact-type facts
+  (`B::emit` -> `forget_tags`; int/float/str/bool decrefs exempt), as do truth calls.
+  Known remaining exposure: generic attribute slow paths (`h2_load_attr`) can run
+  arbitrary code without dropping facts (pre-existing).
+* `RPYTHON_JIT_DEBUG=3` logs inlining decisions (not a candidate / rolled back at op).
+
+### Testing
+* tools/jit_tests: new t_misc.py (handlers, with, except*, match, imports, closures,
+  class bodies, async/await, async for/with, async generators, throw into yield from);
+  t_inline.py extended (branchy, nested, constructors, __init__ errors/non-None,
+  finalizer mutating a class); t_iter.py (mixed tuple/list unpacking). All pass in all
+  six configurations.
+* test_asyncio.test_free_threading crashes intermittently in master too (with the JIT
+  off: 2/2 runs of the `core` build crashed); with jit4's tier 1 it crashes reliably
+  (decref of a bad pointer in a multi-threaded event loop). Not JIT-specific; reported.
+
 ## Missing / next steps (previous jit workstream)
 * Tier 2 (optimising JIT): SSA from bytecode plus profiles, type speculation with guards
   and deopt by materialising the frame (the frame layout is already shared), unboxed
