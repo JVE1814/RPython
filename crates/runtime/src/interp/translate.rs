@@ -681,22 +681,63 @@ pub fn translate(inp: &Input) -> Result<Output, String> {
     let mut em = Emit { ops: Vec::with_capacity(instrs.len() + 8) };
     let mut emitted: Vec<(u32, u32)> = vec![(0, 0); instrs.len()];
 
-    // ---- pass 1: abstract interpretation (entry state of every reachable instruction)
+    // ---- pass 1: abstract interpretation. States are kept only at block leaders (jump and
+    // handler targets); straight-line code is walked with one moving state, so memory and
+    // time stay linear even for very deep stacks.
     let n = instrs.len();
-    let mut state: Vec<Option<St>> = vec![None; n];
-    let mut work: Vec<(usize, St)> = Vec::new();
-    if n > 0 {
-        state[0] = Some(Vec::new());
-        work.push((0, Vec::new()));
+    // handler entry per instruction (the table is sorted and non-overlapping)
+    let mut handler: Vec<Option<usize>> = vec![None; n];
+    {
+        let mut order: Vec<usize> = (0..exc.len()).collect();
+        order.sort_by_key(|&i| exc[i].start);
+        let mut j = 0;
+        for (k, ins) in instrs.iter().enumerate() {
+            while j < order.len() && exc[order[j]].end <= ins.offset {
+                j += 1;
+            }
+            let mut q = j;
+            while q < order.len() && exc[order[q]].start <= ins.offset {
+                if ins.offset < exc[order[q]].end {
+                    handler[k] = Some(order[q]);
+                    break;
+                }
+                q += 1;
+            }
+        }
     }
-    let merge = |state: &mut Vec<Option<St>>, work: &mut Vec<(usize, St)>, k: usize, s: St, lenient: bool| -> Result<(), String> {
+    let mut is_leader = vec![false; n + 1];
+    if n > 0 {
+        is_leader[0] = true;
+    }
+    for ins in &instrs {
+        if let Some(t) = wc::jump_target(ins) {
+            if let Ok(k) = lookup(t) {
+                is_leader[k] = true;
+            }
+        }
+    }
+    for e in &exc {
+        if let Ok(k) = lookup(e.target) {
+            is_leader[k] = true;
+        }
+    }
+    let mut leader_state: Vec<Option<St>> = vec![None; n + 1];
+    let mut reachable = vec![false; n];
+    // internal depth of the handler covering each reachable instruction
+    let mut hdepth: Vec<u32> = vec![0; n];
+    let mut work: Vec<usize> = Vec::new();
+    if n > 0 {
+        leader_state[0] = Some(Vec::new());
+        work.push(0);
+    }
+    let merge = |leader_state: &mut Vec<Option<St>>, work: &mut Vec<usize>, k: usize, s: St, lenient: bool| -> Result<(), String> {
         if k >= n {
             return Err("control flow falls off the end of the code".into());
         }
         if s.len() > inp.stacksize as usize {
             return Err(format!("stack depth exceeds co_stacksize at offset {}", instrs[k].offset * 2));
         }
-        match &state[k] {
+        match &leader_state[k] {
             Some(old) => {
                 // handler entries may be reached from instructions whose stacks differ below
                 // the handler depth (CPython tables cover e.g. a loop epilogue too): the
@@ -706,32 +747,53 @@ pub fn translate(inp: &Input) -> Result<Output, String> {
                 }
             }
             None => {
-                state[k] = Some(s.clone());
-                work.push((k, s));
+                leader_state[k] = Some(s);
+                work.push(k);
             }
         }
         Ok(())
     };
-    while let Some((k, s)) = work.pop() {
-        // exception edge
-        if let Some(h) = handler_for(&exc, instrs[k].offset) {
-            let mut hs = s[..(h.depth as usize).min(s.len())].to_vec();
-            if h.lasti {
+    while let Some(first) = work.pop() {
+        let mut k = first;
+        let mut s = leader_state[k].clone().unwrap();
+        loop {
+            reachable[k] = true;
+            if let Some(hi) = handler[k] {
+                let h = &exc[hi];
+                let keep = (h.depth as usize).min(s.len());
+                hdepth[k] = reals(&s[..keep]);
+                let mut hs = s[..keep].to_vec();
+                if h.lasti {
+                    hs.push(true);
+                }
                 hs.push(true);
+                let t = lookup(h.target)?;
+                merge(&mut leader_state, &mut work, t, hs, true)?;
             }
-            hs.push(true);
-            let t = lookup(h.target)?;
-            merge(&mut state, &mut work, t, hs, true)?;
-        }
-        let start = em.ops.len();
-        let st = cx.step(k, s, &mut em)?;
-        emitted[k] = (start as u32, em.ops.len() as u32);
-        if let Some((t, js)) = st.jump {
-            let tk = lookup(t)?;
-            merge(&mut state, &mut work, tk, js, false)?;
-        }
-        if let Some(fs) = st.fall {
-            merge(&mut state, &mut work, k + 1, fs, false)?;
+            let start = em.ops.len();
+            let st = cx.step(k, s, &mut em)?;
+            emitted[k] = (start as u32, em.ops.len() as u32);
+            if let Some((t, js)) = st.jump {
+                let tk = lookup(t)?;
+                merge(&mut leader_state, &mut work, tk, js, false)?;
+            }
+            match st.fall {
+                None => break,
+                Some(fs) => {
+                    if k + 1 >= n {
+                        return Err("control flow falls off the end of the code".into());
+                    }
+                    if fs.len() > inp.stacksize as usize {
+                        return Err(format!("stack depth exceeds co_stacksize at offset {}", instrs[k + 1].offset * 2));
+                    }
+                    if is_leader[k + 1] {
+                        merge(&mut leader_state, &mut work, k + 1, fs, false)?;
+                        break;
+                    }
+                    k += 1;
+                    s = fs;
+                }
+            }
         }
     }
 
@@ -744,7 +806,7 @@ pub fn translate(inp: &Input) -> Result<Output, String> {
     let mut gen_start = 0u32;
     for k in 0..n {
         first_of_instr[k] = code.len() as u32;
-        if state[k].is_none() {
+        if !reachable[k] {
             continue;
         }
         let ins = instrs[k];
@@ -790,8 +852,11 @@ pub fn translate(inp: &Input) -> Result<Output, String> {
     // ---- exception table: one internal entry per run of words with the same handler
     let mut exception_table: Vec<ExceptionEntry> = Vec::new();
     for k in 0..n {
-        let Some(s) = &state[k] else { continue };
-        let Some(h) = handler_for(&exc, instrs[k].offset) else { continue };
+        if !reachable[k] {
+            continue;
+        }
+        let Some(hi) = handler[k] else { continue };
+        let h = &exc[hi];
         let (a, b) = (first_of_instr[k], first_of_instr[k + 1]);
         if a == b {
             continue;
@@ -800,7 +865,7 @@ pub fn translate(inp: &Input) -> Result<Output, String> {
             start: a,
             end: b,
             target: ipc_of(h.target)?,
-            depth: reals(&s[..(h.depth as usize).min(s.len())]),
+            depth: hdepth[k],
             lasti: h.lasti,
         };
         match exception_table.last_mut() {
