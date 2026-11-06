@@ -726,12 +726,15 @@ fn type_set_bases(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         (*tp).tp_bases = ours;
         incref(new_base as *mut PyObject);
         (*tp).tp_base = new_base;
+        let tp_mro_before = (*tp).tp_mro;
+        xincref(tp_mro_before);
         let r = mro_internal(tp);
         if r.is_err() && (*tp).tp_bases != ours {
             // a re-entrant __bases__ assignment (from mro()) replaced ours and
             // released the references we had installed: keep its result
             decref(old_bases);
             decref(old_base as *mut PyObject);
+            xdecref(tp_mro_before);
             return r;
         }
         if r.is_err() {
@@ -743,15 +746,63 @@ fn type_set_bases(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
             for b in tuple::tuple_items(&*old_bases) {
                 add_subclass(as_type(b), tp);
             }
+            xdecref(tp_mro_before);
             return r;
         }
         for b in tuple::tuple_items(&*(*tp).tp_bases) {
             add_subclass(as_type(b), tp);
         }
-        // recompute subclass MROs
-        for sub in subclasses(tp) {
-            let _ = mro_internal(sub);
+        // recompute the MROs of all subclasses; if one fails (mro() raising, an MRO
+        // conflict), everything goes back to how it was and the error propagates
+        if (*tp).tp_bases == ours {
+            let mut changed: Vec<(*mut PyTypeObject, *mut PyObject)> = Vec::new();
+            let mut todo = subclasses(tp);
+            let mut seen = std::collections::HashSet::new();
+            let mut failed = false;
+            while let Some(sub) = todo.pop() {
+                if !seen.insert(sub as usize) {
+                    continue;
+                }
+                let before = (*sub).tp_mro;
+                xincref(before);
+                if mro_internal(sub).is_err() {
+                    xdecref(before);
+                    failed = true;
+                    break;
+                }
+                changed.push((sub, before));
+                todo.extend(subclasses(sub));
+            }
+            if failed {
+                let err = take_exc();
+                for (sub, before) in changed.into_iter().rev() {
+                    let now = std::mem::replace(&mut (*sub).tp_mro, before);
+                    xdecref(now);
+                    crate::types::slots::type_modified(sub);
+                }
+                for b in tuple::tuple_items(&*(*tp).tp_bases) {
+                    remove_subclass(as_type(b), tp);
+                }
+                let nb = std::mem::replace(&mut (*tp).tp_bases, old_bases);
+                decref(nb);
+                decref(new_base as *mut PyObject);
+                (*tp).tp_base = old_base;
+                for b in tuple::tuple_items(&*old_bases) {
+                    add_subclass(as_type(b), tp);
+                }
+                let now = std::mem::replace(&mut (*tp).tp_mro, tp_mro_before);
+                xdecref(now);
+                crate::types::slots::type_modified(tp);
+                if let Some(e) = err {
+                    set_exc(e);
+                }
+                return Err(PyErr);
+            }
+            for (_, before) in changed {
+                xdecref(before);
+            }
         }
+        xdecref(tp_mro_before);
         decref(old_bases);
         decref(old_base as *mut PyObject);
         crate::types::slots::fixup_slots(tp);
