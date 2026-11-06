@@ -192,7 +192,11 @@ pub fn call_tp_call(callable: &PyObject, args: &PyObject, kw: Option<&PyObject>)
 pub unsafe extern "C" fn vectorcall_call(callable: *mut PyObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
     unsafe {
         let c = &*callable;
-        let f = match vectorcall_func(c) {
+        // like PyVectorcall_Call: the slot at tp_vectorcall_offset, whether or not the type
+        // carries the vectorcall flag (heap subclasses inherit only the offset)
+        let off = c.ty().tp_vectorcall_offset;
+        let f = if off > 0 { *((callable as *mut u8).offset(off) as *const vectorcallfunc) } else { None };
+        let f = match f {
             Some(f) => f,
             None => {
                 return into_c(Err(err!(TypeError, "'{}' object does not support vectorcall", tname(c))));

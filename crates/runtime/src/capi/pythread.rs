@@ -332,13 +332,16 @@ pub unsafe extern "C" fn PyCriticalSection_End(c: *mut PyCriticalSection) {
 
 unsafe fn begin_two(c: *mut PyCriticalSection2, k1: *mut u8, k2: *mut u8) {
     unsafe {
-        if k1 == k2 {
-            begin_one(&mut (*c)._cs_base, k1);
-            (*c)._cs_mutex2 = std::ptr::null_mut();
-            return;
-        }
         let ts = crate::threads::current_mut();
-        let (lo, hi) = if (k1 as usize) < (k2 as usize) { (k1, k2) } else { (k2, k1) };
+        // the same object twice is one lock; the record is still a two-lock record (the
+        // matching End pops it as such), with an empty second key
+        let (lo, hi) = if k1 == k2 {
+            (k1, std::ptr::null_mut())
+        } else if (k1 as usize) < (k2 as usize) {
+            (k1, k2)
+        } else {
+            (k2, k1)
+        };
         let lo = if held_by_me(ts, lo as usize) { 0 } else { lo as usize };
         let hi = if held_by_me(ts, hi as usize) { 0 } else { hi as usize };
         if lo == 0 && hi == 0 {

@@ -84,6 +84,11 @@ pub unsafe extern "C" fn PyBuffer_FillInfo(view: *mut Py_buffer, obj: *mut PyObj
             let _ = crate::err!(BufferError, "PyBuffer_FillInfo: view==NULL argument is obsolete");
             return -1;
         }
+        if flags == 0x100 || flags == 0x200 {
+            // PyBUF_READ / PyBUF_WRITE are memoryview flags, not buffer request flags
+            let _ = bad_internal();
+            return -1;
+        }
         if flags != -1 && (flags & PYBUF_WRITABLE) == PYBUF_WRITABLE && readonly == 1 {
             let _ = crate::err!(BufferError, "Object is not writable.");
             return -1;

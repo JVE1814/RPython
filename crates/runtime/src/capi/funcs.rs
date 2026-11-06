@@ -133,14 +133,165 @@ pub unsafe extern "C" fn PyMethod_Self(m: *mut PyObject) -> *mut PyObject {
         fo::method_parts(&*m).1.as_ptr()
     }
 }
+// ---------------------------------------------------------------- instancemethod
+// classobject.h's PyInstanceMethodObject: a callable stored in a class that binds to the
+// instance like a Python function does (used by C code to put builtins in classes).
+
+#[repr(C)]
+struct InstanceMethodObject {
+    ob_base: PyObject,
+    func: *mut PyObject,
+}
+#[unsafe(no_mangle)]
+pub static mut PyInstanceMethod_Type: PyTypeObject = PyTypeObject::ZERO;
+
+fn im_type() -> *mut PyTypeObject {
+    &raw mut PyInstanceMethod_Type
+}
+unsafe fn im_func<'a>(o: *mut PyObject) -> &'a PyObject {
+    unsafe { &*(*(o as *mut InstanceMethodObject)).func }
+}
+fn new_instancemethod(f: &PyObject) -> PyRef {
+    unsafe {
+        let op = crate::alloc::alloc_object(im_type(), std::mem::size_of::<InstanceMethodObject>());
+        (*(op as *mut InstanceMethodObject)).func = f.to_ref().into_raw();
+        crate::gc::track(op);
+        PyRef::from_raw(op)
+    }
+}
+unsafe extern "C" fn im_new(_t: *mut PyTypeObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        if !kw.is_null() && dict::dict_len(&*kw) != 0 {
+            let _ = type_error("instancemethod() takes no keyword arguments");
+            return std::ptr::null_mut();
+        }
+        let a = tuple::tuple_to_vec(&*args);
+        if a.len() != 1 {
+            let _ = type_error(&format!("instancemethod expected 1 argument, got {}", a.len()));
+            return std::ptr::null_mut();
+        }
+        if !ab::is_callable(&a[0]) {
+            let _ = type_error("first argument must be callable");
+            return std::ptr::null_mut();
+        }
+        new_instancemethod(&a[0]).into_raw()
+    }
+}
+unsafe extern "C" fn im_dealloc(o: *mut PyObject) {
+    unsafe {
+        crate::gc::untrack(o);
+        xdecref(std::mem::replace(&mut (*(o as *mut InstanceMethodObject)).func, std::ptr::null_mut()));
+        crate::alloc::free_object(o);
+    }
+}
+unsafe extern "C" fn im_traverse(o: *mut PyObject, visit: visitproc, arg: *mut c_void) -> c_int {
+    unsafe {
+        let f = (*(o as *mut InstanceMethodObject)).func;
+        if !f.is_null() {
+            return visit.unwrap()(f, arg);
+        }
+        0
+    }
+}
+unsafe extern "C" fn im_clear(o: *mut PyObject) -> c_int {
+    unsafe {
+        xdecref(std::mem::replace(&mut (*(o as *mut InstanceMethodObject)).func, std::ptr::null_mut()));
+        0
+    }
+}
+unsafe extern "C" fn im_call(o: *mut PyObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
+    unsafe { ret(ab::call_with_kwargs_dict(im_func(o), &tuple::tuple_to_vec(&*args).iter().map(|x| &**x).collect::<Vec<_>>(), opt(kw))) }
+}
+/// Through the class: the callable itself; through an instance: a method bound to it.
+unsafe extern "C" fn im_descr_get(o: *mut PyObject, obj: *mut PyObject, _t: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        let f = im_func(o);
+        if obj.is_null() {
+            return f.to_ref().into_raw();
+        }
+        fo::new_method(f, &*obj).into_raw()
+    }
+}
+/// Attributes not defined by the type come from the wrapped callable.
+unsafe extern "C" fn im_getattro(o: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        match to::generic_getattr_opt(&*o, &*name, None) {
+            Ok(Some(v)) => v.into_raw(),
+            Ok(None) => ret(ab::getattr(im_func(o), &*name)),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+}
+unsafe extern "C" fn im_repr(o: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        let f = im_func(o);
+        let name = match ab::getattr_opt(f, crate::name!("__name__")) {
+            Ok(Some(n)) if pystr::is_str(&n) => pystr::to_string_lossy(&n),
+            Ok(_) => "?".to_string(),
+            Err(_) => return std::ptr::null_mut(),
+        };
+        ret(Ok(pystr::new_str(&format!("<instancemethod {} at {:#x}>", name, o as usize))))
+    }
+}
+unsafe extern "C" fn im_richcompare(a: *mut PyObject, b: *mut PyObject, op: c_int) -> *mut PyObject {
+    unsafe {
+        if (*b).type_ptr() != im_type() || (op != Py_EQ && op != Py_NE) {
+            return crate::types::none::not_implemented().to_ref().into_raw();
+        }
+        let same = (*(a as *mut InstanceMethodObject)).func == (*(b as *mut InstanceMethodObject)).func;
+        crate::types::bool_::new_bool(same == (op == Py_EQ)).into_raw()
+    }
+}
+fn im_get_doc(o: &PyObject) -> PyResult {
+    ab::getattr(unsafe { im_func(o.as_ptr()) }, crate::name!("__doc__"))
+}
+fn im_get_func(o: &PyObject) -> PyResult {
+    Ok(unsafe { im_func(o.as_ptr()) }.to_ref())
+}
+
+/// Make PyInstanceMethod_Type ready (before the first extension module loads).
+pub(crate) fn init_instancemethod_type() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        let t = &mut *im_type();
+        t.tp_name = c"instancemethod".as_ptr();
+        t.tp_basicsize = std::mem::size_of::<InstanceMethodObject>() as isize;
+        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC;
+        t.tp_new = Some(im_new);
+        t.tp_dealloc = Some(im_dealloc);
+        t.tp_traverse = Some(im_traverse);
+        t.tp_clear = Some(im_clear);
+        t.tp_call = Some(im_call);
+        t.tp_descr_get = Some(im_descr_get);
+        t.tp_getattro = Some(im_getattro);
+        t.tp_repr = Some(im_repr);
+        t.tp_richcompare = Some(im_richcompare);
+        t.tp_getset = crate::getset_table![("__doc__", im_get_doc), ("__func__", im_get_func)];
+        if super::typeobj::PyType_Ready(t) < 0 {
+            clear_exc();
+        }
+    });
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInstanceMethod_New(f: *mut PyObject) -> *mut PyObject {
-    // instancemethod behaves like the function itself when bound through a class
-    unsafe { (*f).to_ref().into_raw() }
+    unsafe {
+        if f.is_null() {
+            return null_arg();
+        }
+        init_instancemethod_type();
+        new_instancemethod(&*f).into_raw()
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInstanceMethod_Function(m: *mut PyObject) -> *mut PyObject {
-    m
+    unsafe {
+        if m.is_null() || (*m).type_ptr() != im_type() {
+            let _ = bad_internal();
+            return std::ptr::null_mut();
+        }
+        (*(m as *mut InstanceMethodObject)).func
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyStaticMethod_New(f: *mut PyObject) -> *mut PyObject {
@@ -419,6 +570,90 @@ pub(crate) struct CCodeArgs<'a> {
     pub name: &'a PyObject,
     pub qualname: Option<&'a PyObject>,
     pub firstlineno: i32,
+    /// CPython-format location table (bytes), if the caller supplied one.
+    pub linetable: Option<&'a PyObject>,
+}
+
+/// Decode a location table in CPython's published code-object format into one location per
+/// 2-byte code unit. Each entry starts with a byte that has bit 7 set; bits 3-6 hold the
+/// entry kind and bits 0-2 the number of code units minus one. Kinds 0-9 keep the line and
+/// carry the start column in the kind (high bits) and the next byte (low 3 bits, then the
+/// width); 10-12 move the line by 0-2 and carry both columns in two bytes; 13 moves the line
+/// (signed varint) without columns; 14 moves the line and gives the end-line delta and both
+/// columns plus one as varints; 15 has no location. Varints are 6-bit groups, low group
+/// first, bit 6 meaning "more follows". Returns None for a malformed table.
+fn decode_location_table(t: &[u8], firstlineno: i32) -> Option<Vec<rpy_compiler::bytecode::Location>> {
+    use rpy_compiler::bytecode::Location;
+    let mut pos = 0usize;
+    let next = |pos: &mut usize| -> Option<u8> {
+        let b = *t.get(*pos)?;
+        *pos += 1;
+        Some(b)
+    };
+    let varint = |pos: &mut usize| -> Option<u64> {
+        let mut v = 0u64;
+        let mut shift = 0;
+        loop {
+            let b = next(pos)?;
+            v |= ((b & 63) as u64) << shift;
+            if b & 64 == 0 {
+                return Some(v);
+            }
+            shift += 6;
+            if shift > 60 {
+                return None;
+            }
+        }
+    };
+    let svarint = |pos: &mut usize| -> Option<i64> {
+        let u = varint(pos)?;
+        Some(if u & 1 != 0 { -((u >> 1) as i64) } else { (u >> 1) as i64 })
+    };
+    let mut line = firstlineno as i64;
+    let mut out = Vec::new();
+    while pos < t.len() {
+        let head = next(&mut pos)?;
+        if head & 0x80 == 0 {
+            return None;
+        }
+        let kind = (head >> 3) & 15;
+        let len = (head & 7) as usize + 1;
+        let as_u32 = |x: i64| if x <= 0 { 0 } else { x.min(u32::MAX as i64 - 1) as u32 };
+        let loc = match kind {
+            0..=9 => {
+                let b = next(&mut pos)?;
+                let col = (kind as u32) * 8 + ((b >> 4) & 7) as u32;
+                let l = as_u32(line);
+                Location { lineno: l, end_lineno: l, col, end_col: col + (b & 15) as u32 }
+            }
+            10..=12 => {
+                line += (kind - 10) as i64;
+                let c0 = next(&mut pos)? as u32;
+                let c1 = next(&mut pos)? as u32;
+                let l = as_u32(line);
+                Location { lineno: l, end_lineno: l, col: c0, end_col: c1 }
+            }
+            13 => {
+                line += svarint(&mut pos)?;
+                let l = as_u32(line);
+                Location { lineno: l, end_lineno: l, col: u32::MAX, end_col: u32::MAX }
+            }
+            14 => {
+                line += svarint(&mut pos)?;
+                let end = line + varint(&mut pos)? as i64;
+                let c0 = varint(&mut pos)?;
+                let c1 = varint(&mut pos)?;
+                let col = |c: u64| if c == 0 { u32::MAX } else { (c - 1).min(u32::MAX as u64 - 1) as u32 };
+                Location { lineno: as_u32(line), end_lineno: as_u32(end), col: col(c0), end_col: col(c1) }
+            }
+            _ => Location { lineno: 0, end_lineno: 0, col: u32::MAX, end_col: u32::MAX },
+        };
+        if out.len() + len > 1 << 20 {
+            return None;
+        }
+        out.extend(std::iter::repeat_n(loc, len));
+    }
+    Some(out)
 }
 
 pub(crate) fn new_code_from_c(a: CCodeArgs) -> PyResult {
@@ -482,11 +717,23 @@ pub(crate) fn new_code_from_c(a: CCodeArgs) -> PyResult {
     let stub = c_code_stub();
     let sd = code::code_data(stub);
     let line = a.firstlineno.max(0) as u32;
-    let locations: Vec<rpy_compiler::bytecode::Location> = sd
-        .locations
-        .iter()
-        .map(|_| rpy_compiler::bytecode::Location { lineno: line, end_lineno: line, col: u32::MAX, end_col: u32::MAX })
-        .collect();
+    let first = rpy_compiler::bytecode::Location { lineno: line, end_lineno: line, col: u32::MAX, end_col: u32::MAX };
+    let mut code_words = sd.code.clone();
+    let mut locations = vec![first; sd.locations.len()];
+    // With a location table (Cython emits one per function), instruction i reports the
+    // table's entry for code unit i, so co_lines()/co_positions() give the source lines.
+    // The padding instructions after the stub's own are never reached.
+    if let Some(lt) = a.linetable.filter(|t| crate::types::bytes::is_bytes(t)) {
+        if let Some(units) = decode_location_table(crate::types::bytes::bytes_data(lt), a.firstlineno) {
+            while code_words.len() < units.len() {
+                code_words.push(rpy_compiler::bytecode::encode(rpy_compiler::bytecode::Op::Nop, 0));
+                locations.push(first);
+            }
+            for (slot, u) in locations.iter_mut().zip(units) {
+                *slot = u;
+            }
+        }
+    }
     let parts = code::CodeParts {
         argcount: a.argcount as u32,
         posonlyargcount: a.posonlyargcount as u32,
@@ -494,7 +741,7 @@ pub(crate) fn new_code_from_c(a: CCodeArgs) -> PyResult {
         flags,
         stacksize: code::code(stub).obj.co_stacksize as u32,
         firstlineno: line,
-        code: sd.code.clone(),
+        code: code_words,
         lines: code::Lines::Decoded(&locations),
         exception_table: sd.exception_table.clone(),
         exctable_raw: None,
@@ -523,7 +770,7 @@ pub(crate) fn new_code_from_c(a: CCodeArgs) -> PyResult {
 unsafe fn code_new_c(
     a: c_int, p: c_int, k: c_int, f: c_int, consts: *mut PyObject, names: *mut PyObject, varnames: *mut PyObject,
     freevars: *mut PyObject, cellvars: *mut PyObject, filename: *mut PyObject, name: *mut PyObject, qualname: *mut PyObject,
-    fl: c_int,
+    fl: c_int, lt: *mut PyObject,
 ) -> *mut PyObject {
     unsafe {
         if filename.is_null() || name.is_null() {
@@ -543,8 +790,88 @@ unsafe fn code_new_c(
             name: &*name,
             qualname: opt(qualname),
             firstlineno: fl,
+            linetable: opt(lt),
         }))
     }
+}
+
+/// `types.CodeType(argcount, posonlyargcount, kwonlyargcount, nlocals, stacksize, flags,
+/// codestring, constants, names, varnames, filename, name, qualname, firstlineno, linetable,
+/// exceptiontable, freevars=(), cellvars=(), /)`. Like the C constructors, the result carries
+/// the given metadata over the shared stub body (the bytecode argument is checked for type
+/// only); used e.g. by limited-API Cython modules for their functions' `__code__`.
+pub(crate) unsafe extern "C" fn code_tp_new(_t: *mut PyTypeObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
+    unsafe { ret(code_new_impl(&*args, opt(kw))) }
+}
+
+fn code_new_impl(args: &PyObject, kw: Option<&PyObject>) -> PyResult {
+    if let Some(k) = kw {
+        if dict::dict_len(k) != 0 {
+            raise!(TypeError, "code() takes no keyword arguments");
+        }
+    }
+    let a = tuple::tuple_to_vec(args);
+    if a.len() < 16 || a.len() > 18 {
+        let (what, n) = if a.len() < 16 { ("at least", 16) } else { ("at most", 18) };
+        raise!(TypeError, "code expected {} {} arguments, got {}", what, n, a.len());
+    }
+    let int_arg = |i: usize, what: &str| -> PyResult<i32> {
+        if !int::is_int(&a[i]) {
+            raise!(TypeError, "code() argument {} must be int, not {}", i + 1, tname(&a[i]));
+        }
+        let v = ab::as_i64(&a[i])?;
+        if v < i32::MIN as i64 || v > i32::MAX as i64 {
+            raise!(OverflowError, "code: {} is out of range", what);
+        }
+        Ok(v as i32)
+    };
+    let typed = |i: usize, ok: bool, tn: &str| -> PyResult<()> {
+        if !ok {
+            raise!(TypeError, "code() argument {} must be {}, not {}", i + 1, tn, tname(&a[i]));
+        }
+        Ok(())
+    };
+    let argcount = int_arg(0, "argcount")?;
+    let posonly = int_arg(1, "posonlyargcount")?;
+    let kwonly = int_arg(2, "kwonlyargcount")?;
+    let nlocals = int_arg(3, "nlocals")?;
+    let _stacksize = int_arg(4, "stacksize")?;
+    let flags = int_arg(5, "flags")?;
+    typed(6, crate::types::bytes::is_bytes(&a[6]), "bytes")?;
+    for i in [7, 8, 9] {
+        typed(i, tuple::is_tuple(&a[i]), "tuple")?;
+    }
+    for i in [10, 11, 12] {
+        typed(i, pystr::is_str(&a[i]), "str")?;
+    }
+    let firstlineno = int_arg(13, "firstlineno")?;
+    typed(14, crate::types::bytes::is_bytes(&a[14]), "bytes")?;
+    typed(15, crate::types::bytes::is_bytes(&a[15]), "bytes")?;
+    for i in 16..a.len() {
+        typed(i, tuple::is_tuple(&a[i]), "tuple")?;
+    }
+    if argcount < posonly || posonly < 0 || kwonly < 0 || nlocals < 0 {
+        raise!(ValueError, "code: argcount must not be negative");
+    }
+    if nlocals as usize != tuple::tuple_len(&a[9]) {
+        raise!(ValueError, "code: co_nlocals != len(co_varnames)");
+    }
+    new_code_from_c(CCodeArgs {
+        argcount,
+        posonlyargcount: posonly,
+        kwonlyargcount: kwonly,
+        flags,
+        consts: Some(&a[7]),
+        names: Some(&a[8]),
+        varnames: Some(&a[9]),
+        freevars: a.get(16).map(|x| &**x),
+        cellvars: a.get(17).map(|x| &**x),
+        filename: &a[10],
+        name: &a[11],
+        qualname: Some(&a[12]),
+        firstlineno,
+        linetable: Some(&a[14]),
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -566,6 +893,7 @@ pub unsafe extern "C" fn PyCode_NewEmpty(filename: *const c_char, funcname: *con
             name: &name,
             qualname: None,
             firstlineno,
+            linetable: None,
         }))
     }
 }
@@ -579,7 +907,7 @@ pub unsafe extern "C" fn PyUnstable_Code_New(
     varnames: *mut PyObject, freevars: *mut PyObject, cellvars: *mut PyObject, filename: *mut PyObject, name: *mut PyObject,
     qualname: *mut PyObject, fl: c_int, _lt: *mut PyObject, _et: *mut PyObject,
 ) -> *mut PyObject {
-    unsafe { code_new_c(a, 0, k, f, consts, names, varnames, freevars, cellvars, filename, name, qualname, fl) }
+    unsafe { code_new_c(a, 0, k, f, consts, names, varnames, freevars, cellvars, filename, name, qualname, fl, _lt) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_Code_NewWithPosOnlyArgs(
@@ -587,7 +915,7 @@ pub unsafe extern "C" fn PyUnstable_Code_NewWithPosOnlyArgs(
     names: *mut PyObject, varnames: *mut PyObject, freevars: *mut PyObject, cellvars: *mut PyObject, filename: *mut PyObject,
     name: *mut PyObject, qualname: *mut PyObject, fl: c_int, _lt: *mut PyObject, _et: *mut PyObject,
 ) -> *mut PyObject {
-    unsafe { code_new_c(a, p, k, f, consts, names, varnames, freevars, cellvars, filename, name, qualname, fl) }
+    unsafe { code_new_c(a, p, k, f, consts, names, varnames, freevars, cellvars, filename, name, qualname, fl, _lt) }
 }
 static CODE_EXTRA: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 static CODE_EXTRA_DATA: std::sync::Mutex<Vec<(usize, isize, usize)>> = std::sync::Mutex::new(Vec::new());

@@ -667,11 +667,24 @@ unsafe extern "C" fn list_repr(o: *mut PyObject) -> *mut PyObject {
             sb.push('[' as u32);
             let res = (|| {
                 let mut i = 0;
-                while let Some(it) = get(o, i) {
+                loop {
+                    // a list made by PyList_New may still hold NULL items: shown as <NULL>
+                    let item = {
+                        let _g = ob_lock(o);
+                        let l = lp(o);
+                        if i >= (*l).ob_base.ob_size as usize {
+                            break;
+                        }
+                        let p = *((*l).ob_item as *const *mut PyObject).add(i);
+                        if p.is_null() { None } else { Some((*p).to_ref()) }
+                    };
                     if i > 0 {
                         sb.push_str(", ");
                     }
-                    sb.push_obj(&*ab::repr(&it)?);
+                    match item {
+                        Some(it) => sb.push_obj(&*ab::repr(&it)?),
+                        None => sb.push_str("<NULL>"),
+                    }
                     i += 1;
                 }
                 Ok::<(), PyErr>(())

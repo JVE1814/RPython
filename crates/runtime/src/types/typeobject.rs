@@ -81,18 +81,30 @@ pub fn type_name_of(o: &PyObject) -> String {
 }
 
 /// `__module__` of a type as Rust string (best effort).
+/// True if `__module__` in a heap type's dict is a member/getset descriptor for its
+/// instances (C types whose instances carry their own module, e.g. Cython's function
+/// type made with PyType_FromSpec); the type's own module then comes from its dotted name.
+pub fn module_is_instance_descr(m: &PyObject) -> bool {
+    let t = m.type_ptr();
+    t == crate::types::descr::member_descr_type() || t == crate::types::descr::getset_descr_type()
+}
+
 pub fn type_module(tp: *mut PyTypeObject) -> Option<String> {
     unsafe {
         if is_heap_type(tp) {
             let d = (*tp).tp_dict;
+            let mut from_name = false;
             if !d.is_null() {
                 if let Some(m) = dict::get_item_str(&*d, name!("__module__")) {
                     if pystr::is_str(&m) {
                         return Some(pystr::to_string_lossy(&m));
                     }
+                    from_name = module_is_instance_descr(&m);
                 }
             }
-            return None;
+            if !from_name {
+                return None;
+            }
         }
         let full = CStr::from_ptr((*tp).tp_name).to_string_lossy();
         match full.rfind('.') {
@@ -234,8 +246,9 @@ pub unsafe fn dict_slot(o: *mut PyObject) -> *mut *mut PyObject {
 pub unsafe fn dict_slot_raw(o: *mut PyObject) -> *mut *mut PyObject {
     unsafe {
         let tp = (*o).type_ptr();
-        if (*tp).tp_flags & Py_TPFLAGS_MANAGED_DICT != 0 && alloc::has_managed(o) {
-            return alloc::managed_dict_slot(o);
+        if (*tp).tp_flags & Py_TPFLAGS_MANAGED_DICT != 0 {
+            // (tp_dictoffset is then the sentinel -1, not an offset)
+            return if alloc::has_managed(o) { alloc::managed_dict_slot(o) } else { std::ptr::null_mut() };
         }
         let off = (*tp).tp_dictoffset;
         if off == 0 {
@@ -407,12 +420,27 @@ pub fn generic_setattr_with_dict(
     }
 }
 
+/// object's tp_getattro, exported as PyObject_GenericGetAttr: extensions compare a type's
+/// tp_getattro with that symbol to detect standard attribute lookup (msgspec, Cython).
+#[unsafe(export_name = "PyObject_GenericGetAttr")]
 pub unsafe extern "C" fn object_generic_getattro(o: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
-    unsafe { into_c(generic_getattr(&*o, &*name)) }
+    unsafe {
+        if !pystr::is_str(&*name) {
+            return into_c(Err(crate::err!(TypeError, "attribute name must be string, not '{}'", tname(&*name))));
+        }
+        into_c(generic_getattr(&*o, &*name))
+    }
 }
 
+/// object's tp_setattro, exported as PyObject_GenericSetAttr (see above).
+#[unsafe(export_name = "PyObject_GenericSetAttr")]
 pub unsafe extern "C" fn object_generic_setattro(o: *mut PyObject, name: *mut PyObject, v: *mut PyObject) -> c_int {
-    unsafe { int_into_c(generic_setattr(&*o, &*name, if v.is_null() { None } else { Some(&*v) })) }
+    unsafe {
+        if !pystr::is_str(&*name) {
+            return int_into_c(Err(crate::err!(TypeError, "attribute name must be string, not '{}'", tname(&*name))));
+        }
+        int_into_c(generic_setattr(&*o, &*name, if v.is_null() { None } else { Some(&*v) }))
+    }
 }
 
 // ---------------------------------------------------------------- allocation
@@ -607,6 +635,12 @@ pub unsafe extern "C" fn subtype_clear(op: *mut PyObject) -> c_int {
 // ---------------------------------------------------------------- readiness
 
 /// Mark a static type as immortal and prepare it (PyType_Ready).
+thread_local! {
+    /// Set while PyType_Ready runs for an extension: static types readied then share their
+    /// base's number/async/sequence/mapping/buffer tables when they have none of their own.
+    pub static SHARE_BASE_SUBSTRUCTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub fn type_ready(tp: *mut PyTypeObject) -> PyResult<()> {
     unsafe {
         if (*tp).tp_flags & Py_TPFLAGS_READY != 0 {
@@ -615,7 +649,11 @@ pub fn type_ready(tp: *mut PyTypeObject) -> PyResult<()> {
         (*tp).tp_flags |= Py_TPFLAGS_READYING;
         let o = tp as *mut PyObject;
         if (*o).ob_type.load(std::sync::atomic::Ordering::Relaxed).is_null() {
-            (*o).ob_type.store(type_type(), std::sync::atomic::Ordering::Relaxed);
+            // a static type without an explicit metatype gets its base's metatype (numpy's
+            // DTypes set only tp_base = &PyArrayDescr_Type and expect _DTypeMeta)
+            let b = (*tp).tp_base;
+            let meta = if b.is_null() { std::ptr::null_mut() } else { (*(b as *mut PyObject)).ob_type.load(std::sync::atomic::Ordering::Relaxed) };
+            (*o).ob_type.store(if meta.is_null() { type_type() } else { meta }, std::sync::atomic::Ordering::Relaxed);
         }
         if !is_heap_type(tp) {
             make_immortal(o);
@@ -657,6 +695,28 @@ pub fn type_ready(tp: *mut PyTypeObject) -> PyResult<()> {
         // inheritance
         if !base.is_null() {
             inherit_special(tp, base);
+            if (*tp).tp_flags & Py_TPFLAGS_HEAPTYPE == 0 && SHARE_BASE_SUBSTRUCTS.with(|c| c.get()) {
+                // an extension's static type without its own method tables uses its base's
+                // tables (the same structs), so slots of other MRO entries are not added
+                // (np.str_ keeps str's sq_repeat for `*` rather than numpy's generic multiply)
+                let t = &mut *tp;
+                let b = &*base;
+                if t.tp_as_number.is_null() {
+                    t.tp_as_number = b.tp_as_number;
+                }
+                if t.tp_as_async.is_null() {
+                    t.tp_as_async = b.tp_as_async;
+                }
+                if t.tp_as_sequence.is_null() {
+                    t.tp_as_sequence = b.tp_as_sequence;
+                }
+                if t.tp_as_mapping.is_null() {
+                    t.tp_as_mapping = b.tp_as_mapping;
+                }
+                if t.tp_as_buffer.is_null() {
+                    t.tp_as_buffer = b.tp_as_buffer;
+                }
+            }
         }
         let mro = (*tp).tp_mro;
         for b in tuple::tuple_items(&*mro).iter().skip(1) {
@@ -851,7 +911,18 @@ unsafe fn inherit_slots(tp: *mut PyTypeObject, base: *mut PyTypeObject) {
     unsafe {
         let t = &mut *tp;
         let b = &*base;
-        if !b.tp_as_number.is_null() {
+        // a table shared with tp_base (see type_ready) belongs to the base: never fill it
+        let tb = t.tp_base;
+        let shared = |own: *mut c_void, base_own: Option<*mut c_void>| -> bool {
+            !is_heap_type(tp) && !own.is_null() && base_own == Some(own)
+        };
+        let tbr = if tb.is_null() { None } else { Some(&*tb) };
+        let skip_num = shared(t.tp_as_number as *mut c_void, tbr.map(|x| x.tp_as_number as *mut c_void));
+        let skip_async = shared(t.tp_as_async as *mut c_void, tbr.map(|x| x.tp_as_async as *mut c_void));
+        let skip_seq = shared(t.tp_as_sequence as *mut c_void, tbr.map(|x| x.tp_as_sequence as *mut c_void));
+        let skip_map = shared(t.tp_as_mapping as *mut c_void, tbr.map(|x| x.tp_as_mapping as *mut c_void));
+        let skip_buf = shared(t.tp_as_buffer as *mut c_void, tbr.map(|x| x.tp_as_buffer as *mut c_void));
+        if !b.tp_as_number.is_null() && !skip_num {
             if t.tp_as_number.is_null() {
                 t.tp_as_number = Box::into_raw(Box::new(PyNumberMethods::ZERO));
             }
@@ -893,7 +964,7 @@ unsafe fn inherit_slots(tp: *mut PyTypeObject, base: *mut PyTypeObject) {
             copyslot!(tn, bn, nb_matrix_multiply);
             copyslot!(tn, bn, nb_inplace_matrix_multiply);
         }
-        if !b.tp_as_async.is_null() {
+        if !b.tp_as_async.is_null() && !skip_async {
             if t.tp_as_async.is_null() {
                 t.tp_as_async = Box::into_raw(Box::new(PyAsyncMethods::ZERO));
             }
@@ -904,7 +975,7 @@ unsafe fn inherit_slots(tp: *mut PyTypeObject, base: *mut PyTypeObject) {
             copyslot!(ta, ba, am_anext);
             copyslot!(ta, ba, am_send);
         }
-        if !b.tp_as_sequence.is_null() {
+        if !b.tp_as_sequence.is_null() && !skip_seq {
             if t.tp_as_sequence.is_null() {
                 t.tp_as_sequence = Box::into_raw(Box::new(PySequenceMethods::ZERO));
             }
@@ -919,7 +990,7 @@ unsafe fn inherit_slots(tp: *mut PyTypeObject, base: *mut PyTypeObject) {
             copyslot!(ts, bs, sq_inplace_concat);
             copyslot!(ts, bs, sq_inplace_repeat);
         }
-        if !b.tp_as_mapping.is_null() {
+        if !b.tp_as_mapping.is_null() && !skip_map {
             if t.tp_as_mapping.is_null() {
                 t.tp_as_mapping = Box::into_raw(Box::new(PyMappingMethods::ZERO));
             }
@@ -929,7 +1000,7 @@ unsafe fn inherit_slots(tp: *mut PyTypeObject, base: *mut PyTypeObject) {
             copyslot!(tm, bm, mp_subscript);
             copyslot!(tm, bm, mp_ass_subscript);
         }
-        if !b.tp_as_buffer.is_null() {
+        if !b.tp_as_buffer.is_null() && !skip_buf {
             if t.tp_as_buffer.is_null() {
                 t.tp_as_buffer = Box::into_raw(Box::new(PyBufferProcs::ZERO));
             }
@@ -950,9 +1021,13 @@ unsafe fn inherit_slots(tp: *mut PyTypeObject, base: *mut PyTypeObject) {
         copyslot!(t, b, tp_repr);
         copyslot!(t, b, tp_call);
         copyslot!(t, b, tp_str);
-        if t.tp_vectorcall_offset == 0 && t.tp_call == b.tp_call && b.tp_flags & Py_TPFLAGS_HAVE_VECTORCALL != 0 && !is_heap_type(tp) {
+        if t.tp_vectorcall_offset == 0 && t.tp_call == b.tp_call && b.tp_flags & Py_TPFLAGS_HAVE_VECTORCALL != 0 {
+            // the offset is inherited with tp_call (PyVectorcall_Call as tp_call reads it); heap
+            // types do not get the flag, so a later `__call__` assignment still takes effect
             t.tp_vectorcall_offset = b.tp_vectorcall_offset;
-            t.tp_flags |= Py_TPFLAGS_HAVE_VECTORCALL;
+            if !is_heap_type(tp) {
+                t.tp_flags |= Py_TPFLAGS_HAVE_VECTORCALL;
+            }
         }
         if t.tp_richcompare.is_none() && t.tp_hash.is_none() {
             let d = &*t.tp_dict;

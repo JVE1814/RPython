@@ -1284,6 +1284,15 @@ pub fn ready_all() -> PyResult<()> {
     for &(idx, ..) in TABLE.iter() {
         let tp = unsafe { (&raw mut TYPES[idx as usize]) as *mut PyTypeObject };
         type_ready(tp)?;
+        // every builtin exception class has its own __new__ (as in CPython, where each one
+        // sets tp_new); extensions look for it in the class dict (msgspec rejects
+        // `class S(Struct, Exception)` that way)
+        unsafe {
+            let d = &*(*tp).tp_dict;
+            if (*tp).tp_new.is_some() && dict::get_item_str(d, crate::name!("__new__")).is_none() {
+                dict::set_item(d, crate::name!("__new__"), &crate::types::descr::new_tp_new_wrapper(tp))?;
+            }
+        }
     }
     Ok(())
 }

@@ -759,10 +759,9 @@ pub fn from_bufferproc(o: &PyObject, flags: isize, proc: getbufferproc) -> PyRes
     if flags > i32::MAX as isize || flags < i32::MIN as isize {
         raise!(OverflowError, "buffer flags out of range");
     }
+    // PyBUF_READ / PyBUF_WRITE alone are rejected by PyBuffer_FillInfo (bytes, bytearray);
+    // an extension's getbuffer may accept them (numpy does)
     let flags = flags as c_int;
-    if flags == PyBUF_READ || flags == PyBUF_WRITE {
-        return Err(system_error("bad argument to internal function"));
-    }
     let proc = match proc {
         Some(p) => p,
         None => raise!(TypeError, "a bytes-like object is required, not '{}'", tname(o)),

@@ -1062,6 +1062,7 @@ pub fn init_types() {
         t.tp_repr = Some(code_repr);
         t.tp_richcompare = Some(code_richcompare);
         t.tp_hash = Some(code_hash);
+        t.tp_new = Some(crate::capi::funcs::code_tp_new);
         t.tp_weaklistoffset = std::mem::offset_of!(PyCodeObject, co_weakreflist) as isize;
         t.tp_getattro = Some(object_generic_getattro);
         t.tp_getset = crate::getset_table![

@@ -80,7 +80,11 @@ pub unsafe extern "C" fn PyVectorcall_Function(callable: *mut PyObject) -> vecto
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyVectorcall_Call(callable: *mut PyObject, tup: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
     unsafe {
-        let Some(f) = ab::vectorcall_func(&*callable) else {
+        // the slot at tp_vectorcall_offset, even without the type flag (heap subclasses of a
+        // vectorcall type inherit only the offset, e.g. Python subclasses of msgspec's StructMeta)
+        let off = (*callable).ty().tp_vectorcall_offset;
+        let f = if off > 0 { *((callable as *mut u8).offset(off) as *const vectorcallfunc) } else { None };
+        let Some(f) = f else {
             let _ = type_error(&format!("'{}' object does not support vectorcall", tname(&*callable)));
             return std::ptr::null_mut();
         };
@@ -570,7 +574,19 @@ pub unsafe extern "C" fn PySequence_InPlaceRepeat(a: *mut PyObject, n: Py_ssize_
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PySequence_Contains(o: *mut PyObject, v: *mut PyObject) -> c_int {
-    unsafe { ret_b(ab::contains(&*o, &*v)) }
+    unsafe {
+        if o.is_null() || v.is_null() {
+            // an empty sequence never compares, so a NULL item is only noticed otherwise
+            if !o.is_null() && ab::length(&*o).ok() == Some(0) {
+                clear_exc();
+                return 0;
+            }
+            clear_exc();
+            let _ = null_arg();
+            return -1;
+        }
+        ret_b(ab::contains(&*o, &*v))
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PySequence_In(o: *mut PyObject, v: *mut PyObject) -> c_int {
@@ -778,6 +794,10 @@ pub unsafe extern "C" fn PyMapping_GetItemString(o: *mut PyObject, k: *const c_c
 pub unsafe extern "C" fn PyMapping_GetOptionalItem(o: *mut PyObject, k: *mut PyObject, result: *mut *mut PyObject) -> c_int {
     unsafe {
         *result = std::ptr::null_mut();
+        if o.is_null() || k.is_null() {
+            let _ = null_arg();
+            return -1;
+        }
         if dict::is_dict_exact(&*o) {
             return match dict::get_item(&*o, &*k) {
                 Ok(Some(v)) => {

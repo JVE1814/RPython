@@ -115,6 +115,10 @@ pub struct DictTable {
     cap: usize,
     /// Number of live entries.
     used: usize,
+    /// Index slots that are not EMPTY (live or DUMMY). popitem trims `nentries` but leaves
+    /// DUMMY slots behind, so growth must also be driven by this count, or a table could end
+    /// up without any EMPTY slot and lookups of missing keys would probe forever.
+    fill: usize,
     data_bytes: usize,
 }
 
@@ -184,6 +188,7 @@ impl DictTable {
             size,
             cap: ecap,
             used: 0,
+            fill: 0,
             data_bytes: bytes,
         }
     }
@@ -242,6 +247,7 @@ impl DictTable {
             }
             fresh.nentries = n;
             fresh.used = n;
+            fresh.fill = n;
         }
         // the old data block goes; the header (and `version`) stay in place
         std::mem::swap(&mut self.entries_p, &mut fresh.entries_p);
@@ -250,6 +256,7 @@ impl DictTable {
         std::mem::swap(&mut self.cap, &mut fresh.cap);
         std::mem::swap(&mut self.data_bytes, &mut fresh.data_bytes);
         self.nentries = fresh.nentries;
+        self.fill = fresh.fill;
         fresh.nentries = 0;
         self.version = next_version();
         self.layout = next_version();
@@ -257,10 +264,13 @@ impl DictTable {
     }
     #[inline]
     fn insert_new(&mut self, h: isize, key: *mut PyObject, value: *mut PyObject) {
-        if self.nentries >= self.cap {
+        if self.nentries >= self.cap || self.fill >= self.cap {
             self.resize(self.used * 3);
         }
         let slot = self.find_empty_slot(h);
+        if self.indices()[slot] == EMPTY {
+            self.fill += 1;
+        }
         let n = self.nentries;
         self.indices_mut()[slot] = n as i32;
         unsafe { *self.entries_p.add(n) = Entry { hash: h, key, value } };

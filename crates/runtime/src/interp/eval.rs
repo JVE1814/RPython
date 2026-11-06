@@ -127,6 +127,34 @@ pub fn binary_op(op: BinOp, a: &PyObject, b: &PyObject) -> PyResult {
     if inplace { ab::inplace_op(a, b, slot) } else { ab::binary_op(a, b, slot) }
 }
 
+thread_local! {
+    /// Operands that the innermost BINARY_OP of this thread took off its value stack and is
+    /// passing to a type's number slot (0 = none). See `is_stack_temporary`.
+    static STACK_OPERANDS: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0, 0]) };
+}
+
+/// `binary_op` for operands that came off a frame's value stack (the interpreter and the JIT
+/// helpers). While a slot function runs, the operands are recorded so that
+/// `PyUnstable_Object_IsUniqueReferencedTemporary` can tell a stack temporary (which an
+/// extension such as numpy may reuse for the result) from an object that C code owns.
+pub fn binary_op_on_stack(op: BinOp, a: &PyObject, b: &PyObject) -> PyResult {
+    if let Some(r) = binary_fast(op, a, b) {
+        return Ok(r);
+    }
+    let saved = STACK_OPERANDS.with(|c| c.replace([a.as_ptr() as usize, b.as_ptr() as usize]));
+    let (slot, inplace) = binop_slot(op);
+    let r = if inplace { ab::inplace_op(a, b, slot) } else { ab::binary_op(a, b, slot) };
+    STACK_OPERANDS.with(|c| c.set(saved));
+    r
+}
+
+/// True if `p` is an operand of the binary operation the interpreter is currently
+/// dispatching on this thread.
+pub fn is_stack_temporary(p: *const PyObject) -> bool {
+    let p = p as usize;
+    p != 0 && STACK_OPERANDS.with(|c| c.get().contains(&p))
+}
+
 /// Find the exception handler for instruction `i` (first matching entry).
 fn find_handler(code: &PyObject, i: u32) -> Option<bc::ExceptionEntry> {
     let d = crate::types::code::code_data(code);
@@ -956,7 +984,7 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                         Op::BinaryOp => {
                             let b = popref!(f);
                             let a = popref!(f);
-                            let r = binary_op(BINOPS[arg as usize], &a, &b)?;
+                            let r = binary_op_on_stack(BINOPS[arg as usize], &a, &b)?;
                             push!(f, r.into_raw());
                         }
                         Op::UnaryNegative => {
@@ -1927,6 +1955,9 @@ pub fn handle_eval_breaker(ts: &ThreadState) -> PyResult<()> {
     }
     if eb & crate::threads::EVAL_ASYNC_EXC != 0 {
         crate::modules::thread::raise_async_exc(ts)?;
+    }
+    if eb & crate::threads::EVAL_PENDING != 0 {
+        crate::capi::pystate::run_pending_calls()?;
     }
     Ok(())
 }

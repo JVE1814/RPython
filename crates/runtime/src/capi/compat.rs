@@ -217,6 +217,9 @@ unsafe fn prepare(w: *mut PrivWriter, len: Py_ssize_t, maxc: u32) -> c_int {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _PyUnicodeWriter_WriteChar(w: *mut PrivWriter, c: u32) -> c_int {
     unsafe {
+        if super::unicode::as_public_writer(w as *mut std::ffi::c_void).is_some() {
+            return write_chars(w, &[c]);
+        }
         if prepare(w, 1, c) < 0 {
             return -1;
         }
@@ -228,6 +231,10 @@ pub unsafe extern "C" fn _PyUnicodeWriter_WriteChar(w: *mut PrivWriter, c: u32) 
 }
 unsafe fn write_chars(w: *mut PrivWriter, it: &[u32]) -> c_int {
     unsafe {
+        if let Some(p) = super::unicode::as_public_writer(w as *mut std::ffi::c_void) {
+            super::unicode::public_writer_push(p, it.iter().copied());
+            return 0;
+        }
         let maxc = it.iter().copied().max().unwrap_or(0);
         if prepare(w, it.len() as Py_ssize_t, maxc) < 0 {
             return -1;

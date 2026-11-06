@@ -852,6 +852,21 @@ fn call_codec(func: &PyObject, obj: &PyObject, errors: Option<&str>, op: &str, e
 /// `str.encode(encoding, errors)`.
 pub fn encode_text(s: &PyObject, encoding: &str, errors: &str) -> PyResult {
     if let Some(f) = if encoding.is_ascii() { fast_codec(encoding) } else { None } {
+        // ASCII text is its own UTF-8/ASCII/Latin-1 encoding, and 1-byte text its own
+        // Latin-1 encoding: copy it straight into the bytes object (no intermediate buffer,
+        // and MemoryError instead of an abort for huge strings)
+        if pystr::is_str(s) {
+            let one_byte = pystr::str_kind(s) == 1;
+            let direct = match f {
+                Fast::Utf8 | Fast::Ascii => pystr::str_is_ascii(s),
+                Fast::Latin1 => one_byte,
+                _ => false,
+            };
+            if direct && one_byte {
+                let n = pystr::str_len(s);
+                return bytes::try_new_bytes(unsafe { std::slice::from_raw_parts(pystr::str_data_ptr(s), n) });
+            }
+        }
         let mut ctx = EncCtx::new(
             match f {
                 Fast::Utf8 => "utf-8",
@@ -870,7 +885,7 @@ pub fn encode_text(s: &PyObject, encoding: &str, errors: &str) -> PyResult {
             Fast::Ascii => ci::encode_charlimit(&mut ctx, 128)?,
             Fast::Latin1 => ci::encode_charlimit(&mut ctx, 256)?,
         };
-        return Ok(bytes::new_bytes(&v));
+        return bytes::try_new_bytes(&v);
     }
     let info = lookup_text_codec(encoding, "codecs.encode()")?;
     encode_with(s, &info, encoding, errors)
