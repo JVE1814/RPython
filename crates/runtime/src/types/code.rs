@@ -393,11 +393,13 @@ pub fn new_code_from_unit(cu: &CodeUnit, filename: Option<&PyRef>) -> PyResult {
 static CONST_TUPLES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, PyRef>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// Type-tagged rendering of a constant (equal keys = same type and value, so the objects
+/// are interchangeable); None for constants that are never merged (code objects).
 fn const_key(c: &rpy_compiler::wordcode::Constant) -> Option<String> {
     use rpy_compiler::wordcode::Constant as C;
     use std::fmt::Write;
     fn go(c: &C, out: &mut String, depth: usize) -> bool {
-        if depth > 8 || out.len() > 4096 {
+        if depth > 16 || out.len() > 1 << 16 {
             return false;
         }
         match c {
@@ -437,7 +439,33 @@ fn const_key(c: &rpy_compiler::wordcode::Constant) -> Option<String> {
                 }
                 out.push(')');
             }
-            _ => return false,
+            C::FrozenSet(items) => {
+                let mut keys = Vec::with_capacity(items.len());
+                for it in items {
+                    let mut k = String::new();
+                    if !go(it, &mut k, depth + 1) {
+                        return false;
+                    }
+                    keys.push(k);
+                }
+                keys.sort();
+                let _ = write!(out, "{{{}:", keys.len());
+                for k in keys {
+                    out.push_str(&k);
+                    out.push('|');
+                }
+                out.push('}');
+            }
+            C::Slice(parts) => {
+                out.push('[');
+                for it in parts.iter() {
+                    if !go(it, out, depth + 1) {
+                        return false;
+                    }
+                }
+                out.push(']');
+            }
+            C::Code(_) | C::Opaque(_) => return false,
         }
         true
     }
@@ -445,10 +473,37 @@ fn const_key(c: &rpy_compiler::wordcode::Constant) -> Option<String> {
     if go(c, &mut s, 0) { Some(s) } else { None }
 }
 
+/// Per-compilation sharing (one `compile()` call): equal constants, equal co_consts
+/// tuples, equal name tuples and equal line/exception tables become one object.
+#[derive(Default)]
+pub struct ConstMerger {
+    consts: std::collections::HashMap<String, PyRef>,
+    blobs: std::collections::HashMap<Vec<u8>, PyRef>,
+}
+
+impl ConstMerger {
+    fn bytes(&mut self, b: &[u8]) -> PyRef {
+        if let Some(s) = bytes::bytes_singleton(b) {
+            return s;
+        }
+        self.blobs.entry(b.to_vec()).or_insert_with(|| bytes::new_bytes(b)).clone()
+    }
+}
+
 /// Convert a public-form compiler constant into an object.
 pub fn wconst_to_obj(c: &rpy_compiler::wordcode::Constant, filename: &PyRef) -> PyResult {
+    wconst_merged(c, filename, &mut ConstMerger::default())
+}
+
+fn wconst_merged(c: &rpy_compiler::wordcode::Constant, filename: &PyRef, m: &mut ConstMerger) -> PyResult {
     use rpy_compiler::wordcode::Constant as C;
-    Ok(match c {
+    let key = const_key(c);
+    if let Some(k) = &key {
+        if let Some(v) = m.consts.get(k) {
+            return Ok(v.clone());
+        }
+    }
+    let v = match c {
         C::None => none::none_ref(),
         C::Bool(b) => crate::types::bool_::new_bool(*b),
         C::Ellipsis => none::ellipsis().to_ref(),
@@ -457,41 +512,45 @@ pub fn wconst_to_obj(c: &rpy_compiler::wordcode::Constant, filename: &PyRef) -> 
         C::Float(f) => crate::types::float::new_float(*f),
         C::Complex { real, imag } => crate::types::complex::new_complex(*real, *imag),
         C::Str(cps) => pystr::intern(pystr::from_codepoints(cps)),
-        C::Bytes(b) => bytes::bytes_singleton(b).unwrap_or_else(|| bytes::new_bytes(b)),
+        C::Bytes(b) => m.bytes(b),
         C::Tuple(items) => {
-            let key = const_key(c);
-            if let Some(k) = &key {
-                if let Some(t) = CONST_TUPLES.lock().unwrap().get(k) {
-                    return Ok(t.clone());
+            let global = key.as_ref().and_then(|k| CONST_TUPLES.lock().unwrap().get(k).cloned());
+            match global {
+                Some(t) => t,
+                None => {
+                    let mut v = Vec::with_capacity(items.len());
+                    for it in items {
+                        v.push(wconst_merged(it, filename, m)?);
+                    }
+                    let t = tuple::new_tuple(v);
+                    match &key {
+                        Some(k) => CONST_TUPLES.lock().unwrap().entry(k.clone()).or_insert(t).clone(),
+                        None => t,
+                    }
                 }
             }
-            let mut v = Vec::with_capacity(items.len());
-            for it in items {
-                v.push(wconst_to_obj(it, filename)?);
-            }
-            let t = tuple::new_tuple(v);
-            if let Some(k) = key {
-                return Ok(CONST_TUPLES.lock().unwrap().entry(k).or_insert(t).clone());
-            }
-            t
         }
         C::FrozenSet(items) => {
             let mut v = Vec::with_capacity(items.len());
             for it in items {
-                v.push(wconst_to_obj(it, filename)?);
+                v.push(wconst_merged(it, filename, m)?);
             }
             crate::types::set::new_frozenset_from_vec(v)?
         }
         C::Slice(parts) => {
-            let a = wconst_to_obj(&parts[0], filename)?;
-            let b = wconst_to_obj(&parts[1], filename)?;
-            let s = wconst_to_obj(&parts[2], filename)?;
+            let a = wconst_merged(&parts[0], filename, m)?;
+            let b = wconst_merged(&parts[1], filename, m)?;
+            let s = wconst_merged(&parts[2], filename, m)?;
             crate::types::slice::new_slice(&a, &b, &s)
         }
-        C::Code(co) => new_code_from_wordcode(co, Some(filename))?,
+        C::Code(co) => new_code_wc_merged(co, filename, m)?,
         // placeholders of the compiler test hooks; they substitute the real objects
         C::Opaque(_) => none::none_ref(),
-    })
+    };
+    if let Some(k) = key {
+        m.consts.insert(k, v.clone());
+    }
+    Ok(v)
 }
 
 /// Build a (public-form) code object from the compiler's wordcode output.
@@ -500,11 +559,23 @@ pub fn new_code_from_wordcode(co: &rpy_compiler::wordcode::CodeObject, filename:
         Some(f) => f.clone(),
         None => pystr::intern_str(&co.filename),
     };
+    new_code_wc_merged(co, &filename, &mut ConstMerger::default())
+}
+
+fn new_code_wc_merged(co: &rpy_compiler::wordcode::CodeObject, filename: &PyRef, m: &mut ConstMerger) -> PyResult {
     let mut consts = Vec::with_capacity(co.consts.len());
+    let mut tuple_key = Some(String::from("C"));
     for c in &co.consts {
-        consts.push(wconst_to_obj(c, &filename)?);
+        match (const_key(c), &mut tuple_key) {
+            (Some(k), Some(tk)) => {
+                tk.push_str(&k);
+                tk.push('\u{1}');
+            }
+            _ => tuple_key = None,
+        }
+        consts.push(wconst_merged(c, filename, m)?);
     }
-    new_code_from_public(PublicParts {
+    let r = new_code_from_public(PublicParts {
         argcount: co.argcount as i32,
         posonlyargcount: co.posonlyargcount as i32,
         kwonlyargcount: co.kwonlyargcount as i32,
@@ -516,12 +587,23 @@ pub fn new_code_from_wordcode(co: &rpy_compiler::wordcode::CodeObject, filename:
         names: co.names.iter().map(|n| pystr::intern_str(n)).collect(),
         localsplusnames: co.localsplusnames.iter().map(|n| pystr::intern_str(n)).collect(),
         kinds: co.localspluskinds.clone(),
-        filename,
+        filename: filename.clone(),
         name: pystr::intern_str(&co.name),
         qualname: pystr::intern_str(&co.qualname),
-        linetable: bytes::new_bytes(&co.linetable),
-        exceptiontable: bytes::new_bytes(&co.exceptiontable),
-    })
+        linetable: m.bytes(&co.linetable),
+        exceptiontable: m.bytes(&co.exceptiontable),
+    })?;
+    // equal co_consts tuples (same items, all merged above) are shared too
+    if let Some(k) = tuple_key {
+        let c = unsafe { &mut *(r.as_ptr() as *mut PyCodeObject) };
+        let mine = unsafe { PyRef::from_borrowed(c.co_consts) };
+        let shared = m.consts.entry(k).or_insert(mine).clone();
+        if !shared.is(unsafe { &*c.co_consts }) {
+            let old = std::mem::replace(&mut c.co_consts, shared.into_raw());
+            unsafe { xdecref(old) };
+        }
+    }
+    Ok(r)
 }
 
 /// Everything a legacy code object is made of, with the object-valued parts already built
