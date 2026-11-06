@@ -1298,6 +1298,26 @@ impl<'a> B<'a> {
                     self.discard(a, k);
                     self.push(AV::Bool(r));
                 }
+                AV::InFrame(_) | AV::Obj(..) => {
+                    // truth of any object: True/False/None without a call, otherwise
+                    // the object's truth protocol (may run arbitrary code)
+                    let es = self.snap(i, SnapKind::Error);
+                    let p = self.peek_ptr(1);
+                    let r = self.v(Class::G);
+                    self.emit(Inst::Call { addr: h2_truth as usize, args: vec![Opnd::V(p)], fargs: vec![], ret: Some(r), fret: None });
+                    self.emit(Inst::Guard(Cond::Cmp(r, Opnd::I(0), Cc::L), es));
+                    let k = self.st.stack.len() - 1;
+                    let a = self.pop();
+                    self.discard(a, k);
+                    self.forget_tags();
+                    if ins.op == Op::UnaryNot {
+                        let n = self.v(Class::G);
+                        self.emit(Inst::Alu(Alu::Xor, n, r, Opnd::I(1)));
+                        self.push(AV::Bool(n));
+                    } else {
+                        self.push(AV::Bool(r));
+                    }
+                }
                 _ => self.template(i),
             },
             Op::PopJumpIfFalse | Op::PopJumpIfTrue => {
@@ -1433,6 +1453,33 @@ impl<'a> B<'a> {
     fn peek_ptr_if_inframe(&mut self, n: usize) {
         if let AV::InFrame(_) = self.peek(n) {
             self.peek_ptr(n);
+        }
+    }
+
+    /// After a call that may run arbitrary code: type facts that such code can break
+    /// (version tags: class mutation; exact heap types: `__class__` assignment) no
+    /// longer hold.
+    fn forget_tags(&mut self) {
+        fn weak(t: Ty) -> Ty {
+            match t {
+                Ty::Tag(_) => Ty::Unknown,
+                Ty::Exact(p) if is_heap_type(p) => Ty::Unknown,
+                t => t,
+            }
+        }
+        for l in self.st.locals.iter_mut() {
+            if let LS::Frame(t) = *l {
+                *l = LS::Frame(weak(t));
+            }
+        }
+        let fix = |a: &mut AV| match *a {
+            AV::InFrame(t) => *a = AV::InFrame(weak(t)),
+            AV::Obj(v, o, t) => *a = AV::Obj(v, o, weak(t)),
+            _ => {}
+        };
+        self.st.stack.iter_mut().for_each(fix);
+        if let Some(c) = self.inl.as_mut() {
+            c.locals.iter_mut().for_each(fix);
         }
     }
 
@@ -2455,7 +2502,22 @@ impl<'a> B<'a> {
     /// Try to compile Call instruction i by inlining its callee. False: nothing was
     /// emitted (the caller emits the call normally).
     fn try_inline(&mut self, i: usize) -> Result<bool, String> {
-        let Some((fp, an)) = self.inline_candidate(i) else { return Ok(false) };
+        let Some((fp, an)) = self.inline_candidate(i) else {
+            if super::debug_level() >= 3 {
+                let n = self.u.an.instrs[i].arg as usize;
+                let d = self.st.stack.len();
+                if let AV::Const(p) = self.st.stack[d - n - 2] {
+                    let o = unsafe { &*(p as *mut PyObject) };
+                    if o.is_type(crate::types::funcobject::function_type()) {
+                        let nm = crate::types::str::to_string_lossy(unsafe { &*crate::types::funcobject::func(o).func_qualname });
+                        eprintln!("[jit] inline {} not a candidate", nm);
+                    }
+                } else {
+                    eprintln!("[jit] call at {} in {}: callee not constant", i, crate::types::str::to_string_lossy(&self.u.cd.co_qualname));
+                }
+            }
+            return Ok(false);
+        };
         let n = self.u.an.instrs[i].arg as usize;
         // rollback point
         let save_st = self.st.clone();
@@ -2691,6 +2753,10 @@ impl<'a> B<'a> {
         self.u = caller_u;
         let bad = if branchy { !ok } else { !ok || result.is_none() || self.st.stack.len() != base };
         if bad {
+            if super::debug_level() >= 3 {
+                let nm = unsafe { crate::types::str::to_string_lossy(&*crate::types::funcobject::func(&*(fp as *mut PyObject)).func_qualname) };
+                eprintln!("[jit] inline {} rolled back at callee instr {} ({:?})", nm, j, an_ref.instrs.get(j).map(|x| x.op));
+            }
             // roll back everything emitted for the attempt
             self.st = save_st;
             self.f.blocks.truncate(save_nblocks);
@@ -2947,6 +3013,22 @@ pub unsafe extern "C" fn h2_len(o: *mut PyObject) -> i64 {
 
 /// Generic attribute load through the inline cache (slow path of tier-2 LoadAttr):
 /// new reference, or NULL with an exception set.
+/// Truth value of `o` for compiled ToBool / UnaryNot: 1, 0, or -1 with an exception set.
+pub unsafe extern "C" fn h2_truth(o: *mut PyObject) -> i64 {
+    unsafe {
+        if o == true_p() as *mut PyObject {
+            return 1;
+        }
+        if o == false_p() as *mut PyObject || o == none_p() as *mut PyObject {
+            return 0;
+        }
+        match crate::abstract_::is_true(&*o) {
+            Ok(b) => b as i64,
+            Err(_) => -1,
+        }
+    }
+}
+
 pub unsafe extern "C" fn h2_load_attr(o: *mut PyObject, name: *mut PyObject, es: *const crate::interp::cache::Entry) -> *mut PyObject {
     unsafe {
         let es = std::slice::from_raw_parts(es, crate::interp::cache::POLY);

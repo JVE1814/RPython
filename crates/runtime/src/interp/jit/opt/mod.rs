@@ -145,6 +145,10 @@ static ENABLED: AtomicU8 = AtomicU8::new(2);
 static CALLS: AtomicU32 = AtomicU32::new(1000);
 static BACKEDGES: AtomicU32 = AtomicU32::new(10000);
 static DEBUG: AtomicU8 = AtomicU8::new(0);
+/// RPYTHON_JIT_DEBUG level (3: also log inlining decisions).
+pub fn debug_level() -> u8 {
+    DEBUG.load(Relaxed)
+}
 /// deoptimisations after which code is discarded
 const DEOPT_LIMIT: u32 = 64;
 /// compilations per code object
