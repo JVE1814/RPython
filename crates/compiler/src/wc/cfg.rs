@@ -938,6 +938,8 @@ fn nop_out(ins: &mut Instr) {
     ins.op = O::NOP;
     ins.arg = 0;
     ins.target = NO_LABEL;
+    // folded-away instructions leave no line event behind
+    ins.loc = NO_POS;
 }
 
 /// Size limit for folded tuples/sets (same order as CPython's).
@@ -1500,10 +1502,12 @@ fn convert_closure_loads(cfg: &mut Cfg) {
 }
 
 /// LOAD_FAST of a local that may be unbound at that point becomes LOAD_FAST_CHECK.
-fn add_checks_for_unbound_locals(cfg: &mut Cfg, nlocals: usize, bound: &[bool]) {
-    if nlocals == 0 {
+fn add_checks_for_unbound_locals(cfg: &mut Cfg, all_locals: usize, bound: &[bool]) {
+    if all_locals == 0 {
         return;
     }
+    // the first 64 slots are analysed over the whole CFG, the others only within a block
+    let nlocals = all_locals.min(64);
     let words = nlocals.div_ceil(64);
     let pos = cfg.positions();
     let nb = cfg.blocks.len();
@@ -1576,11 +1580,27 @@ fn add_checks_for_unbound_locals(cfg: &mut Cfg, nlocals: usize, bound: &[bool]) 
     }
     for &b in &cfg.order.clone() {
         let Some(mut s) = state[b as usize].clone() else { continue };
+        let mut known: std::collections::HashSet<i32> = std::collections::HashSet::new();
         for i in cfg.blocks[b as usize].instrs.iter_mut() {
+            let a = i.arg as usize;
             if i.op == O::LOAD_FAST {
-                let a = i.arg as usize;
-                if a < nlocals && s[a / 64] & (1 << (a % 64)) != 0 {
+                if a < nlocals {
+                    if s[a / 64] & (1 << (a % 64)) != 0 {
+                        i.op = O::LOAD_FAST_CHECK;
+                    }
+                } else if !known.contains(&i.arg) {
                     i.op = O::LOAD_FAST_CHECK;
+                }
+            }
+            if a >= nlocals && wordcode::has_local(i.op) {
+                match i.op {
+                    O::STORE_FAST | O::LOAD_FAST | O::LOAD_FAST_CHECK => {
+                        known.insert(i.arg);
+                    }
+                    O::DELETE_FAST | O::LOAD_FAST_AND_CLEAR | O::STORE_FAST_MAYBE_NULL => {
+                        known.remove(&i.arg);
+                    }
+                    _ => {}
                 }
             }
             transfer(&mut s, i);
