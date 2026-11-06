@@ -313,6 +313,10 @@ struct B<'a> {
     /// callee analyses / units referenced through `u` while inlining
     inl_an: Vec<Box<Analysis>>,
     inl_units: Vec<Box<Unit<'static>>>,
+    /// contexts of the callees being inlined around the current one (nested inlining)
+    inl_outer: Vec<InlCtx>,
+    /// code data of the root unit and of every callee being inlined (no recursion)
+    inl_cds: Vec<usize>,
     /// generator unit: YieldValue suspends natively and resumes at its own entry
     is_gen: bool,
 }
@@ -2439,7 +2443,8 @@ impl<'a> B<'a> {
     /// body (no jumps, no handlers, no cells) of instructions the builder compiles
     /// natively, and tier-1 profiles. Returns (function, its unit, analysis).
     fn inline_candidate(&self, i: usize) -> Option<(usize, Box<Analysis>)> {
-        if self.inl.is_some() || !inline_enabled() {
+        let depth = self.inl_outer.len() + self.inl.is_some() as usize;
+        if depth >= 3 || !inline_enabled() {
             return None;
         }
         let n = self.u.an.instrs[i].arg as usize;
@@ -2454,7 +2459,7 @@ impl<'a> B<'a> {
             let f = crate::types::funcobject::func(fo);
             let code = &*f.func_code;
             let cd = crate::types::code::code_data(code);
-            if std::ptr::eq(cd, self.u.cd) || cd.caches.jit.load(std::sync::atomic::Ordering::Acquire).is_null() {
+            if std::ptr::eq(cd, self.u.cd) || self.inl_cds.contains(&(cd as *const CodeData as usize)) || cd.caches.jit.load(std::sync::atomic::Ordering::Acquire).is_null() {
                 return None; // recursion, or not warm (no profiles)
             }
             let co = crate::types::code::code(code).obj;
@@ -2485,7 +2490,7 @@ impl<'a> B<'a> {
                     }
                     Op::Nop | Op::ExtendedArg | Op::LoadFast | Op::LoadFastCheck | Op::StoreFast | Op::LoadConst | Op::PopTop | Op::PushNull | Op::Copy | Op::Swap => true,
                     Op::LoadGlobal | Op::LoadAttr | Op::StoreAttr | Op::BinaryOp | Op::CompareOp | Op::IsOp | Op::UnaryNegative | Op::UnaryNot | Op::ToBool => true,
-                    Op::BinarySubscr | Op::StoreSubscr | Op::UnpackSequence | Op::Call => true,
+                    Op::BinarySubscr | Op::StoreSubscr | Op::UnpackSequence | Op::Call | Op::LoadMethod => true,
                     _ => ins.op == Op::Resume,
                 };
                 if !ok || an.depth[k] < 0 {
@@ -2533,7 +2538,16 @@ impl<'a> B<'a> {
         let d = self.st.stack.len();
         let base = d - n - 2;
         let ins = self.u.an.instrs[i];
-        let err = {
+        let err = if let Some(c) = &self.inl {
+            // nested: the exception is raised in the enclosing inlined callee's frame
+            // (rebuilt by its InlineError stub), which then propagates it further
+            let stack = self.st.stack[c.base..base].iter().map(|a| self.mat_of(a)).collect();
+            let locals = c.locals.iter().enumerate().map(|(k, a)| (k as u32, self.mat_of(a), false)).collect();
+            let inl = Some(InlSnap { func: c.func, res: c.res, cont: c.cont, err: c.err });
+            self.inl.as_mut().unwrap().snapped = true;
+            self.f.snaps.push(Snapshot { resume: ins.start, lasti: ins.pc, stack, locals, kind: SnapKind::InlineError, inl });
+            self.f.snaps.len() as SnapId - 1
+        } else {
             let stack = self.st.stack[..base].iter().map(|a| self.mat_of(a)).collect();
             let locals = self.dirty_locals();
             self.f.snaps.push(Snapshot { resume: ins.start, lasti: ins.pc, stack, locals, kind: SnapKind::Error, inl: None });
@@ -2562,12 +2576,25 @@ impl<'a> B<'a> {
                     self.emit(Inst::SetCond(v, c));
                     AV::Bool(v)
                 }
+                // borrowed from a local of the enclosing inlined callee: the inner
+                // callee's local indices mean something else, so own it
+                AV::Obj(v, Own::Inl(_), t) => {
+                    self.emit(Inst::Incref(v));
+                    AV::Obj(v, Own::Owned, t)
+                }
                 other => other,
             };
         }
         self.st.stack.truncate(base);
         let cont = self.new_block(u32::MAX);
         let res = self.v(Class::G);
+        // an enclosing inlined callee's context is suspended while this one is built
+        let outer = self.inl.take();
+        let nested = outer.is_some();
+        if let Some(o) = outer {
+            self.inl_outer.push(o);
+        }
+        self.inl_cds.push(cd as *const CodeData as usize);
         // switch to the callee
         self.inl_an.push(an);
         // (boxed: the addresses stay valid while `inl_an` grows; B outlives every use)
@@ -2751,6 +2778,10 @@ impl<'a> B<'a> {
         }
         let ctx = self.inl.take().unwrap();
         self.u = caller_u;
+        self.inl_cds.pop();
+        if nested {
+            self.inl = self.inl_outer.pop();
+        }
         let bad = if branchy { !ok } else { !ok || result.is_none() || self.st.stack.len() != base };
         if bad {
             if super::debug_level() >= 3 {
@@ -3127,6 +3158,8 @@ fn build_once(u: &Unit, reps: &[Rep], assume: &mut Vec<Option<State>>) -> Result
         inl_an: Vec::new(),
         inl_units: Vec::new(),
         is_gen: !resumes.is_empty(),
+        inl_outer: Vec::new(),
+        inl_cds: vec![u.cd as *const CodeData as usize],
     };
     // OSR unit / generator resumption: a separate entry block unboxes the unboxed
     // locals from the frame and jumps to the loop header / instruction after the yield

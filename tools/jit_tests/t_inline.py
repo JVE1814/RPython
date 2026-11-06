@@ -185,6 +185,39 @@ def use_half(vals):
         t += half(v, i % 2 == 0)
     return t
 
+class Vec2:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+    def check(self):
+        return self
+
+    def dot(self, o):
+        o.check()
+        return self.x * o.x + self.y * o.y
+
+    def norm2(self):
+        return self.dot(self)
+
+def nested(vs):
+    t = 0
+    for v in vs:
+        t += v.norm2() + sign(v.dot(vs[0]))
+    return t
+
+vs = [Vec2(i, -i) for i in range(8)]
+for k in range(60):
+    r = nested(vs)
+print(r)
+vs[3].y = 2.5  # float inside a doubly inlined callee
+print(nested(vs))
+Vec2.check = lambda self: 1 / 0
+try:
+    nested(vs)
+except ZeroDivisionError as e:
+    print("ZeroDivisionError", [f.name for f in traceback.extract_tb(e.__traceback__)])
+
 for k in range(60):
     r = use_half(list(range(20)))
 print(r, use_half([1.5, 2, 3.25, 4, 5]))
