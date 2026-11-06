@@ -232,7 +232,6 @@ pub unsafe extern "C" fn h_store_attr(sp: *mut *mut PyObject, name: *mut PyObjec
     unsafe {
         let o = take(sp.sub(1));
         let v = take(sp.sub(2));
-        specialize::adaptive_note(|| crate::interp::adaptive::store_attr(&o, &*name));
         match specialize::store_attr(&o, &*name, &v, std::slice::from_raw_parts(e, crate::interp::cache::POLY)) {
             Ok(()) => OK,
             Err(_) => ERR,

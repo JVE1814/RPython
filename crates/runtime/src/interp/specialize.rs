@@ -510,8 +510,12 @@ pub fn store_attr(o: &PyObject, nm: &PyObject, v: &PyObject, es: &[Entry]) -> Py
 
 #[cold]
 fn store_attr_miss(o: &PyObject, nm: &PyObject, v: &PyObject, es: &[Entry]) -> PyResult<()> {
-    adaptive_note(|| super::adaptive::store_attr(o, nm));
     let r = ab::setattr(o, nm, v);
+    // the form later executions take (the store may just have moved the object's
+    // attributes into a dict): compiled code reaches here only on fills/misses
+    if r.is_ok() {
+        adaptive_note(|| super::adaptive::store_attr(o, nm));
+    }
     if r.is_ok() && es[0].note_miss() {
         if let Some(f) = fill_store_attr(o, nm) {
             store_fill(es, f);

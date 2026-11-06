@@ -3336,7 +3336,6 @@ pub unsafe extern "C" fn h2_load_attr(o: *mut PyObject, name: *mut PyObject, es:
 pub unsafe extern "C" fn h2_store_attr(o: *mut PyObject, name: *mut PyObject, v: *mut PyObject, es: *const crate::interp::cache::Entry) -> u64 {
     unsafe {
         let es = std::slice::from_raw_parts(es, crate::interp::cache::POLY);
-        crate::interp::specialize::adaptive_note(|| crate::interp::adaptive::store_attr(&*o, &*name));
         match crate::interp::specialize::store_attr(&*o, &*name, &*v, es) {
             Ok(()) => {
                 crate::object::decref(v);

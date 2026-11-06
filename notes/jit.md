@@ -491,6 +491,35 @@ yet in master when jit4 started; it was merged from there (master has it since).
   Known remaining exposure: generic attribute slow paths (`h2_load_attr`) can run
   arbitrary code without dropping facts (pre-existing).
 * `RPYTHON_JIT_DEBUG=3` logs inlining decisions (not a candidate / rolled back at op).
+* isinstance(x, C) with a constant class: exact type inline, `h2_isinstance` otherwise.
+
+### Fixes after merging D24 / perf2 and from other workstreams' reports
+* D24: `LoadSpecial` is an `exec_misc` instruction; `ReturnGenerator` (end of an eager
+  generator prologue, run in the interpreter at call time) makes the next instruction
+  a resume entry in both tiers; `generator_entry` uses the frame's current pc; the
+  generator-creation fast path is skipped for eager prologues. `gen_send_fast` claims
+  the generator with the same CAS as `gen_send_ex` (free-threading fix in master).
+* Register allocation: values live into a block were considered live from its first
+  instruction, so a call there was not counted as crossed when all definitions came
+  later in the layout (continuation of an inlined branchy callee): crash in enum's
+  `_update_flag_masks`. Live-in now starts one position before the block.
+* Inline-cache entries keep raw type pointers; the builder dereferenced them for
+  classes that had been freed (test_pyrepl). `cache.rs` keeps a tag registry (tag ->
+  type, cleared in type_dealloc via `unwatch_type_dict`); `live_type` and
+  `attr_entries` only trust registered pairs.
+* Inconsistent joins and blocks without predecessor state abandon the compilation
+  (`B::fatal`, `meet` returns Result) instead of panicking (test_descr/test_capi
+  output).
+* A class gaining/losing `__get__`/`__set__`/`__delete__` invalidates every type tag
+  (test_descriptor_added_after_optimization).
+* Tier-1 direct calls and tier-2 inlining honour a replaced function vectorcall
+  (`_testinternalcapi.set_vectorcall_nop`); NULL `func_code` guards.
+* Cache misses and compiled store-attribute slow paths refresh the adaptive view
+  (`dis(adaptive=True)`); tier 1's inline instance-dict store does not, so
+  test_opcache's `test_store_attr_with_hint` race variant still differs with the JIT.
+* Not JIT bugs (reported): test_ssl `test_sni_callback_race` (bindings read
+  `sni_callback` unsynchronised), test_asyncio.test_free_threading (crashes with
+  the JIT off too).
 
 ### Testing
 * tools/jit_tests: new t_misc.py (handlers, with, except*, match, imports, closures,
