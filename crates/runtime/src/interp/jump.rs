@@ -366,67 +366,85 @@ pub fn set_lineno(f: &mut Frame, value: Option<&PyObject>) -> PyResult<()> {
     Ok(())
 }
 
-/// Locals that are unbound in the frame but read without a check (LoadFast) on some
-/// path from `target` before being stored get None. Returns how many were set.
+/// Locals that the code treats as bound at `target` (assigned on every path from the start
+/// of the code, so later reads are unchecked) but that are unbound in the frame get None.
+/// Returns how many were set.
 fn fill_unbound_locals(f: &mut Frame, ins: &[(usize, Op, u32)], target: usize) -> usize {
     let cd = code::code_data(f.code());
     let nl = cd.localspluskinds.len().min(f.nlocalsplus);
     let candidates: Vec<usize> = (0..nl)
         .filter(|&i| f.slots[i].is_null() && cd.localspluskinds[i] & (fast::CELL | fast::FREE) == 0)
         .collect();
-    if candidates.is_empty() {
+    if candidates.is_empty() || target >= ins.len() {
         return 0;
     }
     let idx = |i: usize| candidates.iter().position(|&c| c == i);
-    // state: bitset over candidates of "stored on this path"
-    let mut best: Vec<Option<Vec<bool>>> = vec![None; ins.len()];
-    let mut need = vec![false; candidates.len()];
-    let mut work = vec![(target, vec![false; candidates.len()])];
-    while let Some((i, stored)) = work.pop() {
-        if i >= ins.len() {
-            continue;
-        }
-        if let Some(b) = &best[i] {
-            // only revisit with fewer stored locals
-            if b.iter().zip(stored.iter()).all(|(old, new)| *old <= *new) {
-                continue;
+    let n = ins.len();
+    // must-assigned analysis (intersection over paths), exception edges included
+    let mut handler: Vec<Option<usize>> = vec![None; n];
+    for e in &cd.exception_table {
+        for h in handler.iter_mut().take((e.end as usize).min(n)).skip(e.start as usize) {
+            if h.is_none() {
+                *h = Some(e.target as usize);
             }
         }
-        best[i] = Some(match &best[i] {
-            Some(b) => b.iter().zip(stored.iter()).map(|(a, b)| *a && *b).collect(),
-            None => stored.clone(),
-        });
+    }
+    let entry: Vec<bool> = candidates
+        .iter()
+        .map(|&c| cd.localspluskinds[c] & (fast::ARG_POS | fast::ARG_KW | fast::ARG_VAR) != 0)
+        .collect();
+    let mut st: Vec<Option<Vec<bool>>> = vec![None; n];
+    st[0] = Some(entry);
+    let mut work = vec![0usize];
+    while let Some(i) = work.pop() {
+        let Some(mut s) = st[i].clone() else { continue };
         let (_, op, arg) = ins[i];
-        let mut s = stored.clone();
+        let before = s.clone();
         match op {
-            Op::LoadFast => {
-                if let Some(k) = idx(arg as usize) {
-                    if !s[k] {
-                        need[k] = true;
-                    }
-                }
-            }
-            Op::StoreFast | Op::LoadFastCheck | Op::DeleteFast => {
+            Op::StoreFast => {
                 if let Some(k) = idx(arg as usize) {
                     s[k] = true;
+                }
+            }
+            Op::DeleteFast | Op::LoadFastAndClear => {
+                if let Some(k) = idx(arg as usize) {
+                    s[k] = false;
                 }
             }
             _ => {}
         }
         let (fall, jump) = step(op, arg, &Vec::new());
+        let mut succ: Vec<(usize, &Vec<bool>)> = Vec::new();
         if fall.is_some() {
-            work.push((i + 1, s.clone()));
+            succ.push((i + 1, &s));
         }
         if let Some((t, _)) = jump {
-            work.push((t, s));
+            succ.push((t, &s));
+        }
+        if let Some(h) = handler[i] {
+            succ.push((h, &before));
+        }
+        for (t, v) in succ {
+            if t >= n {
+                continue;
+            }
+            let merged = match &st[t] {
+                None => v.clone(),
+                Some(old) => old.iter().zip(v.iter()).map(|(a, b)| *a && *b).collect(),
+            };
+            if st[t].as_ref() != Some(&merged) {
+                st[t] = Some(merged);
+                work.push(t);
+            }
         }
     }
-    let mut n = 0;
+    let Some(at) = st[target].clone() else { return 0 };
+    let mut count = 0;
     for (k, &slot) in candidates.iter().enumerate() {
-        if need[k] {
+        if at[k] {
             f.slots[slot] = crate::types::none::none_ref().into_raw();
-            n += 1;
+            count += 1;
         }
     }
-    n
+    count
 }
