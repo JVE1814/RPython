@@ -1073,10 +1073,9 @@ impl<'a> Compiler<'a> {
                 self.compile_body(body, true)?;
                 self.process_deferred_annotations_module()?;
                 self.u().loc = NO_LOC;
-                if self.codegen_only || !self.ur().ir.last_is_terminator() {
-                    self.load_const_noloc(Constant::None);
-                    self.emit_noloc(O::RETURN_VALUE, 0);
-                }
+                // always present (dead code is removed later); it puts None among the constants
+                self.load_const_noloc(Constant::None);
+                self.emit_noloc(O::RETURN_VALUE, 0);
             }
             Mod::Interactive { body } => {
                 self.compile_body(body, false)?;
@@ -1449,11 +1448,11 @@ impl<'a> Compiler<'a> {
         for s in body {
             self.compile_stmt(s)?;
         }
-        if self.codegen_only || !self.ur().ir.last_is_terminator() {
-            self.u().loc = NO_LOC;
-            self.load_const_noloc(Constant::None);
-            self.emit_noloc(O::RETURN_VALUE, 0);
-        }
+        // the implicit `return None` is always emitted (dead code is removed later); it puts
+        // None among the constants
+        self.u().loc = NO_LOC;
+        self.load_const_noloc(Constant::None);
+        self.emit_noloc(O::RETURN_VALUE, 0);
         if handler.is_some() {
             self.u().fblocks.pop();
         }
