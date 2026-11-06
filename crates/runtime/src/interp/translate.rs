@@ -677,6 +677,9 @@ pub fn translate(inp: &Input) -> Result<Output, String> {
         }
     }
     let mut cx = Ctx { inp, instrs: instrs.clone(), eager_prologue, extras: Vec::new() };
+    // internal ops of every reachable instruction, produced once by pass 1
+    let mut em = Emit { ops: Vec::with_capacity(instrs.len() + 8) };
+    let mut emitted: Vec<(u32, u32)> = vec![(0, 0); instrs.len()];
 
     // ---- pass 1: abstract interpretation (entry state of every reachable instruction)
     let n = instrs.len();
@@ -720,8 +723,9 @@ pub fn translate(inp: &Input) -> Result<Output, String> {
             let t = lookup(h.target)?;
             merge(&mut state, &mut work, t, hs, true)?;
         }
-        let mut em = Emit { ops: Vec::new() };
+        let start = em.ops.len();
         let st = cx.step(k, s, &mut em)?;
+        emitted[k] = (start as u32, em.ops.len() as u32);
         if let Some((t, js)) = st.jump {
             let tk = lookup(t)?;
             merge(&mut state, &mut work, tk, js, false)?;
@@ -740,12 +744,13 @@ pub fn translate(inp: &Input) -> Result<Output, String> {
     let mut gen_start = 0u32;
     for k in 0..n {
         first_of_instr[k] = code.len() as u32;
-        let Some(s) = state[k].clone() else { continue };
+        if state[k].is_none() {
+            continue;
+        }
         let ins = instrs[k];
-        let mut em = Emit { ops: Vec::new() };
-        cx.step(k, s, &mut em)?;
         let loc = location_of(inp.positions.get(ins.offset as usize).unwrap_or(&Position::default()));
-        for (o, a, t) in em.ops {
+        let (e0, e1) = emitted[k];
+        for &(o, a, t) in &em.ops[e0 as usize..e1 as usize] {
             if t.is_some() {
                 fixups.push((code.len(), t.unwrap()));
                 // jump targets are patched below; reserve no ExtendedArg (internal targets < 2^24)
