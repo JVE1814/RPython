@@ -105,6 +105,13 @@ pub unsafe fn incref_nonowner(op: *mut PyObject) {
     }
 }
 
+/// (scale1) Is the caller's reference the only one, held by this thread (owner, local
+/// count 1, nothing shared)? Then no other thread can reach the object.
+#[inline(always)]
+pub fn exclusively_owned(o: &PyObject) -> bool {
+    o.ob_tid.load(Relaxed) == thread_id() && o.ob_ref_local.load(Relaxed) == 1 && o.ob_ref_shared.load(Relaxed) == 0
+}
+
 #[inline(always)]
 pub unsafe fn xincref(op: *mut PyObject) {
     if !op.is_null() {

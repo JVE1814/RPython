@@ -143,6 +143,7 @@ impl Drop for AutoAttached {
         if ts.exited.load(SeqCst) {
             return; // retired properly (thread_exit)
         }
+        crate::qsbr::thread_exit();
         crate::sharded::thread_exit();
         ts.mode.0.store(ThreadMode::Blocked as u8, SeqCst);
         {

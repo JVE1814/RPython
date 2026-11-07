@@ -625,6 +625,7 @@ fn promote(objs: &[*mut PyObject]) {
 }
 
 static DEAD_SHARDED: Mutex<Vec<PyRef>> = Mutex::new(Vec::new());
+static QSBR_TAKEN: Mutex<Vec<crate::qsbr::ItemSendBatch>> = Mutex::new(Vec::new());
 
 /// Run a full collection; returns the number of unreachable objects found.
 pub fn collect() -> usize {
@@ -643,6 +644,8 @@ fn collect_gen(young_only: bool) -> usize {
     // now that it runs again
     let dead = std::mem::take(&mut *DEAD_SHARDED.lock().unwrap_or_else(|e| e.into_inner()));
     drop(dead);
+    let taken = std::mem::take(&mut *QSBR_TAKEN.lock().unwrap_or_else(|e| e.into_inner()));
+    crate::qsbr::release_taken(taken);
     if crate::scalestats::on() {
         crate::scalestats::GC_COUNT.fetch_add(1, Relaxed);
         crate::scalestats::add_ns(&crate::scalestats::GC_NS, t0);
@@ -687,6 +690,8 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
         mature_deferred();
         crate::object::merge_type_counts();
         crate::sharded::merge_all();
+        // (scale1) everything retired through QSBR before this stop can go
+        QSBR_TAKEN.lock().unwrap_or_else(|e| e.into_inner()).extend(crate::qsbr::take_all_for_gc());
         // ---- phase 1 (stopped): find the unreachable objects
         let mut objs = snapshot_gen(young_only);
         crate::gc_support::untrack_atomic_tuples(&mut objs);

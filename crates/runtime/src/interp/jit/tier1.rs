@@ -802,13 +802,13 @@ impl<'a> Gen<'a> {
                 let done = self.a.label();
                 let lm = self.slot(d - 1 - arg as i32);
                 let vm = self.slot(d - 1);
-                self.a.mov_ri(Rdx, (&raw const crate::threads::MULTI_THREADED) as i64);
-                self.a.cmp_mi(M(Rdx, 0), 0);
-                self.a.jcc(Cc::NE, generic);
                 self.a.load(Rax, lm);
                 self.a.mov_ri(Rcx, crate::types::list::list_type() as i64);
                 self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
                 self.a.jcc(Cc::NE, generic);
+                // (scale1) with threads too, as long as the list is referenced only from
+                // this frame (owned by this thread, count 1): nobody else can reach it
+                self.emit_exclusive_check(Rax, generic);
                 self.a.load(Rcx, M(Rax, LIST_SIZE));
                 self.a.cmp_rm(Rcx, M(Rax, LIST_ALLOCATED));
                 self.a.jcc(Cc::GE, generic);
@@ -1046,10 +1046,10 @@ impl<'a> Gen<'a> {
             self.a.mov_ri(Rcx, (&raw mut crate::types::list::PyListIter_Type) as i64);
             self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
             self.a.jcc(Cc::NE, not_list);
-            // single-threaded only (see binary_subscr)
-            self.a.mov_ri(Rdx, (&raw const crate::threads::MULTI_THREADED) as i64);
-            self.a.cmp_mi(M(Rdx, 0), 0);
-            self.a.jcc(Cc::NE, generic);
+            // (scale1) an iterator stepped only by this frame (owned, count 1); the list
+            // itself is read like the lock-free subscript: size, then array, then item,
+            // a null array or slot (racing writer) takes the generic path
+            self.emit_exclusive_check(Rax, generic);
             self.a.load(Rdx, M(Rax, 40));
             self.a.test_rr(Rdx, Rdx);
             self.a.jcc(Cc::E, generic);
@@ -1059,7 +1059,11 @@ impl<'a> Gen<'a> {
             self.a.cmp_rm(Rcx, M(Rdx, LIST_SIZE));
             self.a.jcc(Cc::GE, generic);
             self.a.load(Rsi, M(Rdx, LIST_ITEMS));
+            self.a.test_rr(Rsi, Rsi);
+            self.a.jcc(Cc::E, generic);
             self.a.load_idx(Rsi, Rsi, Rcx, 8, 0);
+            self.a.test_rr(Rsi, Rsi);
+            self.a.jcc(Cc::E, generic);
             self.a.add_mi(M(Rax, 32), 1);
             self.incref(Rsi);
             self.a.store(out, Rsi);
@@ -1882,6 +1886,17 @@ impl<'a> Gen<'a> {
     }
     /// Emit the inline incref / decref / xdecref sequences (r11 clobbered; decref's
     /// slow path clobbers caller-saved registers).
+    /// (scale1) Jump to `fail` unless the object in `r` is referenced exactly once, by
+    /// this thread (owner, local count 1, nothing in the shared field): then no other
+    /// thread can reach it, and it may be changed or read without its lock.
+    pub(crate) fn emit_exclusive_check(&mut self, r: R, fail: Label) {
+        self.a.cmp_rm(R15, M(r, OB_TID));
+        self.a.jcc(Cc::NE, fail);
+        self.a.cmp32_mi(M(r, OB_REF_LOCAL), 1);
+        self.a.jcc(Cc::NE, fail);
+        self.a.cmp_mi(M(r, OB_REF_SHARED), 0);
+        self.a.jcc(Cc::NE, fail);
+    }
     pub(crate) fn emit_incref(&mut self, r: R) {
         self.incref(r)
     }

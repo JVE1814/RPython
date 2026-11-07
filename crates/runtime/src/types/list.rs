@@ -1164,6 +1164,33 @@ pub fn list_reversed(o: &PyObject) -> PyResult {
 /// is released after the lock is dropped (its deallocation may run code).
 unsafe fn listiter_step(o: *mut PyObject, step: isize) -> *mut PyObject {
     unsafe {
+        if crate::threads::multi_threaded() && exclusively_owned(&*o) {
+            // (scale1) only this thread can step the iterator (one reference, its own):
+            // no iterator lock; the list is read like the lock-free subscript
+            let it = &mut *(o as *mut ListIter);
+            if it.seq.is_null() {
+                return std::ptr::null_mut();
+            }
+            if it.index >= 0 {
+                if let Some(v) = get_signed(&*it.seq, it.index as i64) {
+                    it.index += step;
+                    return v.into_raw();
+                }
+                // out of range, or a racing writer left a hole: decide under the lock
+                if (it.index as usize) < list_len(&*it.seq) {
+                    if let Some(v) = get(&*it.seq, it.index as usize) {
+                        it.index += step;
+                        return v.into_raw();
+                    }
+                }
+            }
+            if step < 0 {
+                it.index = -1;
+            }
+            let finished = std::mem::replace(&mut it.seq, std::ptr::null_mut());
+            decref(finished);
+            return std::ptr::null_mut();
+        }
         let mut finished: *mut PyObject = std::ptr::null_mut();
         let r = {
             let _g = if crate::threads::multi_threaded() { Some(ob_lock(&*o)) } else { None };

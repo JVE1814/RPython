@@ -136,6 +136,13 @@ struct Local {
     known_min: u64,
     /// Polls left until the next scan of the other threads.
     scan_in: u32,
+    /// Remaining self re-arms of the eval breaker (see REARM).
+    rearm: u32,
+    retires: u32,
+    /// Listed in LOCALS (for collections to take the pending items).
+    registered: bool,
+    /// The thread has run `thread_exit`: later items go straight to the orphans.
+    dead: bool,
 }
 
 #[thread_local]
@@ -145,6 +152,10 @@ static LOCAL: UnsafeCell<Local> = UnsafeCell::new(Local {
     polls: 0,
     known_min: 0,
     scan_in: 0,
+    rearm: 0,
+    retires: 0,
+    registered: false,
+    dead: false,
 });
 
 /// Items retired by threads that exited before their batches matured.
@@ -157,7 +168,11 @@ unsafe impl Send for ItemSend {}
 /// Close the open batch once it holds this many items ...
 const BATCH: usize = 1024;
 /// ... or after this many eval-breaker polls.
-const POLLS: u32 = 1024;
+const POLLS: u32 = 32;
+/// Eval-breaker visits a thread re-arms itself for while it has pending items; after
+/// that it comes back only when it retires more, another thread closes a batch, or a
+/// collection stops the world (which releases everything retired before it).
+const REARM: u32 = 64;
 /// While a closed batch waits, rescan the other threads every this many polls.
 const SCAN_EVERY: u32 = 16;
 static PENDING_TOTAL: AtomicUsize = AtomicUsize::new(0);
@@ -225,36 +240,123 @@ pub unsafe fn free_deferred(p: *mut u8, f: unsafe fn(*mut u8)) {
 fn retire(it: Item) {
     let l = local();
     if l.open.is_empty() {
+        if l.dead {
+            return retire_after_exit(it);
+        }
         retire_first();
     }
     l.open.push(it);
+    // Nothing is released here: the caller may hold locks, and releasing runs
+    // deallocators (Python code). Releases happen at the next eval-breaker poll.
     if l.open.len() >= BATCH {
         retire_full();
+    } else if !l.closed.is_empty() {
+        l.retires = l.retires.wrapping_add(1);
+        if l.retires & 63 == 0 {
+            come_back_soon(l);
+        }
     }
 }
 
+/// Have this thread visit `on_eval_breaker` at its next poll(s).
 #[cold]
-fn retire_first() {
-    // come back at the next polls to close the batch
+fn come_back_soon(l: &mut Local) {
+    l.rearm = l.rearm.max(8);
     let t = me();
     if !t.is_null() {
         unsafe { (*t).c.eval_breaker.fetch_or(EVAL_QSBR, Release) };
     }
+}
+
+/// Collections take the pending items of every thread (`take_all_for_gc`).
+static LOCALS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+#[cold]
+fn retire_first() {
     let l = local();
+    if !l.registered {
+        LOCALS.lock().unwrap_or_else(|e| e.into_inner()).push(LOCAL.get() as usize);
+        l.registered = true;
+    }
+    // come back at the next polls to close the batch
+    l.rearm = REARM;
+    let t = me();
+    if !t.is_null() {
+        unsafe { (*t).c.eval_breaker.fetch_or(EVAL_QSBR, Release) };
+    }
     if l.open.capacity() == 0 {
         l.open.reserve(BATCH);
     }
 }
 
+/// An item retired by a thread after its `thread_exit` (teardown): an orphan of its own.
+#[cold]
+fn retire_after_exit(it: Item) {
+    let goal = GLOBAL.fetch_add(1, SeqCst) + 1;
+    PENDING_TOTAL.fetch_add(1, Relaxed);
+    let mut o = ORPHANS.lock().unwrap_or_else(|e| e.into_inner());
+    o.push((goal, vec![ItemSend(it)]));
+    ORPHAN_MIN.store(o.iter().map(|b| b.0).min().unwrap_or(u64::MAX), Relaxed);
+}
+
 #[cold]
 fn retire_full() {
     close_batch();
-    poll(true);
+    let l = local();
+    come_back_soon(l);
+    l.scan_in = 0;
+}
+
+/// The world is stopped for a collection: every thread is at a quiescent point, so
+/// everything retired so far, by any thread, can be released. The items are taken
+/// here and released by the caller once the world runs again (`release_taken`).
+/// This bounds how long items wait when their thread stopped polling for them.
+pub fn take_all_for_gc() -> Vec<ItemSendBatch> {
+    let mut out = Vec::new();
+    let locals = LOCALS.lock().unwrap_or_else(|e| e.into_inner());
+    for &lp in locals.iter() {
+        let l = unsafe { &mut *(lp as *mut Local) };
+        if !l.open.is_empty() {
+            out.push(ItemSendBatch(std::mem::take(&mut l.open), false));
+        }
+        for (_, items) in l.closed.drain(..) {
+            out.push(ItemSendBatch(items, true));
+        }
+        l.polls = 0;
+    }
+    drop(locals);
+    let mut o = ORPHANS.lock().unwrap_or_else(|e| e.into_inner());
+    for (_, items) in o.drain(..) {
+        out.push(ItemSendBatch(items.into_iter().map(|i| i.0).collect(), true));
+    }
+    ORPHAN_MIN.store(u64::MAX, Relaxed);
+    out
+}
+
+/// Items taken by `take_all_for_gc` (`.1`: counted in PENDING_TOTAL).
+pub struct ItemSendBatch(Vec<Item>, bool);
+unsafe impl Send for ItemSendBatch {}
+
+/// Release what `take_all_for_gc` took (world running).
+pub fn release_taken(v: Vec<ItemSendBatch>) {
+    for b in v {
+        if b.1 {
+            unsafe { release(b.0) };
+        } else {
+            for it in b.0 {
+                match it {
+                    Item::Decref(p) => unsafe { crate::object::decref(p) },
+                    Item::Free(p, f) => unsafe { f(p) },
+                }
+            }
+        }
+    }
 }
 
 fn close_batch() {
     let l = local();
     l.polls = 0;
+    l.rearm = REARM;
     if l.open.is_empty() {
         return;
     }
@@ -372,8 +474,9 @@ pub fn on_eval_breaker(ts: &ThreadState) {
     }
     poll(false);
     let l = local();
-    if !l.closed.is_empty() || !l.open.is_empty() || ORPHAN_MIN.load(Relaxed) != u64::MAX {
-        // not yet matured: check again at the next poll
+    if (!l.closed.is_empty() || !l.open.is_empty() || ORPHAN_MIN.load(Relaxed) != u64::MAX) && l.rearm > 0 {
+        // not yet matured: check again at the next poll (a bounded number of times)
+        l.rearm -= 1;
         ts.c.eval_breaker.fetch_or(EVAL_QSBR, Release);
     }
 }
@@ -385,6 +488,13 @@ pub fn thread_exit() {
     if !l.open.is_empty() {
         close_batch();
     }
+    if l.registered {
+        // (scale1) under the LOCALS lock: a collection may be taking items right now
+        let me = LOCAL.get() as usize;
+        LOCALS.lock().unwrap_or_else(|e| e.into_inner()).retain(|&x| x != me);
+        l.registered = false;
+    }
+    l.dead = true;
     let closed = std::mem::take(&mut l.closed);
     if std::env::var_os("RPY_QSBR_DEBUG").is_some() {
         eprintln!("qsbr: thread {:p} exits with {} closed batches (goals {:?}), GLOBAL={}", me(), closed.len(),
