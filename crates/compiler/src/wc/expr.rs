@@ -1563,7 +1563,7 @@ impl<'a> Compiler<'a> {
                 Some(v) => {
                     self.compile_expr(elt)?;
                     self.compile_expr(v)?;
-                    self.set_loc(e.loc);
+                    self.set_loc(comp_element_loc(elt, Some(v)));
                     self.emit(O::MAP_ADD, depth + 1);
                 }
                 None => {
