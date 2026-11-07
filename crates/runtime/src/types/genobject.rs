@@ -825,16 +825,17 @@ pub fn get_anext_awaitable(aiter: &PyObject) -> PyResult {
     };
     match get_awaitable_iter(&next) {
         Ok(r) => Ok(r),
-        Err(e) => {
-            if exc_matches(exc::TypeError()) {
-                clear_exc();
-                raise!(
-                    TypeError,
-                    "'async for' received an invalid object from __anext__: {}",
-                    tname(&next)
-                );
+        Err(_) => {
+            // reported as a TypeError caused by the original error
+            let cause = take_exc().unwrap_or_else(none::none_ref);
+            let msg = format!("'async for' received an invalid object from __anext__: {}", tname(&next));
+            let te = crate::types::exceptions::make_exception(exc::TypeError(), &[pystr::new_str(&msg)])?;
+            if !cause.is(none::none()) {
+                ab::setattr(&te, &pystr::new_str("__context__"), &cause)?;
+                ab::setattr(&te, &pystr::new_str("__cause__"), &cause)?;
             }
-            Err(e)
+            set_exc(te);
+            Err(PyErr)
         }
     }
 }
