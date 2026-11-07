@@ -557,6 +557,7 @@ fn int_constants() -> Vec<(&'static str, i64)> {
         ("SCHED_BATCH", SCHED_BATCH as i64),
         ("SCHED_IDLE", SCHED_IDLE as i64),
         ("SCHED_DEADLINE", 6), // (hang1) Linux value; libc does not export it
+        ("NODEV", -1),         // (hang1) (dev_t)-1
         ("SCHED_RESET_ON_FORK", SCHED_RESET_ON_FORK as i64),
         ("RTLD_LAZY", RTLD_LAZY as i64),
         ("RTLD_NOW", RTLD_NOW as i64),

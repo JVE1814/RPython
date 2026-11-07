@@ -482,6 +482,9 @@ pub fn os_sendfile(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> 
     let out_fd = c_int(out_fd.unwrap())?;
     let in_fd = c_int(in_fd.unwrap())?;
     let count = ssize(count.unwrap())?;
+    if count < 0 {
+        raise!(ValueError, "count cannot be negative");
+    }
     let off = offset.unwrap();
     let r = if off.is(none::none()) {
         retry_eintr(-1, || unsafe { libc::sendfile(out_fd, in_fd, std::ptr::null_mut(), count as usize) })?
@@ -581,9 +584,6 @@ fn do_rename(fname: &str, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult
     let [src, dst, sfd, dfd] = kwparse::<4>(fname, &["src", "dst", "src_dir_fd", "dst_dir_fd"], 0, 2, 2, args, kw)?;
     let s = path_named(fname, "src", src.unwrap())?;
     let d = path_named(fname, "dst", dst.unwrap())?;
-    if s.narrow != d.narrow {
-        raise!(TypeError, "{}: src and dst must be the same type", fname);
-    }
     let sfd = dir_fd(sfd)?;
     let dfd = dir_fd(dfd)?;
     let r = unsafe { libc::renameat(sfd, s.ptr(), dfd, d.ptr()) };
@@ -604,9 +604,6 @@ pub fn os_link(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRe
         kwparse::<5>("link", &["src", "dst", "src_dir_fd", "dst_dir_fd", "follow_symlinks"], 0, 2, 3, args, kw)?;
     let s = path_named("link", "src", src.unwrap())?;
     let d = path_named("link", "dst", dst.unwrap())?;
-    if s.narrow != d.narrow {
-        raise!(TypeError, "link: src and dst must be the same type");
-    }
     let sfd = dir_fd(sfd)?;
     let dfd = dir_fd(dfd)?;
     let follow = truthy(follow, true)?;
@@ -749,8 +746,9 @@ fn time_to_timespec(o: &PyObject) -> PyResult<libc::timespec> {
         if !f.is_finite() {
             raise!(ValueError, "Invalid value {} (type float)", f);
         }
+        // (hang1) rounded towards minus infinity, like the other converters
         let sec = f.floor();
-        let mut nsec = ((f - sec) * 1e9).round();
+        let mut nsec = ((f - sec) * 1e9).floor();
         let mut s = sec as i64;
         if nsec >= 1e9 {
             nsec -= 1e9;
@@ -760,6 +758,21 @@ fn time_to_timespec(o: &PyObject) -> PyResult<libc::timespec> {
     }
     if int::is_int(o) {
         return Ok(libc::timespec { tv_sec: c_long(o)?, tv_nsec: 0 });
+    }
+    // other real numbers (Decimal, Fraction): exactly, from their integer ratio
+    if let Some(m) = crate::abstract_::getattr_opt(o, crate::name!("as_integer_ratio"))? {
+        let r = crate::abstract_::call(&m, &[])?;
+        if crate::types::tuple::is_tuple(&r) && crate::types::tuple::tuple_len(&r) == 2 {
+            let n = crate::abstract_::as_i64(crate::types::tuple::tuple_get(&r, 0))? as i128;
+            let d = crate::abstract_::as_i64(crate::types::tuple::tuple_get(&r, 1))? as i128;
+            if d > 0 {
+                let total = (n * 1_000_000_000).div_euclid(d);
+                return Ok(libc::timespec {
+                    tv_sec: total.div_euclid(1_000_000_000) as i64,
+                    tv_nsec: total.rem_euclid(1_000_000_000) as i64,
+                });
+            }
+        }
     }
     raise!(TypeError, "unsupported type for timestamp {}", tname(o).replace('\'', ""));
 }
@@ -924,18 +937,31 @@ pub fn os_mknod(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyR
     ok_none()
 }
 
+/// (hang1) `-1` is NODEV ((dev_t)-1): major/minor/makedev map it to itself.
+fn is_nodev(o: &PyObject) -> bool {
+    int::is_int(o) && int::as_i64(o) == Some(-1)
+}
 pub fn os_major(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     crate::args::check_pos("major", args, 1, 1)?;
+    if is_nodev(args[0]) {
+        return Ok(int::new_int(-1));
+    }
     let d = c_u64(args[0])?;
     Ok(int::new_int(libc::major(d) as i64))
 }
 pub fn os_minor(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     crate::args::check_pos("minor", args, 1, 1)?;
+    if is_nodev(args[0]) {
+        return Ok(int::new_int(-1));
+    }
     let d = c_u64(args[0])?;
     Ok(int::new_int(libc::minor(d) as i64))
 }
 pub fn os_makedev(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     crate::args::check_pos("makedev", args, 2, 2)?;
+    if is_nodev(args[0]) && is_nodev(args[1]) {
+        return Ok(int::new_int(-1));
+    }
     let a = c_u64(args[0])?;
     let b = c_u64(args[1])?;
     if a > u32::MAX as u64 || b > u32::MAX as u64 {

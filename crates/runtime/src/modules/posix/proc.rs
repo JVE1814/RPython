@@ -73,6 +73,12 @@ pub fn init_types() -> PyResult<()> {
     })?;
     unsafe {
         (*t).tp_new = Some(sched_param_new);
+        // (hang1) pickles as sched_param(priority): the generic structseq
+        // reduce form (seq, dict) does not fit this constructor
+        let ml = crate::mdefs![("__reduce__", NOARGS, sched_param_reduce)];
+        let d = crate::types::descr::new_method_descr(t, ml);
+        crate::types::dict::set_item_str(&*(*t).tp_dict, "__reduce__", &d)?;
+        crate::types::slots::type_modified(t);
     }
     SCHED_PARAM.store(t, Ordering::Release);
     Ok(())
@@ -88,6 +94,12 @@ unsafe extern "C" fn sched_param_new(tp: *mut PyTypeObject, args: *mut PyObject,
         })();
         into_c(r)
     }
+}
+
+fn sched_param_reduce(o: &PyObject) -> PyResult {
+    let tp = unsafe { PyRef::from_borrowed(o.type_ptr() as *mut PyObject) };
+    let prio = structseq::get_item(o, 0).to_ref();
+    Ok(tuple::new_tuple(vec![tp, tuple::new_tuple(vec![prio])]))
 }
 
 fn ok_none() -> PyResult {
@@ -736,10 +748,17 @@ fn env_list(fname: &str, env: &PyObject) -> PyResult<Vec<CString>> {
             return Err(e);
         }
     };
+    // (hang1) keys and values are taken as two snapshots (mapping protocol:
+    // keys()/values(), no lookups), so __fspath__ of an item mutating the
+    // mapping cannot invalidate what is being converted
     let keys = ab::collect_iterable(&keys)?;
+    let values = ab::call_method_str(env, "values", &[])?;
+    let values = ab::collect_iterable(&values)?;
+    if values.len() != keys.len() {
+        raise!(RuntimeError, "{}: environment changed size during iteration", fname);
+    }
     let mut v = Vec::with_capacity(keys.len());
-    for k in &keys {
-        let val = ab::getitem(env, k)?;
+    for (k, val) in keys.iter().zip(values.iter()) {
         let kb = fspath(k)?;
         let vb = fspath(&val)?;
         let mut kraw = if bytes::is_bytes(&kb) { bytes::bytes_data(&kb).to_vec() } else { fs_encode_str(&kb)? };
