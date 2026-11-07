@@ -306,6 +306,15 @@ pub fn make_exception(tp: *mut PyTypeObject, args: &[PyRef]) -> PyResult {
 
 unsafe extern "C" fn base_new(tp: *mut PyTypeObject, args: *mut PyObject, _kw: *mut PyObject) -> *mut PyObject {
     unsafe {
+        // (tail2) constructing an exception from Python honours a failure-injecting
+        // allocator hook; MemoryError itself stays constructible (CPython keeps
+        // preallocated MemoryError instances for this)
+        if crate::capi::mem::hooked_alloc_refuses((*tp).tp_basicsize as usize)
+            && !is_subtype(tp, MemoryError())
+        {
+            let _ = crate::errors::memory_error();
+            return std::ptr::null_mut();
+        }
         let alloc = (*tp).tp_alloc.unwrap_or(generic_alloc);
         let op = alloc(tp, 0);
         if op.is_null() {

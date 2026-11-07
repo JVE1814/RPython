@@ -754,6 +754,9 @@ pub fn init() -> PyResult<PyRef> {
     let m = crate::types::module::new_module("builtins")?;
     crate::subinterp::current().builtins.store(m.clone().into_raw(), Release);
     let d = crate::types::module::module_dict(&m);
+    // (tail2) writes to the builtins dict are reported to the write hook (rare-event
+    // counter, tier-2 dependencies): the tag the JIT uses for watched dicts
+    unsafe { (*(d.as_ptr() as *mut PyDictObject))._ma_watcher_tag = crate::interp::jit::opt::WATCH_TAG };
     dict::set_item_str(&d, "__doc__", &pystr::new_str("Built-in functions, types, exceptions, and other objects.\n\nThis module provides direct access to all 'built-in'\nidentifiers of Python; for example, builtins.len is\nthe full name for the built-in function len().\n\nThis module is not normally accessed explicitly by most\napplications, but can be useful in modules that provide\nobjects with the same name as a built-in value, but in\nwhich the built-in of that name is also needed."))?;
     let methods = crate::mdefs![
         ("__build_class__", FASTKW, b_build_class, "__build_class__(func, name, /, *bases, [metaclass], **kwds) -> class\n\nInternal helper function used by the class statement."),

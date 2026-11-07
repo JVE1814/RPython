@@ -33,7 +33,14 @@ fn set_proto(info: &mut StgInfo, proto: &PyObject) -> PyResult<()> {
         None => raise!(TypeError, "_type_ must have storage info"),
     };
     info.proto = Some(proto.to_ref());
-    info.format = Some(format!("&{}", pinfo.format.clone().unwrap_or_else(|| "B".to_string())));
+    // (tail2) a pointer to an array carries the array's shape: "&(2,3)<h"
+    let item = pinfo.format.clone().unwrap_or_else(|| "B".to_string());
+    info.format = Some(if pinfo.shape.is_empty() {
+        format!("&{item}")
+    } else {
+        let dims: Vec<String> = pinfo.shape.iter().map(|d| d.to_string()).collect();
+        format!("&({}){item}", dims.join(","))
+    });
     Ok(())
 }
 

@@ -157,6 +157,13 @@ pub unsafe extern "C" fn PyMem_SetupDebugHooks() {}
 /// allocator (e.g. a failure-injecting test hook), those allocations ask the
 /// installed hook first, so that a hook refusing memory turns into MemoryError.
 /// Returns true when the hook refused `n` bytes.
+/// (tail2) True once a C extension has replaced an allocator (cheap pre-check for
+/// paths that must stay free when no hook is installed).
+#[inline(always)]
+pub fn hook_installed() -> bool {
+    HOOKED.load(Relaxed)
+}
+
 pub fn hooked_alloc_refuses(n: usize) -> bool {
     if !HOOKED.load(Acquire) {
         return false;
