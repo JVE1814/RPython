@@ -1359,6 +1359,14 @@ impl<'a> B<'a> {
                     self.discard(a, k);
                     self.push(AV::Bool(r));
                 }
+                AV::I64(v) => {
+                    // (jit6) unboxed int: no template (an inlined callee testing an int
+                    // argument used to roll back here)
+                    let r = self.v(Class::G);
+                    self.emit(Inst::SetCond(r, Cond::Test(v, Opnd::V(v), if ins.op == Op::UnaryNot { Cc::E } else { Cc::NE })));
+                    self.pop();
+                    self.push(AV::Bool(r));
+                }
                 AV::InFrame(_) | AV::Obj(..) => {
                     // truth of any object: True/False/None without a call, otherwise
                     // the object's truth protocol (may run arbitrary code)
