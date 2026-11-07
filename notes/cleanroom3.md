@@ -168,6 +168,23 @@
   `importfile`, `safeimport`, `locate`, `replace`, `splitdoc`) are module-level public
   functions that test_pydoc and third-party code call; their bodies are own.  No action.
 
+### zipfile/__init__.py (partial: CPython helper names and the cipher)
+- Renamed (nothing outside the module used them): `_EndRecData64` -> `_merge_zip64_end`,
+  `_EndRecData` -> `_find_end_record`, `_check_zipfile` -> `_looks_like_zip` (body
+  rewritten), `_strip_extra` -> `_without_extra_ids`, `_sanitize_filename` ->
+  `_clean_member_name`, `_SharedFile` -> `_ArchiveView`, `_Tellable` -> `_CountingWriter`,
+  `_ZipWriteFile` -> `_MemberWriter`, field-index constants `_ECD_*/_CD64_*/_CD_*/_FH_*` ->
+  `_END_*/_END64_*/_CEN_*/_LOC_*`.  ZipCrypto: `_crctable/_gen_crc/_ZipDecrypter` replaced
+  by `_reflected_crc_table()` and the `_ZipCryptoDecoder` class (keys in a list, chunked
+  calls keep state); verified byte-identical to the old decrypter on 500 random
+  password/data/chunking cases, speed ~equal.
+- Kept (pinned): `_Extra`, `_get_compressor`, `_get_decompressor`, `_check_compression`,
+  `_MASK_USE_DATA_DESCRIPTOR`, the public struct names/sizes (`sizeEndCentDir*`,
+  `sizeCentralDir`, `struct*`, `string*`), `_path`, every message.
+- Not done: ZipInfo/ZipExtFile/ZipFile bodies keep CPython's decomposition (method names
+  are largely API); a full rewrite would be the next step.
+- test_zipfile, test_zipfile64, test_zipimport, test_zipapp, test_shutil, test___all__ =.
+
 ## Reviewed: own text and structure, no action needed
 (none yet)
 
