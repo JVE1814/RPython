@@ -387,6 +387,11 @@ impl Asm {
             self.buf.extend_from_slice(&i.to_le_bytes());
         }
     }
+    /// lock or word [m], imm16 (scale2)
+    pub fn lock_or16_mi(&mut self, m: M, i: u16) {
+        self.b(0xf0);
+        self.or16_mi(m, i)
+    }
     /// cmp r64, qword [m]
     pub fn cmp_rm(&mut self, r: R, m: M) {
         self.rex(true, r as u8, 0, m.0 as u8, false);

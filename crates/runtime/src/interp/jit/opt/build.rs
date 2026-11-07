@@ -2169,6 +2169,7 @@ impl<'a> B<'a> {
             let k = self.st.stack.len() - 1;
             if s.kind == kind::SLOT {
                 let x = self.v(Class::G);
+                self.emit(Inst::NoteRead(p)); // scale2
                 self.emit(Inst::Load(x, Base::V(p), s.c as i32));
                 self.emit(Inst::Guard(Cond::Test(x, Opnd::V(x), Cc::E), snap));
                 self.emit(Inst::Incref(x));
@@ -2207,12 +2208,14 @@ impl<'a> B<'a> {
                     self.check_shape_key(w, s.b, name, f);
                     let vb = self.values_base(p, w);
                     let x = self.v(Class::G);
+                    self.emit(Inst::NoteRead(p)); // scale2
                     self.emit(Inst::Load(x, Base::V(vb), 8 * s.b as i32));
                     self.check(Cond::Test(x, Opnd::V(x), Cc::E), f);
                     x
                 }
                 kind::SLOT => {
                     let x = self.v(Class::G);
+                    self.emit(Inst::NoteRead(p)); // scale2
                     self.emit(Inst::Load(x, Base::V(p), s.c as i32));
                     self.check(Cond::Test(x, Opnd::V(x), Cc::E), f);
                     x

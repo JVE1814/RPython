@@ -206,6 +206,8 @@ fn gc_get_referents(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     crate::modules::sys_full::audit("gc.get_referents", &[&tuple::new_tuple(args.iter().map(|a| a.to_ref()).collect())])?;
     let mut out = Vec::new();
     for a in args {
+        // the traversal reads attribute storage lock-free (scale2: qsbr::note_attr_read)
+        crate::qsbr::note_attr_read(a);
         for p in referents_of(a) {
             out.push(unsafe { PyRef::from_borrowed(p as *mut PyObject) });
         }

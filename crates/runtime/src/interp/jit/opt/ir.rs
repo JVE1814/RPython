@@ -151,6 +151,9 @@ pub enum Inst {
     /// acquire the per-object mutex of the object in v, deoptimise if contended
     TryLock(V, SnapId),
     Unlock(V),
+    /// (scale2) qsbr::note_attr_read of the object in v (before a lock-free load of
+    /// its attribute storage)
+    NoteRead(V),
     /// Call a runtime function (SysV); clobbers caller-saved registers. Result in a
     /// gpr (`ret`) or xmm0 (`fret`).
     Call { addr: usize, args: Vec<Opnd>, fargs: Vec<V>, ret: Option<V>, fret: Option<V> },
@@ -311,7 +314,7 @@ impl Inst {
         match self {
             Imm(d, _) | FImm(d, _) | SlotAddr(d, _) => defs.push(*d),
             LoadLocalUnboxed { home, .. } => defs.push(*home),
-            TryLock(v, _) | Unlock(v) => uses.push(*v),
+            TryLock(v, _) | Unlock(v) | NoteRead(v) => uses.push(*v),
             Mov(d, s)
             | Neg(d, s)
             | NegOv(d, s, _)

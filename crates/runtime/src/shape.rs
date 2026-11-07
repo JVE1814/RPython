@@ -370,6 +370,7 @@ pub fn get(o: &PyObject, name: &PyObject) -> Get {
             return Get::NotValues;
         }
     };
+    crate::qsbr::note_attr_read(o);
     unsafe {
         loop {
             let p = w.load(Acquire) as usize;
@@ -422,6 +423,7 @@ pub fn get_hinted(o: &PyObject, name: *mut PyObject, hint: u64) -> Option<Option
                 None => return Some(None),
             }
         };
+        crate::qsbr::note_attr_read(o);
         let p = slot(op, sh, i).load(Acquire);
         if p.is_null() { Some(None) } else { Some(Some((p, i))) }
     }
@@ -434,13 +436,11 @@ fn wlock(o: &PyObject) -> WLock {
     if crate::qsbr::multi_threaded() { WLock(Some(dict::ob_lock(o))) } else { WLock(None) }
 }
 
-/// Release a value removed from the value slots (deferred while other threads may
-/// still be reading it lock-free).
+/// Release a value removed from the value slots of `op` (by a SeqCst swap): deferred
+/// while other threads may still be reading it lock-free (scale2: `qsbr::release_attr`).
 #[inline(always)]
-unsafe fn release_old(p: *mut PyObject) {
-    if !p.is_null() {
-        unsafe { crate::qsbr::decref_deferred(p) }
-    }
+unsafe fn release_old(op: *mut PyObject, p: *mut PyObject) {
+    unsafe { crate::qsbr::release_attr(op, p) }
 }
 
 pub enum Set {
@@ -488,9 +488,9 @@ pub fn set_ix(o: &PyObject, name: &PyObject, value: Option<&PyObject>) -> (Set, 
         match (shr.index_of(k), value) {
             (Some(i), Some(val)) => {
                 incref(val.as_ptr());
-                let old = slot(op, shr, i).swap(val.as_ptr(), AcqRel);
+                let old = slot(op, shr, i).swap(val.as_ptr(), SeqCst);
                 drop(g);
-                release_old(old);
+                release_old(op, old);
                 (Set::Done, i)
             }
             (None, Some(val)) => {
@@ -515,10 +515,10 @@ pub fn set_ix(o: &PyObject, name: &PyObject, value: Option<&PyObject>) -> (Set, 
             (Some(i), None) => {
                 if i + 1 == shr.len as usize && !shr.parent.is_null() {
                     // deleting the most recently added attribute: back to the parent
-                    let old = slot(op, shr, i).swap(std::ptr::null_mut(), AcqRel);
+                    let old = slot(op, shr, i).swap(std::ptr::null_mut(), SeqCst);
                     w.store((shr.parent as usize | 1) as *mut PyObject, Release);
                     drop(g);
-                    release_old(old);
+                    release_old(op, old);
                     return (Set::Done, i);
                 }
                 drop(g);
@@ -551,9 +551,9 @@ pub fn replace_hinted(o: &PyObject, name: *mut PyObject, hint: u64, val: &PyObje
             return false;
         }
         incref(val.as_ptr());
-        let old = slot(op, sh, hint as usize).swap(val.as_ptr(), AcqRel);
+        let old = slot(op, sh, hint as usize).swap(val.as_ptr(), SeqCst);
         drop(g);
-        release_old(old);
+        release_old(op, old);
         true
     }
 }

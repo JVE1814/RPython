@@ -759,6 +759,10 @@ impl<'a, 'b> Cg<'a, 'b> {
                 a.lock_cmpxchg8(M(r, OB_MUTEX), R11);
                 a.jcc(Cc::NE, l);
             }
+            NoteRead(v) => {
+                let r = self.gr(*v, R10);
+                crate::interp::jit::tier1::emit_note_attr_read(&mut self.g.a, r);
+            }
             Unlock(v) => {
                 let r = self.gr(*v, R10);
                 // (scale1) runtime waiters park on a contended ob_mutex (bit 1): a plain

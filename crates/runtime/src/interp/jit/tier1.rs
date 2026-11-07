@@ -1253,6 +1253,7 @@ impl<'a> Gen<'a> {
                     self.a.load(Rax, obj);
                     self.guard_tag(Rax, tag, slow);
                     let dict_path = self.a.label();
+                    emit_note_attr_read(&mut self.a, Rax); // scale2
                     self.inline_values(Rax, s.b, name, slow, dict_path);
                     self.incref(Rsi);
                     self.a.store(obj, Rsi);
@@ -1270,6 +1271,7 @@ impl<'a> Gen<'a> {
                 (Op::LoadAttr, kind::SLOT) => {
                     self.a.load(Rax, obj);
                     self.guard_tag(Rax, tag, slow);
+                    emit_note_attr_read(&mut self.a, Rax); // scale2
                     self.a.load(Rsi, M(Rax, s.c as i32));
                     self.a.test_rr(Rsi, Rsi);
                     self.a.jcc(Cc::E, slow);
@@ -2038,6 +2040,22 @@ fn preserving_routine(target: usize) -> Option<usize> {
         a.resolve().ok()?;
         crate::interp::jit::mem::install(&a.buf, |_, _| {})
     }
+}
+
+/// (scale2) Inline `qsbr::note_attr_read` for the object in `r` (not r11): a thread
+/// other than the owner sets the sticky XREAD bit before its first lock-free read of
+/// the object's attribute storage (`lock or` is a full barrier, so the slot load that
+/// follows is ordered after it). Clobbers r11 only.
+pub(crate) fn emit_note_attr_read(a: &mut Asm, r: R) {
+    const OB_FLAGS: i32 = offset_of!(PyObject, ob_flags) as i32;
+    let done = a.label();
+    a.cmp_rm(R15, M(r, OB_TID));
+    a.jcc(Cc::E, done);
+    a.load8(R11, M(r, OB_FLAGS));
+    a.test_ri(R11, crate::qsbr::XREAD as i32);
+    a.jcc(Cc::NE, done);
+    a.lock_or16_mi(M(r, OB_FLAGS), crate::qsbr::XREAD);
+    a.bind(done);
 }
 
 /// Out-of-line part of an inline incref when the object in `r` (not r11) is owned by
