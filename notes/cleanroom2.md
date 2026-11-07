@@ -108,3 +108,13 @@
   auto_arg_index=0)` (test_string calls it); numbering logic moved to `_number_field`; the
   manual-numbering state is None instead of False; str.format's own error texts kept.
 - string/templatelib.py reviewed: tiny, own (`_template_unpickle` is used by the runtime).
+
+### queue.py (rewritten)
+- test_queue 165 = (C and Python variants), test_logging 289 =, test___all__ =,
+  test_concurrent_futures.test_thread_pool = (1 pre-existing test_free_reference failure).
+- Kept: the documented attributes (`mutex not_empty not_full all_tasks_done
+  unfinished_tasks maxsize queue is_shutdown`), the storage hooks `_init _qsize _put _get`
+  (subclass API, the tests override them), `_PySimpleQueue` (tests), message "task_done()
+  called too many times" and the negative-timeout ValueError.  put()/get() have an inline fast
+  path and share one waiting helper (`_wait_until`) for the blocking cases; shutdown
+  semantics as documented.  Timing (put+get, uncontended, ns): ~equal (noise > difference).
