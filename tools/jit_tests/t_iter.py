@@ -126,3 +126,43 @@ for bad in ([1, 2], (1, 2, 3, 4), "ab"):
         unpack_mixed([bad])
     except (ValueError, TypeError) as e:
         print(type(e).__name__, e)
+
+# jit5: iter(range(...)) without the range object
+class Idx:
+    def __init__(self, v):
+        self.v = v
+    def __index__(self):
+        return self.v
+
+def ranges(n):
+    out = []
+    for k in range(n):
+        s = 0
+        for i in range(k):
+            s += i
+        for i in range(k, 2 * k):
+            s += i
+        for i in range(3 * k, -k, -3):
+            s -= i
+        for i in range(True, Idx(k)):
+            s += i
+        for i in range(2**62, 2**62 + 2):
+            s += i & 7
+        for i in range(-2**63, -2**63 + 1, 2**63):
+            s += 1
+        out.append(s)
+    try:
+        for i in range(0, 5, 0):
+            pass
+    except ValueError as e:
+        out.append(str(e))
+    try:
+        for i in range(1.5):
+            pass
+    except TypeError as e:
+        out.append(str(e))
+    for i in range(2**70, 2**70 + 3):
+        out.append(i)
+    return out
+
+print(ranges(60)[-8:])

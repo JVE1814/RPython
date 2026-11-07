@@ -790,10 +790,20 @@ impl<'a> Gen<'a> {
                 self.a.jmp(done);
                 self.a.bind(generic);
                 self.helper_sp(&ins, d, addr!(h::h_call), Some(arg as i64), Some(0), base);
+                // C calls: observe signals, pending calls and safepoints right after
+                // (Python callees poll at their own Resume)
+                self.poll(pc, base + 1);
                 self.a.bind(done);
             }
-            Op::CallKw => self.helper_sp(&ins, d, addr!(h::h_call), Some(arg as i64), Some(1), d - arg as i32 - 3),
-            Op::CallFunctionEx => self.helper_sp(&ins, d, addr!(h::h_call_ex), None, None, d - 4),
+            Op::CallKw => {
+                let base = d - arg as i32 - 3;
+                self.helper_sp(&ins, d, addr!(h::h_call), Some(arg as i64), Some(1), base);
+                self.poll(pc, base + 1);
+            }
+            Op::CallFunctionEx => {
+                self.helper_sp(&ins, d, addr!(h::h_call_ex), None, None, d - 4);
+                self.poll(pc, d - 3);
+            }
             Op::CallIntrinsic1 => {
                 self.set_lasti(pc);
                 self.a.mov_rr(Rdi, R13);

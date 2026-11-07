@@ -1460,6 +1460,9 @@ impl<'a> B<'a> {
             Op::LoadMethod => self.load_method(i),
             Op::StoreAttr => self.store_attr(i),
             Op::Call => {
+                if self.try_range_iter(i, last) {
+                    return Ok(true);
+                }
                 if !self.try_builtin(i) && !self.try_inline(i)? && !self.try_inline_new(i)? {
                     self.template(i);
                 }
@@ -2465,6 +2468,43 @@ impl<'a> B<'a> {
         }
     }
 
+    /// `iter(range(...))` (a Call of the builtin range directly followed by GetIter in
+    /// the same block): the range iterator is created by one helper call, without
+    /// the argument tuple, the range object and its int fields. True: instruction
+    /// i + 1 was consumed too.
+    fn try_range_iter(&mut self, i: usize, last: usize) -> bool {
+        let n = self.u.an.instrs[i].arg as usize;
+        if i + 1 > last || self.u.an.instrs[i + 1].op != Op::GetIter || !(1..=3).contains(&n) || self.inl.is_some() {
+            return false;
+        }
+        let d = self.st.stack.len();
+        let AV::Const(fp) = self.st.stack[d - n - 2] else { return false };
+        if !matches!(self.st.stack[d - n - 1], AV::Null) || fp != crate::types::range::range_type() as usize {
+            return false;
+        }
+        let esnap = self.snap(i, SnapKind::Error);
+        let mut args = Vec::new();
+        for k in (1..=n).rev() {
+            args.push(Opnd::V(self.peek_ptr(k)));
+        }
+        while args.len() < 3 {
+            args.push(Opnd::I(0));
+        }
+        args.push(Opnd::I(n as i64));
+        let r = self.v(Class::G);
+        self.emit(Inst::Call { addr: h2_range_iter as usize, args, fargs: vec![], ret: Some(r), fret: None });
+        self.emit(Inst::Guard(Cond::Test(r, Opnd::V(r), Cc::E), esnap));
+        for _ in 0..n {
+            let k = self.st.stack.len() - 1;
+            let a = self.pop();
+            self.discard(a, k);
+        }
+        self.pop(); // NULL
+        self.pop(); // range (a constant)
+        self.push(AV::Obj(r, Own::Owned, Ty::Unknown));
+        true
+    }
+
     /// Calls of a few builtins compiled inline: len() of lists/tuples/dicts/strs.
     fn try_builtin(&mut self, i: usize) -> bool {
         let n = self.u.an.instrs[i].arg as usize;
@@ -3295,6 +3335,38 @@ pub unsafe extern "C" fn h_shape_lacks(sh: *const crate::shape::Shape, name: *mu
         }
         (*cell).store(sh as usize, std::sync::atomic::Ordering::Relaxed);
         1
+    }
+}
+
+/// `iter(range(*args))` (try_range_iter): borrowed arguments, n of them (1..=3).
+/// New reference, or NULL with an exception set.
+pub unsafe extern "C" fn h2_range_iter(a: *mut PyObject, b: *mut PyObject, c: *mut PyObject, n: u64) -> *mut PyObject {
+    unsafe {
+        let args: [*mut PyObject; 3] = [a, b, c];
+        let args = &args[..n as usize];
+        let mut v = [0i64; 3];
+        let mut fast = true;
+        for (k, &p) in args.iter().enumerate() {
+            match crate::types::int::is_int_exact(&*p).then(|| crate::types::int::as_i64(&*p)).flatten() {
+                Some(x) => v[k] = x,
+                None => fast = false,
+            }
+        }
+        if fast {
+            let (start, stop, step) = match n {
+                1 => (0, v[0], 1),
+                2 => (v[0], v[1], 1),
+                _ => (v[0], v[1], v[2]),
+            };
+            if step != 0 {
+                return crate::types::range::iter_i64(start, stop, step).into_raw();
+            }
+        }
+        // anything else: the real range() (errors, __index__) and iter()
+        let refs: Vec<&PyObject> = args.iter().map(|&p| &*p).collect();
+        let r = crate::abstract_::call(crate::types::typeobject::type_obj(crate::types::range::range_type()), &refs)
+            .and_then(|r| crate::abstract_::get_iter(&r));
+        crate::errors::into_c(r)
     }
 }
 
