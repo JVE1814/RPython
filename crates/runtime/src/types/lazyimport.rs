@@ -530,7 +530,22 @@ pub fn import_from(p: &PyObject, attr: &PyObject) -> PyResult {
 
 /// `from`-style lookup used while replaying attribute names.
 fn lookup_attr(v: &PyObject, attr: &PyObject) -> PyResult {
-    match ab::getattr(v, attr) {
+    // A package whose own `lazy from . import sub` is being resolved holds that very
+    // placeholder under `sub`: reading the attribute would resolve it again. It counts as
+    // missing, so the submodule is imported (which rebinds the attribute).
+    let self_binding = crate::types::module::is_module(v)
+        && dict::get_item_str(&crate::types::module::module_dict(v), attr)
+            .is_some_and(|cur| is_lazy(&cur) && RESOLVING.with(|r| r.borrow().contains(&(cur.as_ptr() as usize))));
+    let got = if self_binding {
+        Err(crate::types::exceptions::attribute_error_with(
+            &format!("module has no attribute '{}'", pystr::to_string_lossy(attr)),
+            v,
+            attr,
+        ))
+    } else {
+        ab::getattr(v, attr)
+    };
+    match got {
         Ok(x) => Ok(x),
         Err(e) => {
             if !exc_matches(crate::types::exceptions::AttributeError()) && !exc_matches(crate::types::exceptions::ImportError()) {
@@ -713,14 +728,26 @@ pub fn resolve(p: &PyObject) -> PyResult {
             return guarded_root(p, false);
         }
         let root = unsafe { PyRef::from_borrowed(l.base) };
-        let mut v = guarded_root(&root, root_is_from_form(&root))?;
-        let attrs = unsafe { PyRef::from_borrowed(l.attrs) };
-        for a in tuple::tuple_items(&attrs) {
-            v = lookup_attr(&v, a)?;
-            if is_lazy(&v) {
-                v = resolve(&v)?;
+        let key = p.as_ptr() as usize;
+        RESOLVING.with(|r| r.borrow_mut().push(key));
+        let r = (|| -> PyResult {
+            let mut v = guarded_root(&root, root_is_from_form(&root))?;
+            let attrs = unsafe { PyRef::from_borrowed(l.attrs) };
+            for a in tuple::tuple_items(&attrs) {
+                v = lookup_attr(&v, a)?;
+                if is_lazy(&v) {
+                    v = resolve(&v)?;
+                }
             }
-        }
+            Ok(v)
+        })();
+        RESOLVING.with(|r| {
+            let mut v = r.borrow_mut();
+            if let Some(i) = v.iter().rposition(|&k| k == key) {
+                v.remove(i);
+            }
+        });
+        let v = r?;
         finish(p);
         Ok(v)
     })();
