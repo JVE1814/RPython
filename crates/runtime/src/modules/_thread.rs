@@ -185,7 +185,10 @@ fn parse_acquire_args(fname: &str, args: &[&PyObject], kw: Option<&PyObject>) ->
     if timeout == -1.0 {
         return Ok(None);
     }
-    if timeout.is_nan() || timeout > TIMEOUT_MAX {
+    if timeout.is_nan() {
+        raise!(ValueError, "Invalid value NaN (not a number)");
+    }
+    if timeout > TIMEOUT_MAX {
         raise!(OverflowError, "timeout value is too large");
     }
     Ok(Some(Duration::from_secs_f64(timeout)))
