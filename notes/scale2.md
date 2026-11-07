@@ -94,16 +94,61 @@ simultaneously). Tables use best runs (`STAT=min`) with old/new interleaved in t
 harness run where a before/after is claimed. See the final table in the agent report
 (also below once filled in).
 
-FINAL_TABLE_PLACEHOLDER
+Final run A (18:00–18:15, load ≈ 12–14, `REPS=3 THREADS="1 4"`, before = my base snapshot
+1249f42 (core with scale1), ours = 03d2501 without item 8, py-ft) and final run B
+(18:19–18:25, load ≈ 7–9, ours = 086feb6+core merge, py-ft). Best runs. Under the very
+high load of run A threads rarely ran simultaneously, which hides contention for every
+interpreter; run B shows more of it. cpu-infl@4 (ideal 1.00):
+
+| workload | before (A) | ours (A) | py-ft (A) | ours (B) | py-ft (B) | ours/ft wall@1 (B) |
+|---|---|---|---|---|---|---|
+| cpu_nbody | 1.03 | 0.93 | 1.03 | **1.01** | 1.01 | 0.46 |
+| cpu_oo | 1.38 | 0.97 | 1.05 | **1.07** | 1.09 | 0.59 |
+| cpu_float | 1.26 | 1.17 | 1.12 | 1.27 | 1.03 | 0.83 |
+| cpu_gen | 1.10 | 1.02 | 1.00 | 1.06 | 1.05 | 0.99 |
+| cpu_comp | 1.21 | 1.08 | 1.00 | 1.29 | 1.06 | 1.77 |
+| cpu_regex | 1.24 | 1.09 | 1.11 | **1.11** | 1.19 | 0.46 |
+| cpu_json | 1.02 | 0.98 | 1.02 | **0.98** | 1.08 | 0.81 |
+| shr_dict | 0.95 | 1.01 | 1.30 | 2.02 | 1.37 | 0.97 |
+| shr_list | 0.76 | 0.74 | 1.01 | **0.94** | 1.44 | 0.83 |
+| shr_globals | 0.98 | 1.02 | 1.06 | 1.07 | 1.02 | 0.55 |
+| shr_attrs | 1.20 | 1.05 | 1.06 | 2.05 | 1.00 | 0.54 |
+| alloc_small | 1.04 | 1.10 | 0.98 | 1.06 | 1.05 | 0.65 |
+| alloc_cycles | 1.38 | 1.59 | 0.89 | 1.72 | 0.82 | 0.50 |
+| alloc_dicts | 1.02 | 1.04 | 1.04 | 1.05 | 1.00 | 1.53 |
+| mut_queue | 1.01 | 1.01 | 1.15 | **1.09** | 2.22 | 1.51 |
+| mut_dict | 1.05 | 1.13 | 1.03 | 3.10 | 1.98 | 1.45 |
+| mut_lock | 1.02 | 1.13 | 1.02 | 1.58 | 1.34 | 1.15 |
+| mut_list | 1.19 | 1.33 | 1.15 | 2.54 | 1.55 | 1.19 |
+| jit_loop | 1.02 | 1.01 | 0.98 | 1.04 | 1.03 | 0.10 |
+| jit_calls | 1.63 | 1.04 | 1.06 | 1.10 | 1.02 | 0.49 |
+| misc_classes | 3.87 | 1.49 | 1.36 | 1.62 | 1.49 | 0.72 |
+| misc_import | 0.98 | 0.92 | 0.89 | 1.33 | 1.30 | 1.31 |
+| misc_cext | 1.21 | 1.00 | 0.93 | 1.07 | 1.03 | 1.15 |
+
+(bold: at least as good as py-ft in run B.) Same-load before/after pairs measured during
+the work (old and new binaries interleaved in one harness run, best runs): jit_calls
+2.19 → 1.00, cpu_oo 2.97 → 1.05, cpu_float 1.92 → 1.19, nbody 1.34 → 1.08, mut_list
+6.08 → 1.88, misc_classes 4.54 → 1.94, shr_dict 5.84 → 1.94, mut_dict 2.41 → 1.86;
+shr_attrs (single runs, 4 threads, 264 units): 2.47 s wall / 7.1 s CPU → 0.38 s / 0.22 s
+after item 8.
+
+8. **(late) Tier-2 class attributes read through instances** (`self.LIMIT`,
+   `CLASS_ATTR_SHADOWABLE`): handled in tier 2 with the shape-lacks guard used for
+   shadowable methods. Methods that read class constants through `self` could not be
+   inlined before (the inliner rolled back at that LoadAttr), so every call passed an
+   owned reference to the receiver: shr_attrs' shared instance went from 9.0M to 1.6M
+   non-owner decrefs per run. jit test: tools/jit_tests/t_shadow.py.
 
 ## What is left (measured causes)
 
-* **shr_attrs (cpu-infl ~2–7 depending on load, py-ft 1.0)**: every use of the shared
-  instance `o` increfs/decrefs it from 4 threads (9M non-owner decrefs at 0.3 scale):
-  tier 2 calls `o.compute()` / `o.prop` through the tier-1 call template with an owned
-  reference to `o`, and the callee frame owns its arguments. Fix = borrowed stack/argument
-  references (item 3 of the brief; D27 would then become unnecessary) or inlining those
-  calls; not done (large change across interpreter frames and both JIT tiers).
+* **shr_attrs (cpu-infl 2.05 in run B, py-ft 1.0)**: after item 8 one owned reference to
+  the shared instance per iteration remains (1.6M non-owner decrefs at 0.3 scale): `o.prop`
+  (a property; tier 2 calls the getter through the tier-1 template with an owned `self`)
+  or `isinstance(o, _Base)`. The general fix is borrowed stack/argument references
+  (item 3 of the brief; D27's getrefcount emulation could then go) — not done (frames
+  would need tagged borrowed slots in the interpreter and both JIT tiers); a smaller step
+  is inlining property getters in tier 2.
 * **mut_list / mut_dict / shr_dict**: same root cause on the shared container
   (LOAD_FAST incref of the shared list/dict, its refcount and `ob_mutex` share the
   ABI-fixed header line). Sharding young containers was rejected by scale1 (delays the
@@ -127,7 +172,17 @@ thread (all multi-threaded paths) only differs in finalization timing of deferre
 objects (t_inline `P.alive`, t_unpack `__del__` log), as on the base build.
 Negative control: with the XREAD check disabled, attr_owner_race.py fails (freed values
 read: AttributeError/garbage) — the test detects the race the bit prevents.
-Suite gate: see GATE_PLACEHOLDER.
+Suite gate (installed-layout snapshot, vs my base snapshot 1249f42): test_threading,
+test_thread, test_free_threading, test_weakref, test_list, test_set, test_class,
+test_queue, test_collections, test_itertools, test_functools, test_concurrent_futures
+(test_interpreter_pool env changed as before), test_finalization, test_monitoring pass;
+test_gc (2), test_sys (1), test_dict (1), test_descr (1), test_opcache (1), test_capi
+(40 failures/13 errors) fail exactly the same tests as the base build; test_asyncio 2
+(the sslproto no_cycles tests above; base snapshot additionally failed others since fixed
+on core). The base build also failed test_free_threading (2) and test_class (1).
+Single-thread instruction counts (callgrind, tools/bench/micro, 100000 loops, base →
+new): attr +0.1%, calls +1.7%, globals_ -0.4%, method +0.3%, gen -0.4%, listdict -0.3%,
+floatops -0.7%.
 
 ## Files
 
