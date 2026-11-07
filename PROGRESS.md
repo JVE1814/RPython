@@ -1,13 +1,13 @@
 # PROGRESS
 
 ## Status 2026-11-07 (day 7, afternoon)
-Master ca5cdc8: core6, perf4, tail1, capi2, cleanroom1 (14 Lib modules rewritten clean-room), scale1 (multi-core scaling) merged today; suite run 12: 367/434 modules pass, 129 failures, 70 errors. Smoke on snap19: test_capi 40 failures (was 433 in run 11),
+Master 0a2f1fa: core6, perf4, tail1, capi2, cleanroom1+2 (20 Lib modules rewritten clean-room), scale1 (multi-core scaling), tail2 (re.DEBUG, _zoneinfo, ssl PSK, alloc-failure injection, 22 modules) merged today; suite run 13 running; suite run 12: 367/434 modules pass, 129 failures, 70 errors. Smoke on snap19: test_capi 40 failures (was 433 in run 11),
 stable_abi_ctypes/fileutils pass, cmd_line_script 1; tail1 fixed ~60 long-tail modules (inspect, codecs, time,
 path modules, math, buffer, logging, json, ...). Run 11 (pre-merges):
 294/434 modules pass, 674 failures (241 without test_capi), 616 errors. Baseline free-threaded CPython: 416/434.
 Running agents: scale2 (scaling round 2 + prompt-free regression in test_concurrent_futures), perf5 (remaining slow benchmarks), stability3 (test_free_threading races,
-flaky crashes, gc hang), tail2 (alloc-failure injection, re.DEBUG, _zoneinfo, pdb, tkinter, leftovers),
-cleanroom2 (continuing the D19 Lib audit).
+flaky crashes), tail3 (crossinterp, getpath, nturl2path, asyncio, ast, leftovers), pdb1 (clean-room pdb, remote pdb,
+profiling.sampling).
 Earlier history (2026-11-02): agents stopped when the weekly API limit was hit; resumed Nov 5.
 
 ## RESUMED (2026-11-01, 22:15 UTC) after a pause at user request
