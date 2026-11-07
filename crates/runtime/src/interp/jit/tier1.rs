@@ -192,6 +192,13 @@ pub(crate) struct Gen<'a> {
     pub(crate) own_load: Vec<bool>,
 }
 
+/// (perf8) Call/CallKw sites call the shared dispatch routines (callpy.rs);
+/// RPYTHON_JIT_SHAREDCALL=0 emits the dispatch inline at every site instead.
+fn shared_calls() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| !matches!(std::env::var("RPYTHON_JIT_SHAREDCALL").as_deref(), Ok("0")))
+}
+
 fn fnaddr<T>(f: T) -> usize
 where
     T: Copy,
@@ -323,8 +330,7 @@ impl<'a> Gen<'a> {
         if obj != Rdi {
             self.a.mov_rr(Rdi, obj);
         }
-        self.a.mov_ri(R11, rt as i64);
-        self.a.call_r(R11);
+        self.a.call_abs_via(rt, R11);
         self.a.pop(Rdi);
         self.a.bind(done);
     }
@@ -1053,6 +1059,16 @@ impl<'a> Gen<'a> {
                 // call routines (callpy converts them, h_call_t passes untagged copies)
                 self.own_slot(base);
                 let tagged_args = (base + 1..d).any(|k| self.tagged(k));
+                // (perf8) one shared routine does the dispatch (callpy.rs `dispatch`)
+                let shared = super::callpy::dispatch(if tagged_args { super::callpy::Dispatch::CallTagged } else { super::callpy::Dispatch::Call });
+                if shared != 0 && shared_calls() {
+                    self.set_lasti(pc);
+                    self.lea_sp(Rdi, base);
+                    self.a.mov_ri(Rsi, arg as i64);
+                    self.call(shared);
+                    self.check(pc, base);
+                    return Ok(());
+                }
                 let generic = self.a.label();
                 let done = self.a.label();
                 let m = self.slot(base);
@@ -1141,6 +1157,20 @@ impl<'a> Gen<'a> {
             }
             Op::CallKw => {
                 let base = d - arg as i32 - 3;
+                let tagged = (base..d).any(|k| self.tagged(k));
+                if self.tagged(base) {
+                    // (the shared routine takes an owned callable)
+                    self.own_slot(base);
+                }
+                let shared = super::callpy::dispatch(if tagged { super::callpy::Dispatch::CallKwTagged } else { super::callpy::Dispatch::CallKw });
+                if shared != 0 && shared_calls() {
+                    self.set_lasti(pc);
+                    self.lea_sp(Rdi, base);
+                    self.a.mov_ri(Rsi, arg as i64);
+                    self.call(shared);
+                    self.check(pc, base);
+                    return Ok(());
+                }
                 let hc = if (base..d).any(|k| self.tagged(k)) { addr!(h::h_call_t) } else { addr!(h::h_call) };
                 self.generic_call(&ins, d, hc, 1, base);
                 self.poll(pc, base + 1);
@@ -2321,15 +2351,14 @@ pub(crate) fn emit_routines(a: &mut Asm, box_int: Label, box_float: Label, free_
         let l = [b.label(), b.label(), b.label()];
         emit_routines_body(&mut b, l[0], l[1], l[2]);
         b.resolve().ok()?;
-        let base = super::mem::install(&b.buf, |_, _| {})?;
+        let base = super::mem::install_asm(&b)?;
         Some([base + b.label_pos(l[0])?, base + b.label_pos(l[1])?, base + b.label_pos(l[2])?])
     });
     match shared {
         Some(s) => {
             for (l, &t) in [box_int, box_float, free_num].into_iter().zip(s.iter()) {
                 a.bind(l);
-                a.mov_ri(R11, t as i64);
-                a.jmp_r(R11);
+                a.jmp_abs_via(t, R11);
             }
         }
         None => emit_routines_body(a, box_int, box_float, free_num),
@@ -2813,7 +2842,7 @@ fn preserving_routine(target: usize) -> Option<usize> {
         a.pop(Rbp);
         a.ret();
         a.resolve().ok()?;
-        crate::interp::jit::mem::install(&a.buf, |_, _| {})
+        crate::interp::jit::mem::install_asm(&a)
     }
 }
 
@@ -2887,8 +2916,7 @@ pub(crate) fn emit_nonowner_incref(a: &mut Asm, r: R, done: Label) {
             if r != Rdi {
                 a.mov_rr(Rdi, r);
             }
-            a.mov_ri(R11, rt as i64);
-            a.call_r(R11);
+            a.call_abs_via(rt, R11);
             a.pop(Rdi);
             a.jmp(done);
         }

@@ -80,6 +80,10 @@ pub struct Asm {
     /// (perf7) after relaxation: (old position of a shortened jump, bytes removed up to
     /// and including it), for `map_pos`
     moved: Vec<(usize, usize)>,
+    /// (perf8) (position of rel32 field, absolute target): `call`/`jmp rel32` and
+    /// RIP-relative `lea` of addresses in the near code cache's reach (mem.rs), patched
+    /// at installation
+    rel_abs: Vec<(usize, usize)>,
 }
 
 /// `relax` marker of an unconditional jump
@@ -107,6 +111,7 @@ impl Asm {
             short_fixups: Vec::new(),
             relax: Vec::new(),
             moved: Vec::new(),
+            rel_abs: Vec::new(),
         }
     }
     /// (perf7) Position after `resolve` of an instruction boundary that was at `old`
@@ -212,8 +217,15 @@ impl Asm {
         self.modrm_sib(0, base, index, scale, disp);
         self.d32(imm);
     }
-    /// jmp to an absolute address (via rax)
+    /// jmp to an absolute address (`jmp rel32` when the near code cache reaches it,
+    /// else via rax)
     pub fn jmp_abs(&mut self, addr: usize) {
+        if super::mem::reachable(addr) {
+            self.b(0xe9);
+            self.rel_abs.push((self.pos(), addr));
+            self.d32(0);
+            return;
+        }
         self.mov_ri(Rax, addr as i64);
         self.jmp_r(Rax);
     }
@@ -249,6 +261,13 @@ impl Asm {
             self.b(0xc7);
             self.modrm_reg(0, dst as u8);
             self.d32(imm as i32);
+        } else if super::mem::reachable(imm as usize) {
+            // (perf8) lea dst, [rip + disp32]: 7 bytes instead of 10
+            self.rex(true, dst as u8, 0, 0, false);
+            self.b(0x8d);
+            self.b((dst as u8 & 7) << 3 | 5);
+            self.rel_abs.push((self.pos(), imm as usize));
+            self.d32(0);
         } else {
             self.rex(true, 0, 0, dst as u8, false);
             self.b(0xb8 + (dst as u8 & 7));
@@ -717,10 +736,34 @@ impl Asm {
         self.b(0xff);
         self.modrm_reg(4, r as u8);
     }
-    /// Call an absolute address (via rax).
+    /// Call an absolute address: `call rel32` when the near code cache reaches it
+    /// (perf8), else via rax (callers must treat rax as clobbered either way).
     pub fn call_abs(&mut self, addr: usize) {
+        if super::mem::reachable(addr) {
+            self.b(0xe8);
+            self.rel_abs.push((self.pos(), addr));
+            self.d32(0);
+            return;
+        }
         self.mov_ri(Rax, addr as i64);
         self.call_r(Rax);
+    }
+    /// (perf8) Call an absolute address through `scratch` when it is out of reach
+    /// (rax must survive).
+    pub fn call_abs_via(&mut self, addr: usize, scratch: R) {
+        if super::mem::reachable(addr) {
+            return self.call_abs(addr);
+        }
+        self.mov_ri(scratch, addr as i64);
+        self.call_r(scratch);
+    }
+    /// (perf8) `jmp_abs` through `scratch` when out of reach (rax must survive).
+    pub fn jmp_abs_via(&mut self, addr: usize, scratch: R) {
+        if super::mem::reachable(addr) {
+            return self.jmp_abs(addr);
+        }
+        self.mov_ri(scratch, addr as i64);
+        self.jmp_r(scratch);
     }
     pub fn jmp(&mut self, l: Label) {
         if let Some(p) = self.labels[l.0 as usize] {
@@ -906,6 +949,8 @@ impl Asm {
         self.fixups = kept;
         let abs = std::mem::take(&mut self.abs_fixups);
         self.abs_fixups = abs.into_iter().map(|(at, l)| (self.map_pos(at), l)).collect();
+        let ra = std::mem::take(&mut self.rel_abs);
+        self.rel_abs = ra.into_iter().map(|(at, t)| (self.map_pos(at), t)).collect();
         let sh = std::mem::take(&mut self.short_fixups);
         self.short_fixups = sh.into_iter().map(|(at, l)| (self.map_pos(at), l)).chain(new_short).collect();
     }
@@ -931,11 +976,20 @@ impl Asm {
         Ok(())
     }
 
-    /// Patch absolute label addresses for a code buffer that will live at `base`.
+    /// Patch absolute label addresses and (perf8) rel32 references to absolute targets
+    /// for a code buffer that will live at `base`; Err if one of the latter does not
+    /// reach from there.
     pub fn patch_abs(&self, code: &mut [u8], base: usize) -> Result<(), String> {
         for &(at, l) in &self.abs_fixups {
             let target = self.labels[l.0 as usize].ok_or_else(|| format!("unbound label {}", l.0))?;
             code[at..at + 8].copy_from_slice(&((base + target) as u64).to_le_bytes());
+        }
+        for &(at, t) in &self.rel_abs {
+            let rel = t as i64 - (base + at + 4) as i64;
+            if rel < i32::MIN as i64 || rel > i32::MAX as i64 {
+                return Err(format!("rel32 target {:#x} out of reach from {:#x}", t, base + at));
+            }
+            code[at..at + 4].copy_from_slice(&(rel as i32).to_le_bytes());
         }
         Ok(())
     }
@@ -970,6 +1024,35 @@ mod tests {
         a.buf.clear();
         a.load_idx(R9, R13, R10, 4, 0);
         assert_eq!(a.buf, [0x4f, 0x8b, 0x8c, 0x95, 0, 0, 0, 0]);
+    }
+
+    /// (perf8) near code cache: calls and address loads of targets in reach take the
+    /// rel32 forms and are patched for the installation address; relaxation moves them.
+    #[test]
+    fn near_forms() {
+        let Some((lo, hi)) = crate::interp::jit::mem::near_window() else { return };
+        let t = near_forms as fn() as usize;
+        assert!(t >= lo && t < hi);
+        let mut a = Asm::new();
+        let l = a.label();
+        a.jcc(Cc::E, l); // shrinks to 2 bytes
+        a.call_abs(t); // e8 rel32
+        a.mov_ri(Rcx, t as i64); // 48 8d 0d rel32
+        a.bind(l);
+        a.ret();
+        a.resolve().unwrap();
+        assert_eq!(a.buf.len(), 2 + 5 + 7 + 1);
+        assert_eq!(a.buf[2], 0xe8);
+        assert_eq!(&a.buf[7..10], &[0x48, 0x8d, 0x0d]);
+        let base = crate::interp::jit::mem::install_asm(&a).expect("install");
+        let code = unsafe { std::slice::from_raw_parts(base as *const u8, a.buf.len()) };
+        let rel = |at: usize| i32::from_le_bytes(code[at..at + 4].try_into().unwrap()) as i64;
+        assert_eq!(base as i64 + 7 + rel(3), t as i64);
+        assert_eq!(base as i64 + 14 + rel(10), t as i64);
+        // out of reach of the window: 64-bit forms
+        let mut b = Asm::new();
+        b.call_abs(0x7fff_0000_0000);
+        assert_eq!(b.buf.len(), 12);
     }
 
     /// (perf7) jump relaxation: forward jumps shrink when their target ends up close,

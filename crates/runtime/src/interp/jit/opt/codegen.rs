@@ -703,9 +703,21 @@ impl<'a, 'b> Cg<'a, 'b> {
                 a.cmp_rr(R11, Rax);
                 a.jcc(Cc::NE, l);
                 a.load(R11, M(p, LV_TAG));
-                a.cmp_ri(R11, 16);
+                // (perf8) one or two 30-bit digits (exact in i64, converted with the
+                // correctly rounded cvtsi2sd): a nanosecond difference passes 2^30
+                // after a second (logging's relativeCreated), which deoptimised
+                // every call until the unit was discarded
+                a.cmp_ri(R11, 24);
                 a.jcc(Cc::AE, l);
                 a.load32(Rax, M(p, LV_DIGIT));
+                let one = a.label();
+                a.cmp_ri(R11, 16);
+                a.jcc_short(Cc::B, one);
+                a.load32(R11, M(p, LV_DIGIT + 4));
+                a.shl_ri(R11, 30);
+                a.add_rr(Rax, R11);
+                a.load(R11, M(p, LV_TAG));
+                a.bind(one);
                 let pos = a.label();
                 a.and_ri(R11, 2);
                 a.jcc(Cc::E, pos);
@@ -807,8 +819,7 @@ impl<'a, 'b> Cg<'a, 'b> {
                 if rx != Rdi {
                     a.mov_rr(Rdi, rx);
                 }
-                a.mov_ri(R11, rt as i64);
-                a.call_r(R11);
+                a.call_abs_via(rt, R11);
                 a.pop(Rdi);
                 a.bind(skip);
             }
@@ -828,8 +839,7 @@ impl<'a, 'b> Cg<'a, 'b> {
                         if r != Rdi {
                             a.mov_rr(Rdi, r);
                         }
-                        a.mov_ri(R11, rt as i64);
-                        a.call_r(R11);
+                        a.call_abs_via(rt, R11);
                         a.pop(Rdi);
                         a.bind(done);
                     }
@@ -1333,15 +1343,14 @@ fn emit_routines(a: &mut Asm, box_int: Label, box_float: Label, dshared: Label, 
         let l = [b.label(), b.label(), b.label(), b.label()];
         emit_routines_body(&mut b, l[0], l[1], l[2], l[3]);
         b.resolve().ok()?;
-        let base = crate::interp::jit::mem::install(&b.buf, |_, _| {})?;
+        let base = crate::interp::jit::mem::install_asm(&b)?;
         Some([base + b.label_pos(l[0])?, base + b.label_pos(l[1])?, base + b.label_pos(l[2])?, base + b.label_pos(l[3])?])
     });
     match shared {
         Some(s) => {
             for (l, &t) in [box_int, box_float, dshared, mzero].into_iter().zip(s.iter()) {
                 a.bind(l);
-                a.mov_ri(R11, t as i64);
-                a.jmp_r(R11);
+                a.jmp_abs_via(t, R11);
             }
         }
         None => emit_routines_body(a, box_int, box_float, dshared, mzero),

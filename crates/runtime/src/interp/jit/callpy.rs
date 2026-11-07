@@ -276,8 +276,7 @@ fn build() -> Option<usize> {
     a.mov_rr(Rdx, R13);
     a.mov_rr(Rcx, R14);
     a.mov_rr(R8, Rsp);
-    a.mov_ri(Rax, tramp);
-    a.call_r(Rax);
+    a.call_abs(tramp as usize);
     // unlink
     a.load(Rcx, M(Rbx, f_prev));
     a.store(M(R13, ts_frame), Rcx);
@@ -398,7 +397,7 @@ fn build() -> Option<usize> {
 
     a.resolve().ok()?;
     let _ = (f_func, epi);
-    super::mem::install(&a.buf, |_, _| {})
+    super::mem::install_asm(&a)
 }
 
 /// The tier-2 call countdown of the callee expired: compile it; returns the new
@@ -443,4 +442,248 @@ unsafe extern "C" fn h_callpy_drop(frame: *mut Frame) {
         f.builtins = std::ptr::null_mut();
         drop(f);
     }
+}
+
+// ---------------------------------------------------------------- shared call sites (perf8)
+
+/// (perf8) Shared machine code of a `Call`/`CallKw` site, like HotSpot's call stubs:
+/// the per-site code is `lasti = pc; rdi = &slot[base]; esi = argc; call dispatch;
+/// test eax, eax; jne error`, and everything else (the checks for a Python function
+/// with a fast entry, bound-method unpacking, `type(x)`, the generic call with its
+/// stack_top bookkeeping and the eval-breaker poll after it) is one routine per
+/// variant instead of ~250 bytes at every site.
+///
+/// Contract: rdi = base of [callable, self_or_null, args..(, kwnames)] in the
+/// caller's stack slots (the callable owned and untagged), rsi = argument count
+/// without self (and without kwnames), rbx/r12/r13/r15 as in compiled code, f.lasti
+/// set, rsp 16-byte aligned at the call. Returns eax = 0 (result in slot[base]) or 1
+/// (exception set; nothing left above base: the entries were consumed, a result the
+/// poll would have kept is released). Clobbers the caller-saved registers.
+/// The tagged variants accept borrowed (refs1) self/argument entries.
+pub fn dispatch(kind: Dispatch) -> usize {
+    static D: [std::sync::OnceLock<usize>; 4] = [const { std::sync::OnceLock::new() }; 4];
+    *D[kind as usize].get_or_init(|| build_dispatch(kind).unwrap_or(0))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Dispatch {
+    Call = 0,
+    CallTagged = 1,
+    CallKw = 2,
+    CallKwTagged = 3,
+}
+
+/// Release the call result left at `*base` (the eval-breaker poll after a C call
+/// raised: the error exit's depth does not include it).
+unsafe extern "C" fn h_drop_result(base: *mut *mut PyObject) {
+    unsafe {
+        let r = std::ptr::replace(base, std::ptr::null_mut());
+        crate::object::xdecref(r);
+    }
+}
+
+fn build_dispatch(kind: Dispatch) -> Option<usize> {
+    use super::helpers as h;
+    use super::x64::{Asm, Label, R};
+    use crate::ffi::PyObject as O;
+    let tagged = matches!(kind, Dispatch::CallTagged | Dispatch::CallKwTagged);
+    let kw = matches!(kind, Dispatch::CallKw | Dispatch::CallKwTagged);
+    let ob_type = offset_of!(O, ob_type) as i32;
+    let ob_tid = offset_of!(O, ob_tid) as i32;
+    let ob_ref_local = offset_of!(O, ob_ref_local) as i32;
+    use crate::types::funcobject::PyFunctionObject as F;
+    let fn_code = offset_of!(F, func_code) as i32;
+    let fn_vc = offset_of!(F, vectorcall) as i32;
+    let code_data = offset_of!(crate::types::code::PyCodeObject, data) as i32;
+    let cd_entry = (offset_of!(CodeData, caches) + offset_of!(crate::interp::cache::CodeCaches, fast_entry)) as i32;
+    let stack_top = offset_of!(Frame, stack_top) as i32;
+    let eval_breaker = (offset_of!(ThreadState, c) + offset_of!(CThreadState, eval_breaker)) as i32;
+    let func_t = crate::types::funcobject::function_type() as i64;
+    let meth_t = crate::types::funcobject::method_type() as i64;
+    let type_t = crate::types::typeobject::type_type() as i64;
+    let callpy = routine();
+
+    // inline owner incref of the object in r (not r11), slow path out of line
+    fn incref(a: &mut Asm, r: R, stubs: &mut Vec<(Label, Label, R)>, ob_ref_local: i32, ob_tid: i32) {
+        let done = a.label();
+        let slow = a.label();
+        a.load32(R11, M(r, ob_ref_local));
+        a.add32_ri(R11, 1);
+        a.jcc_short(Cc::E, done);
+        a.cmp_rm(R15, M(r, ob_tid));
+        a.jcc(Cc::NE, slow);
+        a.store32(M(r, ob_ref_local), R11);
+        a.bind(done);
+        stubs.push((slow, done, r));
+    }
+
+    let mut a = Asm::new();
+    let mut stubs: Vec<(Label, Label, R)> = Vec::new();
+    let generic = a.label();
+    if !kw {
+        let is_func = a.label();
+        let not_type = a.label();
+        a.load(Rax, M(Rdi, 0));
+        a.mov_ri(Rcx, func_t);
+        a.cmp_rm(Rcx, M(Rax, ob_type));
+        a.jcc(Cc::E, is_func);
+        // type(x): the argument's type (CPython's CALL_TYPE_1)
+        a.cmp_ri(Rsi, 1);
+        a.jcc(Cc::NE, not_type);
+        a.mov_ri(Rcx, type_t);
+        a.cmp_rr(Rax, Rcx);
+        a.jcc(Cc::NE, not_type);
+        a.cmp_mi(M(Rdi, 8), 0);
+        a.jcc(Cc::NE, not_type);
+        a.load(Rdx, M(Rdi, 16));
+        a.mov_rr(Rcx, Rdx);
+        if tagged {
+            a.and_ri(Rcx, -2);
+        }
+        a.load(Rax, M(Rcx, ob_type));
+        incref(&mut a, Rax, &mut stubs, ob_ref_local, ob_tid);
+        a.store(M(Rdi, 0), Rax);
+        a.store_i(M(Rdi, 16), 0);
+        // release the argument (unless borrowed); the `type` callable is immortal
+        if !unsafe { (*(type_t as *mut O)).is_immortal() } {
+            return None;
+        }
+        let rel_done = a.label();
+        let rel_slow = a.label();
+        if tagged {
+            a.test_ri(Rdx, 1);
+            a.jcc(Cc::NE, rel_done);
+        }
+        a.load32(R11, M(Rcx, ob_ref_local));
+        a.cmp32_ri(R11, -1);
+        a.jcc_short(Cc::E, rel_done);
+        a.cmp_rm(R15, M(Rcx, ob_tid));
+        a.jcc(Cc::NE, rel_slow);
+        a.sub32_ri(R11, 1);
+        a.jcc(Cc::E, rel_slow);
+        a.store32(M(Rcx, ob_ref_local), R11);
+        a.bind(rel_done);
+        a.xor_rr(Rax, Rax);
+        a.ret();
+        a.bind(rel_slow);
+        // (rsp is 8 off alignment at entry: one push aligns it)
+        a.push(Rdi);
+        a.mov_rr(Rdi, Rcx);
+        a.call_abs(h::h_decref as usize);
+        a.pop(Rdi);
+        a.xor_rr(Rax, Rax);
+        a.ret();
+        a.bind(not_type);
+        // bound method with a free self slot: unpack it in the stack, retry
+        a.mov_ri(Rcx, meth_t);
+        a.cmp_rm(Rcx, M(Rax, ob_type));
+        a.jcc(Cc::NE, generic);
+        a.cmp_mi(M(Rdi, 8), 0);
+        a.jcc(Cc::NE, generic);
+        a.push(Rdi);
+        a.push(Rsi);
+        a.sub_ri(Rsp, 8);
+        a.call_abs(h::h_unpack_method as usize);
+        a.add_ri(Rsp, 8);
+        a.pop(Rsi);
+        a.pop(Rdi);
+        a.load(Rax, M(Rdi, 0));
+        a.mov_ri(Rcx, func_t);
+        a.cmp_rm(Rcx, M(Rax, ob_type));
+        a.jcc(Cc::NE, generic);
+        a.bind(is_func);
+        // a replaced vectorcall (C API) must be honoured; the code body may still be
+        // lazy (perf2); no published fast entry: generic path
+        a.mov_ri(Rcx, crate::interp::function_vectorcall as usize as i64);
+        a.cmp_rm(Rcx, M(Rax, fn_vc));
+        a.jcc(Cc::NE, generic);
+        a.load(Rcx, M(Rax, fn_code));
+        a.test_rr(Rcx, Rcx);
+        a.jcc(Cc::E, generic);
+        a.load(Rcx, M(Rcx, code_data));
+        a.test_rr(Rcx, Rcx);
+        a.jcc(Cc::E, generic);
+        a.cmp_mi(M(Rcx, cd_entry), 0);
+        a.jcc(Cc::E, generic);
+        if tagged {
+            // the callee frame owns its arguments: own the borrowed entries (self may
+            // be NULL; r8 = cursor, r9 = end)
+            let lp = a.label();
+            let next = a.label();
+            let done = a.label();
+            a.lea(R8, M(Rdi, 8));
+            a.lea_idx(R9, Rdi, Rsi, 8, 16);
+            a.bind(lp);
+            a.cmp_rr(R8, R9);
+            a.jcc(Cc::AE, done);
+            a.load(Rax, M(R8, 0));
+            a.test_ri(Rax, 1);
+            a.jcc(Cc::E, next);
+            a.and_ri(Rax, -2);
+            a.store(M(R8, 0), Rax);
+            incref(&mut a, Rax, &mut stubs, ob_ref_local, ob_tid);
+            a.bind(next);
+            a.add_ri(R8, 8);
+            a.jmp(lp);
+            a.bind(done);
+        }
+        a.mov_rr(Rdx, Rcx);
+        if callpy != 0 {
+            a.jmp_abs_via(callpy, R11);
+        } else {
+            a.jmp_abs_via(super::h_call_py as usize, R11);
+        }
+    }
+    // ---- generic: h_call(&slot[top], argc, kw) with stack_top = the call's top
+    a.bind(generic);
+    let out = a.label();
+    let poll = a.label();
+    a.push(R14);
+    a.push(Rdi);
+    a.sub_ri(Rsp, 8);
+    a.load(R14, M(Rbx, stack_top));
+    let extra = if kw { 3 } else { 2 };
+    a.mov_rr(Rax, Rdi);
+    a.sub_rr(Rax, R12);
+    a.sar_ri(Rax, 3);
+    a.add_rr(Rax, Rsi);
+    a.add_ri(Rax, extra);
+    a.store(M(Rbx, stack_top), Rax);
+    a.lea_idx(Rdi, Rdi, Rsi, 8, 8 * extra);
+    a.mov_ri(Rdx, kw as i64);
+    a.call_abs(if tagged { h::h_call_t as usize } else { h::h_call as usize });
+    a.store(M(Rbx, stack_top), R14);
+    a.test_rr(Rax, Rax);
+    a.jcc(Cc::NE, out);
+    // C calls: observe signals, pending calls and safepoints right after (Python
+    // callees poll at their own Resume)
+    a.load(Rax, M(R13, eval_breaker));
+    a.test_rr(Rax, Rax);
+    a.jcc(Cc::NE, poll);
+    a.bind(out);
+    a.add_ri(Rsp, 8);
+    a.pop(Rdi);
+    a.pop(R14);
+    a.ret();
+    a.bind(poll);
+    a.load(Rax, M(Rsp, 8));
+    a.sub_rr(Rax, R12);
+    a.sar_ri(Rax, 3);
+    a.add_ri(Rax, 1);
+    a.store(M(Rbx, stack_top), Rax);
+    a.mov_rr(Rdi, R13);
+    a.call_abs(h::h_eval_breaker as usize);
+    a.store(M(Rbx, stack_top), R14);
+    a.test_rr(Rax, Rax);
+    a.jcc(Cc::E, out);
+    a.load(Rdi, M(Rsp, 8));
+    a.call_abs(h_drop_result as usize);
+    a.mov_ri(Rax, 1);
+    a.jmp(out);
+    for (slow, done, r) in stubs {
+        a.bind(slow);
+        super::tier1::emit_nonowner_incref(&mut a, r, done);
+    }
+    a.resolve().ok()?;
+    super::mem::install_asm(&a)
 }

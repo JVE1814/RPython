@@ -749,7 +749,7 @@ pub fn trampoline() -> usize {
         a.mov_rr(R13, Rdx);
         a.load_fs0(R15);
         a.jmp_r(Rcx);
-        let t = mem::install(&a.buf, |_, _| {}).expect("jit: cannot install the entry trampoline");
+        let t = mem::install_asm(&a).expect("jit: cannot install the entry trampoline");
         TRAMP_ADDR.store(t, Relaxed);
         t
     })
@@ -842,9 +842,7 @@ pub fn drain_code(cd: &CodeData, code: &PyObject) -> Option<*const Compiled> {
     let tables = cd.caches.tables(&cd.code);
     let out = tier1::compile_mode(cd, nlp, co_.flags(), tables, true).ok()?;
     let asm = &out.asm;
-    let addr = mem::install(&asm.buf, |buf, base| {
-        let _ = asm.patch_abs(buf, base);
-    })?;
+    let addr = mem::install_asm(asm)?;
     if DEBUG.load(Relaxed) != 0 {
         eprintln!("[jit] tier1 drain {} ({} bytes)", crate::types::str::to_string_lossy(&cd.co_qualname), asm.buf.len());
     }
@@ -892,9 +890,7 @@ fn compile(f: &Frame, cd: &CodeData) -> bool {
         Ok(out) => {
             let code = &out.asm.buf;
             let asm = &out.asm;
-            let addr = mem::install(code, |buf, base| {
-                let _ = asm.patch_abs(buf, base);
-            });
+            let addr = mem::install_asm(asm);
             match addr {
                 Some(addr) => {
                     if let Ok(dir) = std::env::var("RPYTHON_JIT_DUMP") {
