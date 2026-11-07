@@ -28,8 +28,9 @@ const MAGIC: u32 = 0x5250_5947; // "RPYG"
 /// Block sizes. The 8-byte steps below 96 are used by GC objects only (instances with
 /// inline attributes, tuples, lists): other allocations are rounded to 16 bytes, which
 /// PyObject_Malloc callers may rely on for alignment.
-pub const CLASSES: [usize; 28] = [
-    16, 32, 40, 48, 56, 64, 72, 80, 88, 96, 112, 128, 144, 160, 176, 192, 224, 256, 288, 320, 384, 448, 512, 640, 768, 896, 1024, 2048,
+pub const CLASSES: [usize; 36] = [
+    16, 32, 40, 48, 56, 64, 72, 80, 88, 96, 112, 128, 144, 160, 176, 192, 224, 256, 288, 320, 352, 384, 448, 512, 576, 640, 704, 768, 832, 896,
+    960, 1024, 1280, 1536, 1792, 2048,
 ];
 pub const MAX_SMALL: usize = 2048;
 const NCLASSES: usize = CLASSES.len();

@@ -119,7 +119,10 @@ pub fn initialize(cfg: &Config) -> PyResult<()> {
             errors::clear_exc();
         }
     }
-    modules::sys_full::import_site()?;
+    let r = modules::sys_full::import_site();
+    // (perf4) automatic collections start with the program (see gc::startup_complete)
+    gc::startup_complete();
+    r?;
     Ok(())
 }
 

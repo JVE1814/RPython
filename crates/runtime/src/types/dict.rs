@@ -297,7 +297,8 @@ impl DictTable {
     #[inline]
     fn insert_new(&mut self, h: isize, key: *mut PyObject, value: *mut PyObject) {
         if self.nentries >= self.cap || self.fill >= self.cap {
-            self.resize(self.used * 3);
+            // (perf4) like CPython: the new index size is at least 3 * used (usable = 2/3 of it)
+            self.resize(self.used * 2);
         }
         let slot = self.find_empty_slot(h);
         if self.indices()[slot] == EMPTY {
