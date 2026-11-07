@@ -516,7 +516,7 @@ pub unsafe fn analyse_young(me: *mut ThreadState) -> Option<Analysis> {
     unsafe {
         if crate::gc::helper_candidates() == 0 {
             NO_HELPERS.fetch_add(1, Relaxed);
-            if std::env::var_os("RPY_GCDEBUG").is_some() {
+            if crate::scalestats::gc_debug() {
                 let v: Vec<(u8, bool)> = crate::threads::ALL_THREADS.lock().unwrap().iter().map(|&t| { let t = &*(t as *const ThreadState); (t.mode.0.load(SeqCst), t.alive()) }).collect();
                 eprintln!("nohelp me={:?} {:?}", me, v);
             }

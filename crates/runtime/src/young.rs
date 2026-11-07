@@ -28,26 +28,29 @@ use std::sync::atomic::Ordering::*;
 /// The object has an entry in a young buffer.
 pub const GC_BIT_YOUNG_BUF: u8 = 0x08;
 
-/// One thread's buffer.
+/// One thread's buffer (a thread-local static; the registry holds its address while
+/// the thread lives).
 pub struct YoungBuf {
     pub entries: Vec<usize>,
-    /// Compact (drop stale entries) when `entries` reaches this length.
+    /// Compact (drop stale entries) when `entries` reaches this length; 0 until the
+    /// buffer is registered (and again once the thread exits), so that appends take
+    /// the slow path.
     limit: usize,
-    /// The thread state of the thread owning this buffer when it last appended (for
+    /// The thread state of the thread owning this buffer when it last compacted (for
     /// partition affinity; may be stale).
     pub ts: usize,
 }
 
 const MIN_LIMIT: usize = 4096;
 
-/// Every live thread's buffer (raw `Box<YoungBuf>` pointers).
+/// Every live thread's buffer (addresses of the threads' `BUF`).
 static REGISTRY: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// Entries of threads that exited (and appends from threads whose buffer is gone).
 static ORPHANS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 #[thread_local]
-static mut MINE: *mut YoungBuf = std::ptr::null_mut();
-/// 0: no buffer yet, 1: registered, 2: thread exiting (append to the orphans).
+static mut BUF: YoungBuf = YoungBuf { entries: Vec::new(), limit: 0, ts: 0 };
+/// 0: not registered yet, 1: registered, 2: thread exiting (append to the orphans).
 #[thread_local]
 static mut STATE: u8 = 0;
 
@@ -55,19 +58,18 @@ struct ExitGuard;
 impl Drop for ExitGuard {
     fn drop(&mut self) {
         unsafe {
-            let b = MINE;
+            let was = STATE;
             STATE = 2;
-            MINE = std::ptr::null_mut();
-            if b.is_null() {
+            if was != 1 {
                 return;
             }
+            let b = &raw mut BUF;
             let mut reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
             reg.retain(|&p| p != b as usize);
+            (*b).limit = 0;
+            let entries = std::mem::take(&mut (*b).entries);
             let mut o = ORPHANS.lock().unwrap_or_else(|e| e.into_inner());
-            o.extend_from_slice(&(*b).entries);
-            drop(o);
-            drop(reg);
-            drop(Box::from_raw(b));
+            o.extend_from_slice(&entries);
         }
     }
 }
@@ -77,20 +79,17 @@ thread_local! {
 }
 
 /// Record that `op` (a small GC object that just became tracked and young, without the
-/// buffer bit) is young. Sets the bit; the caller stores the other bits around it.
+/// buffer bit) is young. The caller sets the bit.
 #[inline(always)]
 pub unsafe fn push(op: *mut PyObject) {
     unsafe {
-        let b = MINE;
-        if !b.is_null() {
-            let v = &mut (*b).entries;
-            if v.len() < (*b).limit {
-                // capacity is reserved up to the limit
-                let len = v.len();
-                *v.as_mut_ptr().add(len) = op as usize;
-                v.set_len(len + 1);
-                return;
-            }
+        let b = &mut *(&raw mut BUF);
+        let len = b.entries.len();
+        if len < b.limit {
+            // capacity is reserved up to the limit
+            *b.entries.as_mut_ptr().add(len) = op as usize;
+            b.entries.set_len(len + 1);
+            return;
         }
         push_slow(op)
     }
@@ -100,18 +99,19 @@ pub unsafe fn push(op: *mut PyObject) {
 #[inline(never)]
 unsafe fn push_slow(op: *mut PyObject) {
     unsafe {
-        if MINE.is_null() {
+        let b = &mut *(&raw mut BUF);
+        if STATE != 1 {
             if STATE == 0 && GUARD.try_with(|_| ()).is_ok() {
-                let b = Box::into_raw(Box::new(YoungBuf { entries: Vec::with_capacity(MIN_LIMIT), limit: MIN_LIMIT, ts: 0 }));
-                REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).push(b as usize);
-                MINE = b;
+                let mut reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+                b.entries.reserve(MIN_LIMIT);
+                b.limit = MIN_LIMIT;
+                reg.push(b as *mut YoungBuf as usize);
                 STATE = 1;
             } else {
                 ORPHANS.lock().unwrap_or_else(|e| e.into_inner()).push(op as usize);
                 return;
             }
         }
-        let b = &mut *MINE;
         b.ts = crate::threads::current_ptr() as usize;
         if b.entries.len() >= b.limit {
             compact(b);
@@ -120,15 +120,13 @@ unsafe fn push_slow(op: *mut PyObject) {
     }
 }
 
-/// Drop the stale and duplicate entries of the calling thread's own buffer. Does not
-/// write any object (other threads may own the objects behind stale entries); the
-/// duplicates are found with a hash set.
+/// Drop the stale entries of the calling thread's own buffer. Writes no object (other
+/// threads may own the objects behind stale entries), so duplicates of a reused
+/// address survive until the next collection claims (and thereby dedupes) them.
 fn compact(b: &mut YoungBuf) {
-    let mut seen: crate::gc::PtrSet = Default::default();
-    seen.reserve(b.entries.len() / 4);
     b.entries.retain(|&p| unsafe {
         let bits = (*(p as *mut PyObject)).ob_gc_bits.load(Relaxed);
-        bits & (GC_BIT_YOUNG_BUF | GC_BIT_TRACKED | GC_BIT_OLD) == GC_BIT_YOUNG_BUF | GC_BIT_TRACKED && seen.insert(p)
+        bits & (GC_BIT_YOUNG_BUF | GC_BIT_TRACKED | GC_BIT_OLD) == GC_BIT_YOUNG_BUF | GC_BIT_TRACKED
     });
     b.limit = (b.entries.len() * 2).max(MIN_LIMIT);
     let need = b.limit - b.entries.len();
@@ -168,11 +166,6 @@ pub fn give_back_orphans(v: Vec<usize>) {
     }
 }
 
-/// The calling thread's buffer (null if it has none).
-pub fn mine() -> *mut YoungBuf {
-    unsafe { MINE }
-}
-
 /// Claim `p` (an entry) for a collection: true if it is a live young object whose
 /// buffer bit was set; the bit is cleared (and, with `promote`, the object becomes old).
 /// `atomic`: other workers may claim concurrently (parallel snapshot).
@@ -181,21 +174,16 @@ pub unsafe fn claim(p: usize, promote: bool, atomic: bool) -> bool {
     unsafe {
         let b = &(*(p as *mut PyObject)).ob_gc_bits;
         let bits = b.load(Relaxed);
-        if bits & (GC_BIT_YOUNG_BUF | GC_BIT_TRACKED | GC_BIT_OLD) != GC_BIT_YOUNG_BUF | GC_BIT_TRACKED {
-            if bits & GC_BIT_YOUNG_BUF != 0 && bits & GC_BIT_TRACKED == 0 {
-                // untracked since: drop the entry (and the bit, so that re-tracking it
-                // appends it again)
-                if atomic {
-                    b.fetch_and(!GC_BIT_YOUNG_BUF, Relaxed);
-                } else {
-                    b.store(bits & !GC_BIT_YOUNG_BUF, Relaxed);
-                }
-            } else if bits & (GC_BIT_YOUNG_BUF | GC_BIT_OLD) == GC_BIT_YOUNG_BUF | GC_BIT_OLD {
-                if atomic {
-                    b.fetch_and(!GC_BIT_YOUNG_BUF, Relaxed);
-                } else {
-                    b.store(bits & !GC_BIT_YOUNG_BUF, Relaxed);
-                }
+        if bits & GC_BIT_YOUNG_BUF == 0 {
+            return false; // stale: the object died (or a duplicate was claimed)
+        }
+        if bits & (GC_BIT_TRACKED | GC_BIT_OLD) != GC_BIT_TRACKED {
+            // not a young tracked object any more: drop the entry and the bit (so that
+            // tracking it again appends it again)
+            if atomic {
+                b.fetch_and(!GC_BIT_YOUNG_BUF, Relaxed);
+            } else {
+                b.store(bits & !GC_BIT_YOUNG_BUF, Relaxed);
             }
             return false;
         }

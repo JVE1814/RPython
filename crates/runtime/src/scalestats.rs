@@ -115,6 +115,12 @@ pub static GC_STOPPED_NS: AtomicU64 = AtomicU64::new(0);
 pub static GC_EXAMINED: AtomicU64 = AtomicU64::new(0);
 pub static GC_GARBAGE: AtomicU64 = AtomicU64::new(0);
 
+/// (scale3) `RPY_GCDEBUG` set: print one line per collection to stderr (diagnostics).
+pub fn gc_debug() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("RPY_GCDEBUG").is_some())
+}
+
 /// CPU time of the calling thread in nanoseconds.
 pub fn thread_cpu_ns() -> u64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };

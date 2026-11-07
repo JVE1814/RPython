@@ -950,7 +950,7 @@ fn snapshot_gen(young_only: bool) -> Vec<*mut PyObject> {
     v
 }
 
-/// (scale3) Tracked young objects, taken from the per-thread young buffers (young.rs)
+/// (scale3) Tracked young objects (promoted to old here), taken from the per-thread young buffers (young.rs)
 /// and the large-object registry; the buffers are emptied (every entry kept here
 /// is claimed, the others were stale). The world must be stopped.
 fn snapshot_young() -> Vec<*mut PyObject> {
@@ -959,7 +959,7 @@ fn snapshot_young() -> Vec<*mut PyObject> {
     let mut v = Vec::with_capacity(n);
     unsafe {
         for &p in &bs.orphans {
-            if crate::young::claim(p, false, false) {
+            if crate::young::claim(p, true, false) {
                 v.push(p as *mut PyObject);
             }
         }
@@ -967,7 +967,7 @@ fn snapshot_young() -> Vec<*mut PyObject> {
         for &bp in bs.bufs() {
             let b = &mut *(bp as *mut crate::young::YoungBuf);
             for &p in &b.entries {
-                if crate::young::claim(p, false, false) {
+                if crate::young::claim(p, true, false) {
                     v.push(p as *mut PyObject);
                 }
             }
@@ -977,6 +977,7 @@ fn snapshot_young() -> Vec<*mut PyObject> {
     drop(bs);
     crate::alloc::for_each_large_gc(|op| unsafe {
         if (*op).ob_gc_bits.load(Relaxed) & (GC_BIT_TRACKED | GC_BIT_OLD) == GC_BIT_TRACKED {
+            (*op).ob_gc_bits.fetch_or(GC_BIT_OLD, Relaxed); // promoted like the claimed ones
             v.push(op);
         }
     });
@@ -1011,7 +1012,7 @@ fn collect_gen(young_only: bool, explicit: bool) -> usize {
     }
     COLLECTOR.store(crate::object::thread_id(), Release);
     let me = crate::threads::current_mut();
-    if std::env::var_os("RPY_GCDEBUG").is_some() {
+    if crate::scalestats::gc_debug() {
         eprintln!("collect {:?} young={} nthreads={} thr={} since={} tracked={} lastlive={} scale={} t={:?}", me, young_only, crate::threads::ALL_THREADS.lock().unwrap().len(), trigger_threshold(), ALLOCS_SINCE.load(Relaxed), TRACKED.load(Relaxed), LAST_LIVE.load(Relaxed), YOUNG_SCALE.load(Relaxed), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() % 100000000);
     }
     let saved_exc = crate::errors::take_exc();
@@ -1031,7 +1032,7 @@ fn collect_gen(young_only: bool, explicit: bool) -> usize {
     }
     clock.lap(0);
     let n = unsafe { collect_phases(me, young_only, explicit, &mut clock) };
-    if std::env::var_os("RPY_GCDEBUG").is_some() {
+    if crate::scalestats::gc_debug() {
         eprintln!("  done n={:?} in {:?} handed={}", n, t0.elapsed(), HANDED.load(Relaxed));
     }
     if crate::scalestats::on() {
@@ -1129,7 +1130,7 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool, explicit: bool,
                 crate::scalestats::GC_EXAMINED.fetch_add(a.examined as u64, Relaxed);
             }
             clock.lap(3);
-            if std::env::var_os("RPY_GCDEBUG").is_some() {
+            if crate::scalestats::gc_debug() {
                 eprintln!("  par: examined={} garbage={} flags={} explicit={}", a.examined, a.unreachable_count(), a.flags, explicit);
             }
             if !explicit && a.flags == 0 && !crate::gc_support::save_all_on() {
@@ -1148,25 +1149,27 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool, explicit: bool,
             }
             u
         } else {
-        let mut objs = if young_only {
-            snapshot_young()
-        } else {
-            let v = snapshot_gen(false);
-            // everything tracked is examined (and promoted) now
-            crate::young::clear_all();
-            v
-        };
-        crate::gc_support::untrack_atomic_tuples(&mut objs);
-        crate::gc_support::CANDIDATES.fetch_add(objs.len(), Relaxed);
-        LAST_EXAMINED.store(objs.len(), Relaxed);
-        promote(&objs);
-        clock.lap(2);
-        if crate::scalestats::on() {
-            crate::scalestats::GC_EXAMINED.fetch_add(objs.len() as u64, Relaxed);
-        }
-        let u = find_unreachable(objs);
-        clock.lap(3);
-        u
+            let mut objs = if young_only {
+                snapshot_young()
+            } else {
+                let v = snapshot_gen(false);
+                // everything tracked is examined (and promoted) now
+                crate::young::clear_all();
+                v
+            };
+            crate::gc_support::untrack_atomic_tuples(&mut objs);
+            crate::gc_support::CANDIDATES.fetch_add(objs.len(), Relaxed);
+            LAST_EXAMINED.store(objs.len(), Relaxed);
+            if !young_only {
+                promote(&objs); // (claimed young objects are promoted already)
+            }
+            clock.lap(2);
+            if crate::scalestats::on() {
+                crate::scalestats::GC_EXAMINED.fetch_add(objs.len() as u64, Relaxed);
+            }
+            let u = find_unreachable(objs);
+            clock.lap(3);
+            u
         };
         LIVE_AT_STOP.store((TRACKED.load(Relaxed).max(0) as usize).saturating_sub(unreachable.len()), Relaxed);
         if crate::scalestats::on() {
