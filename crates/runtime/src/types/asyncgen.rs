@@ -526,6 +526,18 @@ unsafe extern "C" fn self_iter(o: *mut PyObject) -> *mut PyObject {
 }
 
 /// tp_finalize of asend/athrow: warn about never-awaited awaitables.
+/// (jit6, flagged) An asend/athrow that already completed has nothing to finalize:
+/// skip the finalizer protocol on dealloc (one per `async for` step per level).
+unsafe extern "C" fn awaitable_dealloc(o: *mut PyObject) {
+    unsafe {
+        if state(&*o) == STATE_CLOSED {
+            lu::ptrs_dealloc_unfinalized(o);
+        } else {
+            lu::ptrs_dealloc(o);
+        }
+    }
+}
+
 unsafe extern "C" fn awaitable_finalize(o: *mut PyObject) {
     unsafe {
         let o = &*o;
@@ -682,6 +694,7 @@ pub fn init_types() -> PyResult<()> {
         (*t).tp_iter = Some(self_iter);
         (*t).tp_iternext = Some(asend_iternext);
         (*t).tp_finalize = Some(awaitable_finalize);
+        (*t).tp_dealloc = Some(awaitable_dealloc);
         (*t).tp_methods = crate::mdefs![
             ("send", O, asend_send_m, "send(arg) -> send 'arg' into coroutine,\nreturn next yielded value or raise StopIteration."),
             ("throw", FAST, asend_throw, "throw(value)\nthrow(type[,value[,traceback]])\n\nRaise exception in coroutine, return next yielded value or raise\nStopIteration.\nthe (type, val, tb) signature is deprecated, \nand may be removed in a future version of Python."),

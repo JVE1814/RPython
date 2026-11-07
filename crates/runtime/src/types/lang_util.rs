@@ -35,6 +35,15 @@ pub unsafe extern "C" fn ptrs_dealloc(op: *mut PyObject) {
         if (*tp).tp_finalize.is_some() && !crate::gc::is_finalized(op) && crate::gc::call_finalizer_from_dealloc(op) {
             return;
         }
+        ptrs_dealloc_unfinalized(op);
+    }
+}
+
+/// (jit6) `ptrs_dealloc` for an object whose finalizer has nothing to do (the caller
+/// knows; asyncgen.rs: an awaitable that already completed).
+pub unsafe fn ptrs_dealloc_unfinalized(op: *mut PyObject) {
+    unsafe {
+        let tp = (*op).type_ptr();
         crate::gc::untrack(op);
         let (p, n, wl) = ptr_slots(op);
         if wl > 0 {
