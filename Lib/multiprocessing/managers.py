@@ -9,8 +9,7 @@
 # '#UNSERIALIZABLE'.
 #
 
-__all__ = ['BaseManager', 'SyncManager', 'BaseProxy', 'Token',
-           'SharedMemoryManager']
+__all__ = ['BaseManager', 'SyncManager', 'BaseProxy', 'Token']
 
 import collections.abc
 import os

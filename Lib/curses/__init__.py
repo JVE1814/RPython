@@ -14,7 +14,7 @@ from _curses import *
 import _curses
 
 __all__ = [name for name in dir(_curses) if not name.startswith("_")]
-__all__ += ["initscr", "start_color", "wrapper", "has_key", "window"]
+__all__ += [n for n in ("initscr", "start_color", "wrapper", "has_key", "window") if n not in __all__]
 
 
 def _publish(predicate):

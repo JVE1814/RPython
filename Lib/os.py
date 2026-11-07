@@ -63,7 +63,7 @@ elif 'nt' in sys.builtin_module_names:
 else:
     raise ImportError('no os specific module found')
 
-__all__.extend(_public_names(_platform))
+__all__.extend(n for n in _public_names(_platform) if n not in __all__)
 del _platform
 
 sys.modules['os.path'] = path
