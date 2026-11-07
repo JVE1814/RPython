@@ -681,7 +681,7 @@ pub fn update_slot(tp: *mut PyTypeObject, attr: &PyObject) {
                 (*tp).tp_flags &= !Py_TPFLAGS_HAVE_VECTORCALL;
             }
             for sub in subclasses(tp) {
-                drop_vectorcall(sub, false);
+                drop_vectorcall(sub.p(), false);
             }
         }
         drop_vectorcall(tp, true);
