@@ -168,7 +168,7 @@ impl<'a, 'b> Cg<'a, 'b> {
         let a = self.a();
         a.load32(R11, M(r, OB_REF_LOCAL));
         a.add32_ri(R11, 1);
-        a.jcc(Cc::E, done);
+        a.jcc_short(Cc::E, done);
         a.cmp_rm(R15, M(r, OB_TID));
         a.jcc(Cc::NE, slow);
         a.store32(M(r, OB_REF_LOCAL), R11);
@@ -186,7 +186,7 @@ impl<'a, 'b> Cg<'a, 'b> {
         let a = self.a();
         a.load32(R11, M(r, OB_REF_LOCAL));
         a.cmp32_ri(R11, -1);
-        a.jcc(Cc::E, done);
+        a.jcc_short(Cc::E, done);
         a.cmp_rm(R15, M(r, OB_TID));
         a.jcc(Cc::NE, shared);
         a.sub32_ri(R11, 1);
@@ -616,7 +616,7 @@ impl<'a, 'b> Cg<'a, 'b> {
                 let r = self.gr(*v, Rax);
                 let skip = self.a().label();
                 self.a().test_rr(r, r);
-                self.a().jcc(Cc::E, skip);
+                self.a().jcc_short(Cc::E, skip);
                 self.decref(r);
                 self.a().bind(skip);
             }

@@ -72,6 +72,8 @@ pub struct Asm {
     fixups: Vec<(usize, Label)>,
     /// (position of imm64 field, label): absolute address of label, patched at finalize
     abs_fixups: Vec<(usize, Label)>,
+    /// (position of rel8 field, label): `jcc_short`
+    short_fixups: Vec<(usize, Label)>,
 }
 
 impl Default for Asm {
@@ -82,7 +84,7 @@ impl Default for Asm {
 
 impl Asm {
     pub fn new() -> Asm {
-        Asm { buf: Vec::with_capacity(4096), labels: Vec::new(), fixups: Vec::new(), abs_fixups: Vec::new() }
+        Asm { buf: Vec::with_capacity(4096), labels: Vec::new(), fixups: Vec::new(), abs_fixups: Vec::new(), short_fixups: Vec::new() }
     }
     #[inline]
     pub fn pos(&self) -> usize {
@@ -419,22 +421,27 @@ impl Asm {
     }
     /// add r32, imm (32-bit op)
     pub fn add32_ri(&mut self, d: R, imm: i32) {
-        self.rex(false, 0, 0, d as u8, false);
-        self.b(0x81);
-        self.modrm_reg(0, d as u8);
-        self.d32(imm);
+        self.alu32_ri(0, d, imm)
     }
     pub fn sub32_ri(&mut self, d: R, imm: i32) {
-        self.rex(false, 0, 0, d as u8, false);
-        self.b(0x81);
-        self.modrm_reg(5, d as u8);
-        self.d32(imm);
+        self.alu32_ri(5, d, imm)
     }
     pub fn cmp32_ri(&mut self, d: R, imm: i32) {
+        self.alu32_ri(7, d, imm)
+    }
+    /// (perf7) 32-bit ALU op with an immediate, in the sign-extended imm8 form when it
+    /// fits (the refcount sequences inlined everywhere use +1/-1: 3 bytes shorter each)
+    fn alu32_ri(&mut self, ext: u8, d: R, imm: i32) {
         self.rex(false, 0, 0, d as u8, false);
-        self.b(0x81);
-        self.modrm_reg(7, d as u8);
-        self.d32(imm);
+        if (-128..=127).contains(&imm) {
+            self.b(0x83);
+            self.modrm_reg(ext, d as u8);
+            self.b(imm as i8 as u8);
+        } else {
+            self.b(0x81);
+            self.modrm_reg(ext, d as u8);
+            self.d32(imm);
+        }
     }
     pub fn imul_rr(&mut self, d: R, s: R) {
         self.rex(true, d as u8, 0, s as u8, false);
@@ -713,6 +720,17 @@ impl Asm {
         self.fixups.push((self.pos(), l));
         self.d32(0);
     }
+    /// (perf7) Forward conditional jump known to stay within 127 bytes (a skip over a
+    /// short fixed sequence, such as the owner check of an inline incref): the 2-byte
+    /// form instead of the 6-byte one. `resolve` fails if the target ends up farther.
+    pub fn jcc_short(&mut self, cc: Cc, l: Label) {
+        if self.labels[l.0 as usize].is_some() {
+            return self.jcc(cc, l);
+        }
+        self.b(0x70 | cc as u8);
+        self.short_fixups.push((self.pos(), l));
+        self.b(0);
+    }
     pub fn int3(&mut self) {
         self.b(0xcc);
     }
@@ -732,6 +750,14 @@ impl Asm {
             let target = self.labels[l.0 as usize].ok_or_else(|| format!("unbound label {}", l.0))?;
             let rel = target as i64 - (at as i64 + 4);
             self.buf[at..at + 4].copy_from_slice(&(rel as i32).to_le_bytes());
+        }
+        for &(at, l) in &self.short_fixups {
+            let target = self.labels[l.0 as usize].ok_or_else(|| format!("unbound label {}", l.0))?;
+            let rel = target as i64 - (at as i64 + 1);
+            if !(-128..=127).contains(&rel) {
+                return Err(format!("short jump out of range ({})", rel));
+            }
+            self.buf[at] = rel as i8 as u8;
         }
         Ok(())
     }

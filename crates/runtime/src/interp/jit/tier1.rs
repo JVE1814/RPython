@@ -248,7 +248,7 @@ impl<'a> Gen<'a> {
         let slow = self.a.label();
         self.a.load32(R11, M(r, OB_REF_LOCAL));
         self.a.add32_ri(R11, 1);
-        self.a.jcc(Cc::E, done);
+        self.a.jcc_short(Cc::E, done);
         self.a.cmp_rm(R15, M(r, OB_TID));
         self.a.jcc(Cc::NE, slow);
         self.a.store32(M(r, OB_REF_LOCAL), R11);
@@ -261,7 +261,7 @@ impl<'a> Gen<'a> {
     fn xincref(&mut self, r: R) {
         let skip = self.a.label();
         self.a.test_rr(r, r);
-        self.a.jcc(Cc::E, skip);
+        self.a.jcc_short(Cc::E, skip);
         self.incref(r);
         self.a.bind(skip);
     }
@@ -273,7 +273,7 @@ impl<'a> Gen<'a> {
         let zero = self.a.label();
         self.a.load32(R11, M(r, OB_REF_LOCAL));
         self.a.cmp32_ri(R11, -1);
-        self.a.jcc(Cc::E, done);
+        self.a.jcc_short(Cc::E, done);
         self.a.cmp_rm(R15, M(r, OB_TID));
         self.a.jcc(Cc::NE, shared);
         self.a.sub32_ri(R11, 1);
@@ -295,7 +295,7 @@ impl<'a> Gen<'a> {
     fn xdecref(&mut self, r: R) {
         let skip = self.a.label();
         self.a.test_rr(r, r);
-        self.a.jcc(Cc::E, skip);
+        self.a.jcc_short(Cc::E, skip);
         self.decref(r);
         self.a.bind(skip);
     }
