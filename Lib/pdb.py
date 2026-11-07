@@ -438,7 +438,7 @@ class Pdb(bdb.Bdb, cmd.Cmd):
     def sigint_handler(self, signum, frame):
         if self.allow_kbdint:
             raise KeyboardInterrupt
-        self.message("\nProgram interrupted. (Use 'cont' to resume).")
+        self.message("\nInterrupted; type 'continue' to go on.")
         self.set_step()
         self.set_trace(frame)
 
@@ -929,7 +929,7 @@ class Pdb(bdb.Bdb, cmd.Cmd):
                 self.allow_kbdint = False
                 break
             except KeyboardInterrupt:
-                self.message('--KeyboardInterrupt--')
+                self.message('--interrupted--')
 
     def _flush_status(self):
         if self._status_pending:
@@ -1386,8 +1386,7 @@ class Pdb(bdb.Bdb, cmd.Cmd):
             self.error('No help for %r' % arg)
             return
         if sys.flags.optimize >= 2:
-            self.error('No help for %r; please do not run Python with -OO '
-                       'if you need command help' % arg)
+            self.error('No help for %r (docstrings are stripped under -OO)' % arg)
             return
         if command.__doc__ is None:
             self.error('No help for %r; __doc__ string missing' % arg)
@@ -1399,12 +1398,14 @@ class Pdb(bdb.Bdb, cmd.Cmd):
     def help_exec(self):
         """(!) statement
 
-        Execute the (one-line) statement in the context of the current
-        stack frame.  The exclamation point may be omitted unless the first
-        word of the statement is a debugger command, e.g.:
-        (Pdb) ! n = 42
-        To change a global variable, put a global statement first:
-        (Pdb) global list_options; list_options = ['-l']
+        Anything typed at the prompt that is not a debugger command runs as
+        Python code in the frame being examined; a block (def, for, if...)
+        goes on until an empty line.  Start the line with "!" when its first
+        word is also the name of a command:
+        (Pdb) !c = 3
+        Assignments go to the frame's local variables; use a global statement
+        to assign a module variable instead:
+        (Pdb) global counter; counter = 0
         """
         self.message(self._help_message_from_doc(self.help_exec.__doc__))
 
@@ -1504,11 +1505,11 @@ class Pdb(bdb.Bdb, cmd.Cmd):
             module_globals = frame.f_globals
         line = linecache.getline(filename, lineno, module_globals)
         if not line:
-            self.message('End of file')
+            self.message('Line %d is past the end of the file' % lineno)
             return 0
         line = line.strip()
         if not line or line[0] == '#' or line[:3] in ('"""', "'''"):
-            self.error('Blank or comment')
+            self.error('Line %d holds no code (blank, comment or string)' % lineno)
             return 0
         return lineno
 
@@ -1548,14 +1549,15 @@ class Pdb(bdb.Bdb, cmd.Cmd):
             filename = arg[:colon].rstrip()
             found = self.lookupmodule(filename)
             if not found:
-                self.error('%r not found from sys.path' % filename)
+                self.error('Cannot find %r (neither a file nor a module on sys.path)'
+                           % filename)
                 return
             filename = found
             arg = arg[colon + 1:].lstrip()
             try:
                 lineno = int(arg)
             except ValueError:
-                self.error('Bad lineno: %s' % arg)
+                self.error('Line number expected, got %r' % arg)
                 return
         else:
             try:
@@ -1694,7 +1696,7 @@ class Pdb(bdb.Bdb, cmd.Cmd):
             what = '%d crossings' % count if count > 1 else '1 crossing'
             self.message('Will ignore next %s of breakpoint %d.' % (what, bp.number))
         else:
-            self.message('Will stop next time breakpoint %d is reached.' % bp.number)
+            self.message('Breakpoint %d will stop when it is next reached.' % bp.number)
 
     def _confirm(self, prompt):
         try:
@@ -1895,7 +1897,7 @@ class Pdb(bdb.Bdb, cmd.Cmd):
         older frames).
         """
         if self.curindex == 0:
-            self.error('Oldest frame')
+            self.error('Already at the oldest frame')
             return
         try:
             count = int(arg or 1)
@@ -1914,7 +1916,7 @@ class Pdb(bdb.Bdb, cmd.Cmd):
         newer frames).
         """
         if self.curindex + 1 == len(self.stack):
-            self.error('Newest frame')
+            self.error('Already at the newest frame')
             return
         try:
             count = int(arg or 1)
@@ -1936,9 +1938,8 @@ class Pdb(bdb.Bdb, cmd.Cmd):
         (post-mortem); with a number, examine that exception instead.
         """
         if not self._chained_exceptions:
-            self.error('Did not find chained exceptions. To move between '
-                       'exceptions, pdb has to be started with an exception '
-                       'object instead of a traceback.')
+            self.error('There is no chain of exceptions to examine (post-mortem '
+                       'debugging of an exception object provides one).')
             return
         if not arg:
             for index, exc in enumerate(self._chained_exceptions):
@@ -2007,11 +2008,10 @@ class Pdb(bdb.Bdb, cmd.Cmd):
             try:
                 lineno = int(arg)
             except ValueError:
-                self.error('Error in argument: %r' % arg)
+                self.error('Cannot use argument %r' % arg)
                 return
             if lineno <= self.curframe.f_lineno:
-                self.error('"until" line number is smaller than current '
-                           'line number')
+                self.error('"until" needs a line number after the current one')
                 return
         else:
             lineno = None
@@ -2058,17 +2058,17 @@ class Pdb(bdb.Bdb, cmd.Cmd):
             self._print_arg_required()
             return
         if self.curindex + 1 != len(self.stack):
-            self.error('You can only jump within the bottom frame')
+            self.error('Jumps are only possible in the newest frame')
             return
         try:
             lineno = int(arg)
         except ValueError:
-            self.error("The 'jump' command requires a line number")
+            self.error("'jump' takes a line number")
             return
         try:
             self.curframe.f_lineno = lineno
         except ValueError as err:
-            self.error('Jump failed: %s' % err)
+            self.error('Cannot jump there: %s' % err)
             return
         self.stack[self.curindex] = self.stack[self.curindex][0], lineno
         self.print_stack_entry(self.stack[self.curindex])
@@ -2133,7 +2133,7 @@ class Pdb(bdb.Bdb, cmd.Cmd):
         if self.mode == 'inline' and not hasattr(sys, 'ps1'):
             while True:
                 try:
-                    reply = self._read_line('Quit anyway? [y/n] ', state='confirm')
+                    reply = self._read_line('Quit anyway (the program stops)? y/n: ', state='confirm')
                     reply = reply.strip().lower()
                 except EOFError:
                     reply = 'y'
@@ -2194,7 +2194,7 @@ class Pdb(bdb.Bdb, cmd.Cmd):
         if '__return__' in values:
             self.message(self._safe_repr(values['__return__'], 'retval'))
         else:
-            self.error('Not yet returned!')
+            self.error('The function has not returned yet')
 
     do_rv = do_retval
 
@@ -2288,7 +2288,7 @@ class Pdb(bdb.Bdb, cmd.Cmd):
             try:
                 del self.displaying.get(self.curframe, {})[arg]
             except KeyError:
-                self.error('not displaying %s' % arg)
+                self.error('%s is not being displayed' % arg)
         else:
             self.displaying.pop(self.curframe, None)
 
@@ -2377,8 +2377,8 @@ class Pdb(bdb.Bdb, cmd.Cmd):
             return
         known = self._file_mtime_table.setdefault(filename, mtime)
         if known != mtime:
-            self.message('*** WARNING: file %r was edited, running stale code '
-                         'until the program is rerun' % filename)
+            self.message('*** WARNING: %r was edited after the program started; '
+                         'the code that runs is the old one' % filename)
 
     def _print_lines(self, lines, start, breaks=(), frame=None):
         if frame is not None:
@@ -2431,7 +2431,7 @@ class Pdb(bdb.Bdb, cmd.Cmd):
                 else:
                     first = max(1, int(arg.strip()) - 5)
             except ValueError:
-                self.error('Error in argument: %r' % arg)
+                self.error('Cannot use argument %r' % arg)
                 return
         elif self.lineno is None or arg == '.':
             first = max(1, self.curframe.f_lineno - 5)
@@ -3196,13 +3196,12 @@ def _connect(*, host, port, frame, commands, version, signal_raising_thread,
     remote = _PdbServer(sockfile, signal_server=signal_server, colorize=colorize)
     weakref.finalize(remote, sockfile.close)
     if Pdb._last_pdb_instance is not None:
-        remote.error('Another PDB instance is already attached.')
+        remote.error('A debugger is already attached to this process.')
     elif version != remote.protocol_version():
         remote.error(
-            'The target process is running a Python version that is '
-            'incompatible with this PDB module.\n'
-            'Target process pdb protocol version: 0x%08X\n'
-            'Local pdb module protocol version: 0x%08X'
+            'The debugger and the process speak incompatible protocol versions '
+            '(process: protocol version 0x%08X, debugger: protocol version 0x%08X); '
+            'detaching.'
             % (remote.protocol_version(), version))
     else:
         remote.rcLines.extend(commands.splitlines())
@@ -3371,9 +3370,9 @@ and "-c 'until X'" runs it up to line X of the debugged file."""
 def exit_with_permission_help_text():
     print("Error: The specified process cannot be attached to due to "
           "insufficient permissions.\n"
-          "See the Python documentation for details on required privileges "
-          "and troubleshooting:\n"
-          "https://docs.python.org/3/howto/remote_debugging.html#permission-requirements\n")
+          "Attaching needs the right to inspect the other process (for "
+          "instance the same user and a permissive ptrace policy, or "
+          "elevated privileges).\n")
     sys.exit(1)
 
 
@@ -3483,7 +3482,14 @@ def _parse_command_line(argv):
 def main():
     commands, module, pid, pyfile, rest = _parse_command_line(sys.argv[1:])
     if pid is not None:
-        attach(pid, commands)
+        try:
+            attach(pid, commands)
+        except PermissionError:
+            exit_with_permission_help_text()
+        except (RuntimeError, ProcessLookupError, OSError):
+            print('Cannot attach to pid %d, please make sure that the process '
+                  'exists and runs the same Python version.' % pid)
+            sys.exit(1)
         return
     if module is not None:
         target = _ModuleTarget(module)
@@ -3508,12 +3514,12 @@ def main():
             print('\t' + ' '.join(sys.argv[1:]))
             continue
         except SystemExit as exc:
-            print('The program exited via sys.exit(). Exit status:', end=' ')
+            print('The program called sys.exit(); exit status:', end=' ')
             print(exc)
         except BaseException as exc:
             traceback.print_exception(exc, colorize=_colorize.can_colorize())
-            print('Uncaught exception. Entering post mortem debugging')
-            print("Running 'cont' or 'step' will restart the program")
+            print('The program raised an exception: post-mortem debugging starts')
+            print("('continue' or 'step' runs the program again)")
             try:
                 debugger.interaction(None, exc)
             except Restart:
@@ -3522,11 +3528,11 @@ def main():
                 continue
             if debugger._user_requested_quit:
                 break
-            print('Post mortem debugger finished. The %s will be restarted' % target)
+            print('Leaving post-mortem debugging; %s starts again' % target)
             continue
         if debugger._user_requested_quit:
             break
-        print('The program finished and will be restarted')
+        print('The program finished; it starts again')
 
 
 # when invoked as a script (python -m pdb), the work is done by the module

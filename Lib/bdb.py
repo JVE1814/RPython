@@ -398,7 +398,7 @@ class Bdb:
                 return self.dispatch_opcode(frame, arg)
             if event in ('c_call', 'c_exception', 'c_return'):
                 return self.trace_dispatch
-            print('bdb.Bdb.dispatch: unknown debugging event:', repr(event))
+            print('bdb: unknown trace event', repr(event))
             return self.trace_dispatch
         finally:
             self.enterframe = None
