@@ -415,7 +415,7 @@ pub unsafe fn retire_thread_state(p: *mut ThreadState) {
         {
             let mut all = threads::ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner());
             all.retain(|&t| t != p as usize);
-            crate::qsbr::note_threads(all.len());
+            crate::qsbr::note_threads(&all);
         }
         threads::FREE_STATES.lock().unwrap_or_else(|e| e.into_inner()).push(p as usize);
     }

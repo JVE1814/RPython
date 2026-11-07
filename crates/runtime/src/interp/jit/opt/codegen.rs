@@ -175,8 +175,7 @@ impl<'a, 'b> Cg<'a, 'b> {
         a.bind(done);
         self.g.add_stub(Box::new(move |a: &mut Asm, _e, _n| {
             a.bind(slow);
-            a.lock_add_mi(M(r, OB_REF_SHARED), 1 << REF_SHARED_SHIFT);
-            a.jmp(done);
+            crate::interp::jit::tier1::emit_nonowner_incref(a, r, done);
         }));
     }
     /// inline decref of the object in r (r != r11); slow paths preserve registers
@@ -762,7 +761,27 @@ impl<'a, 'b> Cg<'a, 'b> {
             }
             Unlock(v) => {
                 let r = self.gr(*v, R10);
-                self.a().store8_i(M(r, OB_MUTEX), 0);
+                // (scale1) runtime waiters park on a contended ob_mutex (bit 1): a plain
+                // store would drop their wake-up
+                match crate::interp::jit::tier1::unlock_slow_routine() {
+                    Some(rt) => {
+                        let a = &mut self.g.a;
+                        let done = a.label();
+                        a.mov_ri(Rax, 1);
+                        a.mov_ri(R11, 0);
+                        a.lock_cmpxchg8(M(r, OB_MUTEX), R11);
+                        a.jcc(Cc::E, done);
+                        a.push(Rdi);
+                        if r != Rdi {
+                            a.mov_rr(Rdi, r);
+                        }
+                        a.mov_ri(R11, rt as i64);
+                        a.call_r(R11);
+                        a.pop(Rdi);
+                        a.bind(done);
+                    }
+                    None => self.a().store8_i(M(r, OB_MUTEX), 0),
+                }
             }
             Call { addr, args, fargs, ret, fret } => {
                 const AREGS: [R; 6] = [Rdi, Rsi, Rdx, Rcx, R8, R9];

@@ -236,8 +236,7 @@ impl<'a> Gen<'a> {
         self.a.bind(done);
         self.stubs.push(Box::new(move |a: &mut Asm, _exit, _nlp| {
             a.bind(slow);
-            a.lock_add_mi(M(r, OB_REF_SHARED), 1 << REF_SHARED_SHIFT);
-            a.jmp(done);
+            emit_nonowner_incref(a, r, done);
         }));
     }
     fn xincref(&mut self, r: R) {
@@ -803,13 +802,13 @@ impl<'a> Gen<'a> {
                 let done = self.a.label();
                 let lm = self.slot(d - 1 - arg as i32);
                 let vm = self.slot(d - 1);
-                self.a.mov_ri(Rdx, (&raw const crate::threads::MULTI_THREADED) as i64);
-                self.a.cmp_mi(M(Rdx, 0), 0);
-                self.a.jcc(Cc::NE, generic);
                 self.a.load(Rax, lm);
                 self.a.mov_ri(Rcx, crate::types::list::list_type() as i64);
                 self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
                 self.a.jcc(Cc::NE, generic);
+                // (scale1) with threads too, as long as the list is referenced only from
+                // this frame (owned by this thread, count 1): nobody else can reach it
+                self.emit_exclusive_check(Rax, generic);
                 self.a.load(Rcx, M(Rax, LIST_SIZE));
                 self.a.cmp_rm(Rcx, M(Rax, LIST_ALLOCATED));
                 self.a.jcc(Cc::GE, generic);
@@ -1047,10 +1046,10 @@ impl<'a> Gen<'a> {
             self.a.mov_ri(Rcx, (&raw mut crate::types::list::PyListIter_Type) as i64);
             self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
             self.a.jcc(Cc::NE, not_list);
-            // single-threaded only (see binary_subscr)
-            self.a.mov_ri(Rdx, (&raw const crate::threads::MULTI_THREADED) as i64);
-            self.a.cmp_mi(M(Rdx, 0), 0);
-            self.a.jcc(Cc::NE, generic);
+            // (scale1) an iterator stepped only by this frame (owned, count 1); the list
+            // itself is read like the lock-free subscript: size, then array, then item,
+            // a null array or slot (racing writer) takes the generic path
+            self.emit_exclusive_check(Rax, generic);
             self.a.load(Rdx, M(Rax, 40));
             self.a.test_rr(Rdx, Rdx);
             self.a.jcc(Cc::E, generic);
@@ -1060,7 +1059,11 @@ impl<'a> Gen<'a> {
             self.a.cmp_rm(Rcx, M(Rdx, LIST_SIZE));
             self.a.jcc(Cc::GE, generic);
             self.a.load(Rsi, M(Rdx, LIST_ITEMS));
+            self.a.test_rr(Rsi, Rsi);
+            self.a.jcc(Cc::E, generic);
             self.a.load_idx(Rsi, Rsi, Rcx, 8, 0);
+            self.a.test_rr(Rsi, Rsi);
+            self.a.jcc(Cc::E, generic);
             self.a.add_mi(M(Rax, 32), 1);
             self.incref(Rsi);
             self.a.store(out, Rsi);
@@ -1883,6 +1886,17 @@ impl<'a> Gen<'a> {
     }
     /// Emit the inline incref / decref / xdecref sequences (r11 clobbered; decref's
     /// slow path clobbers caller-saved registers).
+    /// (scale1) Jump to `fail` unless the object in `r` is referenced exactly once, by
+    /// this thread (owner, local count 1, nothing in the shared field): then no other
+    /// thread can reach it, and it may be changed or read without its lock.
+    pub(crate) fn emit_exclusive_check(&mut self, r: R, fail: Label) {
+        self.a.cmp_rm(R15, M(r, OB_TID));
+        self.a.jcc(Cc::NE, fail);
+        self.a.cmp32_mi(M(r, OB_REF_LOCAL), 1);
+        self.a.jcc(Cc::NE, fail);
+        self.a.cmp_mi(M(r, OB_REF_SHARED), 0);
+        self.a.jcc(Cc::NE, fail);
+    }
     pub(crate) fn emit_incref(&mut self, r: R) {
         self.incref(r)
     }
@@ -1976,4 +1990,118 @@ pub fn compile_mode(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crat
     emit_routines(&mut g.a, rt_box_int, rt_box_float, rt_free_num);
     g.a.resolve()?;
     Ok(Output { asm: g.a, entries })
+}
+
+// ---------------------------------------------------------------- sharded increfs (scale1)
+
+/// Process-wide routine for the incref of a sharded object (crate::sharded) from JIT
+/// code. Entered by `call` with the object in rdi (the caller saves rdi); preserves
+/// every other general register and xmm0-15, whatever the stack alignment at entry.
+pub(crate) fn incref_sharded_routine() -> Option<usize> {
+    static R: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *R.get_or_init(|| preserving_routine(h::h_incref_sharded as usize))
+}
+
+/// (scale1) Same calling convention: unlock the `ob_mutex` of the object in rdi when
+/// waiters may be parked on it (tier-2 inline Unlock).
+pub(crate) fn unlock_slow_routine() -> Option<usize> {
+    static R: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *R.get_or_init(|| preserving_routine(h::h_ob_unlock_slow as usize))
+}
+
+/// A routine calling `target(rdi)` that preserves every other general register and
+/// xmm0-15 and aligns the stack itself.
+fn preserving_routine(target: usize) -> Option<usize> {
+    {
+        let mut a = Asm::new();
+        a.push(Rbp);
+        a.mov_rr(Rbp, Rsp);
+        for r in [Rax, Rcx, Rdx, Rsi, R8, R9, R10, R11] {
+            a.push(r);
+        }
+        a.and_ri(Rsp, -16);
+        a.sub_ri(Rsp, 128);
+        for k in 0..16u8 {
+            a.movsd_store(M(Rsp, 8 * k as i32), X(k));
+        }
+        a.call_abs(target);
+        for k in 0..16u8 {
+            a.movsd_load(X(k), M(Rsp, 8 * k as i32));
+        }
+        a.mov_rr(Rsp, Rbp);
+        a.sub_ri(Rsp, 64);
+        for r in [R11, R10, R9, R8, Rsi, Rdx, Rcx, Rax] {
+            a.pop(r);
+        }
+        a.pop(Rbp);
+        a.ret();
+        a.resolve().ok()?;
+        crate::interp::jit::mem::install(&a.buf, |_, _| {})
+    }
+}
+
+/// Out-of-line part of an inline incref when the object in `r` (not r11) is owned by
+/// another thread: a sharded object's reference goes to the thread's delta table
+/// (through `incref_sharded_routine`), any other object's to its shared field.
+/// Clobbers r11 only; continues at `done`.
+pub(crate) fn emit_nonowner_incref(a: &mut Asm, r: R, done: Label) {
+    const OB_FLAGS: i32 = offset_of!(PyObject, ob_flags) as i32;
+    match incref_sharded_routine() {
+        Some(rt) => {
+            let sh = a.label();
+            let call = a.label();
+            a.load8(R11, M(r, OB_FLAGS));
+            a.test_ri(R11, crate::sharded::SHARDED as i32);
+            a.jcc(Cc::NE, sh);
+            a.lock_add_mi(M(r, OB_REF_SHARED), 1 << REF_SHARED_SHIFT);
+            a.jmp(done);
+            a.bind(sh);
+            if let Some(l) = crate::sharded::jit_layout() {
+                // inline `sharded::add(r, 1)` (r15 = thread pointer): look the object
+                // up in its bucket, else take a slot whose delta is zero, else call
+                a.cmp8_mi(M(R15, l.ready), 0);
+                a.jcc(Cc::E, call);
+                a.mov_rr(R11, r);
+                a.shr_ri(R11, 4);
+                a.imul_rri(R11, R11, l.mul);
+                a.shr_ri(R11, l.shift);
+                a.and_ri(R11, l.bucket_mask);
+                a.shl_ri(R11, l.row_shift);
+                a.lea_idx(R11, R15, R11, 1, l.keys);
+                let found: Vec<Label> = (0..l.ways).map(|_| a.label()).collect();
+                let free: Vec<Label> = (0..l.ways).map(|_| a.label()).collect();
+                for w in 0..l.ways {
+                    a.cmp_rm(r, M(R11, 8 * w as i32));
+                    a.jcc(Cc::E, found[w]);
+                }
+                for w in 0..l.ways {
+                    a.cmp_mi(M(R11, l.vals_delta + 8 * w as i32), 0);
+                    a.jcc(Cc::E, free[w]);
+                }
+                a.jmp(call);
+                for w in 0..l.ways {
+                    a.bind(found[w]);
+                    a.add_mi(M(R11, l.vals_delta + 8 * w as i32), 1);
+                    a.jmp(done);
+                    a.bind(free[w]);
+                    a.store(M(R11, 8 * w as i32), r);
+                    a.store_i(M(R11, l.vals_delta + 8 * w as i32), 1);
+                    a.jmp(done);
+                }
+            }
+            a.bind(call);
+            a.push(Rdi);
+            if r != Rdi {
+                a.mov_rr(Rdi, r);
+            }
+            a.mov_ri(R11, rt as i64);
+            a.call_r(R11);
+            a.pop(Rdi);
+            a.jmp(done);
+        }
+        None => {
+            a.lock_add_mi(M(r, OB_REF_SHARED), 1 << REF_SHARED_SHIFT);
+            a.jmp(done);
+        }
+    }
 }

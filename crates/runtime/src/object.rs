@@ -85,9 +85,31 @@ pub unsafe fn incref(op: *mut PyObject) {
         if o.ob_tid.load(Relaxed) == thread_id() {
             o.ob_ref_local.store(new_local, Relaxed);
         } else {
-            o.ob_ref_shared.fetch_add(1 << REF_SHARED_SHIFT, Relaxed);
+            incref_nonowner(op);
         }
     }
+}
+
+/// Incref by a thread that does not own `op` (and `op` is not immortal).
+#[inline(always)]
+pub unsafe fn incref_nonowner(op: *mut PyObject) {
+    unsafe {
+        if crate::scalestats::on() {
+            crate::scalestats::note_nonowner(op, true);
+        }
+        if crate::sharded::is_sharded(&*op) {
+            crate::sharded::add(op, 1);
+        } else {
+            (*op).ob_ref_shared.fetch_add(1 << REF_SHARED_SHIFT, Relaxed);
+        }
+    }
+}
+
+/// (scale1) Is the caller's reference the only one, held by this thread (owner, local
+/// count 1, nothing shared)? Then no other thread can reach the object.
+#[inline(always)]
+pub fn exclusively_owned(o: &PyObject) -> bool {
+    o.ob_tid.load(Relaxed) == thread_id() && o.ob_ref_local.load(Relaxed) == 1 && o.ob_ref_shared.load(Relaxed) == 0
 }
 
 #[inline(always)]
@@ -157,6 +179,12 @@ pub unsafe fn merge_zero_local_refcount(op: *mut PyObject) {
 pub unsafe fn decref_shared(op: *mut PyObject) {
     unsafe {
         let o = &*op;
+        if crate::scalestats::on() {
+            crate::scalestats::note_nonowner(op, false);
+        }
+        if crate::sharded::note_decref(op) {
+            return;
+        }
         let mut cur = o.ob_ref_shared.load(Relaxed);
         loop {
             let flags = cur & REF_SHARED_FLAG_MASK;
@@ -520,6 +548,7 @@ pub unsafe fn assign_type_id(tp: *mut PyTypeObject) {
         g.types[id] = tp as usize;
         (*tp.cast::<PyObject>()).ob_ref_shared.fetch_add(TYPE_BIAS << REF_SHARED_SHIFT, Relaxed);
         (*(tp as *mut crate::ffi::PyHeapTypeObject)).unique_id = id as isize;
+        crate::sharded::mark_type(tp as *mut PyObject);
     }
 }
 
@@ -574,8 +603,10 @@ pub unsafe fn has_type_id(op: *mut PyObject) -> bool {
 /// Py_REFCNT): without the per-thread-counting bias of a type.
 pub fn visible_refcnt(o: &PyObject) -> isize {
     let n = o.refcnt();
-    if !o.is_immortal() && unsafe { has_type_id(o.as_ptr()) } {
-        n - TYPE_BIAS
+    if !o.is_immortal() && (crate::sharded::is_sharded(o) || unsafe { has_type_id(o.as_ptr()) }) {
+        // (sharded counting, sharded.rs: the other threads' pending deltas are not
+        // seen here, the calling thread's are)
+        n - TYPE_BIAS + crate::sharded::own_delta(o.as_ptr())
     } else {
         n
     }
@@ -597,6 +628,9 @@ pub unsafe fn release_type_id(tp: *mut PyTypeObject, drop_bias: bool) {
                 g.free_ids.push(id);
             }
             (*(tp as *mut crate::ffi::PyHeapTypeObject)).unique_id = 0;
+            // (sharded.rs) no table may keep a delta for an object counted plainly
+            crate::sharded::flush_own_entry(tp as *mut PyObject);
+            crate::sharded::unmark_type(tp as *mut PyObject);
         }
         if drop_bias {
             // fold the owner's local count into the shared field first so that removing
