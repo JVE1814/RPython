@@ -2012,7 +2012,12 @@ pub fn handle_eval_breaker(ts: &ThreadState) -> PyResult<()> {
         crate::threads::process_merge_queue(ts);
     }
     if eb & crate::threads::EVAL_SAFEPOINT != 0 {
-        crate::gc::safepoint_poll(ts);
+        crate::gc::safepoint_poll_eval(ts);
+    }
+    // (scale3) garbage a collection handed to this thread (possibly while it was
+    // parked just now)
+    if ts.c.eval_breaker.load(std::sync::atomic::Ordering::Acquire) & crate::threads::EVAL_GC_CLEAR != 0 {
+        crate::gc::clear_handed(ts);
     }
     if eb & crate::threads::EVAL_GC != 0 {
         crate::gc::maybe_collect(ts);
