@@ -751,20 +751,24 @@ pub unsafe extern "C" fn PyUnstable_DumpTracebackThreads(fd: c_int, _interp: *mu
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_Exc_PrepReraiseStar(orig: *mut PyObject, excs: *mut PyObject) -> *mut PyObject {
     unsafe {
-        // keep the raised exceptions that are not the original's leaves
-        let items = crate::types::list::list_to_vec(&*excs);
-        let raised: Vec<PyRef> = items.into_iter().filter(|e| !none::is_none(e)).collect();
-        if raised.is_empty() {
-            return none::none_ref().into_raw();
-        }
-        if raised.len() == 1 {
-            return raised[0].clone().into_raw();
-        }
-        let _ = orig;
         ret((|| -> PyResult {
-            let b = crate::builtins::builtins_module();
-            let eg = ab::getattr_str(&b, "ExceptionGroup")?;
-            ab::call(&eg, &[&pystr::new_str(""), &crate::types::list::new_list(raised)])
+            let is_exc = |o: &PyObject| crate::types::typeobject::is_subtype(o.type_ptr(), crate::types::exceptions::BaseException());
+            if orig.is_null() || !is_exc(&*orig) {
+                return Err(type_error(&format!("orig must be an exception, not {}", if orig.is_null() { "NULL".into() } else { tname(&*orig) })));
+            }
+            if excs.is_null() || !crate::types::list::is_list(&*excs) {
+                return Err(type_error(&format!("excs must be a list, not {}", if excs.is_null() { "NULL".into() } else { tname(&*excs) })));
+            }
+            for (i, e) in crate::types::list::list_to_vec(&*excs).iter().enumerate() {
+                if !none::is_none(e) && !is_exc(e) {
+                    return Err(type_error(&format!("item {} of excs is not an exception", i)));
+                }
+            }
+            // the original must have been raised (it carries a traceback)
+            if none::is_none(&*ab::getattr_str(&*orig, "__traceback__")?) {
+                return Err(value_error("orig must be a raised exception"));
+            }
+            crate::types::exceptiongroup::prep_reraise_star(&*orig, &*excs)
         })())
     }
 }

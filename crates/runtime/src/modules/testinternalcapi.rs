@@ -287,6 +287,27 @@ fn module_get_gc_hooks(_m: &PyObject, o: &PyObject) -> PyResult {
     Ok(tuple::new_tuple(vec![int::new_int_usize(t), int::new_int_usize(c), int::new_int_usize(f)]))
 }
 
+/// get_configs(): {"global_config": {legacy global variable: value}}. (capi2)
+fn get_configs(_m: &PyObject) -> PyResult {
+    let g = dict::new_dict();
+    for (k, v) in crate::capi::config::legacy_globals() {
+        dict::set_item_str(&g, k, &int::new_int(v as i64))?;
+    }
+    let out = dict::new_dict();
+    dict::set_item_str(&out, "global_config", &g)?;
+    Ok(out)
+}
+
+/// _pyerr_setkeyerror(arg): raise KeyError(arg) (one argument, never unpacked), replacing a
+/// pending exception. (capi2)
+fn pyerr_setkeyerror(_m: &PyObject, arg: &PyObject) -> PyResult {
+    let _ = memory_error();
+    clear_exc();
+    let e = ab::call(crate::types::typeobject::type_obj(crate::types::exceptions::KeyError()), &[arg])?;
+    set_exc(e);
+    Err(PyErr)
+}
+
 pub fn init() -> PyResult {
     let m = crate::types::module::new_module("_testinternalcapi")?;
     let d = crate::types::module::module_dict(&m);
@@ -295,6 +316,8 @@ pub fn init() -> PyResult {
         crate::mdefs![
             ("has_inline_values", O, has_inline_values),
             ("module_get_gc_hooks", O, module_get_gc_hooks),
+            ("get_configs", NOARGS, get_configs),
+            ("_pyerr_setkeyerror", O, pyerr_setkeyerror),
             ("pending_threadfunc", FASTKW, pending_threadfunc),
             ("tuple_from_pair", FAST, tuple_from_pair),
             ("tuple_from_pair_steal", FAST, tuple_from_pair),

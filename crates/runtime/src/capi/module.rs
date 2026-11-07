@@ -183,6 +183,11 @@ pub unsafe extern "C" fn PyModule_GetToken(m: *mut PyObject, result: *mut *mut c
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyModule_GetToken_DuringGC(m: *mut PyObject, result: *mut *mut c_void) -> c_int {
     unsafe {
+        // no exception can be raised during GC: a non-module only gives -1
+        if m.is_null() || !tmod::is_module(&*m) {
+            *result = std::ptr::null_mut();
+            return -1;
+        }
         *result = module_token(m as *mut PyModuleObject);
         0
     }

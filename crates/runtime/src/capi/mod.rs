@@ -15,6 +15,7 @@ pub mod capsule;
 pub mod ceval;
 pub mod codecs;
 pub mod compat;
+pub mod config;
 pub mod containers;
 pub mod data;
 pub mod dict;

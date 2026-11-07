@@ -818,7 +818,7 @@ fn thread_frames_and_excs(want_exc: bool) -> PyResult {
     Ok(d)
 }
 fn sys_get_cpu_count_config(_m: &PyObject) -> PyResult {
-    Ok(int::new_int(config().cpu_count as i64))
+    Ok(int::new_int(crate::capi::config::cpu_count_config() as i64))
 }
 
 fn sys_current_frames(_m: &PyObject) -> PyResult {
@@ -1274,6 +1274,26 @@ fn thread_lib_version() -> PyRef {
     none::none_ref()
 }
 
+const FLAG_FIELDS: [&str; 22] = [
+    "debug", "inspect", "interactive", "optimize", "dont_write_bytecode", "no_user_site", "no_site",
+    "ignore_environment", "verbose", "bytes_warning", "quiet", "hash_randomization", "isolated", "dev_mode",
+    "utf8_mode", "warn_default_encoding", "safe_path", "int_max_str_digits", "gil", "thread_inherit_context",
+    "context_aware_warnings", "lazy_imports",
+];
+
+/// Install a new `sys.flags` equal to the current one except for `field` (PyConfig_Set). (capi2)
+pub fn replace_flag(field: &str, value: &PyObject) -> PyResult<()> {
+    let ix = FLAG_FIELDS.iter().position(|f| *f == field).ok_or_else(|| value_error(&format!("unknown sys.flags field {}", field)))?;
+    let tp = FLAGS_TYPE.load(Acquire);
+    if tp.is_null() {
+        return Err(system_error("sys.flags not initialised"));
+    }
+    let cur = crate::modules::sys::get_sys_attr("flags").ok_or_else(|| system_error("lost sys.flags"))?;
+    let mut vals: Vec<PyRef> = (0..FLAG_FIELDS.len()).map(|i| ss::get_field(&cur, i)).collect();
+    vals[ix] = value.to_ref();
+    crate::modules::sys::set_sys_attr("flags", &ss::new_instance(tp, vals))
+}
+
 /// Build `sys.flags` from the configuration.
 pub fn make_flags() -> PyResult {
     let c = config();
@@ -1281,12 +1301,7 @@ pub fn make_flags() -> PyResult {
     if tp.is_null() {
         tp = ss::make_type(
             "sys.flags",
-            &[
-                "debug", "inspect", "interactive", "optimize", "dont_write_bytecode", "no_user_site", "no_site",
-                "ignore_environment", "verbose", "bytes_warning", "quiet", "hash_randomization", "isolated", "dev_mode",
-                "utf8_mode", "warn_default_encoding", "safe_path", "int_max_str_digits", "gil", "thread_inherit_context",
-                "context_aware_warnings", "lazy_imports",
-            ],
+            &FLAG_FIELDS,
             18,
             false,
         )?;
@@ -1466,6 +1481,7 @@ pub fn populate(d: &PyObject) -> PyResult<()> {
         &*crate::types::set::new_frozenset_from_vec(STDLIB_MODULE_NAMES.iter().map(|n| s(n)).collect())?,
     )?;
     set("flags", &*make_flags()?)?;
+    crate::capi::config::init_legacy_globals();
     // float_info
     let fi = ss::make_type(
         "sys.float_info",
