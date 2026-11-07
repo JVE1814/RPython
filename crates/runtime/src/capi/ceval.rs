@@ -444,7 +444,11 @@ pub unsafe extern "C" fn PyEval_GetFrameLocals() -> *mut PyObject {
         match current_frame() {
             Some(f) => {
                 let fo = crate::interp::eval::frame_object(f);
-                ret(ab::getattr_str(&*fo, "f_locals"))
+                // PEP 667: a snapshot dict for optimized (function) frames, the real
+                // namespace for module and class frames
+                ret(ab::getattr_str(&*fo, "f_locals").and_then(|l| {
+                    if crate::types::dict::is_dict(&l) { Ok(l) } else { ab::call(crate::types::typeobject::type_obj(crate::types::dict::dict_type()), &[&l]) }
+                }))
             }
             None => std::ptr::null_mut(),
         }
@@ -687,4 +691,10 @@ pub unsafe extern "C" fn PyCompile_OpcodeStackEffect(_opcode: c_int, _oparg: c_i
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyCompile_OpcodeStackEffectWithJump(opcode: c_int, oparg: c_int, _jump: c_int) -> c_int {
     unsafe { PyCompile_OpcodeStackEffect(opcode, oparg) }
+}
+
+/// Is `o` a trace function installed from C (PyEval_SetTrace)? Such functions receive the
+/// events of every frame, including frames that were already running when it was set.
+pub fn is_ctracer(o: *mut PyObject) -> bool {
+    !o.is_null() && unsafe { (*o).type_ptr() } == ctracer_type()
 }

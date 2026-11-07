@@ -224,8 +224,13 @@ pub fn new_thread_state() -> *mut ThreadState {
         (*ts).c.exc_info = &mut (*ts).c.exc_state;
         let n = {
             let mut all = ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner());
-            if !all.is_empty() {
-                MULTI_THREADED.store(1, SeqCst);
+            // (jit6) the flag flipped here, not by a parent before starting the
+            // thread (_thread, PyThread_start_new_thread): the other threads may be
+            // inside a single-threaded fast path right now; the first attach of a
+            // thread state handshakes with them before running Python code
+            // (MT_HANDSHAKE, capi/pystate.rs `attach`)
+            if !all.is_empty() && MULTI_THREADED.swap(1, SeqCst) == 0 {
+                MT_HANDSHAKE.store(true, SeqCst);
             }
             all.push(ts as usize);
             all.len()
@@ -242,6 +247,11 @@ pub(crate) static FREE_STATES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// only taken while this is 0: with a single thread no writer can race them.
 /// (A u64 so JIT code can test it with one qword compare.)
 pub static MULTI_THREADED: AtomicUsize = AtomicUsize::new(0);
+/// MULTI_THREADED was set by a thread registering itself (e.g. a foreign thread in
+/// PyGILState_Ensure) rather than before the second thread started: the next thread
+/// to attach waits until every other thread has passed a safepoint (single-threaded
+/// fast paths never span one), so none of them still relies on the old value.
+pub static MT_HANDSHAKE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[inline(always)]
 pub fn multi_threaded() -> bool {

@@ -14,9 +14,24 @@ use crate::types::{dict, int, list, none, str as pystr, tuple};
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
-static FILTERS: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
-static ONCEREGISTRY: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
-static DEFAULTACTION: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
+/// (interp1) filters, onceregistry and defaultaction exist once per interpreter.
+struct WarnState {
+    filters: AtomicPtr<PyObject>,
+    onceregistry: AtomicPtr<PyObject>,
+    defaultaction: AtomicPtr<PyObject>,
+}
+impl Drop for WarnState {
+    fn drop(&mut self) {
+        for p in [&self.filters, &self.onceregistry, &self.defaultaction] {
+            unsafe { crate::object::xdecref(p.swap(std::ptr::null_mut(), Ordering::AcqRel)) };
+        }
+    }
+}
+static WSTATE: crate::subinterp::PerInterp<WarnState> = crate::subinterp::PerInterp::new(|| WarnState {
+    filters: AtomicPtr::new(std::ptr::null_mut()),
+    onceregistry: AtomicPtr::new(std::ptr::null_mut()),
+    defaultaction: AtomicPtr::new(std::ptr::null_mut()),
+});
 static FILTERS_VERSION: AtomicU64 = AtomicU64::new(1);
 
 // ---------------------------------------------------------------- the lock
@@ -79,7 +94,7 @@ fn state_obj(p: &AtomicPtr<PyObject>) -> PyRef {
 }
 
 fn init_state() {
-    if !FILTERS.load(Ordering::Acquire).is_null() {
+    if !WSTATE.get().filters.load(Ordering::Acquire).is_null() {
         return;
     }
     let filters = list::new_list_empty();
@@ -99,9 +114,9 @@ fn init_state() {
     list::append(&filters, mk("ignore", crate::exc_type!(PendingDeprecationWarning), None));
     list::append(&filters, mk("ignore", crate::exc_type!(ImportWarning), None));
     list::append(&filters, mk("ignore", crate::exc_type!(ResourceWarning), None));
-    FILTERS.store(filters.into_raw(), Ordering::Release);
-    ONCEREGISTRY.store(dict::new_dict().into_raw(), Ordering::Release);
-    DEFAULTACTION.store(pystr::new_str("default").into_raw(), Ordering::Release);
+    WSTATE.get().filters.store(filters.into_raw(), Ordering::Release);
+    WSTATE.get().onceregistry.store(dict::new_dict().into_raw(), Ordering::Release);
+    WSTATE.get().defaultaction.store(pystr::new_str("default").into_raw(), Ordering::Release);
 }
 
 fn warnings_module(try_import: bool) -> Option<PyRef> {
@@ -144,13 +159,13 @@ fn get_filters() -> PyResult {
             return Ok(f);
         }
     }
-    Ok(state_obj(&FILTERS))
+    Ok(state_obj(&WSTATE.get().filters))
 }
 
 fn get_onceregistry() -> PyResult {
     let r = match warnings_attr("onceregistry", false)? {
         Some(r) => r,
-        None => state_obj(&ONCEREGISTRY),
+        None => state_obj(&WSTATE.get().onceregistry),
     };
     if !dict::is_dict(&r) {
         raise!(TypeError, "warnings.onceregistry must be a dict, not '{}'", crate::types::typeobject::tname(&r));
@@ -161,7 +176,7 @@ fn get_onceregistry() -> PyResult {
 fn get_default_action() -> PyResult {
     let r = match warnings_attr("defaultaction", false)? {
         Some(r) => r,
-        None => state_obj(&DEFAULTACTION),
+        None => state_obj(&WSTATE.get().defaultaction),
     };
     if !pystr::is_str(&r) {
         raise!(TypeError, "warnings.defaultaction must be a string, not '{}'", crate::types::typeobject::tname(&r));
@@ -207,11 +222,25 @@ pub fn module_names_of_path(filename: &str) -> Vec<String> {
 
 /// A filter's module pattern matches the module name, or (for a warning
 /// located in a file) one of the dotted names the file path stands for.
+thread_local! {
+    /// Set while a warning with a caller-chosen module name (compile(..., module=...)) is
+    /// filtered: only that name is matched, not the names derived from the file path.
+    static EXACT_MODULE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// warn_explicit() for a warning whose module name the caller chose explicitly.
+pub fn warn_explicit_exact_module(category: *mut PyTypeObject, msg: &PyObject, filename: &PyObject, lineno: i64, module: &PyObject) -> PyResult<()> {
+    let prev = EXACT_MODULE.with(|c| c.replace(true));
+    let r = warn_explicit(category, msg, filename, lineno, Some(module), None);
+    EXACT_MODULE.with(|c| c.set(prev));
+    r
+}
+
 fn module_matches(pattern: &PyObject, module: &PyObject, filename: &PyObject) -> PyResult<bool> {
     if check_matched(pattern, module)? {
         return Ok(true);
     }
-    if pattern.is(none::none()) || !pystr::is_str(filename) {
+    if pattern.is(none::none()) || !pystr::is_str(filename) || EXACT_MODULE.with(|c| c.get()) {
         return Ok(false);
     }
     for cand in module_names_of_path(&pystr::to_string_lossy(filename)) {
@@ -446,6 +475,10 @@ fn warn_explicit_impl(
             raise!(TypeError, "'registry' must be a dict or None");
         }
     }
+    // the dotted names a file path stands for are only tried for a warning
+    // whose module is unknown (derived from its file name); a known module
+    // name (the caller's __name__, or one passed in) is matched as it is
+    let module_known = module.is_some_and(|m| !m.is(none::none()));
     let module: PyRef = match module {
         Some(m) if !m.is(none::none()) => m.to_ref(),
         _ => normalize_module(filename)?,
@@ -470,7 +503,12 @@ fn warn_explicit_impl(
         if already_warned(registry, &key, false)? {
             return Ok(());
         }
-        let (action, item) = get_filter(&category, &text, lineno, &module, filename)?;
+        let prev_exact = if module_known { Some(EXACT_MODULE.with(|c| c.replace(true))) } else { None };
+        let found = get_filter(&category, &text, lineno, &module, filename);
+        if let Some(p) = prev_exact {
+            EXACT_MODULE.with(|c| c.set(p));
+        }
+        let (action, item) = found?;
         let a = pystr::to_string_lossy(&action);
         match a.as_str() {
             "error" => {
@@ -698,9 +736,9 @@ pub fn init_module() -> PyResult {
         ("_release_lock", NOARGS, py_release_lock),
     ];
     crate::builtins::add_methods_to_dict(&d, methods, Some(&m))?;
-    dict::set_item_str(&d, "filters", &state_obj(&FILTERS))?;
-    dict::set_item_str(&d, "_onceregistry", &state_obj(&ONCEREGISTRY))?;
-    dict::set_item_str(&d, "_defaultaction", &state_obj(&DEFAULTACTION))?;
+    dict::set_item_str(&d, "filters", &state_obj(&WSTATE.get().filters))?;
+    dict::set_item_str(&d, "_onceregistry", &state_obj(&WSTATE.get().onceregistry))?;
+    dict::set_item_str(&d, "_defaultaction", &state_obj(&WSTATE.get().defaultaction))?;
     // A ContextVar holding the warnings context (used when
     // sys.flags.context_aware_warnings is set), if contextvars is available.
     match crate::import::import_absolute("_contextvars") {
@@ -727,4 +765,20 @@ pub fn warn_ex(category: *mut PyTypeObject, msg: &PyObject, stacklevel: i64, sou
 pub fn warn_explicit(category: *mut PyTypeObject, msg: &PyObject, filename: &PyObject, lineno: i64, module: Option<&PyObject>, registry: Option<&PyObject>) -> PyResult<()> {
     let cat = crate::types::typeobject::type_ref(category);
     warn_explicit_impl(Some(&cat), msg, filename, lineno, module, registry, None, None)
+}
+
+/// In a forked child only the forking thread survives: a warnings lock held by any other
+/// thread at fork time is released (its owner no longer exists).
+pub fn after_fork_child() {
+    let me = crate::object::thread_id();
+    let mut g = match LOCK.state.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        // the inner mutex is only held for a few instructions; a fork inside that window
+        // leaves the lock as it is
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    if g.1 != 0 && g.0 != me {
+        *g = (0, 0);
+    }
 }

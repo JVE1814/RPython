@@ -195,7 +195,7 @@ fn mon_register_callback(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     let mut rel = Released(Vec::new());
     let old = {
         let mut m = MON.lock().unwrap();
-        check_in_use(&m, tool)?;
+        // registering (or clearing) a callback does not require the tool to be in use
         let nv = if args[2].is(none::none()) { 0 } else { args[2].to_ref().into_raw() as usize };
         let evs: Vec<usize> = if ev == 18 { vec![8, 9] } else { vec![ev] };
         let mut old = 0usize;
@@ -313,4 +313,173 @@ pub fn install_monitoring(d: &PyObject) -> PyResult<()> {
     }
     dict::set_item_str(d, "monitoring", &m)?;
     Ok(())
+}
+
+// ------------------------------------------------------------------ PEP 669 C API
+//
+// C code that implements "code-like" objects keeps one `PyMonitoringState` per event
+// location. EnterScope fills in which tools listen (globally) for each location's event;
+// the Fire functions call those tools' callbacks. A callback returning DISABLE clears its
+// tool from that location's state.
+
+#[repr(C)]
+pub struct CMonitoringState {
+    active: u8,
+    opaque: u8,
+}
+
+fn c_listeners(ev: usize) -> u8 {
+    let bit = if ev == st::C_RETURN || ev == st::C_RAISE { st::CALL } else { ev };
+    let m = MON.lock().unwrap();
+    let mut tools = 0u8;
+    for t in 0..NTOOLS {
+        if m.global[t] & (1 << bit) != 0 && m.callbacks[t][ev] != 0 {
+            tools |= 1 << t;
+        }
+    }
+    tools
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyMonitoring_EnterScope(
+    states: *mut CMonitoringState,
+    version: *mut u64,
+    event_types: *const u8,
+    length: crate::ffi::Py_ssize_t,
+) -> std::ffi::c_int {
+    unsafe {
+        for i in 0..length.max(0) as usize {
+            let ev = *event_types.add(i) as usize;
+            let s = &mut *states.add(i);
+            s.active = if ev < EVENT_NAMES.len() { c_listeners(ev) } else { 0 };
+            s.opaque = 0;
+        }
+        if !version.is_null() {
+            *version = 1;
+        }
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn PyMonitoring_ExitScope() -> std::ffi::c_int {
+    0
+}
+
+/// Events whose C-level firing reports the currently raised exception.
+fn c_needs_exception(ev: usize) -> bool {
+    matches!(ev, 11 | 12 | 13 | 14 | 15 | 17)
+}
+
+unsafe fn c_fire(state: *mut CMonitoringState, codelike: *mut PyObject, offset: i32, ev: usize, extra: &[*mut PyObject]) -> std::ffi::c_int {
+    let ts = crate::threads::current();
+    if ts.tracing_depth.get() > 0 || state.is_null() {
+        return 0;
+    }
+    let st_ref = unsafe { &mut *state };
+    let raised = if c_needs_exception(ev) {
+        match take_exc() {
+            Some(e) => Some(e),
+            None => {
+                let _ = value_error(&format!("Firing event {} with no exception set", ev));
+                return -1;
+            }
+        }
+    } else {
+        None
+    };
+    let code = unsafe { PyRef::from_borrowed(codelike) };
+    let off = int::new_int(offset as i64);
+    let mut args: Vec<&PyObject> = vec![&code, &off];
+    let extras: Vec<PyRef> = extra.iter().map(|&p| if p.is_null() { none::none_ref() } else { unsafe { PyRef::from_borrowed(p) } }).collect();
+    for e in &extras {
+        args.push(e);
+    }
+    if let Some(e) = &raised {
+        args.push(e);
+    }
+    let result = (|| -> PyResult<()> {
+        for t in 0..NTOOLS {
+            if st_ref.active & (1 << t) == 0 {
+                continue;
+            }
+            let cb = {
+                let m = MON.lock().unwrap();
+                let p = m.callbacks[t][ev];
+                if p == 0 { None } else { Some(unsafe { PyRef::from_borrowed(p as *mut PyObject) }) }
+            };
+            let Some(cb) = cb else { continue };
+            ts.tracing_depth.set(ts.tracing_depth.get() + 1);
+            let r = ab::call(&cb, &args);
+            ts.tracing_depth.set(ts.tracing_depth.get() - 1);
+            let r = r?;
+            let dis = st::DISABLE_OBJ.load(Acquire);
+            if !dis.is_null() && r.as_ptr() == dis {
+                if (1u32 << ev) & st::DISABLE_MASK == 0 || c_needs_exception(ev) {
+                    raise!(ValueError, "Cannot disable {} events. Callback removed.", EVENT_NAMES[ev]);
+                }
+                st_ref.active &= !(1 << t);
+            }
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            if let Some(e) = raised {
+                set_exc(e);
+            }
+            0
+        }
+        Err(_) => -1,
+    }
+}
+
+macro_rules! c_fire_fns {
+    ($( $name:ident ( $($a:ident),* ) => $ev:expr ; )*) => {
+        $(
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(state: *mut CMonitoringState, codelike: *mut PyObject, offset: i32 $(, $a: *mut PyObject)*) -> std::ffi::c_int {
+                unsafe { c_fire(state, codelike, offset, $ev, &[$($a),*]) }
+            }
+        )*
+    };
+}
+c_fire_fns! {
+    _PyMonitoring_FirePyStartEvent() => 0;
+    _PyMonitoring_FirePyResumeEvent() => 1;
+    _PyMonitoring_FirePyReturnEvent(retval) => 2;
+    _PyMonitoring_FirePyYieldEvent(retval) => 3;
+    _PyMonitoring_FireCallEvent(callable, arg0) => 4;
+    _PyMonitoring_FireJumpEvent(target) => 7;
+    _PyMonitoring_FireBranchLeftEvent(target) => 8;
+    _PyMonitoring_FireBranchRightEvent(target) => 9;
+    _PyMonitoring_FireBranchEvent(target) => 18;
+    _PyMonitoring_FireCReturnEvent(retval) => 16;
+    _PyMonitoring_FirePyThrowEvent() => 14;
+    _PyMonitoring_FireRaiseEvent() => 11;
+    _PyMonitoring_FireReraiseEvent() => 15;
+    _PyMonitoring_FireExceptionHandledEvent() => 12;
+    _PyMonitoring_FireCRaiseEvent() => 17;
+    _PyMonitoring_FirePyUnwindEvent() => 13;
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _PyMonitoring_FireLineEvent(state: *mut CMonitoringState, codelike: *mut PyObject, offset: i32, lineno: i32) -> std::ffi::c_int {
+    let l = int::new_int(lineno as i64);
+    unsafe { c_fire(state, codelike, offset, st::LINE, &[l.as_ptr()]) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _PyMonitoring_FireStopIterationEvent(state: *mut CMonitoringState, codelike: *mut PyObject, offset: i32, value: *mut PyObject) -> std::ffi::c_int {
+    // callbacks receive an exception: a bare value is wrapped in StopIteration
+    let v = unsafe { PyRef::from_borrowed(value) };
+    let exc = if crate::types::exceptions::is_exception_instance(&v) {
+        v
+    } else {
+        match ab::call(crate::types::typeobject::type_obj(crate::types::exceptions::StopIteration()), &[&v]) {
+            Ok(e) => e,
+            Err(_) => return -1,
+        }
+    };
+    unsafe { c_fire(state, codelike, offset, st::STOP_ITERATION, &[exc.as_ptr()]) }
 }

@@ -1926,6 +1926,16 @@ pub fn decode_source_with(src: &[u8], hook: Option<DecodeHook>, filename: &str) 
             Err(e) => {
                 let off = e.valid_up_to();
                 let (lineno, offset, text) = bad_byte_location(data, off);
+                // source is read line by line: a NUL byte on an earlier line is reported first
+                let bad_line_start = data[..off].iter().rposition(|&c| c == b'\n').map_or(0, |p| p + 1);
+                if let Some(p) = data[..bad_line_start].iter().position(|&c| c == 0) {
+                    let (nl, no, nt) = bad_byte_location(data, p);
+                    let mut err = SyntaxError::simple("source code cannot contain null bytes");
+                    err.lineno = nl;
+                    err.offset = no;
+                    err.text = Some(nt);
+                    return Err(err);
+                }
                 let mut err = if det.from_cookie || det.bom {
                     let reason = if e.error_len().is_none() { "unexpected end of data" } else if data[off] >= 0xC2 && data[off] <= 0xF4 { "invalid continuation byte" } else { "invalid start byte" };
                     SyntaxError::simple(format!("'utf-8' codec can't decode byte 0x{:02x} in position {}: {}", data[off], off, reason))

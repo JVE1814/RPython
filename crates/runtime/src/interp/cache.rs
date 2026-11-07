@@ -267,9 +267,16 @@ pub fn mc_store(tag: u32, name: &PyObject, value: Option<&PyObject>) {
 // ------------------------------------------------------------------ cache entries
 
 /// Kinds of cache entries (`Entry::kind`).
+/// (jit5) Bumped whenever a type is modified (version tags reset) or an object's
+/// __class__ is reassigned: compiled code that called into arbitrary code (generic
+/// attribute paths) compares it before/after and deoptimises when its type facts
+/// may have become stale.
+pub static TYPE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
 pub mod kind {
     pub const EMPTY: u32 = 0;
-    /// LoadGlobal: a = globals version, b = builtins version, c = value (borrowed)
+    /// LoadGlobal (jit5): a = globals keys_version, b = builtins keys_version (names
+    /// found in builtins only), c = entry index << 1 | found-in-builtins
     pub const GLOBAL: u32 = 1;
     /// LoadAttr/StoreAttr: attribute lives in the instance dict. a = type tag,
     /// b = entry-index hint in the dict; c = class attribute fallback (LoadAttr) or
@@ -533,6 +540,15 @@ pub struct CodeCaches {
     pub t2_prof: AtomicU8,
     /// invalidated tier-2 code, freed with the code object
     pub t2_retired: std::sync::Mutex<Vec<usize>>,
+    /// Generator expression prologue shape (interp::genexpr_prologue): 0 not yet
+    /// examined, 1 not the plain `iter(.0)` prologue, 2 + n: plain, with n free variables.
+    pub genexpr: AtomicU32,
+    /// (jit6) tier-1 "drain mode" code of a generator expression (YieldValue hands the
+    /// value to its consumer directly, jit/helpers.rs `h_drain`); 1 = cannot be built
+    pub drain: AtomicPtr<crate::interp::jit::Compiled>,
+    /// (jit6) tier-2 deoptimisations per resume pc ((pc, count)); recompilations use
+    /// generic paths instead of deoptimising guards at pcs that trapped
+    pub traps: std::sync::Mutex<Vec<(u32, u32)>>,
 }
 
 impl CodeCaches {
@@ -556,6 +572,9 @@ impl CodeCaches {
             t2_invalidations: AtomicU8::new(0),
             t2_prof: AtomicU8::new(1),
             t2_retired: std::sync::Mutex::new(Vec::new()),
+            genexpr: AtomicU32::new(0),
+            drain: AtomicPtr::new(std::ptr::null_mut()),
+            traps: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -600,6 +619,10 @@ impl Drop for CodeCaches {
         let j = *self.jit.get_mut();
         if !j.is_null() {
             crate::interp::jit::release_compiled(j);
+        }
+        let d = *self.drain.get_mut();
+        if !d.is_null() && d as usize != 1 {
+            crate::interp::jit::release_compiled(d);
         }
     }
 }

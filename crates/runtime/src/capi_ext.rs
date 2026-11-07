@@ -3,7 +3,8 @@
 //! `_imp` primitives used by importlib's ExtensionFileLoader.
 //!
 //! Suffixes (in priority order): `.cpython-315t-x86_64-linux-gnu.so` (version-specific
-//! free-threaded ABI), `.abi3t.so` (PEP 803 free-threaded stable ABI), `.so`.
+//! free-threaded ABI), `.abi3t-x86_64-linux-gnu.so` and `.abi3t.so` (PEP 803 free-threaded stable
+//! ABI; the GIL-only `.abi3` suffixes are not loadable here), `.so`.
 
 use crate::abstract_ as ab;
 use crate::capi;
@@ -16,7 +17,7 @@ use std::collections::HashMap;
 use std::ffi::{CString, c_void};
 use std::sync::Mutex;
 
-pub const EXTENSION_SUFFIXES: [&str; 3] = [".cpython-315t-x86_64-linux-gnu.so", ".abi3t.so", ".so"];
+pub const EXTENSION_SUFFIXES: [&str; 4] = [".cpython-315t-x86_64-linux-gnu.so", ".abi3t-x86_64-linux-gnu.so", ".abi3t.so", ".so"];
 
 pub fn find_extension(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
     for s in EXTENSION_SUFFIXES {
@@ -153,9 +154,13 @@ unsafe fn create_from_initfunc(
     spec: &PyObject,
 ) -> PyResult<(PyRef, Option<*mut PyModuleDef>)> {
     unsafe {
-        capi::import::push_package_context(name);
-        let r = f();
-        capi::import::pop_package_context();
+        // (interp1) in a subinterpreter the init function runs in the main one
+        let r = crate::subinterp::call_initfunc(name, || {
+            capi::import::push_package_context(name);
+            let r = f();
+            capi::import::pop_package_context();
+            r
+        })?;
         if r.is_null() {
             if !err_occurred() {
                 raise!(SystemError, "initialization of {} failed without raising an exception", name.rsplit('.').next().unwrap());
@@ -180,17 +185,64 @@ unsafe fn create_from_initfunc(
         let ro = PyRef::from_raw(r);
         if is_moduledef(&ro) {
             let def = ro.as_ptr() as *mut PyModuleDef;
+            // (interp1) Py_mod_multiple_interpreters decides where it may load
+            crate::subinterp::check_multiphase_extension(name, def)?;
             let m = from_c(capi::module::PyModule_FromDefAndSpec2(def, spec.as_ptr(), 1013))?;
             return Ok((m, Some(def)));
         }
         if !tmod::is_module(&ro) {
             raise!(SystemError, "initialization of {} did not return an extension module", name.rsplit('.').next().unwrap());
         }
+        // (interp1) single-phase modules cannot be isolated
+        crate::subinterp::check_singlephase_extension(name)?;
         Ok((ro, None))
     }
 }
 
 /// PEP 793: module from a PyModExport_* slot array.
+/// Whether a PySlot array (or an array nested in it through Py_slot_subslots)
+/// contains Py_mod_abi.
+unsafe fn has_mod_abi_slot(mut s: *const capi::typeobj::PySlot, depth: u32) -> bool {
+    const PY_MOD_ABI: u16 = 109;
+    const PY_SLOT_SUBSLOTS: u16 = 92;
+    unsafe {
+        while !s.is_null() && (*s).sl_id != 0 {
+            match (*s).sl_id {
+                PY_MOD_ABI => return true,
+                PY_SLOT_SUBSLOTS if depth < 8 => {
+                    if has_mod_abi_slot((*s).sl_ptr as *const capi::typeobj::PySlot, depth + 1) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+            s = s.add(1);
+        }
+    }
+    false
+}
+
+/// The value of the Py_mod_gil slot of a PySlot array, if present.
+unsafe fn mod_gil_slot(mut s: *const capi::typeobj::PySlot, depth: u32) -> Option<usize> {
+    const PY_MOD_GIL: u16 = 87;
+    const PY_SLOT_SUBSLOTS: u16 = 92;
+    unsafe {
+        while !s.is_null() && (*s).sl_id != 0 {
+            match (*s).sl_id {
+                PY_MOD_GIL => return Some((*s).sl_ptr as usize),
+                PY_SLOT_SUBSLOTS if depth < 8 => {
+                    if let Some(v) = mod_gil_slot((*s).sl_ptr as *const capi::typeobj::PySlot, depth + 1) {
+                        return Some(v);
+                    }
+                }
+                _ => {}
+            }
+            s = s.add(1);
+        }
+    }
+    None
+}
+
 unsafe fn create_from_export(
     name: &str,
     f: unsafe extern "C" fn() -> *const capi::typeobj::PySlot,
@@ -206,7 +258,15 @@ unsafe fn create_from_export(
             }
             return Err(PyErr);
         }
+        // an exported slot array must declare the ABI it was built for
+        if !has_mod_abi_slot(slots, 0) {
+            raise!(SystemError, "module export hook for {} did not provide a Py_mod_abi slot", name);
+        }
         let m = from_c(capi::module::PyModule_FromSlotsAndSpec(slots, spec.as_ptr()))?;
+        // (interp1) Py_mod_gil (absent: the module may need the GIL)
+        if mod_gil_slot(slots, 0) != Some(1) {
+            crate::subinterp::note_gil_used(name);
+        }
         let def = if tmod::is_module(&m) { tmod::m(&m).md_def } else { std::ptr::null_mut() };
         Ok((m, if def.is_null() { None } else { Some(def) }))
     }
@@ -301,9 +361,44 @@ pub fn load_extension(name: &str, path: &std::path::Path) -> PyResult {
     }
 }
 
+
+/// `_imp.create_dynamic`: create the module only. A multi-phase module is executed later by
+/// `exec_extension` and is not put into sys.modules (importlib does that); a single-phase
+/// module is complete once its init function returned and is registered right away.
+pub fn create_extension(name: &str, path: &std::path::Path, spec: &PyObject) -> PyResult {
+    let p = path.to_string_lossy().into_owned();
+    unsafe {
+        let (m, def) = create_dynamic_impl(name, &p, spec)?;
+        set_file_attrs(&m, &p, Some(spec));
+        match def {
+            Some(d) => PENDING_EXEC.lock().unwrap_or_else(|e| e.into_inner()).push((m.as_ptr() as usize, d as usize)),
+            None => {
+                let modules = crate::modules::sys::modules_dict();
+                dict::set_item_str(&modules, name, &m)?;
+            }
+        }
+        Ok(m)
+    }
+}
+
+/// `_imp.exec_dynamic`: run the exec slots of a module made by `create_extension`.
+pub fn exec_extension(m: &PyObject) -> PyResult<()> {
+    let def = {
+        let mut v = PENDING_EXEC.lock().unwrap_or_else(|e| e.into_inner());
+        let key = m.as_ptr() as usize;
+        v.iter().position(|&(k, _)| k == key).map(|i| v.remove(i).1)
+    };
+    let Some(d) = def else { return Ok(()) };
+    // the address may belong to a newer module if the original one died unexecuted
+    if !tmod::is_module(m) || tmod::m(m).md_def as usize != d {
+        return Ok(());
+    }
+    unsafe { exec_pending(m, d as *mut PyModuleDef) }
+}
+
 // ---------------------------------------------------------------- _imp
 
-fn imp_create_dynamic(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+pub fn imp_create_dynamic(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     if args.is_empty() || args.len() > 2 {
         raise!(TypeError, "create_dynamic expected 1 or 2 arguments, got {}", args.len());
     }
@@ -326,7 +421,7 @@ fn imp_create_dynamic(_m: &PyObject, args: &[&PyObject]) -> PyResult {
         Ok(m)
     }
 }
-fn imp_exec_dynamic(_m: &PyObject, module: &PyObject) -> PyResult {
+pub fn imp_exec_dynamic(_m: &PyObject, module: &PyObject) -> PyResult {
     let pending = {
         let mut g = PENDING_EXEC.lock().unwrap();
         let pos = g.iter().position(|&(m, _)| m == module.as_ptr() as usize);
@@ -406,7 +501,7 @@ pub fn init_imp_module() -> PyResult {
         Some(&m),
     )?;
     dict::set_item_str(&d, "check_hash_based_pycs", &pystr::new_str("never"))?;
-    dict::set_item_str(&d, "pyc_magic_number_token", &crate::types::int::new_int(3700 | (b'\r' as i64) << 16 | (b'\n' as i64) << 24))?;
+    dict::set_item_str(&d, "pyc_magic_number_token", &crate::types::int::new_int(crate::modules::_imp::MAGIC as i64))?;
     let _ = tuple::empty_tuple();
     Ok(m)
 }

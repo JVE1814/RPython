@@ -1,7 +1,9 @@
-//! `rpy-compiler`: symbol table analysis and bytecode generation (AST -> [`bytecode::CodeUnit`]).
+//! `rpy-compiler`: symbol table analysis and code generation: AST -> CPython 3.15 wordcode
+//! ([`wordcode::CodeObject`], the public code format, D24).
 //!
-//! Entry points: [`compile`], [`symtable`], [`optimize_ast`], [`dis::disassemble`].
-//! See NOTES.md for the bytecode shapes the VM must understand.
+//! Entry points: [`compile`], [`symtable`], [`optimize_ast`], [`wordcode::dis::disassemble`].
+//! [`bytecode`] holds the runtime's internal instruction format (`Op`, `encode`/`decode`,
+//! `ExceptionEntry`, `Location`), which the runtime translates wordcode into.
 
 pub mod bytecode;
 pub mod error;
@@ -10,10 +12,7 @@ pub mod error;
 
 pub use rpy_parser::ast;
 
-mod assemble;
-mod codegen;
 pub(crate) mod wc;
-pub mod dis;
 pub mod fold;
 pub mod symtable;
 pub mod unparse;
@@ -21,8 +20,6 @@ pub mod validate;
 pub mod wordcode;
 
 pub use error::{CompileError, ErrorKind, Warning, WarningCategory};
-
-use bytecode::CodeUnit;
 
 /// Compile mode (the `mode` argument of `compile()`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,25 +99,14 @@ impl CompileOptions {
     }
 }
 
-/// Result of a successful compilation.
-#[derive(Clone, Debug)]
-pub struct CompileOutput {
-    pub code: CodeUnit,
-    /// Compile-time warnings (deduplicated by location and message), in source order of
-    /// emission. The runtime emits them via the warnings module.
-    pub warnings: Vec<Warning>,
-    /// Future features in effect (CO_FUTURE_* bits), including inherited ones.
-    pub future_flags: u32,
-}
-
-/// Compile a module/expression AST to a code unit.
-pub fn compile(module: &ast::Mod, opts: &CompileOptions) -> Result<CompileOutput, CompileError> {
-    codegen::compile_module(module, opts)
+/// Compile a module/expression AST to a code object in the public CPython 3.15 format.
+pub fn compile(module: &ast::Mod, opts: &CompileOptions) -> Result<WordcodeOutput, CompileError> {
+    wc::compile_module(module, opts)
 }
 
 /// Build and analyse the symbol table (for the stdlib `symtable` module).
 pub fn symtable(module: &ast::Mod, opts: &CompileOptions) -> Result<symtable::SymbolTable, CompileError> {
-    let future = codegen::check_future(module, opts.flags)?;
+    let future = wc::check_future(module, opts.flags)?;
     let st = symtable::build(module, future | (opts.flags & cf::PYCF_ALLOW_TOP_LEVEL_AWAIT), opts.max_depth)?;
     Ok(st)
 }
@@ -138,8 +124,7 @@ pub fn validate_ast(module: &ast::Mod) -> Result<(), CompileError> {
     validate::validate_positions(module)
 }
 
-/// Compile to the public CPython 3.15 code format (D24). Transitional: the runtime still
-/// executes [`compile`]'s legacy output; see notes/bytecode.md.
+/// Same as [`compile`] (name kept for existing callers).
 pub fn compile_wordcode(module: &ast::Mod, opts: &CompileOptions) -> Result<wc::WordcodeOutput, CompileError> {
     wc::compile_module(module, opts)
 }

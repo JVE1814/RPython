@@ -632,19 +632,43 @@ unsafe fn count_new_impl(tp: *mut PyTypeObject, args: *mut PyObject, kw: *mut Py
 tpnew!(count_new, count_new_impl);
 
 fn count_next_impl(o: &PyObject) -> PyResult<Option<PyRef>> {
-    let s = rs::<Count>(o);
-    let cnt = s.cnt.clone().unwrap();
-    let step = s.step.clone().unwrap();
-    let next = if int::is_int_exact(&cnt) && int::is_int_exact(&step) && int::is_compact(&cnt) && int::is_compact(&step) {
-        match int::compact_value(&cnt).checked_add(int::compact_value(&step)) {
-            Some(v) => int::new_int(v),
-            None => ab::binary_op(&cnt, &step, NbSlot::Add)?,
+    use crate::types::dict::ob_lock;
+    // Concurrent next() calls on one count object must neither lose increments nor
+    // free a value another thread is still reading.  The fields are read (with a
+    // new reference) and replaced only under the object's lock; the sum is computed
+    // outside it (it may allocate or run Python code) and is published only if no
+    // other thread advanced the counter meanwhile, otherwise we start over.
+    loop {
+        let (cnt, step) = {
+            let _g = ob_lock(o);
+            let s = rs::<Count>(o);
+            (s.cnt.clone().unwrap(), s.step.clone().unwrap())
+        };
+        let next = if int::is_int_exact(&cnt) && int::is_int_exact(&step) && int::is_compact(&cnt) && int::is_compact(&step) {
+            match int::compact_value(&cnt).checked_add(int::compact_value(&step)) {
+                Some(v) => int::new_int(v),
+                None => ab::binary_op(&cnt, &step, NbSlot::Add)?,
+            }
+        } else {
+            ab::binary_op(&cnt, &step, NbSlot::Add)?
+        };
+        let old = {
+            let _g = ob_lock(o);
+            let s = rs::<Count>(o);
+            if !s.cnt.as_ref().is_some_and(|c| c.is(&cnt)) {
+                None
+            } else {
+                Some(s.cnt.replace(next))
+            }
+        };
+        match old {
+            Some(old) => {
+                drop(old);
+                return Ok(Some(cnt));
+            }
+            None => continue,
         }
-    } else {
-        ab::binary_op(&cnt, &step, NbSlot::Add)?
-    };
-    rs::<Count>(o).cnt = Some(next);
-    Ok(Some(cnt))
+    }
 }
 iternext!(count_next, count_next_impl);
 
@@ -652,8 +676,11 @@ unsafe extern "C" fn count_repr(o: *mut PyObject) -> *mut PyObject {
     unsafe {
         into_c((|| -> PyResult {
             let o = &*o;
-            let s = rs::<Count>(o);
-            let (cnt, step) = (s.cnt.clone().unwrap(), s.step.clone().unwrap());
+            let (cnt, step) = {
+                let _g = crate::types::dict::ob_lock(o);
+                let s = rs::<Count>(o);
+                (s.cnt.clone().unwrap(), s.step.clone().unwrap())
+            };
             let name = fc::repr_type_name(o);
             let cr = ab::repr_string(&cnt)?;
             let step_is_one = int::is_int(&step) && int::as_i64(&step) == Some(1);
@@ -1246,16 +1273,10 @@ unsafe fn ziplongest_new_impl(tp: *mut PyTypeObject, args: *mut PyObject, kw: *m
     }
     let a = unsafe { targs(args) };
     let mut its = Vec::with_capacity(a.len());
-    for (i, x) in a.iter().enumerate() {
+    for x in a.iter() {
         match ab::get_iter(x) {
             Ok(it) => its.push(Some(it)),
-            Err(e) => {
-                if exc_matches(crate::types::exceptions::TypeError()) {
-                    clear_exc();
-                    raise!(TypeError, "zip_longest argument #{} must support iteration", i + 1);
-                }
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         }
     }
     let n = its.len();
@@ -1475,6 +1496,31 @@ fn itertools_tee(_m: &PyObject, a: &[&PyObject]) -> PyResult {
 
 // ================================================================== module
 
+// __sizeof__ of the combinatoric iterators reports the footprint of the classic C layout
+// (header, object pointers, counters, plus one machine word per index entry), which
+// is what sys.getsizeof() callers budget with; our Rust state is laid out differently.
+fn classic_sizeof(o: &PyObject, base: *mut PyTypeObject, words: usize, ints: usize, nindex: usize) -> PyResult {
+    let w = std::mem::size_of::<isize>();
+    let raw = std::mem::size_of::<PyObject>() + words * w + ints * 4;
+    let fixed = raw.div_ceil(w) * w;
+    // instance dicts/weakref slots a subclass adds
+    let extra = unsafe { (o.ty().tp_basicsize - (*base).tp_basicsize).max(0) as usize };
+    Ok(int::new_int((fixed + extra + nindex * w) as i64))
+}
+fn product_sizeof(o: &PyObject) -> PyResult {
+    let n = rs::<Product>(o).indices.len();
+    classic_sizeof(o, product_type(), 3, 1, n)
+}
+fn combinations_sizeof(o: &PyObject) -> PyResult {
+    let n = rs::<Combinations>(o).r;
+    let base = if crate::types::typeobject::is_subtype(o.type_ptr(), cwr_type()) { cwr_type() } else { combinations_type() };
+    classic_sizeof(o, base, 4, 1, n)
+}
+fn permutations_sizeof(o: &PyObject) -> PyResult {
+    let s = rs::<Permutations>(o);
+    classic_sizeof(o, permutations_type(), 5, 1, s.pool.len() + s.r)
+}
+
 fn class_getitem_m() -> PyMethodDef {
     crate::methods::def("__class_getitem__", crate::methods::o(fc::class_getitem), METH_O | METH_CLASS, "See PEP 585")
 }
@@ -1543,6 +1589,10 @@ fn init_types() -> PyResult<()> {
             c"permutations(iterable, r=None)\n--\n\nReturn successive r-length permutations of elements in the iterable.\n\npermutations(range(3), 2) --> (0,1), (0,2), (1,0), (1,2), (2,0), (2,1)", true);
         setup::<Product>(product_type(), c"itertools.product", Some(product_new), Some(product_next),
             c"product(*iterables, repeat=1)\n--\n\nCartesian product of input iterables.  Equivalent to nested for-loops.\n\nFor example, product(A, B) returns the same as:  ((x,y) for x in A for y in B).\nThe leftmost iterators are in the outermost for-loop, so the output tuples\ncycle in a manner similar to an odometer (with the rightmost element changing\non every iteration).\n\nTo compute the product of an iterable with itself, specify the number\nof repetitions with the optional repeat keyword argument. For example,\nproduct(A, repeat=4) means the same as product(A, A, A, A).\n\nproduct('ab', range(3)) --> ('a',0) ('a',1) ('a',2) ('b',0) ('b',1) ('b',2)\nproduct((0,1), (0,1), (0,1)) --> (0,0,0) (0,0,1) (0,1,0) (0,1,1) (1,0,0) ...", true);
+        (*product_type()).tp_methods = mdefs![("__sizeof__", NOARGS, product_sizeof, "Returns size in memory, in bytes.")];
+        (*combinations_type()).tp_methods = mdefs![("__sizeof__", NOARGS, combinations_sizeof, "Returns size in memory, in bytes.")];
+        (*cwr_type()).tp_methods = mdefs![("__sizeof__", NOARGS, combinations_sizeof, "Returns size in memory, in bytes.")];
+        (*permutations_type()).tp_methods = mdefs![("__sizeof__", NOARGS, permutations_sizeof, "Returns size in memory, in bytes.")];
         setup::<Repeat>(repeat_type(), c"itertools.repeat", Some(repeat_new), Some(repeat_next),
             c"repeat(object [,times]) -> create an iterator which returns the object\nfor the specified number of times.  If not specified, returns the object\nendlessly.", true);
         (*repeat_type()).tp_repr = Some(repeat_repr);

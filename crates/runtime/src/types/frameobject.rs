@@ -203,6 +203,9 @@ fn f_lineno(o: &PyObject) -> PyResult {
     Ok(if l < 0 { none::none_ref() } else { int::new_int(l as i64) })
 }
 fn f_set_lineno(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
+    if v.is_none() {
+        raise!(AttributeError, "cannot delete f_lineno");
+    }
     let f = need(o)?;
     crate::interp::jump::set_lineno(f, v)
 }
@@ -213,9 +216,10 @@ fn f_lasti(o: &PyObject) -> PyResult {
 fn f_back(o: &PyObject) -> PyResult {
     let f = need(o)?;
     if f.prev.is_null() {
-        // a finished frame remembers its caller; a suspended one has none
+        // a finished function frame remembers its caller; a suspended or finished
+        // generator frame has none
         let fo = unsafe { &*(o.as_ptr() as *const PyFrameObject) };
-        if !fo._f_back.is_null() && f.state == crate::interp::frame::FrameState::Completed {
+        if !fo._f_back.is_null() && f.state == crate::interp::frame::FrameState::Completed && f.generator.is_null() {
             return Ok(unsafe { PyRef::from_borrowed(fo._f_back) });
         }
         return Ok(none::none_ref());
@@ -247,6 +251,7 @@ fn f_set_trace_lines(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
             need(o)?.f_trace_lines = v.is(bool_::true_obj());
             Ok(())
         }
+        None => raise!(TypeError, "can't delete numeric/char attribute"),
         _ => raise!(TypeError, "attribute value type must be bool"),
     }
 }
@@ -259,6 +264,7 @@ fn f_set_trace_opcodes(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
             need(o)?.f_trace_opcodes = v.is(bool_::true_obj());
             Ok(())
         }
+        None => raise!(AttributeError, "attribute 'f_trace_opcodes' of 'frame' objects cannot be deleted"),
         _ => raise!(TypeError, "attribute value type must be bool"),
     }
 }
@@ -314,16 +320,17 @@ fn f_generator(o: &PyObject) -> PyResult {
     Ok(if f.generator.is_null() { none::none_ref() } else { unsafe { PyRef::from_borrowed(f.generator) } })
 }
 fn frame_clear_method(o: &PyObject) -> PyResult {
-    let f = need(o)?;
+    // a frame whose generator or call is gone has nothing left to clear
+    let Some(f) = frame_of(o) else { return Ok(none::none_ref()) };
     match f.state {
         FrameState::Executing => raise!(RuntimeError, "cannot clear an executing frame"),
-        FrameState::Suspended => {
-            if !f.generator.is_null() {
-                let g = unsafe { (*f.generator).to_ref() };
-                crate::types::genobject::gen_close(&g)?;
-            } else {
-                raise!(RuntimeError, "cannot clear a suspended frame");
-            }
+        FrameState::Suspended => raise!(RuntimeError, "cannot clear a suspended frame"),
+        FrameState::Created if !f.generator.is_null() => {
+            // a generator that never started is finalized (an unawaited coroutine warns)
+            let genr = unsafe { (*f.generator).to_ref() };
+            // (this releases the frame: `f` must not be used afterwards)
+            crate::types::genobject::finalize_unstarted(&genr);
+            return Ok(none::none_ref());
         }
         _ => {}
     }

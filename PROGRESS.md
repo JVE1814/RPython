@@ -77,13 +77,57 @@ Ours (tools/run_tests.sh, 434 modules):
 | 4 | 30f8658 | 208 | 215 | 6 | 4 | 23,987 | 1,165 | 1,632 |
 | 5 | b578bf8 | 250 | 174 | 6 | 4 | 40,734 | 1,294 | 2,549 |
 | 6 | cd9478e | 259 | 158 | 13 | 4 | 39,273 | 660 | 2,377 |
+| 7 | c8fda7a | 268 | 157 | 5 | 4 | 42,747 | 542 | 2,539 |
+| 8 | 0b5f6a0 (jit5+core5, pre-lib6) | 280 | 144 | 3 | 7 | 42,339 | 275 | 2,485 |
+Run 7 (pre-core4): crashes = test_capi (segfault after a lone-surrogate print), test_free_threading
+(deque race, test_collections), test_itertools (flaky; passes now), test_multiprocessing_fork/spawn
+(heap corruption in test_manager); timeouts = asyncio, cmd_line_script, os, subprocess. Largest
+failure counts: sys_settrace 91 and monitoring 52 (both fixed by core4 since: 1 and 5), importlib 39,
+cmd_line 28, call 17, inspect 15, lazy_import 13, descr 13, compile 12, traceback 10.
+Run 8: crashes = test_free_threading (deque race), test_itertools (count race; fixed by lib6 since),
+test_multiprocessing_fork; timeouts = asyncio, capi, cmd_line_script, multiprocessing_forkserver/spawn, os,
+subprocess. Largest failure counts: importlib 20, call 17, inspect 15, dict 8, concurrent_futures 7.
 Run 3 top blockers: array (39 modules), http (21), urllib (12), multiprocessing (11),
 importlib.resources (11), datetime (11), concurrent (9), xml/email (7 each), html (6).
 Run 1 top blockers: py_compile (230 modules; merged since), unittest.mock (57), doctest (24),
 array (24), socket (17), pathlib (16), http (14), multiprocessing, decimal, datetime, ntpath.
 
 ## Benchmarks
-### Latest (jit4, 2026-11-07; steady-state callgrind instructions per loop, millions; ratio = ours / best CPython)
+### Latest (jit5, 2026-11-07; steady-state callgrind instructions per loop, millions; ratio = ours / best CPython)
+| bench | CPython best | jit4 | jit5 | ratio |
+|---|---|---|---|---|
+| richards | 461.1 | 314.3 | 282.8–322.6 | 0.61–0.70 |
+| nbody | 1107.5 | 359.8 | 359.8 | 0.32 |
+| spectral_norm | 1207.8 | 636.0 | 643.5 | 0.53 |
+| float | 778.4 | 702.2 | 702.9 | 0.90 |
+| richards_super | 530.4 | 484.4 | 454.0 | 0.86 |
+| chaos | 610.7 | 486.3 | 408.0 | 0.67 |
+| raytrace | 2757.1 | 2776.3 | 2704.8 | 0.98 |
+| go | 1138.4 | 1511–2167 | 1173–1244 | 1.03–1.09 |
+| generators | 337.1 | 477.9 | 351.8 | 1.04 |
+| coroutines | 294.4 | 289.7 | 281.6 | 0.96 |
+| nqueens | 841.8 | 1860.1 | 1043.7 | 1.24 |
+| deltablue | 29.1 | 36.9 | 23.1–34.4 | 0.79–1.18 |
+| hexiom | 58.1 | 82.7 | 53.8 | 0.93 |
+| fannkuch | 4392.7 | 5779.9 | 3849.2 | 0.88 |
+| unpack_sequence | 0.15 | 0.11 | 0.11 | 0.73 |
+| comprehensions | 0.19 | 0.39 | 0.18–0.24 | 0.95–1.26 |
+
+Full-suite wall-clock (jit5, s/loop, pinned to one core with other agents running; ratio = ours / best CPython).
+Wins: chaos 0.78, deltablue 0.86, nbody 0.46, pidigits 0.54, regex_compile 0.17, regex_dna 0.57,
+regex_effbot 0.51, regex_v8 0.88, richards 0.76, richards_super 0.92, raytrace 0.99, spectral_norm 0.53,
+decimal_pi 0.03 / telco 0.06 (baseline lacks `_decimal`, D21).
+Roughly even (1.00–1.10): coroutines, float, hexiom, pyflate, scimark.
+Losses: base64 2.98, json_dumps 2.83, gc_traversal 2.77, asyncio_tcp 2.53, pathlib 2.35,
+typing_runtime_protocols 2.34, generators 2.05, mdp 2.05, async_generators 2.04, deepcopy 1.86,
+json_loads 1.85, meteor_contest 1.83, xml_etree 1.71, comprehensions 1.66, pprint 1.66, bpe_tokeniser 1.65,
+gc_collect 1.49, unpack_sequence 1.49, python_startup 1.46, nqueens 1.40, logging 1.39, concurrent_imap 1.37,
+sqlite_synth 1.37, go 1.29, barnes_hut 1.22, fannkuch 1.17. 26 benchmarks need CLI args or third-party
+packages and did not run on any interpreter (list in notes/jit.md).
+Wall-clock is much worse than instruction counts and load-sensitive (locked instructions, cache effects
+valgrind does not model); `perf` is unavailable in the container.
+
+### Previous (jit4, 2026-11-07; steady-state callgrind instructions per loop, millions; ratio = ours / best CPython)
 | bench | CPython default | CPython ft | ours | ratio |
 |---|---|---|---|---|
 | richards | 461 | 566 | 314 | 0.68 |

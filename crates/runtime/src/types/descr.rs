@@ -388,14 +388,36 @@ unsafe extern "C" fn classmethod_descr_call(d: *mut PyObject, args: *mut PyObjec
 
 // ---- member_descriptor
 
-pub unsafe fn member_get(obj: *mut PyObject, m: *const PyMemberDef) -> PyResult {
+/// Our own PyMemberDef flag (not a CPython value): a `__slots__` member of a tuple subclass.
+/// Tuples keep their items inline, so such slots are stored after the items; `offset` holds
+/// `!position` (always negative, so offset-caching fast paths that require a positive
+/// offset leave it alone), position = byte distance from the end of the items.
+pub const RPY_MEMBER_AFTER_ITEMS: std::ffi::c_int = 1 << 12;
+
+pub fn after_items_offset(position: usize) -> isize {
+    !(position as isize)
+}
+
+/// Address of the field described by `m` in `obj`.
+pub unsafe fn member_addr(obj: *mut PyObject, m: *const PyMemberDef) -> *mut u8 {
     unsafe {
+        if (*m).flags & RPY_MEMBER_AFTER_ITEMS != 0 {
+            let items_end = std::mem::offset_of!(PyTupleObject, ob_item)
+                + var_size(&*obj) as usize * std::mem::size_of::<*mut PyObject>();
+            return (obj as *mut u8).add(items_end + !(*m).offset as usize);
+        }
         let mut off = (*m).offset;
         if (*m).flags & Py_RELATIVE_OFFSET != 0 {
             let tp = (*obj).type_ptr();
             off += (*(*tp).tp_base).tp_basicsize;
         }
-        let p = (obj as *mut u8).offset(off);
+        (obj as *mut u8).offset(off)
+    }
+}
+
+pub unsafe fn member_get(obj: *mut PyObject, m: *const PyMemberDef) -> PyResult {
+    unsafe {
+        let p = member_addr(obj, m);
         Ok(match (*m).type_code {
             Py_T_BOOL => crate::types::bool_::new_bool(*(p as *const i8) != 0),
             Py_T_BYTE => int::new_int(*(p as *const i8) as i64),
@@ -443,12 +465,7 @@ pub unsafe fn member_set(obj: *mut PyObject, m: *const PyMemberDef, v: Option<&P
         if (*m).flags & Py_READONLY != 0 {
             raise!(AttributeError, "readonly attribute");
         }
-        let mut off = (*m).offset;
-        if (*m).flags & Py_RELATIVE_OFFSET != 0 {
-            let tp = (*obj).type_ptr();
-            off += (*(*tp).tp_base).tp_basicsize;
-        }
-        let p = (obj as *mut u8).offset(off);
+        let p = member_addr(obj, m);
         let v = match v {
             Some(v) => v,
             None => {

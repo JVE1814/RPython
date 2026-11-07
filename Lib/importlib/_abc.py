@@ -11,7 +11,7 @@ class Loader(metaclass=abc.ABCMeta):
     def create_module(self, spec):
         """Return a module to initialise, or None for the default module
         creation semantics."""
-        # By default, defer to default semantics for the new module.
+        # None: the import system creates a plain module object
         return None
 
     def load_module(self, fullname):

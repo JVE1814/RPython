@@ -8,13 +8,12 @@ use crate::object::*;
 use crate::types::typeobject::*;
 use crate::types::{bool_, dict, int, list, none, str as pystr, tuple};
 use crate::{name, raise};
-use std::sync::atomic::{AtomicPtr, Ordering::*};
+use std::sync::atomic::Ordering::*;
 
-static BUILTINS: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
-static IMPORT_FN: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
+// (interp1) builtins and its __import__ are per interpreter: see subinterp::Interp
 
 pub fn builtins_module() -> PyRef {
-    unsafe { PyRef::from_borrowed(BUILTINS.load(Acquire)) }
+    unsafe { PyRef::from_borrowed(crate::subinterp::current().builtins.load(Acquire)) }
 }
 pub fn builtins_dict() -> PyRef {
     crate::types::module::module_dict(&builtins_module())
@@ -26,7 +25,7 @@ pub fn builtin(nm: &str) -> PyResult {
     }
 }
 pub fn is_our_import(f: &PyObject) -> bool {
-    f.as_ptr() == IMPORT_FN.load(Relaxed)
+    f.as_ptr() == crate::subinterp::current().import_fn.load(Relaxed)
 }
 
 /// Add a method table to a module dict as builtin functions (module = `m` if given).
@@ -317,7 +316,8 @@ fn b_globals(_m: &PyObject) -> PyResult {
 fn b_locals(_m: &PyObject) -> PyResult {
     let f = crate::interp::current_frame_ptr();
     if f.is_null() {
-        return Ok(dict::new_dict());
+        // (interp1) module-level code of a running __main__: locals are globals
+        return Ok(crate::subinterp::running_main_globals().unwrap_or_else(dict::new_dict));
     }
     crate::types::frameobject::locals_dict(unsafe { &*f })
 }
@@ -610,6 +610,8 @@ fn exec_or_eval(args: &[&PyObject], kw: Option<&PyObject>, is_eval: bool) -> PyR
             crate::compile::compile_bytes(&b, "<string>", mode, flags, -1)?.code
         }
     };
+    // auditing hooks see every code object exec()/eval() is about to run
+    crate::modules::sys_full::audit("exec", &[&code])?;
     let nfree = crate::types::code::code(&code).nfreevars();
     if !is_eval {
         match closure.filter(|c| !c.is(none::none())) {
@@ -663,7 +665,7 @@ fn b_input(_m: &PyObject, args: &[&PyObject]) -> PyResult {
 
 pub fn init() -> PyResult<PyRef> {
     let m = crate::types::module::new_module("builtins")?;
-    BUILTINS.store(m.clone().into_raw(), Release);
+    crate::subinterp::current().builtins.store(m.clone().into_raw(), Release);
     let d = crate::types::module::module_dict(&m);
     dict::set_item_str(&d, "__doc__", &pystr::new_str("Built-in functions, types, exceptions, and other objects.\n\nThis module provides direct access to all 'built-in'\nidentifiers of Python; for example, builtins.len is\nthe full name for the built-in function len().\n\nThis module is not normally accessed explicitly by most\napplications, but can be useful in modules that provide\nobjects with the same name as a built-in value, but in\nwhich the built-in of that name is also needed."))?;
     let methods = crate::mdefs![
@@ -710,7 +712,7 @@ pub fn init() -> PyResult<PyRef> {
     crate::types::lazyimport::install_builtins(&d, &m)?;
     crate::modules::builtins_numbers::install(&d, &m)?;
     if let Some(f) = dict::get_item_rs(&d, "__import__") {
-        IMPORT_FN.store(f.as_ptr(), Release);
+        crate::subinterp::current().import_fn.store(f.as_ptr(), Release);
     }
     let set = |k: &str, v: &PyObject| dict::set_item_str(&d, k, v);
     set("None", none::none())?;

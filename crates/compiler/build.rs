@@ -1,6 +1,9 @@
 //! Derives a bytecode format number from the compiler (and parser) sources, so
 //! that cached .pyc files are invalidated automatically whenever code generation
-//! may have changed (the runtime builds its pyc magic number from it).
+//! may have changed. The runtime uses CPython's pyc magic number (D25), so staleness of
+//! our own caches is decided by `COMPILER_EPOCH` instead: the time this script last ran,
+//! i.e. when the compiler sources last changed; cache files written before it are
+//! recompiled.
 
 use std::path::Path;
 
@@ -30,10 +33,15 @@ fn main() {
         hash_dir(&d, &mut h);
         println!("cargo:rerun-if-changed={}", d.display());
     }
+    let epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
     let out = std::env::var("OUT_DIR").unwrap();
     std::fs::write(
         Path::new(&out).join("bytecode_hash.rs"),
-        format!("/// Hash of the compiler/parser sources (see build.rs).\npub const BYTECODE_HASH: u32 = {};\n", (h ^ (h >> 32)) as u32),
+        format!(
+            "/// Hash of the compiler/parser sources (see build.rs).\npub const BYTECODE_HASH: u32 = {};\n/// Unix time (seconds) at which the compiler sources were last seen to change.\npub const COMPILER_EPOCH: f64 = {:?};\n",
+            (h ^ (h >> 32)) as u32,
+            epoch
+        ),
     )
     .unwrap();
 }

@@ -479,6 +479,10 @@ pub unsafe extern "C" fn generic_alloc(tp: *mut PyTypeObject, nitems: Py_ssize_t
         if (*tp).tp_itemsize != 0 {
             set_var_size(op, nitems);
         }
+        if (*tp).tp_flags & Py_TPFLAGS_TUPLE_SUBCLASS != 0 {
+            // (jit6) tuples of every type cache their hash (tuple.rs `tuple_hash`)
+            (*(op as *mut PyTupleObject)).ob_hash = -1;
+        }
         if (*tp).tp_flags & Py_TPFLAGS_HAVE_GC != 0 {
             crate::gc::track(op);
         }
@@ -629,7 +633,7 @@ unsafe fn clear_slots(tp: *mut PyTypeObject, op: *mut PyObject) {
         }
         while !(*m).name.is_null() {
             if (*m).type_code == Py_T_OBJECT_EX && (*m).flags & Py_READONLY == 0 {
-                let p = (op as *mut u8).offset((*m).offset) as *mut *mut PyObject;
+                let p = crate::types::descr::member_addr(op, m) as *mut *mut PyObject;
                 let old = *p;
                 if !old.is_null() {
                     *p = std::ptr::null_mut();
@@ -652,7 +656,7 @@ pub unsafe extern "C" fn subtype_traverse(op: *mut PyObject, visit: visitproc, a
             if !m.is_null() {
                 while !(*m).name.is_null() {
                     if (*m).type_code == Py_T_OBJECT_EX {
-                        let p = *((op as *mut u8).offset((*m).offset) as *mut *mut PyObject);
+                        let p = *(crate::types::descr::member_addr(op, m) as *mut *mut PyObject);
                         if !p.is_null() {
                             let r = f(p, arg);
                             if r != 0 {
@@ -705,20 +709,30 @@ pub unsafe extern "C" fn subtype_clear(op: *mut PyObject) -> c_int {
             base = (*base).tp_base;
         }
         crate::shape::clear_values(op, true);
+        let mut released: *mut PyObject = std::ptr::null_mut();
         let slot = dict_slot_raw(op);
         if !slot.is_null() && !(*slot).is_null() && (*slot) as usize & 1 == 0 {
             dict::clear(&**slot);
+            if (*op).ob_gc_bits.load(std::sync::atomic::Ordering::Relaxed) & crate::alloc::GC_BIT_DICT_DETACHED != 0 {
+                // a dict assigned from Python can be part of the cycle itself
+                // (`self.__dict__ = self`): drop the reference, not just the contents
+                // (released last: it may be `op` itself)
+                released = *slot;
+                *slot = std::ptr::null_mut();
+            }
         }
         let mut b = tp;
         while is_heap_type(b) && (*b).tp_clear == Some(subtype_clear) {
             b = (*b).tp_base;
         }
+        let mut r = 0;
         if !b.is_null() {
             if let Some(c) = (*b).tp_clear {
-                return c(op);
+                r = c(op);
             }
         }
-        0
+        xdecref(released);
+        r
     }
 }
 

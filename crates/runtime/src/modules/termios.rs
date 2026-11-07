@@ -9,7 +9,7 @@ use crate::types::{bytes, dict, int, list, none, str as pystr, tuple};
 use crate::{mdefs, raise};
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-static ERROR: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
+static ERROR: crate::subinterp::InterpPtr = crate::subinterp::InterpPtr::new(); // (interp1) per interpreter
 
 const NCCS: usize = 32;
 const ICANON: libc::tcflag_t = 0o2;

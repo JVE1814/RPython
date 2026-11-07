@@ -8,24 +8,23 @@ use crate::interp::Exit;
 use crate::object::*;
 use crate::threads::ThreadState;
 use crate::types::{dict, list, none, str as pystr, tuple};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering::*};
 
-static SYS_MODULE: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
-static MODULES: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
+// (interp1) the sys module and sys.modules are per interpreter: see subinterp::Interp
 pub static TRACING: AtomicBool = AtomicBool::new(false);
 pub static OPTIMIZE: AtomicI32 = AtomicI32::new(0);
 
 pub fn sys_module() -> PyRef {
-    unsafe { PyRef::from_borrowed(SYS_MODULE.load(Acquire)) }
+    unsafe { PyRef::from_borrowed(crate::subinterp::current().sys.load(Acquire)) }
 }
 pub fn sys_dict() -> PyRef {
     crate::types::module::module_dict(&sys_module())
 }
 pub fn modules_dict() -> PyRef {
-    unsafe { PyRef::from_borrowed(MODULES.load(Acquire)) }
+    unsafe { PyRef::from_borrowed(crate::subinterp::current().modules.load(Acquire)) }
 }
 pub fn get_sys_attr(nm: &str) -> Option<PyRef> {
-    let p = SYS_MODULE.load(Acquire);
+    let p = crate::subinterp::current().sys.load(Acquire);
     if p.is_null() {
         return None;
     }
@@ -153,8 +152,24 @@ pub fn init_stdio() {
 }
 
 fn create_stdio(fd: i32, write: bool, name: &str, errors: &str, unbuffered: bool, force_line: bool) -> PyResult<PyRef> {
+    // a standard descriptor the process was started without: the stream is None
+    let closed_at_start = crate::modules::sys_full::config().closed_std_fds & (1 << fd) != 0;
+    if closed_at_start || unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+        return Ok(crate::types::none::none_ref());
+    }
     // PYTHONIOENCODING=encoding[:errors] (errors do not apply to stderr)
     let (enc, errs) = io_encoding();
+    // a chosen encoding is reported under its codec's canonical name
+    // (PYTHONIOENCODING=latin1 gives 'iso8859-1')
+    let enc = enc.map(|e| {
+        match crate::modules::_codecs::lookup(&e).and_then(|ci| crate::abstract_::getattr_str(&ci, "name")) {
+            Ok(n) if pystr::is_str(&n) => pystr::to_string_lossy(&n),
+            _ => {
+                clear_exc();
+                e
+            }
+        }
+    });
     // an explicitly chosen encoding without an error handler is strict
     let errors: &str = if fd != 2 {
         errs.as_deref().unwrap_or(if enc.is_some() { "strict" } else { errors })
@@ -236,9 +251,9 @@ fn init_stdio_impl() -> PyResult<()> {
 
 pub fn create_sys_module(argv: &[String]) -> PyResult<PyRef> {
     let m = crate::types::module::new_module("sys")?;
-    SYS_MODULE.store(m.clone().into_raw(), Release);
+    crate::subinterp::current().sys.store(m.clone().into_raw(), Release);
     let modules = dict::new_dict();
-    MODULES.store(modules.clone().into_raw(), Release);
+    crate::subinterp::current().modules.store(modules.clone().into_raw(), Release);
     let d = crate::types::module::module_dict(&m);
     dict::set_item_str(&d, "modules", &modules)?;
     dict::set_item_str(&modules, "sys", &m)?;

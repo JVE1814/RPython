@@ -48,10 +48,19 @@ pub struct RtConfig {
     pub xoptions: Vec<String>,
     pub pycache_prefix: Option<String>,
     pub orig_argv: Vec<String>,
+    /// The exact command-line bytes behind `orig_argv` (sys.orig_argv decodes them with the
+    /// filesystem encoding and surrogateescape); empty when not supplied.
+    pub orig_argv_bytes: Vec<Vec<u8>>,
     pub faulthandler: bool,
     pub tracemalloc: i32,
     pub check_hash_based_pycs: String,
     pub stdlib_dir: Option<String>,
+    /// -X cpu_count / PYTHON_CPU_COUNT: what os.cpu_count() reports (-1: the real count).
+    pub cpu_count: i32,
+    /// Standard descriptors (bit n = fd n) the process was started without.
+    pub closed_std_fds: u8,
+    /// -X importtime[=2] / PYTHONPROFILEIMPORTTIME: 0 off, 1 timings, 2 also cached imports.
+    pub import_time: i32,
 }
 
 impl Default for RtConfig {
@@ -77,6 +86,9 @@ impl Default for RtConfig {
             int_max_str_digits: 4300,
             gil: -1,
             thread_inherit_context: 1,
+            cpu_count: -1,
+            closed_std_fds: 0,
+            import_time: 0,
             context_aware_warnings: 1,
             lazy_imports: -1,
             unbuffered: false,
@@ -84,6 +96,7 @@ impl Default for RtConfig {
             xoptions: Vec::new(),
             pycache_prefix: None,
             orig_argv: Vec::new(),
+            orig_argv_bytes: Vec::new(),
             faulthandler: false,
             tracemalloc: 0,
             check_hash_based_pycs: "default".into(),
@@ -659,7 +672,7 @@ fn sys_getfilesystemencodeerrors(_m: &PyObject) -> PyResult {
     Ok(pystr::new_str("surrogateescape"))
 }
 fn sys_is_gil_enabled(_m: &PyObject) -> PyResult {
-    Ok(bool_::new_bool(false))
+    Ok(bool_::new_bool(crate::subinterp::gil_enabled())) // (interp1)
 }
 fn sys_settrace(_m: &PyObject, f: &PyObject) -> PyResult {
     crate::modules::sys_trace_api::settrace(f)
@@ -784,6 +797,10 @@ fn thread_frames_and_excs(want_exc: bool) -> PyResult {
         if !crate::threads::is_live(ts) {
             continue;
         }
+        // (interp1) only the threads of the calling interpreter
+        if !std::ptr::eq(crate::subinterp::of_ts(ts), crate::subinterp::current()) {
+            continue;
+        }
         let key = int::new_int_u128(ts.c.thread_id as u128);
         if want_exc {
             let e = crate::interp::eval::handled_exception(ts);
@@ -800,6 +817,10 @@ fn thread_frames_and_excs(want_exc: bool) -> PyResult {
     }
     Ok(d)
 }
+fn sys_get_cpu_count_config(_m: &PyObject) -> PyResult {
+    Ok(int::new_int(config().cpu_count as i64))
+}
+
 fn sys_current_frames(_m: &PyObject) -> PyResult {
     thread_frames_and_excs(false)
 }
@@ -847,13 +868,22 @@ fn sys_getunicodeinternedsize(_m: &PyObject, args: &[&PyObject], kw: Option<&PyO
 /// per-type free lists in this runtime (the small-object allocator keeps
 /// per-thread caches instead), so the free-list counts are all zero.
 fn sys_debugmallocstats(_m: &PyObject) -> PyResult {
-    let mut s = String::from("Small-object allocator: per-thread caches over 64 KiB pages (no pymalloc arenas)\n");
+    print_malloc_stats();
+    Ok(none::none_ref())
+}
+
+/// The statistics behind sys._debugmallocstats() and PYTHONMALLOCSTATS, on the C stderr.
+pub fn print_malloc_stats() {
+    let mut s = format!(
+        "Small block threshold = {}, in {} size classes.\nSmall-object allocator: per-thread caches over 64 KiB pages (no pymalloc arenas)\n",
+        crate::tlab::MAX_SMALL,
+        crate::tlab::CLASSES.len()
+    );
     s.push_str(&format!("{:>10} tracked GC objects\n", crate::gc::tracked_count()));
     for name in ["PyDictObjects", "PyListObjects", "PyFloatObjects", "PyTupleObjects"] {
         s.push_str(&format!("{:>10} free {}\n", 0, name));
     }
     crate::modules::sys::write_fd(2, s.as_bytes());
-    Ok(none::none_ref())
 }
 fn sys_get_coroutine_origin_tracking_depth(_m: &PyObject) -> PyResult {
     Ok(int::new_int(crate::threads::current().c.coroutine_origin_tracking_depth as i64))
@@ -1362,6 +1392,15 @@ pub(crate) fn call_module_func(module: &str, func: &str) {
 pub(crate) fn flush_std(name: &str) -> bool {
     if let Some(s) = crate::modules::sys::get_sys_attr(name) {
         if !s.is(none::none()) {
+            // a stream the program closed has nothing left to flush
+            match ab::getattr_opt(&s, crate::name!("closed")) {
+                Ok(Some(c)) if ab::is_true(&c).unwrap_or(false) => return true,
+                Ok(_) => {}
+                Err(_) => clear_exc(),
+            }
+            if err_occurred() {
+                clear_exc();
+            }
             if ab::call_method_str(&s, "flush", &[]).is_err() {
                 write_unraisable(Some(&format!("Exception ignored while flushing sys.{}", name)), None);
                 return false;
@@ -1411,7 +1450,10 @@ pub fn populate(d: &PyObject) -> PyResult<()> {
         }
     }
     set("_xoptions", &xo)?;
-    if !c.orig_argv.is_empty() {
+    if !c.orig_argv_bytes.is_empty() {
+        let items = c.orig_argv_bytes.iter().map(|b| crate::modules::posix::path::fs_decode(b)).collect::<PyResult<Vec<_>>>()?;
+        set("orig_argv", &crate::types::list::new_list(items))?;
+    } else if !c.orig_argv.is_empty() {
         set("orig_argv", &strlist(&c.orig_argv))?;
     }
     set("copyright", &s("Copyright (c) 2001 Python Software Foundation.\nAll Rights Reserved.\n\nCopyright (c) 2000 BeOpen.com.\nAll Rights Reserved.\n\nCopyright (c) 1995-2001 Corporation for National Research Initiatives.\nAll Rights Reserved.\n\nCopyright (c) 1991-1995 Stichting Mathematisch Centrum, Amsterdam.\nAll Rights Reserved."))?;
@@ -1531,6 +1573,7 @@ pub fn populate(d: &PyObject) -> PyResult<()> {
         ("_clear_type_cache", NOARGS, sys_clear_type_cache),
         ("_clear_internal_caches", NOARGS, sys_clear_internal_caches),
         ("_current_frames", NOARGS, sys_current_frames),
+        ("_get_cpu_count_config", NOARGS, sys_get_cpu_count_config),
         ("_current_exceptions", NOARGS, sys_current_exceptions),
         ("activate_stack_trampoline", FASTKW, sys_activate_stack_trampoline, "activate_stack_trampoline(backend, /)\n--\n\nTurn on the perf profiler trampoline for the given backend."),
         ("deactivate_stack_trampoline", NOARGS, sys_deactivate_stack_trampoline),

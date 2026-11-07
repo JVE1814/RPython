@@ -477,6 +477,8 @@ pub unsafe extern "C" fn PyThread_start_new_thread(func: Option<unsafe extern "C
     let mut b = std::thread::Builder::new();
     let ss = STACK_SIZE.load(Relaxed);
     b = b.stack_size(if ss > 0 { ss } else { 16 << 20 });
+    // (jit5) single-threaded fast paths stop before the second thread exists
+    crate::threads::MULTI_THREADED.store(1, std::sync::atomic::Ordering::SeqCst);
     let (tx, rx) = std::sync::mpsc::channel::<c_ulong>();
     match b.spawn(move || {
         let _ = tx.send(unsafe { libc::pthread_self() } as c_ulong);

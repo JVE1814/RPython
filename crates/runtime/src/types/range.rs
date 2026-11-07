@@ -428,6 +428,26 @@ fn new_fast_iter(start: i64, step: i64, len: i64) -> PyRef {
         PyRef::from_raw(op)
     }
 }
+/// (jit5) `iter(range(start, stop, step))` for machine-int arguments (step != 0),
+/// without the range object.
+pub fn iter_i64(start: i64, stop: i64, step: i64) -> PyRef {
+    let (a, b, c) = (start as i128, stop as i128, step as i128);
+    let n = if c == 1 {
+        (b - a).max(0)
+    } else if c > 0 {
+        if a < b { (b - a - 1) / c + 1 } else { 0 }
+    } else if a > b {
+        (a - b - 1) / (-c) + 1
+    } else {
+        0
+    };
+    // the length always fits: |stop - start| < 2**64 and step != 0; only lengths up to
+    // i64::MAX are representable in the fast iterator
+    if n <= i64::MAX as i128 {
+        return new_fast_iter(start, step, n as i64);
+    }
+    new_long_iter(int::new_int(start), int::new_int(step), int::new_int_i128(n)).expect("range iterator")
+}
 fn new_long_iter(start: PyRef, step: PyRef, len: PyRef) -> PyResult {
     unsafe {
         let op = crate::alloc::alloc_object(&raw mut PyLongRangeIter_Type, std::mem::size_of::<LongIter>());
@@ -446,8 +466,12 @@ unsafe extern "C" fn range_iter(o: *mut PyObject) -> *mut PyObject {
         }
         // the machine-int iterator only needs start, step and length to fit (the
         // stop of a pickled iterator's range can lie just outside)
+        // -- but every value it yields must fit as well
         if let (Some(s), Some(st), Some(l)) = (i64_of(obj(ro.start)), i64_of(obj(ro.step)), i64_of(obj(ro.length))) {
-            return new_fast_iter(s, st, l).into_raw();
+            let last = s as i128 + (l.max(1) as i128 - 1) * st as i128;
+            if last >= i64::MIN as i128 && last <= i64::MAX as i128 {
+                return new_fast_iter(s, st, l).into_raw();
+            }
         }
         into_c(new_long_iter(obj(ro.start).to_ref(), obj(ro.step).to_ref(), obj(ro.length).to_ref()))
     }

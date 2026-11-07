@@ -243,7 +243,8 @@ pub fn trace_call(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
     if ts.tracing_depth.get() > 0 {
         return Ok(());
     }
-    let cd = crate::types::code::code_data(f.code());
+    let co = f.code().to_ref();
+    let cd = crate::types::code::code_data(&co);
     if cd.eager_prologue && f.next_instr < cd.gen_start {
         // the eager part of a generator prologue (before RETURN_GENERATOR) is not traced
         return Ok(());
@@ -252,6 +253,12 @@ pub fn trace_call(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
     f.trace_last = u32::MAX;
     if !resume {
         f.trace_line = -1;
+        // The start event is reported at the RESUME instruction (the `def` line), past a
+        // prologue without line numbers (COPY_FREE_VARS, MAKE_CELL).
+        let start = f.next_instr as usize;
+        if let Some(k) = cd.code.iter().skip(start).take(16).position(|w| (w & 0xff) as u8 == rpy_compiler::bytecode::Op::Resume as u8) {
+            f.lasti = (start + k) as u32;
+        }
     }
     fire(ts, f, if resume { PY_RESUME } else { PY_START }, offset(f), &[])?;
     call_profile(ts, f, "call", none::none())?;
@@ -264,7 +271,16 @@ pub fn trace_call(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
 }
 
 fn is_line_start(code: &PyObject, i: usize, line: i32) -> bool {
-    i == 0 || crate::types::code::line_for_instr(code, i - 1).map(|l| l as i32) != Some(line)
+    if i == 0 {
+        return true;
+    }
+    // the start RESUME does not count as executing its line: code after it on the same
+    // line (a class body's first line) still reports that line
+    let prev = crate::types::code::code_data(code).code.get(i - 1).copied().unwrap_or(0);
+    if (prev & 0xff) as u8 == rpy_compiler::bytecode::Op::Resume as u8 && (prev >> 8) == 0 {
+        return true;
+    }
+    crate::types::code::frame_line(code, i - 1).map(|l| l as i32) != Some(line)
 }
 
 pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
@@ -280,10 +296,7 @@ pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
     let lasti = f.lasti;
     let prev = std::mem::replace(&mut f.trace_last, lasti);
     // instructions without a line number (artificial cleanup code) never start a line
-    let line = match crate::types::code::code_data(f.code()).locations.get(lasti as usize) {
-        Some(l) if l.lineno != 0 => l.lineno as i32,
-        _ => -1,
-    };
+    let line = crate::types::code::frame_line(f.code(), lasti as usize).map_or(-1, |l| l as i32);
     // A line event fires on the first instruction of a line (entered by falling
     // through or by a jump, including a backward jump to the same line); never on
     // RESUME (the `def` line) and not when resuming in the middle of a line.
@@ -294,11 +307,26 @@ pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
     let new_line = line >= 0
         && !is_resume
         && ((start && (line != f.trace_line || (jumped && lasti <= prev))) || (jumped && (line != f.trace_line || lasti <= prev)));
-    if new_line {
-        f.trace_line = line;
-        if MON_ANY.load(Relaxed) & (1 << LINE) != 0 && start {
+    if MON_ANY.load(Relaxed) & (1 << LINE) != 0 && line >= 0 && !is_resume {
+        // sys.monitoring LINE: at line starts, at jump targets on another line than the
+        // jump, and at exception handlers entered with a line number
+        let cd = crate::types::code::code_data(f.code());
+        let entered_handler = (prev == u32::MAX || lasti != prev.wrapping_add(1))
+            && cd.exception_table.iter().any(|e| e.target == lasti);
+        let mon_line = if entered_handler {
+            true
+        } else if !jumped {
+            new_line && start
+        } else {
+            let from = crate::types::code::frame_line(f.code(), prev as usize).map(|l| l as i32);
+            new_line && (start || from != Some(line))
+        };
+        if mon_line {
             fire(ts, f, LINE, line as u32, &[])?;
         }
+    }
+    if new_line {
+        f.trace_line = line;
     }
     // one INSTRUCTION / opcode event per public instruction (an instruction may be
     // implemented by several internal words)
@@ -306,6 +334,12 @@ pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
     // RESUME produces no INSTRUCTION event
     if first_word && !is_resume && MON_ANY.load(Relaxed) & (1 << INSTRUCTION) != 0 {
         fire(ts, f, INSTRUCTION, offset(f), &[])?;
+    }
+    if f.f_trace.is_null() && crate::capi::ceval::is_ctracer(ts.trace_func.get()) {
+        // a C-level tracer sees running frames too
+        let t = ts.trace_func.get();
+        unsafe { incref(t) };
+        f.f_trace = t;
     }
     if ts.trace_func.get().is_null() || f.f_trace.is_null() {
         return Ok(());
@@ -552,4 +586,37 @@ pub fn fire_branch(ts: &ThreadState, f: &mut Frame, ev: usize, dest: usize) -> P
 #[inline]
 pub fn wants(ev: usize) -> bool {
     MON_ANY.load(Relaxed) & (1 << ev) != 0
+}
+
+/// A generator or coroutine driven by FOR_ITER / SEND finished (no exception is raised
+/// for it): sys.monitoring sees STOP_ITERATION, a legacy trace function an 'exception'
+/// event, both at `at` (internal pc of the instruction that consumes the result).
+pub fn stop_iteration_event(ts: &ThreadState, f: &mut Frame, value: &PyObject, at: usize) -> PyResult<()> {
+    if ts.tracing_depth.get() > 0 {
+        return Ok(());
+    }
+    let want_mon = MON_ANY.load(Relaxed) & (1 << STOP_ITERATION) != 0;
+    let want_legacy = !ts.trace_func.get().is_null() && !f.f_trace.is_null();
+    if !want_mon && !want_legacy {
+        return Ok(());
+    }
+    let saved_lasti = f.lasti;
+    f.lasti = at as u32;
+    let r = (|| -> PyResult<()> {
+        let si = ab::call(crate::types::typeobject::type_obj(crate::types::exceptions::StopIteration()), &[value])?;
+        if want_mon {
+            let off = offset(f);
+            fire(ts, f, STOP_ITERATION, off, &[&si])?;
+        }
+        if want_legacy && !f.f_trace.is_null() {
+            let t = crate::types::typeobject::type_ref(si.type_ptr());
+            let arg = tuple::new_tuple(vec![t, si.clone(), none::none_ref()]);
+            let ftr = unsafe { PyRef::from_borrowed(f.f_trace) };
+            let r = call_trace(ts, ftr.as_ptr(), f, "exception", &arg)?;
+            set_f_trace(f, r);
+        }
+        Ok(())
+    })();
+    f.lasti = saved_lasti;
+    r
 }

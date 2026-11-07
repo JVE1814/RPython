@@ -400,7 +400,6 @@ fn b_sizeof(o: &PyObject) -> PyResult {
 unsafe extern "C" fn b_iternext(op: *mut PyObject) -> *mut PyObject {
     unsafe {
         let o = &*op;
-        let _lk = crate::objlock::lock(o);
         if !o.is_type(bytesio_type()) {
             // subclass may override readline
             let r = call0(o, "readline");
@@ -442,10 +441,17 @@ struct BytesIOBuffer {
 
 unsafe extern "C" fn buf_getbuffer(op: *mut PyObject, view: *mut Py_buffer, flags: c_int) -> c_int {
     unsafe {
+        // a NULL view (the obsolete "lock only" request) and a holder created
+        // behind our back (tp_alloc, no BytesIO attached) are both refused
         let srcp = (*(op as *mut BytesIOBuffer)).source;
         if view.is_null() || srcp.is_null() {
-            // C code may allocate the type directly and ask for no view
-            let _ = crate::err!(BufferError, "bytesiobuf_getbuffer: view==NULL argument is obsolete");
+            let refuse = || -> PyResult<()> {
+                if view.is_null() {
+                    raise!(BufferError, "a NULL view is not supported");
+                }
+                raise!(BufferError, "buffer holder is not attached to a BytesIO");
+            };
+            let _ = refuse();
             return -1;
         }
         let src = &*srcp;
@@ -547,7 +553,6 @@ pub fn init_types() -> PyResult<()> {
             ("__sizeof__", NOARGS, b_sizeof),
         ];
         t.tp_getset = crate::getset_table![("closed", b_closed)];
-        crate::methods::lock_self_methods(bytesio_type());
         crate::types::typeobject::type_ready(bytesio_type())?;
 
         let t = &mut *(&raw mut BYTESIOBUF_TYPE);

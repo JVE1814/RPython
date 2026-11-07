@@ -33,10 +33,10 @@ pub fn find_builtin(name: &str) -> Option<ModInit> {
 /// returns the same object while it is alive, but a module dropped from
 /// sys.modules (and otherwise unreferenced) can be collected and is then
 /// initialised afresh by the next import.
-static BUILTIN_OBJECTS: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
+// (interp1) the table lives in the interpreter state: subinterp::Interp::builtin_objects
 
 fn builtin_entry(name: &str) -> Option<PyRef> {
-    let wr = BUILTIN_OBJECTS.lock().unwrap().iter().find(|(n, _)| n == name).map(|(_, p)| unsafe { PyRef::from_borrowed(*p as *mut PyObject) })?;
+    let wr = crate::subinterp::current().builtin_objects.lock().unwrap().iter().find(|(n, _)| n == name).map(|(_, p)| unsafe { PyRef::from_borrowed(*p as *mut PyObject) })?;
     if crate::types::weakref::is_weakref(&wr) {
         crate::types::weakref::get_object(&wr).filter(|o| !o.is(crate::types::none::none()))
     } else {
@@ -56,7 +56,7 @@ pub fn note_builtin_module(name: &str, m: &PyObject) {
             m.to_ref()
         }
     };
-    let mut g = BUILTIN_OBJECTS.lock().unwrap();
+    let mut g = crate::subinterp::current().builtin_objects.lock().unwrap();
     let old = match g.iter_mut().find(|(n, _)| n == name) {
         Some(e) => std::mem::replace(&mut e.1, held.into_raw() as usize),
         None => {
@@ -76,12 +76,12 @@ fn cached_builtin(name: &str) -> Option<PyRef> {
 
 /// The importlib bootstrap module once installed.
 pub fn bootstrap() -> Option<PyRef> {
-    let p = BOOTSTRAP.load(std::sync::atomic::Ordering::Acquire);
+    let p = crate::subinterp::current().bootstrap.load(std::sync::atomic::Ordering::Acquire);
     if p.is_null() { None } else { Some(unsafe { PyRef::from_borrowed(p) }) }
 }
-static BOOTSTRAP: std::sync::atomic::AtomicPtr<PyObject> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+// (interp1) per interpreter: subinterp::Interp::bootstrap
 /// True once the path-based finders (PathFinder) are installed.
-static EXTERNAL_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// (interp1) per interpreter: subinterp::Interp::importlib_ready
 
 /// Code object of an importlib bootstrap module. Compiling it from source on every
 /// start dominated startup time, so the compiled code is cached next to the source
@@ -98,7 +98,7 @@ pub(crate) fn bootstrap_code(src: &[u8], file: &str, display: &str) -> PyResult 
     let key = (|| {
         let (sl, st) = stamp(path)?;
         let (el, et) = stamp(&std::env::current_exe().ok()?)?;
-        Some(format!("rpython-boot v1{} {} {} {} {} {}\n", if crate::types::code::public_mode() { "w" } else { "" }, sl, st, el, et, display))
+        Some(format!("rpython-boot v1w {} {} {} {} {}\n", sl, st, el, et, display))
     })();
     let cache = path.parent().map(|dir| {
         let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -178,7 +178,7 @@ pub fn install_importlib(stdlib: &str) -> PyResult<()> {
     let bs = exec_bootstrap_module("_frozen_importlib", &bs_file, "<frozen importlib._bootstrap>")?;
     let sys = crate::modules::sys::sys_module();
     ab::call(&*ab::getattr_str(&bs, "_install")?, &[&sys, &imp])?;
-    BOOTSTRAP.store(bs.clone().into_raw(), std::sync::atomic::Ordering::Release);
+    crate::subinterp::current().bootstrap.store(bs.clone().into_raw(), std::sync::atomic::Ordering::Release);
     let ext_file = format!("{}/importlib/_bootstrap_external.py", stdlib);
     let r = (|| -> PyResult<()> {
         exec_bootstrap_module("_frozen_importlib_external", &ext_file, "<frozen importlib._bootstrap_external>")?;
@@ -188,7 +188,7 @@ pub fn install_importlib(stdlib: &str) -> PyResult<()> {
     if r.is_err() {
         let e = take_exc();
         // fall back to the Rust import implementation entirely
-        BOOTSTRAP.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
+        crate::subinterp::current().bootstrap.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
         if let Some(mp) = crate::modules::sys::get_sys_attr("meta_path") {
             list::clear(&mp);
         }
@@ -200,7 +200,7 @@ pub fn install_importlib(stdlib: &str) -> PyResult<()> {
         }
         return Ok(());
     }
-    EXTERNAL_INSTALLED.store(true, std::sync::atomic::Ordering::Release);
+    crate::subinterp::current().importlib_ready.store(true, std::sync::atomic::Ordering::Release);
     if let Some(ext) = get_loaded_module("_frozen_importlib_external") {
         give_frozen_spec(&ext);
     }
@@ -249,7 +249,7 @@ fn install_zipimport_hook() {
 }
 
 pub fn importlib_active() -> bool {
-    EXTERNAL_INSTALLED.load(std::sync::atomic::Ordering::Acquire)
+    crate::subinterp::current().importlib_ready.load(std::sync::atomic::Ordering::Acquire)
 }
 
 pub fn get_loaded_module(name: &str) -> Option<PyRef> {
@@ -338,6 +338,10 @@ static SYS_PATH_0: Mutex<Option<String>> = Mutex::new(None);
 /// Record the directory start-up put in front of sys.path (script dir, cwd, '').
 pub fn set_sys_path_0(p: &str) {
     *SYS_PATH_0.lock().unwrap_or_else(|e| e.into_inner()) = Some(p.to_string());
+}
+/// (interp1) the entry start-up put in front of sys.path, if any.
+pub fn sys_path_0() -> Option<String> {
+    SYS_PATH_0.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Is the module file at `origin` possibly shadowing another module, i.e. does it
@@ -529,6 +533,17 @@ fn resolve_name(nm: &str, globals: Option<&PyObject>, level: i64) -> PyResult<St
             if !pystr::is_str(&p) {
                 raise!(TypeError, "package must be a string");
             }
+            if let Some(s) = spec.as_ref().filter(|s| !s.is(none::none())) {
+                let parent = ab::getattr(s, name!("parent"))?;
+                if !ab::rich_eq(&p, &parent)? {
+                    let msg = format!(
+                        "__package__ != __spec__.parent ({} != {})",
+                        ab::repr_string(&p)?,
+                        ab::repr_string(&parent)?
+                    );
+                    crate::modules::warnings::warn(crate::types::exceptions::DeprecationWarning(), &msg, 1)?;
+                }
+            }
             pystr::to_string_lossy(&p)
         }
         _ => match spec.filter(|s| !s.is(none::none())) {
@@ -582,10 +597,33 @@ pub fn import_module_level(nm: &PyObject, globals: Option<&PyObject>, fromlist: 
         let modules = crate::modules::sys::modules_dict();
         if let Some(m) = dict::get_item(&modules, nm)? {
             if !m.is(none::none()) {
+                import_time_cached(&|| escaped_name(nm));
                 return Ok(m);
             }
         }
+        // otherwise let importlib's own __import__ search for it: its finders
+        // keep the name a str (file names with undecodable bytes map to
+        // surrogate escapes). -X importtime still shows the escaped name.
+        let display = escaped_name(nm);
+        let lossy = pystr::to_string_lossy(nm);
+        return IT_DISPLAY.with(|d| {
+            let old = d.replace(Some((lossy, display)));
+            let r = match bootstrap() {
+                Some(bs) if importlib_active() => (|| {
+                    let f = ab::getattr_str(&bs, "__import__")?;
+                    let g = globals.map(|g| g.to_ref()).unwrap_or_else(none::none_ref);
+                    ab::call(&f, &[nm, &g, none::none(), fromlist, &crate::types::int::new_int(0)])
+                })(),
+                _ => import_module_level_inner(nm, globals, fromlist, level),
+            };
+            d.replace(old);
+            r
+        });
     }
+    import_module_level_inner(nm, globals, fromlist, level)
+}
+
+fn import_module_level_inner(nm: &PyObject, globals: Option<&PyObject>, fromlist: &PyObject, level: i64) -> PyResult {
     let n = pystr::to_string_lossy(nm);
     let abs = if level > 0 {
         resolve_name(&n, globals, level)?
@@ -609,9 +647,13 @@ pub fn import_module_level(nm: &PyObject, globals: Option<&PyObject>, fromlist: 
             // relative: return the module corresponding to the first component of `n`
             let cut = abs.len() - n.len() + n.split('.').next().unwrap().len();
             let top = &abs[..cut];
-            return match get_loaded_module(top) {
+            let modules = crate::modules::sys::modules_dict();
+            return match dict::get_item_rs(&modules, top) {
                 Some(m) => Ok(m),
-                None => import_absolute(top),
+                None => Err(crate::errors::set_err_obj(
+                    crate::types::exceptions::KeyError(),
+                    pystr::new_str(&format!("'{}' not in sys.modules as expected", top)),
+                )),
             };
         }
         return Ok(m);
@@ -670,12 +712,92 @@ fn handle_fromlist(m: &PyObject, fromlist: &PyObject, modname: &str) -> PyResult
 
 static IMPORT_LOCKS: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
 
+// ---------------------------------------------------------------- -X importtime
+//
+// Every import that runs the import system reports its own time and the time
+// including nested imports (microseconds), indented by nesting depth; with
+// -X importtime=2 imports answered from sys.modules are reported as "cached".
+
+thread_local! {
+    /// Time spent in nested imports, one entry per import in progress.
+    static IT_NESTED: std::cell::RefCell<Vec<u128>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// (lossy name, display name) of a module name that has no exact Rust form.
+    static IT_DISPLAY: std::cell::RefCell<Option<(String, String)>> = const { std::cell::RefCell::new(None) };
+}
+static IT_HEADER: std::sync::Once = std::sync::Once::new();
+
+fn import_time_level() -> i32 {
+    crate::modules::sys_full::config().import_time
+}
+
+/// A module name as printed: lone surrogates as backslash escapes.
+fn escaped_name(nm: &PyObject) -> String {
+    let mut out = String::new();
+    for c in pystr::str_data(nm).iter() {
+        match char::from_u32(c) {
+            Some(ch) => out.push(ch),
+            None => out.push_str(&format!("\\u{:04x}", c)),
+        }
+    }
+    out
+}
+
+fn display_name(abs: &str) -> String {
+    IT_DISPLAY.with(|d| match &*d.borrow() {
+        Some((lossy, shown)) if lossy == abs => shown.clone(),
+        _ => abs.to_string(),
+    })
+}
+
+fn import_time_line(own: &str, total: &str, depth: usize, name: &str) {
+    IT_HEADER.call_once(|| crate::modules::sys::write_fd(2, b"import time: self [us] | cumulative | imported package\n"));
+    // numbers are right-aligned, the word "cached" left-aligned
+    let line = if own == "cached" {
+        format!("import time: {:<9} | {:<10} | {}{}\n", own, total, "  ".repeat(depth), name)
+    } else {
+        format!("import time: {:>9} | {:>10} | {}{}\n", own, total, "  ".repeat(depth), name)
+    };
+    crate::modules::sys::write_fd(2, line.as_bytes());
+}
+
+fn import_time_cached(name: &dyn Fn() -> String) {
+    if import_time_level() >= 2 {
+        let depth = IT_NESTED.with(|s| s.borrow().len());
+        import_time_line("cached", "cached", depth, &name());
+    }
+}
+
+fn import_timed(abs: &str, f: impl FnOnce() -> PyResult) -> PyResult {
+    if import_time_level() == 0 {
+        return f();
+    }
+    let depth = IT_NESTED.with(|s| {
+        let mut s = s.borrow_mut();
+        s.push(0);
+        s.len() - 1
+    });
+    let start = std::time::Instant::now();
+    let r = f();
+    let total = start.elapsed().as_micros();
+    let nested = IT_NESTED.with(|s| {
+        let mut s = s.borrow_mut();
+        let nested = s.pop().unwrap_or(0);
+        if let Some(parent) = s.last_mut() {
+            *parent += total;
+        }
+        nested
+    });
+    import_time_line(&(total.saturating_sub(nested)).to_string(), &total.to_string(), depth, &display_name(abs));
+    r
+}
+
 /// Import a module by absolute dotted name.
 pub fn import_absolute(abs: &str) -> PyResult {
     let active = importlib_active();
     if let Some(m) = get_loaded_module(abs) {
         // fast path: fully initialised module in sys.modules
         if !active || !spec_initializing(&m) {
+            import_time_cached(&|| display_name(abs));
             return Ok(m);
         }
     }
@@ -683,7 +805,7 @@ pub fn import_absolute(abs: &str) -> PyResult {
         let bs = bootstrap().unwrap();
         let f = ab::getattr_str(&bs, "_find_and_load")?;
         let imp = crate::builtins::builtin("__import__")?;
-        return ab::call(&f, &[&pystr::new_str(abs), &imp]).map_err(|e| {
+        return import_timed(abs, || ab::call(&f, &[&pystr::new_str(abs), &imp])).map_err(|e| {
             remove_importlib_frames();
             e
         });

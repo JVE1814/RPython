@@ -290,6 +290,21 @@ pub fn call_with_kwargs_dict(callable: &PyObject, args: &[&PyObject], kw: Option
 pub fn call_unbound(f: &PyObject, self_: &PyObject, args: &[&PyObject]) -> PyResult {
     let ft = f.ty();
     if ft.tp_flags & Py_TPFLAGS_METHOD_DESCRIPTOR != 0 {
+        // (jit5) slot dunders call Python functions with a few arguments: no heap
+        // vector, and plain functions go straight to the function call path
+        if args.len() < 4 {
+            let mut buf: [*mut PyObject; 4] = [self_.as_ptr(); 4];
+            for (i, a) in args.iter().enumerate() {
+                buf[i + 1] = a.as_ptr();
+            }
+            let n = args.len() + 1;
+            if f.is_type(crate::types::funcobject::function_type())
+                && crate::types::funcobject::func(f).vectorcall.map(|p| p as usize) == Some(crate::interp::function_vectorcall as usize)
+            {
+                return crate::interp::call_function(f, &buf[..n], n, None);
+            }
+            return unsafe { from_c(vectorcall_raw(f, buf.as_ptr(), n, std::ptr::null_mut())) };
+        }
         let mut v: Vec<&PyObject> = Vec::with_capacity(args.len() + 1);
         v.push(self_);
         v.extend_from_slice(args);

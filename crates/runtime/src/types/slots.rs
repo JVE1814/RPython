@@ -749,6 +749,22 @@ fn update_one_slot(tp: *mut PyTypeObject, slot: Slot) {
                 }
                 continue;
             }
+            if wslot != slot && is_subtype(tp, dtype) && lookup_with_owner(tp, nm).is_some_and(|(_, owner)| owner == dtype) {
+                // the name belongs to another slot of a builtin base and was inherited from
+                // it (tuple.__add__ is sq_concat, not nb_add): this slot is whatever that
+                // base has for it
+                let inherited = slot.get(dtype);
+                if inherited.is_null() {
+                    continue;
+                }
+                any = true;
+                if chosen.is_null() && !use_generic {
+                    chosen = inherited;
+                } else if chosen != inherited {
+                    use_generic = true;
+                }
+                continue;
+            }
         }
         use_generic = true;
     }
@@ -770,6 +786,7 @@ fn update_one_slot(tp: *mut PyTypeObject, slot: Slot) {
 /// Invalidate any per-type caches (method cache, version tag).
 pub fn type_modified(tp: *mut PyTypeObject) {
     unsafe {
+        crate::interp::cache::TYPE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         (*tp).tp_version_tag = 0;
         (*tp).tp_flags &= !Py_TPFLAGS_VALID_VERSION_TAG;
         for s in subclasses(tp) {
@@ -1261,7 +1278,8 @@ unsafe extern "C" fn slot_tp_descr_get(s: *mut PyObject, obj: *mut PyObject, tp:
         };
         let o = if obj.is_null() { none::none() } else { &*obj };
         let t = if tp.is_null() { none::none() } else { &*tp };
-        into_c(ab::call_unbound(&f, s, &[o, t]))
+        // called as found on the type, with the descriptor passed explicitly (no binding)
+        into_c(ab::call(&f, &[s, o, t]))
     }
 }
 unsafe extern "C" fn slot_tp_descr_set(s: *mut PyObject, obj: *mut PyObject, v: *mut PyObject) -> c_int {

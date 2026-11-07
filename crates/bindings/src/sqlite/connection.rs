@@ -477,6 +477,12 @@ fn conn_init_impl(o: &PyObject, a: &fc::VcArgs) -> PyResult<()> {
     if autocommit == 0 {
         exec_simple(c, "BEGIN")?;
     }
+    // second audit event: the database is open, hooks get the connection object
+    unsafe {
+        if capi::PySys_Audit(cs!("sqlite3.connect/handle"), cs!("O"), o.as_ptr()) < 0 {
+            return Err(PyErr);
+        }
+    }
     Ok(())
 }
 

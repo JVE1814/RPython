@@ -39,6 +39,10 @@ pub fn typeptr(a: &AtomicPtr<PyTypeObject>) -> *mut PyTypeObject {
 pub fn after_fork_child_hook() {
     // JIT code memory must not stay shared with the parent.
     crate::interp::jit::mem::after_fork_child();
+    // locks owned by threads that do not exist in the child, then those threads'
+    // thread-local values (their finalizers may warn, which takes the warnings lock)
+    crate::modules::_warnings::after_fork_child();
+    crate::modules::_thread::clear_foreign_thread_locals(crate::threads::current().c.id);
 }
 
 pub static TERMINAL_SIZE: AtomicPtr<PyTypeObject> = AtomicPtr::new(std::ptr::null_mut());

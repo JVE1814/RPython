@@ -115,15 +115,17 @@ impl<'a> Compiler<'a> {
                 }
                 let end = self.new_label();
                 self.compile_jump_if(test, true, end)?;
-                // the failure is reported at the asserted expression
-                self.set_loc(test.loc);
+                // building the AssertionError belongs to the statement; the raise itself is
+                // reported at the asserted expression
+                self.set_loc(s.loc);
                 self.emit(O::LOAD_COMMON_CONSTANT, common::ASSERTION_ERROR);
                 if let Some(m) = msg {
                     // the message travels in the self_or_null slot: AssertionError(msg)
                     self.compile_expr(m)?;
-                    self.set_loc(test.loc);
+                    self.set_loc(s.loc);
                     self.emit(O::CALL, 0);
                 }
+                self.set_loc(test.loc);
                 self.emit(O::RAISE_VARARGS, 1);
                 self.use_label(end);
                 Ok(())
@@ -1023,7 +1025,7 @@ impl<'a> Compiler<'a> {
             }
             ExprKind::Attribute { value, attr, .. } => {
                 self.compile_expr(value)?;
-                self.set_loc(t.loc);
+                self.set_loc(super::expr::attr_loc(t.loc, t, attr));
                 let m = self.mangle(attr);
                 self.emit_name(O::DELETE_ATTR, &m);
                 Ok(())

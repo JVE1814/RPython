@@ -78,9 +78,23 @@ class Template:
     @classmethod
     def _compile_pattern(cls):
         import re
-        pattern = cls.pattern
+        # A pattern that was generated from delimiter/idpattern belongs to the
+        # class it was generated for (``_pattern_auto`` set in its dict); a
+        # subclass inheriting it regenerates its own from its own attributes.
+        # A pattern a class spells out itself is inherited as is.
+        own = cls.__dict__.get('pattern', _TemplatePattern)
+        if own is not _TemplatePattern and not cls.__dict__.get('_pattern_auto'):
+            pattern = own
+            cls._pattern_auto = False
+        elif ('pattern' not in cls.__dict__
+                and not getattr(cls, '_pattern_auto', True)):
+            pattern = cls.pattern
+        else:
+            pattern = _TemplatePattern
+            cls._pattern_auto = True
         if pattern is not _TemplatePattern and not isinstance(pattern, str):
             # Already a compiled pattern object.
+            cls.pattern = pattern
             return pattern
         if pattern is _TemplatePattern:
             delim = re.escape(cls.delimiter)
@@ -103,7 +117,7 @@ class Template:
 
     @classmethod
     def _get_pattern(cls):
-        pattern = cls.pattern
+        pattern = cls.__dict__.get('pattern', _TemplatePattern)
         if pattern is _TemplatePattern or isinstance(pattern, str):
             pattern = cls._compile_pattern()
         return pattern
@@ -215,14 +229,17 @@ class Formatter:
             if field_name is not None:
                 # Automatic ('{}') and manual ('{0}') numbering cannot be
                 # mixed; auto_arg_index is False once manual numbering is used.
-                if field_name == '':
+                # The argument part ends at the first '.' or '['; an empty one
+                # ('{}', '{.attr}', '{[key]}') takes the next automatic index.
+                head = field_name.partition('.')[0].partition('[')[0]
+                if head == '':
                     if auto_arg_index is False:
                         raise ValueError('cannot switch from manual field '
                                          'specification to automatic field '
                                          'numbering')
-                    field_name = str(auto_arg_index)
+                    field_name = str(auto_arg_index) + field_name
                     auto_arg_index += 1
-                elif field_name.isdigit():
+                elif head.isdigit():
                     if auto_arg_index:
                         raise ValueError('cannot switch from automatic field '
                                          'numbering to manual field '

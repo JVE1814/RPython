@@ -259,16 +259,16 @@ fn imp_override_frozen(_m: &PyObject, v: &PyObject) -> PyResult {
     crate::frozen::set_override(n);
     Ok(none::none_ref())
 }
-static MULTI_INTERP_OVERRIDE: AtomicI32 = AtomicI32::new(-1);
+// (interp1) the override is per interpreter: subinterp::Interp::override_ext_check
 fn imp_override_multi_interp(_m: &PyObject, v: &PyObject) -> PyResult {
     let n = ab::as_i64(v)? as i32;
-    Ok(int::new_int(MULTI_INTERP_OVERRIDE.swap(n, AcqRel) as i64))
+    Ok(int::new_int(crate::subinterp::current().override_ext_check.swap(n, AcqRel) as i64))
 }
 
 // ------------------------------------------------------------------ extensions
 
 pub fn extension_suffixes() -> Vec<&'static str> {
-    vec![EXT_SUFFIX, ".abi3.so", ".so"]
+    crate::capi_ext::EXTENSION_SUFFIXES.to_vec()
 }
 fn imp_extension_suffixes(_m: &PyObject) -> PyResult {
     Ok(list::new_list(extension_suffixes().into_iter().map(pystr::new_str).collect()))
@@ -292,9 +292,10 @@ fn imp_create_dynamic(_m: &PyObject, args: &[&PyObject]) -> PyResult {
         raise!(ValueError, "embedded null character");
     }
     crate::modules::sys_full::audit("import", &[&n, &origin, none::none(), none::none(), none::none()])?;
-    crate::capi_ext::load_extension(&name, std::path::Path::new(&path))
+    crate::capi_ext::create_extension(&name, std::path::Path::new(&path), spec)
 }
-fn imp_exec_dynamic(_m: &PyObject, _module: &PyObject) -> PyResult {
+fn imp_exec_dynamic(_m: &PyObject, module: &PyObject) -> PyResult {
+    crate::capi_ext::exec_extension(module)?;
     Ok(int::new_int(0))
 }
 
@@ -379,17 +380,31 @@ fn imp_rpy_getcwd(_m: &PyObject) -> PyResult {
     use std::os::unix::ffi::OsStrExt;
     Ok(crate::modules::_thread::decode_surrogateescape(d.as_os_str().as_bytes()))
 }
+/// `_imp._set_lazy_attributes(module, name)`: called once `name` has been imported, so its pending
+/// lazily imported submodules become reachable as attributes. Our module attribute lookup
+/// already falls back to pending `sys.lazy_modules` entries (types/lazyimport.rs), so
+/// nothing has to be stored; the call only validates its arguments.
+fn imp_set_lazy_attributes(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    if args.len() != 2 {
+        raise!(TypeError, "_set_lazy_attributes expected 2 arguments, got {}", args.len());
+    }
+    if !pystr::is_str(args[1]) {
+        raise!(TypeError, "_set_lazy_attributes() argument 2 must be str, not {}", crate::types::typeobject::tname(args[1]));
+    }
+    Ok(crate::types::none::none_ref())
+}
+
 fn imp_rpy_read_file(_m: &PyObject, p: &PyObject) -> PyResult {
     let path = path_arg(p)?;
     let data = crate::threads::blocking(|| std::fs::read(&path)).map_err(|e| os_err(e, &path))?;
     Ok(bytes::new_bytes(&data))
 }
 
-/// pyc magic: 3690..3699 (the top of the 3.15 range, 2900+50*15, unlikely to collide
-/// with CPython's own) selected by a hash of the compiler sources (stale caches written
-/// by an older compiler are never reused) and by the marshal layout of code objects
-/// (`marshal::CODE_FORMAT`), then "\r\n".
-pub const MAGIC: u32 = (3690 + (rpy_compiler::BYTECODE_HASH % 10 + crate::modules::marshal::CODE_FORMAT) % 10) | ((b'\r' as u32) << 16) | ((b'\n' as u32) << 24);
+/// pyc magic number: CPython 3.15's own (3666, then "\r\n"; D25). Our code objects marshal to
+/// CPython 3.15's format (public wordcode, same field layout), so cache files are
+/// interchangeable with CPython's. Our own stale caches (written by an older compiler) are
+/// detected by `_rpy_compiler_epoch`, see SourceFileLoader in importlib.
+pub const MAGIC: u32 = 3666 | ((b'\r' as u32) << 16) | ((b'\n' as u32) << 24);
 
 pub fn init_module() -> PyResult {
     let m = crate::types::module::new_module("_imp")?;
@@ -420,11 +435,13 @@ pub fn init_module() -> PyResult {
             ("_rpy_listdir", O, imp_rpy_listdir),
             ("_rpy_getcwd", NOARGS, imp_rpy_getcwd),
             ("_rpy_read_file", O, imp_rpy_read_file),
+            ("_set_lazy_attributes", FAST, imp_set_lazy_attributes),
         ],
         Some(&m),
     )?;
     let chk = crate::modules::sys_full::config().check_hash_based_pycs.clone();
     dict::set_item_str(&d, "check_hash_based_pycs", &pystr::new_str(&chk))?;
-    dict::set_item_str(&d, "pyc_magic_number_token", &int::new_int(if crate::types::code::public_mode() { (MAGIC + 50) as i64 } else { MAGIC as i64 }))?;
+    dict::set_item_str(&d, "pyc_magic_number_token", &int::new_int(MAGIC as i64))?;
+    dict::set_item_str(&d, "_rpy_compiler_epoch", &crate::types::float::new_float(rpy_compiler::COMPILER_EPOCH))?;
     Ok(m)
 }

@@ -135,6 +135,23 @@ pub struct Unit<'a> {
     pub flags: u32,
     /// fold global/builtin values into constants (off after repeated invalidation)
     pub fold_globals: bool,
+    /// (jit5) earlier code of this unit was discarded: monomorphic attribute sites
+    /// get a generic slow path instead of a deoptimising guard (no deopt churn when
+    /// a site turns polymorphic after compilation)
+    pub cautious: bool,
+}
+
+impl Unit<'_> {
+    /// (jit6) generic path instead of a deoptimising guard at this instruction: it
+    /// trapped repeatedly in earlier code (CodeCaches::traps), or, when no trap was
+    /// recorded, earlier code of the unit was discarded
+    fn cautious_at(&self, ins: crate::interp::jit::analysis::Instr) -> bool {
+        let t = self.cd.caches.traps.lock().unwrap_or_else(|e| e.into_inner());
+        if t.iter().any(|&(p, n)| n >= 2 && (p == ins.start || p == ins.pc)) {
+            return true;
+        }
+        self.cautious && t.is_empty()
+    }
 }
 
 struct BcBlock {
@@ -290,6 +307,8 @@ pub struct Built {
 struct B<'a> {
     u: &'a Unit<'a>,
     cfg: Cfg,
+    /// (jit6) further instructions an instruction consumed (fused UnpackSequence + StoreFast)
+    skip_extra: usize,
     f: Func,
     cur: BlockId,
     st: State,
@@ -1188,7 +1207,7 @@ impl<'a> B<'a> {
                 break;
             }
             let consumed_next = self.instr(i, last)?;
-            i += 1 + consumed_next as usize;
+            i += 1 + consumed_next as usize + std::mem::take(&mut self.skip_extra);
         }
         if !self.closed {
             // fall through into the next block
@@ -1340,6 +1359,14 @@ impl<'a> B<'a> {
                     self.discard(a, k);
                     self.push(AV::Bool(r));
                 }
+                AV::I64(v) => {
+                    // (jit6) unboxed int: no template (an inlined callee testing an int
+                    // argument used to roll back here)
+                    let r = self.v(Class::G);
+                    self.emit(Inst::SetCond(r, Cond::Test(v, Opnd::V(v), if ins.op == Op::UnaryNot { Cc::E } else { Cc::NE })));
+                    self.pop();
+                    self.push(AV::Bool(r));
+                }
                 AV::InFrame(_) | AV::Obj(..) => {
                     // truth of any object: True/False/None without a call, otherwise
                     // the object's truth protocol (may run arbitrary code)
@@ -1460,12 +1487,18 @@ impl<'a> B<'a> {
             Op::LoadMethod => self.load_method(i),
             Op::StoreAttr => self.store_attr(i),
             Op::Call => {
+                if self.try_range_iter(i, last) {
+                    return Ok(true);
+                }
+                if self.try_method_builtin(i) {
+                    return Ok(false);
+                }
                 if !self.try_builtin(i) && !self.try_inline(i)? && !self.try_inline_new(i)? {
                     self.template(i);
                 }
             }
             Op::StoreSubscr => self.store_subscr(i),
-            Op::UnpackSequence => self.unpack_sequence(i),
+            Op::UnpackSequence => self.unpack_sequence(i, last),
             Op::DeleteFast | Op::LoadFastAndClear => self.template(i),
             _ => {
                 self.template(i);
@@ -1594,6 +1627,10 @@ impl<'a> B<'a> {
             return None;
         }
         let key = nm.as_ptr() as usize;
+        // rebound after an earlier fold: read it through the cache instead
+        if super::unstable_key(gp as usize, nm.as_ptr()) || super::unstable_key(bp as usize, nm.as_ptr()) {
+            return None;
+        }
         let (v, from_builtins) = match crate::types::dict::get_item_str(g, nm) {
             Some(v) => (v, false),
             None => (crate::types::dict::get_item_str(b, nm)?, true),
@@ -2125,7 +2162,7 @@ impl<'a> B<'a> {
             return;
         }
         let snap = self.snap(i, SnapKind::Deopt);
-        if es.len() == 1 && cases[0].kind != kind::INSTANCE_DICT {
+        if es.len() == 1 && cases[0].kind != kind::INSTANCE_DICT && !self.u.cautious_at(self.u.an.instrs[i]) {
             // monomorphic slot / class attribute: no slow path needed
             let s = cases[0];
             let p = self.guard_tag(1, s.a as u32, snap);
@@ -2151,7 +2188,7 @@ impl<'a> B<'a> {
         let cont = self.new_block(u32::MAX);
         let slow = self.new_block(u32::MAX);
         let p;
-        let bodies = if es.len() == 1 {
+        let bodies = if es.len() == 1 && !self.u.cautious_at(self.u.an.instrs[i]) {
             p = self.guard_tag(1, cases[0].a as u32, snap);
             vec![self.cur]
         } else {
@@ -2194,15 +2231,57 @@ impl<'a> B<'a> {
             // (cache misses refresh the adaptive view of the running instruction)
             self.emit(Inst::SetLasti(self.u.an.instrs[i].pc));
         }
+        let e0 = if self.inl.is_none() { Some(self.epoch_load()) } else { None };
         self.emit(Inst::Call { addr: h2_load_attr as usize, args: vec![Opnd::V(p), Opnd::I(name as i64), Opnd::I(ea)], fargs: vec![], ret: Some(r), fret: None });
         self.emit(Inst::Guard(Cond::Test(r, Opnd::V(r), Cc::E), esnap));
+        if let Some(e0) = e0 {
+            self.epoch_check(i, e0, false, Some(r));
+        }
         self.emit(Inst::Mov(res, r));
         self.term(Term::Jump(cont));
         self.switch_to(cont);
+        if self.inl.is_some() {
+            self.forget_tags(); // (no resumable snapshot inside an inlined callee)
+        }
         let k = self.st.stack.len() - 1;
         let a = self.pop();
         self.discard(a, k);
         self.push(AV::Obj(res, Own::Owned, Ty::Unknown));
+    }
+
+    /// Current value of the type epoch (cache::TYPE_EPOCH).
+    fn epoch_load(&mut self) -> V {
+        let a = self.imm(&crate::interp::cache::TYPE_EPOCH as *const _ as i64);
+        let v = self.v(Class::G);
+        self.emit(Inst::Load(v, Base::V(a), 0));
+        v
+    }
+
+    /// After a generic attribute call (which may run arbitrary code: __getattr__,
+    /// properties, descriptors): if a type was modified or an object's class reassigned
+    /// meanwhile (epoch differs from `e0`), the type facts of this unit may be stale, so
+    /// deoptimise, resuming after instruction i with the operands popped (the receiver
+    /// released; for a store the value below it was consumed) and `result` pushed.
+    fn epoch_check(&mut self, i: usize, e0: V, store: bool, result: Option<V>) {
+        let e1 = self.epoch_load();
+        let chg = self.new_block(u32::MAX);
+        let ok = self.new_block(u32::MAX);
+        self.term(Term::Branch(Cond::Cmp(e1, Opnd::V(e0), Cc::NE), chg, ok));
+        self.switch_to(chg);
+        let saved = self.st.clone();
+        let k = self.st.stack.len() - 1;
+        let a = self.pop();
+        self.discard(a, k);
+        if store {
+            self.pop();
+        }
+        if let Some(r) = result {
+            self.push(AV::Obj(r, Own::Owned, Ty::Unknown));
+        }
+        let s = self.snap_next(i);
+        self.term(Term::Deopt(s));
+        self.st = saved;
+        self.switch_to(ok);
     }
 
     /// Value of attribute `name` of a module object folded into the code, with a
@@ -2222,7 +2301,7 @@ impl<'a> B<'a> {
                 return None;
             }
             let d = crate::types::module::m(mo).md_dict;
-            if d.is_null() || !crate::types::dict::is_dict_exact(&*d) {
+            if d.is_null() || !crate::types::dict::is_dict_exact(&*d) || super::unstable_key(d as usize, nm.as_ptr()) {
                 return None;
             }
             let v = crate::types::dict::get_item_str(&*d, nm)?;
@@ -2246,7 +2325,18 @@ impl<'a> B<'a> {
         // no dict and no values: nothing can shadow
         self.term(Term::Branch(Cond::Test(w, Opnd::V(w), Cc::E), cont, check));
         self.switch_to(check);
-        self.check(Cond::Test(w, Opnd::I(1), Cc::E), f);
+        // a real instance dict (objects that outgrew their inline values): look the
+        // name up instead of deoptimising
+        let _ = f;
+        let in_dict = self.new_block(u32::MAX);
+        let values = self.new_block(u32::MAX);
+        self.term(Term::Branch(Cond::Test(w, Opnd::I(1), Cc::E), in_dict, values));
+        self.switch_to(in_dict);
+        let rd = self.v(Class::G);
+        self.emit(Inst::Call { addr: h2_dict_lacks as usize, args: vec![Opnd::V(w), Opnd::I(name as i64)], fargs: vec![], ret: Some(rd), fret: None });
+        self.emit(Inst::Guard(Cond::Test(rd, Opnd::V(rd), Cc::E), snap));
+        self.term(Term::Jump(cont));
+        self.switch_to(values);
         let sh = self.shape_of(w);
         let cell = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0))) as *const _ as usize;
         self.cells.push(cell);
@@ -2422,9 +2512,16 @@ impl<'a> B<'a> {
             // (cache misses refresh the adaptive view of the running instruction)
             self.emit(Inst::SetLasti(self.u.an.instrs[i].pc));
         }
+        let e0 = if self.inl.is_none() { Some(self.epoch_load()) } else { None };
         self.emit(Inst::CallChecked { addr: h2_store_attr as usize, args: vec![Opnd::V(p), Opnd::I(name as i64), Opnd::V(val), Opnd::I(ea)], err: esnap });
+        if let Some(e0) = e0 {
+            self.epoch_check(i, e0, true, None);
+        }
         self.term(Term::Jump(cont));
         self.switch_to(cont);
+        if self.inl.is_some() {
+            self.forget_tags();
+        }
         // value moved into the object / released by the runtime
         let k = self.st.stack.len() - 1;
         let a = self.pop();
@@ -2452,6 +2549,91 @@ impl<'a> B<'a> {
             }
             std::ffi::CStr::from_ptr((*ml).ml_name).to_str().ok()
         }
+    }
+
+    /// `iter(range(...))` (a Call of the builtin range directly followed by GetIter in
+    /// the same block): the range iterator is created by one helper call, without
+    /// the argument tuple, the range object and its int fields. True: instruction
+    /// i + 1 was consumed too.
+    fn try_range_iter(&mut self, i: usize, last: usize) -> bool {
+        let n = self.u.an.instrs[i].arg as usize;
+        if i + 1 > last || self.u.an.instrs[i + 1].op != Op::GetIter || !(1..=3).contains(&n) || self.inl.is_some() {
+            return false;
+        }
+        let d = self.st.stack.len();
+        let AV::Const(fp) = self.st.stack[d - n - 2] else { return false };
+        if !matches!(self.st.stack[d - n - 1], AV::Null) || fp != crate::types::range::range_type() as usize {
+            return false;
+        }
+        let esnap = self.snap(i, SnapKind::Error);
+        let mut args = Vec::new();
+        for k in (1..=n).rev() {
+            args.push(Opnd::V(self.peek_ptr(k)));
+        }
+        while args.len() < 3 {
+            args.push(Opnd::I(0));
+        }
+        args.push(Opnd::I(n as i64));
+        let r = self.v(Class::G);
+        self.emit(Inst::Call { addr: h2_range_iter as usize, args, fargs: vec![], ret: Some(r), fret: None });
+        self.emit(Inst::Guard(Cond::Test(r, Opnd::V(r), Cc::E), esnap));
+        for _ in 0..n {
+            let k = self.st.stack.len() - 1;
+            let a = self.pop();
+            self.discard(a, k);
+        }
+        self.pop(); // NULL
+        self.pop(); // range (a constant)
+        self.push(AV::Obj(r, Own::Owned, Ty::Unknown));
+        true
+    }
+
+    /// Calls of a few builtin methods found by LoadMethod (stack: [descriptor, receiver,
+    /// args...]): dict.get and list.append go straight to their implementation
+    /// instead of through the generic call (descriptor vectorcall, argument checks).
+    fn try_method_builtin(&mut self, i: usize) -> bool {
+        let n = self.u.an.instrs[i].arg as usize;
+        let d = self.st.stack.len();
+        if d < n + 2 {
+            return false;
+        }
+        let AV::Const(dp) = self.st.stack[d - n - 2] else { return false };
+        if matches!(self.st.stack[d - n - 1], AV::Null) {
+            return false;
+        }
+        let Some((tp, name)) = (unsafe { method_descr_name(dp) }) else { return false };
+        let helper = if tp == crate::types::dict::dict_type() as usize && name == "get" && (n == 1 || n == 2) {
+            h2_dict_get as usize
+        } else if tp == list_t() && name == "append" && n == 1 {
+            h2_list_append as usize
+        } else {
+            return false;
+        };
+        let esnap = self.snap(i, SnapKind::Error);
+        let recv = self.peek_ptr(n + 1);
+        let a1 = self.peek_ptr(n);
+        let a2 = if n == 2 { Opnd::V(self.peek_ptr(1)) } else { Opnd::I(0) };
+        // a key's __hash__/__eq__ may run Python code (exact str/int keys do not)
+        let key_ty = self.ty_of(&self.peek(n));
+        let safe_key = key_ty.is(crate::types::str::str_type()) || key_ty.is(int_t() as *mut PyTypeObject);
+        let r = self.v(Class::G);
+        self.emit(Inst::Call { addr: helper, args: vec![Opnd::V(recv), Opnd::V(a1), a2], fargs: vec![], ret: Some(r), fret: None });
+        self.emit(Inst::Guard(Cond::Test(r, Opnd::V(r), Cc::E), esnap));
+        for _ in 0..n + 1 {
+            let k = self.st.stack.len() - 1;
+            let a = self.pop();
+            self.discard(a, k);
+        }
+        self.pop(); // the descriptor (a constant)
+        if helper == h2_list_append as usize {
+            self.push(AV::Const(none_p()));
+        } else {
+            if !safe_key {
+                self.forget_tags();
+            }
+            self.push(AV::Obj(r, Own::Owned, Ty::Unknown));
+        }
+        true
     }
 
     /// Calls of a few builtins compiled inline: len() of lists/tuples/dicts/strs.
@@ -2721,6 +2903,7 @@ impl<'a> B<'a> {
             invalid_flag: self.u.invalid_flag,
             flags: co.co_flags as u32,
             fold_globals: self.u.fold_globals,
+            cautious: self.u.cautious,
         });
         self.inl_units.push(unit);
         let up: &'a Unit<'a> = unsafe { &*(&**self.inl_units.last().unwrap() as *const Unit<'static> as *const Unit<'a>) };
@@ -3157,7 +3340,7 @@ impl<'a> B<'a> {
         self.pop();
     }
 
-    fn unpack_sequence(&mut self, i: usize) {
+    fn unpack_sequence(&mut self, i: usize, last: usize) {
         let ins = self.u.an.instrs[i];
         let n = ins.arg as usize;
         let (pa, _) = self.prof(i);
@@ -3188,7 +3371,7 @@ impl<'a> B<'a> {
             self.term(Term::Jump(join));
             self.switch_to(join);
             self.emit(Inst::Guard(Cond::CmpMem(Base::V(s), LIST_SIZE, n as i64, Cc::NE), snap));
-            self.unpack_items(n, (items, 0));
+            self.unpack_or_fuse(i, last, n, (items, 0));
             return;
         }
         let tp = if is_list { list_t() } else { tuple_t() };
@@ -3206,7 +3389,65 @@ impl<'a> B<'a> {
         } else {
             (s, TUPLE_ITEMS)
         };
-        self.unpack_items(n, base);
+        self.unpack_or_fuse(i, last, n, base);
+    }
+
+    /// (jit6) `a, b, c, ... = seq` with every target a distinct frame-represented
+    /// local: one call to `h2_unpack_store` instead of n inline incref/store/decref
+    /// sequences (the inline form is ~1.8 KB of machine code per statement, which
+    /// made functions with many such statements instruction-fetch bound). Otherwise
+    /// the items are pushed as usual.
+    fn unpack_or_fuse(&mut self, i: usize, last: usize, n: usize, base: (V, i32)) {
+        let ok = n >= 4 && n <= 15 && i + n <= last && self.inl.is_none() && {
+            let mut seen = Vec::with_capacity(n);
+            (1..=n).all(|k| {
+                let ins = self.u.an.instrs[i + k];
+                let li = ins.arg as usize;
+                let fine = ins.op == Op::StoreFast && li < 255 && self.reps[li] == Rep::Frame && !seen.contains(&li);
+                seen.push(li);
+                fine
+            })
+        };
+        if !ok {
+            self.unpack_items(n, base);
+            return;
+        }
+        let targets: Vec<u32> = (1..=n).map(|k| self.u.an.instrs[i + k].arg).collect();
+        for &t in &targets {
+            self.unborrow(t);
+            let dummy = AV::Obj(0, Own::Owned, Ty::Unknown);
+            self.note_store_kind(t as usize, &dummy);
+        }
+        let items = if base.1 == 0 {
+            base.0
+        } else {
+            let p = self.v(Class::G);
+            self.emit(Inst::Lea(p, Base::V(base.0), base.1));
+            p
+        };
+        let sl = self.v(Class::G);
+        self.emit(Inst::SlotAddr(sl, 0));
+        let (mut lo, mut hi) = (0u64, (n as u64) << 56);
+        for (k, &t) in targets.iter().enumerate() {
+            if k < 8 {
+                lo |= (t as u64) << (8 * k);
+            } else {
+                hi |= (t as u64) << (8 * (k - 8));
+            }
+        }
+        self.emit(Inst::Call { addr: h2_unpack_store as usize, args: vec![Opnd::V(items), Opnd::V(sl), Opnd::I(lo as i64), Opnd::I(hi as i64)], fargs: vec![], ret: None, fret: None });
+        // the old values' release may run arbitrary code
+        self.forget_tags();
+        let k = self.st.stack.len() - 1;
+        let a = self.pop();
+        self.discard(a, k);
+        for &t in &targets {
+            let li = t as usize;
+            self.st.locals[li] = LS::Frame(Ty::Unknown);
+            self.st.ptr[li] = None;
+            self.st.unb[li] = None;
+        }
+        self.skip_extra = n;
     }
 
     /// Push the n items at `base` (incref'd, last item deepest) in place of the
@@ -3247,6 +3488,33 @@ pub extern "C" fn h_fpow(x: f64, y: f64) -> f64 {
 
 /// Does shape `sh` lack attribute `name` (interned)? If so remember the shape in the
 /// site's memo cell. 1: lacks it, 0: has it (or no shape).
+/// Does instance dict `d` (an exact dict) certainly lack the interned str `name`? 1 if
+/// so; 0 if it has it or the answer would need a comparison that can run code (a
+/// non-str key with the same hash) or a long scan. Only reads the entries.
+pub unsafe extern "C" fn h2_dict_lacks(d: *mut PyObject, name: *mut PyObject) -> u64 {
+    unsafe {
+        let d = &*d;
+        if !crate::types::dict::is_dict_exact(d) {
+            return 0;
+        }
+        let t = crate::types::dict::table(d);
+        let es = t.entries();
+        if es.len() > 64 {
+            return 0;
+        }
+        let h = crate::types::str::str_hash(&*name);
+        for e in es {
+            if e.key.is_null() || e.value.is_null() || e.hash != h {
+                continue;
+            }
+            if e.key == name || !crate::types::str::is_str_exact(&*e.key) || crate::types::str::str_eq(&*e.key, &*name) {
+                return 0;
+            }
+        }
+        1
+    }
+}
+
 pub unsafe extern "C" fn h_shape_lacks(sh: *const crate::shape::Shape, name: *mut PyObject, cell: *const std::sync::atomic::AtomicUsize) -> u64 {
     unsafe {
         if sh.is_null() {
@@ -3257,6 +3525,102 @@ pub unsafe extern "C" fn h_shape_lacks(sh: *const crate::shape::Shape, name: *mu
         }
         (*cell).store(sh as usize, std::sync::atomic::Ordering::Relaxed);
         1
+    }
+}
+
+/// (defining type, name) of a builtin method descriptor.
+unsafe fn method_descr_name(p: usize) -> Option<(usize, &'static str)> {
+    unsafe {
+        let o = &*(p as *mut PyObject);
+        if !o.is_type(crate::types::descr::method_descr_type()) {
+            return None;
+        }
+        let md = p as *mut PyMethodDescrObject;
+        let ml = (*md).d_method;
+        if ml.is_null() || (*ml).ml_name.is_null() {
+            return None;
+        }
+        let tp = (*md).d_common.d_type as usize;
+        std::ffi::CStr::from_ptr((*ml).ml_name).to_str().ok().map(|s| (tp, s))
+    }
+}
+
+/// dict.get(key[, default]) (try_method_builtin): `d` is a dict (or subclass), the
+/// default NULL when absent. New reference, or NULL with an exception set.
+pub unsafe extern "C" fn h2_dict_get(d: *mut PyObject, key: *mut PyObject, dflt: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        match crate::types::dict::get_item(&*d, &*key) {
+            Ok(Some(v)) => v.into_raw(),
+            Ok(None) => {
+                let r = if dflt.is_null() { crate::types::none::none().as_ptr() } else { dflt };
+                crate::object::incref(r);
+                r
+            }
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+}
+
+/// list.append(x) (try_method_builtin): 1, or 0 with an exception set.
+pub unsafe extern "C" fn h2_list_append(l: *mut PyObject, x: *mut PyObject, _unused: *mut PyObject) -> u64 {
+    unsafe {
+        crate::types::list::append(&*l, (*x).to_ref());
+        1
+    }
+}
+
+/// (jit6) Fused `UnpackSequence n` + n `StoreFast` (`unpack_or_fuse`): `items` are the
+/// sequence's n items (borrowed); local slot k gets item k. Slot indices are bytes:
+/// items 0..8 in `lo`, 8..15 in `hi`, n in the top byte of `hi`. All items are
+/// referenced before any old value is released (a release may run arbitrary code
+/// that drops the sequence).
+pub unsafe extern "C" fn h2_unpack_store(items: *const *mut PyObject, slots: *mut *mut PyObject, lo: u64, hi: u64) {
+    unsafe {
+        let n = ((hi >> 56) as usize).min(15);
+        let idx: [u8; 16] = std::mem::transmute([lo.to_le(), hi.to_le()]);
+        let mut old: [std::mem::MaybeUninit<*mut PyObject>; 15] = [std::mem::MaybeUninit::uninit(); 15];
+        for k in 0..n {
+            let x = *items.add(k);
+            crate::object::incref(x);
+            let s = slots.add(*idx.get_unchecked(k) as usize);
+            old.get_unchecked_mut(k).write(*s);
+            *s = x;
+        }
+        for k in 0..n {
+            crate::object::xdecref(old.get_unchecked(k).assume_init());
+        }
+    }
+}
+
+/// `iter(range(*args))` (try_range_iter): borrowed arguments, n of them (1..=3).
+/// New reference, or NULL with an exception set.
+pub unsafe extern "C" fn h2_range_iter(a: *mut PyObject, b: *mut PyObject, c: *mut PyObject, n: u64) -> *mut PyObject {
+    unsafe {
+        let args: [*mut PyObject; 3] = [a, b, c];
+        let args = &args[..n as usize];
+        let mut v = [0i64; 3];
+        let mut fast = true;
+        for (k, &p) in args.iter().enumerate() {
+            match crate::types::int::is_int_exact(&*p).then(|| crate::types::int::as_i64(&*p)).flatten() {
+                Some(x) => v[k] = x,
+                None => fast = false,
+            }
+        }
+        if fast {
+            let (start, stop, step) = match n {
+                1 => (0, v[0], 1),
+                2 => (v[0], v[1], 1),
+                _ => (v[0], v[1], v[2]),
+            };
+            if step != 0 {
+                return crate::types::range::iter_i64(start, stop, step).into_raw();
+            }
+        }
+        // anything else: the real range() (errors, __index__) and iter()
+        let refs: Vec<&PyObject> = args.iter().map(|&p| &*p).collect();
+        let r = crate::abstract_::call(crate::types::typeobject::type_obj(crate::types::range::range_type()), &refs)
+            .and_then(|r| crate::abstract_::get_iter(&r));
+        crate::errors::into_c(r)
     }
 }
 
@@ -3432,6 +3796,7 @@ fn build_once(u: &Unit, reps: &[Rep], assume: &mut Vec<Option<State>>) -> Result
         is_gen: !resumes.is_empty(),
         inl_outer: Vec::new(),
         fatal: None,
+        skip_extra: 0,
         inl_cds: vec![u.cd as *const CodeData as usize],
     };
     // OSR unit / generator resumption: a separate entry block unboxes the unboxed

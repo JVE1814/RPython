@@ -158,7 +158,10 @@ fn object_get_class(o: &PyObject) -> PyResult {
     Ok(type_ref(o.type_ptr()))
 }
 
-fn compatible_for_assignment(old: *mut PyTypeObject, new: *mut PyTypeObject) -> bool {
+/// Whether instances laid out for `old` can be treated as `new` instances. For `__bases__`
+/// assignment, `owner` is the class whose base changes: storage the new base needs in the
+/// pre-header (managed `__dict__` / `__weakref__`) may also come from `owner` itself.
+fn compatible_for_assignment(old: *mut PyTypeObject, new: *mut PyTypeObject, owner: Option<*mut PyTypeObject>) -> bool {
     unsafe {
         let mut o = old;
         while is_heap_type(o) && (*o).tp_dealloc == Some(subtype_dealloc) && (*o).tp_basicsize == (*(*o).tp_base).tp_basicsize {
@@ -171,10 +174,25 @@ fn compatible_for_assignment(old: *mut PyTypeObject, new: *mut PyTypeObject) -> 
         if (*old).tp_basicsize != (*new).tp_basicsize || (*old).tp_itemsize != (*new).tp_itemsize {
             return false;
         }
-        if ((*old).tp_flags ^ (*new).tp_flags) & (Py_TPFLAGS_PREHEADER | Py_TPFLAGS_HAVE_GC) != 0 {
+        match owner {
+            None => {
+                if ((*old).tp_flags ^ (*new).tp_flags) & Py_TPFLAGS_PREHEADER != 0 {
+                    return false;
+                }
+            }
+            Some(t) => {
+                if (*new).tp_flags & Py_TPFLAGS_PREHEADER & !(*t).tp_flags != 0 {
+                    return false;
+                }
+            }
+        }
+        // every class statement makes a GC type, so GC-ness is compared where the classes
+        // that add nothing to the layout end
+        if ((*o).tp_flags ^ (*n).tp_flags) & Py_TPFLAGS_HAVE_GC != 0 {
             return false;
         }
-        if (*old).tp_dictoffset != (*new).tp_dictoffset {
+        let managed = |t: *mut PyTypeObject| (*t).tp_flags & Py_TPFLAGS_MANAGED_DICT != 0;
+        if (*old).tp_dictoffset != (*new).tp_dictoffset && !(owner.is_some() && (managed(old) || managed(new))) {
             return false;
         }
         solid_base(o) == solid_base(n) || o == n || same_slots_added(o, n)
@@ -217,7 +235,7 @@ fn object_set_class(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
             raise!(TypeError, "__class__ assignment only supported for mutable types or ModuleType subclasses");
         }
     }
-    if !compatible_for_assignment(old, new) {
+    if !compatible_for_assignment(old, new, None) {
         raise!(
             TypeError,
             "__class__ assignment: '{}' object layout differs from '{}'",
@@ -226,6 +244,7 @@ fn object_set_class(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         );
     }
     // shapes belong to the old type: move inline values into a real dict first
+    crate::interp::cache::TYPE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     crate::shape::materialize(o);
     unsafe {
         incref(new as *mut PyObject);
@@ -709,7 +728,7 @@ fn type_set_bases(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         }
     }
     let new_base = best_base(v)?;
-    if !compatible_for_assignment(unsafe { (*tp).tp_base }, new_base) {
+    if !compatible_for_assignment(unsafe { (*tp).tp_base }, new_base, Some(tp)) {
         raise!(
             TypeError,
             "__bases__ assignment: '{}' object layout differs from '{}'",
@@ -1168,6 +1187,12 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
         }
         bases.to_ref()
     };
+    for b in tuple::tuple_items(&bases_owned) {
+        // a base still inside its own creation (its mro() is running) has no MRO yet
+        if is_type(b) && is_heap_type(as_type(b)) && unsafe { (*as_type(b)).tp_mro.is_null() } {
+            raise!(TypeError, "Cannot extend an incomplete type '{}'", type_name(unsafe { &*as_type(b) }));
+        }
+    }
     let base = best_base(&bases_owned)?;
     // a dict subclass with its own iteration order (OrderedDict) is copied in
     // that order
@@ -1186,6 +1211,17 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
     if pystr::as_utf8(nm)?.contains('\0') {
         raise!(ValueError, "type name must not contain null characters");
     }
+    // attribute lookup only ever finds str keys: say so when the namespace has others
+    {
+        let mut pos = 0usize;
+        while let Some((k, _)) = dict::next_entry(&dict, &mut pos) {
+            if !pystr::is_str(&k) {
+                let msg = format!("non-string key in the __dict__ of class {}", name_s);
+                crate::modules::warnings::warn(crate::types::exceptions::RuntimeWarning(), &msg, 1)?;
+                break;
+            }
+        }
+    }
 
     // __slots__
     let slots = dict::get_item_str(&dict, name!("__slots__"));
@@ -1198,12 +1234,18 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
     match &slots {
         None => {
             add_dict = !base_has_dict;
-            add_weak = !base_has_weak;
+            // variable-size instances get a weak-reference slot only on request
+            // (`__slots__ = ['__weakref__']`)
+            add_weak = !base_has_weak && unsafe { (*base).tp_itemsize == 0 };
         }
         Some(s) => {
             let seq: Vec<PyRef> = if pystr::is_str(s) { vec![s.clone()] } else { ab::collect_iterable(s)? };
+            // Variable-size bases: `__dict__` / `__weakref__` live in the pre-header, so they
+            // are always possible; named slots only for tuple subclasses (stored after the
+            // items, see `descr::member_addr`).
+            let named = seq.iter().any(|s| !pystr::is_str(s) || !(pystr::str_eq_ascii(s, "__dict__") || pystr::str_eq_ascii(s, "__weakref__")));
             unsafe {
-                if !seq.is_empty() && (*base).tp_itemsize != 0 {
+                if named && (*base).tp_itemsize != 0 && !is_subtype(base, crate::types::tuple::tuple_type()) {
                     raise!(
                         TypeError,
                         "nonempty __slots__ not supported for subtype of '{}'",
@@ -1357,6 +1399,9 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
         }
         // layout
         let mut slotoffset = (*base).tp_basicsize as usize;
+        // named slots of a tuple subclass follow the (variable) items
+        let after_items = nslots > 0 && (*base).tp_itemsize != 0;
+        let items_start = std::mem::offset_of!(PyTupleObject, ob_item);
         let members_ptr = (tp_obj as *mut u8).add(std::mem::size_of::<PyHeapTypeObject>()) as *mut PyMemberDef;
         let mut mvec: Vec<PyMemberDef> = Vec::with_capacity(nslots + 1);
         for s in slot_names.iter() {
@@ -1368,8 +1413,8 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
             mvec.push(PyMemberDef {
                 name: crate::methods::cstr_static(&sname),
                 type_code: Py_T_OBJECT_EX,
-                offset: slotoffset as isize,
-                flags: 0,
+                offset: if after_items { crate::types::descr::after_items_offset(slotoffset - items_start) } else { slotoffset as isize },
+                flags: if after_items { crate::types::descr::RPY_MEMBER_AFTER_ITEMS } else { 0 },
                 doc,
             });
             slotoffset += 8;
@@ -1402,6 +1447,7 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
         }
         // inherit preheader flags from base
         (*tp).tp_flags |= (*base).tp_flags & Py_TPFLAGS_PREHEADER;
+        (*tp).tp_flags |= (*base).tp_flags & Py_TPFLAGS_ITEMS_AT_END;
         (*tp).tp_flags |= (*base).tp_flags & Py_TPFLAGS_INLINE_VALUES;
         // managed slots report CPython's sentinel offsets, which C extensions test against 0
         // ("instances have a __dict__ / are weakly referenceable"; msgspec reads them)
@@ -1499,10 +1545,31 @@ fn shared_subtype_descr(which: usize) -> PyRef {
     unsafe { PyRef::from_borrowed(p as *mut PyObject) }
 }
 
+/// For an instance of a class deriving from a builtin type that keeps its own instance
+/// dict (module, function, ...): that builtin's `__dict__` descriptor, which the shared
+/// descriptor defers to (a module's dict cannot be replaced, for example).
+fn builtin_dict_descr(o: &PyObject) -> Option<PyRef> {
+    unsafe {
+        let mut t = o.type_ptr();
+        while !t.is_null() {
+            if !is_heap_type(t) && t != object_type() && ((*t).tp_dictoffset != 0 || (*t).tp_flags & Py_TPFLAGS_MANAGED_DICT != 0) {
+                return lookup(t, name!("__dict__")).filter(|x| !x.is(&shared_subtype_descr(0)));
+            }
+            t = (*t).tp_base;
+        }
+        None
+    }
+}
+
 fn subtype_get_dict(o: &PyObject) -> PyResult {
     if is_type(o) {
         // classes: the type's own __dict__ (a read-only proxy)
         return type_get_dict(o);
+    }
+    if let Some(d) = builtin_dict_descr(o) {
+        if let Some(get) = d.ty().tp_descr_get {
+            return unsafe { from_c(get(d.as_ptr(), o.as_ptr(), o.type_ptr() as *mut PyObject)) };
+        }
     }
     match instance_dict(o) {
         Some(d) => Ok(d),
@@ -1512,6 +1579,13 @@ fn subtype_get_dict(o: &PyObject) -> PyResult {
 fn subtype_set_dict(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     if is_type(o) {
         raise!(AttributeError, "attribute '__dict__' of 'type' objects is not writable");
+    }
+    if let Some(d) = builtin_dict_descr(o) {
+        let Some(set) = d.ty().tp_descr_set else {
+            raise!(AttributeError, "attribute '__dict__' of '{}' objects is not writable", tname(o));
+        };
+        let r = unsafe { set(d.as_ptr(), o.as_ptr(), v.map_or(std::ptr::null_mut(), |v| v.as_ptr())) };
+        return if r < 0 { Err(PyErr) } else { Ok(()) };
     }
     unsafe {
         let slot = dict_slot(o.as_ptr());

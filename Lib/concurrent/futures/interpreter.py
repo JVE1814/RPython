@@ -87,10 +87,6 @@ class InterpreterPoolExecutor(_thread_pool.ThreadPoolExecutor):
         """Like ThreadPoolExecutor, but each worker thread runs the tasks in
         its own interpreter.  Tasks and their results must be shareable
         between interpreters (in practice: picklable)."""
-        if futures._interpreters is None:
-            raise NotImplementedError(
-                "InterpreterPoolExecutor requires subinterpreter support "
-                "(the _interpreters module), which this build lacks")
         thread_name_prefix = (thread_name_prefix or
                               f'InterpreterPoolExecutor-{self._counter()}')
         super().__init__(max_workers, thread_name_prefix,

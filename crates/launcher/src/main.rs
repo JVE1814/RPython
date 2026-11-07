@@ -51,23 +51,50 @@ arg ...: arguments passed to program in sys.argv[1:]
 ";
 
 const HELP_ENV: &str = "Environment variables that change behavior:
-PYTHONSTARTUP   : file executed on interactive startup (no default)
-PYTHONPATH      : ':'-separated list of directories prefixed to the
-                  default module search path.  The result is sys.path.
-PYTHONHOME      : alternate <prefix> directory (or <prefix>:<exec_prefix>).
-PYTHONPLATLIBDIR: override sys.platlibdir
-PYTHONCASEOK    : ignore case in 'import' statements (Windows)
-PYTHONIOENCODING: encoding[:errors] used for stdin/stdout/stderr
-PYTHONHASHSEED  : if this variable is set to 'random', a random value is used
-                  to seed the hashes of str and bytes objects.
-PYTHONINTMAXSTRDIGITS: limit the size of int<->str conversions
-PYTHONUTF8      : control the UTF-8 mode
-PYTHONWARNINGS  : warning control
-PYTHONSAFEPATH  : don't prepend a potentially unsafe path to sys.path
-PYTHONGIL       : when set to 0, disables the GIL
+PYTHONASYNCIODEBUG: turn on asyncio debug mode
+PYTHONBREAKPOINT: callable that breakpoint() calls (\"0\" disables it)
+PYTHONCASEOK    : ignore case in 'import' statements (Windows only)
+PYTHON_CONTEXT_AWARE_WARNINGS: warnings.catch_warnings() uses a context variable
+PYTHON_CPU_COUNT: number that os.cpu_count() and os.process_cpu_count() report
+PYTHONDEVMODE   : enable the development mode, like -X dev
+PYTHONFAULTHANDLER: dump the Python traceback on fatal errors, like -X faulthandler
+PYTHON_GIL      : 0 or 1: run without or with the global interpreter lock
+PYTHONHASHSEED  : 'random' or an integer in [0; 4294967295] seeding the hashes
+                  of str and bytes objects (0 disables the randomization)
+PYTHONHOME      : alternative <prefix> directory (or <prefix>:<exec_prefix>)
+PYTHONINTMAXSTRDIGITS: digit limit of int<->str conversions (0: no limit)
+PYTHONIOENCODING: encoding[:errors] of the standard streams
+PYTHON_LAZY_IMPORTS: 'all' or 'normal': which imports are lazy, like -X lazy_imports
+PYTHONMALLOC    : memory allocator and debug hooks ('debug' adds the hooks)
+PYTHONMALLOCSTATS: print allocator statistics at exit
+PYTHONNODEBUGRANGES: leave column information out of code objects
+PYTHONPATH      : ':'-separated directories put in front of the default module
+                  search path (the result is sys.path)
+PYTHONPLATLIBDIR: overrides sys.platlibdir
+PYTHONPYCACHEPREFIX: root of a separate tree for the .pyc cache files
+PYTHONSAFEPATH  : do not put a possibly unsafe directory in front of sys.path
+PYTHONSTARTUP   : file run when an interactive session starts
+PYTHON_THREAD_INHERIT_CONTEXT: new threads start with a copy of the creator's
+                  contextvars context
+PYTHON_TLBC     : 0 or 1: thread-local copies of specialised bytecode
+PYTHONTRACEMALLOC: trace allocations with tracemalloc (value: frames kept)
+PYTHONUSERBASE  : base directory of the user site-packages
+PYTHONUTF8      : 0 or 1: UTF-8 mode, like -X utf8
+PYTHONWARNDEFAULTENCODING: EncodingWarning when an encoding is left out
+PYTHONWARNINGS  : warning filters, like -W
+
+These variables have equivalent command-line options (see --help):
+PYTHONDEBUG     : -d
+PYTHONDONTWRITEBYTECODE: -B
+PYTHONINSPECT   : -i
+PYTHONNOUSERSITE: -s
+PYTHONOPTIMIZE  : -O
+PYTHONUNBUFFERED: -u
+PYTHONVERBOSE   : -v
 ";
 
 const HELP_X: &str = "The following implementation-specific options are available:
+-X cpu_count=N|default: number that os.cpu_count() reports
 -X dev : enable Python Development Mode
 -X faulthandler: dump the Python traceback on fatal errors
 -X frozen_modules=[on|off]: whether to use frozen modules
@@ -77,10 +104,64 @@ const HELP_X: &str = "The following implementation-specific options are availabl
 -X lazy_imports=[all|normal]: control lazy imports
 -X no_debug_ranges: don't include extra location information in code objects
 -X pycache_prefix=PATH: write .pyc files to a parallel tree under PATH
+-X tlbc=[0|1]: thread-local copies of specialised bytecode
 -X tracemalloc[=N]: trace Python memory allocations
 -X utf8[=0|1]: enable (1) or disable (0) UTF-8 mode
 -X warn_default_encoding: enable opt-in EncodingWarning for 'encoding=None'
 ";
+
+/// Whether --help output is colourised (PYTHON_COLORS, NO_COLOR, FORCE_COLOR, TERM, tty).
+fn help_colorized() -> bool {
+    let var = |n: &str| std::env::var(n).ok().filter(|v| !v.is_empty());
+    match var("PYTHON_COLORS").as_deref() {
+        Some("0") => return false,
+        Some("1") => return true,
+        _ => {}
+    }
+    if var("NO_COLOR").is_some() {
+        return false;
+    }
+    if var("FORCE_COLOR").is_some() {
+        return true;
+    }
+    if var("TERM").as_deref() == Some("dumb") {
+        return false;
+    }
+    unsafe { libc::isatty(1) == 1 }
+}
+
+/// Help text with headings and option names highlighted when colours are on.
+fn help_text(text: &str) -> String {
+    if !help_colorized() {
+        return text.to_string();
+    }
+    const BOLD: &str = "\x1b[1m";
+    const OPT: &str = "\x1b[1;36m";
+    const RESET: &str = "\x1b[0m";
+    let mut out = String::with_capacity(text.len() * 2);
+    for line in text.split_inclusive('\n') {
+        if let Some(rest) = line.strip_prefix("usage:") {
+            out.push_str(BOLD);
+            out.push_str("usage:");
+            out.push_str(RESET);
+            out.push_str(rest);
+        } else if line.starts_with('-') || line.starts_with("PYTHON") {
+            let end = line.find(|c: char| c == ' ' || c == ':').unwrap_or(line.len());
+            out.push_str(OPT);
+            out.push_str(&line[..end]);
+            out.push_str(RESET);
+            out.push_str(&line[end..]);
+        } else if line.ends_with(":\n") && !line.starts_with(' ') {
+            out.push_str(BOLD);
+            out.push_str(line.trim_end_matches('\n'));
+            out.push_str(RESET);
+            out.push('\n');
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
 
 fn prog_name() -> String {
     std::env::args().next().unwrap_or_else(|| "python3".into())
@@ -132,10 +213,46 @@ fn underpth_paths() -> Option<(Vec<String>, bool)> {
     Some((paths, site))
 }
 
+/// Whether the character set of the user's LC_CTYPE locale is plain ASCII.
+fn locale_is_ascii() -> bool {
+    unsafe {
+        let prev = libc::setlocale(libc::LC_CTYPE, std::ptr::null());
+        let saved = if prev.is_null() { None } else { Some(std::ffi::CStr::from_ptr(prev).to_owned()) };
+        libc::setlocale(libc::LC_CTYPE, c"".as_ptr());
+        let cs = libc::nl_langinfo(libc::CODESET);
+        let ascii = !cs.is_null() && {
+            let s = std::ffi::CStr::from_ptr(cs).to_bytes();
+            s == b"ANSI_X3.4-1968" || s.eq_ignore_ascii_case(b"ascii") || s == b"US-ASCII"
+        };
+        if let Some(s) = saved {
+            libc::setlocale(libc::LC_CTYPE, s.as_ptr());
+        }
+        ascii
+    }
+}
+
 fn fatal(msg: &str) -> ! {
     eprintln!("Fatal Python error: {}", msg);
     std::process::exit(1);
 }
+
+/// Standard descriptors (bit n = fd n) that were closed when the process started. Rust's
+/// runtime reopens closed ones on /dev/null before `main`, so this is recorded by an ELF
+/// constructor, which runs earlier; sys.stdin/stdout/stderr are None for these, as in
+/// CPython.
+static CLOSED_STD_FDS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+extern "C" fn record_closed_std_fds() {
+    for fd in 0..3 {
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+            CLOSED_STD_FDS.fetch_or(1 << fd, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+#[used]
+#[unsafe(link_section = ".init_array")]
+static RECORD_CLOSED_STD_FDS: extern "C" fn() = record_closed_std_fds;
 
 fn main() {
     // Prefer running the interpreter on the process's main thread (like CPython:
@@ -217,8 +334,16 @@ fn parse_int_max_str_digits(v: &str, from_env: bool) -> i32 {
 }
 
 fn real_main() -> i32 {
-    let args: Vec<String> = std::env::args().collect();
-    let mut cfg = RtConfig { orig_argv: args.clone(), ..Default::default() };
+    // Arguments are bytes on POSIX: options are parsed from a lossy UTF-8 view, while the
+    // exact bytes travel to sys.argv / sys.orig_argv (decoded there with surrogateescape).
+    let raw: Vec<Vec<u8>> = std::env::args_os().map(|a| std::os::unix::ffi::OsStringExt::into_vec(a)).collect();
+    let args: Vec<String> = raw.iter().map(|b| String::from_utf8_lossy(b).into_owned()).collect();
+    let any_undecodable = raw.iter().any(|b| std::str::from_utf8(b).is_err());
+    let mut cfg = RtConfig { orig_argv: args.clone(), closed_std_fds: CLOSED_STD_FDS.load(std::sync::atomic::Ordering::Relaxed), ..Default::default() };
+    if any_undecodable {
+        cfg.orig_argv_bytes = raw.clone();
+    }
+    let mut cmd_undecodable: Option<Vec<u8>> = None;
     let mut cmd: Option<String> = None;
     let mut module: Option<String> = None;
     let mut warn_cli: Vec<String> = Vec::new();
@@ -227,6 +352,7 @@ fn real_main() -> i32 {
     let mut i = 1;
     let mut stdin_dash = false;
     let mut no_site_user = false;
+    let mut force_hash_random = false;
     'outer: while i < args.len() {
         let a = &args[i];
         if a == "--" {
@@ -243,19 +369,19 @@ fn real_main() -> i32 {
         if let Some(long) = a.strip_prefix("--") {
             match long {
                 "help" => {
-                    print!("{}{}", USAGE.replace("{prog}", &prog_name()), HELP);
+                    print!("{}", help_text(&format!("{}{}", USAGE.replace("{prog}", &prog_name()), HELP)));
                     std::process::exit(0);
                 }
                 "help-env" => {
-                    print!("{}", HELP_ENV);
+                    print!("{}", help_text(HELP_ENV));
                     std::process::exit(0);
                 }
                 "help-xoptions" => {
-                    print!("{}", HELP_X);
+                    print!("{}", help_text(HELP_X));
                     std::process::exit(0);
                 }
                 "help-all" => {
-                    print!("{}{}{}{}", USAGE.replace("{prog}", &prog_name()), HELP, HELP_ENV, HELP_X);
+                    print!("{}", help_text(&format!("{}{}{}{}", USAGE.replace("{prog}", &prog_name()), HELP, HELP_ENV, HELP_X)));
                     std::process::exit(0);
                 }
                 "version" => {
@@ -295,6 +421,12 @@ fn real_main() -> i32 {
                 i += 1;
                 match c {
                     'c' => {
+                        if std::str::from_utf8(&raw[i - 1]).is_err() {
+                            // the command itself (an attached `-cCMD` carries the option prefix)
+                            let whole = &raw[i - 1];
+                            let skip = if args[i - 1] != val { whole.iter().position(|&b| b == b'c').map_or(0, |p| p + 1) } else { 0 };
+                            cmd_undecodable = Some(whole[skip..].to_vec());
+                        }
                         cmd = Some(val);
                         break 'outer;
                     }
@@ -313,7 +445,7 @@ fn real_main() -> i32 {
                 'd' => cfg.debug += 1,
                 'E' => cfg.ignore_environment = 1,
                 'h' | '?' => {
-                    print!("{}{}", USAGE.replace("{prog}", &prog_name()), HELP);
+                    print!("{}", help_text(&format!("{}{}", USAGE.replace("{prog}", &prog_name()), HELP)));
                     std::process::exit(0);
                 }
                 'i' => {
@@ -329,7 +461,7 @@ fn real_main() -> i32 {
                 'O' => cfg.optimize += 1,
                 'P' => cfg.safe_path = true,
                 'q' => cfg.quiet = 1,
-                'R' => {}
+                'R' => force_hash_random = true,
                 's' => no_site_user = true,
                 'S' => cfg.no_site = 1,
                 'u' => cfg.unbuffered = true,
@@ -354,7 +486,8 @@ fn real_main() -> i32 {
     if no_site_user || env(&cfg, "PYTHONNOUSERSITE").is_some() {
         cfg.no_user_site = 1;
     }
-    cfg.debug = cfg.debug.max(env_level(&cfg, "PYTHONDEBUG"));
+    // PYTHONDEBUG only switches parser debugging on (unlike -d, it has no levels)
+    cfg.debug = cfg.debug.max(env_level(&cfg, "PYTHONDEBUG").min(1));
     if env(&cfg, "PYTHONINSPECT").is_some() {
         cfg.inspect = cfg.inspect.max(1);
     }
@@ -385,7 +518,11 @@ fn real_main() -> i32 {
         };
     }
     if let Some(v) = env(&cfg, "PYTHONUTF8") {
-        cfg.utf8_mode = if v == "0" { 0 } else { 1 };
+        cfg.utf8_mode = match v.as_str() {
+            "1" => 1,
+            "0" => 0,
+            _ => fatal("invalid PYTHONUTF8 environment variable value"),
+        };
     }
     if let Some(v) = env(&cfg, "PYTHONPYCACHEPREFIX") {
         cfg.pycache_prefix = Some(v);
@@ -408,6 +545,22 @@ fn real_main() -> i32 {
             _ => fatal("PYTHON_LAZY_IMPORTS: invalid value; expected 'all' or 'normal'"),
         };
     }
+    if let Some(v) = env(&cfg, "PYTHONPROFILEIMPORTTIME") {
+        cfg.import_time = if v == "2" { 2 } else { 1 };
+    }
+    if let Some(v) = env(&cfg, "PYTHON_TLBC") {
+        if v != "0" && v != "1" {
+            fatal("config_read_tlbc: PYTHON_TLBC=N: N is missing or invalid");
+        }
+    }
+    if let Some(v) = env(&cfg, "PYTHON_CPU_COUNT") {
+        if v != "default" {
+            match v.parse::<i32>() {
+                Ok(n) if n >= 1 => cfg.cpu_count = n,
+                _ => fatal("config_init_cpu_count: PYTHON_CPU_COUNT=n option: n is missing or an invalid number, n must be greater than 0"),
+            }
+        }
+    }
     if let Some(v) = env(&cfg, "PYTHON_THREAD_INHERIT_CONTEXT") {
         cfg.thread_inherit_context = if v == "0" { 0 } else { 1 };
     }
@@ -423,9 +576,37 @@ fn real_main() -> i32 {
         match k {
             "dev" => cfg.dev_mode = true,
             "faulthandler" => cfg.faulthandler = true,
-            "utf8" => cfg.utf8_mode = if v == Some("0") { 0 } else { 1 },
+            "utf8" => {
+                cfg.utf8_mode = match v {
+                    None | Some("1") => 1,
+                    Some("0") => 0,
+                    _ => fatal("invalid -X utf8 option value"),
+                }
+            }
             "warn_default_encoding" => cfg.warn_default_encoding = 1,
-            "pycache_prefix" => cfg.pycache_prefix = v.map(|s| s.to_string()),
+            // `-X pycache_prefix` or an empty value: no prefix, whatever the environment says
+            "pycache_prefix" => cfg.pycache_prefix = v.filter(|s| !s.is_empty()).map(|s| s.to_string()),
+            "importtime" => {
+                cfg.import_time = match v.map(|s| s.parse::<i64>()) {
+                    None => 1,
+                    Some(Ok(n)) if (0..=2).contains(&n) => n as i32,
+                    Some(Ok(_)) => fatal("-X importtime: invalid number; expected 0, 1 or 2"),
+                    // any other value (e.g. "true") just switches it on
+                    Some(Err(_)) => 1,
+                }
+            }
+            "tlbc" => match v {
+                Some("0") | Some("1") => {}
+                _ => fatal("config_read_tlbc: -X tlbc=n: n is missing or invalid"),
+            },
+            "cpu_count" => match v {
+                Some("default") => cfg.cpu_count = -1,
+                Some(s) => match s.parse::<i32>() {
+                    Ok(n) if n >= 1 => cfg.cpu_count = n,
+                    _ => fatal("config_init_cpu_count: -X cpu_count=n option: n is missing or an invalid number, n must be greater than 0"),
+                },
+                None => fatal("config_init_cpu_count: -X cpu_count=n option: n is missing or an invalid number, n must be greater than 0"),
+            },
             "tracemalloc" => {
                 cfg.tracemalloc = match v {
                     None => 1,
@@ -462,10 +643,18 @@ fn real_main() -> i32 {
     cfg.bytes_warning = cfg.bytes_warning.min(2);
     // warnings: PYTHONWARNINGS first, then -b/-W (CPython ordering: env, then cmdline)
     let mut warn = Vec::new();
+    if cfg.dev_mode {
+        warn.push("default".to_string());
+    }
     if let Some(w) = env(&cfg, "PYTHONWARNINGS") {
         warn.extend(w.split(',').filter(|s| !s.is_empty()).map(|s| s.trim().to_string()));
     }
     warn.extend(warn_cli);
+    match cfg.bytes_warning {
+        0 => {}
+        1 => warn.push("default::BytesWarning".to_string()),
+        _ => warn.push("error::BytesWarning".to_string()),
+    }
     cfg.warnoptions = warn;
     let seed = match env(&cfg, "PYTHONHASHSEED") {
         Some(s) if s == "random" => None,
@@ -480,26 +669,47 @@ fn real_main() -> i32 {
         },
         None => None,
     };
+    if force_hash_random {
+        cfg.hash_randomization = 1;
+    }
+    if let Some(b) = &cmd_undecodable {
+        // the command must be valid source text: report the first undecodable byte the way
+        // encoding the surrogateescape-decoded text back to UTF-8 fails
+        let (pos, byte) = first_undecodable(b);
+        eprintln!("Unable to decode the command from the command line:");
+        eprintln!("UnicodeEncodeError: 'utf-8' codec can't encode character '\\udc{:02x}' in position {}: surrogates not allowed", byte, pos);
+        return 1;
+    }
     let rest: Vec<String> = args[i.min(args.len())..].to_vec();
+    let rest_raw: Vec<Vec<u8>> = raw[i.min(raw.len())..].to_vec();
     let mut argv: Vec<String> = Vec::new();
+    let mut argv_bytes: Vec<Vec<u8>> = Vec::new();
     let mode;
     if let Some(c) = &cmd {
         argv.push("-c".into());
         argv.extend(rest.iter().cloned());
+        argv_bytes.push(b"-c".to_vec());
+        argv_bytes.extend(rest_raw.iter().cloned());
         mode = RunMode::Command(c.clone());
     } else if let Some(m) = &module {
         argv.push("-m".into());
         argv.extend(rest.iter().cloned());
+        argv_bytes.push(b"-m".to_vec());
+        argv_bytes.extend(rest_raw.iter().cloned());
         mode = RunMode::Module(m.clone());
     } else if !rest.is_empty() && !stdin_dash {
         argv.extend(rest.iter().cloned());
+        argv_bytes.extend(rest_raw.iter().cloned());
         mode = RunMode::Script(rest[0].clone());
     } else {
         if stdin_dash {
             argv.push("-".into());
             argv.extend(args[i + 1..].iter().cloned());
+            argv_bytes.push(b"-".to_vec());
+            argv_bytes.extend(raw[i + 1..].iter().cloned());
         } else {
             argv.push(String::new());
+            argv_bytes.push(Vec::new());
         }
         let tty = unsafe { libc::isatty(0) } != 0;
         mode = if tty || cfg.inspect > 0 && !stdin_dash { RunMode::Repl } else { RunMode::Stdin };
@@ -520,7 +730,21 @@ fn real_main() -> i32 {
     let quiet = cfg.quiet != 0;
     let safe_path = cfg.safe_path;
     let opt = cfg.optimize;
-    let rcfg = rpy_runtime::Config { argv, hash_seed: seed, optimize: opt, sys: cfg, pth_paths: pth_paths.map(|p| p.0) };
+    // Without UTF-8 mode, arguments are decoded with the locale encoding; under an
+    // ASCII locale (C/POSIX) every non-ASCII byte becomes a surrogate escape.
+    let argv_ascii = cfg.utf8_mode == 0 && argv_bytes.iter().any(|b| !b.is_ascii()) && locale_is_ascii();
+    if !any_undecodable && !argv_ascii {
+        argv_bytes.clear();
+    }
+    let rcfg = rpy_runtime::Config {
+        argv,
+        argv_bytes,
+        argv_ascii,
+        hash_seed: seed,
+        optimize: opt,
+        sys: cfg,
+        pth_paths: pth_paths.map(|p| p.0),
+    };
     rpy_bindings::register();
     if rpy_runtime::initialize(&rcfg).is_err() {
         eprintln!("Fatal Python error: initialization failed");
@@ -535,4 +759,17 @@ fn real_main() -> i32 {
         safe_path,
         program_name: prog_name(),
     })
+}
+
+/// (character position, byte) of the first byte that is not part of valid UTF-8 in `b`,
+/// counting characters the way surrogateescape decoding produces them.
+fn first_undecodable(b: &[u8]) -> (usize, u8) {
+    match std::str::from_utf8(b) {
+        Ok(_) => (0, 0),
+        Err(e) => {
+            let valid = e.valid_up_to();
+            let chars = std::str::from_utf8(&b[..valid]).map_or(0, |s| s.chars().count());
+            (chars, b[valid])
+        }
+    }
 }

@@ -33,6 +33,8 @@ pub fn finalize() -> bool {
     // the callback registry is per interpreter, not per atexit module object
     super::atexit::run_exitfuncs();
     crate::capi::lifecycle::run_interp_atexit();
+    // (interp1) subinterpreters that are still around are finalized first
+    crate::subinterp::destroy_all();
     // threads started by atexit callbacks are waited for as well (threading's
     // own bookkeeping already shut down: join the handles directly)
     if super::_thread::thread_shutdown(crate::types::none::none()).is_err() {
@@ -48,17 +50,28 @@ pub fn finalize() -> bool {
     collect();
     crate::gc_support::dump_shutdown_stats();
     finalize_modules();
+    // the main thread's state goes last: its contextvars context
+    super::_contextvars::clear_thread_context();
+    clear_exc();
     collect();
     super::sys_full::flush_std("stdout");
     super::sys_full::flush_std("stderr");
     clear_exc();
+    if env_flag("PYTHONMALLOCSTATS") {
+        super::sys_full::print_malloc_stats();
+    }
     crate::capi::lifecycle::run_process_atexit();
     ok
 }
 
+/// A non-empty environment variable (ignored under -E / -I).
+fn env_flag(name: &str) -> bool {
+    super::sys_full::config().ignore_environment == 0 && std::env::var_os(name).is_some_and(|v| !v.is_empty())
+}
+
 /// threading._shutdown() joins the non-daemon threads; an error there (also a
 /// KeyboardInterrupt that ends the wait) is reported, then shutdown continues.
-fn wait_for_thread_shutdown() {
+pub(crate) fn wait_for_thread_shutdown() {
     let Some(m) = crate::import::get_loaded_module("threading") else {
         return;
     };
@@ -84,11 +97,18 @@ fn set_none(d: &PyObject, key: &str) {
 }
 
 /// Unregister and clear the modules (step 4 above).
-fn finalize_modules() {
+pub(crate) fn finalize_modules() {
     let sysd = super::sys::sys_dict();
     let bd = crate::builtins::builtins_dict();
     // state that keeps user objects alive and is not needed any more
     set_none(&bd, "_");
+    // pending lazy imports are not going to be resolved any more
+    if let Some(s) = dict::get_item_rs(&sysd, "lazy_modules") {
+        if crate::types::set::is_set(&s) {
+            crate::types::set::clear(&s);
+            clear_exc();
+        }
+    }
     for k in ["last_exc", "last_type", "last_value", "last_traceback", "ps1", "ps2"] {
         set_none(&sysd, k);
     }
@@ -99,6 +119,9 @@ fn finalize_modules() {
             }
         }
     }
+    // imports from here on fail quietly ("sys.meta_path is None, Python is likely shutting
+    // down") instead of warning about an empty meta_path on every attempt
+    set_none(&sysd, "meta_path");
     if let Some(c) = dict::get_item_rs(&sysd, "path_importer_cache") {
         if dict::is_dict(&c) {
             dict::clear(&c);

@@ -20,30 +20,58 @@ use rpy_compiler::bytecode::BinOp;
 // ------------------------------------------------------------------ globals
 
 /// LoadGlobal through the instruction's cache entry.
+///
+/// (jit5) The entry records where the name lives, not its value: a = the globals
+/// dict's `keys_version`, b = the builtins dict's `keys_version` (only for names found
+/// in builtins), c = entry index << 1 | found-in-builtins. Key versions change only
+/// when keys are added/removed or a table is rebuilt, so rebinding a global (go's
+/// `TIMESTAMP += 1`) does not invalidate every LoadGlobal in the module; the value is
+/// read from the entry each time.
 #[inline]
 pub fn load_global(f: &Frame, nm: &PyObject, e: &Entry) -> PyResult<PyRef> {
     let g = f.globals();
     let b = f.builtins();
     if dict::is_dict_exact(g) && dict::is_dict_exact(b) {
-        let gv = dict::version(g);
-        let bv = dict::version(b);
         if let Some(s) = e.read() {
-            if s.kind == kind::GLOBAL && s.a == gv && s.b == bv {
-                return Ok(unsafe { PyRef::from_borrowed(s.c as *mut PyObject) });
+            if s.kind == kind::GLOBAL {
+                let ix = s.c >> 1;
+                let r = if s.c & 1 == 0 {
+                    dict::value_at_if(g, s.a, ix)
+                } else if dict::table(g).keys_version == s.a {
+                    dict::value_at_if(b, s.b, ix)
+                } else {
+                    None
+                };
+                if let Some(v) = r {
+                    if !crate::types::lazyimport::is_lazy(&v) {
+                        return Ok(v);
+                    }
+                }
             }
         }
-        return load_global_fill(f, nm, e, gv, bv);
+        return load_global_fill(f, nm, e);
     }
     super::eval::load_global(f, nm)
 }
 
 #[cold]
-fn load_global_fill(f: &Frame, nm: &PyObject, e: &Entry, gv: u64, bv: u64) -> PyResult<PyRef> {
+fn load_global_fill(f: &Frame, nm: &PyObject, e: &Entry) -> PyResult<PyRef> {
     let r = super::eval::load_global(f, nm)?;
-    // only cache if neither dict changed during the lookup (str-keyed lookups never
-    // run Python code, but globals may contain non-str keys)
-    if dict::version(f.globals()) == gv && dict::version(f.builtins()) == bv && e.note_miss() {
-        e.write(kind::GLOBAL, gv, bv, r.as_ptr() as usize);
+    if pystr::is_str_exact(nm) && !crate::types::lazyimport::is_lazy(&r) && e.note_miss() {
+        let (g, b) = (f.globals(), f.builtins());
+        if let Some((gix, gkv)) = dict::str_key_index(g, nm) {
+            match gix {
+                Some(ix) => e.write(kind::GLOBAL, gkv, 0, ix << 1),
+                None => {
+                    if let Some((Some(ix), bkv)) = dict::str_key_index(b, nm) {
+                        // the globals must still lack the name
+                        if dict::table(g).keys_version == gkv {
+                            e.write(kind::GLOBAL, gkv, bkv, ix << 1 | 1);
+                        }
+                    }
+                }
+            }
+        }
     }
     Ok(r)
 }
@@ -161,7 +189,9 @@ unsafe fn member_offset(descr: &PyObject, tp: *mut PyTypeObject, for_store: bool
         if tc != Py_T_OBJECT_EX && tc != Py_T_OBJECT {
             return None;
         }
-        if (*m).flags & Py_AUDIT_READ != 0 || (for_store && (*m).flags & Py_READONLY != 0) {
+        // (jit6) members stored after a tuple subclass's items have no fixed offset
+        // (negative `offset`, descr::member_addr): never cached as an inline offset
+        if (*m).flags & (Py_AUDIT_READ | crate::types::descr::RPY_MEMBER_AFTER_ITEMS) != 0 || (*m).offset < 0 || (for_store && (*m).flags & Py_READONLY != 0) {
             return None;
         }
         // the descriptor must belong to a base of tp (it does if lookup found it, but be strict)
@@ -206,13 +236,14 @@ fn load_attr_hit(o: &PyObject, nm: &PyObject, e: &Entry) -> Option<PyResult<PyRe
             if cache::type_tag(tp) as u64 != s.a {
                 return None;
             }
+            // (jit6) the instance-dict probe can run Python code (`__eq__` of a key
+            // with the same hash) that deletes the class attribute: the descriptor is
+            // held across the probe and that one is bound
+            let keep = if s.c != 0 { Some(unsafe { PyRef::from_borrowed(s.c as *mut PyObject) }) } else { None };
             if let Some(v) = instance_get_hinted(o, nm, s.b, e) {
                 return Some(Ok(unsafe { PyRef::from_borrowed(v) }));
             }
-            if s.c != 0 {
-                return Some(bind(s.c as *mut PyObject, o));
-            }
-            None
+            keep.map(|d| bind(d.as_ptr(), o))
         }
         kind::SLOT => {
             if cache::type_tag(tp) as u64 != s.a {
@@ -245,10 +276,12 @@ fn load_attr_hit(o: &PyObject, nm: &PyObject, e: &Entry) -> Option<PyResult<PyRe
             if cache::type_tag(tp) as u64 != s.a {
                 return None;
             }
+            // (jit6) held across the probe (see INSTANCE_DICT)
+            let keep = unsafe { PyRef::from_borrowed(s.c as *mut PyObject) };
             if let Some(v) = instance_get_hinted(o, nm, u64::MAX, e) {
                 return Some(Ok(unsafe { PyRef::from_borrowed(v) }));
             }
-            Some(bind(s.c as *mut PyObject, o))
+            Some(bind(keep.as_ptr(), o))
         }
         kind::MODULE => {
             if !o.is_type(module::module_type()) {
@@ -426,10 +459,12 @@ pub fn load_method(o: &PyObject, nm: &PyObject, es: &[Entry]) -> PyResult<(PyRef
                 }
                 kind::METHOD_SHADOWABLE => {
                     if cache::type_tag(tp) as u64 == s.a {
+                        // (jit6) held across the probe (see load_attr_hit)
+                        let keep = unsafe { PyRef::from_borrowed(s.c as *mut PyObject) };
                         if let Some(v) = instance_get_hinted(o, nm, u64::MAX, e) {
                             return Ok((unsafe { PyRef::from_borrowed(v) }, None));
                         }
-                        return Ok((unsafe { PyRef::from_borrowed(s.c as *mut PyObject) }, Some(o.to_ref())));
+                        return Ok((keep, Some(o.to_ref())));
                     }
                 }
                 kind::EMPTY => {}
@@ -468,6 +503,7 @@ pub fn store_attr(o: &PyObject, nm: &PyObject, v: &PyObject, es: &[Entry]) -> Py
                         if crate::shape::replace_hinted(o, nm.as_ptr(), s.b, v) {
                             return Ok(());
                         }
+                        let had_values = crate::shape::has_inline_values(o);
                         match crate::shape::set_ix(o, nm, Some(v)) {
                             (crate::shape::Set::Done, i) => {
                                 if i as u64 != s.b {
@@ -483,7 +519,14 @@ pub fn store_attr(o: &PyObject, nm: &PyObject, v: &PyObject, es: &[Entry]) -> Py
                             if (*slot).is_null() {
                                 *slot = dict::new_dict().into_raw();
                             }
-                            return dict::set_item(&**slot, nm, v);
+                            let r = dict::set_item(&**slot, nm, v);
+                            if had_values && r.is_ok() {
+                                // the object's attributes just moved into a dict: later
+                                // stores (compiled hits, which record nothing) see the
+                                // dict, so the adaptive view records that form
+                                adaptive_note(|| super::adaptive::store_attr(o, nm));
+                            }
+                            return r;
                         }
                     },
                     kind::SLOT => unsafe {

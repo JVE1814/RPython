@@ -3,7 +3,7 @@
 
 pub(crate) mod cfg;
 pub mod hooks;
-mod expr;
+pub(crate) mod expr;
 pub(crate) mod ir;
 mod pattern;
 mod stmt;
@@ -118,6 +118,15 @@ fn ckey(c: &Constant, code_ctr: &mut usize) -> CKey {
         Constant::Ellipsis => CKey::Ellipsis,
         Constant::Int(i) => CKey::Int(*i),
         Constant::BigInt { neg, decimal } => CKey::Big(*neg, decimal.clone()),
+        // a NaN is only ever equal to itself: each occurrence is its own constant
+        Constant::Float(f) if f.is_nan() => {
+            *code_ctr += 1;
+            CKey::Code(*code_ctr)
+        }
+        Constant::Complex { real, imag } if real.is_nan() || imag.is_nan() => {
+            *code_ctr += 1;
+            CKey::Code(*code_ctr)
+        }
         Constant::Float(f) => CKey::Float(f.to_bits()),
         Constant::Complex { real, imag } => CKey::Complex(real.to_bits(), imag.to_bits()),
         Constant::Str(s) => CKey::Str(s.clone()),
@@ -1640,7 +1649,13 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_class_body(&mut self, s: &'a Stmt, body: &'a [Stmt], firstlineno: i32, generic: bool) -> R {
-        self.set_loc(s.loc);
+        // the prologue belongs to the whole (decorated) statement: it starts on the first
+        // decorator's line, which is what tracing reports for it
+        let mut prologue = s.loc;
+        if firstlineno > 0 && firstlineno < prologue.lineno {
+            prologue.lineno = firstlineno;
+        }
+        self.set_loc(prologue);
         let sid = self.ur().scope;
         if self.st.scopes[sid].needs_classdict {
             self.emit(O::LOAD_LOCALS, 0);

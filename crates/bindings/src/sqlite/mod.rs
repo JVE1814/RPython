@@ -441,6 +441,20 @@ pub fn init() -> PyResult {
         _ => 3,
     };
     dict::set_item_str(&d, "threadsafety", &new_int(ts))?;
+    // the library's SQL keyword list (only when it can enumerate it)
+    let l = ffi::lib();
+    if let (Some(count), Some(name_at)) = (l.sqlite3_keyword_count, l.sqlite3_keyword_name) {
+        let mut words = Vec::new();
+        for i in 0..unsafe { count() } {
+            let mut p: *const std::ffi::c_char = std::ptr::null();
+            let mut n: std::ffi::c_int = 0;
+            if unsafe { name_at(i, &mut p, &mut n) } == ffi::SQLITE_OK && !p.is_null() && n >= 0 {
+                let b = unsafe { std::slice::from_raw_parts(p as *const u8, n as usize) };
+                words.push(new_str(&String::from_utf8_lossy(b)));
+            }
+        }
+        dict::set_item_str(&d, "SQLITE_KEYWORDS", &tuple::new_tuple(words))?;
+    }
     Ok(m)
 }
 

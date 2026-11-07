@@ -131,6 +131,10 @@ pub struct DictTable {
     /// Identity of the index layout: renewed on resize/clear (lookups that ran
     /// Python code restart only if this or the probed entry changed).
     layout: u64,
+    /// (jit5) Renewed whenever the set of keys or their entry positions change
+    /// (insert of a new key, delete, resize, clear) but not on value replacement:
+    /// caches of "key K is at entry ix" (LoadGlobal) stay valid across value stores.
+    pub keys_version: u64,
     pub entries_p: *mut Entry,
     /// Entries in insertion order (deleted entries have a NULL key): entries_p[..nentries]
     pub nentries: usize,
@@ -208,6 +212,7 @@ impl DictTable {
         DictTable {
             version: next_version(),
             layout: next_version(),
+            keys_version: next_version(),
             entries_p: unsafe { data.add(ibytes) as *mut Entry },
             nentries: 0,
             indices_p: data as *mut i32,
@@ -286,6 +291,7 @@ impl DictTable {
         fresh.nentries = 0;
         self.version = next_version();
         self.layout = next_version();
+        self.keys_version = next_version();
         drop(fresh);
     }
     #[inline]
@@ -303,6 +309,7 @@ impl DictTable {
         self.nentries = n + 1;
         self.used += 1;
         self.version = next_version();
+        self.keys_version = self.version;
     }
     /// Find the index slot holding entry `ix` (which has hash `h`).
     fn slot_of(&self, ix: usize, h: isize) -> usize {
@@ -328,6 +335,7 @@ impl DictTable {
         en.value = std::ptr::null_mut();
         self.used -= 1;
         self.version = next_version();
+        self.keys_version = self.version;
         (e.key, e.value)
     }
     pub fn used(&self) -> usize {
@@ -620,6 +628,39 @@ pub fn get_item_hash(d: &PyObject, key: &PyObject, h: isize) -> PyResult<Option<
     };
     drop(g);
     Ok(r)
+}
+
+/// (jit5, LoadGlobal caches) Entry index of the exact-str `key` in exact dict `d`
+/// (None: absent) together with the dict's `keys_version`, read under the dict lock.
+/// None if the lookup failed (a key's `__eq__` raised; the error is cleared).
+pub fn str_key_index(d: &PyObject, key: &PyObject) -> Option<(Option<usize>, u64)> {
+    let h = crate::types::str::str_hash(key);
+    match find(d, key, h) {
+        Ok((g, f)) => {
+            let kv = table(d).keys_version;
+            drop(g);
+            Some((if let Found::At(ix) = f { Some(ix) } else { None }, kv))
+        }
+        Err(_) => {
+            clear_exc();
+            None
+        }
+    }
+}
+
+/// (jit5) The value (new reference) at entry `ix` of exact dict `d` if its key layout
+/// is still `keys_version`.
+pub fn value_at_if(d: &PyObject, keys_version: u64, ix: usize) -> Option<PyRef> {
+    let g = ob_lock(d);
+    let t = table(d);
+    let r = if t.keys_version == keys_version && ix < t.nentries {
+        let v = t.entries()[ix].value;
+        if v.is_null() { None } else { Some(unsafe { PyRef::from_borrowed(v) }) }
+    } else {
+        None
+    };
+    drop(g);
+    r
 }
 
 /// Fast lookup by an exact str key; errors from Python `__eq__` are swallowed.

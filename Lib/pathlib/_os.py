@@ -19,6 +19,13 @@ _METADATA_UNSUPPORTED = frozenset(
 _FAST_COPY_UNSUPPORTED = frozenset(
     {errno.ENOSYS, errno.EXDEV, errno.EINVAL, errno.EOPNOTSUPP,
      errno.ETXTBSY, errno.EBADF})
+# errno values after which a FICLONE ioctl falls back to copying the data
+_REFLINK_UNSUPPORTED = _FAST_COPY_UNSUPPORTED | {errno.ENOTTY, errno.ENOTSUP}
+
+try:
+    import fcntl as _fcntl
+except ImportError:
+    _fcntl = None
 
 
 def vfspath(obj):
@@ -137,6 +144,17 @@ def copyfileobj(source_f, target_f):
         dst_fd = target_f.fileno()
     except Exception:
         src_fd = dst_fd = None
+    # First choice: share the source's extents (reflink) where the file
+    # system supports it; this copies nothing at all.
+    if src_fd is not None and _fcntl is not None and hasattr(_fcntl, 'FICLONE'):
+        try:
+            _fcntl.ioctl(dst_fd, _fcntl.FICLONE, src_fd)
+            return
+        except OSError as err:
+            err.filename = source_f.name
+            err.filename2 = target_f.name
+            if err.errno not in _REFLINK_UNSUPPORTED:
+                raise err
     if src_fd is not None and hasattr(os, 'copy_file_range'):
         try:
             block = max(os.fstat(src_fd).st_blksize, 1 << 16)
