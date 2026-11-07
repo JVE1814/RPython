@@ -290,6 +290,21 @@ pub fn call_with_kwargs_dict(callable: &PyObject, args: &[&PyObject], kw: Option
 /// tuple); others get a stack vector.
 pub fn call_ex_tuple(callable: &PyObject, self_or_null: Option<&PyObject>, args: &PyObject, kw: Option<&PyObject>) -> PyResult {
     let kw = kw.filter(|k| dict::dict_len(k) > 0);
+    // (perf4) Python functions (also bound to an instance) bind from the tuple and the
+    // dict directly
+    let plain_func = |c: &PyObject| {
+        crate::types::funcobject::is_function(c)
+            && crate::types::funcobject::func(c).vectorcall.map(|p| p as usize) == Some(crate::interp::function_vectorcall as usize)
+    };
+    if plain_func(callable) {
+        return crate::interp::call_function_ex(callable, self_or_null, args, kw);
+    }
+    if self_or_null.is_none() && crate::types::funcobject::is_method(callable) {
+        let (mf, ms) = crate::types::funcobject::method_parts(callable);
+        if plain_func(mf) {
+            return crate::interp::call_function_ex(mf, Some(ms), args, kw);
+        }
+    }
     let items = tuple::tuple_items(args);
     if self_or_null.is_none() && vectorcall_func(callable).is_none() && callable.ty().tp_call.is_some() {
         return call_tp_call(callable, args, kw);

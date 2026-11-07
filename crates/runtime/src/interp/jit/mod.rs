@@ -254,6 +254,71 @@ fn call_compiled(func: &PyObject, code: &PyObject, cd: &CodeData, c: &Compiled, 
         unsafe { incref(a) };
         frame.slots[i] = a;
     }
+    enter_bound(ts, f, code, cd, c, off, frame)
+}
+
+/// (perf4) Call of a compiled, optimized, non-generator Python function with any
+/// argument shape (keywords, defaults, *args/**kwargs parameters): the arguments are
+/// bound into a pooled frame by `bind_arguments` and the activation enters machine
+/// code directly (no `run_frame`/`eval_frame` prelude, cheap frame recycling).
+/// None: not compiled (or tracing); the caller takes the interpreter path.
+#[inline]
+pub fn call_bound(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwnames: Option<&PyObject>) -> Option<PyResult> {
+    let f = crate::types::funcobject::func(func);
+    let code = unsafe { &*f.func_code };
+    let cd = crate::types::code::code_data(code);
+    let c = cd.caches.jit.load(Acquire);
+    if c.is_null() {
+        return None;
+    }
+    let c = unsafe { &*c };
+    let off = match c.entries.first() {
+        Some(&o) if o != u32::MAX => o,
+        _ => return None,
+    };
+    if crate::modules::sys::tracing_active() {
+        return None;
+    }
+    let ts = crate::threads::current();
+    if let Err(e) = crate::interp::enter_recursive_call(ts, "") {
+        return Some(Err(e));
+    }
+    let mut frame = Frame::new_call(code, func, unsafe { &*f.func_globals }, unsafe { &*f.func_builtins });
+    if let Err(e) = crate::interp::bind_arguments(func, &mut frame, args, nargs, kwnames) {
+        crate::interp::leave_recursive_call(ts);
+        crate::interp::frame::recycle(frame);
+        return Some(Err(e));
+    }
+    Some(enter_bound(ts, f, code, cd, c, off, frame))
+}
+
+/// (perf4) Run a `Frame::new_call` frame of optimized, non-generator function `func`
+/// whose arguments are bound: in compiled code when there is a unit, else in the
+/// interpreter (`run_frame`).
+pub fn run_bound(func: &PyObject, frame: Box<Frame>) -> PyResult {
+    let f = crate::types::funcobject::func(func);
+    let code = unsafe { &*f.func_code };
+    let cd = crate::types::code::code_data(code);
+    let c = cd.caches.jit.load(Acquire);
+    if !c.is_null() && !crate::modules::sys::tracing_active() {
+        let c = unsafe { &*c };
+        if let Some(&off) = c.entries.first() {
+            if off != u32::MAX {
+                let ts = crate::threads::current();
+                if let Err(e) = crate::interp::enter_recursive_call(ts, "") {
+                    crate::interp::frame::recycle(frame);
+                    return Err(e);
+                }
+                return enter_bound(ts, f, code, cd, c, off, frame);
+            }
+        }
+    }
+    crate::interp::run_frame(frame)
+}
+
+/// Run a bound call frame in compiled code (recursion depth already entered; left here).
+#[inline]
+fn enter_bound(ts: &ThreadState, f: &crate::types::funcobject::PyFunctionObject, code: &PyObject, cd: &CodeData, c: &Compiled, off: u32, frame: Box<Frame>) -> PyResult {
     let mut target = c.addr + off as usize;
     if bump_invocations(cd) {
         if let Some(t) = opt::compile(code, f.func_globals, f.func_builtins, 0) {

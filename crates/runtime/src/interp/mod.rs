@@ -146,6 +146,11 @@ pub fn call_function(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwna
         }
     } else if let Some(r) = jit::call_fast(func, args, nargs, kwnames) {
         return r; // jit workstream: compiled callee, direct entry
+    } else if flags & bc::co::OPTIMIZED != 0 {
+        // (perf4) any other argument shape: bind, then enter compiled code directly
+        if let Some(r) = jit::call_bound(func, args, nargs, kwnames) {
+            return r;
+        }
     }
     // plain calls borrow code/func from the caller (perf-runtime, frame.rs `owns_fc`)
     let mut frame = Frame::new_call(co, func, unsafe { &*f.func_globals }, unsafe { &*f.func_builtins });
@@ -170,6 +175,165 @@ pub fn call_function(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwna
     }
     prepare_cells(&mut frame, f);
     run_frame(frame)
+}
+
+/// (perf4) `func(*args, **kw)` for a Python function (CALL_FUNCTION_EX): `args` is an
+/// exact tuple, `kw` a non-empty exact dict or None. Arguments are bound straight
+/// from the tuple and the dict (no argument vector, no kwnames tuple); a function
+/// whose only parameter is `*args` receives the tuple itself. Anything unusual
+/// (errors to report, non-str keys) goes through the general vectorcall path.
+pub fn call_function_ex(func: &PyObject, self_: Option<&PyObject>, args: &PyObject, kw: Option<&PyObject>) -> PyResult {
+    let f: &PyFunctionObject = funcobject::func(func);
+    if !f.func_code.is_null() {
+        let co = unsafe { &*f.func_code };
+        let cobj = code::code(co).obj;
+        let flags = cobj.co_flags as u32;
+        let plain = flags & (bc::co::GENERATOR | bc::co::COROUTINE | bc::co::ASYNC_GENERATOR) == 0 && flags & bc::co::OPTIMIZED != 0;
+        if plain {
+            let items = tuple::tuple_items(args);
+            if kw.is_none() && self_.is_none() && cobj.co_argcount == 0 && cobj.co_kwonlyargcount == 0 && flags & bc::co::VARKEYWORDS == 0 && flags & bc::co::VARARGS != 0 {
+                let mut frame = Frame::new_call(co, func, unsafe { &*f.func_globals }, unsafe { &*f.func_builtins });
+                frame.slots[0] = args.to_ref().into_raw();
+                return jit::run_bound(func, frame);
+            }
+            let n = items.len() + self_.is_some() as usize;
+            if n <= 16 {
+                let mut buf: [*mut PyObject; 16] = [std::ptr::null_mut(); 16];
+                let mut i = 0;
+                if let Some(s) = self_ {
+                    buf[0] = s.as_ptr();
+                    i = 1;
+                }
+                for (k, it) in items.iter().enumerate() {
+                    buf[i + k] = it.as_ptr();
+                }
+                match kw {
+                    None => return call_function(func, &buf[..n], n, None),
+                    Some(d) if dict::is_dict_exact(d) => {
+                        let mut frame = Frame::new_call(co, func, unsafe { &*f.func_globals }, unsafe { &*f.func_builtins });
+                        match bind_kwdict(f, &mut frame, &buf[..n], d) {
+                            Ok(true) => return jit::run_bound(func, frame),
+                            Ok(false) => frame::recycle(frame),
+                            Err(e) => {
+                                frame::recycle(frame);
+                                return Err(e);
+                            }
+                        }
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+    let mut v: Vec<&PyObject> = Vec::with_capacity(tuple::tuple_len(args) + 1);
+    if let Some(s) = self_ {
+        v.push(s);
+    }
+    v.extend_from_slice(tuple::tuple_items(args));
+    crate::abstract_::call_with_kwargs_dict(func, &v, kw)
+}
+
+/// Bind positional `args` and the entries of exact dict `kw` into `frame` (see
+/// `call_function_ex`). Ok(false): a case left to the general binder (which reports
+/// the errors); the frame is then partly filled and must be discarded.
+fn bind_kwdict(f: &PyFunctionObject, frame: &mut Frame, args: &[*mut PyObject], kw: &PyObject) -> PyResult<bool> {
+    let cd = code::code(unsafe { &*frame.code });
+    let co = cd.obj;
+    let argcount = co.co_argcount as usize;
+    let posonly = co.co_posonlyargcount as usize;
+    let kwonly = co.co_kwonlyargcount as usize;
+    let flags = co.co_flags as u32;
+    let total_named = argcount + kwonly;
+    let has_varargs = flags & bc::co::VARARGS != 0;
+    let has_varkw = flags & bc::co::VARKEYWORDS != 0;
+    let nargs = args.len();
+    if nargs > argcount && !has_varargs {
+        return Ok(false);
+    }
+    let slots = &mut frame.slots;
+    for i in 0..nargs.min(argcount) {
+        unsafe { incref(args[i]) };
+        slots[i] = args[i];
+    }
+    if has_varargs {
+        let extra = if nargs > argcount { unsafe { tuple::new_tuple_from_ptrs(&args[argcount..nargs]) } } else { tuple::empty_tuple() };
+        slots[total_named] = extra.into_raw();
+    }
+    let kwnew = if has_varkw {
+        let d = dict::new_dict_presized(dict::dict_len(kw));
+        slots[total_named + has_varargs as usize] = d.as_ptr();
+        Some(d.into_raw())
+    } else {
+        None
+    };
+    let names = &cd.d.localsplusnames;
+    {
+        // (no Python code runs below: exact str keys, str comparisons)
+        let _g = dict::ob_lock(kw);
+        let t = dict::table(kw);
+        for e in t.entries().iter() {
+            if e.key.is_null() {
+                continue;
+            }
+            let key = unsafe { &*e.key };
+            if !pystr::is_str_exact(key) {
+                return Ok(false);
+            }
+            let mut found = None;
+            for i in posonly..total_named {
+                if names[i].is(key) {
+                    found = Some(i);
+                    break;
+                }
+            }
+            if found.is_none() {
+                for i in posonly..total_named {
+                    if pystr::str_eq(&names[i], key) {
+                        found = Some(i);
+                        break;
+                    }
+                }
+            }
+            match found {
+                Some(i) => {
+                    if !slots[i].is_null() {
+                        return Ok(false);
+                    }
+                    unsafe { incref(e.value) };
+                    slots[i] = e.value;
+                }
+                None => match kwnew {
+                    // keys of a dict are unique: no comparisons needed
+                    Some(d) => dict::insert_unique(unsafe { &*d }, key, e.hash, unsafe { &*e.value }),
+                    None => return Ok(false),
+                },
+            }
+        }
+    }
+    if nargs < argcount {
+        let defs = if f.func_defaults.is_null() { &[][..] } else { tuple::tuple_items(unsafe { &*f.func_defaults }) };
+        let defs = &defs[defs.len().saturating_sub(argcount)..];
+        let first_default = argcount - defs.len();
+        for i in nargs..argcount {
+            if slots[i].is_null() {
+                if i < first_default {
+                    return Ok(false);
+                }
+                slots[i] = defs[i - first_default].to_ref().into_raw();
+            }
+        }
+    }
+    for i in argcount..total_named {
+        if slots[i].is_null() {
+            let nm = &cd.d.localsplusnames[i];
+            let d = if f.func_kwdefaults.is_null() { None } else { dict::get_item_str(unsafe { &*f.func_kwdefaults }, nm) };
+            match d {
+                Some(v) => slots[i] = v.into_raw(),
+                None => return Ok(false),
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Number of free variables if the code's eager generator prologue is exactly a
@@ -351,8 +515,8 @@ fn prepare_cells(frame: &mut Frame, f: &PyFunctionObject) {
 /// Put arguments into localsplus according to CPython's binding rules.
 pub fn bind_arguments(func: &PyObject, frame: &mut Frame, args: &[*mut PyObject], nargs: usize, kwnames: Option<&PyObject>) -> PyResult<()> {
     let f = funcobject::func(func);
-    let code_ref = frame.code().to_ref();
-    let cd = code::code(&code_ref);
+    // (perf4) borrowed: the frame holds the code for the whole call
+    let cd = code::code(unsafe { &*frame.code });
     let co = cd.obj;
     let argcount = co.co_argcount as usize;
     let posonly = co.co_posonlyargcount as usize;
@@ -370,6 +534,23 @@ pub fn bind_arguments(func: &PyObject, frame: &mut Frame, args: &[*mut PyObject]
             slots[i] = args[i];
         }
         return Ok(());
+    }
+    // (perf4) positional call relying on trailing defaults
+    if kwnames.is_none() && nargs < argcount && !has_varargs && !has_varkw && kwonly == 0 && !f.func_defaults.is_null() {
+        let defs = tuple::tuple_items(unsafe { &*f.func_defaults });
+        let ndef = defs.len().min(argcount);
+        if nargs + ndef >= argcount {
+            for i in 0..nargs {
+                unsafe { incref(args[i]) };
+                slots[i] = args[i];
+            }
+            let first_default = argcount - ndef;
+            let defs = &defs[defs.len() - ndef..];
+            for i in nargs..argcount {
+                slots[i] = defs[i - first_default].to_ref().into_raw();
+            }
+            return Ok(());
+        }
     }
 
     let qualname = || pystr::to_string_lossy(unsafe { &*f.func_qualname });
