@@ -100,12 +100,16 @@ class Queue:
             _known[qid] = self
         return self
 
-    def __del__(self):
-        if getattr(self, '_bound', False):
+    # Everything __del__ uses is bound when the class is made: the last
+    # reference may go while an interpreter is torn down, after this module's
+    # globals were cleared.
+    def __del__(self, _getattr=getattr, _release=_queues.release,
+                _error=QueueError):
+        if _getattr(self, '_bound', False):
             self._bound = False
             try:
-                _queues.release(self._id)
-            except QueueError:
+                _release(self._id)
+            except _error:
                 pass
 
     def __repr__(self):

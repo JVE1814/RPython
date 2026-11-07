@@ -120,6 +120,43 @@ fn for_each_thread(mut f: impl FnMut(&ThreadState)) {
     }
 }
 
+/// (scale2) Registered thread states for which `pred` holds (a consistent snapshot of
+/// the list, without the `ALL_THREADS` lock unless there are more than CAP threads).
+/// The memory of a thread state is never freed, so the result stays dereferenceable;
+/// whether it is still the same thread must be checked by the caller.
+pub fn find_threads(mut pred: impl FnMut(&ThreadState) -> bool) -> smallvec_like::Found {
+    let mut out = smallvec_like::Found::default();
+    for_each_thread(|ts| {
+        if pred(ts) {
+            out.push(ts as *const ThreadState as usize);
+        }
+    });
+    out
+}
+
+pub mod smallvec_like {
+    /// Up to 4 matches without allocating.
+    #[derive(Default)]
+    pub struct Found {
+        n: usize,
+        inline: [usize; 4],
+        more: Vec<usize>,
+    }
+    impl Found {
+        pub fn push(&mut self, v: usize) {
+            if self.n < 4 {
+                self.inline[self.n] = v;
+            } else {
+                self.more.push(v);
+            }
+            self.n += 1;
+        }
+        pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+            self.inline[..self.n.min(4)].iter().copied().chain(self.more.iter().copied())
+        }
+    }
+}
+
 // ---------------------------------------------------------------- per-thread batches
 
 enum Item {
@@ -230,6 +267,104 @@ pub unsafe fn swap_field(slot: *mut *mut PyObject, new: *mut PyObject) {
         if !old.is_null() {
             decref_deferred(old);
         }
+    }
+}
+
+// ---------------------------------------------------------------- attribute storage (scale2)
+//
+// Values stored in an object's attribute storage (inline values of `shape.rs`,
+// `__slots__` members) are read lock-free. A value replaced there only needs the
+// deferred release if some thread other than the object's owner may be in the middle of
+// such a read. Such readers announce themselves once per object: before their first
+// lock-free read of the object's attribute storage they set the sticky `XREAD` bit in its
+// `ob_flags` (a locked RMW followed by a SeqCst fence). A writer swaps the value out with
+// a SeqCst RMW and then loads the flags (SeqCst): if it is the owner and sees the bit
+// clear, every non-owner reader's bit-setting comes after its swap in the single total
+// order, so such a reader's slot load sees the new value and the old one can be released
+// at once. Readers that are the owner thread need nothing (same thread as the writer);
+// writers that are not the owner always defer. Objects whose owner gave up ownership
+// (`ob_tid == 0`) have no owner: every access counts as a non-owner one.
+
+/// `ob_flags` bit: a thread other than the owner has read the attribute storage
+/// lock-free (bits 0-2 belong to the C API, 5-7 to `sharded.rs`, 8-15 to `shape.rs`).
+pub const XREAD: u16 = 1 << 4;
+
+/// Announce a lock-free read of `o`'s attribute storage by the calling thread (call
+/// before loading the slot).
+#[inline(always)]
+pub fn note_attr_read(o: &PyObject) {
+    if o.ob_tid.load(Relaxed) != crate::object::thread_id() && o.ob_flags.load(Relaxed) & XREAD == 0 {
+        mark_xread(o);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn mark_xread(o: &PyObject) {
+    o.ob_flags.fetch_or(XREAD, SeqCst);
+    std::sync::atomic::fence(SeqCst);
+}
+
+/// Release `old` (an owned reference or null), just swapped out of the attribute
+/// storage of `o` by a SeqCst RMW: at once when no other thread can be reading it
+/// lock-free (see above), else through QSBR. Must not be called with a leaf lock held
+/// (the release may run a deallocator).
+#[inline(always)]
+pub unsafe fn release_attr(o: *mut PyObject, old: *mut PyObject) {
+    unsafe {
+        if old.is_null() {
+            return;
+        }
+        if !multi_threaded() || ((*o).ob_tid.load(Relaxed) == crate::object::thread_id() && (*o).ob_flags.load(SeqCst) & XREAD == 0) || others_quiescent() {
+            crate::object::decref(old);
+            return;
+        }
+        decref_deferred(old);
+    }
+}
+
+/// (scale2) Is every other thread quiescent right now (not executing Python: blocked in
+/// a wait, in native code, parked)? Then none of them is in the middle of a lock-free
+/// read, and a pointer the caller unpublished with a SeqCst RMW (before this call) can
+/// be released at once: a thread that enters the VM afterwards stores its mode
+/// (SeqCst) before reading anything, so it sees the new value (Dekker with
+/// `gc::enter_vm`). The common case of a writer whose helper threads are idle (an event
+/// loop next to blocked executor threads) then finalizes values promptly.
+pub fn others_quiescent() -> bool {
+    let me = me() as usize;
+    let mut quiet = true;
+    for_each_thread(|ts| {
+        if quiet && ts as *const ThreadState as usize != me && ts.alive() && ts.mode.0.load(SeqCst) == crate::threads::ThreadMode::InVm as u8 {
+            quiet = false;
+        }
+    });
+    quiet
+}
+
+/// As `swap_field`, for callers that hold no lock (the old value may be released at
+/// once, which can run a deallocator): released at once when every other thread is
+/// quiescent, else through QSBR.
+pub unsafe fn swap_field_unlocked(slot: *mut *mut PyObject, new: *mut PyObject) {
+    unsafe {
+        let old = std::sync::atomic::AtomicPtr::from_ptr(slot).swap(new, SeqCst);
+        if old.is_null() {
+            return;
+        }
+        if !multi_threaded() || others_quiescent() {
+            crate::object::decref(old);
+        } else {
+            decref_deferred(old);
+        }
+    }
+}
+
+/// Store `new` (an owned reference or null) into attribute storage `slot` of `o`
+/// (readers use `note_attr_read`) and release the previous value (`release_attr`).
+#[inline(always)]
+pub unsafe fn swap_attr(o: *mut PyObject, slot: *mut *mut PyObject, new: *mut PyObject) {
+    unsafe {
+        let old = std::sync::atomic::AtomicPtr::from_ptr(slot).swap(new, SeqCst);
+        release_attr(o, old);
     }
 }
 
@@ -478,6 +613,41 @@ fn poll(scan: bool) {
     }
 }
 
+/// (scale2) The calling thread is about to wait (lock acquire, sleep, join) and may not
+/// poll for a long time: close its open batch and release what has matured (with the
+/// other threads blocked too, that is everything), so that objects it retired are not
+/// kept alive for the whole wait (a weakref callback another thread waits for, a
+/// reference cycle through a frame...). Called where running deallocators is safe
+/// (the same places that run signal handlers). `spin`: a long wait (thread join,
+/// interpreter teardown); otherwise only matured batches are released.
+pub fn before_wait(spin: bool) {
+    let l = local();
+    if l.open.is_empty() && l.closed.is_empty() {
+        return;
+    }
+    if !spin {
+        // short waits (lock and queue waits of busy producer/consumer threads): only
+        // release what has matured; closing a batch here would send a handshake to
+        // every thread at each wait
+        if !l.closed.is_empty() {
+            poll(true);
+        }
+        return;
+    }
+    if !l.open.is_empty() {
+        close_batch();
+    }
+    poll(true);
+    // Threads running Python report within microseconds (closing the batch asked them
+    // to); blocked ones already count as quiescent. Give them a moment rather than
+    // keeping the items for the whole wait.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2);
+    while !local().closed.is_empty() && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+        poll(true);
+    }
+}
+
 /// Eval-breaker handler (`EVAL_QSBR`): this thread is at a quiescent point.
 pub fn on_eval_breaker(ts: &ThreadState) {
     ts.c.eval_breaker.fetch_and(!EVAL_QSBR, AcqRel);
@@ -582,6 +752,55 @@ pub fn quiesce_now() {
         });
         crate::threads::blocking(|| std::thread::sleep(std::time::Duration::from_micros(200)));
         report(me as *const ThreadState);
+    }
+}
+
+/// (stability3) Retired items handed out by `take_for_gc`.
+pub struct Taken(Vec<Item>);
+
+/// Anything retired (by any thread, or orphaned) and not yet released?
+pub fn has_pending_for_gc() -> bool {
+    if PENDING_TOTAL.load(Relaxed) > 0 {
+        return true;
+    }
+    let locals = LOCALS.lock().unwrap_or_else(|e| e.into_inner());
+    locals.iter().any(|&lp| !unsafe { &*(lp as *const Local) }.open.is_empty())
+}
+
+/// (stability3) Take every retired item of every thread and every orphaned batch.
+/// Only call with the world stopped: no thread is then inside a lock-free read, so
+/// all of them are due. Unlike `take_all_for_gc` (whose items go back to their
+/// threads, or are released after the collection), the caller releases these itself
+/// with `release_taken_now` once the world runs again and *before* analysing the
+/// heap: a reference that a thread dropped while other threads existed (e.g. `del x`
+/// of a global) must not keep a cycle alive, and a thread blocked for a long time
+/// (one left over by an earlier test) would otherwise hold its items until it wakes.
+pub fn take_for_gc() -> Taken {
+    let mut out: Vec<Item> = Vec::new();
+    let locals = LOCALS.lock().unwrap_or_else(|e| e.into_inner());
+    for &lp in locals.iter() {
+        let l = unsafe { &mut *(lp as *mut Local) };
+        let open = std::mem::take(&mut l.open);
+        PENDING_TOTAL.fetch_add(open.len(), Relaxed);
+        out.extend(open);
+        for (_, items) in l.closed.drain(..) {
+            out.extend(items);
+        }
+        l.polls = 0;
+    }
+    drop(locals);
+    let mut o = ORPHANS.lock().unwrap_or_else(|e| e.into_inner());
+    for (_, items) in o.drain(..) {
+        out.extend(items.into_iter().map(|i| i.0));
+    }
+    ORPHAN_MIN.store(u64::MAX, Relaxed);
+    Taken(out)
+}
+
+/// Release what `take_for_gc` returned (world running).
+pub fn release_taken_now(t: Taken) {
+    if !t.0.is_empty() {
+        unsafe { release(t.0) };
     }
 }
 

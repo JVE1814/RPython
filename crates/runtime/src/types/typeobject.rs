@@ -306,10 +306,15 @@ pub fn instance_dict_existing(o: &PyObject) -> Option<PyRef> {
             return None;
         }
         let slot = dict_slot(o.as_ptr());
-        if slot.is_null() || (*slot).is_null() {
+        if slot.is_null() {
             return None;
         }
-        Some(PyRef::from_borrowed(*slot))
+        // (stability3) one load: another thread may assign __dict__ meanwhile
+        let d = std::sync::atomic::AtomicPtr::from_ptr(slot).load(std::sync::atomic::Ordering::Acquire);
+        if d.is_null() {
+            return None;
+        }
+        Some(PyRef::from_borrowed(d))
     }
 }
 
@@ -919,17 +924,65 @@ pub fn type_ready(tp: *mut PyTypeObject) -> PyResult<()> {
 /// destroyed concurrently; bc-vm fix found by test_opcache's race tests).
 static SUBCLASSES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// (scale2) The direct subclasses of a type (`tp_subclasses`), in insertion order,
+/// with O(1) insertion and removal: a base like `object` has every class of the
+/// program as a subclass, and a linear search per class creation and per class
+/// deallocation made programs that create classes (on several threads, where more
+/// dead classes wait for the collector) quadratic. Removed entries leave a hole (0);
+/// the vector is compacted when half of it is holes.
+pub struct SubList {
+    items: Vec<usize>,
+    pos: std::collections::HashMap<usize, usize>,
+    holes: usize,
+}
+
+impl SubList {
+    fn new() -> SubList {
+        SubList { items: Vec::new(), pos: std::collections::HashMap::new(), holes: 0 }
+    }
+    fn add(&mut self, x: usize) {
+        if self.pos.contains_key(&x) {
+            return;
+        }
+        self.pos.insert(x, self.items.len());
+        self.items.push(x);
+    }
+    fn remove(&mut self, x: usize) {
+        let Some(i) = self.pos.remove(&x) else { return };
+        self.items[i] = 0;
+        self.holes += 1;
+        if self.holes > 16 && self.holes * 2 > self.items.len() {
+            self.items.retain(|&y| y != 0);
+            self.holes = 0;
+            for (k, &y) in self.items.iter().enumerate() {
+                self.pos.insert(y, k);
+            }
+        }
+    }
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.items.iter().copied().filter(|&y| y != 0)
+    }
+}
+
+/// Free a type's subclass list (type deallocation).
+pub unsafe fn free_subclasses(tp: *mut PyTypeObject) {
+    unsafe {
+        if !(*tp).tp_subclasses.is_null() {
+            drop(Box::from_raw((*tp).tp_subclasses as *mut SubList));
+            (*tp).tp_subclasses = std::ptr::null_mut();
+        }
+    }
+}
+
 pub fn add_subclass(base: *mut PyTypeObject, sub: *mut PyTypeObject) {
     let _g = SUBCLASSES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     unsafe {
         if (*base).tp_subclasses.is_null() {
-            (*base).tp_subclasses = Box::into_raw(Box::new(Vec::<usize>::new())) as *mut c_void;
+            (*base).tp_subclasses = Box::into_raw(Box::new(SubList::new())) as *mut c_void;
         }
-        let v = &mut *((*base).tp_subclasses as *mut Vec<usize>);
+        let v = &mut *((*base).tp_subclasses as *mut SubList);
         crate::object::enable_try_incref(sub as *mut PyObject); // see subclasses()
-        if !v.contains(&(sub as usize)) {
-            v.push(sub as usize);
-        }
+        v.add(sub as usize);
     }
 }
 
@@ -939,8 +992,8 @@ pub fn remove_subclass(base: *mut PyTypeObject, sub: *mut PyTypeObject) {
         if (*base).tp_subclasses.is_null() {
             return;
         }
-        let v = &mut *((*base).tp_subclasses as *mut Vec<usize>);
-        v.retain(|&x| x != sub as usize);
+        let v = &mut *((*base).tp_subclasses as *mut SubList);
+        v.remove(sub as usize);
     }
 }
 
@@ -965,12 +1018,12 @@ pub fn subclasses(tp: *mut PyTypeObject) -> Vec<SubType> {
         if (*tp).tp_subclasses.is_null() {
             return Vec::new();
         }
-        let v = &*((*tp).tp_subclasses as *mut Vec<usize>);
+        let v = &*((*tp).tp_subclasses as *mut SubList);
         // a subclass is removed from the list in its dealloc, which needs this lock:
         // its memory is valid here, and try_incref refuses one that is dying
         v.iter()
-            .filter(|&&x| crate::object::try_incref(x as *mut PyObject))
-            .map(|&x| SubType(PyRef::from_raw(x as *mut PyObject)))
+            .filter(|&x| crate::object::try_incref(x as *mut PyObject))
+            .map(|x| SubType(PyRef::from_raw(x as *mut PyObject)))
             .collect()
     }
 }

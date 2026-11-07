@@ -275,6 +275,34 @@ pub fn call_kw(callable: &PyObject, args_and_kwvalues: &[&PyObject], kwnames: Op
     }
 }
 
+/// (tail3) `f(**d)`: does `f` receive the dict itself, so that whether its keys must be
+/// strings is the callee's decision?  As in CPython: callables without vectorcall (their
+/// tp_call takes the dict), builtins using METH_VARARGS|METH_KEYWORDS, and classes whose
+/// `__new__`/`__init__` take the dict (Python-level ones bind the arguments themselves and
+/// reject non-str keys there; the `object` defaults reject any surplus; `ast` nodes report
+/// them).  Every other callee goes through vectorcall, whose keyword names must be str.
+pub fn passes_kwargs_dict(callable: &PyObject) -> bool {
+    if crate::types::typeobject::is_type(callable) {
+        let tp = crate::types::typeobject::as_type(callable);
+        let (new, init) = unsafe { ((*tp).tp_new.map(|f| f as usize), (*tp).tp_init.map(|f| f as usize)) };
+        let new_ok = [
+            crate::types::slots::slot_tp_new as usize,
+            crate::types::object_type::object_new as usize,
+            crate::modules::_ast::ast_new as usize,
+        ];
+        let init_ok = [
+            crate::types::slots::slot_tp_init as usize,
+            crate::types::object_type::object_init as usize,
+            crate::modules::_ast::ast_init as usize,
+        ];
+        return new.is_some_and(|f| new_ok.contains(&f)) && init.is_some_and(|f| init_ok.contains(&f));
+    }
+    if crate::types::cfunction::takes_args_and_dict(callable) {
+        return true;
+    }
+    callable.ty().tp_call.is_some() && vectorcall_func(callable).is_none()
+}
+
 /// Call with positional args and an optional kwargs dict.
 pub fn call_with_kwargs_dict(callable: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
     match kw {
@@ -291,6 +319,10 @@ pub fn call_with_kwargs_dict(callable: &PyObject, args: &[&PyObject], kw: Option
                     if callable.ty().tp_call.is_some() && callable.ty().tp_call != Some(vectorcall_call) {
                         let t = tuple::new_tuple(args.iter().map(|a| a.to_ref()).collect());
                         return call_tp_call(callable, &t, Some(k));
+                    }
+                    if crate::types::cfunction::takes_args_and_dict(callable) {
+                        let t = tuple::new_tuple(args.iter().map(|a| a.to_ref()).collect());
+                        return crate::types::cfunction::call_args_and_dict(callable, &t, Some(k));
                     }
                     raise!(TypeError, "keywords must be strings");
                 }

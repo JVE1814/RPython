@@ -247,20 +247,59 @@ pub fn enter_vm(cell: &crate::threads::ModeCell, safe: crate::threads::ThreadMod
     use crate::threads::ThreadMode;
     let safe = if safe == ThreadMode::InVm { ThreadMode::Blocked } else { safe };
     let me = cell as *const _ as usize;
+    // (stability3) set once this thread had to wait: it is then counted in ENTERING
+    // until it gets in, which makes the next stop wait for it (no starvation)
+    let mut waited = false;
     loop {
         cell.0.store(ThreadMode::InVm as u8, SeqCst);
         if STW_OWNER.load(SeqCst) == me {
-            return;
+            break;
         }
         if RELEASE.load(SeqCst) {
             if !PARK_ALL.load(SeqCst) || FINALIZER.load(SeqCst) == me {
-                return;
+                break;
             }
             cell.0.store(safe as u8, SeqCst);
+            if waited {
+                ENTERING.fetch_sub(1, SeqCst);
+            }
             park_forever();
         }
         cell.0.store(safe as u8, SeqCst);
+        if !waited {
+            waited = true;
+            ENTERING.fetch_add(1, SeqCst);
+        }
         wait_for_release();
+    }
+    if waited {
+        ENTERING.fetch_sub(1, SeqCst);
+    }
+}
+
+/// (stability3) Threads that found the world stopped while entering the VM and have
+/// not got in yet. A new stop first gives them a moment to enter, so a thread that
+/// stops the world in a tight loop cannot keep the others out forever (each of them
+/// makes progress between two pauses).
+static ENTERING: AtomicUsize = AtomicUsize::new(0);
+
+/// Wait (briefly) until the threads queued in ENTERING have entered the VM.
+fn let_waiters_in() {
+    if ENTERING.load(SeqCst) == 0 {
+        return;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+    let mut i = 0u32;
+    while ENTERING.load(SeqCst) != 0 {
+        if i < 32 {
+            std::thread::yield_now();
+        } else {
+            if std::time::Instant::now() > deadline {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(20));
+        }
+        i += 1;
     }
 }
 
@@ -345,13 +384,33 @@ pub fn safepoint_poll(ts: &ThreadState) {
         return; // already counts as stopped
     }
     ts.mode.0.store(crate::threads::ThreadMode::Blocked as u8, SeqCst);
-    wait_for_release();
+    // enter_vm waits for the restart (and queues this thread in ENTERING meanwhile)
     enter_vm(&ts.mode, crate::threads::ThreadMode::Blocked);
+}
+
+/// `_testinternalcapi.test_stop_the_world()`: stop every other thread and restart
+/// them at once (stability3).
+pub fn test_stop_the_world() {
+    if COLLECTOR.load(Acquire) == crate::object::thread_id() {
+        return; // called from a finalizer of this thread's own collection
+    }
+    while COLLECTING.compare_exchange(false, true, AcqRel, Acquire).is_err() {
+        crate::threads::blocking(|| std::thread::sleep(std::time::Duration::from_micros(100)));
+    }
+    let me = crate::threads::current_mut();
+    for _ in 0..40 {
+        if stop_the_world(me) {
+            start_the_world();
+            break;
+        }
+    }
+    COLLECTING.store(false, Release);
 }
 
 /// Bring all other threads to a safepoint. Returns false if they did not arrive in
 /// time (the world is running again then).
 fn stop_the_world(me: *mut ThreadState) -> bool {
+    let_waiters_in();
     let t0 = if crate::scalestats::on() {
         crate::scalestats::STW_COUNT.fetch_add(1, Relaxed);
         Some(std::time::Instant::now())
@@ -721,6 +780,15 @@ fn collect_gen(young_only: bool) -> usize {
     let me = crate::threads::current_mut();
     let saved_exc = crate::errors::take_exc();
     let t0 = std::time::Instant::now();
+    // (stability3) references dropped while other threads existed wait in QSBR batches
+    // until every thread reports (a blocked thread's batches until it wakes); a cycle
+    // they point into would look reachable to this collection. With the world stopped
+    // all of them are due: take them, restart, release, then collect.
+    if crate::qsbr::multi_threaded() && crate::qsbr::has_pending_for_gc() && stop_the_world(me) {
+        let taken = crate::qsbr::take_for_gc();
+        start_the_world();
+        crate::qsbr::release_taken_now(taken);
+    }
     let n = unsafe { collect_phases(me, young_only) };
     if crate::scalestats::on() {
         crate::scalestats::GC_COUNT.fetch_add(1, Relaxed);
@@ -780,6 +848,9 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
         crate::sharded::merge_all();
         // (scale1) everything retired through QSBR before this stop can go
         QSBR_TAKEN.lock().unwrap_or_else(|e| e.into_inner()).extend(crate::qsbr::take_all_for_gc());
+        // (scale2) objects waiting in the merge queues of owners that do not poll
+        // (blocked threads) are merged now and released after the collection
+        DEAD_SHARDED.lock().unwrap_or_else(|e| e.into_inner()).extend(crate::threads::merge_all_queues_stopped());
         // ---- phase 1 (stopped): find the unreachable objects
         let mut objs = snapshot_gen(young_only);
         crate::gc_support::untrack_atomic_tuples(&mut objs);
@@ -967,6 +1038,74 @@ pub fn handshake_safepoint() {
     COLLECTING.store(false, Release);
 }
 
+/// (stability3) Run `f` with every other thread stopped at a safepoint (or outside
+/// the VM), e.g. to walk other threads' frame chains (faulthandler.dump_traceback).
+/// If the world cannot be stopped in time, `f` runs anyway (best effort).
+pub fn with_world_stopped<R>(f: impl FnOnce() -> R) -> R {
+    if !crate::threads::multi_threaded() {
+        return f();
+    }
+    let own = COLLECTOR.load(Acquire) == crate::object::thread_id();
+    while !own && COLLECTING.compare_exchange(false, true, AcqRel, Acquire).is_err() {
+        crate::threads::blocking(|| std::thread::sleep(std::time::Duration::from_micros(200)));
+    }
+    let me = crate::threads::current_mut();
+    let mut stopped = false;
+    let already = !RELEASE.load(SeqCst) && STW_OWNER.load(SeqCst) == unsafe { &(*me).mode as *const _ as usize };
+    if !already {
+        for _ in 0..40 {
+            if stop_the_world(me) {
+                stopped = true;
+                break;
+            }
+        }
+    }
+    let r = f();
+    if stopped {
+        start_the_world();
+    }
+    if !own {
+        COLLECTING.store(false, Release);
+    }
+    r
+}
+
+/// (stability3) `with_world_stopped` for a thread that is not a Python thread (the
+/// faulthandler watchdog). Bounded waits: if a collection holds the collector lock or
+/// a thread does not reach a safepoint within the deadline, `f` runs anyway.
+pub fn with_world_stopped_external<R>(f: impl FnOnce() -> R) -> R {
+    let mut have = false;
+    for _ in 0..1000 {
+        if COLLECTING.compare_exchange(false, true, AcqRel, Acquire).is_ok() {
+            have = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+    if !have {
+        return f();
+    }
+    STW_OWNER.store(0, SeqCst);
+    RELEASE.store(false, SeqCst);
+    let threads: Vec<usize> = crate::threads::ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for &t in &threads {
+        unsafe { &*(t as *const ThreadState) }.c.eval_breaker.fetch_or(crate::threads::EVAL_SAFEPOINT, SeqCst);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while std::time::Instant::now() < deadline
+        && threads.iter().any(|&t| {
+            let ts = unsafe { &*(t as *const ThreadState) };
+            ts.alive() && ts.mode.0.load(SeqCst) == crate::threads::ThreadMode::InVm as u8
+        })
+    {
+        std::thread::sleep(std::time::Duration::from_micros(50));
+    }
+    let r = f();
+    RELEASE.store(true, SeqCst);
+    COLLECTING.store(false, Release);
+    r
+}
+
 /// All tracked objects (for gc.get_objects / get_referrers).
 pub fn all_tracked() -> Vec<PyRef> {
     if !crate::threads::multi_threaded() {
@@ -984,10 +1123,13 @@ pub fn all_tracked() -> Vec<PyRef> {
     }
     let me = crate::threads::current_mut();
     let mut stopped = false;
-    for _ in 0..40 {
-        if stop_the_world(me) {
-            stopped = true;
-            break;
+    let already = !RELEASE.load(SeqCst) && STW_OWNER.load(SeqCst) == unsafe { &(*me).mode as *const _ as usize };
+    if !already {
+        for _ in 0..40 {
+            if stop_the_world(me) {
+                stopped = true;
+                break;
+            }
         }
     }
     let v: Vec<PyRef> = snapshot().into_iter().map(|o| unsafe { PyRef::from_borrowed(o) }).collect();
@@ -1035,6 +1177,7 @@ pub fn fork_parent(stopped: bool) {
 /// Reset the collector state in the child: the other threads are gone.
 pub fn fork_child() {
     PARKED.store(0, Release);
+    ENTERING.store(0, SeqCst);
     STW_OWNER.store(0, SeqCst);
     RELEASE.store(true, Release);
     COLLECTING.store(false, Release);

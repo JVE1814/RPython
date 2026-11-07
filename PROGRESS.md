@@ -1,13 +1,13 @@
 # PROGRESS
 
 ## Status 2026-11-07 (day 7, afternoon)
-Master 0a2f1fa: core6, perf4, tail1, capi2, cleanroom1+2 (20 Lib modules rewritten clean-room), scale1 (multi-core scaling), tail2 (re.DEBUG, _zoneinfo, ssl PSK, alloc-failure injection, 22 modules) merged today; suite run 13 running; suite run 12: 367/434 modules pass, 129 failures, 70 errors. Smoke on snap19: test_capi 40 failures (was 433 in run 11),
+Master 24d1c6a: core6, perf4, tail1, capi2, cleanroom1+2 (20 Lib modules rewritten clean-room), scale1 (multi-core scaling), tail2 (re.DEBUG, _zoneinfo, ssl PSK, alloc-failure injection, 22 modules), perf5, stability3 (test_free_threading passes), scale2 checkpoint (concurrent_futures + multiprocessing pass), pdb1 (clean-room pdb: test_pdb, test_remote_pdb pass), tail3 (crossinterp, getpath, nturl2path, ast, multiprocessing, httpservers, asyncio 10→2) merged today; suite run 14 running; suite run 13: 396/434 pass or whole-module skip; suite run 12: 367/434 modules pass, 129 failures, 70 errors. Smoke on snap19: test_capi 40 failures (was 433 in run 11),
 stable_abi_ctypes/fileutils pass, cmd_line_script 1; tail1 fixed ~60 long-tail modules (inspect, codecs, time,
 path modules, math, buffer, logging, json, ...). Run 11 (pre-merges):
 294/434 modules pass, 674 failures (241 without test_capi), 616 errors. Baseline free-threaded CPython: 416/434.
-Running agents: scale2 (scaling round 2 + prompt-free regression in test_concurrent_futures), perf5 (remaining slow benchmarks), stability3 (test_free_threading races,
-flaky crashes), tail3 (crossinterp, getpath, nturl2path, asyncio, ast, leftovers), pdb1 (clean-room pdb, remote pdb,
-profiling.sampling).
+Running agents: scale2 (scaling round 2), perf6 (startup image, slow call paths, xml engine, memory), cleanroom3 (D19 Lib audit, round 3),
+capi3 (remaining test_capi, test_sys sizes, per-interpreter interning), remote1 (_remote_debugging, sys.remote_exec,
+profiling.sampling, pyrepl).
 Earlier history (2026-11-02): agents stopped when the weekly API limit was hit; resumed Nov 5.
 
 ## RESUMED (2026-11-01, 22:15 UTC) after a pause at user request
@@ -91,6 +91,7 @@ Ours (tools/run_tests.sh, 434 modules):
 | 10 | 55e6237 (stability2+perf3, pre-hang1) | 292 | 134 | 0 | 8 | 43,012 | 225 | 2,492 |
 | 11 | 9af79cb (hang1, pre-wheels2/core6) | 294 | 140 | 0 | 0 | 49,781 | 674 (241 excl. test_capi) | 3,200 |
 | 12 | f66b390 (core6+perf4+tail1+capi2) | 367 | 67 | 0 | 0 | 49,880 | 129 (+70 errors) | 3,202 |
+| 13 | 0a2f1fa (tail2+cleanroom2+scale1, pre-perf5/stability3) | 360 (+36 whole-module skips) | 37 | 0 | 1 | 50,095 | 111 (+68 errors) | 3,190 |
 Run 7 (pre-core4): crashes = test_capi (segfault after a lone-surrogate print), test_free_threading
 (deque race, test_collections), test_itertools (flaky; passes now), test_multiprocessing_fork/spawn
 (heap corruption in test_manager); timeouts = asyncio, cmd_line_script, os, subprocess. Largest
@@ -102,6 +103,11 @@ subprocess. Largest failure counts: importlib 20, call 17, inspect 15, dict 8, c
 Run 9: crashes = test_free_threading (io heap corruption), test_functools (lru_cache race; fixed since), test_super
 (__class__ assignment race), test_multiprocessing_fork/forkserver/spawn; timeouts = asyncio, capi, cmd_line_script,
 os, subprocess. Largest failure counts: importlib 20, call 17, inspect 15, dict 8, concurrent_futures 7.
+Run 13: 396/434 pass or skip as a whole module (D28 now labels whole-module skips SKIP; the baseline's 416 counts them
+as PASS). 31 modules fail that pass on CPython: capi 40+13E, asyncio 10, concurrent_futures 9 (fixed since by
+stability3: 2), crossinterp 30E, import 3 (new: builtins missing in teardown), multiprocessing_* 2 each (1 since), ast 2,
+gc 2, free_threading 2 (passes since stability3), httpservers (new hang in test_https_client), getpath, nturl2path, pdb,
+remote_pdb, profiling, and 1-failure modules. tail3 and pdb1 own the rest.
 Run 12: no crashes, no timeouts; 367/434 (baseline 416). 51 modules fail that pass on CPython: capi 40+13E, asyncio 10,
 concurrent_futures 5, re 4, faulthandler 3, collections 3, multiprocessing_* 2 each, crossinterp 30E, sys 1+3E, gc 2, ast 2,
 repl 2, ~30 modules with 1 failure; module-level errors: getpath (needs a getpath code object), nturl2path (missing),
@@ -121,7 +127,31 @@ Run 1 top blockers: py_compile (230 modules; merged since), unittest.mock (57), 
 array (24), socket (17), pathlib (16), http (14), multiprocessing, decimal, datetime, ntpath.
 
 ## Benchmarks
-### Latest (perf4, 2026-11-07; wall-clock ratio ours / best CPython, pinned to one core, one run each, loaded machine, ±10%)
+### Latest (perf5, 2026-11-07; wall ratio ours / best CPython, pinned one core, one run each, load 6–7, ±10–15%)
+| benchmark | perf4 | perf5 |
+|---|---|---|
+| xml_etree | 1.55 | 1.55 |
+| deepcopy | 1.52 | 1.36 |
+| bpe_tokeniser | 1.27 | 1.30 |
+| logging | 1.34 | 1.30 |
+| python_startup | 1.33 | 1.29 |
+| comprehensions | 1.35 | 1.27 |
+| typing_runtime_protocols | 1.37 | 1.25 |
+| mdp | 1.33 | 1.24 |
+| base64 | 1.28 | 1.18 |
+| async_generators | 1.25 | 1.17 |
+| pathlib | 1.87 | 1.16 |
+| nqueens | 1.30 | 1.14 |
+| concurrent_imap | 1.00 | 1.08 |
+| pprint | 1.11 | 1.02 |
+| go | 1.03 | 0.97 |
+| gc_traversal | 1.42 | 0.70 |
+| gc_collect | 0.66 | 0.51 |
+Instructions per call: bound method 447 (CPython 502), property read 401 (441), kw call 743 (701), raise+catch 4042
+(3686). Peak memory 35.3 MB (CPython 32.4). Startup `-c pass` 55.8M instructions (40.5M). perf6 is on startup
+(CDS-style startup image), slow call paths, xml_etree's expat engine, raise/catch, memory.
+
+### Previous (perf4, 2026-11-07; wall-clock ratio ours / best CPython, pinned to one core, one run each, loaded machine, ±10%)
 About 11 of 32 benchmarks beat or match the best CPython build (json_dumps 0.83, json_loads, raytrace, richards 0.60,
 deltablue, chaos 0.65, float, hexiom, gc_collect, coroutines 0.98, unpack_sequence); fannkuch and go within a few %.
 

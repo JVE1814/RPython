@@ -246,7 +246,13 @@ fn build() -> Option<usize> {
     // tier-2 countdown (bump_invocations)
     let nocompile = a.label();
     let docall = a.label();
-    a.add32_mi(M(Rdx, cd_invoc), 1);
+    // (scale2) the countdown is written only while it runs (> 0): a shared counter
+    // stored at every call makes all threads calling the function fight over its
+    // cache line. (The invocation count only matters before tier 1, so callees
+    // reached here, which are compiled, no longer bump it.)
+    let _ = cd_invoc;
+    a.cmp32_mi(M(Rdx, cd_t2), 0);
+    a.jcc(Cc::LE, nocompile);
     a.sub32_mi(M(Rdx, cd_t2), 1);
     a.jcc(Cc::NE, nocompile);
     a.mov_rr(Rdi, Rbx);

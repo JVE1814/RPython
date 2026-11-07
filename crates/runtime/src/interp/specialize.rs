@@ -250,7 +250,8 @@ fn load_attr_hit(o: &PyObject, nm: &PyObject, e: &Entry) -> Option<PyResult<PyRe
             if cache::type_tag(tp) as u64 != s.a {
                 return None;
             }
-            let p = unsafe { *((o.as_ptr() as *mut u8).add(s.c) as *const *mut PyObject) };
+            crate::qsbr::note_attr_read(o);
+            let p = unsafe { (*((o.as_ptr() as *mut u8).add(s.c) as *const std::sync::atomic::AtomicPtr<PyObject>)).load(std::sync::atomic::Ordering::Acquire) };
             if p.is_null() {
                 if s.b as i32 == Py_T_OBJECT {
                     return Some(Ok(crate::types::none::none_ref()));
@@ -577,12 +578,12 @@ pub fn store_attr(o: &PyObject, nm: &PyObject, v: &PyObject, es: &[Entry]) -> Py
                             (crate::shape::Set::Missing, _) => {}
                             (crate::shape::Set::NotValues, _) => {}
                         }
-                        let slot = dict_slot(o.as_ptr());
-                        if !slot.is_null() {
-                            if (*slot).is_null() {
-                                *slot = dict::new_dict().into_raw();
-                            }
-                            let r = dict::set_item(&**slot, nm, v);
+                        // (stability3) an owned reference, created with a CAS: another
+                        // thread may assign `o.__dict__` meanwhile and release the
+                        // old dict (QSBR), and set_item may wait for the dict's lock
+                        // in blocked mode, which counts as a quiescent state
+                        if let Some(d) = crate::types::typeobject::instance_dict(o) {
+                            let r = dict::set_item(&d, nm, v);
                             if had_values && r.is_ok() {
                                 // the object's attributes just moved into a dict: later
                                 // stores (compiled hits, which record nothing) see the
@@ -595,7 +596,7 @@ pub fn store_attr(o: &PyObject, nm: &PyObject, v: &PyObject, es: &[Entry]) -> Py
                     kind::SLOT => unsafe {
                         // readers on other threads load the slot without a lock
                         let p = (o.as_ptr() as *mut u8).add(s.c) as *mut *mut PyObject;
-                        crate::qsbr::swap_field(p, v.to_ref().into_raw());
+                        crate::qsbr::swap_attr(o.as_ptr(), p, v.to_ref().into_raw()); // scale2
                         return Ok(());
                     },
                     kind::DATA_DESCR => unsafe {

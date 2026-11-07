@@ -220,10 +220,14 @@ class ChannelID:
     def __setattr__(self, name, value):
         raise AttributeError(f'readonly attribute {name!r}')
 
-    def __del__(self):
-        if getattr(self, '_counted', False):
-            object.__setattr__(self, '_counted', False)
-            _cid_release(self._cid)
+    # (tail3) everything __del__ needs is bound at definition time: an
+    # interpreter being torn down may already have cleared this module's
+    # globals (and its __builtins__) when the last ChannelID goes away.
+    def __del__(self, _getattr=getattr, _setattr=object.__setattr__,
+                _release=_cid_release):
+        if _getattr(self, '_counted', False):
+            _setattr(self, '_counted', False)
+            _release(self._cid)
 
     def __reduce__(self):
         return (_channel_id, (self._cid,), None)

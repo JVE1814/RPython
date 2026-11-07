@@ -398,6 +398,7 @@ pub unsafe fn retire_thread_state(p: *mut ThreadState) {
         }
         {
             let _all = threads::ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+            let _q = ts.merge_queue.lock().unwrap_or_else(|e| e.into_inner()); // (scale2) see threads::queue_object_for_merge
             ts.alive.store(false, SeqCst);
         }
         loop {
@@ -634,6 +635,9 @@ pub fn finalize_current() {
         crate::modules::sys_full::flush_std("stderr");
         clear_exc();
         crate::gc::collect();
+        // (scale2) deferred releases of this thread (QSBR, merge queue) happen now,
+        // while the modules their finalizers and weakref callbacks use still exist
+        crate::threads::before_wait();
         clear_exc();
         crate::modules::sys_finalize::finalize_modules();
         clear_exc();
@@ -654,11 +658,24 @@ pub fn finalize_current() {
             unsafe { xdecref(p as *mut PyObject) };
         }
         // the namespaces of sys and builtins hold the rest of the object graph
-        for root in [&i.sys, &i.builtins] {
-            let p = root.load(Acquire);
-            if !p.is_null() {
-                let d = pymodule::module_dict(unsafe { &*p });
-                dict::clear(&d);
+        let p = i.sys.load(Acquire);
+        if !p.is_null() {
+            dict::clear(&pymodule::module_dict(unsafe { &*p }));
+        }
+        // (tail3) builtins keeps its builtin functions, types and constants: functions
+        // of this interpreter that are finalized later (an object whose last reference
+        // goes after this point) still find getattr & co. through their __builtins__.
+        // Everything else (modules, site's helpers, `_`) is dropped as before.
+        let p = i.builtins.load(Acquire);
+        if !p.is_null() {
+            let d = pymodule::module_dict(unsafe { &*p });
+            for (k, v) in dict::items_vec(&d) {
+                let keep = crate::types::typeobject::is_type(&v)
+                    || crate::types::cfunction::is_cfunction(&v)
+                    || v.is_immortal();
+                if !keep {
+                    let _ = dict::del_item(&d, &k);
+                }
             }
         }
         let md = i.modules.load(Acquire);

@@ -345,7 +345,13 @@ fn parse_file_threads(fname: &str, args: &[&PyObject], kw: Option<&PyObject>) ->
 
 fn fh_dump_traceback(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
     let (fd, _keep, all, maxt) = parse_file_threads("dump_traceback", args, kw)?;
-    dump_traceback_fd(fd, all, maxt);
+    // (stability3) the other threads must not push or pop frames while their
+    // chains are walked (a popped frame goes back to the frame pool: segfault)
+    if all {
+        crate::gc::with_world_stopped(|| dump_traceback_fd(fd, all, maxt));
+    } else {
+        dump_traceback_fd(fd, all, maxt);
+    }
     Ok(none::none_ref())
 }
 fn fh_dump_c_stack(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
@@ -581,7 +587,8 @@ fn fh_dump_traceback_later(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObje
             }
             drop(g);
             wr(fd, header.as_bytes());
-            dump_traceback_fd(fd, true, DEFAULT_MAX_THREADS);
+            // (stability3) with the other threads parked where possible
+            crate::gc::with_world_stopped_external(|| dump_traceback_fd(fd, true, DEFAULT_MAX_THREADS));
             if exit {
                 unsafe { libc::_exit(1) };
             }

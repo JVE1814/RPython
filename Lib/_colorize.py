@@ -257,6 +257,18 @@ class Syntax(ThemeSection):
 
 
 @dataclass(frozen=True, kw_only=True)
+class ProfilerDump(ThemeSection):
+    header: str = ANSIColors.BOLD_MAGENTA
+    status: str = ANSIColors.CYAN
+    filename: str = ANSIColors.MAGENTA
+    line_no: str = ANSIColors.MAGENTA
+    frame: str = ANSIColors.MAGENTA
+    opcode: str = ANSIColors.GREY
+    source_highlight: str = ANSIColors.BOLD_RED
+    reset: str = ANSIColors.RESET
+
+
+@dataclass(frozen=True, kw_only=True)
 class Timeit(ThemeSection):
     timing: str = ANSIColors.CYAN
     best: str = ANSIColors.GREEN
@@ -295,6 +307,7 @@ class Theme:
     difflib: Difflib = field(default_factory=Difflib)
     fancycompleter: FancyCompleter = field(default_factory=FancyCompleter)
     http_server: HttpServer = field(default_factory=HttpServer)
+    profiler_dump: ProfilerDump = field(default_factory=ProfilerDump)
     syntax: Syntax = field(default_factory=Syntax)
     timeit: Timeit = field(default_factory=Timeit)
     traceback: Traceback = field(default_factory=Traceback)

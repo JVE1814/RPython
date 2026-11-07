@@ -79,13 +79,13 @@ class BaseSelectorEventLoop(base_events.BaseEventLoop):
             extra=None, server=None,
             ssl_handshake_timeout=constants.SSL_HANDSHAKE_TIMEOUT,
             ssl_shutdown_timeout=constants.SSL_SHUTDOWN_TIMEOUT,
-            call_connection_made=True):
+            call_connection_made=True, context=None):
         self._ensure_fd_no_transport(rawsock)
         tls = sslproto.SSLProtocol(
             self, protocol, sslcontext, waiter, server_side, server_hostname,
             ssl_handshake_timeout=ssl_handshake_timeout,
             ssl_shutdown_timeout=ssl_shutdown_timeout,
-            call_connection_made=call_connection_made)
+            call_connection_made=call_connection_made, context=context)
         _SelectorSocketTransport(self, rawsock, tls, extra=extra,
                                  server=server)
         return tls._app_transport

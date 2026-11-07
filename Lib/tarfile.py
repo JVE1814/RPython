@@ -7,6 +7,7 @@ that defend against hostile archives.
 """
 
 
+import bisect
 import io
 import os
 import re
@@ -599,9 +600,12 @@ class _PeekableFile:
         return "tar"
 
 
-class _FileInFile:
-    """Read-only view of a member's data inside the archive file, with
-    sparse regions filled with zeros."""
+class _MemberData:
+    """Read-only file object over the data of one member inside the archive.
+
+    A sparse member lists its stored (offset, length) blocks; the holes
+    between them read as NUL bytes.
+    """
 
     def __init__(self, fileobj, offset, size, name, blockinfo=None):
         self.fileobj = fileobj
@@ -612,19 +616,21 @@ class _FileInFile:
         self.closed = False
         if blockinfo is None:
             blockinfo = [(0, size)]
-        # (is_data, start, end, offset in archive)
-        self.map = []
-        pos = 0
-        last_real = offset
-        for off, length in blockinfo:
-            if off > pos:
-                self.map.append((False, pos, off, None))
-            self.map.append((True, off, off + length, last_real))
-            last_real += length
-            pos = off + length
-        if pos < size:
-            self.map.append((False, pos, size, None))
-        self.map_index = 0
+        # (first byte, end, offset of the bytes in the archive or None
+        # for a hole), in member order
+        segments = []
+        cursor = 0
+        stored = offset
+        for start, length in blockinfo:
+            if start > cursor:
+                segments.append((cursor, start, None))
+            segments.append((start, start + length, stored))
+            stored += length
+            cursor = start + length
+        if cursor < size:
+            segments.append((cursor, size, None))
+        self._segments = segments
+        self._starts = [segment[0] for segment in segments]
 
     def flush(self):
         pass
@@ -647,44 +653,41 @@ class _FileInFile:
 
     def seek(self, position, whence=io.SEEK_SET):
         if whence == io.SEEK_SET:
-            self.position = min(max(position, 0), self.size)
+            target = position
         elif whence == io.SEEK_CUR:
-            if position < 0:
-                self.position = max(self.position + position, 0)
-            else:
-                self.position = min(self.position + position, self.size)
+            target = self.position + position
         elif whence == io.SEEK_END:
-            self.position = max(min(self.size + position, self.size), 0)
+            target = self.size + position
         else:
             raise ValueError("Invalid argument")
+        self.position = max(0, min(target, self.size))
         return self.position
 
     def read(self, size=None):
-        if size is None or size < 0:
-            size = self.size - self.position
-        else:
-            size = min(size, self.size - self.position)
-        out = bytearray()
-        while size > 0:
-            while True:
-                is_data, start, stop, real = self.map[self.map_index]
-                if start <= self.position < stop:
-                    break
-                self.map_index += 1
-                if self.map_index == len(self.map):
-                    self.map_index = 0
-            n = min(size, stop - self.position)
-            if is_data:
-                self.fileobj.seek(real + (self.position - start))
-                chunk = self.fileobj.read(n)
-                if len(chunk) != n:
-                    raise ReadError("unexpected end of data")
-                out += chunk
+        wanted = self.size - self.position
+        if size is not None and size >= 0:
+            wanted = min(wanted, size)
+        pieces = []
+        while wanted > 0:
+            index = bisect.bisect_right(self._starts, self.position) - 1
+            start, end, stored = self._segments[max(index, 0)]
+            if not start <= self.position < end:
+                # not covered by any block: read as a hole up to the next one
+                stored = None
+                following = self._starts[index + 1:index + 2]
+                end = following[0] if following else self.size
+            count = min(wanted, end - self.position)
+            if stored is None:
+                pieces.append(NUL * count)
             else:
-                out += NUL * n
-            size -= n
-            self.position += n
-        return bytes(out)
+                self.fileobj.seek(stored + self.position - start)
+                chunk = self.fileobj.read(count)
+                if len(chunk) != count:
+                    raise ReadError("unexpected end of data")
+                pieces.append(chunk)
+            self.position += count
+            wanted -= count
+        return b''.join(pieces)
 
     def readinto(self, b):
         data = self.read(len(b))
@@ -699,7 +702,7 @@ class ExFileObject(io.BufferedReader):
     """Buffered reader for a member's data (returned by extractfile())."""
 
     def __init__(self, tarfile, tarinfo):
-        raw = _FileInFile(tarfile.fileobj, tarinfo.offset_data, tarinfo.size,
+        raw = _MemberData(tarfile.fileobj, tarinfo.offset_data, tarinfo.size,
                           tarinfo.name, tarinfo.sparse)
         super().__init__(raw)
 

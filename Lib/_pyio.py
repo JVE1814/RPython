@@ -536,6 +536,20 @@ class BytesIO(BufferedIOBase):
             raise ValueError("__getstate__ on closed file")
         return self.__dict__.copy()
 
+    def __setstate__(self, state):
+        # Inverse of __getstate__: the instance dict, whose buffer is copied so that
+        # the stream never shares a bytearray with the state it was restored from.
+        if self.closed:
+            raise ValueError("__setstate__ on closed file")
+        if not isinstance(state, dict):
+            raise TypeError(f"__setstate__ argument should be a dict, "
+                            f"got {type(state).__name__}")
+        attrs = dict(state)
+        buf = attrs.pop('_buffer', None)
+        buf = bytearray() if buf is None else bytearray(buf)
+        self.__dict__.update(attrs)
+        self._buffer = buf
+
     def getvalue(self):
         """Return the bytes value (contents) of the buffer."""
         if self.closed:

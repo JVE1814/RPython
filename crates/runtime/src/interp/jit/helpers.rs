@@ -116,6 +116,18 @@ pub unsafe extern "C" fn h_incref_shared(o: *mut PyObject) {
 pub unsafe extern "C" fn h_ob_unlock_slow(o: *mut PyObject) {
     unsafe { crate::capi::pythread::mutex_unlock(&(*o).ob_mutex) }
 }
+/// (scale2) Deferred release of a value replaced in attribute storage that another
+/// thread may be reading lock-free (JIT stores, see qsbr::release_attr).
+pub unsafe extern "C" fn h_decref_deferred(o: *mut PyObject) {
+    unsafe {
+        // (the store before was a locked instruction: see qsbr::others_quiescent)
+        if crate::qsbr::others_quiescent() {
+            crate::object::decref(o);
+        } else {
+            crate::qsbr::decref_deferred(o)
+        }
+    }
+}
 /// (scale1) Non-owner incref of a sharded object (tier1::incref_sharded_routine).
 pub unsafe extern "C" fn h_incref_sharded(o: *mut PyObject) {
     unsafe { crate::sharded::add(o, 1) }
@@ -1151,9 +1163,9 @@ pub unsafe extern "C" fn h_call_ex(sp: *mut *mut PyObject) -> u64 {
             };
             // core6: like the interpreter, a callable without vectorcall gets the tuple and the
             // keyword dict as they are
-            let direct = self_or_null.is_none() && callable.ty().tp_call.is_some() && ab::vectorcall_func(&callable).is_none();
+            // (tail3) which callees get the dict: ab::passes_kwargs_dict
             if let Some(d) = &kwd {
-                if !direct || crate::types::typeobject::is_type(&callable) {
+                if self_or_null.is_some() || !ab::passes_kwargs_dict(&callable) {
                     st(eval::check_kwargs_keys(d))?;
                 }
             }
@@ -1285,7 +1297,7 @@ pub unsafe extern "C" fn h_load_super_attr(sp: *mut *mut PyObject, arg: u64, nam
                 }
             }
             let sup = if is_super {
-                st(crate::types::super_::new_super(&cls, &slf))?
+                if arg & 2 != 0 { st(crate::types::super_::new_super(&cls, &slf))? } else { st(crate::types::super_::new_super_zero_arg(&cls, &slf))? }
             } else if arg & 2 != 0 {
                 st(ab::call(&gsuper, &[&cls, &slf]))?
             } else {

@@ -313,7 +313,16 @@ pub fn context_copy(o: &PyObject) -> PyResult<PyRef> {
 
 // ------------------------------- current context ----------------------------------------
 
-struct Cur(std::cell::Cell<*mut PyObject>);
+// (tail3) The current context lives in a ContextVar (HAVE_CONTEXTVAR: every asyncio task
+// and contextvars.Context has its own).  Arithmetic asks for it on every operation, so
+// each OS thread caches the last answer together with the stamp of the context state it
+// was read from (thread-state id, context version); any context switch or variable
+// assignment on that thread state changes the stamp.
+
+struct Cur {
+    stamp: std::cell::Cell<(u64, u64)>,
+    ctx: std::cell::Cell<*mut PyObject>,
+}
 impl Drop for Cur {
     fn drop(&mut self) {
         // Leak at thread exit: the interpreter may already be gone.
@@ -321,7 +330,36 @@ impl Drop for Cur {
 }
 
 thread_local! {
-    static CURRENT: Cur = const { Cur(std::cell::Cell::new(std::ptr::null_mut())) };
+    static CURRENT: Cur = const { Cur { stamp: std::cell::Cell::new((0, 0)), ctx: std::cell::Cell::new(std::ptr::null_mut()) } };
+}
+
+static CONTEXT_VAR: std::sync::atomic::AtomicPtr<PyObject> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+fn context_var() -> PyResult<&'static PyObject> {
+    let p = CONTEXT_VAR.load(std::sync::atomic::Ordering::Acquire);
+    if !p.is_null() {
+        return Ok(unsafe { &*p });
+    }
+    let v = crate::modules::_contextvars::new_var("decimal_context")?.into_raw();
+    match CONTEXT_VAR.compare_exchange(std::ptr::null_mut(), v, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire) {
+        Ok(_) => Ok(unsafe { &*v }),
+        Err(winner) => {
+            unsafe { decref(v) };
+            Ok(unsafe { &*winner })
+        }
+    }
+}
+
+fn remember(c: &PyObject) {
+    let stamp = crate::modules::_contextvars::context_stamp();
+    let newp = c.to_ref().into_raw();
+    let old = CURRENT.with(|cur| {
+        cur.stamp.set(stamp);
+        cur.ctx.replace(newp)
+    });
+    if !old.is_null() {
+        unsafe { decref(old) };
+    }
 }
 
 fn is_template(o: &PyObject) -> bool {
@@ -329,25 +367,30 @@ fn is_template(o: &PyObject) -> bool {
     o.is(&s.default_ctx) || o.is(&s.basic_ctx) || o.is(&s.extended_ctx)
 }
 
-/// Current context (borrowed pointer valid while not replaced).
+/// The current context.
 pub fn current() -> PyResult<PyRef> {
-    let p = CURRENT.with(|c| c.0.get());
-    if !p.is_null() {
-        return Ok(unsafe { PyRef::from_borrowed(p) });
+    let stamp = crate::modules::_contextvars::context_stamp();
+    let cached = CURRENT.with(|c| if c.stamp.get() == stamp { c.ctx.get() } else { std::ptr::null_mut() });
+    if !cached.is_null() {
+        return Ok(unsafe { PyRef::from_borrowed(cached) });
+    }
+    if let Some(c) = crate::modules::_contextvars::var_value(context_var()?)? {
+        if is_context(&c) {
+            remember(&c);
+            return Ok(c);
+        }
     }
     let t = &st().default_ctx;
     let c = context_copy(t)?;
     cobj(&c).flags.store(0, Relaxed);
-    set_current(&c);
+    set_current(&c)?;
     Ok(c)
 }
 
-fn set_current(c: &PyObject) {
-    let newp = c.to_ref().into_raw();
-    let old = CURRENT.with(|cur| cur.0.replace(newp));
-    if !old.is_null() {
-        unsafe { decref(old) };
-    }
+fn set_current(c: &PyObject) -> PyResult<()> {
+    crate::modules::_contextvars::var_set(context_var()?, c)?;
+    remember(c);
+    Ok(())
 }
 
 pub fn getcontext(_m: &PyObject) -> PyResult {
@@ -366,9 +409,9 @@ fn setcontext_impl(v: &PyObject) -> PyResult<()> {
     if is_template(v) {
         let c = context_copy(v)?;
         cobj(&c).flags.store(0, Relaxed);
-        set_current(&c);
+        set_current(&c)?;
     } else {
-        set_current(v);
+        set_current(v)?;
     }
     Ok(())
 }

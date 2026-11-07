@@ -385,6 +385,16 @@ unsafe fn consider(op: *mut PyObject) -> bool {
         // (survived a collection) or, for tuples, untracked ones (atomic items).
         let bits = o.ob_gc_bits.load(Relaxed);
         let old = bits & crate::alloc::GC_BIT_OLD != 0;
+        // (stability3) nested functions (closures, callbacks made at run time) keep
+        // immediate release, as CPython only defers the counts of functions whose code
+        // is not nested: dropping the last reference to a callback must free it then
+        // (test_free_threading.test_monitoring checks with a weak reference)
+        if std::ptr::eq(tp, &raw const crate::types::funcobject::PyFunction_Type) {
+            let co = (*(op as *mut crate::types::funcobject::PyFunctionObject)).func_code;
+            if co.is_null() || (*(co as *mut crate::types::code::PyCodeObject)).co_flags & 0x10 != 0 {
+                return false;
+            }
+        }
         if std::ptr::eq(tp, &raw const crate::types::tuple::PyTuple_Type) {
             if bits & crate::alloc::GC_BIT_TRACKED != 0 && !old {
                 return false;

@@ -54,6 +54,13 @@ unsafe fn add_module(n: &PyObject) -> *mut PyObject {
         Ok(Some(m)) if tmod::is_module(&m) => m.into_raw(),
         Ok(_) => ret((|| -> PyResult {
             let m = tmod::new_module_obj(n)?;
+            // (stability3) insert-if-absent in one step: threads adding the same name
+            // concurrently must all get the module that ended up in sys.modules
+            let h = dict::hash_of(n)?;
+            let cur = dict::setdefault_hash(&d, n, h, &m)?;
+            if tmod::is_module(&cur) {
+                return Ok(cur);
+            }
             dict::set_item(&d, n, &m)?;
             Ok(m)
         })()),

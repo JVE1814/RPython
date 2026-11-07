@@ -1,16 +1,22 @@
-"""Path helpers shared by the platform path modules (posixpath, ntpath).
+"""Path functions that are the same on every platform.
 
-Not meant to be imported directly."""
+posixpath and ntpath re-export these; use them through os.path.
+"""
 import os
 import stat
 
 __all__ = ['commonprefix', 'exists', 'getatime', 'getctime', 'getmtime',
            'getsize', 'isdevdrive', 'isdir', 'isfile', 'isjunction', 'islink',
-           'lexists', 'samefile', 'sameopenfile', 'samestat', 'ALLOW_MISSING', 'ALL_BUT_LAST']
+           'lexists', 'samefile', 'sameopenfile', 'samestat', 'ALLOW_MISSING',
+           'ALL_BUT_LAST']
 
+
+# The predicates answer False instead of raising for paths the OS rejects
+# (missing files, permission problems, embedded NULs, unencodable names).
 
 def exists(path):
-    """Return True if path names an existing file system object (False for a dangling symlink)."""
+    """Return True if path names an existing file or directory (broken
+    symbolic links count as missing)."""
     try:
         os.stat(path)
     except (OSError, ValueError):
@@ -19,7 +25,7 @@ def exists(path):
 
 
 def lexists(path):
-    """Return True if path exists, without following a final symbolic link."""
+    """Return True if path exists; a broken symbolic link counts."""
     try:
         os.lstat(path)
     except (OSError, ValueError):
@@ -27,139 +33,144 @@ def lexists(path):
     return True
 
 
-def isfile(path):
-    """Return True if path names an existing regular file."""
+def _mode_is(path, check, follow=True):
     try:
-        st = os.stat(path)
+        info = os.stat(path) if follow else os.lstat(path)
     except (OSError, ValueError):
         return False
-    return stat.S_ISREG(st.st_mode)
+    return check(info.st_mode)
+
+
+def isfile(path):
+    """Return True if path is an existing regular file (following links)."""
+    return _mode_is(path, stat.S_ISREG)
 
 
 def isdir(s):
-    """Return True if path names an existing directory."""
-    try:
-        st = os.stat(s)
-    except (OSError, ValueError):
-        return False
-    return stat.S_ISDIR(st.st_mode)
+    """Return True if s is an existing directory (following links)."""
+    return _mode_is(s, stat.S_ISDIR)
 
 
 def islink(path):
-    """Return True if path names a symbolic link."""
-    try:
-        st = os.lstat(path)
-    except (OSError, ValueError, AttributeError):
-        return False
-    return stat.S_ISLNK(st.st_mode)
+    """Return True if path is a symbolic link."""
+    return _mode_is(path, stat.S_ISLNK, follow=False)
 
 
 def isjunction(path):
-    """Return False: junctions do not exist on this platform."""
+    """Return True if path is a junction; junctions only exist on
+    Windows, so this is always False here."""
     os.fspath(path)
     return False
 
 
 def isdevdrive(path):
-    """Return False: Dev Drives do not exist on this platform."""
+    """Return True if path lives on a Windows Dev Drive; always False
+    on other systems."""
     os.fspath(path)
     return False
 
 
 def getsize(filename):
-    """Return st_size of os.stat(filename)."""
+    """Return the size of a file in bytes, as reported by os.stat()."""
     return os.stat(filename).st_size
 
 
 def getmtime(filename):
-    """Return st_mtime of os.stat(filename)."""
+    """Return the time of last modification, as reported by os.stat()."""
     return os.stat(filename).st_mtime
 
 
 def getatime(filename):
-    """Return st_atime of os.stat(filename)."""
+    """Return the time of last access, as reported by os.stat()."""
     return os.stat(filename).st_atime
 
 
 def getctime(filename):
-    """Return st_ctime of os.stat(filename)."""
+    """Return the metadata change time (Unix) or creation time (Windows),
+    as reported by os.stat()."""
     return os.stat(filename).st_ctime
 
 
 def commonprefix(m, /):
-    """Return the longest string that is a prefix of every item of m (character-wise)."""
+    """Return the longest common leading part of the items of m
+    (deprecated: it compares item by item, characters for strings, so the
+    result need not be a valid path; use commonpath() for paths)."""
     import warnings
-    warnings.warn('os.path.commonprefix() is deprecated. Use '
-                  'os.path.commonpath() for longest path prefix.',
-                  category=DeprecationWarning,
-                  stacklevel=2)
-    return _commonprefix(m)
+    warnings.warn('os.path.commonprefix() is deprecated; use '
+                  'os.path.commonpath() to find a common path',
+                  DeprecationWarning, stacklevel=2)
+    return _common_start(m)
 
 
-def _commonprefix(m, /):
-    if not m:
+def _common_start(items):
+    # Longest common prefix of a list of sequences (strings, lists, ...).
+    if not items:
         return ''
-    if not isinstance(m[0], (list, tuple)):
-        m = tuple(map(os.fspath, m))
-    lo = min(m)
-    hi = max(m)
-    n = min(len(lo), len(hi))
-    i = 0
-    while i < n and lo[i] == hi[i]:
-        i += 1
-    return lo[:i]
+    if not isinstance(items[0], (list, tuple)):
+        items = [os.fspath(item) for item in items]
+    shortest = min(items, key=len)
+    for index, column in enumerate(zip(*items)):
+        first = column[0]
+        for other in column:
+            if other != first:
+                return shortest[:index]
+    return shortest
 
 
 def samestat(s1, s2):
-    """Return True if two stat results describe the same file."""
-    return (s1.st_ino == s2.st_ino and
-            s1.st_dev == s2.st_dev)
+    """Return True if two os.stat() results describe the same file."""
+    return s1.st_ino == s2.st_ino and s1.st_dev == s2.st_dev
 
 
 def samefile(f1, f2):
-    """Return True if both paths refer to the same file (same device and inode)."""
+    """Return True if two paths name the same file or directory (compared
+    by device and inode number)."""
     return samestat(os.stat(f1), os.stat(f2))
 
 
 def sameopenfile(fp1, fp2):
-    """Return True if two file descriptors refer to the same file."""
+    """Return True if two open file descriptors refer to the same file."""
     return samestat(os.fstat(fp1), os.fstat(fp2))
 
 
-def _splitext(p, sep, altsep, extsep):
-    """Split p into (root, ext) where ext starts at the last dot of the final
-    component (leading dots of the component do not count); ext may be empty."""
-    last_sep = p.rfind(sep)
+def _split_extension(path, sep, altsep, extsep):
+    """splitext() for the platform modules: the extension is everything
+    from the last extsep of the last component on, unless that component
+    consists of leading extseps only before it (as in '.profile')."""
+    cut = path.rfind(sep)
     if altsep:
-        last_sep = max(last_sep, p.rfind(altsep))
-    dot = p.rfind(extsep)
-    if dot > last_sep:
-        # the name must contain something other than dots before the dot
-        start = last_sep + 1
-        while start < dot:
-            if p[start:start+1] != extsep:
-                return p[:dot], p[dot:]
-            start += 1
-    return p, p[:0]
+        cut = max(cut, path.rfind(altsep))
+    dot = path.rfind(extsep)
+    if dot > cut:
+        for index in range(cut + 1, dot):
+            if path[index:index + 1] != extsep:
+                return path[:dot], path[dot:]
+    return path, path[:0]
 
 
-def _check_arg_types(funcname, *args):
-    has_str = has_bytes = False
-    for s in args:
-        if isinstance(s, str):
-            has_str = True
-        elif isinstance(s, bytes):
-            has_bytes = True
+def _reject_mixed_types(funcname, *args):
+    """Raise a helpful TypeError when the arguments of a path function are
+    not all str or all bytes (after os.fspath()); return quietly if they
+    are fine, so the caller can re-raise its original error."""
+    seen_str = seen_bytes = False
+    for arg in args:
+        if isinstance(arg, os.PathLike):
+            arg = os.fspath(arg)
+        if isinstance(arg, str):
+            seen_str = True
+        elif isinstance(arg, bytes):
+            seen_bytes = True
         else:
             raise TypeError(f'{funcname}() argument must be str, bytes, or '
-                            f'os.PathLike object, not {s.__class__.__name__!r}') from None
-    if has_str and has_bytes:
+                            f'os.PathLike object, not '
+                            f'{type(arg).__name__!r}') from None
+    if seen_str and seen_bytes:
         raise TypeError("Can't mix strings and bytes in path components") from None
 
 
-# Markers accepted by realpath(strict=...).  Each pickles and copies as the
-# module-level name it is bound to, so identity survives a round trip.
-class _RealpathMode:
+class _StrictMode:
+    """A named value for realpath()'s strict argument."""
+
     __slots__ = ('_name',)
 
     def __init__(self, name):
@@ -168,9 +179,15 @@ class _RealpathMode:
     def __repr__(self):
         return 'os.path.' + self._name
 
+    __str__ = __repr__
+
     def __reduce__(self):
+        # pickled (and copied) by name: the module attribute is the object
         return self._name
 
 
-ALLOW_MISSING = _RealpathMode('ALLOW_MISSING')
-ALL_BUT_LAST = _RealpathMode('ALL_BUT_LAST')
+# realpath(strict=ALLOW_MISSING): missing components are fine, any other
+# error is raised; realpath(strict=ALL_BUT_LAST): only the last component
+# may be missing.
+ALLOW_MISSING = _StrictMode('ALLOW_MISSING')
+ALL_BUT_LAST = _StrictMode('ALL_BUT_LAST')

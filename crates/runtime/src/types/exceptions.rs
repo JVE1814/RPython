@@ -267,7 +267,7 @@ pub fn fill_attribute_error_context(o: &PyObject, name: &PyObject) {
 /// reference without a lock), so the old value is released through QSBR.
 fn set_field(slot: &mut *mut PyObject, v: Option<&PyObject>) {
     let new = v.map_or(std::ptr::null_mut(), |v| v.to_ref().into_raw());
-    unsafe { crate::qsbr::swap_field(slot as *mut *mut PyObject, new) };
+    unsafe { crate::qsbr::swap_field_unlocked(slot as *mut *mut PyObject, new) }; // scale2: at once when no other thread runs
 }
 fn get_field(p: *mut PyObject) -> PyRef {
     unsafe { if p.is_null() { none::none_ref() } else { PyRef::from_borrowed(p) } }
@@ -348,8 +348,13 @@ pub unsafe extern "C" fn base_dealloc(op: *mut PyObject) {
 unsafe extern "C" fn base_clear(op: *mut PyObject) -> c_int {
     unsafe {
         let e = exc(&*op);
+        // (tail3) released at once, not through QSBR: this runs while the exception is
+        // being deallocated or cleared by the stop-the-world collector, so no other
+        // thread can be reading the fields (deferred, a dead exception kept its
+        // traceback, and every frame and local in it, alive for a grace period)
         for slot in [&mut e.dict, &mut e.args, &mut e.notes, &mut e.traceback, &mut e.context, &mut e.cause] {
-            set_field(slot, None);
+            let old = std::mem::replace(slot, std::ptr::null_mut());
+            xdecref(old);
         }
         // subclass extra object fields
         let layout = layout_of((*op).type_ptr());
@@ -700,8 +705,31 @@ fn oserror_errno_class(errno: i64) -> Option<*mut PyTypeObject> {
 }
 const ENOTCAPABLE_OR_ZERO: i32 = -9999;
 
+/// (tail3) Which of `__new__`/`__init__` interprets the constructor arguments: when a
+/// subclass overrides `__init__` but keeps OSError's `__new__`, the arguments belong to
+/// `__init__` (which may take other parameters); otherwise `__new__` consumes them and
+/// the default `__init__` ignores whatever it is called with.
+fn oserror_args_go_to_init(tp: *mut PyTypeObject) -> bool {
+    unsafe {
+        let init = (*tp).tp_init.map(|f| f as usize);
+        let new = (*tp).tp_new.map(|f| f as usize);
+        init != Some(oserror_init as usize) && new == Some(oserror_new as usize)
+    }
+}
+
 unsafe extern "C" fn oserror_new(tp: *mut PyTypeObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
     unsafe {
+        if oserror_args_go_to_init(tp) {
+            let op = base_new(tp, std::ptr::null_mut(), kw);
+            if !op.is_null() {
+                (*(op as *mut OSErrorExc)).written = -1;
+            }
+            return op;
+        }
+        if !kw.is_null() && dict::dict_len(&*kw) > 0 {
+            let _ = err!(TypeError, "{}() takes no keyword arguments", type_name(&*tp));
+            return std::ptr::null_mut();
+        }
         let mut tp = tp;
         let a = tuple::tuple_items(&*args);
         if tp == OSError() && a.len() >= 2 {
@@ -717,13 +745,9 @@ unsafe extern "C" fn oserror_new(tp: *mut PyTypeObject, args: *mut PyObject, kw:
         }
         let e = &mut *(op as *mut OSErrorExc);
         e.written = -1;
-        // only fill fields here when __init__ is the default one (so subclasses that
-        // override __init__ still get errno/strerror from the arguments)
-        if (*tp).tp_init == OSError().as_ref().and_then(|t| t.tp_init) || true {
-            if oserror_fill(&*op, &*args).is_err() {
-                decref(op);
-                return std::ptr::null_mut();
-            }
+        if oserror_fill(&*op, &*args).is_err() {
+            decref(op);
+            return std::ptr::null_mut();
         }
         op
     }
@@ -757,10 +781,18 @@ fn oserror_fill(o: &PyObject, args: &PyObject) -> PyResult<()> {
     Ok(())
 }
 
-unsafe extern "C" fn oserror_init(_op: *mut PyObject, _args: *mut PyObject, kw: *mut PyObject) -> c_int {
+unsafe extern "C" fn oserror_init(op: *mut PyObject, args: *mut PyObject, kw: *mut PyObject) -> c_int {
     unsafe {
+        if !oserror_args_go_to_init((*op).type_ptr()) {
+            // __new__ already consumed the arguments
+            return 0;
+        }
         if !kw.is_null() && dict::dict_len(&*kw) > 0 {
-            let _ = err!(TypeError, "{}() takes no keyword arguments", type_name((*_op).ty()));
+            let _ = err!(TypeError, "{}() takes no keyword arguments", type_name((*op).ty()));
+            return -1;
+        }
+        set_field(&mut exc(&*op).args, Some(&*args));
+        if oserror_fill(&*op, &*args).is_err() {
             return -1;
         }
         0
@@ -1386,7 +1418,26 @@ pub fn exc_traceback(e: &PyObject) -> Option<PyRef> {
     if p.is_null() { None } else { Some(unsafe { PyRef::from_borrowed(p) }) }
 }
 pub fn set_exc_traceback(e: &PyObject, tb: Option<&PyObject>) {
-    set_field(&mut exc(e).traceback, tb);
+    // (tail3) Unwinding prepends an entry per frame: the new traceback's tb_next is the
+    // current one, which therefore stays alive (and readable) through the new value.
+    // Its field reference is dropped at once instead of through QSBR: deferred, it kept
+    // every older entry, and the frames and locals they hold, alive until the next
+    // grace period, which a thread that then blocks never reaches (e.g. a discarded
+    // HTTP response keeping its socket open while the program waits for the peer).
+    let slot = &mut exc(e).traceback;
+    let old = *slot;
+    if let Some(t) = tb {
+        if !old.is_null() && crate::types::traceback::is_traceback(t) {
+            let next = unsafe { (*(t.as_ptr() as *const crate::types::traceback::PyTracebackObject)).tb_next };
+            if next == old {
+                let a = unsafe { &*(slot as *mut *mut PyObject as *const std::sync::atomic::AtomicPtr<PyObject>) };
+                let prev = a.swap(t.to_ref().into_raw(), std::sync::atomic::Ordering::AcqRel);
+                unsafe { xdecref(prev) };
+                return;
+            }
+        }
+    }
+    set_field(slot, tb);
 }
 pub fn exc_context(e: &PyObject) -> Option<PyRef> {
     let p = exc(e).context;

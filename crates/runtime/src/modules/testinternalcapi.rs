@@ -95,6 +95,13 @@ fn get_tlbc_id(_m: &PyObject, f: &PyObject) -> PyResult {
     Ok(int::new_int(crate::interp::adaptive::view_id(cd) as i64))
 }
 
+/// (tail3) The path-calculation program (modules/getpath.py), compiled: test_getpath
+/// executes it against a mocked namespace when no source checkout is around.
+fn get_getpath_codeobject(_m: &PyObject) -> PyResult {
+    let src = include_str!("getpath.py");
+    Ok(crate::compile::compile_str(src, "getpath.py", crate::compile::Mode::Exec, 0, -1)?.code)
+}
+
 fn compiler_cleandoc(_m: &PyObject, s: &PyObject) -> PyResult {
     if !pystr::is_str(s) {
         raise!(TypeError, "compiler_cleandoc() argument must be str, not {}", crate::types::typeobject::tname(s));
@@ -119,9 +126,22 @@ fn dict_getitem_knownhash(_m: &PyObject, a: &[&PyObject]) -> PyResult {
     }
 }
 
-fn has_split_table(_m: &PyObject, _o: &PyObject) -> PyResult {
-    // instance dicts are combined tables in this runtime
-    Ok(bool_::new_bool(false))
+fn has_split_table(_m: &PyObject, o: &PyObject) -> PyResult {
+    // (stability3) An instance dict built from inline values keeps the class's
+    // attribute names (CPython's split table) for as long as only string keys are added
+    // and it stays within the inline capacity; any other key makes it an ordinary table.
+    if !dict::is_dict_exact(o) || o.ob_flags.load(std::sync::atomic::Ordering::Relaxed) & dict::OBF_FROM_INSTANCE == 0 {
+        return Ok(bool_::new_bool(false));
+    }
+    let keys = dict::keys_vec(o);
+    let split = keys.len() <= INLINE_VALUES_MAX && keys.iter().all(|k| pystr::is_str_exact(k));
+    Ok(bool_::new_bool(split))
+}
+
+/// Stop every other thread and restart them (the stop-the-world handshake, gc.rs).
+fn test_stop_the_world(_m: &PyObject) -> PyResult {
+    crate::gc::test_stop_the_world();
+    Ok(none::none_ref())
 }
 
 fn get_recursion_depth(_m: &PyObject) -> PyResult {
@@ -725,10 +745,12 @@ pub fn init() -> PyResult {
             ("has_split_table", O, has_split_table),
             ("get_object_dict_values", O, get_object_dict_values),
             ("compiler_cleandoc", O, compiler_cleandoc),
+            ("get_getpath_codeobject", NOARGS, get_getpath_codeobject),
             ("get_tlbc", O, get_tlbc),
             ("get_tlbc_id", O, get_tlbc_id),
             ("dict_getitem_knownhash", FAST, dict_getitem_knownhash),
             ("get_recursion_depth", NOARGS, get_recursion_depth),
+            ("test_stop_the_world", NOARGS, test_stop_the_world),
             ("get_long_lived_total", NOARGS, get_long_lived_total),
             ("pymem_getallocatorsname", NOARGS, pymem_getallocatorsname),
             ("get_c_recursion_remaining", NOARGS, get_c_recursion_remaining),

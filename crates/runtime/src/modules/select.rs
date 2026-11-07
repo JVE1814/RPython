@@ -123,7 +123,7 @@ fn f_select(_m: &PyObject, args: &[&PyObject]) -> PyResult {
         } else {
             std::ptr::null_mut()
         };
-        let (n, e) = crate::threads::blocking(|| {
+        let (n, e) = crate::threads::blocking_pure(false, || { // (stability3)
             let n = unsafe { libc::select(maxfd + 1, &mut r, &mut w, &mut x, tvp) };
             (n, if n < 0 { errno() } else { 0 })
         });
@@ -273,7 +273,7 @@ fn poll_poll(o: &PyObject, args: &[&PyObject]) -> PyResult {
     let mut pf: Vec<libc::pollfd> = pfds(o).iter().map(|&(fd, ev)| libc::pollfd { fd, events: ev, revents: 0 }).collect();
     let deadline = if ms >= 0 { mono_ns() + ms as i64 * 1_000_000 } else { 0 };
     loop {
-        let (n, e) = crate::threads::blocking(|| {
+        let (n, e) = crate::threads::blocking_pure(false, || { // (stability3)
             let n = unsafe { libc::poll(pf.as_mut_ptr(), pf.len() as libc::nfds_t, ms) };
             (n, if n < 0 { errno() } else { 0 })
         });
@@ -504,7 +504,7 @@ fn epoll_poll(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResu
     let deadline = if timeout_ns >= 0 { mono_ns() + timeout_ns } else { 0 };
     let mut ms: c_int = if timeout_ns < 0 { -1 } else { ((timeout_ns + 999_999) / 1_000_000) as c_int };
     let n = loop {
-        let (n, e) = crate::threads::blocking(|| {
+        let (n, e) = crate::threads::blocking_pure(false, || { // (stability3)
             let n = unsafe { libc::epoll_wait(epfd, evs.as_mut_ptr(), maxevents, ms) };
             (n, if n < 0 { errno() } else { 0 })
         });

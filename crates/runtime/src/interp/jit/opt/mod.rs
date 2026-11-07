@@ -37,6 +37,7 @@ pub mod layout {
     use std::mem::offset_of;
     pub const OB_TID: i32 = offset_of!(PyObject, ob_tid) as i32;
     pub const OB_MUTEX: i32 = offset_of!(PyObject, ob_mutex) as i32;
+    pub const OB_FLAGS: i32 = offset_of!(PyObject, ob_flags) as i32;
     pub const GC_BITS: i32 = offset_of!(PyObject, ob_gc_bits) as i32;
     pub const OB_REF_LOCAL: i32 = offset_of!(PyObject, ob_ref_local) as i32;
     pub const OB_REF_SHARED: i32 = offset_of!(PyObject, ob_ref_shared) as i32;
@@ -588,7 +589,7 @@ pub unsafe extern "C" fn h_backedge(f: *mut crate::interp::frame::Frame, header:
         let f = &mut *f;
         let cd = crate::types::code::code_data(f.code());
         let cc = &cd.caches;
-        cc.t2_backedge.store(i32::MAX, Relaxed);
+        cc.t2_backedge.store(-1, Relaxed); // (scale2) parked: tier-1 code stops counting
         if !enabled() {
             return 0;
         }

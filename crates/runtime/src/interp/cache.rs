@@ -90,8 +90,17 @@ pub fn assign_type_tag(tp: *mut PyTypeObject) -> u32 {
         TYPE_VERSION.store(u32::MAX - 1, Relaxed);
         return 0;
     }
-    match tag_cell(tp).compare_exchange(0, v, AcqRel, Acquire) {
+    if TYPE_WRITERS.load(SeqCst) != 0 {
+        return 0;
+    }
+    match tag_cell(tp).compare_exchange(0, v, SeqCst, Acquire) {
         Ok(_) => {
+            // (stability3) a type attribute store that began meanwhile may already
+            // have reset the tags; caching now could pair this tag with the old value
+            if TYPE_WRITERS.load(SeqCst) != 0 {
+                let _ = tag_cell(tp).compare_exchange(v, 0, SeqCst, Relaxed);
+                return 0;
+            }
             unsafe { (*tp).tp_flags |= Py_TPFLAGS_VALID_VERSION_TAG };
             if heap {
                 unsafe { (*tp).tp_versions_used = (*tp).tp_versions_used.saturating_add(1) };
@@ -103,6 +112,12 @@ pub fn assign_type_tag(tp: *mut PyTypeObject) -> u32 {
     }
 }
 
+/// (stability3) Type attribute stores in progress (`type.__setattr__`). The store
+/// resets the version tags of the type and its subclasses *before* changing the dict
+/// and no tag is assigned while any store runs, so a cache hit can never return a
+/// value older than one a lock-free read of the type's dict already saw (CPython
+/// does both under its type lock).
+pub static TYPE_WRITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 const MAX_VERSIONS_PER_CLASS: u16 = 1000;
 
 /// (tail2) `_testinternalcapi.type_assign_specific_version_unsafe`: give `tp` the tag
@@ -176,6 +191,21 @@ pub fn tag_alive(tag: u64) -> bool {
     }
     let g = TAGS.lock().unwrap_or_else(|e| e.into_inner());
     g.as_ref().is_some_and(|(by_tag, _)| by_tag.contains_key(&(tag as u32)))
+}
+
+/// (scale2) The live type `tag` was handed out to, if any (its pointer may only be
+/// dereferenced while the type is alive: callers use it at compile time, under the
+/// tag guards of the code they generate).
+pub fn type_for_tag(tag: u64) -> Option<usize> {
+    if tag == 0 || tag > u32::MAX as u64 {
+        return None;
+    }
+    let g = TAGS.lock().unwrap_or_else(|e| e.into_inner());
+    let tp = *g.as_ref()?.0.get(&(tag as u32))?;
+    // (read under the lock: a type being freed first forgets its tags under it)
+    let r = if type_tag(tp as *mut PyTypeObject) == tag as u32 { Some(tp) } else { None };
+    drop(g);
+    r
 }
 
 /// Is `tp` (possibly a dangling pointer from a cache entry) a live type whose

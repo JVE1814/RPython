@@ -668,7 +668,13 @@ unsafe extern "C" fn type_setattro(op: *mut PyObject, nm: *mut PyObject, v: *mut
             return -1;
         }
         let n = pystr::intern(PyRef::from_borrowed(nm));
+        // (stability3) invalidate the attribute caches before the dict changes, and
+        // let no cache be filled until it has (interp::cache::TYPE_WRITERS)
+        use std::sync::atomic::Ordering::SeqCst;
+        crate::interp::cache::TYPE_WRITERS.fetch_add(1, SeqCst);
+        crate::types::slots::type_modified(tp);
         let r = generic_setattr_with_dict(&*op, &n, if v.is_null() { None } else { Some(&*v) }, Some(&*(*tp).tp_dict));
+        crate::interp::cache::TYPE_WRITERS.fetch_sub(1, SeqCst);
         if r.is_err() {
             return -1;
         }
@@ -700,9 +706,7 @@ unsafe extern "C" fn type_dealloc(op: *mut PyObject) {
             xdecref(p);
         }
         xdecref((*tp).tp_base as *mut PyObject);
-        if !(*tp).tp_subclasses.is_null() {
-            drop(Box::from_raw((*tp).tp_subclasses as *mut Vec<usize>));
-        }
+        crate::types::typeobject::free_subclasses(tp);
         if !(*h)._ht_tpname.is_null() {
             crate::alloc::raw_free((*h)._ht_tpname as *mut u8);
         }
@@ -1743,7 +1747,7 @@ fn subtype_set_dict(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
             o.ob_gc_bits.fetch_or(crate::alloc::GC_BIT_DICT_DETACHED, std::sync::atomic::Ordering::Relaxed);
         }
         // readers take the dict without a lock: the old one goes through QSBR
-        crate::qsbr::swap_field(slot, v.map_or(std::ptr::null_mut(), |v| v.to_ref().into_raw()));
+        crate::qsbr::swap_field_unlocked(slot, v.map_or(std::ptr::null_mut(), |v| v.to_ref().into_raw()));
     }
     Ok(())
 }
