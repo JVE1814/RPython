@@ -560,6 +560,12 @@ fn handle_join(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRes
         |s| *s == HState::Done || h.lost_by_fork(fgen),
         timeout,
     )?;
+    // references the finished thread dropped on objects this thread owns were queued for
+    // a refcount merge: apply them now, so the caller sees the objects freed
+    let ts = crate::threads::current();
+    if ts.c.eval_breaker.load(Relaxed) & crate::threads::EVAL_MERGE_REFCOUNTS != 0 {
+        crate::threads::process_merge_queue(ts);
+    }
     Ok(none::none_ref())
 }
 fn handle_is_done(o: &PyObject) -> PyResult {
