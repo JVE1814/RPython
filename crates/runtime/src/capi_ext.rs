@@ -3,7 +3,8 @@
 //! `_imp` primitives used by importlib's ExtensionFileLoader.
 //!
 //! Suffixes (in priority order): `.cpython-315t-x86_64-linux-gnu.so` (version-specific
-//! free-threaded ABI), `.abi3t.so` (PEP 803 free-threaded stable ABI), `.so`.
+//! free-threaded ABI), `.abi3t-x86_64-linux-gnu.so` and `.abi3t.so` (PEP 803 free-threaded stable
+//! ABI; the GIL-only `.abi3` suffixes are not loadable here), `.so`.
 
 use crate::abstract_ as ab;
 use crate::capi;
@@ -16,7 +17,7 @@ use std::collections::HashMap;
 use std::ffi::{CString, c_void};
 use std::sync::Mutex;
 
-pub const EXTENSION_SUFFIXES: [&str; 3] = [".cpython-315t-x86_64-linux-gnu.so", ".abi3t.so", ".so"];
+pub const EXTENSION_SUFFIXES: [&str; 4] = [".cpython-315t-x86_64-linux-gnu.so", ".abi3t-x86_64-linux-gnu.so", ".abi3t.so", ".so"];
 
 pub fn find_extension(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
     for s in EXTENSION_SUFFIXES {
@@ -299,6 +300,41 @@ pub fn load_extension(name: &str, path: &std::path::Path) -> PyResult {
         // the module may have replaced itself in sys.modules
         Ok(dict::get_item_rs(&modules, name).unwrap_or(m))
     }
+}
+
+
+/// `_imp.create_dynamic`: create the module only. A multi-phase module is executed later by
+/// `exec_extension` and is not put into sys.modules (importlib does that); a single-phase
+/// module is complete once its init function returned and is registered right away.
+pub fn create_extension(name: &str, path: &std::path::Path, spec: &PyObject) -> PyResult {
+    let p = path.to_string_lossy().into_owned();
+    unsafe {
+        let (m, def) = create_dynamic_impl(name, &p, spec)?;
+        set_file_attrs(&m, &p, Some(spec));
+        match def {
+            Some(d) => PENDING_EXEC.lock().unwrap_or_else(|e| e.into_inner()).push((m.as_ptr() as usize, d as usize)),
+            None => {
+                let modules = crate::modules::sys::modules_dict();
+                dict::set_item_str(&modules, name, &m)?;
+            }
+        }
+        Ok(m)
+    }
+}
+
+/// `_imp.exec_dynamic`: run the exec slots of a module made by `create_extension`.
+pub fn exec_extension(m: &PyObject) -> PyResult<()> {
+    let def = {
+        let mut v = PENDING_EXEC.lock().unwrap_or_else(|e| e.into_inner());
+        let key = m.as_ptr() as usize;
+        v.iter().position(|&(k, _)| k == key).map(|i| v.remove(i).1)
+    };
+    let Some(d) = def else { return Ok(()) };
+    // the address may belong to a newer module if the original one died unexecuted
+    if !tmod::is_module(m) || tmod::m(m).md_def as usize != d {
+        return Ok(());
+    }
+    unsafe { exec_pending(m, d as *mut PyModuleDef) }
 }
 
 // ---------------------------------------------------------------- _imp

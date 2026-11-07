@@ -268,7 +268,7 @@ fn imp_override_multi_interp(_m: &PyObject, v: &PyObject) -> PyResult {
 // ------------------------------------------------------------------ extensions
 
 pub fn extension_suffixes() -> Vec<&'static str> {
-    vec![EXT_SUFFIX, ".abi3.so", ".so"]
+    crate::capi_ext::EXTENSION_SUFFIXES.to_vec()
 }
 fn imp_extension_suffixes(_m: &PyObject) -> PyResult {
     Ok(list::new_list(extension_suffixes().into_iter().map(pystr::new_str).collect()))
@@ -292,9 +292,10 @@ fn imp_create_dynamic(_m: &PyObject, args: &[&PyObject]) -> PyResult {
         raise!(ValueError, "embedded null character");
     }
     crate::modules::sys_full::audit("import", &[&n, &origin, none::none(), none::none(), none::none()])?;
-    crate::capi_ext::load_extension(&name, std::path::Path::new(&path))
+    crate::capi_ext::create_extension(&name, std::path::Path::new(&path), spec)
 }
-fn imp_exec_dynamic(_m: &PyObject, _module: &PyObject) -> PyResult {
+fn imp_exec_dynamic(_m: &PyObject, module: &PyObject) -> PyResult {
+    crate::capi_ext::exec_extension(module)?;
     Ok(int::new_int(0))
 }
 
