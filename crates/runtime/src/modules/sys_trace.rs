@@ -311,12 +311,15 @@ pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
         // sys.monitoring LINE: at line starts, at jump targets on another line than the
         // jump, and at exception handlers entered with a line number
         let cd = crate::types::code::code_data(f.code());
-        let mon_line = if !jumped {
+        let entered_handler = (prev == u32::MAX || lasti != prev.wrapping_add(1))
+            && cd.exception_table.iter().any(|e| e.target == lasti);
+        let mon_line = if entered_handler {
+            true
+        } else if !jumped {
             new_line && start
         } else {
             let from = crate::types::code::frame_line(f.code(), prev as usize).map(|l| l as i32);
-            cd.exception_table.iter().any(|e| e.target == lasti)
-                || (new_line && (start || from != Some(line)))
+            new_line && (start || from != Some(line))
         };
         if mon_line {
             fire(ts, f, LINE, line as u32, &[])?;
