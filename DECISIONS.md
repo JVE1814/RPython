@@ -314,3 +314,11 @@ frames/registers without refcount traffic) — is open work for the core/JIT wor
 Also recorded: pandas comparison methodology. Ours-only failures are counted with the baseline's pytest
 selection (`-m "not slow and not network and not db and not single_cpu"`); stability2's earlier 2,320
 compared different selections (fair count 1,502). wheels2 brought it to 3, then 0 (xz presets).
+
+## D28 — Suite accounting: whole-module skips and errors (2026-11-07)
+tools/run_tests.sh records a module as SKIP when every test in it was skipped, whether the skip happened at import
+(baseline without `_tkinter`: exit 0) or through regrtest's resource check (our build has `_tkinter`, so test_tkinter /
+test_ttk reach `requires('gui')` and regrtest reports "NO TESTS RAN", exit 4). Both are skips of the whole module;
+neither run executes a test. The comparison with CPython counts skipped tests, so this changes classification only.
+With a display and `-u gui` both modules pass for us (1424 tests, tail2). Errors (tests that raise) are recorded in a
+seventh column, since regrtest's "Total tests" line counts only failures.
