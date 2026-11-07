@@ -565,6 +565,10 @@ fn repl(quiet: bool) -> i32 {
                     }
                     crate::print_exception_and_clear();
                 }
+                // (hang1) each statement's output is flushed before the next
+                // prompt, also when stdout is a pipe (block-buffered)
+                crate::modules::sys_full::flush_std("stdout");
+                crate::modules::sys_full::flush_std("stderr");
             }
             Err(_) => {
                 if is_incomplete_error() && !blank {

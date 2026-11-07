@@ -68,6 +68,9 @@ def _probe_pidfd():
 
 
 _CAN_USE_PIDFD_OPEN = _probe_pidfd()
+# Longest single kernel wait for a child (seconds); longer timeouts are
+# waited for in slices of this size.
+_MAXIMUM_WAIT_TIMEOUT = 86400.0
 _CAN_USE_KQUEUE = (hasattr(select, 'kqueue')
                    and hasattr(select, 'KQ_FILTER_PROC'))
 
@@ -109,7 +112,11 @@ class CalledProcessError(_OutputAlias, SubprocessError):
 
     def __str__(self):
         code = self.returncode
-        if code and code < 0:
+        if not isinstance(code, int):
+            # e.g. a mocked Popen: describe whatever value is there
+            return "Command '%s' returned non-zero exit status %s." % (
+                self.cmd, code)
+        if code < 0:
             try:
                 return "Command '%s' died with %r." % (self.cmd,
                                                        signal.Signals(-code))
@@ -408,6 +415,8 @@ def _as_id(value, lookup, kind):
     if isinstance(value, int):
         if value < 0:
             raise ValueError(f"{kind} ID cannot be negative, got {value}")
+        if value >= 1 << 32:
+            raise ValueError(f"{kind} ID is too large: {value}")
         return value
     return None
 
@@ -896,12 +905,17 @@ class Popen:
             fast = self._wait_kqueue
         if fast is not None:
             try:
-                exited = fast(max(deadline - _time(), 0))
+                # one kernel wait is at most _MAXIMUM_WAIT_TIMEOUT long; only
+                # the real deadline ends the wait
+                while True:
+                    remaining = deadline - _time()
+                    if fast(max(min(remaining, _MAXIMUM_WAIT_TIMEOUT), 0)):
+                        break
+                    if deadline - _time() <= 0:
+                        raise TimeoutExpired(self.args, timeout)
             except OSError:
                 pass   # fall back to polling below
             else:
-                if not exited:
-                    raise TimeoutExpired(self.args, timeout)
                 if self._reap_nowait():
                     return self.returncode
         # Polling with an increasing delay (capped at 50 ms).
@@ -998,6 +1012,12 @@ class Popen:
             if input is not None and self.text_mode:
                 self._input = input.encode(self.stdin.encoding,
                                            self.stdin.errors)
+            elif input is not None and not isinstance(input, bytes):
+                # offsets count bytes, whatever the buffer's item size
+                try:
+                    self._input = memoryview(input).cast('B')
+                except TypeError:
+                    self._input = bytes(memoryview(input))
 
     def _check_timeout(self, endtime, orig_timeout, stdout_seq, stderr_seq,
                        skip_check_and_raise=False):
