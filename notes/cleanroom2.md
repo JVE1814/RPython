@@ -81,3 +81,16 @@
   `magic_check`, ...) and the deprecated `glob0`/`glob1` (their deprecation named 3.15 as the
   removal version; nothing in Lib or the tests uses them).
 - Timing (same results): '**/*.py' over the stdlib ~equal, '**' with include_hidden 21 -> 8 ms.
+
+### types.py (rewritten)
+- test_types 136 =, test_dynamicclassattribute 12 =, test_coroutines 100 =,
+  test_asyncio.test_pep492 11 =, test_asyncio.test_tasks, test_inspect 382, test_enum 1083,
+  test_typing 731, test___all__, test_pydoc, test_functools =; test_descr = (1 pre-existing
+  failure + 1 error, same before/after).
+- Kept (pinned): `_GeneratorWrapper` (tests), DynamicClassAttribute attributes
+  `fget/fset/fdel/overwrite_doc/__isabstractmethod__`, "Expected an instance of type",
+  "types.coroutine() expects a callable".  Dropped: `_calculate_meta` (now
+  `_winning_metaclass`), `_cell_factory`, `_CO_*` constants (now `_FLAG_*`).
+- The no-`_types` fallback (exercised by test_types via import_fresh_module) derives every
+  type from a sample object; `__all__` is `_types.__all__` (or the fallback list) plus the
+  helpers.  `_GeneratorWrapper` forwards gi_*/cr_* through properties made by one helper.
