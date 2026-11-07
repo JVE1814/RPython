@@ -65,3 +65,31 @@
   next attempt and re-arming the timer).
 - Behaviour: as before; base_events now empties the race's exception list after use (the
   attempt frames, reachable from a raised exception's traceback, reach it through the closure).
+
+### asyncio/sslproto.py
+- Verdict: method-for-method CPython's (uvloop-derived) SSLProtocol with reworded comments.
+- Tests (before -> after): test_asyncio 2929 run / 2 failures -> same 2 failures; test_ssl
+  (asyncio) 24, test_sslproto, test_server_context (incl. test_gh140947), test_streams,
+  test_events, test_buffered_proto = (pass).
+- The two `*_failed_certificate_no_cycles` failures are not sslproto's: the failed waiter's
+  exception keeps itself alive through the frame of `_asyncio.Future.result()`/`__await__`
+  (the accelerator's Future is Python code embedded in crates/runtime/src/modules/_asyncio.rs,
+  so its frame sits in the exception's traceback holding `self` -> the future -> the exception).
+  CPython's C future has no such frame.  Fix belongs in _asyncio.rs (clear `self`/locals
+  before raising), out of scope here.
+- Kept because pinned: `SSLProtocol(...)` signature incl. `context`, `_app_transport`,
+  `_app_protocol`, `_transport`, `_sslobj`, `_incoming`, `_outgoing`, `_get_extra_info`,
+  `_fatal_error`, `_app_reading_paused`, `_write_backlog`/`_write_buffer_size`
+  (`_test__append_write_backlog`), `_start_shutdown`, `_abort`, `pause_writing`/`resume_writing`,
+  `_SSLProtocolTransport` with `_ssl_protocol`/`_closed`, `_create_transport_context`,
+  `add_flowcontrol_defaults`, `SSLAgainErrors`, the two state enums, the hang1 drain bound in
+  `_on_shutdown_complete`, every logged/raised message.
+- New structure: one `_advance()` state dispatch (used for incoming data and after
+  resume_reading), `_NEXT_STATES` successor table for `_set_state`, `_handshake_failed`,
+  `_cancel_timers`, `_arm_shutdown_timer`, `_notify_app_writing`, `_schedule_app`, reading via
+  `_read_into_app_buffer`/`_read_and_deliver` returning whether the stream is still open,
+  `_checked_timeout`.
+- Behaviour changes (all tests equal): a BufferedProtocol whose get_buffer() returns a
+  bytearray now gets every decrypted chunk (reads go through a memoryview of the buffer; the
+  old code sliced the bytearray, so a second read in one round went into a copy); EOF during
+  the handshake reports a ConnectionResetError instance.
