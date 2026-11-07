@@ -789,6 +789,8 @@ pub fn init() -> PyResult {
         ],
         Some(&m),
     )?;
+    // (capi3) self-tests of runtime internals and the debug-allocator probes
+    crate::builtins::add_methods_to_dict(&d, crate::modules::testinternalcapi_selftest::methods(), Some(&m))?;
     for (k, v) in [
         ("SIZEOF_PYGC_HEAD", 0i64),
         ("SIZEOF_MANAGED_PRE_HEADER", crate::alloc::MANAGED as i64),

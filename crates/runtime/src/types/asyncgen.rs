@@ -66,7 +66,7 @@ static mut FREE_LISTS: [FreeList; 2] = [const { FreeList { n: 0, items: [std::pt
 fn fl_alloc(k: usize, tp: *mut PyTypeObject) -> PyResult {
     unsafe {
         let fl = &mut (*(&raw mut FREE_LISTS))[k];
-        if fl.n > 0 && !crate::modules::_tracemalloc::TRACING.load(std::sync::atomic::Ordering::Relaxed) {
+        if fl.n > 0 && !crate::alloc::SLOW_PATHS.load(std::sync::atomic::Ordering::Relaxed) {
             fl.n -= 1;
             let op = fl.items[fl.n];
             crate::alloc::reinit_header(op);
@@ -81,7 +81,7 @@ fn fl_alloc(k: usize, tp: *mut PyTypeObject) -> PyResult {
 unsafe fn fl_keep(k: usize, op: *mut PyObject) -> bool {
     unsafe {
         let fl = &mut (*(&raw mut FREE_LISTS))[k];
-        if fl.n < FL_CAP && crate::tlab::fast_free_ok() && !crate::modules::_tracemalloc::TRACING.load(std::sync::atomic::Ordering::Relaxed) {
+        if fl.n < FL_CAP && crate::tlab::fast_free_ok() && !crate::alloc::SLOW_PATHS.load(std::sync::atomic::Ordering::Relaxed) {
             fl.items[fl.n] = op;
             fl.n += 1;
             return true;

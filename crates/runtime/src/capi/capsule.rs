@@ -14,6 +14,8 @@ pub struct PyCapsule {
     pub name: *const c_char,
     pub context: *mut c_void,
     pub destructor: PyCapsule_Destructor,
+    /// (capi3) unused; the size of CPython's capsule object (sys.getsizeof)
+    _reserved: [usize; 2],
 }
 
 #[unsafe(no_mangle)]
