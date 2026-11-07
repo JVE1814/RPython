@@ -58,3 +58,12 @@
   finalize create+call 170 -> 159, WeakMethod 89 -> 82.
 - Behaviour change: entries whose referent died during an iteration are removed immediately
   instead of when the last iterator finishes (len() is exact either way).
+
+## Text fixes (structure already own; recalled text replaced)
+- pickletools.py — audited: own condensed structure (opcode `_TABLE`, `_fixed/_counted`
+  helpers, own dis/optimize code), but the read_* doctest examples were CPython's, as were
+  optimize()'s docstring and the argparse help strings.  Replaced with own examples/wording.
+  Kept (asserted by test_pickletools): every dis()/reader error message, the names listed in
+  its test__all__, and the first lines of the opcode docs shown by `--annotate` (PROTO, FRAME,
+  SHORT_BINUNICODE, MEMOIZE, TUPLE1, STOP).  The other opcode docs are short paraphrases.
+  test_pickletools 202 =, test_pickle 1085 =.
