@@ -36,6 +36,7 @@ pub const ST_ERROR: u32 = 1;
 pub const ST_DEOPT: u32 = 2;
 pub const ST_YIELD: u32 = 3;
 const YIELD_FROM_SEND: i32 = offset_of!(Frame, yield_from_send) as i32;
+const RESUME: i32 = offset_of!(Frame, resume) as i32;
 
 const LASTI: i32 = offset_of!(Frame, lasti) as i32;
 const NEXT_INSTR: i32 = offset_of!(Frame, next_instr) as i32;
@@ -67,6 +68,7 @@ const E_KIND: i32 = offset_of!(crate::interp::cache::Entry, kind) as i32;
 const E_MEMO: i32 = offset_of!(crate::interp::cache::Entry, memo) as i32;
 
 const FUNC_CODE: i32 = offset_of!(crate::types::funcobject::PyFunctionObject, func_code) as i32;
+const FUNC_VECTORCALL: i32 = offset_of!(crate::types::funcobject::PyFunctionObject, vectorcall) as i32;
 const CODE_DATA: i32 = offset_of!(crate::types::code::PyCodeObject, data) as i32;
 const CD_FAST_ENTRY: i32 = (offset_of!(CodeData, caches) + offset_of!(crate::interp::cache::CodeCaches, fast_entry)) as i32;
 
@@ -496,6 +498,24 @@ impl<'a> Gen<'a> {
                 self.a.store32_i(M(Rbx, NEXT_INSTR), next as i32);
                 self.a.store32_i(M(Rbx, YIELD_FROM_SEND), send);
                 self.a.store_i(M(Rbx, STACK_TOP), self.nlp + d - 1);
+                if !self.no_fuse && i + 1 < self.ilabel.len() {
+                    // the next resumption enters the continuation directly
+                    // (genobject.rs `gen_send_fast`)
+                    // (unless tier-2 code is installed: the general resumption path
+                    // moves the activation there)
+                    let cont = self.ilabel[i + 1];
+                    let t2 = self.a.label();
+                    let done = self.a.label();
+                    self.a.mov_ri(Rdx, &self.cd.caches.opt as *const _ as i64);
+                    self.a.cmp_mi(M(Rdx, 0), 0);
+                    self.a.jcc(Cc::NE, t2);
+                    self.a.mov_r_label_addr(Rcx, cont);
+                    self.a.store(M(Rbx, RESUME), Rcx);
+                    self.a.jmp(done);
+                    self.a.bind(t2);
+                    self.a.store_i(M(Rbx, RESUME), 0);
+                    self.a.bind(done);
+                }
                 self.a.mov_ri(Rax, ST_YIELD as i64);
                 self.a.jmp(self.exit);
             }
@@ -749,7 +769,13 @@ impl<'a> Gen<'a> {
                 self.a.mov_ri(Rcx, crate::types::funcobject::function_type() as i64);
                 self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
                 self.a.jcc(Cc::NE, generic);
+                // a replaced vectorcall (C API) must be honoured
+                self.a.mov_ri(Rcx, crate::interp::function_vectorcall as usize as i64);
+                self.a.cmp_rm(Rcx, M(Rax, FUNC_VECTORCALL));
+                self.a.jcc(Cc::NE, generic);
                 self.a.load(Rcx, M(Rax, FUNC_CODE));
+                self.a.test_rr(Rcx, Rcx);
+                self.a.jcc(Cc::E, generic);
                 self.a.load(Rcx, M(Rcx, CODE_DATA));
                 // body not unmarshalled yet (perf2 lazy code): the generic path loads it
                 self.a.test_rr(Rcx, Rcx);
@@ -801,6 +827,26 @@ impl<'a> Gen<'a> {
             Op::LoadSuperAttr => {
                 let name = self.cd.names[(arg >> 2) as usize].as_ptr() as i64;
                 self.helper_sp(&ins, d, addr!(h::h_load_super_attr), Some(arg as i64), Some(name), d - 3);
+            }
+            Op::GetAwaitable => self.helper_sp(&ins, d, addr!(h::h_get_awaitable), Some(arg as i64), None, d - 1),
+            // instructions shared with the interpreter (eval::exec_misc)
+            op if crate::interp::eval::is_misc(op) && super::misc_enabled() => {
+                let pops = match op {
+                    Op::LoadFromDictOrDeref | Op::LoadFromDictOrGlobals | Op::GetAiter | Op::GetAwaitable | Op::LoadSpecial => 1,
+                    Op::PushExcInfo | Op::PopExcept | Op::CheckExcMatch | Op::BeforeWith | Op::BeforeAsyncWith => 1,
+                    Op::EndAsyncFor | Op::CheckEgMatch | Op::ImportName | Op::BuildTemplate => 2,
+                    Op::BuildInterpolation => 2 + (arg & 1) as i32,
+                    Op::CleanupThrow | Op::MatchClass => 3,
+                    _ => 0,
+                };
+                self.set_lasti(pc);
+                self.a.mov_rr(Rdi, R13);
+                self.a.mov_rr(Rsi, Rbx);
+                self.lea_sp(Rdx, d);
+                self.a.mov_ri(Rcx, op as i64 | (arg as i64) << 8);
+                self.a.mov_ri(R8, (self.nlp + d - pops) as i64);
+                self.call(addr!(h::h_misc));
+                self.check(pc, d - pops);
             }
             // everything else runs in the interpreter
             _ => self.deopt(ins.start, d),
@@ -1675,7 +1721,7 @@ pub fn compile(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crate::in
         if reachable && (i == 0 || an.is_target[i] || prev_yield) {
             entries[ins.start as usize] = g.a.pos() as u32;
         }
-        prev_yield = ins.op == Op::YieldValue;
+        prev_yield = ins.op == Op::YieldValue || ins.op == Op::ReturnGenerator;
         if !reachable {
             continue;
         }

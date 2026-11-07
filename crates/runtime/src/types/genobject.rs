@@ -88,6 +88,8 @@ pub fn new_generator_for(frame: Box<Frame>, func: &PyObject, flags: u32) -> PyRe
         gn.code = (*frame).code().to_ref().into_raw();
         let fp = Box::into_raw(frame);
         (*fp).generator = op;
+        // jit4: first resumption enters compiled code directly when there is some
+        (*fp).resume = crate::interp::jit::generator_entry(&*fp);
         gn.frame = fp;
         if tp == coro_type() {
             // coroutines keep their origin (sys.set_coroutine_origin_tracking_depth) here
@@ -169,6 +171,8 @@ fn gen_send_claimed(o: &PyObject, arg: Option<&PyObject>, throw: Option<PyRef>, 
         gn.exc_state.previous_item = (*ts_mut).c.exc_info;
         (*ts_mut).c.exc_info = &mut gn.exc_state;
     }
+    // compiled code that suspends the frame again records its continuation
+    frame.resume = 0;
     let r = crate::interp::enter_recursive_call(ts, "").and_then(|_| {
         let r = eval_frame(ts, frame, throw);
         crate::interp::leave_recursive_call(ts);
@@ -192,6 +196,102 @@ fn gen_send_claimed(o: &PyObject, arg: Option<&PyObject>, throw: Option<PyRef>, 
     }
 }
 
+/// `gen_send_ex(o, arg, None, false)` for the common case (jit4): a suspended (or
+/// created) generator/coroutine frame whose continuation is compiled code is entered
+/// directly (`Frame::resume`), without the interpreter's frame prelude. `arg` NULL
+/// means None. Everything else takes the general path.
+#[inline]
+pub fn gen_send_fast(o: &PyObject, arg: *mut PyObject) -> PyResult<SendResult> {
+    let gn = g(o);
+    let argo = || if arg.is_null() { None } else { Some(unsafe { &*arg }) };
+    // claim the generator (as gen_send_ex does); a failed claim reports "already
+    // executing" through the general path
+    let flag = unsafe { &*(&raw mut gn.running as *const std::sync::atomic::AtomicBool) };
+    if flag.compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire).is_err() {
+        return gen_send_ex(o, argo(), None, false);
+    }
+    let fp = gn.frame;
+    let mut r = None;
+    if !fp.is_null() {
+        let f = unsafe { &mut *fp };
+        if f.resume != 0 && !crate::modules::sys::tracing_active() && crate::interp::jit::genfast_enabled() {
+            let ok = match f.state {
+                FrameState::Suspended => true,
+                FrameState::Created => arg.is_null() || arg == none::none().as_ptr(),
+                _ => false,
+            };
+            if ok {
+                let ts = crate::threads::current();
+                let d = ts.recursion_depth.get() + 1;
+                if d <= ts.c.py_recursion_limit && crate::interp::stack_pointer() >= ts.stack_soft_limit() {
+                    r = Some(resume_compiled(ts, gn, f, arg, d));
+                }
+            }
+        }
+    }
+    let r = match r {
+        Some(r) => r,
+        None => gen_send_claimed(o, argo(), None, false),
+    };
+    flag.store(false, std::sync::atomic::Ordering::Release);
+    r
+}
+
+#[inline(always)]
+fn resume_compiled(ts: &crate::threads::ThreadState, gn: &mut GenObject, f: &mut Frame, arg: *mut PyObject, depth: i32) -> PyResult<SendResult> {
+    use crate::interp::jit::tier1::{ST_RETURN, ST_YIELD};
+    if f.state == FrameState::Suspended {
+        let v = if arg.is_null() { none::none().as_ptr() } else { arg };
+        unsafe { incref(v) };
+        f.slots[f.stack_top] = v;
+        f.stack_top += 1;
+    }
+    ts.recursion_depth.set(depth);
+    let tsm = ts as *const _ as *mut crate::threads::ThreadState;
+    unsafe {
+        gn.exc_state.previous_item = (*tsm).c.exc_info;
+        (*tsm).c.exc_info = &mut gn.exc_state;
+    }
+    let prev = ts.frame.get();
+    f.prev = prev;
+    ts.frame.set(f as *mut Frame);
+    f.state = FrameState::Executing;
+    let target = std::mem::replace(&mut f.resume, 0);
+    let mut out: *mut PyObject = std::ptr::null_mut();
+    let st = crate::interp::jit::enter(ts, f, target, &mut out);
+    let r = match st {
+        ST_YIELD => Ok(crate::interp::Exit::Yield(unsafe { PyRef::from_raw(out) })),
+        ST_RETURN => {
+            f.clear_stack();
+            Ok(crate::interp::Exit::Return(unsafe { PyRef::from_raw(out) }))
+        }
+        _ => crate::interp::jit::continue_in_interp(ts, f, st),
+    };
+    ts.frame.set(prev);
+    f.prev = std::ptr::null_mut();
+    ts.recursion_depth.set(depth - 1);
+    unsafe {
+        (*tsm).c.exc_info = gn.exc_state.previous_item;
+    }
+    gn.exc_state.previous_item = std::ptr::null_mut();
+    match r {
+        Ok(crate::interp::Exit::Yield(v)) => {
+            f.state = FrameState::Suspended;
+            Ok(SendResult::Yield(v))
+        }
+        Ok(crate::interp::Exit::Return(v)) => {
+            f.state = FrameState::Completed;
+            finish(gn);
+            Ok(SendResult::Return(v))
+        }
+        Err(e) => {
+            f.state = FrameState::Completed;
+            finish(gn);
+            Err(e)
+        }
+    }
+}
+
 fn finish(gn: &mut GenObject) {
     if gn.frame.is_null() {
         return;
@@ -209,7 +309,7 @@ fn finish(gn: &mut GenObject) {
 /// Send for `Send` opcode / yield from: handles generators natively and other iterators.
 pub fn send_to(recv: &PyObject, v: &PyObject) -> PyResult<SendResult> {
     if is_generator_exact(recv) || is_coroutine_exact(recv) {
-        return match gen_send_ex(recv, Some(v), None, false) {
+        return match gen_send_fast(recv, v.as_ptr()) {
             Ok(r) => Ok(r),
             Err(e) => {
                 if exc_matches(exc::StopIteration()) {
@@ -262,7 +362,7 @@ fn stop_iteration_with(v: PyRef) -> PyErr {
 }
 
 fn gen_send(o: &PyObject, v: &PyObject) -> PyResult {
-    match gen_send_ex(o, Some(v), None, false)? {
+    match gen_send_fast(o, v.as_ptr())? {
         SendResult::Yield(y) => Ok(y),
         SendResult::Return(r) => Err(stop_iteration_with(r)),
     }
@@ -270,7 +370,7 @@ fn gen_send(o: &PyObject, v: &PyObject) -> PyResult {
 
 unsafe extern "C" fn gen_iternext(o: *mut PyObject) -> *mut PyObject {
     unsafe {
-        match gen_send_ex(&*o, None, None, false) {
+        match gen_send_fast(&*o, std::ptr::null_mut()) {
             Ok(SendResult::Yield(y)) => y.into_raw(),
             Ok(SendResult::Return(r)) => {
                 if !r.is(none::none()) {
@@ -554,7 +654,8 @@ unsafe extern "C" fn gen_dealloc(o: *mut PyObject) {
         crate::gc::untrack(o);
         let gn = &mut *(o as *mut GenObject);
         crate::types::weakref::clear_weakrefs_at(o, &mut gn.weakreflist);
-        if !crate::gc::is_finalized(o) {
+        // (a finished generator has nothing to finalize: skip the resurrection dance)
+        if !gn.frame.is_null() && !crate::gc::is_finalized(o) {
             crate::gc::set_finalized(o);
             // resurrect temporarily for the finalizer
             (*o).ob_ref_local.store(1, std::sync::atomic::Ordering::Relaxed);
