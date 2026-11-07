@@ -93,3 +93,31 @@
   bytearray now gets every decrypted chunk (reads go through a memoryview of the buffer; the
   old code sliced the bytearray, so a second read in one round went into a copy); EOF during
   the handshake reports a ConnectionResetError instance.
+
+### mailbox.py (rewritten)
+- Tests (before -> after): test_mailbox 386 ok -> 386 ok; test_genericalias, test_imaplib,
+  test___all__, test_email = (pass).
+- Kept because pinned: every public class/method; private names the tests use: `_path`,
+  `_factory`, `_file`, `_toc`, `_lookup`, `_refresh`, `_skewfactor`, `_locked`,
+  `_create_tmp`, `_dump_message(message, target, mangle_from_)`, `_ProxyFile`,
+  `_PartialFile`, `_mboxMMDFMessage`, `_explain_to`, `_become_message`,
+  `_type_specific_attributes` and the per-format attributes (`_subdir`, `_info`, `_date`,
+  `_from`, `_sequences`, `_labels`, `_visible`); `Maildir.colon`, `Maildir._count`; the tmp
+  file name pattern; all messages.
+- New structure: format conversion goes through one neutral status summary (`_status()` ->
+  `_absorb()`, plus `_copy_state_to()` within a format and `_after_export()` for mbox's flag
+  headers) instead of one if-chain per pair of formats; the flat-file mailboxes share
+  `_scan_lines()`/`_set_toc()` and `_copy_messages_to()`; MH sequences go through
+  `_parse_ranges`/`_format_ranges`, per-file locking through a `_file_lock` context manager;
+  Babyl reads through `_read_parts()` and writes header blocks with `_write_header_block()`;
+  `_ProxyFile`/`_PartialFile` differ only in `_limit()` and the seek base; helpers
+  `_lock`, `_unlock`, `_open_new_file`, `_open_side_file`, `_fsync`, `_fsync_close`.
+- Differential check (old vs new module, same interpreter): 200 random operation sequences per
+  format (add/remove/replace/flush/get_* with str, bytes, binary files, email Messages and all
+  five format Message classes carrying random flags/labels/sequences/envelopes; then close,
+  reopen and compare every message, label/sequence tables and the raw file bytes) plus 1,000
+  random cross-format conversions: 0 differences once the label-line spelling is normalised.
+- Behaviour changes: a Babyl labels line separates the basic attributes from user labels with
+  ",," as the RMAIL format does (the old file wrote one comma; both read back the same); a
+  Babyl message whose header block runs past its end (no empty line) yields what can be read
+  instead of an AssertionError.
