@@ -852,7 +852,23 @@ impl<'a> Gen<'a> {
                 self.a.load(Rax, m);
                 self.a.mov_ri(Rcx, crate::types::funcobject::function_type() as i64);
                 self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
+                let is_func = self.a.label();
+                self.a.jcc(Cc::E, is_func);
+                // (perf5) bound method with a free self slot: unpack it in the stack and
+                // retry with its function (CPython's bound-method call specialisation)
+                self.a.mov_ri(Rcx, crate::types::funcobject::method_type() as i64);
+                self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
                 self.a.jcc(Cc::NE, generic);
+                let ms = self.slot(base + 1);
+                self.a.cmp_mi(ms, 0);
+                self.a.jcc(Cc::NE, generic);
+                self.lea_sp(Rdi, base);
+                self.call(addr!(h::h_unpack_method));
+                self.a.load(Rax, m);
+                self.a.mov_ri(Rcx, crate::types::funcobject::function_type() as i64);
+                self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
+                self.a.jcc(Cc::NE, generic);
+                self.a.bind(is_func);
                 // a replaced vectorcall (C API) must be honoured
                 self.a.mov_ri(Rcx, crate::interp::function_vectorcall as usize as i64);
                 self.a.cmp_rm(Rcx, M(Rax, FUNC_VECTORCALL));
@@ -1393,6 +1409,45 @@ impl<'a> Gen<'a> {
                     self.a.store(obj, Rsi);
                     let m = self.slot(d);
                     self.a.store(m, Rax);
+                    inline = true;
+                }
+                (Op::LoadAttr, kind::DATA_DESCR)
+                    if unsafe { (*(s.c as *mut PyObject)).is_type(crate::types::property::property_type()) }
+                        && super::callpy::routine() != 0 =>
+                {
+                    // (perf5) property whose getter is a Python function with a fast
+                    // entry: call the getter through the machine-code call routine with
+                    // the stack laid out as [fget, obj] (the spare slot above the stack
+                    // holds obj as self)
+                    self.a.load(Rax, obj);
+                    self.guard_tag(Rax, tag, slow);
+                    self.a.mov_ri(Rcx, s.c as i64);
+                    self.a.load(Rcx, M(Rcx, crate::types::property::FGET_OFFSET as i32));
+                    self.a.test_rr(Rcx, Rcx);
+                    self.a.jcc(Cc::E, slow);
+                    self.a.mov_ri(Rdx, crate::types::funcobject::function_type() as i64);
+                    self.a.cmp_rm(Rdx, M(Rcx, OB_TYPE));
+                    self.a.jcc(Cc::NE, slow);
+                    self.a.mov_ri(Rdx, crate::interp::function_vectorcall as usize as i64);
+                    self.a.cmp_rm(Rdx, M(Rcx, FUNC_VECTORCALL));
+                    self.a.jcc(Cc::NE, slow);
+                    self.a.load(Rdx, M(Rcx, FUNC_CODE));
+                    self.a.test_rr(Rdx, Rdx);
+                    self.a.jcc(Cc::E, slow);
+                    self.a.load(Rdx, M(Rdx, CODE_DATA));
+                    self.a.test_rr(Rdx, Rdx);
+                    self.a.jcc(Cc::E, slow);
+                    self.a.cmp_mi(M(Rdx, CD_FAST_ENTRY), 0);
+                    self.a.jcc(Cc::E, slow);
+                    let selfm = self.slot(d);
+                    self.a.store(selfm, Rax);
+                    self.incref(Rcx);
+                    self.a.store(obj, Rcx);
+                    self.set_lasti(pc as u32);
+                    self.lea_sp(Rdi, d - 1);
+                    self.a.mov_ri(Rsi, 0);
+                    self.call(super::callpy::routine());
+                    self.check(pc as u32, d - 1);
                     inline = true;
                 }
                 (Op::StoreAttr, kind::SLOT) => {

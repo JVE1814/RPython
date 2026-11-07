@@ -1024,6 +1024,22 @@ unsafe fn call_builtin_fast(callable: *mut PyObject, self_or_null: *mut PyObject
     }
 }
 
+/// (perf5) Call site with a bound method and a free self slot: [method, NULL, ..] ->
+/// [im_func, im_self, ..] (both owned; the method reference is released), so the
+/// function can take the direct call path.
+pub unsafe extern "C" fn h_unpack_method(base: *mut *mut PyObject) {
+    unsafe {
+        let m = *base;
+        let pm = m as *mut crate::ffi::PyMethodObject;
+        let (f, s) = ((*pm).im_func, (*pm).im_self);
+        incref(f);
+        incref(s);
+        *base = f;
+        *base.add(1) = s;
+        decref(m);
+    }
+}
+
 /// Call / CallKw: [callable, self_or_null, args..(, kwnames)] -> [result]
 pub unsafe extern "C" fn h_call(sp: *mut *mut PyObject, n: u64, kw: u64) -> u64 {
     unsafe {
