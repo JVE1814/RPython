@@ -195,6 +195,9 @@ pub(crate) fn compile_error(e: &rpy_compiler::CompileError, filename: &str, src:
             return col + 1;
         }
         match src.and_then(|s| source_line(s, line)) {
+            // CPython reads the line back through a 1000-byte buffer; for longer lines it
+            // keeps the byte offset
+            Some(l) if l.len() > 1000 => col + 1,
             Some(l) => {
                 let b = (col.max(0) as usize).min(l.len());
                 match l.get(..b) {
