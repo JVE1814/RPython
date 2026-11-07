@@ -35,7 +35,9 @@ keep a set of the blocks they produced: our runtime allocates its own objects ou
 the domains, and extensions free them through `PyObject_Free` (tp_free), so an unknown
 pointer is passed to the wrapped allocator unchecked. `hooked_alloc_refuses` treats
 "debug over default" as default, and `hook_installed()` turns off again when a test hook
-is removed. `_testinternalcapi.check_pyobject_*_is_freed` probe the fill patterns
+is removed. With the hooks installed the allocator fast paths are off (`SLOW_PATHS`), so
+an object an extension built in PyObject_Malloc memory (PyObject_Init) and releases
+through the runtime's generic tp_free goes back through the object domain. `_testinternalcapi.check_pyobject_*_is_freed` probe the fill patterns
 (`memdebug::object_looks_freed`, also used by PyObject_Dump).
 
 ### Bytes / unicode / object C API
@@ -96,6 +98,19 @@ bounds (minimum 64 KiB).
 * sizes: see decision D-c3-1.
 * compile() of a str source creates the str's cached UTF-8 form (as CPython; counted
   by `sys.getsizeof`).
+* dict.popitem takes an instance dict out of the split (class layout) state
+  (test_dict test_splittable_popitem, failing before, passes now).
+
+## Regression batch (snapshot, start vs end)
+test_capi test_sys test_ctypes test_stable_abi_ctypes test_embed test_cmd_line_script
+test_call test_descr test_class test_gc test_threading test_free_threading test_tracemalloc
+test_bytes test_str test_unicode_identifiers test_codecs test_int test_long (+ test_list
+test_set test_dict test_enumerate test_range test_generators test_frame test_cmd_line
+test__interpreters test_crossinterp test__interpchannels test_import test_types test_pickle),
+tools/jit_tests/run.sh, tools/stress/run.sh: no new failures. Unchanged failures (also at
+the start): test_descr (2), test_gc (2: capsule tracking of `_socket.CAPI`, tuple untrack
+counts); test_int's DoS timing test is load-dependent (failed in one start run too).
+test_free_threading segfaulted once in the start run, passed in every later run.
 
 ## Decisions to log (proposals)
 
@@ -140,7 +155,7 @@ pass-through for blocks the wrappers did not allocate (see above).
 
 ## Shared files touched (small, marked "(capi3)")
 lib.rs, alloc.rs, methods.rs (`is_extension_code` pub(crate)), interp/eval.rs,
-types/{str,str_methods,bytes_methods,list,dict,dictview,set,enumerate,module,
+types/{str,str_methods,bytes_methods,list,dict,dict_methods,dictview,set,enumerate,module,
 frameobject,genobject,range,object_type,sentinel,asyncgen}.rs,
 modules/{sys_full,_tracemalloc,testinternalcapi,ast_bridge,codec_charmap,mod}.rs.
 
