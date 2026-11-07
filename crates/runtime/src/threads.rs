@@ -78,6 +78,10 @@ pub struct ThreadState {
     pub mode: ModeCell,
     /// Objects whose shared refcount went negative and need the owner to merge.
     pub merge_queue: Mutex<Vec<usize>>,
+    /// (stability3) Set (under `merge_queue`) while the owner waits in a pure blocking
+    /// call (`blocking_pure`): it touches no object then, so other threads fold their
+    /// dropped references into its objects themselves instead of queueing them.
+    pub merge_direct: std::sync::atomic::AtomicBool,
     /// Rust-side top interpreter frame (see interp::frame).
     pub frame: Cell<*mut crate::interp::frame::Frame>,
     pub recursion_depth: Cell<i32>,
@@ -201,6 +205,7 @@ pub fn new_thread_state() -> *mut ThreadState {
             c,
             mode: ModeCell(std::sync::atomic::AtomicU8::new(ThreadMode::Blocked as u8)),
             merge_queue: Mutex::new(Vec::new()),
+            merge_direct: std::sync::atomic::AtomicBool::new(false),
             frame: Cell::new(std::ptr::null_mut()),
             recursion_depth: Cell::new(0),
             owner_tid: crate::object::thread_id(),
@@ -373,15 +378,31 @@ pub unsafe fn queue_object_for_merge(op: *mut PyObject) {
         }
         let tid = (*op).ob_tid.load(Relaxed);
         let threads = ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut folded: Option<bool> = None;
         for &t in threads.iter() {
             let ts = &*(t as *const ThreadState);
             if ts.owner_tid == tid && ts.alive.load(SeqCst) {
-                ts.merge_queue.lock().unwrap_or_else(|e| e.into_inner()).push(op as usize);
+                let mut q = ts.merge_queue.lock().unwrap_or_else(|e| e.into_inner());
+                if ts.merge_direct.load(SeqCst) {
+                    // (stability3) the owner is parked in a pure wait (and must take
+                    // this lock before touching objects again): fold here, release
+                    // after unlocking (deallocation may queue more objects)
+                    folded = Some(crate::object::merge_queued_nodealloc(op));
+                    break;
+                }
+                q.push(op as usize);
+                drop(q);
                 ts.c.eval_breaker.fetch_or(EVAL_MERGE_REFCOUNTS, Release);
                 return;
             }
         }
         drop(threads);
+        if let Some(dead) = folded {
+            if dead {
+                crate::object::dealloc(op);
+            }
+            return;
+        }
         // Owner is gone: merge right here.
         crate::object::merge_queued(op);
     }
@@ -517,6 +538,43 @@ pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
     ts.mode.set(prev);
     if prev == ThreadMode::InVm && ts.c.eval_breaker.load(Acquire) & EVAL_SAFEPOINT != 0 {
         crate::gc::safepoint_poll(ts);
+    }
+    r
+}
+
+/// (stability3) `blocking` for a wait that touches no Python object while blocked
+/// (lock and queue waits, sleep): with `drain`, the thread first merges the
+/// references other threads queued for it (call it only where running finalizers is
+/// fine: no runtime lock held); then, while it waits, threads dropping references to
+/// its objects fold them in themselves (`merge_direct`), so objects owned by an idle
+/// thread (a pool worker waiting for work) are released when their last reference
+/// goes, not when that thread wakes up.
+pub fn blocking_pure<R>(drain: bool, f: impl FnOnce() -> R) -> R {
+    let p = current_ptr();
+    if p.is_null() || !crate::qsbr::multi_threaded() {
+        return blocking(f);
+    }
+    let ts = unsafe { &*p };
+    if ts.mode.get() != ThreadMode::InVm {
+        return blocking(f);
+    }
+    loop {
+        let mut q = ts.merge_queue.lock().unwrap_or_else(|e| e.into_inner());
+        if q.is_empty() || !drain {
+            ts.merge_direct.store(true, SeqCst);
+            break;
+        }
+        let items = std::mem::take(&mut *q);
+        drop(q);
+        for op in items {
+            unsafe { crate::object::merge_queued(op as *mut PyObject) };
+        }
+    }
+    let r = blocking(f);
+    // before this thread touches any object again
+    {
+        let _q = ts.merge_queue.lock().unwrap_or_else(|e| e.into_inner());
+        ts.merge_direct.store(false, SeqCst);
     }
     r
 }

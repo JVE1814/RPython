@@ -273,6 +273,29 @@ pub unsafe fn merge_queued(op: *mut PyObject) {
     unsafe { merge_with_delta(op, -1) }
 }
 
+/// (stability3) As `merge_queued`, by a thread other than the owner while the owner
+/// cannot touch the object (threads::blocking_pure); true if the count reached zero
+/// (the caller deallocates once it holds no lock).
+pub unsafe fn merge_queued_nodealloc(op: *mut PyObject) -> bool {
+    unsafe {
+        let o = &*op;
+        if o.is_immortal() {
+            return false;
+        }
+        let local = o.ob_ref_local.load(Relaxed) as isize - 1;
+        o.ob_ref_local.store(0, Relaxed);
+        o.ob_tid.store(0, Relaxed);
+        let mut cur = o.ob_ref_shared.load(Relaxed);
+        loop {
+            let new = ((cur >> REF_SHARED_SHIFT) + local) << REF_SHARED_SHIFT | REF_MERGED;
+            match o.ob_ref_shared.compare_exchange_weak(cur, new, AcqRel, Relaxed) {
+                Ok(_) => return (new >> REF_SHARED_SHIFT) == 0,
+                Err(x) => cur = x,
+            }
+        }
+    }
+}
+
 unsafe fn merge_with_delta(op: *mut PyObject, delta: isize) {
     unsafe {
         let o = &*op;

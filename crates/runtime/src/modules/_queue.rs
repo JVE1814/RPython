@@ -142,7 +142,7 @@ fn sq_get_impl(o: &PyObject, block: bool, timeout: Option<Duration>) -> PyResult
             crate::modules::signal::check_signals()?;
             wait = wait.min(Duration::from_millis(20));
         }
-        let got = crate::threads::blocking(|| {
+        let got = crate::threads::blocking_pure(true, || { // (stability3)
             let mut g = s.q.lock().unwrap();
             if g.is_empty() {
                 g = s.cv.wait_timeout(g, wait).unwrap().0;
