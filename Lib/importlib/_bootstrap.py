@@ -234,14 +234,18 @@ def _get_module_lock(name):
             if _weakref is None:
                 _module_locks[name] = lock
             else:
-                def forget(ref, name=name):
-                    _imp.acquire_lock()
+                # The callback may run after the modules were cleared (a lock
+                # that outlives its interpreter's teardown), so it carries
+                # what it uses.
+                def forget(ref, name=name, acquire=_imp.acquire_lock,
+                           release=_imp.release_lock, locks=_module_locks):
+                    acquire()
                     try:
                         # a newer lock may have replaced the dead one
-                        if _module_locks.get(name) is ref:
-                            del _module_locks[name]
+                        if locks.get(name) is ref:
+                            del locks[name]
                     finally:
-                        _imp.release_lock()
+                        release()
                 _module_locks[name] = _weakref.ref(lock, forget)
     finally:
         _imp.release_lock()

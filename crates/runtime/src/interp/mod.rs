@@ -517,8 +517,10 @@ pub fn frame_finished(mut frame: Box<Frame>) {
     }
     if !frame.frame_obj.is_null() {
         // the frame object outlives the activation: it keeps its caller as f_back
+        // (tail3) not a generator's frame: its f_back is None once it stops running,
+        // and a hidden link would keep whoever last resumed it alive
         let caller = crate::threads::current().frame.get();
-        if !caller.is_null() && !std::ptr::eq(caller, &*frame) {
+        if !caller.is_null() && !std::ptr::eq(caller, &*frame) && frame.generator.is_null() {
             let back = eval::frame_object(unsafe { &mut *caller });
             unsafe { crate::types::frameobject::set_back(frame.frame_obj, back) };
         }

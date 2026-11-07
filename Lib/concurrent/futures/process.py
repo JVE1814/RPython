@@ -400,6 +400,9 @@ class _ExecutorManagerThread(threading.Thread):
                             "The process pool was forcefully shut down "
                             "(terminate_workers()/kill_workers()) before the "
                             "pending work could run.")
+                        # (tail3) nothing is left to run work: this thread
+                        # winds the pool down instead of waiting forever
+                        executor._shutdown_thread = True
                     return
                 if (len(self.processes) < executor._max_workers
                         and (self.pending_work_items

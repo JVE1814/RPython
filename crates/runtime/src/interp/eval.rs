@@ -1608,9 +1608,9 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             };
                             // a callable without vectorcall gets the argument tuple itself (no copy) and the
                             // keyword dict as is (its keys are the callee's business, as in CPython)
-                            let direct = self_or_null.is_none() && callable.ty().tp_call.is_some() && ab::vectorcall_func(&callable).is_none();
+                            // (tail3) which callees get the dict: ab::passes_kwargs_dict
                             if let Some(d) = &kwd {
-                                if !direct || is_type(&callable) {
+                                if self_or_null.is_some() || !ab::passes_kwargs_dict(&callable) {
                                     check_kwargs_keys(d)?;
                                 }
                             }
@@ -2272,8 +2272,10 @@ pub(crate) fn exec_misc(ts: &ThreadState, f: &mut Frame, cd: &crate::types::code
                 push!(f, none::none_ref().into_raw());
                 push!(f, val.into_raw());
             } else {
+                // (tail3) the exception was raised (and given this frame's traceback
+                // entry) at the SEND it was thrown into: passing it on is a re-raise
                 set_exc(e);
-                return Err(PyErr);
+                return Err(ReraiseMarker::mark(ts));
             }
         }
         Op::LoadBuildClass => {
