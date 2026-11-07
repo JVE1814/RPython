@@ -67,6 +67,8 @@ macro_rules! helper {
 /// profile word, `b` (may be NULL) in the high byte.
 pub unsafe extern "C" fn h_prof(p: *const std::sync::atomic::AtomicU16, a: *mut PyObject, b: *mut PyObject) {
     unsafe {
+        // (refs1) stack entries: a borrowed one carries the tag bit
+        let (a, b) = (crate::interp::borrow::untag(a), crate::interp::borrow::untag(b));
         let mut bits = if a.is_null() { 0 } else { specialize::profile_bits(&*a) as u16 };
         if !b.is_null() {
             bits |= (specialize::profile_bits(&*b) as u16) << 8;
@@ -1087,7 +1089,11 @@ pub unsafe extern "C" fn h_unpack_method(base: *mut *mut PyObject) {
 #[inline(always)]
 unsafe fn untagged_args(base: *mut *mut PyObject, n: usize, tmp: &mut std::mem::MaybeUninit<[*mut PyObject; 16]>, tmpv: &mut Vec<*mut PyObject>) -> *mut *mut PyObject {
     unsafe {
-        if !(0..n).any(|i| crate::interp::borrow::is_borrowed(*base.add(i))) {
+        let mut acc = 0usize;
+        for i in 0..n {
+            acc |= *base.add(i) as usize;
+        }
+        if acc & crate::interp::borrow::TAG == 0 {
             return base;
         }
         let dst: *mut *mut PyObject = if n <= 16 {
@@ -1103,14 +1109,25 @@ unsafe fn untagged_args(base: *mut *mut PyObject, n: usize, tmp: &mut std::mem::
     }
 }
 
-/// Call / CallKw: [callable, self_or_null, args..(, kwnames)] -> [result]
+/// Call / CallKw: [callable, self_or_null, args..(, kwnames)] -> [result]. No entry
+/// may be borrowed (refs1: compiled code calls `h_call_t` when one may be).
 pub unsafe extern "C" fn h_call(sp: *mut *mut PyObject, n: u64, kw: u64) -> u64 {
+    unsafe { call_impl::<false>(sp, n, kw) }
+}
+
+/// (refs1) `h_call` where entries may be borrowed (tagged).
+pub unsafe extern "C" fn h_call_t(sp: *mut *mut PyObject, n: u64, kw: u64) -> u64 {
+    unsafe { call_impl::<true>(sp, n, kw) }
+}
+
+#[inline(always)]
+unsafe fn call_impl<const TAGS: bool>(sp: *mut *mut PyObject, n: u64, kw: u64) -> u64 {
     unsafe {
         let n = n as usize;
         let (top, kwnames) = if kw != 0 { (sp.sub(1), take_opt(sp.sub(1))) } else { (sp, None) };
         let base = top.sub(n + 2);
-        let mut callable = view(base);
-        let mut self_or_null = view(base.add(1));
+        let mut callable = if TAGS { view(base) } else { *base };
+        let mut self_or_null = if TAGS { view(base.add(1)) } else { *base.add(1) };
         if self_or_null.is_null() && funcobject::is_method(&*callable) {
             // (perf4) bound method of a Python function: unpack it into the stack (self
             // into the free slot, the function in place of the method; both owned and
@@ -1123,7 +1140,7 @@ pub unsafe extern "C" fn h_call(sp: *mut *mut PyObject, n: u64, kw: u64) -> u64 
                 let old = *base;
                 *base = mf;
                 *base.add(1) = ms;
-                crate::interp::borrow::release(old);
+                if TAGS { crate::interp::borrow::release(old) } else { decref(old) }
                 callable = mf;
                 self_or_null = ms;
             }
@@ -1135,7 +1152,7 @@ pub unsafe extern "C" fn h_call(sp: *mut *mut PyObject, n: u64, kw: u64) -> u64 
         let mut tmp = std::mem::MaybeUninit::<[*mut PyObject; 16]>::uninit();
         let mut tmpv: Vec<*mut PyObject> = Vec::new();
         let stack_base = base;
-        let base = untagged_args(base, n + 2, &mut tmp, &mut tmpv);
+        let base = if TAGS { untagged_args(base, n + 2, &mut tmp, &mut tmpv) } else { base };
         // (perf4) builtin functions and method descriptors with the common calling
         // conventions: their C function directly
         let fast = if nkw == 0 { call_builtin_fast(callable, self_or_null, base, n) } else { None };
@@ -1163,7 +1180,8 @@ pub unsafe extern "C" fn h_call(sp: *mut *mut PyObject, n: u64, kw: u64) -> u64 
         let mut p = top;
         while p > base {
             p = p.sub(1);
-            crate::interp::borrow::release(std::ptr::replace(p, std::ptr::null_mut()));
+            let v = std::ptr::replace(p, std::ptr::null_mut());
+            if TAGS { crate::interp::borrow::release(v) } else { xdecref(v) }
         }
         if r.is_null() {
             return ERR;

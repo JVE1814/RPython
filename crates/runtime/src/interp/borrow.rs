@@ -426,3 +426,12 @@ impl Cand {
         Step::Live
     }
 }
+
+/// Values an instruction pops in the model of `mark` (None: not modelled).
+pub fn pops(op: Op, arg: u32) -> Option<u32> {
+    match io(op, arg) {
+        Io::Plain(p, _) | Io::Through(p, _) | Io::Store(p, _) | Io::End(p) => Some(p),
+        Io::Swap(_) => Some(0),
+        Io::Unknown => None,
+    }
+}

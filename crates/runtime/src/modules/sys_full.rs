@@ -413,12 +413,15 @@ fn sys_getrefcount(_m: &PyObject, o: &PyObject) -> PyResult {
     // it out. pandas' chained-assignment detection compares these counts.
     // (refs1) only while the copy on the value stack is an owned one: a borrowed copy
     // (LoadFastBorrow) is not counted in the first place
-    if n > 1 && !o.is_immortal() && caller_local_holds(o) && caller_stack_owns(o) {
-        n -= 1;
+    if n > 1 && !o.is_immortal() && caller_local_holds(o) {
+        if caller_stack_owns(o) {
+            n -= 1;
+        }
         // CPython also moves the arguments of a Python-to-Python call from the
         // caller's value stack into the callee's frame. Ours copies them: while
         // the calling frame is still inside that call with the object among its
-        // operands, one of the counted references is that stack slot.
+        // operands (owned: a borrowed operand is not counted), one of the counted
+        // references is that stack slot.
         if n > 1 && parent_call_operand(o) {
             n -= 1;
         }

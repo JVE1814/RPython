@@ -181,6 +181,13 @@ pub(crate) struct Gen<'a> {
     pub(crate) no_fuse: bool,
     /// (jit6) drain-mode code of a generator expression (see YieldValue)
     pub(crate) drain: bool,
+    /// (refs1) LoadFastBorrow pushes borrowed (tagged) entries (standalone tier 1; tier 2
+    /// keeps its own borrowed values)
+    pub(crate) borrow: bool,
+    /// (refs1) value-stack depths (bit k = depth k) holding borrowed entries before the
+    /// instruction being emitted: exact, from `tag_masks` (standalone) or set by tier 2
+    /// for an embedded template
+    pub(crate) tagm: u64,
 }
 
 fn fnaddr<T>(f: T) -> usize
@@ -460,26 +467,74 @@ impl<'a> Gen<'a> {
         self.a.bind(pos);
     }
 
+    // ------------------------------------------------------------ (refs1) borrowed entries
+
+    /// Is the value-stack entry at depth k borrowed (tagged) before this instruction?
+    fn tagged(&self, k: i32) -> bool {
+        (0..64).contains(&k) && self.tagm >> k & 1 != 0
+    }
+    /// Make the borrowed entry at depth k (if it is one) an owned one in place.
+    /// Clobbers rax and r11.
+    fn own_slot(&mut self, k: i32) {
+        if self.tagged(k) {
+            let m = self.slot(k);
+            self.a.load(Rax, m);
+            self.a.and_ri(Rax, -2);
+            self.a.store(m, Rax);
+            self.incref(Rax);
+            self.tagm &= !(1u64 << k);
+        }
+    }
+    /// `own_slot` for every borrowed entry (before a template that expects owned ones).
+    fn own_all(&mut self) {
+        let mut m = self.tagm;
+        while m != 0 {
+            let k = m.trailing_zeros() as i32;
+            m &= m - 1;
+            self.own_slot(k);
+        }
+    }
+    /// r = the object of the entry at depth k (tag removed).
+    fn load_obj(&mut self, r: R, k: i32) {
+        let m = self.slot(k);
+        self.a.load(r, m);
+        if self.tagged(k) {
+            self.a.and_ri(r, -2);
+        }
+    }
+    /// Release the entry at depth k whose object is in r (nothing if it is borrowed).
+    fn release_obj(&mut self, r: R, k: i32) {
+        if !self.tagged(k) {
+            self.decref(r);
+        }
+    }
+
     pub(crate) fn emit(&mut self, i: usize) -> Result<(), String> {
         let ins = self.an.instrs[i];
         let d = self.an.depth[i];
         let pc = ins.pc;
         let arg = ins.arg;
+        if self.tagm != 0 && !tag_aware(ins.op) {
+            // (refs1) this template expects owned entries
+            self.own_all();
+        }
         match ins.op {
             Op::Nop | Op::ExtendedArg => {}
             Op::Resume => self.poll(pc, d),
             Op::PopTop => {
-                let m = self.slot(d - 1);
-                self.a.load(Rax, m);
-                self.xdecref(Rax);
+                if !self.tagged(d - 1) {
+                    let m = self.slot(d - 1);
+                    self.a.load(Rax, m);
+                    self.xdecref(Rax);
+                }
             }
             Op::PushNull => {
                 let m = self.slot(d);
                 self.a.store_i(m, 0);
             }
             Op::Copy => {
-                let m = self.slot(d - arg as i32);
-                self.a.load(Rax, m);
+                // (an owned copy, also of a borrowed entry)
+                self.load_obj(Rax, d - arg as i32);
                 self.xincref(Rax);
                 let m = self.slot(d);
                 self.a.store(m, Rax);
@@ -506,7 +561,12 @@ impl<'a> Gen<'a> {
                 let unbound = self.a.label();
                 self.a.test_rr(Rax, Rax);
                 self.a.jcc(Cc::E, unbound);
-                self.incref(Rax);
+                if ins.op == Op::LoadFastBorrow && self.borrow && (0..64).contains(&d) {
+                    // (refs1) borrowed: tag bit, no reference taken
+                    self.a.or_ri(Rax, 1);
+                } else {
+                    self.incref(Rax);
+                }
                 let m = self.slot(d);
                 self.a.store(m, Rax);
                 let err = self.error_label(pc, d);
@@ -530,6 +590,11 @@ impl<'a> Gen<'a> {
                 let m = self.slot(d - 1);
                 let l = self.local(arg);
                 self.a.load(Rax, m);
+                if self.tagged(d - 1) {
+                    // a local owns its value
+                    self.a.and_ri(Rax, -2);
+                    self.incref(Rax);
+                }
                 self.a.load(Rcx, l);
                 self.a.store(l, Rax);
                 self.xdecref(Rcx);
@@ -554,6 +619,10 @@ impl<'a> Gen<'a> {
             Op::ReturnValue => {
                 let m = self.slot(d - 1);
                 self.a.load(Rax, m);
+                if self.tagged(d - 1) {
+                    self.a.and_ri(Rax, -2);
+                    self.incref(Rax);
+                }
                 self.a.load(Rcx, M(Rsp, 0));
                 self.a.store(M(Rcx, 0), Rax);
                 self.a.store_i(M(Rbx, STACK_TOP), self.nlp + d - 1);
@@ -677,8 +746,8 @@ impl<'a> Gen<'a> {
                 let fall = self.a.label();
                 let slow = self.a.label();
                 let jump_if_true = ins.op == Op::PopJumpIfTrue;
-                let m = self.slot(d - 1);
-                self.a.load(Rax, m);
+                // (refs1) tag removed for the compares (a borrowed non-bool goes to the helper)
+                self.load_obj(Rax, d - 1);
                 self.a.mov_ri(Rcx, crate::types::bool_::true_obj().as_ptr() as i64);
                 self.a.cmp_rr(Rax, Rcx);
                 if jump_if_true {
@@ -715,17 +784,16 @@ impl<'a> Gen<'a> {
             }
             Op::PopJumpIfNone | Op::PopJumpIfNotNone => {
                 let t = self.ilabel[self.an.index_of[arg as usize] as usize];
-                let m = self.slot(d - 1);
-                self.a.load(Rax, m);
+                self.load_obj(Rax, d - 1);
                 self.a.mov_ri(Rcx, crate::types::none::none().as_ptr() as i64);
                 self.a.cmp_rr(Rax, Rcx);
                 if ins.op == Op::PopJumpIfNone {
                     self.a.jcc(Cc::E, t);
-                    self.decref(Rax);
+                    self.release_obj(Rax, d - 1);
                 } else {
                     let fall = self.a.label();
                     self.a.jcc(Cc::E, fall);
-                    self.decref(Rax);
+                    self.release_obj(Rax, d - 1);
                     self.a.jmp(t);
                     self.a.bind(fall);
                 }
@@ -830,13 +898,14 @@ impl<'a> Gen<'a> {
             }
             Op::IsOp => {
                 // inline: pointer compare, produce bool, decref both
-                let (ma, mb) = (self.slot(d - 2), self.slot(d - 1));
-                self.a.load(Rax, ma);
-                self.a.cmp_rm(Rax, mb);
+                let ma = self.slot(d - 2);
+                self.load_obj(Rax, d - 2);
+                self.load_obj(Rcx, d - 1);
+                self.a.cmp_rr(Rax, Rcx);
                 self.a.setcc(if arg == 1 { Cc::NE } else { Cc::E }, R14);
-                self.decref(Rax);
-                self.a.load(Rax, mb);
-                self.decref(Rax);
+                self.release_obj(Rax, d - 2);
+                self.load_obj(Rax, d - 1);
+                self.release_obj(Rax, d - 1);
                 self.a.mov_ri(Rax, crate::types::bool_::false_obj().as_ptr() as i64);
                 self.a.mov_ri(Rcx, crate::types::bool_::true_obj().as_ptr() as i64);
                 self.a.test_rr(R14, R14);
@@ -854,7 +923,9 @@ impl<'a> Gen<'a> {
                 let m = self.slot(d - 1);
                 let t = crate::types::bool_::true_obj().as_ptr() as i64;
                 let f = crate::types::bool_::false_obj().as_ptr() as i64;
-                self.a.load(Rax, m);
+                // (refs1) a borrowed bool is replaced by the plain (immortal) pointer
+                let tagged = self.tagged(d - 1);
+                self.load_obj(Rax, d - 1);
                 self.a.mov_ri(Rcx, t);
                 self.a.mov_ri(Rdx, f);
                 self.a.cmp_rr(Rax, Rcx);
@@ -865,11 +936,15 @@ impl<'a> Gen<'a> {
                 // false
                 if ins.op == Op::UnaryNot {
                     self.a.store(m, Rcx);
+                } else if tagged {
+                    self.a.store(m, Rax);
                 }
                 self.a.jmp(done);
                 self.a.bind(is_t);
                 if ins.op == Op::UnaryNot {
                     self.a.store(m, Rdx);
+                } else if tagged {
+                    self.a.store(m, Rax);
                 }
                 self.a.jmp(done);
                 self.a.bind(slow);
@@ -941,6 +1016,11 @@ impl<'a> Gen<'a> {
                 // Python function with a fast entry: direct call (args moved into the
                 // callee frame); anything else: generic call helper
                 let base = d - arg as i32 - 2;
+                // (refs1) the callable is owned for the type checks below (a borrowed one
+                // is rare: a local function); borrowed self/arguments are handled by the
+                // call routines (callpy converts them, h_call_t passes untagged copies)
+                self.own_slot(base);
+                let tagged_args = (base + 1..d).any(|k| self.tagged(k));
                 let generic = self.a.label();
                 let done = self.a.label();
                 let m = self.slot(base);
@@ -958,13 +1038,12 @@ impl<'a> Gen<'a> {
                     let sm = self.slot(base + 1);
                     self.a.cmp_mi(sm, 0);
                     self.a.jcc(Cc::NE, not_type);
-                    let am = self.slot(base + 2);
-                    self.a.load(Rcx, am);
+                    self.load_obj(Rcx, base + 2);
                     self.a.load(Rdx, M(Rcx, OB_TYPE));
                     self.incref(Rdx);
                     self.a.store(m, Rdx);
                     self.a.mov_rr(Rax, Rcx);
-                    self.decref(Rax);
+                    self.release_obj(Rax, base + 2);
                     self.a.mov_ri(Rax, crate::types::typeobject::type_type() as i64);
                     self.decref(Rax);
                     self.a.jmp(done);
@@ -1012,7 +1091,8 @@ impl<'a> Gen<'a> {
                 self.check(pc, base);
                 self.a.jmp(done);
                 self.a.bind(generic);
-                self.helper_sp(&ins, d, addr!(h::h_call), Some(arg as i64), Some(0), base);
+                let hc = if tagged_args { addr!(h::h_call_t) } else { addr!(h::h_call) };
+                self.helper_sp(&ins, d, hc, Some(arg as i64), Some(0), base);
                 // C calls: observe signals, pending calls and safepoints right after
                 // (Python callees poll at their own Resume)
                 self.poll(pc, base + 1);
@@ -1020,7 +1100,8 @@ impl<'a> Gen<'a> {
             }
             Op::CallKw => {
                 let base = d - arg as i32 - 3;
-                self.helper_sp(&ins, d, addr!(h::h_call), Some(arg as i64), Some(1), base);
+                let hc = if (base..d).any(|k| self.tagged(k)) { addr!(h::h_call_t) } else { addr!(h::h_call) };
+                self.helper_sp(&ins, d, hc, Some(arg as i64), Some(1), base);
                 self.poll(pc, base + 1);
             }
             Op::CallFunctionEx => {
@@ -1108,8 +1189,8 @@ impl<'a> Gen<'a> {
         let done = self.a.label();
         let not_list = self.a.label();
         let got = self.a.label();
-        self.a.load(Rax, mc);
-        self.a.load(Rcx, mk);
+        self.load_obj(Rax, d - 2);
+        self.load_obj(Rcx, d - 1);
         self.compact_int(Rcx, Rsi, Rdx, slow);
         for (tp, is_list) in [(crate::types::list::list_type() as i64, true), (crate::types::tuple::tuple_type() as i64, false)] {
             if !is_list {
@@ -1146,10 +1227,10 @@ impl<'a> Gen<'a> {
         self.a.bind(got);
         self.incref(Rdi);
         self.a.mov_rr(R14, Rdi);
-        self.a.load(Rax, mc);
-        self.decref(Rax);
-        self.a.load(Rax, mk);
-        self.decref(Rax);
+        self.load_obj(Rax, d - 2);
+        self.release_obj(Rax, d - 2);
+        self.load_obj(Rax, d - 1);
+        self.release_obj(Rax, d - 1);
         self.a.store(mc, R14);
         self.a.jmp(done);
         self.a.bind(slow);
@@ -1427,6 +1508,11 @@ impl<'a> Gen<'a> {
     fn attr_op(&mut self, ins: &Instr, d: i32, hf: usize, errd: i32) {
         use crate::interp::cache::kind;
         let pc = ins.pc as usize;
+        if ins.op == Op::StoreAttr {
+            // (refs1) the stored value is kept by the object: owned (a borrowed receiver
+            // is fine: load_obj/release_obj below)
+            self.own_slot(d - 2);
+        }
         let es = self.tables.poly(pc);
         let ep = es.as_ptr() as i64;
         let name = self.cd.names[ins.arg as usize].as_ptr() as i64;
@@ -1446,27 +1532,27 @@ impl<'a> Gen<'a> {
             match (ins.op, s.kind) {
                 (Op::LoadAttr | Op::LoadMethod, kind::INSTANCE_DICT) if s.b < (1 << 20) => {
                     attr_kind = true;
-                    self.a.load(Rax, obj);
+                    self.load_obj(Rax, d - 1);
                     self.guard_tag(Rax, tag, slow);
                     let dict_path = self.a.label();
                     emit_note_attr_read(&mut self.a, Rax); // scale2
                     self.inline_values(Rax, s.b, name, slow, dict_path);
                     self.incref(Rsi);
                     self.a.store(obj, Rsi);
-                    self.decref(Rax);
+                    self.release_obj(Rax, d - 1);
                     self.a.jmp(adone);
                     self.a.bind(dict_path);
                     self.managed_dict(Rax, slow, slow);
                     if self.dict_hinted(s.b, name, slow) {
                         self.incref(Rsi);
                         self.a.store(obj, Rsi);
-                        self.decref(Rax);
+                        self.release_obj(Rax, d - 1);
                         inline = true;
                     }
                 }
                 (Op::LoadAttr | Op::LoadMethod, kind::SLOT) => {
                     attr_kind = true;
-                    self.a.load(Rax, obj);
+                    self.load_obj(Rax, d - 1);
                     self.guard_tag(Rax, tag, slow);
                     emit_note_attr_read(&mut self.a, Rax); // scale2
                     self.a.load(Rsi, M(Rax, s.c as i32));
@@ -1474,12 +1560,12 @@ impl<'a> Gen<'a> {
                     self.a.jcc(Cc::E, slow);
                     self.incref(Rsi);
                     self.a.store(obj, Rsi);
-                    self.decref(Rax);
+                    self.release_obj(Rax, d - 1);
                     inline = true;
                 }
                 (Op::LoadAttr | Op::LoadMethod, kind::TYPE_ATTR) => {
                     attr_kind = true;
-                    self.a.load(Rax, obj);
+                    self.load_obj(Rax, d - 1);
                     self.a.mov_ri(Rcx, s.b as i64);
                     self.a.cmp_rr(Rax, Rcx);
                     self.a.jcc(Cc::NE, slow);
@@ -1488,25 +1574,25 @@ impl<'a> Gen<'a> {
                     self.a.mov_ri(Rsi, s.c as i64);
                     self.incref(Rsi);
                     self.a.store(obj, Rsi);
-                    self.decref(Rax);
+                    self.release_obj(Rax, d - 1);
                     inline = true;
                 }
                 (Op::LoadAttr | Op::LoadMethod, kind::CLASS_ATTR)
                     if unsafe { (*(s.c as *mut PyObject)).ty().tp_descr_get.is_none() } =>
                 {
                     attr_kind = true;
-                    self.a.load(Rax, obj);
+                    self.load_obj(Rax, d - 1);
                     self.guard_tag(Rax, tag, slow);
                     self.a.mov_ri(Rsi, s.c as i64);
                     self.incref(Rsi);
                     self.a.store(obj, Rsi);
-                    self.decref(Rax);
+                    self.release_obj(Rax, d - 1);
                     inline = true;
                 }
                 (Op::LoadAttr | Op::LoadMethod, kind::MODULE) => {
                     attr_kind = true;
                     // guards read from the entry at run time (module dicts change)
-                    self.a.load(Rax, obj);
+                    self.load_obj(Rax, d - 1);
                     self.a.mov_ri(Rcx, crate::types::module::module_type() as i64);
                     self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
                     self.a.jcc(Cc::NE, slow);
@@ -1532,12 +1618,12 @@ impl<'a> Gen<'a> {
                     self.a.jcc(Cc::NE, slow);
                     self.incref(Rsi);
                     self.a.store(obj, Rsi);
-                    self.decref(Rax);
+                    self.release_obj(Rax, d - 1);
                     inline = true;
                 }
                 (Op::LoadMethod, kind::METHOD) | (Op::LoadMethod, kind::METHOD_SHADOWABLE) => {
                     let push = self.a.label();
-                    self.a.load(Rax, obj);
+                    self.load_obj(Rax, d - 1);
                     self.guard_tag(Rax, tag, slow);
                     if s.kind == kind::METHOD_SHADOWABLE {
                         self.lacks_name(e, name, slow, push);
@@ -1547,6 +1633,9 @@ impl<'a> Gen<'a> {
                     self.incref(Rsi);
                     self.a.store(obj, Rsi);
                     let m = self.slot(d);
+                    if self.tagged(d - 1) {
+                        self.a.or_ri(Rax, 1);
+                    }
                     self.a.store(m, Rax);
                     inline = true;
                 }
@@ -1557,14 +1646,14 @@ impl<'a> Gen<'a> {
                     // shadow
                     attr_kind = true;
                     let push = self.a.label();
-                    self.a.load(Rax, obj);
+                    self.load_obj(Rax, d - 1);
                     self.guard_tag(Rax, tag, slow);
                     self.lacks_name(e, name, slow, push);
                     self.a.bind(push);
                     self.a.mov_ri(Rsi, s.c as i64);
                     self.incref(Rsi);
                     self.a.store(obj, Rsi);
-                    self.decref(Rax);
+                    self.release_obj(Rax, d - 1);
                     inline = true;
                 }
                 (Op::LoadAttr | Op::LoadMethod, kind::DATA_DESCR)
@@ -1576,7 +1665,7 @@ impl<'a> Gen<'a> {
                     // entry: call the getter through the machine-code call routine with
                     // the stack laid out as [fget, obj] (the spare slot above the stack
                     // holds obj as self)
-                    self.a.load(Rax, obj);
+                    self.load_obj(Rax, d - 1);
                     self.guard_tag(Rax, tag, slow);
                     self.a.mov_ri(Rcx, s.c as i64);
                     self.a.load(Rcx, M(Rcx, crate::types::property::FGET_OFFSET as i32));
@@ -1597,6 +1686,9 @@ impl<'a> Gen<'a> {
                     self.a.cmp_mi(M(Rdx, CD_FAST_ENTRY), 0);
                     self.a.jcc(Cc::E, slow);
                     let selfm = self.slot(d);
+                    if self.tagged(d - 1) {
+                        self.a.or_ri(Rax, 1);
+                    }
                     self.a.store(selfm, Rax);
                     self.incref(Rcx);
                     self.a.store(obj, Rcx);
@@ -1615,7 +1707,7 @@ impl<'a> Gen<'a> {
                     // owner check)
                     attr_kind = true;
                     let (get, closure) = unsafe { getset_getter(s.c as *mut PyObject).unwrap() };
-                    self.a.load(Rax, obj);
+                    self.load_obj(Rax, d - 1);
                     self.guard_tag(Rax, tag, slow);
                     self.set_lasti(pc as u32);
                     self.a.mov_rr(Rdi, Rax);
@@ -1625,9 +1717,9 @@ impl<'a> Gen<'a> {
                     let err = self.error_label(pc as u32, d);
                     self.a.jcc(Cc::E, err);
                     self.a.mov_rr(Rsi, Rax);
-                    self.a.load(Rax, obj);
+                    self.load_obj(Rax, d - 1);
                     self.a.store(obj, Rsi);
-                    self.decref(Rax);
+                    self.release_obj(Rax, d - 1);
                     inline = true;
                 }
                 (Op::LoadAttr | Op::LoadMethod, kind::DATA_DESCR)
@@ -1636,7 +1728,7 @@ impl<'a> Gen<'a> {
                     // (perf5) namedtuple field (`_tuplegetter`): the item itself
                     attr_kind = true;
                     let idx = crate::modules::_collections::tuplegetter_index(s.c as *mut PyObject).unwrap() as i32;
-                    self.a.load(Rax, obj);
+                    self.load_obj(Rax, d - 1);
                     self.guard_tag(Rax, tag, slow);
                     self.a.load(Rcx, M(Rax, OB_TYPE));
                     self.a.load(Rdx, M(Rcx, offset_of!(PyTypeObject, tp_flags) as i32));
@@ -1649,7 +1741,7 @@ impl<'a> Gen<'a> {
                     self.a.jcc(Cc::E, slow);
                     self.incref(Rsi);
                     self.a.store(obj, Rsi);
-                    self.decref(Rax);
+                    self.release_obj(Rax, d - 1);
                     inline = true;
                 }
                 (Op::LoadAttr | Op::LoadMethod, kind::TYPE_ATTR_META)
@@ -1657,7 +1749,7 @@ impl<'a> Gen<'a> {
                 | (Op::LoadMethod, kind::TYPE_CLASSMETHOD) => {
                     // (perf5) attribute of class b under a type-derived metatype:
                     // identity and both version tags
-                    self.a.load(Rax, obj);
+                    self.load_obj(Rax, d - 1);
                     self.a.mov_ri(Rcx, s.b as i64);
                     self.a.cmp_rr(Rax, Rcx);
                     self.a.jcc(Cc::NE, slow);
@@ -1678,17 +1770,20 @@ impl<'a> Gen<'a> {
                     if s.kind == kind::TYPE_CLASSMETHOD {
                         // the class moves into the self slot
                         let m = self.slot(d);
+                        if self.tagged(d - 1) {
+                            self.a.or_ri(Rax, 1);
+                        }
                         self.a.store(m, Rax);
                     } else {
                         attr_kind = true;
-                        self.decref(Rax);
+                        self.release_obj(Rax, d - 1);
                     }
                     inline = true;
                 }
                 (Op::StoreAttr, kind::SLOT) => {
                     let val = self.slot(d - 2);
                     let mt = self.a.label();
-                    self.a.load(Rax, obj);
+                    self.load_obj(Rax, d - 1);
                     self.guard_tag(Rax, tag, slow);
                     self.a.mov_ri(Rdi, (&raw const crate::threads::MULTI_THREADED) as i64);
                     self.a.cmp_mi(M(Rdi, 0), 0);
@@ -1699,7 +1794,7 @@ impl<'a> Gen<'a> {
                     self.a.mov_rr(R14, Rax);
                     self.xdecref(Rdx);
                     self.a.mov_rr(Rax, R14);
-                    self.decref(Rax);
+                    self.release_obj(Rax, d - 1);
                     self.a.jmp(done);
                     // (scale2) with threads: swap atomically (slots are written without the
                     // object lock), then release the old value at once or through QSBR
@@ -1709,13 +1804,13 @@ impl<'a> Gen<'a> {
                     self.a.mov_rr(R14, Rax);
                     self.release_attr(R14, Rsi);
                     self.a.mov_rr(Rax, R14);
-                    self.decref(Rax);
+                    self.release_obj(Rax, d - 1);
                     inline = true;
                 }
                 (Op::StoreAttr, kind::INSTANCE_DICT) if s.b < (1 << 20) => {
                     let val = self.slot(d - 2);
                     let mt = self.a.label();
-                    self.a.load(Rax, obj);
+                    self.load_obj(Rax, d - 1);
                     self.guard_tag(Rax, tag, slow);
                     // (perf5) attribute-adding store (`__init__`): with the object in the
                     // one shape that lacks the name and room left, store the value and
@@ -1746,7 +1841,7 @@ impl<'a> Gen<'a> {
                         self.a.store(M(Rax, voff + 8 * s.b as i32), Rsi);
                         self.a.mov_ri(Rsi, child as i64 | 1);
                         self.a.store(M(Rax, MANAGED_DICT), Rsi);
-                        self.decref(Rax);
+                        self.release_obj(Rax, d - 1);
                         self.a.jmp(done);
                         self.a.bind(not_add);
                     }
@@ -1764,7 +1859,7 @@ impl<'a> Gen<'a> {
                     self.a.mov_rr(Rax, Rsi);
                     self.decref(Rax);
                     self.a.mov_rr(Rax, R14);
-                    self.decref(Rax);
+                    self.release_obj(Rax, d - 1);
                     self.a.jmp(done);
                     // (scale2) with threads: the same under the object's mutex (writers on
                     // other threads may change the shape), taken inline when free; the
@@ -1784,7 +1879,7 @@ impl<'a> Gen<'a> {
                         self.ob_unlock(R14);
                         self.release_attr(R14, Rsi);
                         self.a.mov_rr(Rax, R14);
-                        self.decref(Rax);
+                        self.release_obj(Rax, d - 1);
                         self.a.jmp(done);
                         self.a.bind(unlock_dict);
                         self.ob_unlock(R14);
@@ -1805,7 +1900,7 @@ impl<'a> Gen<'a> {
                     self.a.test_rr(Rax, Rax);
                     self.a.jcc(Cc::NE, slow);
                     self.a.mov_rr(Rax, R14);
-                    self.decref(Rax);
+                    self.release_obj(Rax, d - 1);
                     inline = true;
                 }
                 _ => {}
@@ -1954,8 +2049,8 @@ impl<'a> Gen<'a> {
         let not_int = self.a.label();
         let have_result = self.a.label();
         let done = self.a.label();
-        self.a.load(Rax, ma);
-        self.a.load(Rcx, mb);
+        self.load_obj(Rax, d - 2);
+        self.load_obj(Rcx, d - 1);
         if int_ok {
             self.compact_int(Rax, Rdi, Rdx, not_int);
             self.compact_int(Rcx, Rsi, Rdx, not_int);
@@ -2021,10 +2116,10 @@ impl<'a> Gen<'a> {
         self.a.bind(have_result);
         // result in rax: keep it in r14 while releasing the operands
         self.a.mov_rr(R14, Rax);
-        self.a.load(Rax, ma);
-        self.decref(Rax);
-        self.a.load(Rax, mb);
-        self.decref(Rax);
+        self.load_obj(Rax, d - 2);
+        self.release_obj(Rax, d - 2);
+        self.load_obj(Rax, d - 1);
+        self.release_obj(Rax, d - 1);
         self.a.store(ma, R14);
         self.a.jmp(done);
         self.a.bind(slow);
@@ -2052,8 +2147,8 @@ impl<'a> Gen<'a> {
         let decide = self.a.label();
         let not_int = self.a.label();
         let release = self.a.label();
-        self.a.load(Rax, ma);
-        self.a.load(Rcx, mb);
+        self.load_obj(Rax, d - 2);
+        self.load_obj(Rcx, d - 1);
         self.compact_int(Rax, Rdi, Rdx, not_int);
         self.compact_int(Rcx, Rsi, Rdx, slow);
         self.prof(ins.pc, (prof::INT as u16) | (prof::INT as u16) << 8);
@@ -2102,10 +2197,10 @@ impl<'a> Gen<'a> {
         }
         self.a.bind(release);
         // operands: release (compact ints are mostly immortal small ints)
-        self.a.load(Rax, ma);
-        self.decref(Rax);
-        self.a.load(Rax, mb);
-        self.decref(Rax);
+        self.load_obj(Rax, d - 2);
+        self.release_obj(Rax, d - 2);
+        self.load_obj(Rax, d - 1);
+        self.release_obj(Rax, d - 1);
         self.a.bind(decide);
         self.a.test_rr(R14, R14);
         self.a.jcc(if jump_if_true { Cc::NE } else { Cc::E }, t);
@@ -2274,7 +2369,7 @@ impl<'a> Gen<'a> {
     pub(crate) fn new_embedded(a: Asm, an: &'a Analysis, cd: &'a CodeData, nlp: usize, flags: u32, tables: &'a crate::interp::cache::Tables, ilabel: Vec<Label>, exit: Label) -> Gen<'a> {
         let mut a = a;
         let (rt_box_int, rt_box_float, rt_free_num) = (a.label(), a.label(), a.label());
-        Gen { a, nlp: nlp as i32, an, cd, tables, ilabel, exit, stubs: Vec::new(), rt_box_int, rt_box_float, rt_free_num, flags, no_fuse: true, drain: false }
+        Gen { a, nlp: nlp as i32, an, cd, tables, ilabel, exit, stubs: Vec::new(), rt_box_int, rt_box_float, rt_free_num, flags, no_fuse: true, drain: false, borrow: false, tagm: 0 }
     }
     /// Emit the out-of-line stubs and shared routines; resolve labels.
     pub(crate) fn finish(mut self) -> Result<Asm, String> {
@@ -2315,6 +2410,93 @@ impl<'a> Gen<'a> {
     }
 }
 
+/// (refs1) Templates that accept borrowed (tagged) entries at their input depths: their
+/// inline code removes the tag before using an object and does not release a borrowed
+/// one, or they only call helpers that do the same (`take_sr`/`take`/`view` in
+/// helpers.rs, the interpreter's stack macros). Every other template first converts
+/// all borrowed entries of the stack to owned ones (`Gen::own_all`).
+fn tag_aware(op: Op) -> bool {
+    use Op::*;
+    matches!(
+        op,
+        Nop | Resume | LoadConst | LoadFast | LoadFastBorrow | LoadFastCheck | LoadGlobal | PushNull | LoadDeref
+            | PopTop | StoreFast | Copy | Swap | ReturnValue | IsOp | PopJumpIfNone | PopJumpIfNotNone
+            | PopJumpIfFalse | PopJumpIfTrue | ToBool | UnaryNot | LoadAttr | LoadMethod | StoreAttr | BinaryOp
+            | CompareOp | BinarySubscr | Call | CallKw | CallFunctionEx | DeleteAttr | StoreGlobal | ContainsOp
+            | UnaryNegative | UnaryPositive | UnaryInvert | DeleteSubscr | StoreSubscr | BinarySlice | StoreSlice
+            | BuildSlice | BuildTuple | BuildList | BuildSet | BuildMap | BuildString | MapAdd | SetAdd | ListExtend
+            | SetUpdate | DictUpdate | DictMerge | UnpackSequence | UnpackEx | GetIter | FormatSimple
+            | FormatWithSpec | ConvertValue | LoadSuperAttr
+    )
+}
+
+/// (refs1) Borrowed-entry masks per instruction (see `Gen::tagm`): LoadFastBorrow
+/// pushes one, LoadMethod passes a borrowed receiver on as `self`, Swap moves them,
+/// every other instruction consumes its inputs and pushes owned values (and a template
+/// that is not `tag_aware` owns everything first). Basic blocks start without
+/// borrowed entries (interp/borrow.rs), so entry points start from 0.
+fn tag_masks(an: &Analysis, borrow: bool) -> Vec<u64> {
+    let n = an.instrs.len();
+    let mut out = vec![0u64; n];
+    if !borrow {
+        return out;
+    }
+    let mut m = 0u64;
+    for i in 0..n {
+        let ins = an.instrs[i];
+        let d = an.depth[i];
+        if d < 0 || i == 0 || an.is_target[i] || (i > 0 && an.instrs[i - 1].op == Op::YieldValue) {
+            m = 0;
+        }
+        if d < 0 {
+            continue;
+        }
+        out[i] = m;
+        if m != 0 && !tag_aware(ins.op) {
+            m = 0;
+        }
+        let low = |b: i32| -> u64 {
+            if b <= 0 {
+                0
+            } else if b >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << b) - 1
+            }
+        };
+        let bit = |k: i32| -> u64 { if (0..64).contains(&k) { 1u64 << k } else { 0 } };
+        m = match ins.op {
+            Op::LoadFastBorrow => m | bit(d),
+            Op::Swap => {
+                let (a, b) = (d - 1, d - ins.arg as i32);
+                let (ba, bb) = (m & bit(a) != 0, m & bit(b) != 0);
+                let mut r = m & !bit(a) & !bit(b);
+                if ba {
+                    r |= bit(b);
+                }
+                if bb {
+                    r |= bit(a);
+                }
+                r
+            }
+            Op::LoadMethod => {
+                let recv = m & bit(d - 1) != 0;
+                let r = m & low(d - 1);
+                if recv { r | bit(d) } else { r }
+            }
+            Op::Copy | Op::LoadConst | Op::LoadFast | Op::LoadFastCheck | Op::LoadGlobal | Op::PushNull | Op::LoadDeref
+            | Op::Nop | Op::Resume => m,
+            op => {
+                let (fall, _) = super::analysis::effect(op, ins.arg);
+                let pops = crate::interp::borrow::pops(op, ins.arg).unwrap_or(d as u32) as i32;
+                let _ = fall;
+                m & low(d - pops)
+            }
+        };
+    }
+    out
+}
+
 /// Compile a code object. Err: not compilable (stays in the interpreter).
 pub fn compile(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crate::interp::cache::Tables) -> Result<Output, String> {
     compile_mode(cd, nlocalsplus, flags, tables, false)
@@ -2327,7 +2509,7 @@ pub fn compile_mode(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crat
     let ilabel: Vec<Label> = (0..an.instrs.len()).map(|_| a.label()).collect();
     let exit = a.label();
     let (rt_box_int, rt_box_float, rt_free_num) = (a.label(), a.label(), a.label());
-    let mut g = Gen { a, nlp: nlocalsplus as i32, an: &an, cd, tables, ilabel, exit, stubs: Vec::new(), rt_box_int, rt_box_float, rt_free_num, flags, no_fuse: false, drain };
+    let mut g = Gen { a, nlp: nlocalsplus as i32, an: &an, cd, tables, ilabel, exit, stubs: Vec::new(), rt_box_int, rt_box_float, rt_free_num, flags, no_fuse: false, drain, borrow: crate::interp::borrow::enabled(), tagm: 0 };
 
     // prologue
     g.a.push(Rbp);
@@ -2355,6 +2537,7 @@ pub fn compile_mode(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crat
     g.a.pop(Rbp);
     g.a.ret();
 
+    let masks = tag_masks(&an, g.borrow);
     let mut entries = vec![u32::MAX; cd.code.len() + 1];
     let mut prev_yield = false;
     let mut skip_next = false;
@@ -2380,6 +2563,7 @@ pub fn compile_mode(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crat
                 skip_next = true;
             }
         }
+        g.tagm = masks[i];
         g.emit(i)?;
         // fall off the end of a non-terminating instruction into the next one is implicit
     }

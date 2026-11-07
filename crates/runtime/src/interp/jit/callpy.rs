@@ -171,6 +171,12 @@ fn build() -> Option<usize> {
     a.jcc(Cc::E, args_done);
     a.bind(args);
     a.load_idx(Rax, R8, Rsi, 8, 0);
+    // (refs1) a borrowed argument (tag bit) becomes an owned reference of the callee
+    let tagged = a.label();
+    let owned = a.label();
+    a.test_ri(Rax, crate::interp::borrow::TAG as i32);
+    a.jcc(Cc::NE, tagged);
+    a.bind(owned);
     a.store_idx(R10, Rsi, 8, 0, Rax);
     a.xor_rr(Rax, Rax);
     a.store_idx(R8, Rsi, 8, 0, Rax);
@@ -391,6 +397,22 @@ fn build() -> Option<usize> {
     // ---- not applicable: the Rust path (nothing was changed)
     a.bind(slow);
     a.jmp_abs(addr(super::h_call_py as usize));
+    // ---- (refs1) borrowed argument in rax: untag and take a reference (rcx scratch)
+    {
+        let shared = a.label();
+        a.bind(tagged);
+        a.and_ri(Rax, -2);
+        a.load32(Rcx, M(Rax, ob_ref_local));
+        a.add32_ri(Rcx, 1);
+        a.jcc(Cc::E, owned);
+        a.cmp_rm(R15, M(Rax, ob_tid));
+        a.jcc(Cc::NE, shared);
+        a.store32(M(Rax, ob_ref_local), Rcx);
+        a.jmp(owned);
+        a.bind(shared);
+        a.lock_add_mi(M(Rax, ob_ref_shared), 1 << REF_SHARED_SHIFT);
+        a.jmp(owned);
+    }
     let (bi, bf) = (a.label(), a.label());
     super::tier1::emit_routines(&mut a, bi, bf, free_num);
 

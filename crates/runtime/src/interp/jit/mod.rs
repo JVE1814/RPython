@@ -559,7 +559,7 @@ pub unsafe extern "C" fn h_call_py(base: *mut *mut PyObject, n: u64) -> u64 {
             || depth > ts.c.py_recursion_limit
             || crate::interp::stack_pointer() < ts.stack_soft_limit()
         {
-            return helpers::h_call(base.add(n as usize + 2), n, 0);
+            return helpers::h_call_t(base.add(n as usize + 2), n, 0);
         }
         let c = &*cd.caches.jit.load(Acquire);
         ts.recursion_depth.set(depth);
@@ -569,7 +569,8 @@ pub unsafe extern "C" fn h_call_py(base: *mut *mut PyObject, n: u64) -> u64 {
         let mut frame = Frame::new_call_raw(code, callable, (*f).func_globals, (*f).func_builtins, nlp, total);
         let s = frame.slots.as_mut_ptr();
         for i in 0..nargs {
-            *s.add(i) = *argp.add(i);
+            // (refs1) the callee frame owns its arguments
+            *s.add(i) = crate::interp::borrow::own(*argp.add(i));
             *argp.add(i) = std::ptr::null_mut();
         }
         if ndef != 0 {
