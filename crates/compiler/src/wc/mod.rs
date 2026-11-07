@@ -1640,7 +1640,13 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_class_body(&mut self, s: &'a Stmt, body: &'a [Stmt], firstlineno: i32, generic: bool) -> R {
-        self.set_loc(s.loc);
+        // the prologue belongs to the whole (decorated) statement: it starts on the first
+        // decorator's line, which is what tracing reports for it
+        let mut prologue = s.loc;
+        if firstlineno > 0 && firstlineno < prologue.lineno {
+            prologue.lineno = firstlineno;
+        }
+        self.set_loc(prologue);
         let sid = self.ur().scope;
         if self.st.scopes[sid].needs_classdict {
             self.emit(O::LOAD_LOCALS, 0);
