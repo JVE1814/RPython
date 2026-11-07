@@ -93,5 +93,6 @@ scaling harness + fixes), tail1 (long-tail modules passing on CPython), perf5 (r
 handlers, startup), stability3 (test_free_threading env-changed races, test_stop_the_world, flaky crashes).
 lib6 (stdlib failures), interp1 (subinterpreters, D26: done). Running: stability2 (free-threading crashes), perf3 (runtime fast paths).
 
-Unassigned: _testclinic re-implemented by us (spec lacks
+Unassigned: D19 clean-room audit of Lib/ (tail1 flagged fractions, shlex, statistics as reading like recalled text; rewrite
+such files in our own structure);  _testclinic re-implemented by us (spec lacks
 internal headers / generated clinic files); no-GIL thread-safety audit; startup time (jit owns perf).
