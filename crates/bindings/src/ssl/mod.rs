@@ -902,8 +902,8 @@ pub fn init() -> PyResult {
         ("HAS_TLSv1_2", true),
         ("HAS_TLSv1_3", true),
         ("HAS_NEVER_CHECK_COMMON_NAME", true),
-        ("HAS_PSK", false),
-        ("HAS_PSK_TLS13", false),
+        ("HAS_PSK", true),
+        ("HAS_PSK_TLS13", true),
         ("HAS_PHA", true),
     ] {
         dict::set_item_str(&d, n, &rpy_runtime::types::bool_::new_bool(v))?;
