@@ -363,3 +363,14 @@ raises SystemError (the behaviour test_capi checks).
 `PYTHONMALLOC=debug`/`*_debug` and `-X dev` install guard-byte debug hooks (capi/memdebug.rs). Blocks the hooks did not
 allocate (runtime objects freed via tp_free) pass through to the wrapped allocator. With hooks, tracemalloc or a
 reference tracer installed, the allocator takes its slow paths (one combined flag, no cost otherwise).
+
+## D35 — Borrowed value-stack references (refs1)
+A value-stack slot may hold a borrowed reference to a local's object, tagged with pointer bit 0. Locals, cells and
+anything C code sees are never tagged. The runtime's translator does its own analysis and marks a load
+`LoadFastBorrow` only if every copy of the value is consumed in the same basic block, the local is not stored or
+deleted in between, and no handler would keep a copy. The marks in the public bytecode are not trusted. The
+interpreter and both JIT tiers accept tagged inputs. A write to a running frame's locals from outside the frame
+releases the old value only when the frame ends. `sys.getrefcount` reports real counts, so D27's caller-stack
+emulation is retired; only its part about arguments copied into callees remains. HotSpot comparison: the JIT knows
+which values are live in which slots without paying a refcount for each one. `RPYTHON_BORROW=0` turns it off.
+Details: notes/refs1.md.

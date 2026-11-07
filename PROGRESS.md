@@ -93,6 +93,7 @@ Ours (tools/run_tests.sh, 434 modules):
 | 12 | f66b390 (core6+perf4+tail1+capi2) | 367 | 67 | 0 | 0 | 49,880 | 129 (+70 errors) | 3,202 |
 | 13 | 0a2f1fa (tail2+cleanroom2+scale1, pre-perf5/stability3) | 360 (+36 whole-module skips) | 37 | 0 | 1 | 50,095 | 111 (+68 errors) | 3,190 |
 | 14 | bcb91fa (tail3+pdb1+stability3+scale2 ckpt) | 381 (+36 whole-module skips) | 17 | 0 | 0 | 50,644 | 75 (+36 errors) | 3,224 |
+| 15 | 8729a48 (capi3+remote1+tail3+perf6, pre-cleanroom4/refs1) | 383 (+34 whole-module skips) | 17 | 0 | 0 | 51,152 | 131 (+156 errors) | 3,202 |
 Run 7 (pre-core4): crashes = test_capi (segfault after a lone-surrogate print), test_free_threading
 (deque race, test_collections), test_itertools (flaky; passes now), test_multiprocessing_fork/spawn
 (heap corruption in test_manager); timeouts = asyncio, cmd_line_script, os, subprocess. Largest
@@ -104,6 +105,7 @@ subprocess. Largest failure counts: importlib 20, call 17, inspect 15, dict 8, c
 Run 9: crashes = test_free_threading (io heap corruption), test_functools (lru_cache race; fixed since), test_super
 (__class__ assignment race), test_multiprocessing_fork/forkserver/spawn; timeouts = asyncio, capi, cmd_line_script,
 os, subprocess. Largest failure counts: importlib 20, call 17, inspect 15, dict 8, concurrent_futures 7.
+Run 15: 417/434 pass or whole-module skip. capi, sys and dict now pass. The failure and error totals rose because remote1's _remote_debugging turned on test_gc_stats, which used to skip, and the rest of test_profiling, which grew from 113 to 483 tests run (98 failures + 129 errors; tail4 owns it). test_gc_stats has 5 errors (no GCMonitor or get_gc_stats, also given to tail4). Other modules that fail but pass on CPython: asyncio 2 (sslproto), gc 2, descr 1, opcache 1, repl 1, thread_local_bytecode 1, sys_settrace 1E, os 1 (timerfd poll count 2 != 1 under load, probably flaky).
 Run 14: 417/434 pass or whole-module skip (baseline 416 incl. its own whole-module skips). Only 10 modules fail that pass
 on CPython: capi 40+13E, asyncio 2, gc 2, descr 1+1E, dict 1, opcache 1, repl 1, sys 1+1E, sys_settrace 1E,
 thread_local_bytecode 1. Skipped tests: 3,224 vs the baseline's 3,371 (fewer than CPython). Baseline failures: 24.
