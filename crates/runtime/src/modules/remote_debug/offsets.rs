@@ -355,20 +355,19 @@ pub static RPY_DEBUG_TABLE: DebugTable = DebugTable {
 /// Measure `Vec`'s field order: a vector with distinct capacity and length shows which
 /// word holds what.
 fn probe_vec_layout() -> (u64, u64) {
+    // (tail4) the vector goes through black_box so the optimizer cannot rewrite its
+    // representation; the pointer word is the one that is neither the length nor the
+    // capacity (an equality test on the pointer alone failed in some builds)
     let mut v: Vec<u32> = Vec::with_capacity(7);
     v.push(1);
     v.push(2);
+    let v = std::hint::black_box(v);
     let words: [usize; 3] = unsafe { std::mem::transmute_copy(&v) };
-    let ptr = v.as_ptr() as usize;
-    let mut p = 0;
-    let mut l = 0;
-    for (i, w) in words.iter().enumerate() {
-        if *w == ptr {
-            p = i;
-        } else if *w == 2 {
-            l = i;
-        }
-    }
+    let (len, cap, ptr) = (v.len(), v.capacity(), v.as_ptr() as usize);
+    let l = words.iter().position(|&w| w == len).unwrap_or(2);
+    let c = words.iter().enumerate().position(|(i, &w)| i != l && w == cap && w != ptr).unwrap_or(0);
+    let p = (0..3).find(|&i| i != l && i != c).unwrap_or(1);
+    debug_assert_eq!(words[p], ptr);
     ((p * 8) as u64, (l * 8) as u64)
 }
 
