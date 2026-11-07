@@ -1493,6 +1493,7 @@ unsafe extern "C" fn parser_init(o: *mut PyObject, args: *mut PyObject, kw: *mut
             }
             let mut eng = Engine::new(Some("}".to_string()), encoding);
             eng.reparse_deferral = true;
+            eng.lazy_positions = true; // (perf6) positions only for errors
             let p = xp(o);
             let old = std::mem::replace(p, blank_parser());
             p.engine = Some(Box::new(eng));
@@ -1563,6 +1564,9 @@ fn fixname(o: &PyObject, raw: &str) -> PyRef {
 
 fn emit_event(o: &PyObject, which: usize, value: &PyObject) -> PyResult<()> {
     let p = xp(o);
+    if p.events_append.is_none() || p.event_names[which].is_none() {
+        return Ok(());
+    }
     let (Some(append), Some(name)) = (p.events_append.clone(), p.event_names[which].clone()) else {
         return Ok(());
     };
@@ -1578,8 +1582,10 @@ fn flush_text(o: &PyObject) -> PyResult<()> {
     if xp(o).text.is_empty() {
         return Ok(());
     }
-    let text = std::mem::take(&mut xp(o).text);
-    deliver_data(o, pystr::new_str(&text))
+    // (perf6) the buffer is kept for the next text
+    let s = pystr::new_str(&xp(o).text);
+    xp(o).text.clear();
+    deliver_data(o, s)
 }
 
 fn deliver_data(o: &PyObject, data: PyRef) -> PyResult<()> {
@@ -1633,7 +1639,7 @@ fn entity_ref(o: &PyObject, name: &str, line: u64, col: u64) -> PyResult<()> {
     }
 }
 
-fn ev_start(o: &PyObject, name: &str, attrs: Vec<(String, String)>) -> PyResult<()> {
+fn ev_start(o: &PyObject, name: &str, attrs: Vec<(crate::modules::pyexpat::engine::Name, String)>) -> PyResult<()> {
     let tag = fixname(o, name);
     let p = xp(o);
     if p.fast {

@@ -291,10 +291,9 @@ pub fn make_exception(tp: *mut PyTypeObject, args: &[PyRef]) -> PyResult {
             if op.is_null() {
                 return Err(PyErr);
             }
-            exc(&*op).args = match args.len() {
-                0 => tuple::empty_tuple().into_raw(),
-                _ => tuple::new_tuple(args.to_vec()).into_raw(),
-            };
+            // (perf6) straight from the slice (PyRef has the layout of a pointer): no
+            // intermediate vector
+            exc(&*op).args = tuple::new_tuple_from_ptrs(std::slice::from_raw_parts(args.as_ptr() as *const *mut PyObject, args.len())).into_raw();
             return Ok(PyRef::from_raw(op));
         }
     }

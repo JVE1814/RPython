@@ -188,6 +188,59 @@ pub fn percent_format(fmt: &PyObject, args: &PyObject) -> PyResult {
         if i >= n {
             break;
         }
+        // (perf6) bare %s / %d / %i (no key, flags, width or precision): no spec parse,
+        // exact str and machine-size int values written directly
+        if i + 1 < n && !(used_key && a.dict.is_some()) {
+            let c = f.get(i + 1);
+            if c == 's' as u32 || c == 'd' as u32 || c == 'i' as u32 {
+                let (v, nm) = a.next()?;
+                i += 2;
+                if c == 's' as u32 && pystr::is_str_exact(&v) {
+                    out.push_obj(v);
+                } else if c != 's' as u32 && int::is_int_exact(&v) && int::as_i64(&v).is_some() {
+                    let x = int::as_i64(&v).unwrap();
+                    let mut buf = [0u8; 20];
+                    let mut k = buf.len();
+                    let mut m = x.unsigned_abs();
+                    loop {
+                        k -= 1;
+                        buf[k] = b'0' + (m % 10) as u8;
+                        m /= 10;
+                        if m == 0 {
+                            break;
+                        }
+                    }
+                    if x < 0 {
+                        out.push_str("-");
+                    }
+                    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[k..]) });
+                } else {
+                    format_one(&mut out, &v, &nm, char::from_u32(c).unwrap_or('s'), &PercentOpts::default())?;
+                }
+                continue;
+            }
+            // %(key)s with a key without parentheses (logging's record formats)
+            if c == '(' as u32 && a.dict.is_some() {
+                let mut j = i + 2;
+                while j < n && f.get(j) != ')' as u32 && f.get(j) != '(' as u32 {
+                    j += 1;
+                }
+                if j + 1 < n && f.get(j) == ')' as u32 && f.get(j + 1) == 's' as u32 {
+                    let key = key_text(fmt, (i + 2, j));
+                    let v = ab::getitem(a.dict.unwrap(), &key)?;
+                    used_key = true;
+                    a.arglen = -1;
+                    a.argidx = -2;
+                    i = j + 2;
+                    if pystr::is_str_exact(&v) {
+                        out.push_obj(v);
+                    } else {
+                        format_one(&mut out, &v, &ArgName::Key(pystr::to_string_lossy(&key)), 's', &PercentOpts::default())?;
+                    }
+                    continue;
+                }
+            }
+        }
         let parsed = dispatch_parse(f, i, &printable);
         let spec: PercentSpec = match parsed {
             Ok(s) => s,

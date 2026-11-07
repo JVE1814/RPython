@@ -99,6 +99,9 @@ pub enum Run {
     Error,
     /// continue interpreting at this pc
     Deopt(usize),
+    /// (perf6) exception set and already unwound out of this frame (traceback entry
+    /// added, stack cleared): the frame returns the error without unwinding again
+    Propagated,
     /// the generator frame yielded this value (frame suspended at f.next_instr)
     Yield(PyRef),
 }
@@ -197,7 +200,42 @@ fn run(ts: &ThreadState, f: &mut Frame, c: &Compiled, pc: usize) -> Run {
     crate::tlab::ensure_registered();
     let entry: EntryFn = unsafe { std::mem::transmute(c.addr) };
     let mut out: *mut PyObject = std::ptr::null_mut();
-    let st = unsafe { entry(f, f.slots.as_mut_ptr(), ts, target, &mut out) };
+    let mut st = unsafe { entry(f, f.slots.as_mut_ptr(), ts, target, &mut out) };
+    let mut t2 = t2;
+    // (perf6) an exception in an activation the interpreter entered compiled code for
+    // (OSR, generator resumption): unwound in Rust as for call frames (finish_in_interp),
+    // and continued at the handler in compiled code, instead of the interpreter running the
+    // handler up to the next back edge for every caught exception
+    while st == tier1::ST_ERROR {
+        // `unwind_compiled` links the frame under ts.frame itself: this frame already
+        // is the current one, so present its caller and restore both links afterwards
+        let (saved_prev, cur) = (f.prev, ts.frame.get());
+        ts.frame.set(saved_prev);
+        let u = crate::interp::eval::unwind_compiled(ts, f);
+        ts.frame.set(cur);
+        f.prev = saved_prev;
+        match u {
+            crate::interp::eval::Unwound::Propagate => return Run::Propagated,
+            crate::interp::eval::Unwound::Interp => return Run::Error,
+            crate::interp::eval::Unwound::Handler(hpc) => {
+                let t = match opt_entry(cd, hpc) {
+                    Some(t) => {
+                        t2 = true;
+                        t
+                    }
+                    None => match c.entries.get(hpc) {
+                        Some(&o) if o != u32::MAX => {
+                            t2 = false;
+                            c.addr + o as usize
+                        }
+                        _ => return Run::Deopt(hpc),
+                    },
+                };
+                out = std::ptr::null_mut();
+                st = unsafe { entry(f, f.slots.as_mut_ptr(), ts, t, &mut out) };
+            }
+        }
+    }
     match st {
         tier1::ST_RETURN => Run::Return(unsafe { PyRef::from_raw(out) }),
         tier1::ST_ERROR => Run::Error,
@@ -629,6 +667,8 @@ pub fn resume(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> Result<P
             f.next_instr = npc as u32;
             Err(None)
         }
+        // (perf6) already unwound out of the frame: the activation finished with the error
+        Run::Propagated => Ok(Err(crate::errors::PyErr)),
         Run::Error => {
             f.next_instr = f.lasti + 1;
             match crate::errors::take_exc() {

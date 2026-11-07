@@ -181,7 +181,7 @@ pub fn handled_exception(ts: &ThreadState) -> *mut PyObject {
     }
 }
 
-fn set_handled_exception(ts: &ThreadState, v: *mut PyObject) -> *mut PyObject {
+pub(crate) fn set_handled_exception(ts: &ThreadState, v: *mut PyObject) -> *mut PyObject {
     unsafe {
         let item = ts.c.exc_info;
         let old = (*item).exc_value;
@@ -494,7 +494,7 @@ pub(super) fn unpack_ex(seq: &PyObject, before: usize, after: usize) -> PyResult
     Ok(out)
 }
 
-fn check_exc_match_type(t: &PyObject, star: bool) -> PyResult<()> {
+pub(crate) fn check_exc_match_type(t: &PyObject, star: bool) -> PyResult<()> {
     let ok = |c: &PyObject| -> bool { exc::is_exception_class(c) };
     if tuple::is_tuple(t) {
         for c in tuple::tuple_items(t) {
@@ -781,6 +781,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
         pending_err = true;
     }
 
+    let mut unwound = false;
     'outer: loop {
         if !pending_err {
             // ---------------------------------------------------------- dispatch loop
@@ -791,6 +792,10 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                         super::jit::Run::NotRun => {}
                         super::jit::Run::Return(v) => return Ok(Some(Exit::Return(v))),
                         super::jit::Run::Error => return Err(PyErr),
+                        super::jit::Run::Propagated => {
+                            unwound = true;
+                            return Err(PyErr);
+                        }
                         super::jit::Run::Deopt(npc) => pc = npc,
                         super::jit::Run::Yield(v) => return Ok(Some(Exit::Yield(v))),
                     }
@@ -1716,6 +1721,8 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                     return Ok(exit);
                 }
                 Ok(None) => continue 'outer, // jit: re-dispatch (OSR entry)
+                // (perf6) compiled code already unwound the exception out of this frame
+                Err(_) if unwound => return Err(PyErr),
                 Err(_) => {}
             }
         }

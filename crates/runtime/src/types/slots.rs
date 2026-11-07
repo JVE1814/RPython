@@ -1256,7 +1256,11 @@ unsafe extern "C" fn slot_tp_richcompare(s: *mut PyObject, o: *mut PyObject, op:
         .to_ref();
         // a descriptor whose __get__ fails makes the comparison NotImplemented
         if let Some(f) = lookup(s.type_ptr(), &nm) {
-            if !crate::types::funcobject::is_function(&f) {
+            // (perf6) a plain function: called with the one lookup
+            if crate::types::funcobject::is_function(&f) {
+                return into_c(ab::call_unbound(&f, s, &[&*o]));
+            }
+            {
                 if let Some(get) = f.ty().tp_descr_get {
                     if f.ty().tp_flags & Py_TPFLAGS_METHOD_DESCRIPTOR == 0 {
                         let bound = get(f.as_ptr(), s.as_ptr(), s.type_ptr() as *mut PyObject);
@@ -1273,12 +1277,9 @@ unsafe extern "C" fn slot_tp_richcompare(s: *mut PyObject, o: *mut PyObject, op:
                     }
                 }
             }
+            return into_c(ab::call_unbound(&f, s, &[&*o]));
         }
-        match call_special(s, &nm, &[&*o]) {
-            Ok(Some(r)) => r.into_raw(),
-            Ok(None) => crate::types::none::not_implemented().to_ref().into_raw(),
-            Err(_) => std::ptr::null_mut(),
-        }
+        crate::types::none::not_implemented().to_ref().into_raw()
     }
 }
 unsafe extern "C" fn slot_tp_iter(s: *mut PyObject) -> *mut PyObject {
@@ -1593,6 +1594,18 @@ unsafe extern "C" fn slot_mp_subscript(s: *mut PyObject, k: *mut PyObject) -> *m
 }
 unsafe extern "C" fn slot_mp_ass_subscript(s: *mut PyObject, k: *mut PyObject, v: *mut PyObject) -> c_int {
     unsafe {
+        // (perf6) `__setitem__` inherited from a C type (a dict subclass that only
+        // overrides __delitem__, like Counter): its slot function directly, no wrapper call
+        if !v.is_null() {
+            if let Some(f) = lookup((*s).type_ptr(), name!("__setitem__")) {
+                if let Some((Slot::MpAssSubscript, w, owner)) = crate::types::descr::wrapper_descr_info(&f) {
+                    if !w.is_null() && w as usize != slot_mp_ass_subscript as usize && is_subtype((*s).type_ptr(), owner) {
+                        let cf: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> c_int = std::mem::transmute(w);
+                        return cf(s, k, v);
+                    }
+                }
+            }
+        }
         let r = if v.is_null() {
             call_special_required(&*s, name!("__delitem__"), &[&*k])
         } else {
