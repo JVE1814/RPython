@@ -98,6 +98,7 @@ pub mod _tracemalloc;
 pub mod _csv;
 pub mod _multiprocessing;
 pub mod testinternalcapi;
+pub mod testinternalcapi_selftest;
 pub mod compiler_hooks;
 pub mod remote_debug;
 

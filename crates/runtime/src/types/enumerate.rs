@@ -22,6 +22,8 @@ struct EnumObject {
     it: *mut PyObject,
     result: *mut PyObject,
     longindex: *mut PyObject,
+    /// (capi3) unused; the size of CPython's enumerate object (sys.getsizeof)
+    _reserved: usize,
 }
 fn en(o: &PyObject) -> &mut EnumObject {
     unsafe { &mut *(o.as_ptr() as *mut EnumObject) }

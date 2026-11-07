@@ -362,6 +362,12 @@ fn index_m(o: &PyObject, v: &PyObject) -> PyResult {
     }
     raise!(ValueError, "sequence.index(x): x not in sequence");
 }
+/// (capi3) sys.getsizeof reports the four object fields (start, stop, step, length), as
+/// for CPython's range; the native copies cached after them for the fast paths are not
+/// counted (decision in notes/capi3.md).
+fn sizeof_m(_o: &PyObject) -> PyResult {
+    Ok(int::new_int(std::mem::offset_of!(RangeObject, fast) as i64))
+}
 fn reduce_m(o: &PyObject) -> PyResult {
     let ro = r(o);
     Ok(tuple::new_tuple(vec![
@@ -620,6 +626,7 @@ pub fn init_types() {
         t.tp_methods = crate::mdefs![
             ("__reversed__", NOARGS, reversed_m, "Return a reverse iterator."),
             ("__reduce__", NOARGS, reduce_m),
+            ("__sizeof__", NOARGS, sizeof_m),
             ("count", O, count_m, "rangeobject.count(value) -> integer -- return number of occurrences of value"),
             ("index", O, index_m, "rangeobject.index(value) -> integer -- return index of value.\nRaise ValueError if the value is not present."),
         ];
