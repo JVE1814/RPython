@@ -174,6 +174,31 @@ pub fn new_list(items: Vec<PyRef>) -> PyRef {
     }
 }
 
+/// (jit5) New list of `n` borrowed items taken from `items` at start, start + step, ...
+/// (a resolved extended slice) without an intermediate vector.
+pub fn new_list_strided(items: &[&PyObject], start: isize, step: isize, n: isize) -> PyRef {
+    unsafe {
+        let op = alloc::alloc_object(list_type(), std::mem::size_of::<PyListObject>());
+        let l = op as *mut PyListObject;
+        let n = n.max(0) as usize;
+        if n > 0 {
+            let arr = alloc_items(n);
+            let mut i = start;
+            for k in 0..n {
+                let it = items[i as usize].as_ptr();
+                incref(it);
+                *arr.add(k) = it;
+                i = i.wrapping_add(step);
+            }
+            (*l).ob_item = arr;
+            (*l).allocated = n as isize;
+        }
+        (*l).ob_base.ob_size = n as isize;
+        crate::gc::track(op);
+        PyRef::from_raw(op)
+    }
+}
+
 /// New list from borrowed items.
 pub fn new_list_from_slice(items: &[&PyObject]) -> PyRef {
     unsafe {
@@ -741,7 +766,7 @@ pub fn list_getitem(o: &PyObject, k: &PyObject) -> PyResult {
         if step == 1 {
             return Ok(new_list_from_slice(&items[start as usize..(start + n) as usize]));
         }
-        return Ok(new_list(slice_items(items, start, step, n)));
+        return Ok(new_list_strided(items, start, step, n));
     }
     if ab::has_index(k) {
         let mut i = ab::index_as_ssize(k, Some(exceptions::IndexError()))?;

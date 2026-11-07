@@ -210,7 +210,26 @@ pub fn backedge_threshold() -> i32 {
 /// compiled with": any write, insertion or deletion of that key, or a mutation that
 /// may touch any key (clear, merge), invalidates the dependent code. Writes of other
 /// keys do not (no invalidation storms from module-level loops assigning globals).
-type DepMap = std::collections::HashMap<usize, Vec<(usize, usize)>>;
+/// (Entries also carry the key's hash, so a write of an unrelated key costs one scan
+/// of hashes and no string comparisons.)
+type DepMap = std::collections::HashMap<usize, Vec<(usize, isize, usize)>, std::hash::BuildHasherDefault<PtrHash>>;
+
+/// Hasher for pointer keys (the default SipHash costs more than the rest of a lookup).
+#[derive(Default)]
+pub struct PtrHash(u64);
+impl std::hash::Hasher for PtrHash {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 << 8 | b as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+    }
+    fn write_usize(&mut self, v: usize) {
+        self.0 = ((v as u64) >> 4).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
 static DEPS: Mutex<Option<DepMap>> = Mutex::new(None);
 
 /// Marker in a dict's `_ma_watcher_tag` (type pointers are aligned, so bit 0 is free).
@@ -231,7 +250,8 @@ fn watch(d: *mut PyObject, key: *mut PyObject, cc: &CodeCaches) {
         (*dp)._ma_watcher_tag = WATCH_TAG;
     }
     let v = g.get_or_insert_with(Default::default).entry(d as usize).or_default();
-    let k = (key as usize, cc as *const _ as usize);
+    let h = key_hash(key).unwrap_or(0);
+    let k = (key as usize, h, cc as *const _ as usize);
     if !v.contains(&k) {
         v.push(k);
     }
@@ -248,6 +268,26 @@ fn same_key(dep: usize, key: *mut PyObject) -> bool {
     }
 }
 
+/// (dict, key hash) pairs whose folding was invalidated once: such a global is
+/// rebound while the program runs (go's `TIMESTAMP`), so folding it again would only
+/// cause more invalidations and recompilations. Builders read them through the
+/// generic path instead. A hash collision merely costs a fold.
+static UNSTABLE: Mutex<Option<std::collections::HashSet<(usize, isize)>>> = Mutex::new(None);
+
+fn key_hash(key: *mut PyObject) -> Option<isize> {
+    unsafe {
+        let k = &*key;
+        if crate::types::str::is_str_exact(k) { Some(crate::types::str::str_hash(k)) } else { None }
+    }
+}
+
+/// Has a fold of `key` in dict `d` been invalidated before?
+pub fn unstable_key(d: usize, key: *mut PyObject) -> bool {
+    let Some(h) = key_hash(key) else { return true };
+    let g = UNSTABLE.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref().is_some_and(|s| s.contains(&(d, h)))
+}
+
 /// A watched dict was written (called from cache::on_dict_write); `key` NULL: any key
 /// may have changed.
 #[cold]
@@ -258,8 +298,22 @@ pub fn dict_written(d: &PyObject, key: *mut PyObject) {
         let Some(m) = g.as_mut() else { return };
         let Some(v) = m.get_mut(&dk) else { return };
         let mut out = Vec::new();
-        v.retain(|&(k, cc)| {
-            if key.is_null() || same_key(k, key) {
+        // only exact-str keys can match a dependency (same_key)
+        let kh = if key.is_null() { None } else { Some(key_hash(key)) };
+        if let Some(h) = kh {
+            match h {
+                Some(h) if v.iter().any(|e| e.1 == h) => {}
+                _ => return,
+            }
+        }
+        if !key.is_null() && v.iter().any(|&(k, _, _)| same_key(k, key)) {
+            if let Some(h) = key_hash(key) {
+                UNSTABLE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert((dk, h));
+            }
+        }
+        let khash = kh.flatten();
+        v.retain(|&(k, h, cc)| {
+            if key.is_null() || (Some(h) == khash && same_key(k, key)) {
                 out.push(cc);
                 false
             } else {
@@ -295,7 +349,7 @@ pub fn forget(cc: &CodeCaches) {
     let mut g = deps();
     if let Some(m) = g.as_mut() {
         m.retain(|_, v| {
-            v.retain(|e| e.1 != k);
+            v.retain(|e| e.2 != k);
             !v.is_empty()
         });
     }
@@ -392,6 +446,11 @@ fn compile_locked(code: &PyObject, cd: &CodeData, globals: *mut PyObject, builti
         if let Some(e) = p.entry(entry_pc) {
             return Some(e);
         }
+        if entry_pc == 0 {
+            // the standard unit exists (a generator whose eager prologue keeps pc 0
+            // out of the unit's entries): nothing to recompile
+            return None;
+        }
     }
     cc.t2_tries.fetch_add(1, Relaxed);
     let dbg = DEBUG.load(Relaxed) != 0;
@@ -433,6 +492,7 @@ fn compile_locked(code: &PyObject, cd: &CodeData, globals: *mut PyObject, builti
         invalid_flag: &*invalid as *const AtomicU8 as usize,
         flags,
         fold_globals: cc.t2_invalidations.load(Relaxed) < 3,
+        cautious: cc.t2_invalidations.load(Relaxed) > 0,
     };
     let mut built = match build::build(&unit) {
         Ok(b) => b,

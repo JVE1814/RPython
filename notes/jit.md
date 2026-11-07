@@ -572,6 +572,211 @@ This is the first thing to fix next.
   off: 2/2 runs of the `core` build crashed); with jit4's tier 1 it crashes reliably
   (decref of a bad pointer in a multi-threaded event loop). Not JIT-specific; reported.
 
+## jit5 workstream (genexprs after D24, generator resumption, globals, call/slice paths)
+
+Branch `worktree-agent-ade977b5895cdf2cd` (based on master + `core`, i.e. jit4; master
+with core4 merged later).
+
+### Fixes
+* **Generator expressions compile again** (`analysis.rs`): exception-table ranges in which
+  no instruction can raise (`may_raise`: LoadConst/LoadFast/StoreFast/PopTop/... and
+  forward jumps) no longer seed their handler. After D24 the code after a genexpr's
+  loop is covered by the StopIteration wrapper with a different converted depth (the
+  public stack is shallower than the handler depth there), which made the handler's
+  entry depth ambiguous ("stack depth mismatch") and sent every genexpr to the
+  interpreter.
+* Generator units with an eager prologue (genexprs) were recompiled on every
+  creation-count expiry (`compile_locked` found no entry at pc 0): an existing standard
+  unit is now final.
+* test_opcache `test_store_attr_with_hint` with the JIT: when a cached store moves an
+  object's attributes from inline values into a dict, the adaptive view records the
+  dict form (compiled hits record nothing, so the last recorded form was the stale
+  inline-values one). test_opcache now gives the same result with and without the JIT.
+* `frame_finished`: a frame object referenced only by the activation itself dies with
+  it. Handing the frame over materialised the caller's frame object as `f_back`, which
+  then repeated for every caller up the stack (one frame object + a non-recycled frame
+  per finished call once any frame object existed; comprehensions 0.39 -> 0.27).
+* Correctness (open item of jit4): tier-2 generic attribute paths (`h2_load_attr`,
+  `h2_store_attr`, which can run `__getattr__`/descriptors) compare `cache::TYPE_EPOCH`
+  (bumped by `type_modified` and `__class__` assignment) before/after the call and
+  deoptimise after the instruction when it changed; inside inlined callees (no
+  resumable snapshot) they drop type facts instead.
+* Coordinator request (core4): tier-1 generic calls (C callees: Call's generic path,
+  CallKw, CallFunctionEx) test the eval-breaker word right after the call (load+test,
+  stub out of line), so signals/pending calls/safepoints are observed after C calls.
+
+### Generators
+* `new_genexpr` (interp/mod.rs): creating a genexpr whose prologue is exactly
+  `[CopyFreeVars] LoadFast .0; GetIter; ReturnGenerator` (cached per code object in
+  `CodeCaches::genexpr`) does `iter()` of an exact builtin container directly and builds
+  the frame in its post-prologue state, instead of running the prologue in the
+  interpreter.
+* `genobject::jit_send`: the lean resumption used by compiled ForIter (`h_for_iter`) and
+  Send (`h_send`) for exact generators/coroutines: claim, push the sent value, link
+  exc_info/frame, enter the continuation through the cached trampoline address, unlink;
+  the thread state comes from compiled code (r13). Return/error/deopt go to a cold
+  `jit_send_end`. ~80 Rust instructions per level of a `yield from` chain (was ~120).
+* `gen_close` without throwing: a generator suspended at a plain `yield` whose only
+  enclosing handler is the implicit StopIteration wrapper (public RESUME after the yield
+  has the depth-1 flag, no yield-from, no frame object, not tracing) is finished
+  directly. Abandoned `any()/all()` genexprs used to run the generator frame in the
+  interpreter with a GeneratorExit and a traceback on every call.
+* `abstract_::call_unbound` (slot dunders: `__iter__`, `__eq__`, ...) uses a stack
+  argument array and calls plain functions through `call_function` (no Vec malloc;
+  generators' `GetIter` on a user class: 720 -> ~450 instructions).
+
+### Globals
+* LoadGlobal caches record *where* the name lives: `kind::GLOBAL` entries hold the
+  globals dict's new `DictTable::keys_version` (renewed only when keys are added/removed
+  or the table is rebuilt), the builtins' keys_version for builtins, and the entry index;
+  the value is read from the entry (tier 1 inline, single-threaded; Rust path under the
+  dict lock; lazy-import objects excluded). Rebinding a global (go's `TIMESTAMP += 1`) no
+  longer invalidates every LoadGlobal of the module.
+* Folded globals: a (dict, key) whose fold was invalidated once is not folded again
+  (`opt::UNSTABLE`, keyed by key hash; was per code object after 3 invalidations).
+* Watched-dict writes (`dict_written`) compare key hashes before strings and use a
+  pointer hasher (the SipHash map lookup + string compares on every global write were
+  ~8% of go).
+
+### Calls, builtins, slices
+* Tier-1 direct calls (`h_call_py`) fill trailing parameters from `__defaults__`
+  (go's `find(self, update=False)` went through the generic binder).
+* Tier 2: `iter(range(...))` (Call of the folded builtin range directly followed by
+  GetIter) is one helper call creating the range iterator (`range::iter_i64`), no
+  argument tuple / range object / int fields; `dict.get` and `list.append` found by
+  LoadMethod are called directly (`try_method_builtin`; type facts dropped after a
+  dict.get unless the key is an exact str/int).
+* Tier-2 LoadMethod on objects with a real instance dict (objects that outgrew their
+  inline values) checks the dict (`h2_dict_lacks`) instead of deoptimising (go: ~1300
+  deopts and 4 discards per hot method per run -> 0).
+* After a unit's code was discarded once, monomorphic attribute loads get a generic
+  slow path instead of a deoptimising guard (`Unit::cautious`).
+* Tier-1 LoadDeref inline.
+* Slices (helpers): `x[a:b]` of exact lists/tuples with None/int bounds without a slice
+  object; `lst[a:b] = other_list` of equal length replaced in place (both list locks in
+  address order); extended list slices without an intermediate vector
+  (`list::new_list_strided`). fannkuch 5725 -> 3789.
+* Generator claim in `jit_send` is a plain store while the process is single-threaded
+  (`_thread` and `PyThread_start_new_thread` now set `MULTI_THREADED` before the second
+  thread starts; foreign threads attaching via PyGILState_Ensure still set it from the
+  new thread). generators wall 0.0317 -> 0.0283 s (CPython 0.0205).
+* `new_function` remembers its two globals lookups (`__builtins__`, `__name__`) per
+  thread while the globals dict's version is unchanged (genexpr/closure creation).
+
+### Measurements
+Steady-state instructions per loop (callgrind, `tools/bench/perloop.sh`, same windows as
+jit3/jit4: -a 2 -b 5; deltablue/hexiom 5/15; fannkuch 1/3; unpack_sequence 2000/6000;
+comprehensions 1000/3000); binary at da4b72a (before the last two commits). CPython
+columns from the jit3 table (same harness). ratio = ours / best CPython.
+
+| bench | CPython default | CPython ft | jit4 | jit5 | ratio |
+|---|---|---|---|---|---|
+| richards | 461.1 | 565.8 | 314.3 | 282.8-322.6 | 0.61-0.70 |
+| nbody | 1107.5 | 1401.5 | 359.8 | 359.8 | 0.32 |
+| spectral_norm | 1207.8 | 1403.9 | 636.0 | 643.5 | 0.53 |
+| float | 778.4 | 870.1 | 702.2 | 702.9 | 0.90 |
+| richards_super | 530.4 | 639.0 | 484.4 | 454.0 | 0.86 |
+| chaos | 610.7 | 682.6 | 486.3 | 408.0 | 0.67 |
+| raytrace | 2757.1 | 3200.8 | 2776.3 | 2704.8 | 0.98 |
+| go | 1138.4 | 1259.6 | 1511-2167 | 1173-1244 | 1.03-1.09 |
+| generators | 337.1 | 372.4 | 477.9 | 351.8 | 1.04 |
+| coroutines | 294.4 | 299.9 | 289.7 | 281.6 | 0.96 |
+| nqueens | 841.8 | 942.5 | 1860.1 | 1043.7 | 1.24 |
+| deltablue | 29.1 | 42.4 | 36.9 | 23.1-34.4 | 0.79-1.18 |
+| hexiom | 58.1 | 65.7 | 82.7 | 53.8 | 0.93 |
+| fannkuch | 4392.7 | 4962.9 | 5779.9 | 3849.2 | 0.88 |
+| unpack_sequence | 0.25 | 0.15 | 0.11 | 0.11 | 0.73 |
+| comprehensions | 0.19 | 0.24 | 0.39 | 0.18-0.24 | 0.95-1.26 |
+
+Wall-clock: see the full-suite table in the jit5 report (tools/bench/run_bench.sh, each
+benchmark run back to back on ours / py-default / py-ft, pinned to one core). Wall time
+is far more sensitive to machine load than for CPython (a first full run with callgrind
+jobs on the other three cores gave go 0.142 s vs 0.093 s on a quiet machine). cachegrind
+(cache + branch simulation) on generators shows our D1 misses equal to CPython's and
+fewer mispredictions, yet wall time is 1.4x: the remaining gap is outside what valgrind
+models; locked instructions are one measured cause (the generator claim CAS alone was
+11% of generators' wall time; making `dict::ob_lock` non-atomic while single-threaded
+gave no measurable change, so it was not kept).
+
+Note on variance: some small benchmarks are bimodal between runs of the same binary
+(deltablue 23.5 or 34.4, richards 283 or 323): whether tier-2 discards/recompiles (e.g.
+deltablue's BinaryConstraint.input/output turn polymorphic after compilation: 2 x 65
+deopts) land in the measured window. Address-dependent hashing makes runs differ.
+
+### Full pyperformance wall-clock
+s/loop through tools/bench/run_bench.sh (shim), per benchmark ours / py-default / py-ft back
+to back, pinned to core 3 while other agents ran (binary = HEAD before the notes commits).
+ratio = ours / best CPython.
+
+| bench | ours | CPython default | CPython ft | ratio |
+|---|---|---|---|---|
+| async_generators | 0.457505145 | 0.224688465 | 0.274162526 | 2.04 |
+| asyncio_tcp | 1.52145308 | 0.600573721 | 0.619876104 | 2.53 |
+| barnes_hut | 0.700137195 | 0.574060754 | 0.653913638 | 1.22 |
+| base64 | 0.000567617332 | 0.0001905294 | 0.00020427235 | 2.98 |
+| bpe_tokeniser | 5.72067989 | 3.45788908 | 3.6496892 | 1.65 |
+| chaos | 0.0327104693 | 0.042845628 | 0.041902579 | 0.78 |
+| comprehensions | 1.72345304e-05 | 1.03925883e-05 | 1.15458282e-05 | 1.66 |
+| concurrent_imap | 0.034641641 | 0.025293479 | 0.027709688 | 1.37 |
+| coroutines | 0.0144920177 | 0.0145903696 | 0.014416989 | 1.01 |
+| decimal_pi | 0.24923996 | 7.14690494 | 8.29454095 | 0.03 |
+| deepcopy | 0.000321172441 | 0.000172302746 | 0.000232124766 | 1.86 |
+| deltablue | 0.00215188134 | 0.00249506041 | 0.00299351572 | 0.86 |
+| fannkuch | 0.332139107 | 0.283428993 | 0.375611438 | 1.17 |
+| float | 0.055055673 | 0.054506524 | 0.0906135315 | 1.01 |
+| gc_collect | 0.00140994771 | 0.00146398711 | 0.000947451547 | 1.49 |
+| gc_traversal | 0.00400660534 | 0.0032852057 | 0.00144473473 | 2.77 |
+| generators | 0.0479151805 | 0.0256009575 | 0.0234016787 | 2.05 |
+| go | 0.133279112 | 0.119595861 | 0.10294956 | 1.29 |
+| hexiom | 0.00575559962 | 0.00564053406 | 0.00644583997 | 1.02 |
+| json_dumps | 0.0188708442 | 0.00666291556 | 0.00824503056 | 2.83 |
+| json_loads | 2.90045119e-05 | 1.56931326e-05 | 2.65685469e-05 | 1.85 |
+| logging | 8.83630806e-06 | 6.33489927e-06 | 7.38362295e-06 | 1.39 |
+| mdp | 2.6153304 | 1.30503048 | 1.27559296 | 2.05 |
+| meteor_contest | 0.138361196 | 0.075765204 | 0.111422589 | 1.83 |
+| nbody | 0.025964333 | 0.0566142125 | 0.078340804 | 0.46 |
+| nqueens | 0.0789750995 | 0.056306227 | 0.0674788505 | 1.40 |
+| pathlib | 0.0215245835 | 0.00915194306 | 0.0106886408 | 2.35 |
+| pidigits | 0.08202222 | 0.170724226 | 0.153116564 | 0.54 |
+| pprint | 0.845196576 | 0.50923507 | 0.565307222 | 1.66 |
+| pyflate | 0.345273216 | 0.345372661 | 0.342094677 | 1.01 |
+| python_startup | 0.0139556831 | 0.009527825 | 0.01171518 | 1.46 |
+| raytrace | 0.195031015 | 0.19717512 | 0.209668282 | 0.99 |
+| regex_compile | 0.0146760095 | 0.0852426025 | 0.0939445075 | 0.17 |
+| regex_dna | 0.076409558 | 0.133652651 | 0.150021738 | 0.57 |
+| regex_effbot | 0.000885122187 | 0.00174519569 | 0.00205625416 | 0.51 |
+| regex_v8 | 0.013412733 | 0.0151606511 | 0.0161099688 | 0.88 |
+| richards | 0.0233166452 | 0.0306851428 | 0.037783592 | 0.76 |
+| richards_super | 0.0325946052 | 0.0354058008 | 0.0412224028 | 0.92 |
+| scimark | 0.180567149 | 0.17007228 | 0.195721506 | 1.06 |
+| spectral_norm | 0.0312990335 | 0.0592222075 | 0.066842873 | 0.53 |
+| sqlite_synth | 1.76122113e-06 | 1.44254576e-06 | 1.28736649e-06 | 1.37 |
+| telco | 0.0064321265 | 0.105442027 | 0.11169753 | 0.06 |
+| typing_runtime_protocols | 0.000255719045 | 0.000109048778 | 0.000132340415 | 2.34 |
+| unpack_sequence | 4.04747708e-08 | 2.7200829e-08 | 3.53087814e-08 | 1.49 |
+| xml_etree | 0.175923655 | 0.10275806 | 0.104314669 | 1.71 |
+
+
+Not run (harness: need a CLI argument or third-party packages; they fail for the baselines
+too): 2to3, argparse, async_tree, asyncio_websockets, chameleon, coverage, crypto_pyaes,
+dask, django_template, docutils, dulwich_log, fastapi, genshi, hg_startup, html5lib, mako,
+networkx, pickle, sphinx, sqlalchemy_*, sqlglot_v2, sympy, tomli_loads, tornado_http, xdsl,
+yaml.
+
+### Open items
+* Genexpr fusion into the consuming loop (sum/any/tuple/set of a genexpr in tier 2):
+  nqueens still pays a generator object, a frame and a resumption per item
+  (~1040 vs 842 M/loop).
+* Machine-code Send/ForIter-over-generator (avoid the Rust helper and the trampoline
+  push/pop): generators ~1.1-1.2x CPython remain, per level ~80 Rust + ~70 machine
+  instructions.
+* Call path: `h_call_py` + `run_call_frame` + `recycle_call` ~300 instructions per
+  non-inlined Python call (frame from the pool, trampoline entry); a contiguous frame
+  stack set up in machine code would halve it (go, deltablue, raytrace).
+* Allocation: `alloc_object` ~95 instructions, dealloc chain similar; perf2's allocator
+  could drop the per-call kind/class computation (`c % NCLASSES` for the zeroing size)
+  and keep slow paths out of line.
+
 ## Missing / next steps (previous jit workstream)
 * Tier 2 (optimising JIT): SSA from bytecode plus profiles, type speculation with guards
   and deopt by materialising the frame (the frame layout is already shared), unboxed

@@ -86,6 +86,17 @@ pub fn is_terminator(op: Op) -> bool {
     matches!(op, Op::Jump | Op::ReturnValue | Op::RaiseVarargs | Op::Reraise)
 }
 
+/// Can executing this instruction raise (or run code that raises into this frame)?
+/// Conservative: only a few plain data moves are known not to.
+pub fn may_raise(ins: Instr) -> bool {
+    use Op::*;
+    match ins.op {
+        Nop | LoadConst | LoadFast | StoreFast | PopTop | PushNull | Copy | Swap | ReturnValue => false,
+        Jump => ins.arg <= ins.start, // a backedge polls the eval breaker
+        _ => true,
+    }
+}
+
 pub struct Analysis {
     pub instrs: Vec<Instr>,
     /// code index (start or pc) -> instruction number
@@ -111,6 +122,14 @@ pub fn analyze(code: &[u32], handlers: &[bc::ExceptionEntry]) -> Result<Analysis
     let mut is_target = vec![false; n];
     let mut work: Vec<(usize, i32)> = vec![(0, 0)];
     for h in handlers {
+        // A range in which nothing can raise never enters its handler. Such ranges
+        // exist where the public stack is shallower than the handler depth (the code
+        // after a genexpr's loop): their converted depth differs from the other
+        // ranges of the same handler and would make its entry depth ambiguous.
+        let (s, e) = ((h.start as usize).min(code.len()), (h.end as usize).min(code.len()));
+        if (index_of[s] as usize..index_of[e] as usize).all(|k| k >= n || !may_raise(instrs[k])) {
+            continue;
+        }
         let t = index_of[h.target as usize] as usize;
         if t < n {
             is_target[t] = true;

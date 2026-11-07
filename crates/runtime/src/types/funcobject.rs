@@ -87,6 +87,11 @@ pub fn func(o: &PyObject) -> &mut PyFunctionObject {
 static FUNC_VERSION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
 /// Create a function from a code object.
+/// (jit5) Per-thread memo of new_function's globals lookups: (globals, its version,
+/// builtins dict, module name), borrowed from the unchanged globals dict.
+#[thread_local]
+static mut NEWFUNC_CACHE: (usize, u64, *mut PyObject, *mut PyObject) = (0, 0, std::ptr::null_mut(), std::ptr::null_mut());
+
 pub fn new_function(code: &PyObject, globals: &PyObject, qualname: Option<&PyObject>) -> PyResult {
     unsafe {
         let op = crate::alloc::alloc_object(function_type(), std::mem::size_of::<PyFunctionObject>());
@@ -99,6 +104,29 @@ pub fn new_function(code: &PyObject, globals: &PyObject, qualname: Option<&PyObj
             Some(q) => q.to_ref().into_raw(),
             None => crate::types::code::code_qualname(code).into_raw(),
         };
+        // (jit5) functions made repeatedly in one module (closures, genexprs): the two
+        // globals lookups below are remembered per thread for an unchanged globals
+        // dict (same dict version stamp => same lookup results)
+        if dict::is_dict_exact(globals) {
+            let ver = dict::table(globals).version;
+            let c = &mut *(&raw mut NEWFUNC_CACHE);
+            if c.0 == globals.as_ptr() as usize && c.1 == ver && ver != 0 {
+                incref(c.2);
+                f.func_builtins = c.2;
+                f.func_module = c.3;
+                if !c.3.is_null() {
+                    incref(c.3);
+                }
+                f.func_doc = match crate::types::code::code_docstring(code) {
+                    Some(d) => d.into_raw(),
+                    None => none::none_ref().into_raw(),
+                };
+                f.vectorcall = Some(crate::interp::function_vectorcall);
+                f.func_version = FUNC_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::gc::track(op);
+                return Ok(PyRef::from_raw(op));
+            }
+        }
         // __builtins__ from globals, else the builtins module dict
         let b = match dict::get_item_str(globals, name!("__builtins__")) {
             Some(b) => {
@@ -115,10 +143,14 @@ pub fn new_function(code: &PyObject, globals: &PyObject, qualname: Option<&PyObj
             Some(d) => d.into_raw(),
             None => none::none_ref().into_raw(),
         };
+        let ver0 = if dict::is_dict_exact(globals) { dict::table(globals).version } else { 0 };
         f.func_module = match dict::get_item_str(globals, name!("__name__")) {
             Some(m) => m.into_raw(),
             None => std::ptr::null_mut(),
         };
+        if ver0 != 0 && dict::table(globals).version == ver0 {
+            *(&raw mut NEWFUNC_CACHE) = (globals.as_ptr() as usize, ver0, f.func_builtins, f.func_module);
+        }
         f.vectorcall = Some(crate::interp::function_vectorcall);
         f.func_version = FUNC_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         crate::gc::track(op);

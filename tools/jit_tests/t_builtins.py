@@ -35,3 +35,46 @@ def len(x):
 print(total(objs, 1))
 del len
 print(total(objs, 1))
+
+# jit5: dict.get / list.append called directly from tier 2
+class Key:
+    def __init__(self, v):
+        self.v = v
+    def __hash__(self):
+        return hash(self.v)
+    def __eq__(self, o):
+        return isinstance(o, Key) and o.v == self.v
+
+class D(dict):
+    pass
+
+class GetOverride(dict):
+    def get(self, k, d=None):
+        return ('override', k)
+
+def methods(n):
+    d = {i: i * i for i in range(10)}
+    d[Key(3)] = 'k3'
+    sub = D(d)
+    ov = GetOverride(d)
+    out = []
+    acc = []
+    for i in range(n):
+        out.append(d.get(i % 12))
+        out.append(d.get(i % 12, -1))
+        out.append(sub.get(i % 11, 'x'))
+        out.append(d.get(Key(i % 5)))
+        acc.append(i)
+        if i == n - 3:
+            out.append(ov.get(i))
+    try:
+        d.get([1])
+    except TypeError as e:
+        out.append(str(e))
+    try:
+        d.get()
+    except TypeError as e:
+        out.append(str(e))
+    return out[-9:], len(acc)
+
+print(methods(300))

@@ -72,8 +72,8 @@ fn init_config() -> bool {
             THRESHOLD.store(n, Relaxed);
         }
     }
-    if std::env::var("RPYTHON_JIT_DEBUG").map(|v| v != "0").unwrap_or(false) {
-        DEBUG.store(1, Relaxed);
+    if let Ok(v) = std::env::var("RPYTHON_JIT_DEBUG") {
+        DEBUG.store(v.parse::<u32>().unwrap_or(1), Relaxed);
     }
     ENABLED.store(en as u32, Relaxed);
     en
@@ -391,8 +391,20 @@ pub unsafe extern "C" fn h_call_py(base: *mut *mut PyObject, n: u64) -> u64 {
         let target = cc.fast_entry.load(Acquire);
         let ts = crate::threads::current();
         let depth = ts.recursion_depth.get() + 1;
+        let argc = cc.fast_argc.load(Relaxed) as usize;
+        // (jit5) trailing parameters with defaults: filled from __defaults__ below
+        let ndef = if argc == nargs {
+            0
+        } else {
+            let dt = (*f).func_defaults;
+            if nargs > argc || dt.is_null() || crate::types::tuple::tuple_len(&*dt) < argc - nargs {
+                usize::MAX
+            } else {
+                argc - nargs
+            }
+        };
         if target == 0
-            || cc.fast_argc.load(Relaxed) as usize != nargs
+            || ndef == usize::MAX
             || crate::modules::sys::tracing_active()
             || depth > ts.c.py_recursion_limit
             || crate::interp::stack_pointer() < ts.stack_soft_limit()
@@ -409,6 +421,16 @@ pub unsafe extern "C" fn h_call_py(base: *mut *mut PyObject, n: u64) -> u64 {
         for i in 0..nargs {
             *s.add(i) = *argp.add(i);
             *argp.add(i) = std::ptr::null_mut();
+        }
+        if ndef != 0 {
+            let dt = &*(*f).func_defaults;
+            let items = crate::types::tuple::tuple_items(dt);
+            let first = items.len() - ndef;
+            for k in 0..ndef {
+                let v = items[first + k].as_ptr();
+                incref(v);
+                *s.add(nargs + k) = v;
+            }
         }
         let mut target = target;
         if bump_invocations(cd) {
@@ -521,7 +543,9 @@ pub fn trampoline() -> usize {
         a.mov_rr(R13, Rdx);
         a.load_fs0(R15);
         a.jmp_r(Rcx);
-        mem::install(&a.buf, |_, _| {}).expect("jit: cannot install the entry trampoline")
+        let t = mem::install(&a.buf, |_, _| {}).expect("jit: cannot install the entry trampoline");
+        TRAMP_ADDR.store(t, Relaxed);
+        t
     })
 }
 
@@ -556,6 +580,17 @@ pub fn enter(ts: &ThreadState, f: &mut Frame, target: usize, out: &mut *mut PyOb
     let entry: EntryFn = unsafe { std::mem::transmute(trampoline()) };
     unsafe { entry(f, f.slots.as_mut_ptr(), ts, target, out) }
 }
+
+/// `enter` for callers running inside compiled code (jit5: generator resumption from
+/// Send/ForIter): the thread's allocator is registered and the trampoline exists.
+#[inline(always)]
+pub fn enter_registered(ts: &ThreadState, f: &mut Frame, target: usize, out: &mut *mut PyObject) -> u32 {
+    let t = TRAMP_ADDR.load(Relaxed);
+    let t = if t != 0 { t } else { trampoline() };
+    let entry: EntryFn = unsafe { std::mem::transmute(t) };
+    unsafe { entry(f, f.slots.as_mut_ptr(), ts, target, out) }
+}
+static TRAMP_ADDR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Compiled code entered by `enter` ended with a deopt or an error (status `st`): the
 /// interpreter finishes this activation (or runs it to the next yield).
@@ -650,6 +685,14 @@ fn compile(f: &Frame, cd: &CodeData) -> bool {
         Err(e) => {
             if dbg {
                 eprintln!("[jit] tier1 failed for {}: {}", crate::types::str::to_string_lossy(&cd.co_qualname), e);
+                if DEBUG.load(Relaxed) >= 4 {
+                    for ins in analysis::decode(&cd.code) {
+                        eprintln!("    {:4} {:?} {}", ins.pc, ins.op, ins.arg);
+                    }
+                    for h in cd.exception_table.iter() {
+                        eprintln!("    handler {}..{} -> {} depth {} lasti {}", h.start, h.end, h.target, h.depth, h.lasti);
+                    }
+                }
             }
             cd.caches.tier_state.store(tier::FAILED, Release);
             false
