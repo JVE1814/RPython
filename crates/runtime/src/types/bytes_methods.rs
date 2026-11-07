@@ -365,7 +365,7 @@ pub fn slice_index(o: Option<&PyObject>, default: isize) -> PyResult<isize> {
         Some(x) if none::is_none(x) => Ok(default),
         Some(x) => {
             if !ab::has_index(x) {
-                raise!(TypeError, "slice indices must be integers or None or have an __index__ method");
+                raise!(TypeError, "slice indices must be integers or have an __index__ method");
             }
             ab::index_as_ssize(x, None)
         }

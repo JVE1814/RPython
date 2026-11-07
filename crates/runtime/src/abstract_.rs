@@ -185,13 +185,13 @@ pub fn call_tp_call(callable: &PyObject, args: &PyObject, kw: Option<&PyObject>)
                     if let Some(f) = crate::types::dict::get_item(&d, &n).ok().flatten() {
                         if is_callable(&f) {
                             let n = crate::types::str::to_string_lossy(&n);
-                            raise!(TypeError, "'{}' object is not callable. Did you mean: '{}.{}(...)'?", tname(callable), n, n);
+                            raise!(TypeError, "'{}' object is not callable. Did you mean: '{}.{}(...)'?", tp_name_of(callable), n, n);
                         }
                     }
                 }
                 crate::errors::clear_exc();
             }
-            raise!(TypeError, "'{}' object is not callable", tname(callable))
+            raise!(TypeError, "'{}' object is not callable", tp_name_of(callable))
         }
     };
     let ts = crate::threads::current();
@@ -425,7 +425,7 @@ pub fn hash(o: &PyObject) -> PyResult<isize> {
             let h = unsafe { f(o.as_ptr()) };
             if h == -1 && err_occurred() { Err(PyErr) } else { Ok(h) }
         }
-        None => raise!(TypeError, "unhashable type: '{}'", tname(o)),
+        None => raise!(TypeError, "unhashable type: '{}'", tp_name_of(o)),
     }
 }
 
@@ -675,7 +675,7 @@ fn binary_op1(a: &PyObject, b: &PyObject, s: NbSlot) -> PyResult {
 }
 
 fn binop_type_error(a: &PyObject, b: &PyObject, s: &str) -> PyErr {
-    err!(TypeError, "unsupported operand type(s) for {}: '{}' and '{}'", s, tname(a), tname(b))
+    err!(TypeError, "unsupported operand type(s) for {}: '{}' and '{}'", s, tp_name_of(a), tp_name_of(b))
 }
 
 pub fn binary_op(a: &PyObject, b: &PyObject, s: NbSlot) -> PyResult {
@@ -706,8 +706,8 @@ pub fn binary_op(a: &PyObject, b: &PyObject, s: NbSlot) -> PyResult {
         raise!(
             TypeError,
             "unsupported operand type(s) for >>: '{}' and '{}'. Did you mean \"print(<message>, file=<output_stream>)\"?",
-            tname(a),
-            tname(b)
+            tp_name_of(a),
+            tp_name_of(b)
         );
     }
     Err(binop_type_error(a, b, s.symbol()))
@@ -733,7 +733,7 @@ fn sequence_repeat_fallback(a: &PyObject, b: &PyObject) -> PyResult<Option<PyRef
 
 fn sequence_repeat(f: unsafe extern "C" fn(*mut PyObject, Py_ssize_t) -> *mut PyObject, seq: &PyObject, n: &PyObject) -> PyResult {
     if !has_index(n) {
-        raise!(TypeError, "can't multiply sequence by non-int of type '{}'", tname(n));
+        raise!(TypeError, "can't multiply sequence by non-int of type '{}'", tp_name_of(n));
     }
     let count = index_as_ssize(n, Some(crate::types::exceptions::OverflowError()))?;
     unsafe { from_c(f(seq.as_ptr(), count)) }
@@ -825,14 +825,14 @@ pub fn power(a: &PyObject, b: &PyObject, m: &PyObject) -> PyResult {
         }
     }
     if m.is(none::none()) {
-        raise!(TypeError, "unsupported operand type(s) for ** or pow(): '{}' and '{}'", tname(a), tname(b));
+        raise!(TypeError, "unsupported operand type(s) for ** or pow(): '{}' and '{}'", tp_name_of(a), tp_name_of(b));
     }
     raise!(
         TypeError,
         "unsupported operand type(s) for ** or pow(): '{}', '{}', '{}'",
-        tname(a),
-        tname(b),
-        tname(m)
+        tp_name_of(a),
+        tp_name_of(b),
+        tp_name_of(m)
     );
 }
 
@@ -854,7 +854,7 @@ fn inplace_power(a: &PyObject, b: &PyObject) -> PyResult {
             if exc_matches(crate::types::exceptions::TypeError()) {
                 let msg = crate::types::exceptions::exc_args(&crate::errors::take_exc().unwrap());
                 let _ = msg;
-                raise!(TypeError, "unsupported operand type(s) for **=: '{}' and '{}'", tname(a), tname(b));
+                raise!(TypeError, "unsupported operand type(s) for **=: '{}' and '{}'", tp_name_of(a), tp_name_of(b));
             }
             Err(e)
         }
@@ -872,7 +872,7 @@ macro_rules! unary {
                     }
                 }
             }
-            raise!(TypeError, "bad operand type for {}: '{}'", $sym, tname(a));
+            raise!(TypeError, "bad operand type for {}: '{}'", $sym, tp_name_of(a));
         }
     };
 }
@@ -889,7 +889,7 @@ pub fn absolute(a: &PyObject) -> PyResult {
             }
         }
     }
-    raise!(TypeError, "bad operand type for abs(): '{}'", tname(a));
+    raise!(TypeError, "bad operand type for abs(): '{}'", tp_name_of(a));
 }
 
 pub fn has_index(o: &PyObject) -> bool {
@@ -928,7 +928,7 @@ pub fn index(o: &PyObject) -> PyResult {
             }
         }
     }
-    raise!(TypeError, "'{}' object cannot be interpreted as an integer", tname(o));
+    raise!(TypeError, "'{}' object cannot be interpreted as an integer", tp_name_of(o));
 }
 
 /// Convert via __index__ to isize. If `overflow_exc` is None, clamp on overflow.
@@ -1019,7 +1019,7 @@ pub fn length(o: &PyObject) -> PyResult<usize> {
             }
         }
     }
-    raise!(TypeError, "object of type '{}' has no len()", tname(o));
+    raise!(TypeError, "object of type '{}' has no len()", tp_name_of(o));
 }
 
 pub fn object_len_or_zero(o: &PyObject) -> usize {
@@ -1087,7 +1087,7 @@ pub fn getitem(o: &PyObject, key: &PyObject) -> PyResult {
         }
         raise!(TypeError, "type '{}' is not subscriptable", type_name(unsafe { &*as_type(o) }));
     }
-    raise!(TypeError, "'{}' object is not subscriptable", tname(o));
+    raise!(TypeError, "'{}' object is not subscriptable", tp_name_of(o));
 }
 
 pub fn setitem(o: &PyObject, key: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
@@ -1119,9 +1119,9 @@ pub fn setitem(o: &PyObject, key: &PyObject, v: Option<&PyObject>) -> PyResult<(
         }
     }
     if v.is_some() {
-        raise!(TypeError, "'{}' object does not support item assignment", tname(o));
+        raise!(TypeError, "'{}' object does not support item assignment", tp_name_of(o));
     }
-    raise!(TypeError, "'{}' object does not support item deletion", tname(o));
+    raise!(TypeError, "'{}' object does not support item deletion", tp_name_of(o));
 }
 
 pub fn contains(container: &PyObject, item: &PyObject) -> PyResult<bool> {
@@ -1172,7 +1172,7 @@ pub fn get_iter(o: &PyObject) -> PyResult {
             return Ok(crate::types::iterobject::new_seq_iter(o.to_ref()));
         }
     }
-    raise!(TypeError, "'{}' object is not iterable", tname(o));
+    raise!(TypeError, "'{}' object is not iterable", tp_name_of(o));
 }
 
 /// next(it): Ok(None) when exhausted (StopIteration cleared).

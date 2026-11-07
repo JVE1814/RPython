@@ -100,6 +100,16 @@ class _Rule:
             day -= 7
         return first + day - 1
 
+    def transitions(self, year):
+        """(start, end) of DST in *year* as epoch seconds of the local wall
+        clock just before each change: standard time for the start, daylight
+        time for the end (third-party code such as pandas reads this)."""
+        spec, at = self.start
+        start = self._date_days(spec, year) * _SECONDS_PER_DAY + at
+        spec, at = self.end
+        end = self._date_days(spec, year) * _SECONDS_PER_DAY + at
+        return start, end
+
     def _events(self, year):
         """(UTC seconds, enters DST?, offset before, offset after) for the
         transitions of the years around *year*, in order."""

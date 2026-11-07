@@ -257,6 +257,10 @@ class TimeRE(dict):
         body = '|'.join(_re.escape(v) for v in values)
         return '(?P<%s>%s)' % (directive, body)
 
+    # Subclasses that are themselves named TimeRE (pandas' strptime) reach
+    # this helper through the private, name-mangled spelling.
+    __seqToRE = _seq_to_re
+
     def _directives(self, format):
         """Split format into ('lit', text) and ('dir', key) items."""
         items = []

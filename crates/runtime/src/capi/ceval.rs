@@ -516,7 +516,7 @@ pub unsafe extern "C" fn _PyEval_SliceIndex(v: *mut PyObject, pi: *mut Py_ssize_
 pub unsafe extern "C" fn _PyEval_SliceIndexNotNone(v: *mut PyObject, pi: *mut Py_ssize_t) -> c_int {
     unsafe {
         if !ab::has_index(&*v) {
-            let _ = type_error("slice indices must be integers or None or have an __index__ method");
+            let _ = type_error("slice indices must be integers or have an __index__ method");
             return 0;
         }
         let i = match ab::index(&*v) {

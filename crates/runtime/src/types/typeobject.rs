@@ -77,11 +77,12 @@ pub fn type_qualname(tp: &PyTypeObject) -> String {
 }
 
 /// The type's tp_name as error messages show it: the full dotted name of a
-/// static type ('types.SimpleNamespace'), the name of a heap type.
+/// static type ('types.SimpleNamespace'), the name of a class statement's type,
+/// the full spec name of a PyType_FromSpec type ('pandas._libs.interval.Interval').
 pub fn tp_name_of(o: &PyObject) -> String {
     unsafe {
         let tp = o.type_ptr();
-        if is_heap_type(tp) || (*tp).tp_name.is_null() {
+        if (*tp).tp_name.is_null() {
             return type_name(&*tp);
         }
         CStr::from_ptr((*tp).tp_name).to_string_lossy().into_owned()
