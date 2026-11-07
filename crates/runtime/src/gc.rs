@@ -565,6 +565,14 @@ unsafe fn traverse_inline(op: *mut PyObject, visit: visitproc, arg: *mut c_void,
 /// current, while local slots always hold owned references or NULL.
 unsafe fn mark_from_frames(stack: &mut Vec<*mut PyObject>) {
     unsafe {
+        // the current interpreter's sys.modules and sys (raw pointers: reference
+        // counts must not change while owner words hold collection state)
+        let it = crate::subinterp::current();
+        for p in [it.modules.load(Acquire), it.sys.load(Acquire)] {
+            if !p.is_null() {
+                mark_visit(p, stack);
+            }
+        }
         let threads: Vec<usize> = crate::threads::ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner()).clone();
         for t in threads {
             let ts = &*(t as *const ThreadState);
