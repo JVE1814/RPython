@@ -502,11 +502,49 @@ pub unsafe extern "C" fn h_delete_subscr(sp: *mut *mut PyObject) -> u64 {
     }
 }
 
+/// (jit5) Bounds of a step-1 slice `[start:stop]` over a sequence of length `len`
+/// when both are None or compact ints: (lo, hi) with lo <= hi.
+#[inline]
+fn simple_bounds(start: &PyObject, stop: &PyObject, len: usize) -> Option<(usize, usize)> {
+    let b = |o: &PyObject, dflt: isize| -> Option<isize> {
+        if o.is(none::none()) {
+            Some(dflt)
+        } else if int::is_int_exact(o) && int::is_compact(o) {
+            Some(int::compact_value(o) as isize)
+        } else {
+            None
+        }
+    };
+    let (mut lo, mut hi) = (b(start, 0)?, b(stop, isize::MAX)?);
+    crate::types::slice::adjust_indices(len as isize, &mut lo, &mut hi, 1);
+    Some((lo as usize, (hi.max(lo)) as usize))
+}
+
 pub unsafe extern "C" fn h_binary_slice(sp: *mut *mut PyObject) -> u64 {
     unsafe {
         let stop = take(sp.sub(1));
         let start = take(sp.sub(2));
         let c = take(sp.sub(3));
+        // (jit5) exact list/tuple with None/int bounds: no slice object
+        if list::is_list_exact(&c) {
+            let _g = crate::types::dict::ob_lock(&c);
+            let items = list::list_items(&c);
+            if let Some((lo, hi)) = simple_bounds(&start, &stop, items.len()) {
+                put(sp.sub(3), list::new_list_from_slice(&items[lo..hi]));
+                return OK;
+            }
+        } else if tuple::is_tuple_exact(&c) {
+            let items = tuple::tuple_items(&c);
+            if let Some((lo, hi)) = simple_bounds(&start, &stop, items.len()) {
+                let r = if lo == 0 && hi == items.len() {
+                    c.clone()
+                } else {
+                    tuple::new_tuple(items[lo..hi].iter().map(|x| x.to_ref()).collect())
+                };
+                put(sp.sub(3), r);
+                return OK;
+            }
+        }
         let s = crate::types::slice::new_slice(&start, &stop, none::none());
         match ab::getitem(&c, &s) {
             Ok(r) => {
@@ -524,6 +562,38 @@ pub unsafe extern "C" fn h_store_slice(sp: *mut *mut PyObject) -> u64 {
         let start = take(sp.sub(2));
         let c = take(sp.sub(3));
         let v = take(sp.sub(4));
+        // (jit5) list[a:b] = other_list of the same length (fannkuch's reversal):
+        // replace the items in place, no slice object or vectors
+        if list::is_list_exact(&c) && list::is_list_exact(&v) && !v.is(&c) {
+            let done = {
+                // two list locks: always in address order
+                let (first, second) = if (c.as_ptr() as usize) < (v.as_ptr() as usize) { (&c, &v) } else { (&v, &c) };
+                let _g1 = crate::types::dict::ob_lock(first);
+                let _g2 = crate::types::dict::ob_lock(second);
+                let items = list::list_items(&c);
+                let new = list::list_items(&v);
+                match simple_bounds(&start, &stop, items.len()) {
+                    Some((lo, hi)) if hi - lo == new.len() && new.len() <= 32 => {
+                        let mut old: [*mut PyObject; 32] = [std::ptr::null_mut(); 32];
+                        let base = items.as_ptr() as *mut *mut PyObject;
+                        for (k, x) in new.iter().enumerate() {
+                            incref(x.as_ptr());
+                            let slot = base.add(lo + k);
+                            old[k] = *slot;
+                            std::sync::atomic::AtomicPtr::from_ptr(slot).store(x.as_ptr(), std::sync::atomic::Ordering::Release);
+                        }
+                        Some((old, new.len()))
+                    }
+                    _ => None,
+                }
+            };
+            if let Some((old, n)) = done {
+                for &p in &old[..n] {
+                    crate::qsbr::decref_deferred(p);
+                }
+                return OK;
+            }
+        }
         let s = crate::types::slice::new_slice(&start, &stop, none::none());
         if ab::setitem(&c, &s, Some(&v)).is_ok() { OK } else { ERR }
     }

@@ -166,3 +166,35 @@ def ranges(n):
     return out
 
 print(ranges(60)[-8:])
+
+# jit5: slices of exact lists/tuples without slice objects; equal-length slice stores
+class L(list):
+    pass
+
+def slices(n):
+    out = []
+    p = list(range(9))
+    t = tuple(range(7))
+    for k in range(n):
+        j = k % 9
+        q = p[:]
+        q[:j + 1] = q[j::-1]
+        out.append(q[0] + q[-1])
+        out.append(p[j:] + p[:j] == p[j:] + p[:j])
+        out.append(t[1:j] + t[-3:] + t[j:2] + t[:])
+        out.append(p[-100:100][2])
+        q[2:5] = [7, 8]
+        q[1:1] = q
+        out.append(len(q))
+        q[0:3] = q[3:6]
+        r = L(p)
+        r[1:3] = [5, 5]
+        out.append(r[1:4])
+        out.append(t[True:None])
+        try:
+            p[1.5:]
+        except TypeError as e:
+            out.append(str(e))
+    return out[-12:]
+
+print(slices(300))
