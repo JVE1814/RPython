@@ -575,6 +575,25 @@ unsafe extern "C" fn tuple_iter(o: *mut PyObject) -> *mut PyObject {
 unsafe extern "C" fn tupleiter_next(o: *mut PyObject) -> *mut PyObject {
     unsafe {
         let it = &mut *(o as *mut TupleIter);
+        if crate::threads::multi_threaded() {
+            // shared iterator: claim the index atomically (each item once) and drop the
+            // tuple through QSBR (another thread may have loaded `seq` just before)
+            use std::sync::atomic::{AtomicPtr, Ordering::*};
+            let seqp = AtomicPtr::from_ptr(&raw mut it.seq).load(Acquire);
+            if seqp.is_null() {
+                return std::ptr::null_mut();
+            }
+            let items = tuple_items(&*seqp);
+            let idx = std::sync::atomic::AtomicIsize::from_ptr(&raw mut it.index).fetch_add(1, AcqRel);
+            if idx >= 0 && (idx as usize) < items.len() {
+                return items[idx as usize].to_ref().into_raw();
+            }
+            let p = AtomicPtr::from_ptr(&raw mut it.seq).swap(std::ptr::null_mut(), AcqRel);
+            if !p.is_null() {
+                crate::qsbr::decref_deferred(p);
+            }
+            return std::ptr::null_mut();
+        }
         if it.seq.is_null() {
             return std::ptr::null_mut();
         }
