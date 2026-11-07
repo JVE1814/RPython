@@ -103,6 +103,7 @@ pub fn initialize(cfg: &Config) -> PyResult<()> {
             }
         }
     }
+    modules::sys_full::check_stdlib_present();
     if cfg.pth_paths.is_none() {
         for entry in modules::sys_full::default_search_path() {
             types::list::append(&path, types::str::new_str(&entry));

@@ -606,14 +606,16 @@ pub fn import_module_level(nm: &PyObject, globals: Option<&PyObject>, fromlist: 
         // surrogate escapes). -X importtime still shows the escaped name.
         let display = escaped_name(nm);
         let lossy = pystr::to_string_lossy(nm);
+        let timed_name = lossy.clone();
         return IT_DISPLAY.with(|d| {
             let old = d.replace(Some((lossy, display)));
             let r = match bootstrap() {
-                Some(bs) if importlib_active() => (|| {
+                // (timed like other imports, also when it fails)
+                Some(bs) if importlib_active() => import_timed(&timed_name, || {
                     let f = ab::getattr_str(&bs, "__import__")?;
                     let g = globals.map(|g| g.to_ref()).unwrap_or_else(none::none_ref);
                     ab::call(&f, &[nm, &g, none::none(), fromlist, &crate::types::int::new_int(0)])
-                })(),
+                }),
                 _ => import_module_level_inner(nm, globals, fromlist, level),
             };
             d.replace(old);
