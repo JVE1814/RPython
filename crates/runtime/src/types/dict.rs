@@ -153,6 +153,9 @@ pub struct DictTable {
     /// (scale1) Sequence lock for lock-free readers (`lookup_lockfree`): odd while a
     /// writer (holding the object lock) changes the index or entry layout.
     pub wseq: std::sync::atomic::AtomicU64,
+    /// (scale1) Set (under the object lock) once a thread other than the owner reads or
+    /// writes the table: from then on, replaced data blocks wait for lock-free readers.
+    shared_read: std::sync::atomic::AtomicBool,
 }
 
 /// A fresh, globally unique dict version stamp (the JIT's allocator). Every
@@ -235,6 +238,7 @@ impl DictTable {
             fill: 0,
             data_bytes: bytes,
             wseq: std::sync::atomic::AtomicU64::new(0),
+            shared_read: std::sync::atomic::AtomicBool::new(false),
         }
     }
     /// Start a change of the index/entry layout (object lock held).
@@ -256,6 +260,11 @@ impl DictTable {
             return;
         }
         let p = unsafe { (std::mem::replace(&mut self.indices_p, std::ptr::null_mut()) as *mut u8).sub(BLOCK_HDR) };
+        if !self.shared_read.load(Relaxed) {
+            // only the owner ever touched this table: nobody can be reading the block
+            unsafe { raw_free(p, self.data_bytes) };
+            return;
+        }
         unsafe fn free_block(p: *mut u8) {
             unsafe { crate::alloc::buf_free(p) }
         }
@@ -339,6 +348,8 @@ impl DictTable {
         self.version = next_version();
         self.layout = next_version();
         self.keys_version = next_version();
+        // `fresh` holds the old block now: it is retired under this table's rules
+        fresh.shared_read.store(self.shared_read.load(Relaxed), Relaxed);
         fresh.retire_block();
         drop(fresh);
     }
@@ -492,7 +503,43 @@ unsafe fn is_shared_empty(d: &PyObject) -> bool {
 /// Unsynchronized table access (callers must hold the object lock or own the object).
 #[inline(always)]
 pub fn table(d: &PyObject) -> &mut DictTable {
-    unsafe { &mut *raw_table(d) }
+    unsafe {
+        let t = raw_table(d);
+        // (scale1) a thread other than the owner works on the table (with the lock held,
+        // as every caller that is not the owner does): see `shared_read`
+        if !(*t).shared_read.load(Relaxed) && d.ob_tid.load(Relaxed) != thread_id() {
+            (*t).shared_read.store(true, Relaxed);
+        }
+        &mut *t
+    }
+}
+
+/// Before a thread other than the owner reads `d` without the lock for the first time:
+/// mark the table (under the lock, so that a writer that frees blocks immediately
+/// cannot be running).
+#[inline(always)]
+fn mark_shared_read(d: &PyObject, tp: *mut DictTable) {
+    unsafe {
+        if !(*tp).shared_read.load(Relaxed) && (*tp).cap != 0 && d.ob_tid.load(Relaxed) != thread_id() {
+            mark_shared_read_slow(d);
+        }
+    }
+}
+/// For code outside this module that reads a dict's entries without the lock
+/// (the specialiser's hinted lookups).
+pub fn prepare_unlocked_read(d: &PyObject) {
+    unsafe {
+        let tp = (*(d.as_ptr() as *mut PyDictObject)).ma_keys as *mut DictTable;
+        if !tp.is_null() {
+            mark_shared_read(d, tp);
+        }
+    }
+}
+#[cold]
+fn mark_shared_read_slow(d: &PyObject) {
+    let g = ob_lock(d);
+    let _ = table(d);
+    drop(g);
 }
 
 /// Table for reading only: may be the shared empty table (never written through).
@@ -721,6 +768,7 @@ fn lookup_lockfree_raw(d: &PyObject, key: &PyObject, hash: isize) -> LfRead {
         if tp.is_null() {
             return LfRead::Undecided;
         }
+        mark_shared_read(d, tp);
         for _ in 0..8 {
             let s1 = (*tp).wseq.load(Acquire);
             if s1 & 1 != 0 {
@@ -909,6 +957,7 @@ pub fn value_at_if(d: &PyObject, keys_version: u64, ix: usize) -> Option<PyRef> 
         use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize};
         let tp = AtomicPtr::from_ptr(&raw mut (*(d.as_ptr() as *mut PyDictObject)).ma_keys).load(Acquire) as *mut DictTable;
         if !tp.is_null() {
+            mark_shared_read(d, tp);
             let s1 = (*tp).wseq.load(Acquire);
             let lay = if s1 & 1 == 0 { block_layout(tp) } else { None };
             if let Some((_, ep, _, cap)) = lay {
@@ -1100,6 +1149,7 @@ pub fn clear(d: &PyObject) {
         fill: t.fill,
         data_bytes: t.data_bytes,
         wseq: std::sync::atomic::AtomicU64::new(0),
+        shared_read: std::sync::atomic::AtomicBool::new(t.shared_read.load(Relaxed)),
     };
     t.entries_p = fresh.entries_p;
     t.nentries = 0;
