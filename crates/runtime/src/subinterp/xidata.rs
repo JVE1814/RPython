@@ -98,8 +98,7 @@ impl Captured {
             Some(m) => format!("{}.{}", m, qualname),
         };
         let formatted = match &msg {
-            Some(m) if !m.is_empty() => format!("{}: {}", shown, m),
-            Some(_) => shown,
+            Some(m) => format!("{}: {}", shown, m),
             None => format!("{}: <exception str() failed>", shown),
         };
         let errdisplay = if with_display { format_traceback(e) } else { None };
@@ -216,21 +215,24 @@ pub fn not_shareable_from(msg: &str, cause: &Captured) -> PyErr {
     PyErr
 }
 
+/// The traceback display of `e` (TracebackException(...).format(), joined,
+/// without the final newline).
 fn format_traceback(e: &PyObject) -> Option<String> {
     let r = (|| -> PyResult<String> {
         let tb = crate::import::import_absolute("traceback")?;
-        let f = ab::getattr_str(&tb, "format_exception")?;
-        let kw = tuple::new_tuple(vec![pystr::new_str("colorize")]);
-        let lines = match ab::call_kw(&f, &[e, bool_::false_obj()], Some(&kw)) {
-            Ok(l) => l,
-            Err(_) => {
-                clear_exc();
-                ab::call(&f, &[e])?
-            }
-        };
+        let te_type = ab::getattr_str(&tb, "TracebackException")?;
+        let from = ab::getattr_str(&te_type, "from_exception")?;
+        let te = ab::call(&from, &[e])?;
+        let lines = ab::call_method_str(&te, "format", &[])?;
         let mut s = String::new();
         for l in ab::collect_iterable(&lines)? {
+            if !pystr::is_str(&l) {
+                raise!(TypeError, "TracebackException.format() must produce str, not {}", crate::types::typeobject::tname(&l));
+            }
             s.push_str(&pystr::to_string_lossy(&l));
+        }
+        if s.ends_with('\n') {
+            s.pop();
         }
         Ok(s)
     })();
@@ -267,6 +269,10 @@ fn is_plain(o: &PyObject) -> bool {
 pub fn get(o: &PyObject, mode: Mode) -> PyResult<Xi> {
     match get_native(o)? {
         Some(x) => Ok(x),
+        None if mode == Mode::Default && int::is_int_exact(o) => {
+            let _ = overflow_error("Python int too large to convert to C int64_t");
+            Err(not_shareable("int too large to be shared", true))
+        }
         None if mode == Mode::Default => Err(not_shareable(&format!("{} does not support cross-interpreter data", type_desc(o)), false)),
         None => get_fallback(o),
     }
@@ -559,7 +565,8 @@ pub fn is_stateless_function(f: &PyObject) -> PyResult<bool> {
 /// A global name that resolves to a builtin wherever the code runs (dunder
 /// names such as `__name__` are module attributes first).
 fn is_builtin_name(builtins: &PyObject, n: &str) -> bool {
-    !(n.starts_with("__") && n.ends_with("__")) && dict::get_item_rs(builtins, n).is_some()
+    const MODULE_ATTRS: [&str; 10] = ["__name__", "__doc__", "__package__", "__loader__", "__spec__", "__file__", "__cached__", "__builtins__", "__annotations__", "__path__"];
+    !MODULE_ATTRS.contains(&n) && dict::get_item_rs(builtins, n).is_some()
 }
 
 /// Can `code` run as a script: no parameters, no free variables, and no return
@@ -571,6 +578,10 @@ pub fn check_script_code(code: &PyObject, what: &str) -> PyResult<()> {
     let flags = int::as_i64(&*ab::getattr_str(code, "co_flags")?).unwrap_or(0);
     const CO_VARARGS: i64 = 0x4;
     const CO_VARKEYWORDS: i64 = 0x8;
+    // generators, coroutines and async generators do not run as scripts
+    if flags & (0x20 | 0x80 | 0x100 | 0x200) != 0 {
+        raise!(ValueError, "{} must be a plain function, not a generator or coroutine", what);
+    }
     if argc != 0 || flags & (CO_VARARGS | CO_VARKEYWORDS) != 0 {
         raise!(ValueError, "{} must not take any arguments", what);
     }
@@ -640,7 +651,7 @@ pub fn script_data(o: &PyObject, pure: bool) -> PyResult<Vec<u8>> {
     } else {
         raise!(TypeError, "unsupported script {}", ab::repr_string(o).unwrap_or_default());
     };
-    if pure {
+    if pure && !(pystr::is_str(o) || bytes::is_bytes(o)) {
         let mut names = Vec::new();
         global_names(&code, &mut names)?;
         let b = crate::builtins::builtins_dict();
