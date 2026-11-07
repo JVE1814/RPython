@@ -274,12 +274,24 @@ fn incompatible(target: &Stack) -> String {
     }
 }
 
+/// Is the frame stopped at a yield (its 'return' trace event is a suspension)?
+fn at_yield(f: &Frame) -> bool {
+    let co = f.code().to_ref();
+    let cd = code::code_data(&co);
+    cd.code
+        .get(f.lasti as usize)
+        .is_some_and(|&w| Op::from_u8((w & 0xff) as u8) == Op::YieldValue)
+}
+
 /// Implements `frame.f_lineno = value`.
 pub fn set_lineno(f: &mut Frame, value: Option<&PyObject>) -> PyResult<()> {
     match f.trace_event {
         0 => raise!(ValueError, "f_lineno can only be set by a trace function"),
         EV_CALL => raise!(ValueError, "can't jump from the 'call' trace event of a new frame"),
         EV_LINE | EV_OPCODE => {}
+        // (tail4) the 'return' event of a yield: the generator does not suspend and
+        // continues at the target instead
+        EV_RETURN if at_yield(f) => {}
         _ => raise!(ValueError, "can only jump from a 'line' trace event"),
     }
     let Some(v) = value else { raise!(AttributeError, "cannot delete f_lineno") };
