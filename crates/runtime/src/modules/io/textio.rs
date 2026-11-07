@@ -1727,6 +1727,7 @@ pub fn init_types() -> PyResult<()> {
             ("reset", NOARGS, nld_reset),
         ];
         t.tp_getset = crate::getset_table![("newlines", nld_newlines)];
+        crate::methods::lock_self_methods(nldecoder_type());
         crate::types::typeobject::type_ready(nldecoder_type())?;
     }
     Ok(())

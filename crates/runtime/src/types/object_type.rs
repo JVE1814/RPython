@@ -248,9 +248,14 @@ fn object_set_class(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     crate::shape::materialize(o);
     unsafe {
         incref(new as *mut PyObject);
-        o.ob_type.store(new, std::sync::atomic::Ordering::Release);
-        if is_heap_type(old) {
-            decref(old as *mut PyObject);
+        // swap, and release the type actually replaced: with two threads assigning at
+        // once, both saw the same `old` above and released it twice (the other type
+        // never), so a class could be freed while instances still had it as their type
+        let replaced = o.ob_type.swap(new, std::sync::atomic::Ordering::AcqRel);
+        if is_heap_type(replaced) {
+            // `type(o)` on another thread may have loaded the old type and not yet taken
+            // its reference
+            crate::qsbr::decref_deferred(replaced as *mut PyObject);
         }
     }
     Ok(())

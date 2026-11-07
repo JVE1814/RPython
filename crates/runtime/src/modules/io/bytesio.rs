@@ -400,6 +400,7 @@ fn b_sizeof(o: &PyObject) -> PyResult {
 unsafe extern "C" fn b_iternext(op: *mut PyObject) -> *mut PyObject {
     unsafe {
         let o = &*op;
+        let _lk = crate::objlock::lock(o);
         if !o.is_type(bytesio_type()) {
             // subclass may override readline
             let r = call0(o, "readline");
@@ -495,7 +496,23 @@ unsafe extern "C" fn buf_dealloc(op: *mut PyObject) {
 unsafe extern "C" fn buf_traverse(op: *mut PyObject, visit: visitproc, arg: *mut c_void) -> c_int {
     unsafe { visit_ptr((*(op as *mut BytesIOBuffer)).source, visit, arg) }
 }
-static mut BUF_PROCS: PyBufferProcs = PyBufferProcs { bf_getbuffer: Some(buf_getbuffer), bf_releasebuffer: Some(buf_releasebuffer) };
+// Exports change the BytesIO's storage (unsharing it) and its export count: done under
+// the BytesIO's object lock, like its methods (concurrent getbuffer/truncate/write).
+unsafe extern "C" fn l_buf_getbuffer(op: *mut PyObject, view: *mut Py_buffer, flags: c_int) -> c_int {
+    unsafe {
+        let src = (*(op as *mut BytesIOBuffer)).source;
+        let _g = if src.is_null() { None } else { Some(crate::objlock::lock(&*src)) };
+        buf_getbuffer(op, view, flags)
+    }
+}
+unsafe extern "C" fn l_buf_releasebuffer(op: *mut PyObject, view: *mut Py_buffer) {
+    unsafe {
+        let src = (*(op as *mut BytesIOBuffer)).source;
+        let _g = if src.is_null() { None } else { Some(crate::objlock::lock(&*src)) };
+        buf_releasebuffer(op, view)
+    }
+}
+static mut BUF_PROCS: PyBufferProcs = PyBufferProcs { bf_getbuffer: Some(l_buf_getbuffer), bf_releasebuffer: Some(l_buf_releasebuffer) };
 
 fn b_getbuffer(o: &PyObject) -> PyResult {
     state(o)?;
@@ -553,6 +570,7 @@ pub fn init_types() -> PyResult<()> {
             ("__sizeof__", NOARGS, b_sizeof),
         ];
         t.tp_getset = crate::getset_table![("closed", b_closed)];
+        crate::methods::lock_self_methods(bytesio_type());
         crate::types::typeobject::type_ready(bytesio_type())?;
 
         let t = &mut *(&raw mut BYTESIOBUF_TYPE);
