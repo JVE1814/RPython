@@ -157,7 +157,7 @@ class BaseHTTPRequestHandler(socketserver.StreamRequestHandler):
     monthname = [None, 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
                  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
-    _control_char_table = _make_log_table()
+    _log_escape_table = _make_log_table()
 
     def parse_request(self):
         """Parse self.raw_requestline and the headers.
@@ -378,7 +378,7 @@ class BaseHTTPRequestHandler(socketserver.StreamRequestHandler):
         return get_theme(tty_file=sys.stderr).http_server
 
     def _escape(self, text):
-        return str(text).translate(self._control_char_table)
+        return str(text).translate(self._log_escape_table)
 
     def log_request(self, code='-', size='-'):
         """Log an accepted request (called by send_response())."""
@@ -693,7 +693,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
         return self.default_content_type
 
 
-def _get_best_family(*address):
+def _pick_address_family(*address):
     infos = socket.getaddrinfo(*address, type=socket.SOCK_STREAM,
                                flags=socket.AI_PASSIVE)
     family, type, proto, canonname, sockaddr = next(iter(infos))
@@ -706,7 +706,7 @@ def test(HandlerClass=BaseHTTPRequestHandler,
          tls_cert=None, tls_key=None, tls_password=None,
          content_type=None):
     """Run an HTTP server on *port* until interrupted."""
-    ServerClass.address_family, addr = _get_best_family(bind, port)
+    ServerClass.address_family, addr = _pick_address_family(bind, port)
     HandlerClass.protocol_version = protocol
     if content_type is not None:
         HandlerClass.default_content_type = content_type
