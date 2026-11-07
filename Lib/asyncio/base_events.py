@@ -985,6 +985,8 @@ class BaseEventLoop(events.AbstractEventLoop):
             resume.cancel()
             again.cancel()
             raise
+        finally:
+            waiter = None   # see _create_connection_transport
         return ssl_protocol._app_transport
 
     # ------------------------------------------------------------ connections
@@ -1163,6 +1165,10 @@ class BaseEventLoop(events.AbstractEventLoop):
         except:
             transport.close()
             raise
+        finally:
+            # a failure's traceback holds this frame: the waiter (which holds
+            # the failure) must not be reachable from it
+            waiter = None
         return transport, protocol
 
     async def create_datagram_endpoint(self, protocol_factory,
@@ -1277,6 +1283,10 @@ class BaseEventLoop(events.AbstractEventLoop):
         except:
             transport.close()
             raise
+        finally:
+            # a failure's traceback holds this frame: the waiter (which holds
+            # the failure) must not be reachable from it
+            waiter = None
         return transport, protocol
 
     async def _create_server_getaddrinfo(self, host, port, family, flags):

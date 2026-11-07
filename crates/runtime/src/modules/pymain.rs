@@ -212,7 +212,96 @@ fn insert_path0(p: &str) {
     crate::import::set_sys_path_0(p);
 }
 
+/// (tail3) The exact bytes of a script path that is not valid UTF-8: options are parsed
+/// from a lossy view, sys.argv[0] carries the original (surrogateescape-decoded).
+fn undecodable_script_bytes(path: &str) -> Option<Vec<u8>> {
+    if !path.contains('\u{FFFD}') {
+        return None;
+    }
+    let argv = crate::modules::sys::get_sys_attr("argv")?;
+    let first = list::list_to_vec(&argv).into_iter().next()?;
+    let b = crate::modules::posix::path::fs_encode_str(&first).ok();
+    clear_exc();
+    b.filter(|b| std::str::from_utf8(b).is_err())
+}
+
+/// A script file whose path is not valid UTF-8, run from its exact bytes (`__file__`
+/// is the surrogateescape-decoded absolute path, as for any other file name).
+fn run_script_bytes(raw: &[u8], opts: &MainOptions) -> Outcome {
+    use std::os::unix::ffi::OsStrExt;
+    let mut abs = raw.to_vec();
+    if !abs.starts_with(b"/") {
+        if let Ok(cwd) = std::env::current_dir() {
+            let mut c = cwd.as_os_str().as_bytes().to_vec();
+            c.push(b'/');
+            c.extend_from_slice(raw);
+            abs = c;
+        }
+    }
+    let os_path = std::ffi::OsStr::from_bytes(&abs);
+    if !opts.safe_path {
+        let real = std::fs::canonicalize(os_path).map(|p| p.into_os_string()).unwrap_or_else(|_| os_path.to_os_string());
+        if let Some(dir) = std::path::Path::new(&real).parent() {
+            match dir.to_str() {
+                Some(d) => insert_path0(d),
+                None => {
+                    if let (Some(path), Ok(d)) = (crate::modules::sys::get_sys_attr("path"), crate::modules::posix::path::fs_decode(dir.as_os_str().as_bytes())) {
+                        list::insert(&path, 0, d);
+                    }
+                    clear_exc();
+                }
+            }
+        }
+    }
+    let lossy = String::from_utf8_lossy(&abs).into_owned();
+    let mut src = match std::fs::read(os_path) {
+        Ok(s) => s,
+        Err(e) => {
+            let shown = crate::modules::posix::path::fs_decode(&abs).ok().and_then(|s| ab::repr_string(&s).ok()).unwrap_or_else(|| format!("'{}'", lossy));
+            clear_exc();
+            crate::modules::sys::write_stderr(&format!(
+                "{}: can't open file {}: [Errno {}] {}\n",
+                opts.program_name,
+                shown,
+                e.raw_os_error().unwrap_or(0),
+                strerror(e.raw_os_error().unwrap_or(0))
+            ));
+            return Outcome::Exit(2);
+        }
+    };
+    if opts.skip_first_line {
+        match src.iter().position(|&b| b == b'\n') {
+            Some(i) => {
+                src.drain(..i);
+            }
+            None => src.clear(),
+        }
+    }
+    let r = (|| -> PyResult<()> {
+        let m = main_module()?;
+        let d = module::module_dict(&m);
+        let file: PyRef = crate::modules::posix::path::fs_decode(&abs)?;
+        dict::set_item_str(&d, "__file__", &file)?;
+        dict::set_item_str(&d, "__cached__", none::none())?;
+        crate::import_spec::set_main_loader(&d, &lossy)?;
+        // the loader was given the lossy spelling; __file__ keeps the real name
+        let file: PyRef = crate::modules::posix::path::fs_decode(&abs)?;
+        dict::set_item_str(&d, "__file__", &file)?;
+        Ok(())
+    })();
+    if r.is_err() {
+        return Outcome::Exit(handle_error());
+    }
+    run_code_in_main(&src, &lossy)
+}
+
 fn run_script(path: &str, opts: &MainOptions) -> Outcome {
+    if let Some(raw) = undecodable_script_bytes(path) {
+        // (directories and archives with such names still take the lossy route)
+        if std::fs::metadata(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&raw)).map(|m| m.is_file()).unwrap_or(true) {
+            return run_script_bytes(&raw, opts);
+        }
+    }
     let meta = std::fs::metadata(path);
     // a directory or zip file with __main__.py: run it as a module
     let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);

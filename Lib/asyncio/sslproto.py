@@ -455,6 +455,9 @@ class SSLProtocol(protocols.BufferedProtocol):
             self._set_state(SSLProtocolState.WRAPPED)
             peercert = sslobj.getpeercert()
         except Exception as exc:
+            # this frame is in exc's traceback: holding exc here too would
+            # be a cycle keeping the transports alive until a collection
+            handshake_exc = None
             self._set_state(SSLProtocolState.UNWRAPPED)
             if ssl is not None and isinstance(exc, ssl.CertificateError):
                 msg = 'SSL handshake failed on verifying the certificate'
