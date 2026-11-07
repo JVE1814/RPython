@@ -1729,5 +1729,7 @@ pub fn codegen(u: &Unit, built: &Built, al: &Alloc, deopt_counter: usize) -> Res
     let _ = tier1_exit;
     let sites = std::mem::take(&mut cg.sites);
     let asm = cg.g.finish()?;
+    // (perf7) jump relaxation in `resolve` moved the code
+    let entries = entries.into_iter().map(|(pc, pos)| (pc, asm.map_pos(pos as usize) as u32)).collect();
     Ok(Out { asm, entries, sites })
 }

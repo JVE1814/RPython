@@ -2433,6 +2433,12 @@ pub fn compile_mode(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crat
     }
     emit_routines(&mut g.a, rt_box_int, rt_box_float, rt_free_num);
     g.a.resolve()?;
+    // (perf7) resolve shortened jumps: entry offsets move with the code
+    for e in entries.iter_mut() {
+        if *e != u32::MAX {
+            *e = g.a.map_pos(*e as usize) as u32;
+        }
+    }
     Ok(Output { asm: g.a, entries })
 }
 
