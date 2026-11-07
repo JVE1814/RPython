@@ -901,3 +901,13 @@ pub fn gen_throw_pub(o: &PyObject, args: &[&PyObject]) -> PyResult {
 pub fn gen_throw_exc(o: &PyObject, e: PyRef) -> PyResult<SendResult> {
     gen_send_ex(o, None, Some(e), false)
 }
+
+/// Finalize a generator whose frame never started (frame.clear() on it): an unawaited
+/// coroutine reports its RuntimeWarning now.
+pub fn finalize_unstarted(o: &PyObject) {
+    unsafe { gen_finalize(o.as_ptr()) }
+    let gn = g(o);
+    if !gn.frame.is_null() && unsafe { (*gn.frame).state == FrameState::Created } {
+        finish(gn);
+    }
+}
