@@ -108,7 +108,7 @@ to them (inspect, pickle's frozendict rule, _datetime's public fields).
   to race condition" (test_signal 4 -> 0).
 * -X importtime times imports of names with surrogates (also failing ones); a PYTHONHOME without a standard
   library stops startup with a path-configuration dump (test_cmd_line 2 -> 0).
-* _ast: `ast.AST` attributes are replaceable (not an immutable type); an unknown non-str constructor keyword
+* _ast (test_ast 4 -> 2): `ast.AST` attributes are replaceable (not an immutable type); an unknown non-str constructor keyword
   warns (DeprecationWarning) before the setattr fails. CALL_FUNCTION_EX leaves keyword-key checks to a
   non-type tp_call callee (it gets the dict as is); Python function binding rejects non-str keys itself.
 * Failure injection (`_testcapi.set_nomemory`): `list.append` growth, `list()`, BUILD_LIST, `dict.copy()` and
