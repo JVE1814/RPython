@@ -72,7 +72,52 @@ pub unsafe extern "C" fn PyType_IsSubtype(a: *mut PyTypeObject, b: *mut PyTypeOb
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyType_GetFlags(t: *mut PyTypeObject) -> std::ffi::c_ulong {
-    unsafe { (*t).tp_flags }
+    PyType_GetFlags_impl(t)
+}
+
+/// (capi3) `_Py_TPFLAGS_MATCH_SELF`: a class pattern with one positional sub-pattern
+/// matches the subject itself (the builtin scalar and container types; inherited).
+pub const TPFLAGS_MATCH_SELF: std::ffi::c_ulong = 1 << 22;
+
+/// (capi3) Flag bits CPython gives its builtin types that our static type definitions
+/// do not spell out: MATCH_SELF on the types whose instances match themselves in class
+/// patterns, ITEMS_AT_END on `type` (its variable part follows the fixed fields).
+pub fn set_builtin_flag_bits() {
+    use crate::types::*;
+    let match_self = [
+        bool_::bool_type(),
+        bytearray::bytearray_type(),
+        bytes::bytes_type(),
+        dict::dict_type(),
+        frozendict::frozendict_type(),
+        float::float_type(),
+        set::frozenset_type(),
+        int::int_type(),
+        list::list_type(),
+        set::set_type(),
+        str::str_type(),
+        tuple::tuple_type(),
+    ];
+    unsafe {
+        for t in match_self {
+            (*t).tp_flags |= TPFLAGS_MATCH_SELF;
+        }
+        (*typeobject::type_type()).tp_flags |= Py_TPFLAGS_ITEMS_AT_END;
+    }
+}
+
+#[allow(non_snake_case)]
+unsafe fn PyType_GetFlags_impl(t: *mut PyTypeObject) -> std::ffi::c_ulong {
+    // (capi3) as CPython reports them: the version-tag bits (which the runtime keeps
+    // for its attribute caches) read as clear, and the runtime's own static types carry
+    // _Py_TPFLAGS_STATIC_BUILTIN (static types of extensions do not)
+    unsafe {
+        let mut f = (*t).tp_flags & !(Py_TPFLAGS_HAVE_VERSION_TAG | Py_TPFLAGS_VALID_VERSION_TAG);
+        if f & Py_TPFLAGS_HEAPTYPE == 0 && !crate::methods::is_extension_code(t as *const std::ffi::c_void) {
+            f |= 1 << 1;
+        }
+        f
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyType_Modified(t: *mut PyTypeObject) {

@@ -1597,6 +1597,7 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
         (*tp).tp_flags |= (*base).tp_flags & Py_TPFLAGS_PREHEADER;
         (*tp).tp_flags |= (*base).tp_flags & Py_TPFLAGS_ITEMS_AT_END;
         (*tp).tp_flags |= (*base).tp_flags & Py_TPFLAGS_INLINE_VALUES;
+        (*tp).tp_flags |= (*base).tp_flags & crate::capi::typeobj::TPFLAGS_MATCH_SELF; // (capi3)
         // managed slots report CPython's sentinel offsets, which C extensions test against 0
         // ("instances have a __dict__ / are weakly referenceable"; msgspec reads them)
         if (*tp).tp_flags & Py_TPFLAGS_MANAGED_DICT != 0 && (*tp).tp_dictoffset == 0 {

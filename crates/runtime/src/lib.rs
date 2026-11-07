@@ -74,6 +74,7 @@ pub fn initialize(cfg: &Config) -> PyResult<()> {
     threads::set_main_thread();
     types::int::init_small_ints();
     types::init_all()?;
+    capi::typeobj::set_builtin_flag_bits(); // (capi3)
     modules::register_all();
     modules::sys::init_bootstrap_types();
     let _b = builtins::init()?;

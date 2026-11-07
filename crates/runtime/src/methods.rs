@@ -328,7 +328,7 @@ pub unsafe fn call_methoddef(
 use crate::raise;
 
 /// Whether code at `addr` belongs to a loaded extension rather than this executable.
-fn is_extension_code(addr: *const c_void) -> bool {
+pub(crate) fn is_extension_code(addr: *const c_void) -> bool {
     static OWN_BASE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let base_of = |a: *const c_void| -> usize {
         let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
