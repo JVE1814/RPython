@@ -535,6 +535,14 @@ impl StrBuilder {
     pub fn with_capacity(n: usize) -> Self {
         StrBuilder { narrow: Vec::with_capacity(n), wide: Vec::new(), is_wide: false, maxc: 0 }
     }
+    /// (capi3) Would appending `extra` characters reallocate the buffer?
+    pub fn would_grow(&self, extra: usize) -> bool {
+        if self.is_wide {
+            self.wide.len() + extra > self.wide.capacity()
+        } else {
+            self.narrow.len() + extra > self.narrow.capacity()
+        }
+    }
     #[cold]
     fn widen(&mut self, extra: usize) {
         self.wide.reserve(self.narrow.len() + extra.max(16));

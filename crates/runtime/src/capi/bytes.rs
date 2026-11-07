@@ -68,11 +68,29 @@ pub unsafe extern "C" fn PyBytes_FromObject(o: *mut PyObject) -> *mut PyObject {
         if (*o).is_type(bytes::bytes_type()) {
             return (*o).to_ref().into_raw();
         }
-        if pystr::is_str(&*o) || int::is_int(&*o) {
-            let _ = type_error(&format!("cannot convert '{}' object to bytes", tname(&*o)));
+        // (capi3) a buffer is copied, any other non-str iterable supplies integers;
+        // `__bytes__` is not consulted (unlike bytes(o))
+        if let Some(v) = contiguous_bytes(&*o) {
+            return ret(bytes::try_new_bytes(&v));
+        }
+        let cannot = || type_error(&format!("cannot convert '{}' object to bytes", tname(&*o)));
+        if pystr::is_str(&*o) {
+            let _ = cannot();
             return std::ptr::null_mut();
         }
-        ret(ab::call(type_obj(bytes::bytes_type()), &[&*o]))
+        let it = match ab::get_iter(&*o) {
+            Ok(it) => it,
+            Err(e) => {
+                if !crate::errors::exc_matches(crate::types::exceptions::TypeError()) {
+                    return ret(Err(e));
+                }
+                clear_exc();
+                let _ = cannot();
+                return std::ptr::null_mut();
+            }
+        };
+        let r = ab::collect_iterable(&it).and_then(|v| ab::call(type_obj(bytes::bytes_type()), &[&crate::types::list::new_list(v)]));
+        ret(r)
     }
 }
 #[unsafe(no_mangle)]
@@ -132,7 +150,16 @@ pub unsafe extern "C" fn PyBytes_Concat(p: *mut *mut PyObject, w: *mut PyObject)
             *p = std::ptr::null_mut();
             return;
         }
-        let r = ab::binary_op(&*left, &*w, ab::NbSlot::Add);
+        // (capi3) both operands may be any C-contiguous buffer; the result is bytes
+        let r = match (contiguous_bytes(&*left), contiguous_bytes(&*w)) {
+            (Some(a), Some(b)) => {
+                let mut v = Vec::with_capacity(a.len() + b.len());
+                v.extend_from_slice(&a);
+                v.extend_from_slice(&b);
+                bytes::try_new_bytes(&v)
+            }
+            _ => Err(type_error(&format!("can't concat {} to {}", tname(&*w), tname(&*left)))),
+        };
         decref(left);
         *p = ret(r);
     }
@@ -147,16 +174,28 @@ pub unsafe extern "C" fn PyBytes_ConcatAndDel(p: *mut *mut PyObject, w: *mut PyO
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyBytes_Join(sep: *mut PyObject, it: *mut PyObject) -> *mut PyObject {
     unsafe {
-        if sep.is_null() || !bytes::is_bytes(&*sep) {
+        if sep.is_null() || it.is_null() {
             let _ = bad_internal();
             return std::ptr::null_mut();
         }
-        ret(ab::call_method_str(&*sep, "join", &[&*it]))
+        if !bytes::is_bytes(&*sep) {
+            let _ = type_error(&format!("PyBytes_Join() separator must be bytes, not {}", tname(&*sep)));
+            return std::ptr::null_mut();
+        }
+        // (capi3) bytes.join itself, whatever a subclass of the separator defines
+        let r = ab::getattr_str(type_obj(bytes::bytes_type()), "join").and_then(|f| ab::call(&f, &[&*sep, &*it]));
+        ret(r)
     }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyBytes_Repr(o: *mut PyObject, _smartquotes: c_int) -> *mut PyObject {
-    unsafe { ret(ab::repr(&*o)) }
+pub unsafe extern "C" fn PyBytes_Repr(o: *mut PyObject, smartquotes: c_int) -> *mut PyObject {
+    unsafe {
+        if o.is_null() || !bytes::is_bytes(&*o) {
+            return ret(ab::repr(&*o));
+        }
+        let s = crate::types::bytes_methods::bytes_repr_quoted(bytes::bytes_data(&*o), "b", "", smartquotes != 0);
+        ret(Ok(pystr::new_str(&s)))
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyBytes_DecodeEscape(s: *const c_char, len: Py_ssize_t, errors: *const c_char, _unicode: Py_ssize_t, _recode: *const c_char) -> *mut PyObject {
@@ -419,11 +458,17 @@ pub struct BytesWriter {
     /// finish() makes a bytearray (_PyBytesWriter_CreateByteArray) instead of bytes
     bytearray: bool,
 }
-/// Set `buf` to `n` bytes (new bytes zeroed); MemoryError instead of an abort.
-fn bw_set_len(buf: &mut Vec<u8>, n: usize) -> PyResult<()> {
-    if n > buf.len() && buf.try_reserve(n - buf.len()).is_err() {
+/// Make room for `n` bytes in total. Growing past the capacity is an allocation: a
+/// failure-injecting allocator hook may refuse it (capi3), as may the system.
+fn bw_reserve(buf: &mut Vec<u8>, n: usize) -> PyResult<()> {
+    if n > buf.capacity() && (crate::capi::mem::hooked_alloc_refuses(n) || buf.try_reserve(n - buf.len()).is_err()) {
         return Err(crate::errors::memory_error());
     }
+    Ok(())
+}
+/// Set `buf` to `n` bytes (new bytes zeroed); MemoryError instead of an abort.
+fn bw_set_len(buf: &mut Vec<u8>, n: usize) -> PyResult<()> {
+    bw_reserve(buf, n)?;
     buf.resize(n, 0);
     Ok(())
 }
@@ -540,7 +585,12 @@ pub unsafe extern "C" fn PyBytesWriter_GrowAndUpdatePointer(w: *mut BytesWriter,
 pub unsafe extern "C" fn PyBytesWriter_WriteBytes(w: *mut BytesWriter, data: *const c_void, size: Py_ssize_t) -> c_int {
     unsafe {
         let n = if size < 0 { libc::strlen(data as *const c_char) } else { size as usize };
-        bw(w).buf.extend_from_slice(std::slice::from_raw_parts(data as *const u8, n));
+        let b = bw(w);
+        let want = b.buf.len().saturating_add(n);
+        if bw_reserve(&mut b.buf, want).is_err() {
+            return -1;
+        }
+        b.buf.extend_from_slice(std::slice::from_raw_parts(data as *const u8, n));
         0
     }
 }
@@ -549,7 +599,12 @@ pub unsafe extern "C" fn PyBytesWriter_Format(w: *mut BytesWriter, fmt: *const c
     unsafe {
         match bytes_format(fmt, &mut args) {
             Ok(v) => {
-                bw(w).buf.extend_from_slice(&v);
+                let b = bw(w);
+                let want = b.buf.len().saturating_add(v.len());
+                if bw_reserve(&mut b.buf, want).is_err() {
+                    return -1;
+                }
+                b.buf.extend_from_slice(&v);
                 0
             }
             Err(_) => -1,
