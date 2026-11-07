@@ -533,6 +533,9 @@ pub struct CodeCaches {
     pub t2_prof: AtomicU8,
     /// invalidated tier-2 code, freed with the code object
     pub t2_retired: std::sync::Mutex<Vec<usize>>,
+    /// Generator expression prologue shape (interp::genexpr_prologue): 0 not yet
+    /// examined, 1 not the plain `iter(.0)` prologue, 2 + n: plain, with n free variables.
+    pub genexpr: AtomicU32,
 }
 
 impl CodeCaches {
@@ -556,6 +559,7 @@ impl CodeCaches {
             t2_invalidations: AtomicU8::new(0),
             t2_prof: AtomicU8::new(1),
             t2_retired: std::sync::Mutex::new(Vec::new()),
+            genexpr: AtomicU32::new(0),
         }
     }
 

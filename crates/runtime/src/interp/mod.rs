@@ -131,6 +131,11 @@ pub fn call_function(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwna
             frame.make_owned();
             return crate::types::genobject::new_generator_for(frame, func, flags);
         }
+        if kwnames.is_none() && nargs == 1 {
+            if let Some(r) = new_genexpr(func, f, co, args[0], flags) {
+                return r;
+            }
+        }
     } else if let Some(r) = jit::call_fast(func, args, nargs, kwnames) {
         return r; // jit workstream: compiled callee, direct entry
     }
@@ -157,6 +162,100 @@ pub fn call_function(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwna
     }
     prepare_cells(&mut frame, f);
     run_frame(frame)
+}
+
+/// Number of free variables if the code's eager generator prologue is exactly a
+/// generator expression's `iter(.0)` (optional CopyFreeVars, Resume/Nop, LoadFast 0,
+/// GetIter, ReturnGenerator), cached per code object.
+fn genexpr_prologue(cd: &code::CodeData) -> Option<u32> {
+    use bc::Op;
+    use std::sync::atomic::Ordering::Relaxed;
+    let s = cd.caches.genexpr.load(Relaxed);
+    if s != 0 {
+        return if s >= 2 { Some(s - 2) } else { None };
+    }
+    let mut nfree = 0;
+    let mut seen_load = false;
+    let mut seen_iter = false;
+    let mut ok = false;
+    for (i, &w) in cd.code.iter().enumerate() {
+        let (op, a) = bc::decode(w);
+        match op {
+            Op::Nop | Op::Resume if !seen_load => {}
+            Op::CopyFreeVars if !seen_load && i == 0 => nfree = a,
+            Op::LoadFast if !seen_load && a == 0 => seen_load = true,
+            Op::GetIter if seen_load && !seen_iter => seen_iter = true,
+            Op::ReturnGenerator if seen_iter => {
+                ok = i + 1 == cd.gen_start as usize;
+                break;
+            }
+            _ => break,
+        }
+    }
+    cd.caches.genexpr.store(if ok { 2 + nfree } else { 1 }, Relaxed);
+    if ok { Some(nfree) } else { None }
+}
+
+/// Create the generator of a generator expression without running its prologue in
+/// the interpreter: `iter()` of an exact builtin container (which cannot fail or run
+/// Python code) is done here. None: use the general path.
+#[inline]
+fn new_genexpr(func: &PyObject, f: &PyFunctionObject, co: &PyObject, arg: *mut PyObject, flags: u32) -> Option<PyResult> {
+    use crate::types::{dict as d, list as l, range as r, set as s, str as st};
+    let cd = code::code_data(co);
+    if !cd.eager_prologue || flags & bc::co::GENERATOR == 0 {
+        return None;
+    }
+    let cobj = code::code(co).obj;
+    if cobj.co_argcount != 1 || cobj.co_kwonlyargcount != 0 || flags & (bc::co::VARARGS | bc::co::VARKEYWORDS) != 0 {
+        return None;
+    }
+    let nfree = genexpr_prologue(cd)? as usize;
+    if crate::modules::sys::tracing_active() {
+        return None;
+    }
+    let a = unsafe { &*arg };
+    let tp = a.type_ptr();
+    let builtin = unsafe {
+        [
+            &raw mut l::PyList_Type,
+            &raw mut tuple::PyTuple_Type,
+            &raw mut r::PyRange_Type,
+            &raw mut d::PyDict_Type,
+            &raw mut s::PySet_Type,
+            &raw mut s::PyFrozenSet_Type,
+            &raw mut st::PyUnicode_Type,
+            crate::types::genobject::gen_type(),
+        ]
+    };
+    if !builtin.contains(&tp) {
+        return None;
+    }
+    let it = match crate::abstract_::get_iter(a) {
+        Ok(it) => it,
+        Err(e) => return Some(Err(e)),
+    };
+    let mut frame = Frame::new_call(co, func, unsafe { &*f.func_globals }, unsafe { &*f.func_builtins });
+    unsafe { incref(arg) };
+    frame.slots[0] = arg;
+    if nfree > 0 {
+        if f.func_closure.is_null() {
+            frame::recycle(frame);
+            return None;
+        }
+        let items = tuple::tuple_items(unsafe { &*f.func_closure });
+        let base = frame.nlocalsplus - nfree;
+        for (i, c) in items.iter().take(nfree).enumerate() {
+            frame.slots[base + i] = c.to_ref().into_raw();
+        }
+    }
+    let nlp = frame.nlocalsplus;
+    frame.slots[nlp] = it.into_raw();
+    frame.stack_top = nlp + 1;
+    frame.lasti = cd.gen_start - 1;
+    frame.next_instr = cd.gen_start;
+    frame.make_owned();
+    Some(crate::types::genobject::new_generator_for(frame, func, flags))
 }
 
 /// Execute a fresh frame to completion on the current thread.

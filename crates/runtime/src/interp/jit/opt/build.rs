@@ -1594,6 +1594,10 @@ impl<'a> B<'a> {
             return None;
         }
         let key = nm.as_ptr() as usize;
+        // rebound after an earlier fold: read it through the cache instead
+        if super::unstable_key(gp as usize, nm.as_ptr()) || super::unstable_key(bp as usize, nm.as_ptr()) {
+            return None;
+        }
         let (v, from_builtins) = match crate::types::dict::get_item_str(g, nm) {
             Some(v) => (v, false),
             None => (crate::types::dict::get_item_str(b, nm)?, true),
@@ -2222,7 +2226,7 @@ impl<'a> B<'a> {
                 return None;
             }
             let d = crate::types::module::m(mo).md_dict;
-            if d.is_null() || !crate::types::dict::is_dict_exact(&*d) {
+            if d.is_null() || !crate::types::dict::is_dict_exact(&*d) || super::unstable_key(d as usize, nm.as_ptr()) {
                 return None;
             }
             let v = crate::types::dict::get_item_str(&*d, nm)?;

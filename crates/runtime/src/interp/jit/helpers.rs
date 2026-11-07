@@ -746,6 +746,30 @@ pub unsafe extern "C" fn h_get_iter(sp: *mut *mut PyObject) -> u64 {
 pub unsafe extern "C" fn h_for_iter(sp: *mut *mut PyObject) -> u64 {
     unsafe {
         let it = &**sp.sub(1);
+        if it.is_type(crate::types::genobject::gen_type()) {
+            use crate::types::genobject as gm;
+            let (st, v) = gm::jit_send(it.as_ptr(), std::ptr::null_mut());
+            match st {
+                gm::JS_YIELD => {
+                    *sp = v;
+                    return 0;
+                }
+                gm::JS_RETURN => {
+                    decref(v);
+                    decref(std::ptr::replace(sp.sub(1), std::ptr::null_mut()));
+                    return 1;
+                }
+                gm::JS_ERROR => {
+                    if !exc_matches(crate::types::exceptions::StopIteration()) {
+                        return 2;
+                    }
+                    clear_exc();
+                    decref(std::ptr::replace(sp.sub(1), std::ptr::null_mut()));
+                    return 1;
+                }
+                _ => {}
+            }
+        }
         let f = match it.ty().tp_iternext {
             Some(f) => f,
             None => {
@@ -773,6 +797,34 @@ pub unsafe extern "C" fn h_for_iter(sp: *mut *mut PyObject) -> u64 {
 /// Send: [recv, v] -> [recv, yielded] (0) | [result] (1, jump) | error (2, [recv])
 pub unsafe extern "C" fn h_send(sp: *mut *mut PyObject) -> u64 {
     unsafe {
+        let recvp = *sp.sub(2);
+        let rt = (*recvp).type_ptr();
+        if rt == crate::types::genobject::gen_type() || rt == crate::types::genobject::coro_type() {
+            use crate::types::genobject as gm;
+            let (st, r) = gm::jit_send(recvp, *sp.sub(1));
+            match st {
+                gm::JS_YIELD => {
+                    *sp.sub(1) = r;
+                    return 0;
+                }
+                gm::JS_RETURN => {
+                    *sp.sub(1) = std::ptr::null_mut();
+                    decref(std::ptr::replace(sp.sub(2), r));
+                    return 1;
+                }
+                gm::JS_ERROR => {
+                    *sp.sub(1) = std::ptr::null_mut();
+                    if !exc_matches(crate::types::exceptions::StopIteration()) {
+                        return 2;
+                    }
+                    let x = take_exc().unwrap();
+                    let val = crate::types::exceptions::stop_iteration_value(&x);
+                    decref(std::ptr::replace(sp.sub(2), val.into_raw()));
+                    return 1;
+                }
+                _ => {}
+            }
+        }
         let v = take(sp.sub(1));
         let recv = &**sp.sub(2);
         match crate::types::genobject::send_to(recv, &v) {

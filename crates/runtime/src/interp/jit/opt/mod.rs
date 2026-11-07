@@ -248,6 +248,26 @@ fn same_key(dep: usize, key: *mut PyObject) -> bool {
     }
 }
 
+/// (dict, key hash) pairs whose folding was invalidated once: such a global is
+/// rebound while the program runs (go's `TIMESTAMP`), so folding it again would only
+/// cause more invalidations and recompilations. Builders read them through the
+/// generic path instead. A hash collision merely costs a fold.
+static UNSTABLE: Mutex<Option<std::collections::HashSet<(usize, isize)>>> = Mutex::new(None);
+
+fn key_hash(key: *mut PyObject) -> Option<isize> {
+    unsafe {
+        let k = &*key;
+        if crate::types::str::is_str_exact(k) { Some(crate::types::str::str_hash(k)) } else { None }
+    }
+}
+
+/// Has a fold of `key` in dict `d` been invalidated before?
+pub fn unstable_key(d: usize, key: *mut PyObject) -> bool {
+    let Some(h) = key_hash(key) else { return true };
+    let g = UNSTABLE.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref().is_some_and(|s| s.contains(&(d, h)))
+}
+
 /// A watched dict was written (called from cache::on_dict_write); `key` NULL: any key
 /// may have changed.
 #[cold]
@@ -258,6 +278,11 @@ pub fn dict_written(d: &PyObject, key: *mut PyObject) {
         let Some(m) = g.as_mut() else { return };
         let Some(v) = m.get_mut(&dk) else { return };
         let mut out = Vec::new();
+        if !key.is_null() && v.iter().any(|&(k, _)| same_key(k, key)) {
+            if let Some(h) = key_hash(key) {
+                UNSTABLE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert((dk, h));
+            }
+        }
         v.retain(|&(k, cc)| {
             if key.is_null() || same_key(k, key) {
                 out.push(cc);
@@ -391,6 +416,11 @@ fn compile_locked(code: &PyObject, cd: &CodeData, globals: *mut PyObject, builti
     if let Some(p) = unsafe { slot.load(Acquire).as_ref() } {
         if let Some(e) = p.entry(entry_pc) {
             return Some(e);
+        }
+        if entry_pc == 0 {
+            // the standard unit exists (a generator whose eager prologue keeps pc 0
+            // out of the unit's entries): nothing to recompile
+            return None;
         }
     }
     cc.t2_tries.fetch_add(1, Relaxed);

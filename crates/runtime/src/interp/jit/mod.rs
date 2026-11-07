@@ -72,8 +72,8 @@ fn init_config() -> bool {
             THRESHOLD.store(n, Relaxed);
         }
     }
-    if std::env::var("RPYTHON_JIT_DEBUG").map(|v| v != "0").unwrap_or(false) {
-        DEBUG.store(1, Relaxed);
+    if let Ok(v) = std::env::var("RPYTHON_JIT_DEBUG") {
+        DEBUG.store(v.parse::<u32>().unwrap_or(1), Relaxed);
     }
     ENABLED.store(en as u32, Relaxed);
     en
@@ -650,6 +650,14 @@ fn compile(f: &Frame, cd: &CodeData) -> bool {
         Err(e) => {
             if dbg {
                 eprintln!("[jit] tier1 failed for {}: {}", crate::types::str::to_string_lossy(&cd.co_qualname), e);
+                if DEBUG.load(Relaxed) >= 4 {
+                    for ins in analysis::decode(&cd.code) {
+                        eprintln!("    {:4} {:?} {}", ins.pc, ins.op, ins.arg);
+                    }
+                    for h in cd.exception_table.iter() {
+                        eprintln!("    handler {}..{} -> {} depth {} lasti {}", h.start, h.end, h.target, h.depth, h.lasti);
+                    }
+                }
             }
             cd.caches.tier_state.store(tier::FAILED, Release);
             false
