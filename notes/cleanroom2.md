@@ -15,6 +15,7 @@
 | file | tests before -> after | names/texts kept because pinned |
 |------|-----------------------|---------------------------------|
 | functools.py | test_functools 338 ok =; test_inspect 382, test_typing 731, test_genericalias, test_annotationlib, test_reprlib, test_call, test_pydoc, test___all__, test_enum, test_dataclasses = (all pass) | `_CacheInfo` (namedtuple "CacheInfo"), `_c3_mro`, `_compose_mro`, `_find_impl` (tests), `_c3_merge`, `RLock` (test_functools uses `py_functools.RLock`), `_unwrap_partial`, `_unwrap_partialmethod` (inspect), `__partialmethod__` marker on partialmethod's functions (inspect), `cached_property.attrname/.func` (inspect), `singledispatchmethod.dispatcher/.func`, `_PlaceholderType`, `Placeholder`; messages asserted by tests (Placeholder/partial call errors, register()/annotation errors, cached_property errors, "Ambiguous dispatch", "requires at least 1 positional argument", "the first argument must be callable") |
+| weakref.py (+ _weakrefset.py: `_IterationGuard` alias dropped) | test_weakref 140 ok = (also with -u cpu); test_weakset 46, test_copy, test_tempfile, test_abc, test_threading_local, test_finalization, test_logging, test_asyncio.test_tasks, test_functools, test___all__, test_pydoc = (all pass) | `KeyedRef` (public, `.key`), `.data` of both weak dicts (WeakValueDictionary's holds KeyedRefs; tests read it), `_remove` without closure (cpython_only test), `keyrefs/valuerefs/itervaluerefs`, finalize `alive/atexit/peek/detach`, "Keyword arguments are not supported: ..." (asserted) |
 
 ### functools.py notes
 - New structure: total_ordering derives methods from five small factories keyed by a recipe
@@ -37,3 +38,23 @@
 - Behaviour changes: partial.__setstate__ copies the namespace dict instead of sharing it;
   `@register` on a function annotated only for 'return' is rejected; wording of untested
   error messages.
+
+### weakref.py notes
+- New design: no iteration guard / deferred removals.  Iterating a weak dict walks a tuple
+  snapshot of its entries (tuple(), not list(): list(dict) is ~3x slower on our runtime) and
+  skips dead ones; removal callbacks always delete at once (WeakValueDictionary through
+  `_remove_dead_weakref`, so a stale callback never drops a newer value).  Removal callbacks are
+  default-argument functions made by `_value_remover/_key_remover` (no closure).
+- WeakMethod's two weak references share a `_MethodDeathNotice` callback object that holds the
+  WeakMethod weakly (no cycle, callback runs once).
+- finalize: state lives in `finalize._live` (finalizer -> `_Finalizer` record, slots class);
+  the exit hook sorts the atexit-enabled finalizers by creation serial and re-sorts whenever a
+  registration happened meanwhile (a finalizer created by a finalizer runs next); the cyclic
+  GC is paused during that pass; finalizers triggered after it do nothing.
+- `_collections_abc.MutableSet.register(WeakSet)` now lives in weakref.py (it was in the old
+  file; _weakrefset is imported too early to do it).
+- Timing (old -> new, ns/op, interleaved minima): WeakKeyDictionary set/get/contains equal,
+  iteration ~equal (57-84 vs 47-81, noisy), WeakValueDictionary items 155 -> 129,
+  finalize create+call 170 -> 159, WeakMethod 89 -> 82.
+- Behaviour change: entries whose referent died during an iteration are removed immediately
+  instead of when the last iterator finishes (len() is exact either way).
