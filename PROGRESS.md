@@ -1,9 +1,9 @@
 # PROGRESS
 
 ## Status 2026-11-07 (day 7, afternoon)
-Master f66b390: core6, perf4, tail1, capi2 merged today. Smoke on snap19: test_capi 40 failures (was 433 in run 11),
+Master f66b390: core6, perf4, tail1, capi2 merged today; suite run 12: 367/434 modules pass, 129 failures, 70 errors. Smoke on snap19: test_capi 40 failures (was 433 in run 11),
 stable_abi_ctypes/fileutils pass, cmd_line_script 1; tail1 fixed ~60 long-tail modules (inspect, codecs, time,
-path modules, math, buffer, logging, json, ...). Suite run 12 (snap19) running. Last complete run: run 11 (pre-merges):
+path modules, math, buffer, logging, json, ...). Run 11 (pre-merges):
 294/434 modules pass, 674 failures (241 without test_capi), 616 errors. Baseline free-threaded CPython: 416/434.
 Running agents: scale1 (multi-core scaling), perf5 (remaining slow benchmarks), stability3 (test_free_threading races,
 flaky crashes, gc hang), tail2 (alloc-failure injection, re.DEBUG, _zoneinfo, pdb, tkinter, leftovers),
@@ -90,6 +90,7 @@ Ours (tools/run_tests.sh, 434 modules):
 | 9 | 433df5d (jit6+interp1, pre-stability2) | 288 | 135 | 6 | 5 | 42,388 | 224 | 2,486 |
 | 10 | 55e6237 (stability2+perf3, pre-hang1) | 292 | 134 | 0 | 8 | 43,012 | 225 | 2,492 |
 | 11 | 9af79cb (hang1, pre-wheels2/core6) | 294 | 140 | 0 | 0 | 49,781 | 674 (241 excl. test_capi) | 3,200 |
+| 12 | f66b390 (core6+perf4+tail1+capi2) | 367 | 67 | 0 | 0 | 49,880 | 129 (+70 errors) | 3,202 |
 Run 7 (pre-core4): crashes = test_capi (segfault after a lone-surrogate print), test_free_threading
 (deque race, test_collections), test_itertools (flaky; passes now), test_multiprocessing_fork/spawn
 (heap corruption in test_manager); timeouts = asyncio, cmd_line_script, os, subprocess. Largest
@@ -101,6 +102,11 @@ subprocess. Largest failure counts: importlib 20, call 17, inspect 15, dict 8, c
 Run 9: crashes = test_free_threading (io heap corruption), test_functools (lru_cache race; fixed since), test_super
 (__class__ assignment race), test_multiprocessing_fork/forkserver/spawn; timeouts = asyncio, capi, cmd_line_script,
 os, subprocess. Largest failure counts: importlib 20, call 17, inspect 15, dict 8, concurrent_futures 7.
+Run 12: no crashes, no timeouts; 367/434 (baseline 416). 51 modules fail that pass on CPython: capi 40+13E, asyncio 10,
+concurrent_futures 5, re 4, faulthandler 3, collections 3, multiprocessing_* 2 each, crossinterp 30E, sys 1+3E, gc 2, ast 2,
+repl 2, ~30 modules with 1 failure; module-level errors: getpath (needs a getpath code object), nturl2path (missing),
+pdb/remote_pdb (_pyrepl_available, _PdbServer), profiling (profiling.sampling missing), type_cache, tkinter/ttk (gui
+resource: NO TESTS RAN exit status). Ours pass where the baseline fails: test_pydoc, test_site.
 Run 11: no crashes, no timeouts. The jump in failures is test_capi (433), which timed out in run 10 and now finishes in 89 s
 (capi2 is on it). Excluding it: 241 failures (225 in run 10; test_asyncio, cmd_line_script, multiprocessing_*, os were
 also timeouts before). Top remaining: importlib 20, call 17, inspect 15 (both 0 after core6), asyncio 10, dict 8.
