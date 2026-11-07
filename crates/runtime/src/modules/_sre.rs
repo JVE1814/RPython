@@ -1456,7 +1456,7 @@ fn init_types() -> PyResult<()> {
             ("prefixmatch", FASTKW, pattern_prefixmatch, "prefixmatch($self, /, string, pos=0, endpos=sys.maxsize)\n--\n\nTry to match the pattern at the start of string[pos:endpos]; return a Match or None."),
             ("fullmatch", FASTKW, pattern_fullmatch, "fullmatch($self, /, string, pos=0, endpos=sys.maxsize)\n--\n\nMatch only if the pattern covers the whole of string[pos:endpos]."),
             ("search", FASTKW, pattern_search, "search($self, /, string, pos=0, endpos=sys.maxsize)\n--\n\nReturn a Match for the first place the pattern matches, or None."),
-            ("sub", FASTKW, pattern_sub, "sub($self, /, repl, string, count=0)\n--\n\nReturn string with up to count (0: all) non-overlapping matches replaced by repl.\n\nrepl is a string (backslash escapes are processed) or a callable that\nreceives the Match and returns the replacement."),
+            ("sub", FASTKW, pattern_sub, "sub($self, /, repl, string, count=0)\n--\n\nReturn the string obtained by replacing the leftmost non-overlapping occurrences of the pattern in string by repl (at most count of them when count is positive).\n\nrepl is a string (backslash escapes are processed) or a callable that\nreceives the Match and returns the replacement."),
             ("subn", FASTKW, pattern_subn, "subn($self, /, repl, string, count=0)\n--\n\nLike sub(), but return (new_string, number_of_substitutions)."),
             ("findall", FASTKW, pattern_findall, "findall($self, /, string, pos=0, endpos=sys.maxsize)\n--\n\nReturn a list of all non-overlapping matches (or of their groups)."),
             ("split", FASTKW, pattern_split, "split($self, /, string, maxsplit=0)\n--\n\nSplit string at the matches; captured groups are kept in the result."),

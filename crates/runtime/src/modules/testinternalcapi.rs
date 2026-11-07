@@ -158,6 +158,17 @@ fn get_c_recursion_remaining(_m: &PyObject) -> PyResult {
     Ok(int::new_int(rem as i64))
 }
 
+/// (tail2) type_assign_specific_version_unsafe(type, version): force a version tag.
+fn type_assign_specific_version_unsafe(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    crate::args::check_pos("type_assign_specific_version_unsafe", args, 2, 2)?;
+    if !crate::types::typeobject::is_type(args[0]) {
+        raise!(TypeError, "type_assign_specific_version_unsafe() argument 1 must be a type");
+    }
+    let v = ab::as_i64(args[1])? as u32;
+    crate::interp::cache::set_type_tag_unchecked(args[0].as_ptr() as *mut PyTypeObject, v);
+    Ok(none::none_ref())
+}
+
 fn get_stack_pointer(_m: &PyObject) -> PyResult {
     let x = 0u8;
     Ok(int::new_int(&x as *const u8 as usize as i64))
@@ -514,6 +525,7 @@ pub fn init() -> PyResult {
             ("pymem_getallocatorsname", NOARGS, pymem_getallocatorsname),
             ("get_c_recursion_remaining", NOARGS, get_c_recursion_remaining),
             ("get_stack_pointer", NOARGS, get_stack_pointer),
+            ("type_assign_specific_version_unsafe", FAST, type_assign_specific_version_unsafe),
             ("get_stack_margin", NOARGS, get_stack_margin),
             ("_set_interrupt", NOARGS, set_interrupt),
             ("iframe_getcode", O, iframe_getcode),

@@ -76,6 +76,12 @@ pub fn assign_type_tag(tp: *mut PyTypeObject) -> u32 {
             return 0;
         }
     }
+    // (tail2) a class that keeps being modified stops being cached (as in CPython,
+    // at most MAX_VERSIONS_PER_CLASS tags per heap type)
+    let heap = unsafe { (*tp).tp_flags & Py_TPFLAGS_HEAPTYPE != 0 };
+    if heap && unsafe { (*tp).tp_versions_used } >= MAX_VERSIONS_PER_CLASS {
+        return 0;
+    }
     if mro_has_foreign_entry(tp) {
         return 0;
     }
@@ -87,10 +93,32 @@ pub fn assign_type_tag(tp: *mut PyTypeObject) -> u32 {
     match tag_cell(tp).compare_exchange(0, v, AcqRel, Acquire) {
         Ok(_) => {
             unsafe { (*tp).tp_flags |= Py_TPFLAGS_VALID_VERSION_TAG };
+            if heap {
+                unsafe { (*tp).tp_versions_used = (*tp).tp_versions_used.saturating_add(1) };
+            }
             register_tag(tp, v);
             v
         }
         Err(cur) => cur,
+    }
+}
+
+const MAX_VERSIONS_PER_CLASS: u16 = 1000;
+
+/// (tail2) `_testinternalcapi.type_assign_specific_version_unsafe`: give `tp` the tag
+/// `v` (0: none), counted against its per-class budget like an assignment.
+pub fn set_type_tag_unchecked(tp: *mut PyTypeObject, v: u32) {
+    tag_cell(tp).store(v, Release);
+    unsafe {
+        if v != 0 {
+            (*tp).tp_flags |= Py_TPFLAGS_VALID_VERSION_TAG;
+        } else {
+            (*tp).tp_flags &= !Py_TPFLAGS_VALID_VERSION_TAG;
+        }
+        (*tp).tp_versions_used = (*tp).tp_versions_used.saturating_add(1);
+    }
+    if v != 0 {
+        register_tag(tp, v);
     }
 }
 
