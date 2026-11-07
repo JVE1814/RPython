@@ -95,9 +95,11 @@ pub fn initialize(cfg: &Config) -> PyResult<()> {
             types::list::append(&path, types::str::new_str(p));
         }
     } else if !ignore_env {
-        if let Ok(pp) = std::env::var("PYTHONPATH") {
-            for p in pp.split(':').filter(|p| !p.is_empty()) {
-                types::list::append(&path, types::str::new_str(p));
+        // raw bytes, decoded like other OS paths (undecodable bytes become surrogates)
+        if let Some(pp) = std::env::var_os("PYTHONPATH") {
+            use std::os::unix::ffi::OsStrExt;
+            for p in pp.as_bytes().split(|&b| b == b':').filter(|p| !p.is_empty()) {
+                types::list::append(&path, modules::posix::path::fs_decode(p)?);
             }
         }
     }

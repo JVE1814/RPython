@@ -73,6 +73,14 @@ fn get_object_dict_values(_m: &PyObject, o: &PyObject) -> PyResult {
     Ok(tuple::new_tuple(out))
 }
 
+fn compiler_cleandoc(_m: &PyObject, s: &PyObject) -> PyResult {
+    if !pystr::is_str(s) {
+        raise!(TypeError, "compiler_cleandoc() argument must be str, not {}", crate::types::typeobject::tname(s));
+    }
+    let cps = pystr::str_data(s).to_vec();
+    Ok(pystr::from_codepoints(&rpy_compiler::clean_docstring(&cps)))
+}
+
 /// `_PyDict_GetItem_KnownHash` with the hash supplied by the caller.
 fn dict_getitem_knownhash(_m: &PyObject, a: &[&PyObject]) -> PyResult {
     crate::args::check_pos("dict_getitem_knownhash", a, 3, 3)?;
@@ -328,6 +336,7 @@ pub fn init() -> PyResult {
             ("pending_threadfunc", FASTKW, pending_threadfunc),
             ("has_split_table", O, has_split_table),
             ("get_object_dict_values", O, get_object_dict_values),
+            ("compiler_cleandoc", O, compiler_cleandoc),
             ("dict_getitem_knownhash", FAST, dict_getitem_knownhash),
             ("get_recursion_depth", NOARGS, get_recursion_depth),
             ("get_long_lived_total", NOARGS, get_long_lived_total),

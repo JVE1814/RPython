@@ -99,6 +99,11 @@ impl CompileOptions {
     }
 }
 
+/// The docstring cleaning the compiler applies (`_testinternalcapi.compiler_cleandoc`).
+pub fn clean_docstring(code_points: &[u32]) -> Vec<u32> {
+    wc::clean_doc(&ast::PyStr::CodePoints(code_points.to_vec()))
+}
+
 /// Compile a module/expression AST to a code object in the public CPython 3.15 format.
 pub fn compile(module: &ast::Mod, opts: &CompileOptions) -> Result<WordcodeOutput, CompileError> {
     wc::compile_module(module, opts)

@@ -159,6 +159,11 @@ pub fn call_function(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwna
             // RETURN_GENERATOR is preceded by real work (a genexpr's `iter()`): run the
             // frame up to it now, so errors surface at call time.
             frame = run_generator_prologue(frame)?;
+        } else {
+            // the free variables are in place from creation on (CPython copies them before
+            // RETURN_GENERATOR), so f_locals of a not yet started frame shows them; the
+            // CopyFreeVars at the first resume stores the same cells again
+            copy_free_vars(&mut frame, f);
         }
         return crate::types::genobject::new_generator_for(frame, func, flags);
     }
@@ -340,6 +345,22 @@ pub fn frame_finished(mut frame: Box<Frame>) {
 /// Copy closure cells into free slots. (Cells for cell variables are created by MakeCell.)
 fn prepare_cells(frame: &mut Frame, f: &PyFunctionObject) {
     let _ = (frame, f);
+}
+
+fn copy_free_vars(frame: &mut Frame, f: &PyFunctionObject) {
+    if f.func_closure.is_null() {
+        return;
+    }
+    let n = code::code(frame.code()).nfreevars();
+    let items = tuple::tuple_items(unsafe { &*f.func_closure });
+    if n == 0 || items.len() < n || frame.nlocalsplus < n {
+        return;
+    }
+    let base = frame.nlocalsplus - n;
+    for i in 0..n {
+        let old = std::mem::replace(&mut frame.slots[base + i], items[i].to_ref().into_raw());
+        unsafe { xdecref(old) };
+    }
 }
 
 /// Put arguments into localsplus according to CPython's binding rules.

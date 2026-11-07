@@ -590,7 +590,7 @@ fn methods() -> *mut crate::ffi::PyMethodDef {
     use scandir::*;
     use stat::*;
     crate::mdefs![
-        ("login_tty", FAST, os_login_tty),
+        ("login_tty", FAST, os_login_tty, "login_tty($module, fd, /)\n--\n\nStart a login session on the terminal open as fd: the process becomes the\nsession leader with that terminal as controlling terminal and standard\nstreams, and fd itself is closed."),
         ("_is_inputhook_installed", NOARGS, os_is_inputhook_installed, "_is_inputhook_installed($module, /)\n--\n\n"),
         ("_inputhook", NOARGS, os_inputhook, "_inputhook($module, /)\n--\n\n"),
         ("stat", FASTKW, os_stat, "stat($module, /, path, *, dir_fd=None, follow_symlinks=True)\n--\n\nReturn a stat_result for a path or file descriptor."),
