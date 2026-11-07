@@ -181,6 +181,10 @@ pub enum Term {
     /// return the owned object in v (stack_top = nlp + depth); the snapshot lists the
     /// dirty unboxed locals (synced if a frame object outlives the activation)
     Return(V, u32, Option<SnapId>),
+    /// generator suspension: yield the owned object in v (stack_top = nlp + depth),
+    /// sync the dirty locals listed in the snapshot (its `resume` is the instruction
+    /// the next resumption enters at), yield_from_send = the i32
+    Yield(V, u32, SnapId, i32),
     /// unconditional deoptimisation
     Deopt(SnapId),
     /// the block ends in a template instruction that never falls through (or jumps
@@ -442,7 +446,7 @@ impl Term {
                 let mut d = Vec::new();
                 Inst::Guard(*c, 0).uses_defs(u, &mut d);
             }
-            Term::Return(v, _, _) => u.push(*v),
+            Term::Return(v, _, _) | Term::Yield(v, _, _, _) => u.push(*v),
             _ => {}
         }
     }

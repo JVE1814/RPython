@@ -26,7 +26,8 @@ def _check_hardlink(optimize, hardlink_dupes):
     if not hardlink_dupes:
         return
     seq = [optimize] if isinstance(optimize, int) else list(optimize)
-    if len(seq) < 2 or len(set(seq)) != len(seq):
+    # duplicates are dropped: what counts is the number of distinct levels
+    if len(set(seq)) < 2:
         raise ValueError("Hardlinking of duplicated bytecode makes sense "
                          "only for more than one optimization level")
 

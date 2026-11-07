@@ -50,6 +50,8 @@ pub mod layout {
     pub const LASTI: i32 = offset_of!(Frame, lasti) as i32;
     pub const NEXT_INSTR: i32 = offset_of!(Frame, next_instr) as i32;
     pub const STACK_TOP: i32 = offset_of!(Frame, stack_top) as i32;
+    pub const YIELD_FROM_SEND: i32 = offset_of!(Frame, yield_from_send) as i32;
+    pub const RESUME: i32 = offset_of!(Frame, resume) as i32;
     pub const T2_SITE: i32 = offset_of!(Frame, t2_site) as i32;
     pub const T2_SP: i32 = offset_of!(Frame, t2_sp) as i32;
     pub const FRAME_OBJ: i32 = offset_of!(Frame, frame_obj) as i32;
@@ -143,6 +145,10 @@ static ENABLED: AtomicU8 = AtomicU8::new(2);
 static CALLS: AtomicU32 = AtomicU32::new(1000);
 static BACKEDGES: AtomicU32 = AtomicU32::new(10000);
 static DEBUG: AtomicU8 = AtomicU8::new(0);
+/// RPYTHON_JIT_DEBUG level (3: also log inlining decisions).
+pub fn debug_level() -> u8 {
+    DEBUG.load(Relaxed)
+}
 /// deoptimisations after which code is discarded
 const DEOPT_LIMIT: u32 = 64;
 /// compilations per code object
@@ -169,6 +175,19 @@ fn init() -> bool {
 pub fn enabled() -> bool {
     match ENABLED.load(Relaxed) {
         2 => init(),
+        x => x != 0,
+    }
+}
+
+/// Tier 2 compiles generator/coroutine code (RPYTHON_JIT2_GEN=0 disables it).
+fn gen_enabled() -> bool {
+    static GEN: AtomicU8 = AtomicU8::new(2);
+    match GEN.load(Relaxed) {
+        2 => {
+            let en = std::env::var("RPYTHON_JIT2_GEN").map(|v| v != "0").unwrap_or(true);
+            GEN.store(en as u8, Relaxed);
+            en
+        }
         x => x != 0,
     }
 }
@@ -346,7 +365,12 @@ pub fn compile(code: &PyObject, globals: *mut PyObject, builtins: *mut PyObject,
     let co = crate::types::code::code(code);
     let flags = co.flags();
     use rpy_compiler::bytecode::co as cof;
-    if flags & (cof::GENERATOR | cof::COROUTINE | cof::ASYNC_GENERATOR | cof::ITERABLE_COROUTINE) != 0 || flags & cof::OPTIMIZED == 0 {
+    // generator code: the standard unit only (with an entry after every yield)
+    let is_gen = flags & (cof::GENERATOR | cof::COROUTINE | cof::ASYNC_GENERATOR | cof::ITERABLE_COROUTINE) != 0;
+    if is_gen && entry_pc != 0 {
+        return None;
+    }
+    if !gen_enabled() && is_gen || flags & cof::OPTIMIZED == 0 {
         cc.t2_tries.store(MAX_TRIES, Relaxed);
         return None;
     }
@@ -511,6 +535,11 @@ pub unsafe extern "C" fn h_backedge(f: *mut crate::interp::frame::Frame, header:
         // only a few times), OSR unit for this activation
         if cc.opt.load(Acquire).is_null() {
             compile(&code, f.globals, f.builtins, 0);
+        }
+        if !f.generator.is_null() || crate::types::code::code(&code).flags() & rpy_compiler::bytecode::co::GENERATOR != 0 {
+            // generator: no OSR units; the activation moves to tier 2 at its next
+            // suspension (tier-1 YieldValue defers to installed tier-2 code)
+            return 0;
         }
         compile(&code, f.globals, f.builtins, header as usize).unwrap_or(0)
     }

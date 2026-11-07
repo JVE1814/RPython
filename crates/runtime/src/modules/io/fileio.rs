@@ -195,6 +195,11 @@ fn fileio_init_impl(o: &PyObject, file: &PyObject, mode: &str, closefd: bool, op
     }
     let _ = plus;
     flags |= libc::O_CLOEXEC;
+    {
+        // audited with the access letters of the mode ('b' is implied)
+        let shown: String = mode.chars().filter(|&c| c != 'b').collect();
+        crate::modules::sys_full::audit("open", &[file, &crate::types::str::new_str(&shown), &int::new_int(flags as i64)])?;
+    }
     f.created = created;
     f.readable = readable;
     f.writable = writable;

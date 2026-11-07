@@ -382,6 +382,8 @@ class _ReadlineWrapper:
         return len(self.get_reader().history)
 
     def read_history_file(self, filename: str = "~/.history") -> None:
+        # the REPL keeps appending new entries to the file history came from
+        self.history_file = filename
         history = self.get_reader().history
         with open(os.path.expanduser(filename), "rb") as f:
             data = f.read()

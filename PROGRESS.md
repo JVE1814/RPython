@@ -43,6 +43,20 @@ D2 extraction — revisit D2 for test_idle.
   warnings.warn, sys.excepthook (harness), enum (functional).
 
 ## C ABI / wheels
+**numpy 2.5.4 cp315t, full own test suite (numpy2, same wheels/pytest/hypothesis on ours and on py-ft):**
+| package | ours | CPython ft | failures only on ours |
+|---|---|---|---|
+| numpy (full) | 50,575 passed, 3 failed, 41 errors | 50,574 passed, 5 failed, 41 errors | **0** |
+| numpy test_multithreading | 34/34 | 34/34 | 0 |
+| bitarray 3.12.3 | 740 passed | 740 passed | 0 |
+| regex | 101 passed, 1 failed | same | 0 |
+| markupsafe 3.0.4 | 79 passed | 79 passed | 0 |
+| msgpack 1.2.4 | 160 passed | 160 passed | 0 |
+| msgspec 0.22.0 | 6,541 passed, 1 failed | 6,542 passed | 1 |
+| pandas 3.1.0 | crashes (use-after-free, stability2 investigating) | 182,561 passed | — |
+numpy suite wall time: ours 7m30s vs CPython ft 10m12s. pip installs from PyPI over the network (ssl) and builds sdists.
+
+### Earlier
 pip (bundled 26.2.2 via ensurepip) installs the unmodified numpy-2.5.4-cp315-cp315t-manylinux wheel in a venv on
 our interpreter; `import numpy` works (array math, linalg, fft, datetime64); numpy test_abc 5/5, test_api 59/59.
 Blockers being fixed (numpy workstream): Cython code objects (numpy.random), C-created frame f_locals.
@@ -62,13 +76,38 @@ Ours (tools/run_tests.sh, 434 modules):
 | 3 | d8d869f | 158 | 266 | 6 | 4 | 14,157 | 1,195 | 892 |
 | 4 | 30f8658 | 208 | 215 | 6 | 4 | 23,987 | 1,165 | 1,632 |
 | 5 | b578bf8 | 250 | 174 | 6 | 4 | 40,734 | 1,294 | 2,549 |
+| 6 | cd9478e | 259 | 158 | 13 | 4 | 39,273 | 660 | 2,377 |
 Run 3 top blockers: array (39 modules), http (21), urllib (12), multiprocessing (11),
 importlib.resources (11), datetime (11), concurrent (9), xml/email (7 each), html (6).
 Run 1 top blockers: py_compile (230 modules; merged since), unittest.mock (57), doctest (24),
 array (24), socket (17), pathlib (16), http (14), multiprocessing, decimal, datetime, ntpath.
 
 ## Benchmarks
-### Latest (jit3, tier 2 on by default; steady-state callgrind instructions per loop, millions; ratio = ours / best CPython)
+### Latest (jit4, 2026-11-07; steady-state callgrind instructions per loop, millions; ratio = ours / best CPython)
+| bench | CPython default | CPython ft | ours | ratio |
+|---|---|---|---|---|
+| richards | 461 | 566 | 314 | 0.68 |
+| nbody | 1108 | 1402 | 360 | 0.32 |
+| spectral_norm | 1208 | 1404 | 636 | 0.53 |
+| float | 778 | 870 | 702 | 0.90 |
+| richards_super | 530 | 639 | 484 | 0.91 |
+| chaos | 611 | 683 | 486 | 0.80 |
+| coroutines | 294 | 300 | 290 | 0.98 |
+| unpack_sequence | 0.25 | 0.15 | 0.11 | 0.73 |
+| raytrace | 2757 | 3201 | 2776 | 1.01 |
+| generators | 337 | 372 | 478 | 1.42 |
+| fannkuch | 4393 | 4963 | 5780 | 1.32 |
+| deltablue | 29.1 | 42.4 | 36.9 | 1.27 |
+| hexiom | 58.1 | 65.7 | 82.7 | 1.42 |
+| go | 1138 | 1260 | 1511-2167 | 1.3-1.9 |
+| nqueens | 842 | 943 | 1860 | 2.21 |
+| comprehensions | 0.19 | 0.24 | 0.39 | 2.1 |
+Wall-clock pinned (s/loop, ours / default / ft): richards 0.0295/0.0299/0.0379, nbody 0.0261/0.0569/0.0784,
+float 0.0460/0.0480/0.0566, chaos 0.0354/0.0376/0.0429, raytrace 0.197/0.188/0.207, generators 0.040/0.020/0.022,
+coroutines 0.0160/0.0144/0.0141, nqueens 0.137/0.054/0.072, deltablue 0.00325/0.00221/0.00275, go 0.127/0.079/0.094.
+Next (jit5): genexp regression after D24, generator resume/wall-clock, go deopt churn, temp tuples.
+
+### Previous (jit3)
 | bench | CPython default | CPython ft | ours | ratio |
 |---|---|---|---|---|
 | richards | 461 | 566 | 353 | 0.77 |

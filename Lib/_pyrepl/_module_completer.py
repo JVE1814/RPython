@@ -168,15 +168,27 @@ class ModuleCompleter:
         return list(pkgutil.iter_modules(locations))
 
     def _package_locations(self, name: str) -> list[str] | None:
+        found = self._search_package_locations(name)
         module = sys.modules.get(name)
-        if module is not None:
-            spec = getattr(module, "__spec__", None)
-            if spec is None or spec.origin is None and not spec.submodule_search_locations:
-                return None
-            if spec.origin is None or not getattr(spec, "has_location", True):
-                return None
-            locations = spec.submodule_search_locations
-            return list(locations) if locations is not None else None
+        if not isinstance(module, types.ModuleType):
+            # nothing imported (or a mere placeholder): trust the search
+            return found
+        spec = getattr(module, "__spec__", None)
+        if (spec is None or spec.origin is None
+                or not getattr(spec, "has_location", True)):
+            return None
+        locations = spec.submodule_search_locations
+        if locations is None:
+            return None
+        locations = list(locations)
+        # the imported package shadows whatever the search path finds now;
+        # if they differ, the files on the path are not what an import of a
+        # submodule would see, so propose nothing
+        if found is not None and found != locations:
+            return None
+        return locations
+
+    def _search_package_locations(self, name: str) -> list[str] | None:
         head, _, tail = name.rpartition(".")
         if head:
             search = self._package_locations(head)

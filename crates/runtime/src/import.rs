@@ -823,7 +823,8 @@ pub fn remove_importlib_frames() {
 }
 
 fn find_and_load(abs: &str, path: Option<&PyObject>) -> PyResult {
-    // 1. importlib (only builtin modules until the path finders are installed)
+    // 1. importlib (only builtin modules until the path finders are installed;
+    // importlib raises the "import" audit event)
     if let Some(bs) = bootstrap() {
         if importlib_active() || (path.is_none() && find_builtin(abs).is_some()) {
             let f = ab::getattr_str(&bs, "_find_and_load")?;

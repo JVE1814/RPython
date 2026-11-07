@@ -519,6 +519,21 @@ def gethistoryfile():
     return os.path.join(os.path.expanduser('~'), '.python_history')
 
 
+def _pyrepl_readline():
+    """The readline emulation of the pyrepl REPL if that REPL is going to
+    run, else None."""
+    if not sys.flags.ignore_environment and os.environ.get("PYTHON_BASIC_REPL"):
+        return None
+    try:
+        from _pyrepl.main import CAN_USE_PYREPL
+        if not CAN_USE_PYREPL:
+            return None
+        import _pyrepl.readline
+    except Exception:
+        return None
+    return _pyrepl.readline
+
+
 def register_readline():
     """The interactive hook: set up readline completion and history."""
     import atexit
@@ -526,15 +541,21 @@ def register_readline():
         import readline
         import rlcompleter  # installs the completer
     except ImportError:
+        readline = None
+    # the history belongs to whichever line editor the REPL will use
+    readline = _pyrepl_readline() or readline
+    if readline is None:
         return
     if 'libedit' in (getattr(readline, '__doc__', '') or ''):
         readline.parse_and_bind('bind ^I rl_complete')
     else:
         readline.parse_and_bind('tab: complete')
-    try:
-        readline.read_init_file()
-    except OSError:
-        pass
+    read_init_file = getattr(readline, 'read_init_file', None)
+    if read_init_file is not None:
+        try:
+            read_init_file()
+        except OSError:
+            pass
     if readline.get_current_history_length() != 0:
         # a startup file already set up the history
         return

@@ -157,17 +157,38 @@ fn jumps(op: Op) -> bool {
     op.is_jump()
 }
 
-fn build_cfg(an: &Analysis, entry: usize) -> Cfg {
+/// Block-ending instruction of the unit's CFG: a generator unit (`resumes` non-empty)
+/// leaves through `YieldValue` and comes back through a separate entry.
+fn ends_block(op: Op, is_gen: bool) -> bool {
+    is_terminator(op) || (is_gen && matches!(op, Op::YieldValue | Op::ReturnGenerator))
+}
+
+/// Instruction indices where a generator unit is re-entered after a yield (empty for
+/// other units).
+fn resume_points(u: &Unit) -> Vec<usize> {
+    use rpy_compiler::bytecode::co as cof;
+    if u.entry != 0 || u.flags & (cof::GENERATOR | cof::COROUTINE | cof::ASYNC_GENERATOR | cof::ITERABLE_COROUTINE) == 0 {
+        return Vec::new();
+    }
+    let an = u.an;
+    (0..an.instrs.len()).filter(|&i| i > 0 && matches!(an.instrs[i - 1].op, Op::YieldValue | Op::ReturnGenerator) && an.depth[i] >= 0 && an.depth[i - 1] >= 0).collect()
+}
+
+fn build_cfg(an: &Analysis, entry: usize, resumes: &[usize]) -> Cfg {
     let n = an.instrs.len();
+    let is_gen = !resumes.is_empty();
     let mut leader = vec![false; n + 1];
     leader[0] = true;
     leader[entry] = true;
+    for &r in resumes {
+        leader[r] = true;
+    }
     for i in 0..n {
         let ins = an.instrs[i];
         if an.is_target[i] {
             leader[i] = true;
         }
-        if jumps(ins.op) || is_terminator(ins.op) {
+        if jumps(ins.op) || ends_block(ins.op, is_gen) {
             leader[i + 1] = true;
             if jumps(ins.op) {
                 leader[an.index_of[ins.arg as usize] as usize] = true;
@@ -195,33 +216,40 @@ fn build_cfg(an: &Analysis, entry: usize) -> Cfg {
         if jumps(ins.op) {
             s.push(block_of[an.index_of[ins.arg as usize] as usize] as usize);
         }
-        if !is_terminator(ins.op) && blocks[b].last + 1 < n {
+        if !ends_block(ins.op, is_gen) && blocks[b].last + 1 < n {
             s.push(block_of[blocks[b].last + 1] as usize);
         }
         blocks[b].succs = s;
     }
-    // reverse postorder from the entry block; backedges mark loop headers
+    // reverse postorder from the entry blocks (resume entries first, so the main
+    // entry comes first in the order); backedges mark loop headers
     let eb = block_of[entry] as usize;
     let mut post = Vec::new();
     let mut state = vec![0u8; blocks.len()]; // 0 new, 1 on stack, 2 done
-    let mut stack: Vec<(usize, usize)> = vec![(eb, 0)];
-    state[eb] = 1;
-    while let Some(&mut (b, ref mut k)) = stack.last_mut() {
-        if *k < blocks[b].succs.len() {
-            let s = blocks[b].succs[*k];
-            *k += 1;
-            match state[s] {
-                0 => {
-                    state[s] = 1;
-                    stack.push((s, 0));
+    let roots: Vec<usize> = resumes.iter().rev().map(|&r| block_of[r] as usize).chain(std::iter::once(eb)).collect();
+    for root in roots {
+        if state[root] != 0 {
+            continue;
+        }
+        let mut stack: Vec<(usize, usize)> = vec![(root, 0)];
+        state[root] = 1;
+        while let Some(&mut (b, ref mut k)) = stack.last_mut() {
+            if *k < blocks[b].succs.len() {
+                let s = blocks[b].succs[*k];
+                *k += 1;
+                match state[s] {
+                    0 => {
+                        state[s] = 1;
+                        stack.push((s, 0));
+                    }
+                    1 => blocks[s].header = true,
+                    _ => {}
                 }
-                1 => blocks[s].header = true,
-                _ => {}
+            } else {
+                state[b] = 2;
+                post.push(b);
+                stack.pop();
             }
-        } else {
-            state[b] = 2;
-            post.push(b);
-            stack.pop();
         }
     }
     post.reverse();
@@ -237,6 +265,10 @@ fn build_cfg(an: &Analysis, entry: usize) -> Cfg {
     if blocks[eb].header || entry != 0 {
         // the entry is also reached from outside
         blocks[eb].npreds += 1;
+    }
+    for &r in resumes {
+        // entered from a synthetic resume-entry block
+        blocks[block_of[r] as usize].npreds += 1;
     }
     Cfg { blocks, block_of, order: post }
 }
@@ -281,6 +313,14 @@ struct B<'a> {
     /// callee analyses / units referenced through `u` while inlining
     inl_an: Vec<Box<Analysis>>,
     inl_units: Vec<Box<Unit<'static>>>,
+    /// contexts of the callees being inlined around the current one (nested inlining)
+    inl_outer: Vec<InlCtx>,
+    /// code data of the root unit and of every callee being inlined (no recursion)
+    inl_cds: Vec<usize>,
+    /// an inconsistent join was met: abandon the compilation
+    fatal: Option<&'static str>,
+    /// generator unit: YieldValue suspends natively and resumes at its own entry
+    is_gen: bool,
 }
 
 /// State of an inlined call being built.
@@ -359,7 +399,7 @@ fn inline_enabled() -> bool {
 /// with version tag `tag`? Tags are unique and never reused, so a freed or modified
 /// type cannot match.
 fn live_type(tp: usize, tag: u64) -> bool {
-    tag != 0 && crate::interp::cache::type_tag(tp as *mut PyTypeObject) as u64 == tag
+    tag != 0 && tag <= u32::MAX as u64 && crate::interp::cache::type_alive_with_tag(tp, tag as u32)
 }
 fn is_heap_type(tp: usize) -> bool {
     unsafe { (*(tp as *mut PyTypeObject)).tp_flags & Py_TPFLAGS_HEAPTYPE != 0 }
@@ -371,7 +411,23 @@ impl<'a> B<'a> {
         self.f.new_v(c)
     }
     fn emit(&mut self, i: Inst) {
+        // a decref may free the object and run arbitrary code (__del__, weakref
+        // callbacks) that mutates classes: type facts guarded earlier no longer hold
+        let forget = matches!(i, Inst::Decref(_) | Inst::XDecref(_)) && !keep_facts();
         self.f.blocks[self.cur as usize].insts.push(i);
+        if forget {
+            self.forget_tags();
+        }
+    }
+    /// Decref of a value whose type is known to free without running Python code.
+    fn emit_leaf_decref(&mut self, v: V) {
+        self.f.blocks[self.cur as usize].insts.push(Inst::Decref(v));
+    }
+    fn leaf_type(t: Ty) -> bool {
+        match t {
+            Ty::Exact(p) => p == int_t() || p == float_t() || p == bool_t() || p == crate::types::str::str_type() as usize,
+            _ => false,
+        }
     }
     fn new_block(&mut self, instr: u32) -> BlockId {
         self.f.blocks.push(Block { insts: Vec::new(), term: Term::None, instr, tsuccs: Vec::new() });
@@ -608,6 +664,7 @@ impl<'a> B<'a> {
                 self.emit(Inst::Load(v, Base::Slots, off));
                 self.emit(Inst::XDecref(v));
             }
+            AV::Obj(v, Own::Owned, t) if Self::leaf_type(t) => self.emit_leaf_decref(v),
             AV::Obj(v, Own::Owned, _) => self.emit(Inst::Decref(v)),
             _ => {}
         }
@@ -951,15 +1008,19 @@ impl<'a> B<'a> {
 
     // ------------------------------------------------------------ control flow
     fn initial_state(&mut self) -> State {
+        self.initial_state_at(self.u.entry)
+    }
+    /// State when the unit is entered at instruction `at` (everything in the frame).
+    fn initial_state_at(&mut self, at: usize) -> State {
         let n = self.u.nlp;
         let mut locals = Vec::with_capacity(n);
         for i in 0..n {
             locals.push(match self.reps[i] {
                 Rep::Frame => LS::Frame(Ty::Unknown),
-                _ => LS::Unboxed { dirty: false, def: if self.u.entry == 0 { Def::No } else { Def::Maybe } },
+                _ => LS::Unboxed { dirty: false, def: if at == 0 { Def::No } else { Def::Maybe } },
             });
         }
-        let d = self.u.an.depth[self.u.entry].max(0) as usize;
+        let d = self.u.an.depth[at].max(0) as usize;
         State { stack: vec![AV::InFrame(Ty::Unknown); d], locals, ptr: vec![None; n], unb: vec![None; n] }
     }
 
@@ -981,8 +1042,10 @@ impl<'a> B<'a> {
         if let Some(es) = &self.entry_state[t] {
             // backedge: the target's assumed state must hold
             if !compatible(&st, es) {
-                let w = meet(es, &st);
-                self.assume[t] = Some(w);
+                match meet(es, &st) {
+                    Ok(w) => self.assume[t] = Some(w),
+                    Err(e) => self.fatal = Some(e),
+                }
                 self.restart = true;
             }
         } else {
@@ -990,30 +1053,31 @@ impl<'a> B<'a> {
         }
     }
 
-    fn block_entry(&mut self, b: usize) -> State {
+    fn block_entry(&mut self, b: usize) -> Result<State, String> {
         if b == self.cfg.block_of[self.u.entry] as usize && self.pending[b].is_empty() && self.u.entry == self.cfg.blocks[b].first {
             let mut s = self.initial_state();
             if let Some(a) = &self.assume[b] {
-                s = meet(&s, a);
+                s = meet(&s, a)?;
             }
-            return s;
+            return Ok(s);
         }
         let mut it = std::mem::take(&mut self.pending[b]).into_iter();
-        let mut s = it.next().expect("tier2: block without predecessor state");
+        let Some(mut s) = it.next() else { return Err("tier2: block without predecessor state".into()) };
         for o in it {
-            s = meet(&s, &o);
+            s = meet(&s, &o)?;
         }
         if self.cfg.blocks[b].first == self.u.entry {
-            s = meet(&s, &self.initial_state());
+            let i = self.initial_state();
+            s = meet(&s, &i)?;
         }
         if self.cfg.blocks[b].header {
             if let Some(a) = &self.assume[b] {
-                s = meet(&s, a);
+                s = meet(&s, a)?;
             }
             s.ptr.iter_mut().for_each(|p| *p = None);
             s.unb.iter_mut().for_each(|p| *p = None);
         }
-        s
+        Ok(s)
     }
 }
 
@@ -1052,8 +1116,12 @@ fn compatible(actual: &State, assumed: &State) -> bool {
     true
 }
 
-fn meet(a: &State, b: &State) -> State {
-    assert_eq!(a.stack.len(), b.stack.len(), "tier2: stack depth mismatch at join");
+/// Join of two states (an inconsistent pair abandons the compilation: `B::fatal`).
+fn meet(a: &State, b: &State) -> Result<State, &'static str> {
+    if a.stack.len() != b.stack.len() || a.locals.len() != b.locals.len() {
+        return Err("tier2: stack depth mismatch at join");
+    }
+    let mut bad = None;
     let stack = a
         .stack
         .iter()
@@ -1061,7 +1129,10 @@ fn meet(a: &State, b: &State) -> State {
         .map(|(x, y)| match (x, y) {
             (AV::InFrame(s), AV::InFrame(t)) => AV::InFrame(s.meet(*t)),
             _ if x == y => *x,
-            _ => panic!("tier2: unmaterialised stack entry at join"),
+            _ => {
+                bad = Some("tier2: unmaterialised stack entry at join");
+                *x
+            }
         })
         .collect();
     let locals = a
@@ -1071,12 +1142,18 @@ fn meet(a: &State, b: &State) -> State {
         .map(|(x, y)| match (x, y) {
             (LS::Frame(s), LS::Frame(t)) => LS::Frame(s.meet(*t)),
             (LS::Unboxed { dirty: d1, def: f1 }, LS::Unboxed { dirty: d2, def: f2 }) => LS::Unboxed { dirty: *d1 || *d2, def: f1.meet(*f2) },
-            _ => panic!("tier2: local representation mismatch"),
+            _ => {
+                bad = Some("tier2: local representation mismatch");
+                *x
+            }
         })
         .collect();
     let ptr = a.ptr.iter().zip(&b.ptr).map(|(x, y)| if x == y { *x } else { None }).collect();
     let unb = a.unb.iter().zip(&b.unb).map(|(x, y)| if x == y { *x } else { None }).collect();
-    State { stack, locals, ptr, unb }
+    match bad {
+        Some(e) => Err(e),
+        None => Ok(State { stack, locals, ptr, unb }),
+    }
 }
 
 // ================================================================ instructions
@@ -1096,7 +1173,10 @@ impl<'a> B<'a> {
 
     /// Build one bytecode block.
     fn build_block(&mut self, b: usize) -> Result<(), String> {
-        let st = self.block_entry(b);
+        if let Some(e) = self.fatal {
+            return Err(e.into());
+        }
+        let st = self.block_entry(b)?;
         self.entry_state[b] = Some(st.clone());
         self.st = st;
         self.cur = self.ir_block[b];
@@ -1260,38 +1340,31 @@ impl<'a> B<'a> {
                     self.discard(a, k);
                     self.push(AV::Bool(r));
                 }
+                AV::InFrame(_) | AV::Obj(..) => {
+                    // truth of any object: True/False/None without a call, otherwise
+                    // the object's truth protocol (may run arbitrary code)
+                    let es = self.snap(i, SnapKind::Error);
+                    let p = self.peek_ptr(1);
+                    let r = self.v(Class::G);
+                    self.emit(Inst::Call { addr: h2_truth as usize, args: vec![Opnd::V(p)], fargs: vec![], ret: Some(r), fret: None });
+                    self.emit(Inst::Guard(Cond::Cmp(r, Opnd::I(0), Cc::L), es));
+                    let k = self.st.stack.len() - 1;
+                    let a = self.pop();
+                    self.discard(a, k);
+                    self.forget_tags();
+                    if ins.op == Op::UnaryNot {
+                        let n = self.v(Class::G);
+                        self.emit(Inst::Alu(Alu::Xor, n, r, Opnd::I(1)));
+                        self.push(AV::Bool(n));
+                    } else {
+                        self.push(AV::Bool(r));
+                    }
+                }
                 _ => self.template(i),
             },
             Op::PopJumpIfFalse | Op::PopJumpIfTrue => {
                 let on_true = ins.op == Op::PopJumpIfTrue;
-                let c = match self.peek(1) {
-                    AV::Cond(c) => {
-                        self.pop();
-                        Some(c)
-                    }
-                    AV::Bool(v) => {
-                        self.pop();
-                        Some(Cond::Test(v, Opnd::V(v), Cc::NE))
-                    }
-                    AV::I64(v) => {
-                        self.pop();
-                        Some(Cond::Test(v, Opnd::V(v), Cc::NE))
-                    }
-                    AV::Const(p) if p == true_p() || p == false_p() || p == none_p() => {
-                        self.pop();
-                        let v = self.imm((p == true_p()) as i64);
-                        Some(Cond::Test(v, Opnd::V(v), Cc::NE))
-                    }
-                    AV::InFrame(t) | AV::Obj(_, _, t) if t.is(crate::types::bool_::bool_type()) => {
-                        let p = self.peek_ptr(1);
-                        let tv = self.imm(true_p() as i64);
-                        let k = self.st.stack.len() - 1;
-                        let a = self.pop();
-                        self.discard(a, k);
-                        Some(Cond::Cmp(p, Opnd::V(tv), Cc::E))
-                    }
-                    _ => None,
-                };
+                let c = self.pop_truth_cond();
                 match c {
                     Some(c) => {
                         let tb = self.target_block(i);
@@ -1355,12 +1428,39 @@ impl<'a> B<'a> {
                 };
                 self.term(Term::Return(v, d, snap));
             }
+            Op::ReturnGenerator if self.is_gen => {
+                // the eager prologue runs in the interpreter (interp::call_function);
+                // compiled code only ever resumes after it
+                let s = self.snap(i, SnapKind::Deopt);
+                self.term(Term::Deopt(s));
+            }
+            Op::YieldValue if self.is_gen && self.inl.is_none() => {
+                // suspend: everything goes to the frame; the next resumption enters
+                // this unit at the instruction after the yield (`resume_points`)
+                let (v, own, _) = self.pop_obj();
+                let v = match own {
+                    Own::Owned => v,
+                    _ => {
+                        self.emit(Inst::Incref(v));
+                        v
+                    }
+                };
+                self.materialize_stack();
+                let d = self.st.stack.len() as u32;
+                let locals = self.dirty_locals();
+                let ins = self.u.an.instrs[i];
+                let next = self.u.an.instrs.get(i + 1).map_or(ins.pc + 1, |n| n.start);
+                let yfs = if i > 0 && self.u.an.instrs[i - 1].op == Op::Send { self.u.an.instrs[i - 1].pc as i32 } else { -1 };
+                self.f.snaps.push(Snapshot { resume: next, lasti: ins.pc, stack: Vec::new(), locals, kind: SnapKind::TemplateExit, inl: None });
+                let snap = self.f.snaps.len() as SnapId - 1;
+                self.term(Term::Yield(v, d, snap, yfs));
+            }
             Op::BinarySubscr => self.binary_subscr(i),
             Op::LoadAttr => self.load_attr(i),
             Op::LoadMethod => self.load_method(i),
             Op::StoreAttr => self.store_attr(i),
             Op::Call => {
-                if !self.try_builtin(i) && !self.try_inline(i)? {
+                if !self.try_builtin(i) && !self.try_inline(i)? && !self.try_inline_new(i)? {
                     self.template(i);
                 }
             }
@@ -1401,6 +1501,62 @@ impl<'a> B<'a> {
     fn peek_ptr_if_inframe(&mut self, n: usize) {
         if let AV::InFrame(_) = self.peek(n) {
             self.peek_ptr(n);
+        }
+    }
+
+    /// After a call that may run arbitrary code: type facts that such code can break
+    /// (version tags: class mutation; exact heap types: `__class__` assignment) no
+    /// longer hold.
+    fn forget_tags(&mut self) {
+        fn weak(t: Ty) -> Ty {
+            match t {
+                Ty::Tag(_) => Ty::Unknown,
+                Ty::Exact(p) if is_heap_type(p) => Ty::Unknown,
+                t => t,
+            }
+        }
+        for l in self.st.locals.iter_mut() {
+            if let LS::Frame(t) = *l {
+                *l = LS::Frame(weak(t));
+            }
+        }
+        let fix = |a: &mut AV| match *a {
+            AV::InFrame(t) => *a = AV::InFrame(weak(t)),
+            AV::Obj(v, o, t) => *a = AV::Obj(v, o, weak(t)),
+            _ => {}
+        };
+        self.st.stack.iter_mut().for_each(fix);
+        if let Some(c) = self.inl.as_mut() {
+            c.locals.iter_mut().for_each(fix);
+        }
+    }
+
+    /// Truth value of the top of the stack as a condition, popping it, when it can be
+    /// tested natively (None: nothing popped).
+    fn pop_truth_cond(&mut self) -> Option<Cond> {
+        match self.peek(1) {
+            AV::Cond(c) => {
+                self.pop();
+                Some(c)
+            }
+            AV::Bool(v) | AV::I64(v) => {
+                self.pop();
+                Some(Cond::Test(v, Opnd::V(v), Cc::NE))
+            }
+            AV::Const(p) if p == true_p() || p == false_p() || p == none_p() => {
+                self.pop();
+                let v = self.imm((p == true_p()) as i64);
+                Some(Cond::Test(v, Opnd::V(v), Cc::NE))
+            }
+            AV::InFrame(t) | AV::Obj(_, _, t) if t.is(crate::types::bool_::bool_type()) => {
+                let p = self.peek_ptr(1);
+                let tv = self.imm(true_p() as i64);
+                let k = self.st.stack.len() - 1;
+                let a = self.pop();
+                self.discard(a, k);
+                Some(Cond::Cmp(p, Opnd::V(tv), Cc::E))
+            }
+            _ => None,
         }
     }
 
@@ -1813,6 +1969,10 @@ impl<'a> B<'a> {
             match s.kind {
                 kind::EMPTY => {}
                 kind::UNCACHEABLE => return None,
+                // (`a` is a dict version there, not a type tag)
+                kind::MODULE | kind::GLOBAL => out.push(s),
+                // entries of classes that died since: their pointers dangle
+                _ if !crate::interp::cache::tag_alive(s.a) => {}
                 _ => out.push(s),
             }
         }
@@ -2030,6 +2190,10 @@ impl<'a> B<'a> {
         self.switch_to(slow);
         let ea = self.entries_addr(i);
         let r = self.v(Class::G);
+        if self.inl.is_none() {
+            // (cache misses refresh the adaptive view of the running instruction)
+            self.emit(Inst::SetLasti(self.u.an.instrs[i].pc));
+        }
         self.emit(Inst::Call { addr: h2_load_attr as usize, args: vec![Opnd::V(p), Opnd::I(name as i64), Opnd::I(ea)], fargs: vec![], ret: Some(r), fret: None });
         self.emit(Inst::Guard(Cond::Test(r, Opnd::V(r), Cc::E), esnap));
         self.emit(Inst::Mov(res, r));
@@ -2250,6 +2414,10 @@ impl<'a> B<'a> {
         // generic store (refills the inline cache); the value reference is released
         self.switch_to(slow);
         let ea = self.entries_addr(i);
+        if self.inl.is_none() {
+            // (cache misses refresh the adaptive view of the running instruction)
+            self.emit(Inst::SetLasti(self.u.an.instrs[i].pc));
+        }
         self.emit(Inst::CallChecked { addr: h2_store_attr as usize, args: vec![Opnd::V(p), Opnd::I(name as i64), Opnd::V(val), Opnd::I(ea)], err: esnap });
         self.term(Term::Jump(cont));
         self.switch_to(cont);
@@ -2329,6 +2497,42 @@ impl<'a> B<'a> {
                 self.push(AV::I64(res));
                 true
             }
+            (Some("isinstance"), 2) => {
+                // isinstance(x, C) with a constant class: exact type match inline,
+                // the full check (subclasses, __instancecheck__) through a call
+                let AV::Const(cls) = self.st.stack[d - 1] else { return false };
+                if !unsafe { (*(cls as *mut PyObject)).ty().tp_flags } & Py_TPFLAGS_TYPE_SUBCLASS != 0 {
+                    return false;
+                }
+                let esnap = self.snap(i, SnapKind::Error);
+                let x = self.peek_ptr(2);
+                let res = self.v(Class::G);
+                let (hit, slow, cont) = (self.new_block(u32::MAX), self.new_block(u32::MAX), self.new_block(u32::MAX));
+                let ty = self.v(Class::G);
+                self.emit(Inst::Load(ty, Base::V(x), OB_TYPE));
+                self.term(Term::Branch(Cond::Cmp(ty, Opnd::I(cls as i64), Cc::E), hit, slow));
+                self.switch_to(hit);
+                let one = self.imm(1);
+                self.emit(Inst::Mov(res, one));
+                self.term(Term::Jump(cont));
+                self.switch_to(slow);
+                let r = self.v(Class::G);
+                self.emit(Inst::Call { addr: h2_isinstance as usize, args: vec![Opnd::V(x), Opnd::I(cls as i64)], fargs: vec![], ret: Some(r), fret: None });
+                self.emit(Inst::Guard(Cond::Cmp(r, Opnd::I(0), Cc::L), esnap));
+                self.emit(Inst::Mov(res, r));
+                self.term(Term::Jump(cont));
+                self.switch_to(cont);
+                self.pop(); // the class (a constant)
+                let k = self.st.stack.len() - 1;
+                let a = self.pop();
+                self.discard(a, k);
+                self.pop();
+                self.pop();
+                // __instancecheck__ may have run arbitrary code
+                self.forget_tags();
+                self.push(AV::Bool(res));
+                true
+            }
             _ => false,
         }
     }
@@ -2340,7 +2544,8 @@ impl<'a> B<'a> {
     /// body (no jumps, no handlers, no cells) of instructions the builder compiles
     /// natively, and tier-1 profiles. Returns (function, its unit, analysis).
     fn inline_candidate(&self, i: usize) -> Option<(usize, Box<Analysis>)> {
-        if self.inl.is_some() || !inline_enabled() {
+        let depth = self.inl_outer.len() + self.inl.is_some() as usize;
+        if depth >= 3 || !inline_enabled() {
             return None;
         }
         let n = self.u.an.instrs[i].arg as usize;
@@ -2353,9 +2558,12 @@ impl<'a> B<'a> {
                 return None;
             }
             let f = crate::types::funcobject::func(fo);
+            if f.func_code.is_null() || f.vectorcall.map(|v| v as usize) != Some(crate::interp::function_vectorcall as usize) {
+                return None; // replaced vectorcall (C API): the call must go through it
+            }
             let code = &*f.func_code;
             let cd = crate::types::code::code_data(code);
-            if std::ptr::eq(cd, self.u.cd) || cd.caches.jit.load(std::sync::atomic::Ordering::Acquire).is_null() {
+            if std::ptr::eq(cd, self.u.cd) || self.inl_cds.contains(&(cd as *const CodeData as usize)) || cd.caches.jit.load(std::sync::atomic::Ordering::Acquire).is_null() {
                 return None; // recursion, or not warm (no profiles)
             }
             let co = crate::types::code::code(code).obj;
@@ -2374,16 +2582,19 @@ impl<'a> B<'a> {
                 return None;
             }
             let an = super::super::analysis::analyze(&cd.code, &cd.exception_table).ok()?;
-            if an.instrs.len() > 48 {
+            if an.instrs.len() > 64 {
                 return None;
             }
             for (k, ins) in an.instrs.iter().enumerate() {
-                let last = k + 1 == an.instrs.len();
                 let ok = match ins.op {
-                    Op::ReturnValue => last,
+                    Op::ReturnValue => true,
+                    // forward branches only (callee paths are duplicated, no loops)
+                    Op::PopJumpIfFalse | Op::PopJumpIfTrue | Op::PopJumpIfNone | Op::PopJumpIfNotNone | Op::Jump => {
+                        an.index_of[ins.arg as usize] as usize > k
+                    }
                     Op::Nop | Op::ExtendedArg | Op::LoadFast | Op::LoadFastCheck | Op::StoreFast | Op::LoadConst | Op::PopTop | Op::PushNull | Op::Copy | Op::Swap => true,
                     Op::LoadGlobal | Op::LoadAttr | Op::StoreAttr | Op::BinaryOp | Op::CompareOp | Op::IsOp | Op::UnaryNegative | Op::UnaryNot | Op::ToBool => true,
-                    Op::BinarySubscr | Op::StoreSubscr | Op::UnpackSequence | Op::Call => true,
+                    Op::BinarySubscr | Op::StoreSubscr | Op::UnpackSequence | Op::Call | Op::LoadMethod => true,
                     _ => ins.op == Op::Resume,
                 };
                 if !ok || an.depth[k] < 0 {
@@ -2400,7 +2611,22 @@ impl<'a> B<'a> {
     /// Try to compile Call instruction i by inlining its callee. False: nothing was
     /// emitted (the caller emits the call normally).
     fn try_inline(&mut self, i: usize) -> Result<bool, String> {
-        let Some((fp, an)) = self.inline_candidate(i) else { return Ok(false) };
+        let Some((fp, an)) = self.inline_candidate(i) else {
+            if super::debug_level() >= 3 {
+                let n = self.u.an.instrs[i].arg as usize;
+                let d = self.st.stack.len();
+                if let AV::Const(p) = self.st.stack[d - n - 2] {
+                    let o = unsafe { &*(p as *mut PyObject) };
+                    if o.is_type(crate::types::funcobject::function_type()) {
+                        let nm = crate::types::str::to_string_lossy(unsafe { &*crate::types::funcobject::func(o).func_qualname });
+                        eprintln!("[jit] inline {} not a candidate", nm);
+                    }
+                } else {
+                    eprintln!("[jit] call at {} in {}: callee not constant", i, crate::types::str::to_string_lossy(&self.u.cd.co_qualname));
+                }
+            }
+            return Ok(false);
+        };
         let n = self.u.an.instrs[i].arg as usize;
         // rollback point
         let save_st = self.st.clone();
@@ -2416,7 +2642,16 @@ impl<'a> B<'a> {
         let d = self.st.stack.len();
         let base = d - n - 2;
         let ins = self.u.an.instrs[i];
-        let err = {
+        let err = if let Some(c) = &self.inl {
+            // nested: the exception is raised in the enclosing inlined callee's frame
+            // (rebuilt by its InlineError stub), which then propagates it further
+            let stack = self.st.stack[c.base..base].iter().map(|a| self.mat_of(a)).collect();
+            let locals = c.locals.iter().enumerate().map(|(k, a)| (k as u32, self.mat_of(a), false)).collect();
+            let inl = Some(InlSnap { func: c.func, res: c.res, cont: c.cont, err: c.err });
+            self.inl.as_mut().unwrap().snapped = true;
+            self.f.snaps.push(Snapshot { resume: ins.start, lasti: ins.pc, stack, locals, kind: SnapKind::InlineError, inl });
+            self.f.snaps.len() as SnapId - 1
+        } else {
             let stack = self.st.stack[..base].iter().map(|a| self.mat_of(a)).collect();
             let locals = self.dirty_locals();
             self.f.snaps.push(Snapshot { resume: ins.start, lasti: ins.pc, stack, locals, kind: SnapKind::Error, inl: None });
@@ -2445,12 +2680,25 @@ impl<'a> B<'a> {
                     self.emit(Inst::SetCond(v, c));
                     AV::Bool(v)
                 }
+                // borrowed from a local of the enclosing inlined callee: the inner
+                // callee's local indices mean something else, so own it
+                AV::Obj(v, Own::Inl(_), t) => {
+                    self.emit(Inst::Incref(v));
+                    AV::Obj(v, Own::Owned, t)
+                }
                 other => other,
             };
         }
         self.st.stack.truncate(base);
         let cont = self.new_block(u32::MAX);
         let res = self.v(Class::G);
+        // an enclosing inlined callee's context is suspended while this one is built
+        let outer = self.inl.take();
+        let nested = outer.is_some();
+        if let Some(o) = outer {
+            self.inl_outer.push(o);
+        }
+        self.inl_cds.push(cd as *const CodeData as usize);
         // switch to the callee
         self.inl_an.push(an);
         // (boxed: the addresses stay valid while `inl_an` grows; B outlives every use)
@@ -2474,9 +2722,26 @@ impl<'a> B<'a> {
         let up: &'a Unit<'a> = unsafe { &*(&**self.inl_units.last().unwrap() as *const Unit<'static> as *const Unit<'a>) };
         self.u = up;
         self.inl = Some(InlCtx { func: fp, base, locals, cont, res, err, failed: false, snapped: false });
+        // Callees with forward branches are compiled path by path (no joins: the
+        // code after a branch is duplicated per path, bounded by `steps`); every path
+        // ends in its own return, which moves the result into `res` and jumps to
+        // `cont`. Straight-line callees keep their result as an abstract value.
+        let branchy = an_ref.instrs.iter().any(|x| jumps(x.op));
         let mut ok = true;
         let mut result: Option<AV> = None;
-        for j in 0..an_ref.instrs.len() {
+        let mut work: Vec<(usize, State, Vec<AV>, BlockId)> = Vec::new();
+        let (mut steps, mut paths) = (0usize, 1usize);
+        let mut j = 0usize;
+        'paths: loop {
+            if j >= an_ref.instrs.len() {
+                ok = false;
+                break;
+            }
+            steps += 1;
+            if steps > 160 {
+                ok = false;
+                break;
+            }
             let ci = an_ref.instrs[j];
             match ci.op {
                 Op::Resume | Op::Nop | Op::ExtendedArg => {}
@@ -2497,6 +2762,7 @@ impl<'a> B<'a> {
                     let k = ci.arg as usize;
                     let mut a = self.pop();
                     let slot = self.st.stack.len();
+                    let mut same = false;
                     match a {
                         AV::InFrame(t) => {
                             let v = self.v(Class::G);
@@ -2514,25 +2780,95 @@ impl<'a> B<'a> {
                             self.emit(Inst::Incref(v));
                             a = AV::Obj(v, Own::Owned, t);
                         }
-                        AV::Obj(_, Own::Inl(_), _) => continue, // x = x
+                        AV::Obj(_, Own::Inl(_), _) => same = true, // x = x
                         _ => {}
                     }
-                    // stack entries borrowed from the old value become owned
-                    for s in 0..self.st.stack.len() {
-                        if let AV::Obj(v, Own::Inl(o), t) = self.st.stack[s] {
-                            if o as usize == k {
-                                self.emit(Inst::Incref(v));
-                                self.st.stack[s] = AV::Obj(v, Own::Owned, t);
+                    if !same {
+                        // stack entries borrowed from the old value become owned
+                        for s in 0..self.st.stack.len() {
+                            if let AV::Obj(v, Own::Inl(o), t) = self.st.stack[s] {
+                                if o as usize == k {
+                                    self.emit(Inst::Incref(v));
+                                    self.st.stack[s] = AV::Obj(v, Own::Owned, t);
+                                }
                             }
                         }
-                    }
-                    let old = std::mem::replace(&mut self.inl.as_mut().unwrap().locals[k], a);
-                    if let AV::Obj(v, Own::Owned, _) = old {
-                        self.emit(Inst::Decref(v));
+                        let old = std::mem::replace(&mut self.inl.as_mut().unwrap().locals[k], a);
+                        if let AV::Obj(v, Own::Owned, _) = old {
+                            self.emit(Inst::Decref(v));
+                        }
                     }
                 }
-                Op::ReturnValue => {
+                Op::ReturnValue if !branchy => {
                     result = Some(self.pop());
+                    break;
+                }
+                Op::ReturnValue => {
+                    // finish this path: result into `res`, release the callee locals
+                    let r = self.pop();
+                    if self.st.stack.len() != base {
+                        ok = false;
+                        break;
+                    }
+                    let v = self.obj_owned(r);
+                    let locals = self.inl.as_ref().unwrap().locals.clone();
+                    for a in locals {
+                        if let AV::Obj(x, Own::Owned, _) = a {
+                            self.emit(Inst::Decref(x));
+                        }
+                    }
+                    self.emit(Inst::Mov(res, v));
+                    self.term(Term::Jump(cont));
+                    match work.pop() {
+                        None => break 'paths,
+                        Some((nj, st, locals, blk)) => {
+                            self.st = st;
+                            self.inl.as_mut().unwrap().locals = locals;
+                            self.cur = blk;
+                            self.closed = false;
+                            j = nj;
+                            continue;
+                        }
+                    }
+                }
+                Op::Jump => {
+                    // forward only (inline_candidate)
+                    j = an_ref.index_of[ci.arg as usize] as usize;
+                    continue;
+                }
+                Op::PopJumpIfFalse | Op::PopJumpIfTrue | Op::PopJumpIfNone | Op::PopJumpIfNotNone => {
+                    paths += 1;
+                    if paths > 8 {
+                        ok = false;
+                        break;
+                    }
+                    let (c, jump_if) = match ci.op {
+                        Op::PopJumpIfNone | Op::PopJumpIfNotNone => {
+                            let (v, own, _) = self.pop_obj();
+                            let nv = self.imm(none_p() as i64);
+                            let r = self.v(Class::G);
+                            self.emit(Inst::SetCond(r, Cond::Cmp(v, Opnd::V(nv), Cc::E)));
+                            self.release(v, own);
+                            (Cond::Test(r, Opnd::V(r), Cc::NE), ci.op == Op::PopJumpIfNone)
+                        }
+                        _ => match self.pop_truth_cond() {
+                            Some(c) => (c, ci.op == Op::PopJumpIfTrue),
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        },
+                    };
+                    let r = self.v(Class::G);
+                    self.emit(Inst::SetCond(r, c));
+                    let (jb, fb) = (self.new_block(u32::MAX), self.new_block(u32::MAX));
+                    let c2 = Cond::Test(r, Opnd::V(r), if jump_if { Cc::NE } else { Cc::E });
+                    self.term(Term::Branch(c2, jb, fb));
+                    let target = an_ref.index_of[ci.arg as usize] as usize;
+                    let locals = self.inl.as_ref().unwrap().locals.clone();
+                    work.push((target, self.st.clone(), locals, jb));
+                    self.cur = fb;
+                    self.closed = false;
                 }
                 _ => {
                     self.instr(j, j)?;
@@ -2542,10 +2878,20 @@ impl<'a> B<'a> {
                 ok = false;
                 break;
             }
+            j += 1;
         }
         let ctx = self.inl.take().unwrap();
         self.u = caller_u;
-        if !ok || result.is_none() || self.st.stack.len() != base {
+        self.inl_cds.pop();
+        if nested {
+            self.inl = self.inl_outer.pop();
+        }
+        let bad = if branchy { !ok } else { !ok || result.is_none() || self.st.stack.len() != base };
+        if bad {
+            if super::debug_level() >= 3 {
+                let nm = unsafe { crate::types::str::to_string_lossy(&*crate::types::funcobject::func(&*(fp as *mut PyObject)).func_qualname) };
+                eprintln!("[jit] inline {} rolled back at callee instr {} ({:?})", nm, j, an_ref.instrs.get(j).map(|x| x.op));
+            }
             // roll back everything emitted for the attempt
             self.st = save_st;
             self.f.blocks.truncate(save_nblocks);
@@ -2562,6 +2908,18 @@ impl<'a> B<'a> {
             self.has_deps = save_has_deps;
             self.closed = save_closed;
             return Ok(false);
+        }
+        if branchy {
+            // every path returned into `res`; the caller's state is what it was
+            // before the call, without the call operands (the callee cannot change
+            // caller locals, and vregs defined before the call dominate `cont`)
+            let mut st = save_st;
+            st.stack.truncate(base);
+            self.st = st;
+            self.cur = cont;
+            self.closed = false;
+            self.push(AV::Obj(res, Own::Owned, Ty::Unknown));
+            return Ok(true);
         }
         // the result: owned (or a value needing no reference); release the callee locals
         let mut r = result.unwrap();
@@ -2598,6 +2956,98 @@ impl<'a> B<'a> {
             self.closed = false;
             self.push(r);
         }
+        Ok(true)
+    }
+
+    /// Call instruction i of a constant class whose instances are made by
+    /// object.__new__ and a Python `__init__`: allocate the instance, then inline
+    /// `__init__` as a method call on it (the class's version tag guards both).
+    /// False: nothing was emitted.
+    fn try_inline_new(&mut self, i: usize) -> Result<bool, String> {
+        if !inline_enabled() || self.inl_outer.len() + self.inl.is_some() as usize >= 3 {
+            return Ok(false);
+        }
+        let n = self.u.an.instrs[i].arg as usize;
+        let d = self.st.stack.len();
+        let AV::Const(tpo) = self.st.stack[d - n - 2] else { return Ok(false) };
+        if !matches!(self.st.stack[d - n - 1], AV::Null) {
+            return Ok(false);
+        }
+        let tp = tpo as *mut PyTypeObject;
+        let (init, tag) = unsafe {
+            let o = &*(tpo as *mut PyObject);
+            if !o.is_type(&raw mut crate::types::typeobject::PyType_Type) {
+                return Ok(false); // not a class, or a metaclass that may override __call__
+            }
+            if (*tp).tp_new != Some(crate::types::object_type::object_new)
+                || (*tp).tp_init != Some(crate::types::slots::slot_tp_init)
+                || (*tp).tp_flags & Py_TPFLAGS_IS_ABSTRACT != 0
+                || (*tp).tp_version_tag == 0
+            {
+                return Ok(false);
+            }
+            let Some(init) = crate::types::typeobject::lookup(tp, crate::name!("__init__")) else { return Ok(false) };
+            if !crate::types::funcobject::is_function(&init) {
+                return Ok(false);
+            }
+            (init.as_ptr() as usize, (*tp).tp_version_tag)
+        };
+        // rollback point (try_inline rolls back only its own part)
+        let save_st = self.st.clone();
+        let save_cur = self.cur;
+        let save_insts = self.f.blocks[self.cur as usize].insts.len();
+        let save_term = self.f.blocks[self.cur as usize].term.clone();
+        let save_tsuccs = self.f.blocks[self.cur as usize].tsuccs.len();
+        let (save_nblocks, save_nsnaps, save_ncls) = (self.f.blocks.len(), self.f.snaps.len(), self.f.classes.len());
+        let save_closed = self.closed;
+        // the class must still be the one compiled against (attributes, __init__)
+        let snap = self.snap(i, SnapKind::Deopt);
+        let tv = self.imm(tpo as i64);
+        self.emit(Inst::Guard(Cond::CmpMem32(Base::V(tv), TP_TAG, tag as i64, Cc::NE), snap));
+        let obj = self.v(Class::G);
+        self.emit(Inst::Call { addr: h2_alloc_instance as usize, args: vec![Opnd::V(tv)], fargs: vec![], ret: Some(obj), fret: None });
+        self.emit(Inst::Guard(Cond::Test(obj, Opnd::V(obj), Cc::E), snap));
+        // one reference for the result, one moved into __init__'s `self`. The result
+        // reference sits on the stack below the call (in the slot of the class), so
+        // error exits of the inlined __init__ release it with the rest of the stack.
+        self.emit(Inst::Incref(obj));
+        self.st.stack.insert(d - n - 2, AV::Obj(obj, Own::Owned, Ty::Exact(tpo)));
+        self.st.stack[d - n - 1] = AV::Const(init);
+        self.st.stack[d - n] = AV::Obj(obj, Own::Owned, Ty::Exact(tpo));
+        let ok = self.try_inline(i)?;
+        if !ok {
+            self.st = save_st;
+            self.f.blocks.truncate(save_nblocks);
+            self.cur = save_cur;
+            let b = &mut self.f.blocks[save_cur as usize];
+            b.insts.truncate(save_insts);
+            b.term = save_term;
+            b.tsuccs.truncate(save_tsuccs);
+            self.f.snaps.truncate(save_nsnaps);
+            self.f.classes.truncate(save_ncls);
+            self.closed = save_closed;
+            return Ok(false);
+        }
+        // __init__'s result must be None
+        let k = self.st.stack.len() - 1;
+        match self.pop() {
+            AV::Const(p) if p == none_p() => {}
+            a => {
+                let es = if self.inl.is_some() { self.snap(i, SnapKind::Error) } else {
+                    let stack = self.st.stack.iter().map(|x| self.mat_of(x)).collect();
+                    let locals = self.dirty_locals();
+                    let ins = self.u.an.instrs[i];
+                    self.f.snaps.push(Snapshot { resume: ins.start, lasti: ins.pc, stack, locals, kind: SnapKind::Error, inl: None });
+                    self.f.snaps.len() as SnapId - 1
+                };
+                let _ = k;
+                let r = self.obj_owned(a);
+                let st = self.v(Class::G);
+                self.emit(Inst::Call { addr: h2_init_done as usize, args: vec![Opnd::V(r)], fargs: vec![], ret: Some(st), fret: None });
+                self.emit(Inst::Guard(Cond::Test(st, Opnd::V(st), Cc::NE), es));
+            }
+        }
+        // the instance is on top of the stack
         Ok(true)
     }
 
@@ -2709,13 +3159,35 @@ impl<'a> B<'a> {
         let (pa, _) = self.prof(i);
         let is_list = pa == prof::LIST;
         let is_tuple = pa == prof::TUPLE;
-        if !(is_list || is_tuple) || n == 0 || n > 16 {
+        let both = pa == prof::LIST | prof::TUPLE;
+        if !(is_list || is_tuple || both) || n == 0 || n > 16 {
             self.template(i);
             return;
         }
-        let tp = if is_list { list_t() } else { tuple_t() };
         let snap = self.snap(i, SnapKind::Deopt);
         let s = self.peek_ptr(1);
+        if both {
+            // tuple or list: items inline or behind ob_item; ob_size at the same offset
+            let ty = self.v(Class::G);
+            self.emit(Inst::Load(ty, Base::V(s), OB_TYPE));
+            let tt = self.imm(tuple_t() as i64);
+            let items = self.v(Class::G);
+            let (bt, bl, join) = (self.new_block(u32::MAX), self.new_block(u32::MAX), self.new_block(u32::MAX));
+            self.term(Term::Branch(Cond::Cmp(ty, Opnd::V(tt), Cc::E), bt, bl));
+            self.switch_to(bt);
+            self.emit(Inst::Alu(Alu::Add, items, s, Opnd::I(TUPLE_ITEMS as i64)));
+            self.term(Term::Jump(join));
+            self.switch_to(bl);
+            let lt = self.imm(list_t() as i64);
+            self.emit(Inst::Guard(Cond::Cmp(ty, Opnd::V(lt), Cc::NE), snap));
+            self.emit(Inst::Load(items, Base::V(s), LIST_ITEMS));
+            self.term(Term::Jump(join));
+            self.switch_to(join);
+            self.emit(Inst::Guard(Cond::CmpMem(Base::V(s), LIST_SIZE, n as i64, Cc::NE), snap));
+            self.unpack_items(n, (items, 0));
+            return;
+        }
+        let tp = if is_list { list_t() } else { tuple_t() };
         if !self.ty_of(&self.peek(1)).is(tp as *mut PyTypeObject) {
             let t = self.imm(tp as i64);
             let ty = self.v(Class::G);
@@ -2730,6 +3202,12 @@ impl<'a> B<'a> {
         } else {
             (s, TUPLE_ITEMS)
         };
+        self.unpack_items(n, base);
+    }
+
+    /// Push the n items at `base` (incref'd, last item deepest) in place of the
+    /// sequence on top of the stack.
+    fn unpack_items(&mut self, n: usize, base: (V, i32)) {
         let mut vals = Vec::with_capacity(n);
         for k in 0..n {
             let x = self.v(Class::G);
@@ -2790,6 +3268,66 @@ pub unsafe extern "C" fn h2_len(o: *mut PyObject) -> i64 {
 
 /// Generic attribute load through the inline cache (slow path of tier-2 LoadAttr):
 /// new reference, or NULL with an exception set.
+/// New instance of the class `tp` for an inlined constructor call (tp_alloc), or
+/// NULL with no exception set (the code deoptimises and the interpreter retries).
+pub unsafe extern "C" fn h2_alloc_instance(tp: *mut PyTypeObject) -> *mut PyObject {
+    unsafe {
+        let alloc = (*tp).tp_alloc.unwrap_or(crate::types::typeobject::generic_alloc);
+        let o = alloc(tp, 0);
+        if o.is_null() {
+            crate::errors::clear_exc();
+        }
+        o
+    }
+}
+
+/// Result `r` (owned) of an inlined `__init__`: 0 if it is None, else TypeError (as
+/// type.__call__ reports it) and 1.
+pub unsafe extern "C" fn h2_init_done(r: *mut PyObject) -> u64 {
+    unsafe {
+        if r == none_p() as *mut PyObject {
+            crate::object::decref(r);
+            return 0;
+        }
+        let _ = crate::err!(TypeError, "__init__() should return None, not '{}'", crate::types::typeobject::type_name((*r).ty()));
+        crate::object::decref(r);
+        1
+    }
+}
+
+/// RPYTHON_JIT2_KEEPFACTS=1: keep type facts across decrefs (measurement switch;
+/// unsafe when finalizers mutate classes).
+fn keep_facts() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("RPYTHON_JIT2_KEEPFACTS").is_ok_and(|v| v == "1"))
+}
+
+/// isinstance(o, cls) for compiled code: 1, 0, or -1 with an exception set.
+pub unsafe extern "C" fn h2_isinstance(o: *mut PyObject, cls: *mut PyObject) -> i64 {
+    unsafe {
+        match crate::abstract_::isinstance(&*o, &*cls) {
+            Ok(b) => b as i64,
+            Err(_) => -1,
+        }
+    }
+}
+
+/// Truth value of `o` for compiled ToBool / UnaryNot: 1, 0, or -1 with an exception set.
+pub unsafe extern "C" fn h2_truth(o: *mut PyObject) -> i64 {
+    unsafe {
+        if o == true_p() as *mut PyObject {
+            return 1;
+        }
+        if o == false_p() as *mut PyObject || o == none_p() as *mut PyObject {
+            return 0;
+        }
+        match crate::abstract_::is_true(&*o) {
+            Ok(b) => b as i64,
+            Err(_) => -1,
+        }
+    }
+}
+
 pub unsafe extern "C" fn h2_load_attr(o: *mut PyObject, name: *mut PyObject, es: *const crate::interp::cache::Entry) -> *mut PyObject {
     unsafe {
         let es = std::slice::from_raw_parts(es, crate::interp::cache::POLY);
@@ -2845,7 +3383,8 @@ fn unbox_candidates(u: &Unit) -> Vec<bool> {
 }
 
 fn build_once(u: &Unit, reps: &[Rep], assume: &mut Vec<Option<State>>) -> Result<(Built, bool, Vec<u8>), String> {
-    let cfg = build_cfg(u.an, u.entry);
+    let resumes = resume_points(u);
+    let cfg = build_cfg(u.an, u.entry, &resumes);
     let nb = cfg.blocks.len();
     let mut f = Func { blocks: Vec::new(), classes: Vec::new(), snaps: Vec::new(), order: Vec::new(), entries: Vec::new() };
     let mut ir_block = vec![u32::MAX; nb];
@@ -2886,33 +3425,47 @@ fn build_once(u: &Unit, reps: &[Rep], assume: &mut Vec<Option<State>>) -> Result
         inl: None,
         inl_an: Vec::new(),
         inl_units: Vec::new(),
+        is_gen: !resumes.is_empty(),
+        inl_outer: Vec::new(),
+        fatal: None,
+        inl_cds: vec![u.cd as *const CodeData as usize],
     };
-    // OSR unit: a separate entry block unboxes the unboxed locals from the frame and
-    // jumps to the loop header
-    let mut entry_block = b.ir_block[b.cfg.block_of[u.entry] as usize];
-    if u.entry != 0 {
+    // OSR unit / generator resumption: a separate entry block unboxes the unboxed
+    // locals from the frame and jumps to the loop header / instruction after the yield
+    let synthetic_entry = |b: &mut B, at: usize| -> BlockId {
         let eb = b.new_block(u32::MAX);
-        entry_block = eb;
         b.cur = eb;
         b.closed = false;
-        b.st = b.initial_state();
+        b.st = b.initial_state_at(at);
         for li in 0..u.nlp {
             if b.reps[li] != Rep::Frame {
-                let snap = b.snap(u.entry, SnapKind::Deopt);
+                let snap = b.snap(at, SnapKind::Deopt);
                 let k = if b.reps[li] == Rep::F64 { BoxK::Float } else { BoxK::Int };
                 let home = b.homes[li];
                 b.emit(Inst::LoadLocalUnboxed { home, slot: li as u32, k, snap });
             }
         }
-        let hb = b.cfg.block_of[u.entry] as usize;
+        let hb = b.cfg.block_of[at] as usize;
         let t = b.edge(hb);
         b.term(Term::Jump(t));
+        eb
+    };
+    let mut entry_block = b.ir_block[b.cfg.block_of[u.entry] as usize];
+    if u.entry != 0 {
+        entry_block = synthetic_entry(&mut b, u.entry);
+    }
+    let mut resume_blocks = Vec::new();
+    for &r in &resumes {
+        resume_blocks.push((u.an.instrs[r].start, synthetic_entry(&mut b, r)));
     }
     for &bb in &order {
         b.build_block(bb)?;
         if b.restart {
             break;
         }
+    }
+    if let Some(e) = b.fatal {
+        return Err(e.into());
     }
     let restart = b.restart;
     let mut instr_block = vec![u32::MAX; u.an.instrs.len()];
@@ -2921,6 +3474,7 @@ fn build_once(u: &Unit, reps: &[Rep], assume: &mut Vec<Option<State>>) -> Result
     }
     let mut f = b.f;
     f.entries.push((u.an.instrs[u.entry].start, entry_block));
+    f.entries.extend(resume_blocks);
     // emission order: creation order (bytecode RPO with synthetic blocks appended)
     f.order = (0..f.blocks.len() as u32).collect();
     let sk = b.store_kinds;
@@ -2930,7 +3484,12 @@ fn build_once(u: &Unit, reps: &[Rep], assume: &mut Vec<Option<State>>) -> Result
 /// Build the IR of a unit: choose local representations, iterate loop-header
 /// assumptions to a fixed point.
 pub fn build(u: &Unit) -> Result<Built, String> {
-    let cand = unbox_candidates(u);
+    let mut cand = unbox_candidates(u);
+    if !resume_points(u).is_empty() {
+        // generator units keep locals boxed: every suspension would have to box the
+        // unboxed ones into the frame and every resumption unbox them again
+        cand.iter_mut().for_each(|c| *c = false);
+    }
     let mut reps = vec![Rep::Frame; u.nlp];
     let mut assume: Vec<Option<State>> = Vec::new();
     let mut chose_reps = false;

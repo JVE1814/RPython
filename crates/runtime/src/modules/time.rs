@@ -173,6 +173,7 @@ fn time_get_clock_info(_m: &PyObject, args: &[&PyObject]) -> PyResult {
 fn time_sleep(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     crate::args::check_pos("sleep", args, 1, 1)?;
     let o = args[0];
+    crate::modules::sys_full::audit("time.sleep", &[o])?;
     let secs: f64 = if int::is_int(o) {
         let v = ab::as_i128_index(o)?;
         if v < 0 {

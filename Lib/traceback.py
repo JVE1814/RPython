@@ -714,7 +714,12 @@ class StackSummary(list):
     def _extract_from_extended_frame_gen(klass, frame_gen, *, limit=None,
                                          lookup_lines=True,
                                          capture_locals=False):
-        if limit is None or limit is BUILTIN_EXCEPTION_LIMIT:
+        if limit is BUILTIN_EXCEPTION_LIMIT:
+            # the interpreter's own reports keep the innermost entries
+            limit = getattr(sys, 'tracebacklimit', None)
+            if limit is not None:
+                limit = -limit if limit > 0 else 0
+        elif limit is None:
             limit = getattr(sys, 'tracebacklimit', None)
             if limit is not None and limit < 0:
                 limit = 0

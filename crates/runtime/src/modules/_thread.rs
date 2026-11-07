@@ -714,6 +714,11 @@ fn start_joinable_thread(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject
         Some(d) => ab::is_true(d)?,
         None => true,
     };
+    // audited with the handle as passed (None when the call creates one)
+    crate::modules::sys_full::audit(
+        "_thread.start_joinable_thread",
+        &[f, &int::new_int(daemon as i64), h.unwrap_or(none::none())],
+    )?;
     let hobj = match h {
         Some(h) if !h.is(none::none()) => {
             if !h.is_type(&raw mut HANDLE_TYPE) {
@@ -723,7 +728,6 @@ fn start_joinable_thread(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject
         }
         _ => new_handle_object(HandleInner::new()),
     };
-    crate::modules::sys_full::audit("_thread.start_joinable_thread", &[f, &bool_::new_bool(daemon), &hobj])?;
     let inner = handle_arc(&hobj);
     inner.daemon.store(daemon, Relaxed);
     if !daemon {

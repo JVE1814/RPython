@@ -156,13 +156,20 @@ pub fn osr_check(f: &mut Frame, cd: &CodeData, target: usize) -> bool {
 }
 
 /// Tier-2 entry for `pc`, if any (standard unit at 0, OSR unit at its header).
+/// (Generator units also have entries after each yield in the standard unit.)
 #[inline]
 fn opt_entry(cd: &CodeData, pc: usize) -> Option<usize> {
-    let p = if pc == 0 { cd.caches.opt.load(Acquire) } else { cd.caches.osr.load(Acquire) };
-    if p.is_null() {
-        return None;
+    let o = cd.caches.opt.load(Acquire);
+    if pc == 0 {
+        return if o.is_null() { None } else { unsafe { (*o).entry(0) } };
     }
-    unsafe { (*p).entry(pc) }
+    let p = cd.caches.osr.load(Acquire);
+    if !p.is_null() {
+        if let Some(e) = unsafe { (*p).entry(pc) } {
+            return Some(e);
+        }
+    }
+    if o.is_null() { None } else { unsafe { (*o).entry(pc) } }
 }
 
 #[inline]
@@ -203,6 +210,9 @@ pub fn call_fast(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwnames:
         return None;
     }
     let f = crate::types::funcobject::func(func);
+    if f.func_code.is_null() {
+        return None;
+    }
     let code = unsafe { &*f.func_code };
     let cd = crate::types::code::code_data(code);
     let c = cd.caches.jit.load(Acquire);
@@ -458,6 +468,112 @@ pub fn resume(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> Result<P
             }
         }
     }
+}
+
+fn env_flag(cell: &AtomicU32, var: &str) -> bool {
+    match cell.load(Relaxed) {
+        UNSET => {
+            let en = std::env::var(var).map(|v| v != "0").unwrap_or(true);
+            cell.store(en as u32, Relaxed);
+            en
+        }
+        x => x != 0,
+    }
+}
+
+/// Tier 1 compiles the instructions shared with the interpreter through
+/// `eval::exec_misc` (RPYTHON_JIT1_MISC=0: they deoptimise instead).
+pub fn misc_enabled() -> bool {
+    static F: AtomicU32 = AtomicU32::new(UNSET);
+    env_flag(&F, "RPYTHON_JIT1_MISC")
+}
+
+/// Generator frames are resumed directly in compiled code (RPYTHON_JIT_GENFAST=0:
+/// always through the interpreter's entry).
+pub fn genfast_enabled() -> bool {
+    static F: AtomicU32 = AtomicU32::new(UNSET);
+    env_flag(&F, "RPYTHON_JIT_GENFAST")
+}
+
+// ------------------------------------------------------------------ generator resumption
+
+static TRAMPOLINE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// A process-wide copy of the entry trampoline every compiled unit starts with
+/// (fn(frame, slots, ts, target, out) -> status; tier1.rs `compile`). Units share the
+/// stack layout of the trampoline, so code entered through it may exit through the
+/// epilogue of any unit.
+pub fn trampoline() -> usize {
+    *TRAMPOLINE.get_or_init(|| {
+        use x64::R::*;
+        let mut a = x64::Asm::new();
+        a.push(Rbp);
+        a.mov_rr(Rbp, Rsp);
+        a.push(Rbx);
+        a.push(R12);
+        a.push(R13);
+        a.push(R14);
+        a.push(R15);
+        a.sub_ri(Rsp, 8);
+        a.store(x64::M(Rsp, 0), R8);
+        a.mov_rr(Rbx, Rdi);
+        a.mov_rr(R12, Rsi);
+        a.mov_rr(R13, Rdx);
+        a.load_fs0(R15);
+        a.jmp_r(Rcx);
+        mem::install(&a.buf, |_, _| {}).expect("jit: cannot install the entry trampoline")
+    })
+}
+
+/// Machine-code entry of a newly created generator frame of `code` (0 if its code is
+/// not compiled): the frame's first resumption enters it directly (`Frame::resume`).
+/// Counts the creation towards tier-2 compilation of the generator's code.
+#[inline]
+pub fn generator_entry(f: &Frame) -> usize {
+    let cd = crate::types::code::code_data(f.code());
+    let c = cd.caches.jit.load(Acquire);
+    if c.is_null() || crate::modules::sys::tracing_active() {
+        return 0;
+    }
+    if bump_invocations(cd) {
+        opt::compile(f.code(), f.globals, f.builtins, 0);
+    }
+    // pc 0, or the instruction after an eager prologue's ReturnGenerator
+    let pc = f.next_instr as usize;
+    match opt_entry(cd, pc) {
+        Some(t) => t,
+        None => match unsafe { (&(*c).entries).get(pc) } {
+            Some(&o) if o != u32::MAX => unsafe { (*c).addr + o as usize },
+            _ => 0,
+        },
+    }
+}
+
+/// Enter compiled code at `target` for the linked, executing frame `f`.
+#[inline(always)]
+pub fn enter(ts: &ThreadState, f: &mut Frame, target: usize, out: &mut *mut PyObject) -> u32 {
+    crate::tlab::ensure_registered();
+    let entry: EntryFn = unsafe { std::mem::transmute(trampoline()) };
+    unsafe { entry(f, f.slots.as_mut_ptr(), ts, target, out) }
+}
+
+/// Compiled code entered by `enter` ended with a deopt or an error (status `st`): the
+/// interpreter finishes this activation (or runs it to the next yield).
+#[cold]
+#[inline(never)]
+pub fn continue_in_interp(ts: &ThreadState, f: &mut Frame, st: u32) -> PyResult<crate::interp::Exit> {
+    let throw = if st == tier1::ST_ERROR {
+        f.next_instr = f.lasti + 1;
+        match crate::errors::take_exc() {
+            Some(e) => Some(e),
+            None => return Err(crate::errors::system_error("error return without exception set")),
+        }
+    } else {
+        let cc = &crate::types::code::code_data(f.code()).caches;
+        opt::note_deopt(cc, f);
+        None
+    };
+    crate::interp::eval::eval_inner(ts, f, throw)
 }
 
 /// Publish the fast-call descriptor of a code object (see CodeCaches::fast_entry).

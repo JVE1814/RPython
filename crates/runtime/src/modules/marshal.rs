@@ -1214,14 +1214,18 @@ fn parse_allow_code(o: Option<&PyObject>) -> PyResult<bool> {
 fn m_dumps(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
     static P: Params = Params::new("dumps", &["value", "version", "allow_code"], 2, 1).kwonly(1);
     let [value, version, allow] = crate::args::parse::<3>(&P, args, kw)?;
-    let out = dumps_vec(value.unwrap(), parse_version(version)?, parse_allow_code(allow)?)?;
+    let version = parse_version(version)?;
+    crate::modules::sys_full::audit("marshal.dumps", &[value.unwrap(), &int::new_int(version as i64)])?;
+    let out = dumps_vec(value.unwrap(), version, parse_allow_code(allow)?)?;
     Ok(bytes::new_bytes(&out))
 }
 
 fn m_dump(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
     static P: Params = Params::new("dump", &["value", "file", "version", "allow_code"], 3, 2).kwonly(1);
     let [value, file, version, allow] = crate::args::parse::<4>(&P, args, kw)?;
-    let out = dumps_vec(value.unwrap(), parse_version(version)?, parse_allow_code(allow)?)?;
+    let version = parse_version(version)?;
+    crate::modules::sys_full::audit("marshal.dumps", &[value.unwrap(), &int::new_int(version as i64)])?;
+    let out = dumps_vec(value.unwrap(), version, parse_allow_code(allow)?)?;
     ab::call_method_str(file.unwrap(), "write", &[&bytes::new_bytes(&out)])?;
     Ok(none::none_ref())
 }
@@ -1231,11 +1235,13 @@ fn m_loads(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult
     let [data, allow] = crate::args::parse::<2>(&P, args, kw)?;
     let allow = parse_allow_code(allow)?;
     let data = data.unwrap();
-    if bytes::is_bytes(data) {
-        return loads_slice(bytes::bytes_data(data), allow);
-    }
-    let view = crate::buffer::with_buffer(data, |b| b.to_vec())?;
-    loads_slice(&view, allow)
+    let data = if bytes::is_bytes(data) {
+        data.to_ref()
+    } else {
+        bytes::new_bytes(&crate::buffer::with_buffer(data, |b| b.to_vec())?)
+    };
+    crate::modules::sys_full::audit("marshal.loads", &[&data])?;
+    loads_slice(bytes::bytes_data(&data), allow)
 }
 
 /// Private helper (used by doctest): loads() with column information removed from
@@ -1253,6 +1259,7 @@ fn m_load(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult 
     let [file, allow] = crate::args::parse::<2>(&P, args, kw)?;
     let allow = parse_allow_code(allow)?;
     let file = file.unwrap();
+    crate::modules::sys_full::audit("marshal.load", &[])?;
     // Make sure the object has a read method returning bytes (as CPython does).
     let data = ab::call_method_str(file, "read", &[&int::new_int(0)])?;
     if !bytes::is_bytes(&data) {

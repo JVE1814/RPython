@@ -957,6 +957,10 @@ def _find_and_load(name, import_):
     if (module is _NEEDS_LOADING or
         getattr(getattr(module, "__spec__", None), "_initializing", False)):
         if module is _NEEDS_LOADING:
+            # announced before the parents are imported
+            sys.audit("import", name, None, getattr(sys, "path", None),
+                      getattr(sys, "meta_path", None),
+                      getattr(sys, "path_hooks", None))
             _resolve_parents(name, import_)
         lock = _get_module_lock(name)
         try:
