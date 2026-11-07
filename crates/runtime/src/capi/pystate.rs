@@ -211,11 +211,37 @@ pub unsafe extern "C" fn PyThreadState_LeaveTracing(ts: *mut c_void) {
     unsafe { (*(ts as *mut ThreadState)).c.tracing -= 1 }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyUnstable_ThreadState_SetStackProtection(_ts: *mut c_void, _base: *mut c_void, _size: usize) -> c_int {
-    0
+pub unsafe extern "C" fn PyUnstable_ThreadState_SetStackProtection(ts: *mut c_void, base: *mut c_void, size: usize) -> c_int {
+    // (capi3) the thread runs on [base, base + size): recursion limits follow that stack
+    unsafe {
+        if size < MIN_STACK_SIZE {
+            let _ = value_error(&format!("stack size {} is too small (minimum {})", size, MIN_STACK_SIZE));
+            return -1;
+        }
+        let t = &*(ts as *mut ThreadState);
+        let mut saved = STACK_DEFAULTS.lock().unwrap_or_else(|e| e.into_inner());
+        if !saved.iter().any(|x| x.0 == ts as usize) {
+            saved.push((ts as usize, t.stack_low.get(), t.stack_margin.get()));
+        }
+        t.stack_low.set(base as usize);
+        t.stack_margin.set((size / 4).clamp(MIN_STACK_SIZE / 8, 256 * 1024));
+        0
+    }
 }
+/// (capi3) Smallest stack PyUnstable_ThreadState_SetStackProtection accepts.
+pub const MIN_STACK_SIZE: usize = 64 * 1024;
+/// Stack bounds of thread states before SetStackProtection changed them.
+static STACK_DEFAULTS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyUnstable_ThreadState_ResetStackProtection(_ts: *mut c_void) {}
+pub unsafe extern "C" fn PyUnstable_ThreadState_ResetStackProtection(ts: *mut c_void) {
+    let mut saved = STACK_DEFAULTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = saved.iter().position(|x| x.0 == ts as usize) {
+        let (_, low, margin) = saved.swap_remove(p);
+        let t = unsafe { &*(ts as *mut ThreadState) };
+        t.stack_low.set(low);
+        t.stack_margin.set(margin);
+    }
+}
 
 
 // ---------------------------------------------------------------- GIL API (no GIL)
@@ -477,19 +503,79 @@ pub unsafe extern "C" fn _PyInterpreterState_IsSpecializationEnabled(_i: *mut c_
 
 // ---------------------------------------------------------------- PEP 788
 
-/// Guards and views are interpreter pointers.
+// Views are interpreter pointers. (capi3) A guard is a small allocation naming its
+// interpreter; each interpreter counts its open guards (`guard_count`), including the
+// one PyThreadState_EnsureFromView holds until the matching PyThreadState_Release.
+// Interpreter teardown does not wait for open guards yet.
+
+#[repr(C)]
+struct Guard {
+    tag: usize,
+    interp: *mut c_void,
+}
+const GUARD_TAG: usize = 0x6775_6172_6421_7079;
+static GUARD_COUNTS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+fn guard_count_add(i: *mut c_void, delta: isize) {
+    let mut g = GUARD_COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+    match g.iter().position(|x| x.0 == i as usize) {
+        Some(p) => {
+            let n = (g[p].1 as isize + delta).max(0) as usize;
+            if n == 0 {
+                g.swap_remove(p);
+            } else {
+                g[p].1 = n;
+            }
+        }
+        None if delta > 0 => g.push((i as usize, delta as usize)),
+        None => {}
+    }
+}
+/// Number of open guards of interpreter `i`.
+pub fn guard_count(i: *mut c_void) -> usize {
+    let g = GUARD_COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+    g.iter().find(|x| x.0 == i as usize).map_or(0, |x| x.1)
+}
+fn new_guard(i: *mut c_void) -> *mut c_void {
+    guard_count_add(i, 1);
+    Box::into_raw(Box::new(Guard { tag: GUARD_TAG, interp: i })) as *mut c_void
+}
+/// The interpreter a guard protects (a bare interpreter pointer is accepted too).
+unsafe fn guard_interp(g: *mut c_void) -> *mut c_void {
+    unsafe { if !g.is_null() && (*(g as *const Guard)).tag == GUARD_TAG { (*(g as *const Guard)).interp } else { g } }
+}
+/// (capi3) The interpreter of guard `g` (tests).
+pub unsafe fn guard_interpreter(g: *mut c_void) -> *mut c_void {
+    unsafe { guard_interp(g) }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInterpreterGuard_FromCurrent() -> *mut c_void {
-    unsafe { PyInterpreterState_Get() }
+    unsafe { new_guard(PyInterpreterState_Get()) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInterpreterGuard_FromView(v: *mut c_void) -> *mut c_void {
     unsafe {
-        if interp(v).alive.load(std::sync::atomic::Ordering::Acquire) { v } else { std::ptr::null_mut() }
+        if interp(v).alive.load(std::sync::atomic::Ordering::Acquire) { new_guard(v) } else { std::ptr::null_mut() }
     }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyInterpreterGuard_Close(_g: *mut c_void) {}
+pub unsafe extern "C" fn PyInterpreterGuard_Close(g: *mut c_void) {
+    unsafe {
+        if g.is_null() || (*(g as *const Guard)).tag != GUARD_TAG {
+            return;
+        }
+        let b = Box::from_raw(g as *mut Guard);
+        guard_count_add(b.interp, -1);
+        drop(b);
+    }
+}
+
+thread_local! {
+    /// One entry per open PyThreadState_Ensure* call of this thread, innermost last:
+    /// the guard the call owns (EnsureFromView), or null.
+    static ENSURE_GUARDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInterpreterView_FromCurrent() -> *mut c_void {
     unsafe { PyInterpreterState_Get() }
@@ -562,7 +648,11 @@ unsafe fn ensure(i: *mut c_void) -> *mut c_void {
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyThreadState_Ensure(g: *mut c_void) -> *mut c_void {
-    unsafe { ensure(g) }
+    unsafe {
+        let t = ensure(guard_interp(g));
+        ENSURE_GUARDS.with(|s| s.borrow_mut().push(0));
+        t
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyThreadState_EnsureFromView(v: *mut c_void) -> *mut c_void {
@@ -570,12 +660,19 @@ pub unsafe extern "C" fn PyThreadState_EnsureFromView(v: *mut c_void) -> *mut c_
         if !interp(v).alive.load(std::sync::atomic::Ordering::Acquire) {
             return std::ptr::null_mut();
         }
-        ensure(v)
+        let g = new_guard(v);
+        let t = ensure(v);
+        ENSURE_GUARDS.with(|s| s.borrow_mut().push(g as usize));
+        t
     }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyThreadState_Release(tok: *mut c_void) {
     unsafe {
+        // (capi3) the guard owned by the matching Ensure call is closed
+        if let Some(g) = ENSURE_GUARDS.with(|s| s.borrow_mut().pop()) {
+            PyInterpreterGuard_Close(g as *mut c_void);
+        }
         let ts = threads::current_ptr();
         if ts.is_null() {
             return;
