@@ -53,7 +53,10 @@ where
 pub fn parse<'b, const N: usize>(p: &Params, args: &[&'b PyObject], kwnames: Option<&'b PyObject>) -> PyResult<[Option<&'b PyObject>; N]> {
     debug_assert_eq!(N, p.names.len());
     let mut out: [Option<&'b PyObject>; N] = [None; N];
-    let (pos, kws) = split(args, kwnames);
+    // perf3: positional part and keyword names straight from the vector (no Vec,
+    // no String per keyword)
+    let nkw = kwnames.map_or(0, |k| tuple::tuple_len(k));
+    let pos: &[&PyObject] = &args[..args.len() - nkw];
     let max_pos = N - p.kwonly;
     if pos.len() > max_pos {
         if p.kwonly > 0 || p.required != max_pos {
@@ -81,8 +84,17 @@ pub fn parse<'b, const N: usize>(p: &Params, args: &[&'b PyObject], kwnames: Opt
     for (i, a) in pos.iter().enumerate() {
         out[i] = Some(*a);
     }
-    for (k, v) in kws {
-        let ks = pystr::to_string_lossy(k);
+    for j in 0..nkw {
+        let k = tuple::tuple_get(kwnames.unwrap(), j);
+        let v: &'b PyObject = args[pos.len() + j];
+        let owned;
+        let ks: &str = match pystr::ascii_str(k) {
+            Some(s) => s,
+            None => {
+                owned = pystr::to_string_lossy(k);
+                &owned
+            }
+        };
         match p.names.iter().position(|n| *n == ks) {
             Some(i) if i >= p.posonly => {
                 if out[i].is_some() {

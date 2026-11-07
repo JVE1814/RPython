@@ -142,18 +142,19 @@ _atomic_types = {types.NoneType, types.EllipsisType, types.NotImplementedType,
 _deepcopy_dispatch = d = {}
 
 
-def _deepcopy_list(x, memo, deepcopy=deepcopy):
+def _deepcopy_list(x, memo, deepcopy=deepcopy, atomic=_atomic_types):
     y = []
     memo[id(x)] = y
     append = y.append
     for a in x:
-        append(deepcopy(a, memo))
+        # atomic items are their own copies: skip the call
+        append(a if type(a) in atomic else deepcopy(a, memo))
     return y
 d[list] = _deepcopy_list
 
 
-def _deepcopy_tuple(x, memo, deepcopy=deepcopy):
-    y = [deepcopy(a, memo) for a in x]
+def _deepcopy_tuple(x, memo, deepcopy=deepcopy, atomic=_atomic_types):
+    y = [a if type(a) in atomic else deepcopy(a, memo) for a in x]
     # A recursive tuple may already have been copied through one of its
     # elements; use that copy.
     try:
@@ -167,11 +168,13 @@ def _deepcopy_tuple(x, memo, deepcopy=deepcopy):
 d[tuple] = _deepcopy_tuple
 
 
-def _deepcopy_dict(x, memo, deepcopy=deepcopy):
+def _deepcopy_dict(x, memo, deepcopy=deepcopy, atomic=_atomic_types):
     y = {}
     memo[id(x)] = y
     for key, value in x.items():
-        y[deepcopy(key, memo)] = deepcopy(value, memo)
+        if type(key) not in atomic:
+            key = deepcopy(key, memo)
+        y[key] = value if type(value) in atomic else deepcopy(value, memo)
     return y
 d[dict] = _deepcopy_dict
 

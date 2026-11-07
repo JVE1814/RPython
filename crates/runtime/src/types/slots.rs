@@ -1332,7 +1332,7 @@ pub unsafe extern "C" fn slot_tp_init(s: *mut PyObject, args: *mut PyObject, kw:
         }
     }
 }
-unsafe extern "C" fn slot_tp_new(tp: *mut PyTypeObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
+pub unsafe extern "C" fn slot_tp_new(tp: *mut PyTypeObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
     unsafe {
         let f = match crate::abstract_::getattr(type_obj(tp), name!("__new__")) {
             Ok(f) => f,

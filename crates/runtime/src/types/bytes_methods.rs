@@ -1214,32 +1214,46 @@ pub fn m_translate(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> P
         None => None,
         Some(x) => Some(barg(x)?),
     };
-    let mut deltab = [false; 256];
-    if let Some(dl) = &del {
-        for &c in dl.data() {
-            deltab[c as usize] = true;
+    let mut map = [0u8; 256];
+    match &t {
+        Some(tb) => map.copy_from_slice(&tb.data()[..256]),
+        None => {
+            for (i, m) in map.iter_mut().enumerate() {
+                *m = i as u8;
+            }
         }
     }
     let d = sdata(o);
-    let mut v = Vec::with_capacity(d.len());
-    let mut changed = false;
-    for &c in d {
-        if deltab[c as usize] {
-            changed = true;
-            continue;
+    let del_data = del.as_ref().map(|dl| dl.data()).filter(|x| !x.is_empty());
+    let v: Vec<u8> = match del_data {
+        None => {
+            if t.is_none() {
+                return self_or_new(o, 0, d.len());
+            }
+            // plain mapping: a branch-free pass, compared afterwards
+            let v: Vec<u8> = d.iter().map(|&c| map[c as usize]).collect();
+            if v[..] == d[..] {
+                return self_or_new(o, 0, d.len());
+            }
+            v
         }
-        let nc = match &t {
-            None => c,
-            Some(tb) => tb.data()[c as usize],
-        };
-        if nc != c {
-            changed = true;
+        Some(dl) => {
+            let mut deltab = [false; 256];
+            for &c in dl {
+                deltab[c as usize] = true;
+            }
+            let mut v = Vec::with_capacity(d.len());
+            for &c in d {
+                if !deltab[c as usize] {
+                    v.push(map[c as usize]);
+                }
+            }
+            if v.len() == d.len() && v[..] == d[..] {
+                return self_or_new(o, 0, d.len());
+            }
+            v
         }
-        v.push(nc);
-    }
-    if !changed {
-        return self_or_new(o, 0, d.len());
-    }
+    };
     new_like(o, &v)
 }
 

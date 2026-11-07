@@ -653,11 +653,15 @@ fn lobj(o: &PyObject) -> &mut LruWrapper {
     unsafe { &mut *(o.as_ptr() as *mut LruWrapper) }
 }
 
-fn make_key(args: &[&PyObject], kw: Option<&PyObject>, typed: bool) -> PyResult {
+fn make_key(args: &[&PyObject], args_tuple: Option<&PyObject>, kw: Option<&PyObject>, typed: bool) -> PyResult {
     let kw = kw.filter(|k| dict::dict_len(k) > 0);
     if kw.is_none() && !typed {
         if args.len() == 1 && (pystr::is_str_exact(args[0]) || int::is_int_exact(args[0])) {
             return Ok(args[0].to_ref());
+        }
+        // the (immutable) argument tuple itself serves as the key
+        if let Some(t) = args_tuple.filter(|t| tuple::is_tuple_exact(t)) {
+            return Ok(t.to_ref());
         }
         return Ok(tuple::new_tuple(args.iter().map(|x| x.to_ref()).collect()));
     }
@@ -685,7 +689,7 @@ fn make_key(args: &[&PyObject], kw: Option<&PyObject>, typed: bool) -> PyResult 
 /// shared by every thread calling the cached function: it is read and changed under
 /// the wrapper's object lock (objlock.rs; recursive, so key hashing/comparison and
 /// finalizers may call back in), while the user function itself runs unlocked.
-fn lru_call_impl(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
+fn lru_call_impl(o: &PyObject, args: &[&PyObject], args_tuple: Option<&PyObject>, kw: Option<&PyObject>) -> PyResult {
     let (func, maxsize, typed) = {
         let _g = crate::objlock::lock(o);
         let w = lobj(o);
@@ -695,7 +699,7 @@ fn lru_call_impl(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyR
         crate::objlock::with(o, || lobj(o).misses += 1);
         return ab::call_with_kwargs_dict(&func, args, kw);
     }
-    let key = make_key(args, kw, typed)?;
+    let key = make_key(args, args_tuple, kw, typed)?;
     let hash = ab::hash(&key)?;
     if maxsize < 0 {
         // unbounded: the dict is the whole cache
@@ -774,7 +778,7 @@ unsafe extern "C" fn lru_call(o: *mut PyObject, args: *mut PyObject, kw: *mut Py
         if crate::interp::enter_recursive_call(ts, " while calling a Python object").is_err() {
             return std::ptr::null_mut();
         }
-        let r = lru_call_impl(o, targs(args), opt(kw));
+        let r = lru_call_impl(o, targs(args), if args.is_null() { None } else { Some(&*args) }, opt(kw));
         crate::interp::leave_recursive_call(ts);
         into_c(r)
     }
@@ -837,6 +841,7 @@ fn lru_cache_clear(o: &PyObject) -> PyResult {
     // Replace the dict first so re-entrant code sees an empty cache.
     let oldd = unsafe { (*w.cache).to_ref() };
     unsafe { fc::set_field(&raw mut w.cache, Some(dict::new_dict())) };
+    drop(_g);
     dict::clear(&oldd);
     drop(old);
     Ok(fc::none())

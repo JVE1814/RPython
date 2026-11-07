@@ -104,6 +104,12 @@ def dumps(obj, *, skipkeys=False, ensure_ascii=True, check_circular=True,
 
     The keyword arguments are those of dump().
     """
+    # the common call with nothing customised needs no options mapping
+    if (cls is None and indent is None and separators is None
+            and default is None and not kw and skipkeys == False
+            and ensure_ascii == True and check_circular == True
+            and allow_nan == True and sort_keys == False):
+        return _shared_encoder.encode(obj)
     options = dict(skipkeys=skipkeys, ensure_ascii=ensure_ascii,
                    check_circular=check_circular, allow_nan=allow_nan,
                    indent=indent, separators=separators, default=default,
@@ -193,6 +199,11 @@ def loads(s, *, cls=None, object_hook=None, parse_float=None,
         raise TypeError(f'the JSON object must be str, bytes or bytearray, '
                         f'not {type(s).__name__}')
 
+    # the common call with no hooks needs no option mappings
+    if (cls is None and object_hook is None and parse_float is None
+            and parse_int is None and parse_constant is None
+            and object_pairs_hook is None and array_hook is None and not kw):
+        return _shared_decoder.decode(s)
     hooks = dict(object_hook=object_hook, parse_float=parse_float,
                  parse_int=parse_int, parse_constant=parse_constant,
                  object_pairs_hook=object_pairs_hook, array_hook=array_hook)

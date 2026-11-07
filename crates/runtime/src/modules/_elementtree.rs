@@ -1245,13 +1245,18 @@ fn tb_flush(o: &PyObject) -> PyResult<()> {
     if b.data.is_empty() {
         return Ok(());
     }
-    let pieces = std::mem::take(&mut b.data);
     let Some(last) = b.last.clone() else {
-        drop(pieces);
+        b.data.clear();
         return Ok(());
     };
     let tail = !matches!(&b.this, Some(t) if t.is(&last));
-    let data = joined_data(pieces)?;
+    // perf3: the buffer keeps its capacity (it was reallocated for every text piece)
+    let data = if b.data.len() == 1 {
+        b.data.pop().unwrap()
+    } else {
+        let pieces: Vec<PyRef> = b.data.drain(..).collect();
+        joined_data(pieces)?
+    };
     set_text_or_tail(&last, data, tail)
 }
 

@@ -69,6 +69,31 @@ fn raw_obj_alloc(total: usize, kind: usize) -> (*mut u8, u8) {
     (unsafe { libc::calloc(1, total) as *mut u8 }, GC_BIT_LARGE)
 }
 
+/// `alloc_object` for non-GC objects whose payload the caller overwrites completely
+/// (bytes/str contents): large blocks skip calloc's clearing. Only the object header
+/// is initialised. Small blocks come from the (zeroing) tlab as usual.
+pub unsafe fn alloc_object_payload_uninit(tp: *mut PyTypeObject, size: usize) -> *mut PyObject {
+    unsafe {
+        if size <= crate::tlab::MAX_SMALL || (*tp).tp_flags & crate::ffi::Py_TPFLAGS_HAVE_GC != 0 {
+            return alloc_object(tp, size);
+        }
+        if (*tp).tp_flags & crate::ffi::Py_TPFLAGS_READY == 0 {
+            ready_lazily(tp);
+        }
+        let raw = libc::malloc(size) as *mut u8;
+        if raw.is_null() {
+            return std::ptr::null_mut();
+        }
+        let op = raw as *mut PyObject;
+        init_header(op, tp);
+        (*op).ob_gc_bits.store(GC_BIT_LARGE, Relaxed);
+        if crate::modules::_tracemalloc::TRACING.load(Relaxed) {
+            crate::modules::_tracemalloc::track(op as *const u8, size);
+        }
+        op
+    }
+}
+
 // ---------------------------------------------------------------- large GC objects
 
 /// GC objects from the system allocator (rare: big tuples and the like), keyed by

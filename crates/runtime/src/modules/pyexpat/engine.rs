@@ -2741,9 +2741,9 @@ impl Engine {
             Some('>') => {}
             Some(_) => return Err((E_INVALID_TOKEN, k)),
         }
-        let name = self.text(ns, ne);
+        // perf3: compare with the open tag without building a String
         match self.stack.last() {
-            Some(f) if f.raw_name == name => {}
+            Some(f) if f.raw_name.chars().eq(self.buf[ns..ne].iter().copied()) => {}
             _ => return Err((E_TAG_MISMATCH, ns)),
         }
         self.pos = k + 1;
