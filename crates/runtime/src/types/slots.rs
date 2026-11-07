@@ -1594,6 +1594,18 @@ unsafe extern "C" fn slot_mp_subscript(s: *mut PyObject, k: *mut PyObject) -> *m
 }
 unsafe extern "C" fn slot_mp_ass_subscript(s: *mut PyObject, k: *mut PyObject, v: *mut PyObject) -> c_int {
     unsafe {
+        // (perf6) `__setitem__` inherited from a C type (a dict subclass that only
+        // overrides __delitem__, like Counter): its slot function directly, no wrapper call
+        if !v.is_null() {
+            if let Some(f) = lookup((*s).type_ptr(), name!("__setitem__")) {
+                if let Some((Slot::MpAssSubscript, w, owner)) = crate::types::descr::wrapper_descr_info(&f) {
+                    if !w.is_null() && w as usize != slot_mp_ass_subscript as usize && is_subtype((*s).type_ptr(), owner) {
+                        let cf: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> c_int = std::mem::transmute(w);
+                        return cf(s, k, v);
+                    }
+                }
+            }
+        }
         let r = if v.is_null() {
             call_special_required(&*s, name!("__delitem__"), &[&*k])
         } else {

@@ -790,6 +790,13 @@ fn lookup_lockfree_raw(d: &PyObject, key: &PyObject, hash: isize) -> LfRead {
     use std::sync::atomic::{AtomicI32, AtomicIsize, AtomicPtr};
     let kp = key.as_ptr();
     let str_key = crate::types::str::is_str_exact(key);
+    let plain_key = !str_key && {
+        let t = key.type_ptr() as *mut crate::ffi::PyTypeObject;
+        t == crate::types::int::int_type()
+            || t == crate::types::tuple::tuple_type()
+            || t == crate::types::float::float_type()
+            || t == crate::types::bytes::bytes_type()
+    };
     unsafe {
         let tp = AtomicPtr::from_ptr(&raw mut (*(d.as_ptr() as *mut PyDictObject)).ma_keys).load(Acquire) as *mut DictTable;
         if tp.is_null() {
@@ -831,6 +838,17 @@ fn lookup_lockfree_raw(d: &PyObject, key: &PyObject, hash: isize) -> LfRead {
                                 if crate::types::str::str_eq(&*ek, key) {
                                     res = LfRead::Hit(ix as usize, AtomicPtr::from_ptr(&raw mut (*e).value).load(Acquire));
                                     break;
+                                }
+                            } else if plain_key {
+                                // (perf6) exact int/float/tuple keys: equality runs no Python
+                                // code (tuple keys used to take the locked path every time)
+                                match crate::abstract_::plain_eq(&*ek, key) {
+                                    Some(true) => {
+                                        res = LfRead::Hit(ix as usize, AtomicPtr::from_ptr(&raw mut (*e).value).load(Acquire));
+                                        break;
+                                    }
+                                    Some(false) => {}
+                                    None => break,
                                 }
                             } else {
                                 break; // a comparison that may run Python code: locked path

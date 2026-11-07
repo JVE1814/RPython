@@ -548,14 +548,23 @@ impl Engine {
         let end = idx.min(self.buf.len());
         // (perf6) whole-range sums instead of a per-character state machine
         let s = self.track_idx.min(end);
-        self.track_byte += self.widths[s..end].iter().map(|&w| w as i64).sum::<i64>();
+        // fixed-size chunks with narrow accumulators so that the loops vectorise
+        let mut bytes = 0u64;
+        for c in self.widths[s..end].chunks(1024) {
+            bytes += c.iter().map(|&w| w as u32).sum::<u32>() as u64;
+        }
+        self.track_byte += bytes as i64;
         let chars = &self.buf[s..end];
-        match chars.iter().rposition(|&c| c == '\n') {
-            Some(last) => {
-                self.track_line += chars[..=last].iter().filter(|&&c| c == '\n').count() as u64;
-                self.track_col = (chars.len() - last - 1) as u64;
-            }
-            None => self.track_col += chars.len() as u64,
+        let mut nl = 0u64;
+        for c in chars.chunks(1024) {
+            nl += c.iter().map(|&ch| (ch == '\n') as u32).sum::<u32>() as u64;
+        }
+        if nl == 0 {
+            self.track_col += chars.len() as u64;
+        } else {
+            let last = chars.iter().rposition(|&c| c == '\n').unwrap_or(0);
+            self.track_line += nl;
+            self.track_col = (chars.len() - last - 1) as u64;
         }
         self.track_idx = end;
         (self.track_line, self.track_col, self.track_byte)
@@ -908,6 +917,9 @@ impl Engine {
         let provisional = !self.enc_resolved;
         let enc = self.enc.clone();
         let mut result = Ok(());
+        // (perf6) at most one character per byte: no repeated growth of a large buffer
+        self.buf.reserve(n);
+        self.widths.reserve(n);
         while i < n {
             match &enc {
                 Enc::Utf8 | Enc::Detect => {
