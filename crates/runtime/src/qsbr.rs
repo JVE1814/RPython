@@ -298,10 +298,44 @@ pub fn quiesce_now() {
     }
     let r = my_rec();
     r.seen.store(GLOBAL.load(SeqCst), Release);
+    if std::env::var_os("RPY_QSBR_DEBUG").is_some() {
+        eprintln!("qsbr: quiesce mt={} pending={} orphans={}", multi_threaded(), PENDING_TOTAL.load(SeqCst), ORPHANS.lock().unwrap().len());
+    }
     if !multi_threaded() {
         close_batch();
+        poll();
+        return;
     }
-    poll();
+    // Other threads are running: ask them to report a quiescent state and wait a
+    // little (the caller is blocking in join anyway) for the orphaned batches of the
+    // joined thread to mature. Threads in native/blocked mode count as quiescent, so
+    // this only waits for threads executing Python, which poll at backedges and calls.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+    loop {
+        poll();
+        let pending_orphans = !ORPHANS.lock().unwrap().is_empty();
+        if !pending_orphans || std::time::Instant::now() >= deadline {
+            if pending_orphans && std::env::var_os("RPY_QSBR_DEBUG").is_some() {
+                let recs = RECS.lock().unwrap();
+                eprintln!("qsbr: orphans left; LIVE={} GLOBAL={}", LIVE.load(SeqCst), GLOBAL.load(SeqCst));
+                for &t in crate::threads::ALL_THREADS.lock().unwrap().iter() {
+                    let ts = unsafe { &*(t as *const ThreadState) };
+                    let seen = recs.iter().find(|r| r.ts == t).map(|r| r.seen.load(SeqCst));
+                    eprintln!("  ts {:#x} alive={} mode={:?} seen={:?} me={} tid={} native={} gil={} frame={:?}", t, ts.alive(), ts.mode.get(), seen, t == me() as usize, ts.c.thread_id, ts.c.native_thread_id, ts.c.gilstate_counter, ts.frame.get());
+                }
+            }
+            break;
+        }
+        let me = me() as usize;
+        for t in crate::threads::ALL_THREADS.lock().unwrap().iter() {
+            if *t != me {
+                let ts = unsafe { &*(*t as *const ThreadState) };
+                ts.c.eval_breaker.fetch_or(EVAL_QSBR, Release);
+            }
+        }
+        crate::threads::blocking(|| std::thread::sleep(std::time::Duration::from_micros(200)));
+        r.seen.store(GLOBAL.load(SeqCst), Release);
+    }
 }
 
 /// Number of retired items not yet released (diagnostics/tests).

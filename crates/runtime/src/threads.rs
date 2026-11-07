@@ -459,7 +459,16 @@ pub fn after_fork_child() {
 /// stop-the-world operations do not wait for it; polls the safepoint on return.
 #[inline]
 pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
-    let ts = current();
+    // A thread without an attached state (inside Py_BEGIN_ALLOW_THREADS, or a C thread
+    // that never entered Python) is already safe for stop-the-world: do not attach a
+    // new state here. (Attaching made a second, never-detached InVm state for a
+    // thread blocking on a PyThread lock while detached; it stalled QSBR and every
+    // stop-the-world for the rest of the process.)
+    let p = current_ptr();
+    if p.is_null() {
+        return f();
+    }
+    let ts = unsafe { &*p };
     let prev = ts.mode.replace(ThreadMode::Blocked);
     let r = f();
     ts.mode.set(prev);

@@ -423,8 +423,9 @@ pub unsafe extern "C" fn PyThread_acquire_lock_timed(l: *mut c_void, microsecond
             return 0;
         }
         let deadline = if microseconds > 0 { Some(Instant::now() + Duration::from_micros(microseconds as u64)) } else { None };
-        let ts = crate::threads::current();
-        let old = ts.mode.replace(crate::threads::ThreadMode::Blocked);
+        // a detached caller (no current state) is already safe: never attach one here
+        let tsp = crate::threads::current_ptr();
+        let old = if tsp.is_null() { None } else { Some((*tsp).mode.replace(crate::threads::ThreadMode::Blocked)) };
         let r = loop {
             if !*g {
                 *g = true;
@@ -441,11 +442,13 @@ pub unsafe extern "C" fn PyThread_acquire_lock_timed(l: *mut c_void, microsecond
                 None => Duration::from_millis(50),
             };
             g = lk.cv.wait_timeout(g, wait).unwrap().0;
-            if intr_flag != 0 && ts.c.eval_breaker.load(Relaxed) & crate::threads::EVAL_SIGNALS != 0 {
+            if intr_flag != 0 && !tsp.is_null() && (*tsp).c.eval_breaker.load(Relaxed) & crate::threads::EVAL_SIGNALS != 0 {
                 break 2;
             }
         };
-        ts.mode.set(old);
+        if let Some(old) = old {
+            (*tsp).mode.set(old);
+        }
         r
     }
 }
