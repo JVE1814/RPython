@@ -85,9 +85,65 @@ CPU per object against ~100 ns; the world was stopped 975 ms. Three causes:
    caller's (a running for loop) is not reachable by other threads. cpu_comp in
    multi-threaded mode: 1285M -> 1099M instructions (= single-threaded mode).
 
+8. **`qsbr::others_quiescent`** (coordinator request after tail4 made it hotter: QSBR
+   polls with pending objects, `release_unpublished`/`release_replaced` on shared dict
+   writes). It scanned every thread state with SeqCst loads through a snapshot copy. Now
+   it stops at the first running thread, checking first the one found running last
+   time (thread-local hint); "quiescent" is only answered after a version-consistent
+   scan of the whole list (same Dekker argument as before; an early "not quiescent" is
+   conservative). mut_dict at 4 threads (callgrind, scale 0.1): 65M -> 20M instructions
+   inclusive (3.5% -> 1.1%), typically one remote mode load per call instead of all.
+   A global count of running threads was rejected: it would add a shared RMW to every
+   mode transition (each blocking call), i.e. contention on the lock-heavy workloads.
+
 ## Results
 
-(filled in below from the final harness run)
+Measurement caveat (D22): load average 6-11 throughout (other agents); no 4-thread
+run passed the contention filter (`*`), and contended workloads (shr_attrs, mut_dict,
+mut_list) are bimodal run to run (e.g. shr_attrs 0.7 or 2.7 s CPU for the same binary).
+Run A (23:24, all workloads, REPS=3, ours = s5 = this branch + core with refs1/perf7,
+before = base snapshot cdcbad1, py-ft) and run B (23:33, GC subset, REPS=5). cpu-infl@4,
+best runs (A) / medians of B where measured:
+
+| workload | before | ours (A) | py-ft (A) | ours (B best/median) | py-ft (B best/median) |
+|---|---|---|---|---|---|
+| alloc_cycles | 0.95-5.6 (bimodal) | 1.06 | 0.76 | 1.00 / 1.03 | 0.94 / 0.84 |
+| misc_classes | 1.64-1.76 | 2.11 | 1.57 | 1.92 / 2.00 | 1.24 / 1.46 |
+| cpu_float | 1.13-1.18 | 1.05 | 0.99 | 1.07 / 1.06 | 1.04 / 1.08 |
+| alloc_small | 0.96-0.98 | 1.12 | 1.07 | 1.14 / 1.13 | 1.01 / 0.96 |
+| misc_import | 1.11-1.25 | 1.11 | 1.26 | 1.06 / 1.07 | 1.28 / 1.31 |
+| cpu_comp | 1.11-1.36 | 0.99 | 1.06 | 1.03 / 1.01 | 0.98 / 1.00 |
+| mut_lock | 0.94-1.10 | 1.02 | 0.97 | 1.00 / 1.12 | 0.92 / 1.19 |
+| cpu_nbody | 0.97 | 1.03 | 1.05 | | |
+| cpu_oo | 1.04 | 1.04 | 1.08 | | |
+| cpu_gen | 1.07 | 0.98 | 1.02 | | |
+| cpu_regex | 1.06 | 1.08 | 1.12 | | |
+| cpu_json | 1.04 | 1.05 | 1.05 | | |
+| shr_dict | 1.39 | 0.98 | 1.37 | | |
+| shr_list | 0.82 | 0.81 | 1.26 | | |
+| shr_globals | 1.01 | 0.99 | 1.04 | | |
+| shr_attrs | 1.00-1.36 | 1.64 (bimodal) | 0.97 | | |
+| alloc_dicts | 1.02 | 1.04 | 1.13 | | |
+| mut_queue | 1.13 | 1.05 | 1.20 | | |
+| mut_dict | 1.15 | 1.26 | 0.90 | | |
+| mut_list | 1.12-1.27 | 1.27 | 1.02 | | |
+| jit_loop | 1.04 | 1.01 | 0.99 | | |
+| jit_calls | 1.04-1.06 | 1.13 | 0.98 | | |
+| misc_cext | 0.97 | 1.01 | 1.03 | | |
+
+misc_classes: the ratio is worse than before because the one-thread run got faster
+(CPU 0.27 -> 0.22 s at scale 1); absolute CPU at 4 threads is lower than before
+(interleaved runs: base 1.60-1.99 s, ours 1.39-2.08 s; with `RPY_GC_PARALLEL=0` 1.71-1.95).
+Wall @4 relative to py-ft (A): alloc_cycles 0.56, misc_classes 0.54, cpu_float 0.97,
+misc_import 1.22, cpu_comp 1.41 (cpu_comp is 1.3x slower than py-ft at one thread too).
+
+GC pause (same binary, `RPY_GC_PARALLEL=0` vs default, 4 threads, scale 0.5, 3 runs):
+alloc_cycles world-stopped 598-698 ms over ~360 collections (1.8 ms each) -> 154-231 ms
+over 88-330 (0.5-0.7 ms each), CPU 0.90-0.95 s -> 0.42-0.56 s, wall 0.80-1.08 s ->
+0.32-0.54 s; misc_classes 103-126 ms -> 70-102 ms stopped, wall 0.74-0.81 -> 0.55-0.74 s.
+Base build (first measurement, same load class): alloc_cycles 975 ms stopped over 65
+collections (15 ms each); STW wait per stop 67 us (base) -> 15-50 us; cpu_float 41 stops
+with 25 ms waiting -> 8-9 stops with 1-4 ms.
 
 ## What is left
 
@@ -108,7 +164,8 @@ CPU per object against ~100 ns; the world was stopped 975 ms. Three causes:
 
 tools/stress/run.sh (22 scripts, new: gc_parallel.py, gc_import_race.py) and
 tools/jit_tests/run.sh pass. Gate (installed-layout snapshots, base cdcbad1 vs this
-branch with core merged): test_gc test_weakref test_finalization test_capi
+branch with core merged; final run on 1fa7cf0 = core with tail4 merged: every gate
+module passes, no failures at all): test_gc test_weakref test_finalization test_capi
 test_threading test_thread test_free_threading test_sys test_dict test_list test_set
 test_descr test_class test_queue test_concurrent_futures test_asyncio test_generators:
 identical failure lists (test_gc 2, test_descr 1, test_asyncio 2, as in the base).
