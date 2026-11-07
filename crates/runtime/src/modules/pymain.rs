@@ -565,6 +565,8 @@ fn repl(quiet: bool) -> i32 {
     let stdin = std::io::stdin();
     let mut nomem = 0u32;
     let mut buf = String::new();
+    // (tail3) `from __future__ import ...` typed at the prompt stays in effect for later statements
+    let mut future_flags = 0u32;
     loop {
         // what the last statement printed is visible before the next prompt (pipes are buffered)
         for name in ["stderr", "stdout"] {
@@ -644,7 +646,7 @@ fn repl(quiet: bool) -> i32 {
         buf.push_str(&line);
         let src = buf.clone();
         let blank = line.trim().is_empty();
-        let r = crate::compile::compile_str(&src, "<stdin>", crate::compile::Mode::Single, 0, -1);
+        let r = crate::compile::compile_str(&src, "<stdin>", crate::compile::Mode::Single, future_flags, -1);
         match r {
             Ok(code) => {
                 // multi-line compound statements continue until a blank line
@@ -654,6 +656,7 @@ fn repl(quiet: bool) -> i32 {
                 }
                 buf.clear();
                 register_interactive_source(&code.code, &src);
+                future_flags |= code.future_flags & rpy_compiler::cf::PYCF_MASK;
                 let res = (|| -> PyResult<()> {
                     let m = main_module()?;
                     let d = module::module_dict(&m);

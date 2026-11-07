@@ -182,6 +182,9 @@ fn abc_init(_m: &PyObject, cls: &PyObject) -> PyResult {
         if let Some(flags) = dict::get_item_str(d, name!("__abc_tpflags__")) {
             if int::is_int(&flags) {
                 let v = ab::as_i64(&flags)? as std::ffi::c_ulong;
+                if v & COLLECTION_FLAGS == COLLECTION_FLAGS {
+                    raise!(TypeError, "__abc_tpflags__ cannot be both Py_TPFLAGS_SEQUENCE and Py_TPFLAGS_MAPPING");
+                }
                 unsafe {
                     (*tp).tp_flags = ((*tp).tp_flags & !COLLECTION_FLAGS) | (v & COLLECTION_FLAGS);
                 }

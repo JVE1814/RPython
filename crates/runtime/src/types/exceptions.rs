@@ -701,8 +701,31 @@ fn oserror_errno_class(errno: i64) -> Option<*mut PyTypeObject> {
 }
 const ENOTCAPABLE_OR_ZERO: i32 = -9999;
 
+/// (tail3) Which of `__new__`/`__init__` interprets the constructor arguments: when a
+/// subclass overrides `__init__` but keeps OSError's `__new__`, the arguments belong to
+/// `__init__` (which may take other parameters); otherwise `__new__` consumes them and
+/// the default `__init__` ignores whatever it is called with.
+fn oserror_args_go_to_init(tp: *mut PyTypeObject) -> bool {
+    unsafe {
+        let init = (*tp).tp_init.map(|f| f as usize);
+        let new = (*tp).tp_new.map(|f| f as usize);
+        init != Some(oserror_init as usize) && new == Some(oserror_new as usize)
+    }
+}
+
 unsafe extern "C" fn oserror_new(tp: *mut PyTypeObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
     unsafe {
+        if oserror_args_go_to_init(tp) {
+            let op = base_new(tp, std::ptr::null_mut(), kw);
+            if !op.is_null() {
+                (*(op as *mut OSErrorExc)).written = -1;
+            }
+            return op;
+        }
+        if !kw.is_null() && dict::dict_len(&*kw) > 0 {
+            let _ = err!(TypeError, "{}() takes no keyword arguments", type_name(&*tp));
+            return std::ptr::null_mut();
+        }
         let mut tp = tp;
         let a = tuple::tuple_items(&*args);
         if tp == OSError() && a.len() >= 2 {
@@ -718,13 +741,9 @@ unsafe extern "C" fn oserror_new(tp: *mut PyTypeObject, args: *mut PyObject, kw:
         }
         let e = &mut *(op as *mut OSErrorExc);
         e.written = -1;
-        // only fill fields here when __init__ is the default one (so subclasses that
-        // override __init__ still get errno/strerror from the arguments)
-        if (*tp).tp_init == OSError().as_ref().and_then(|t| t.tp_init) || true {
-            if oserror_fill(&*op, &*args).is_err() {
-                decref(op);
-                return std::ptr::null_mut();
-            }
+        if oserror_fill(&*op, &*args).is_err() {
+            decref(op);
+            return std::ptr::null_mut();
         }
         op
     }
@@ -758,10 +777,18 @@ fn oserror_fill(o: &PyObject, args: &PyObject) -> PyResult<()> {
     Ok(())
 }
 
-unsafe extern "C" fn oserror_init(_op: *mut PyObject, _args: *mut PyObject, kw: *mut PyObject) -> c_int {
+unsafe extern "C" fn oserror_init(op: *mut PyObject, args: *mut PyObject, kw: *mut PyObject) -> c_int {
     unsafe {
+        if !oserror_args_go_to_init((*op).type_ptr()) {
+            // __new__ already consumed the arguments
+            return 0;
+        }
         if !kw.is_null() && dict::dict_len(&*kw) > 0 {
-            let _ = err!(TypeError, "{}() takes no keyword arguments", type_name((*_op).ty()));
+            let _ = err!(TypeError, "{}() takes no keyword arguments", type_name((*op).ty()));
+            return -1;
+        }
+        set_field(&mut exc(&*op).args, Some(&*args));
+        if oserror_fill(&*op, &*args).is_err() {
             return -1;
         }
         0

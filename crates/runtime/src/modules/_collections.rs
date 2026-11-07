@@ -608,10 +608,20 @@ fn deque_get_maxlen(o: &PyObject) -> PyResult {
     Ok(if ml < 0 { fc::none() } else { int::new_int(ml as i64) })
 }
 
+/// (tail3) CPython's deque object: a variable-size header, two block pointers, five
+/// counters, a 16-entry free-block cache and the weakref list.  Our deque is smaller;
+/// the type reports (and allocates) at least that size so that `object.__sizeof__`
+/// and `__sizeof__` agree with the C layout the tests measure.
+const CPY_DEQUE_SIZE: usize = std::mem::size_of::<PyVarObject>() + (2 + 5 + 16 + 1) * 8;
+/// Items per storage block in CPython's deque, and the block size (two links + items).
+const CPY_DEQUE_BLOCKLEN: usize = 64;
+const CPY_DEQUE_BLOCKSIZE: usize = (CPY_DEQUE_BLOCKLEN + 2) * 8;
+
 fn deque_sizeof(o: &PyObject) -> PyResult {
-    let cap = with_dq(o, |d| d.items.capacity());
-    let base = std::mem::size_of::<fc::RObj<Deque>>();
-    Ok(int::new_int((base + cap * 8) as i64))
+    let len = with_dq(o, |d| d.items.len());
+    let blocks = len / CPY_DEQUE_BLOCKLEN + 1;
+    let base = o.ty().tp_basicsize as usize;
+    Ok(int::new_int((base + blocks * CPY_DEQUE_BLOCKSIZE) as i64))
 }
 
 // ------------------------------------------------------------------ deque iterators
@@ -1023,6 +1033,7 @@ fn init_types() -> PyResult<()> {
             return Ok(());
         }
         fc::init_robj_type::<Deque>(t, c"collections.deque", Py_TPFLAGS_BASETYPE | Py_TPFLAGS_SEQUENCE);
+        (*t).tp_basicsize = (*t).tp_basicsize.max(CPY_DEQUE_SIZE as isize);
         (*t).tp_new = Some(deque_new);
         (*t).tp_clear = Some(deque_tp_clear);
         (*t).tp_init = Some(deque_init);
