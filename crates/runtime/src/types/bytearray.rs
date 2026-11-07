@@ -858,10 +858,8 @@ fn m_extend(o: &PyObject, it: &PyObject) -> PyResult {
             return Err(e);
         }
     };
-    let hint = ab::length_hint(it, 64).unwrap_or_else(|_| {
-        clear_exc();
-        64
-    });
+    // errors from __len__ / __length_hint__ propagate (only a missing hint defaults)
+    let hint = ab::length_hint(it, 64)?;
     let mut v: Vec<u8> = Vec::with_capacity(hint.min(1 << 20));
     while let Some(item) = ab::iter_next(&iter)? {
         v.push(getbytevalue(&item)?);

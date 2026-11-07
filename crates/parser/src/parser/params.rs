@@ -258,7 +258,9 @@ impl<'a> Parser<'a> {
                     }
                     if self.at_name() {
                         let pm = self.p;
-                        if self.param(lambda, true)?.is_some() && self.at(T::EQUAL) {
+                        // `*args: *Ts = ...` is plain invalid syntax (no dedicated message)
+                        let starred_ann = !lambda && self.peek_n(1).ty == T::COLON && self.peek_n(2).ty == T::STAR;
+                        if self.param(lambda, true)?.is_some() && self.at(T::EQUAL) && !starred_ann {
                             let eq = self.peek();
                             return Err(self.err_tok("var-positional parameter cannot have default value", &eq));
                         }

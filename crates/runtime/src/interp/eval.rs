@@ -446,10 +446,14 @@ pub(super) fn unpack_sequence(seq: &PyObject, n: usize, out: &mut Vec<PyRef>) ->
         }
     }
     if ab::iter_next(&it)?.is_some() {
-        if let Ok(len) = ab::length(seq) {
-            raise!(ValueError, "too many values to unpack (expected {}, got {})", n, len);
+        // the count is only shown for builtin containers whose size is known; a
+        // user-defined __len__ is never called for the message
+        if dict::is_dict_exact(seq) || crate::types::set::is_anyset_exact(seq) {
+            if let Ok(len) = ab::length(seq) {
+                raise!(ValueError, "too many values to unpack (expected {}, got {})", n, len);
+            }
+            clear_exc();
         }
-        clear_exc();
         raise!(ValueError, "too many values to unpack (expected {})", n);
     }
     Ok(())

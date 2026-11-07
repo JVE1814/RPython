@@ -76,6 +76,10 @@ def _url_path(rest):
         pos = rest.find(delim)
         if pos >= 0:
             rest = rest[:pos]
+    # parameters of the last segment (";type=a") are not part of the name
+    semi = rest.find(';', rest.rfind('/') + 1)
+    if semi >= 0:
+        rest = rest[:semi]
     return rest
 
 

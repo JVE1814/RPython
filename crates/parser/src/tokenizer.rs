@@ -562,6 +562,14 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Number of the last line of the source text (a final line without a newline
+    /// counts), whether or not the input was given a terminating newline.
+    fn source_line_count(&self) -> u32 {
+        let nl = self.b.iter().filter(|&&c| c == b'\n').count() as u32;
+        let partial = !self.b.is_empty() && *self.b.last().unwrap() != b'\n';
+        (nl + partial as u32).max(1)
+    }
+
     fn last_line_no(&self) -> u32 {
         // number of the last line of the source (for DEDENT at EOF in raw mode)
         if self.b.is_empty() {
@@ -613,7 +621,13 @@ impl<'a> Lexer<'a> {
             if let Some(p) = self.parens.last() {
                 return Err(LexError::UnclosedParen(p.ch, p.lineno, p.col));
             }
-            return Err(LexError::Eof { lineno: self.lineno - 1, col: (self.pos - line_start_of(self.src, self.lineno - 1)) as i32 });
+            // reported just after the backslash (at the newline); with no token before
+            // it in the whole input there is no column (offset 0, no caret)
+            let nl = self.pos - 1;
+            let bs = if nl > 0 && self.b[nl - 1] == b'\r' { nl - 2 } else { nl - 1 };
+            let nothing_before = self.b[..bs].iter().all(|c| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | b'\x0c'));
+            let col = if nothing_before { -1 } else { (nl - line_start_of(self.src, self.lineno - 1)) as i32 };
+            return Err(LexError::Eof { lineno: self.lineno - 1, col });
         }
         Ok(())
     }
@@ -1113,7 +1127,7 @@ impl<'a> Lexer<'a> {
             }
             let c = self.peek();
             if c < 0 || (quote_size == 1 && (c == b'\n' as i32 || c == b'\r' as i32)) {
-                let detected = if c < 0 { self.last_line_no() } else { self.lineno };
+                let detected = if c < 0 { self.source_line_count() } else { self.lineno };
                 if c < 0 {
                     self.eof_error = true;
                 }
@@ -1286,7 +1300,7 @@ impl<'a> Lexer<'a> {
                             self.col_of(self.pos) + 1,
                         ));
                     }
-                    let detected = if c < 0 { self.last_line_no() } else { self.lineno };
+                    let detected = if c < 0 { self.source_line_count() } else { self.lineno };
                     if c < 0 {
                         self.eof_error = true;
                     }

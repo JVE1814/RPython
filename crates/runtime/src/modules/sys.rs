@@ -277,8 +277,25 @@ pub fn create_sys_module(argv: &[String]) -> PyResult<PyRef> {
 
 pub static INT_MAX_STR_DIGITS: AtomicI32 = AtomicI32::new(4300);
 pub static BYTES_WARNING: AtomicI32 = AtomicI32::new(0);
+/// The limit of a subinterpreter (each interpreter has its own; the main
+/// interpreter's is INT_MAX_STR_DIGITS). Starts at the configured value.
+static SUBINTERP_INT_MAX_STR_DIGITS: crate::subinterp::PerInterp<AtomicI32> =
+    crate::subinterp::PerInterp::new(|| AtomicI32::new(crate::modules::sys_full::config().int_max_str_digits));
+
+fn int_max_str_digits_cell() -> &'static AtomicI32 {
+    if crate::subinterp::USED.load(Relaxed) {
+        let i = crate::subinterp::current();
+        if !i.is_main() {
+            return SUBINTERP_INT_MAX_STR_DIGITS.get_in(i);
+        }
+    }
+    &INT_MAX_STR_DIGITS
+}
 pub fn int_max_str_digits() -> i32 {
-    INT_MAX_STR_DIGITS.load(Relaxed)
+    int_max_str_digits_cell().load(Relaxed)
+}
+pub fn set_int_max_str_digits(n: i32) {
+    int_max_str_digits_cell().store(n, Relaxed);
 }
 pub fn bytes_warning() -> i32 {
     BYTES_WARNING.load(Relaxed)

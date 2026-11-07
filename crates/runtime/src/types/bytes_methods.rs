@@ -1533,6 +1533,11 @@ pub fn percent_format(fmt: &[u8], args: &PyObject) -> PyResult<Vec<u8>> {
             continue;
         }
         let mut opts = PercentOpts::from_spec(&spec);
+        // every argument the directive consumes must be there before any is checked
+        let nstars = (spec.width == PercentNum::Star) as usize + (spec.precision == PercentNum::Star) as usize;
+        if nstars > 0 && fa.dict.is_none() && fa.n.saturating_sub(fa.idx) < nstars + 1 {
+            raise!(TypeError, "not enough arguments for format string (got {})", fa.n);
+        }
         if spec.width == PercentNum::Star {
             let (v, p) = fa.next()?;
             if !int::is_int(&v) {

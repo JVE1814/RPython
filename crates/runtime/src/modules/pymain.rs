@@ -163,6 +163,22 @@ fn looks_like_zip(path: &str) -> bool {
     tail.windows(4).any(|w| w == b"PK\x05\x06")
 }
 
+/// A path that does not exist on disk but names a directory inside a zip archive
+/// (`archive.zip/package/sub`): zipimport can import `__main__` from there.
+fn inside_zip(path: &str) -> bool {
+    let mut p = std::path::Path::new(path);
+    while let Some(parent) = p.parent() {
+        if parent.as_os_str().is_empty() {
+            return false;
+        }
+        if let Ok(m) = std::fs::metadata(parent) {
+            return m.is_file() && looks_like_zip(&parent.to_string_lossy());
+        }
+        p = parent;
+    }
+    false
+}
+
 fn insert_path0(p: &str) {
     if let Some(path) = crate::modules::sys::get_sys_attr("path") {
         list::insert(&path, 0, pystr::new_str(p));
@@ -175,7 +191,7 @@ fn run_script(path: &str, opts: &MainOptions) -> Outcome {
     let meta = std::fs::metadata(path);
     // a directory or zip file with __main__.py: run it as a module
     let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-    let is_zip = !is_dir && looks_like_zip(path);
+    let is_zip = !is_dir && (looks_like_zip(path) || (meta.is_err() && inside_zip(path)));
     if is_dir || is_zip {
         // The directory or archive is where __main__ comes from, so it is
         // put on sys.path even in safe-path / isolated mode.

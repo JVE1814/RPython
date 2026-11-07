@@ -10,7 +10,7 @@ use crate::errors::*;
 use crate::ffi::*;
 use crate::modules::fncommon as fc;
 use crate::object::*;
-use crate::types::typeobject::{as_type, is_type, type_obj};
+use crate::types::typeobject::{as_type, is_type, type_obj, type_ref};
 use crate::types::{bool_, dict, int, none, set, str as pystr, tuple};
 use crate::{mdefs, name, raise};
 use std::collections::HashMap;
@@ -233,11 +233,16 @@ fn abc_instancecheck(_m: &PyObject, a: &[&PyObject]) -> PyResult {
     crate::args::check_pos("_abc_instancecheck", a, 2, 2)?;
     let (cls, instance) = (a[0], a[1]);
     let imp = get_impl(cls)?;
-    let subclass = ab::getattr(instance, name!("__class__"))?;
+    // a strong reference: __subclasscheck__ may reassign instance.__class__
+    let subtype = type_ref(instance.type_ptr());
+    // an instance without a usable __class__ is checked by its type alone
+    let subclass = match ab::getattr_opt(instance, name!("__class__"))? {
+        Some(c) => c,
+        None => subtype.clone(),
+    };
     if lock(&imp).cache.contains(&subclass) {
         return Ok(bool_::new_bool(true));
     }
-    let subtype = type_obj(instance.type_ptr());
     if subtype.is(&subclass) {
         {
             let st = lock(&imp);
@@ -251,7 +256,7 @@ fn abc_instancecheck(_m: &PyObject, a: &[&PyObject]) -> PyResult {
     if ab::is_true(&r)? {
         return Ok(r);
     }
-    ab::call_method(cls, name!("__subclasscheck__"), &[subtype])
+    ab::call_method(cls, name!("__subclasscheck__"), &[&subtype])
 }
 
 fn abc_subclasscheck(_m: &PyObject, a: &[&PyObject]) -> PyResult {

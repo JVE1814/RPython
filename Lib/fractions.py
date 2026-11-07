@@ -386,6 +386,9 @@ class Fraction(numbers.Rational):
         no_neg_zero = bool(match["no_neg_zero"])
         alternate_form = bool(match["alt"])
         zeropad = bool(match["zeropad"])
+        # an explicit "0=" fill and alignment pads with grouped zeros as well
+        if fill == "0" and align == "=":
+            zeropad = True
         minimumwidth = int(match["minimumwidth"] or "0")
         thousands_sep = match["thousands_sep"]
         precision = int(match["precision"] or "6")

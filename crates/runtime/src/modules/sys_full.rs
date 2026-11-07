@@ -832,7 +832,7 @@ fn sys_set_int_max_str_digits(_m: &PyObject, args: &[&PyObject], kw: Option<&PyO
         raise!(ValueError, "maxdigits must be >= 640 or 0 for unlimited");
     }
     let n = n.min(i32::MAX as i64);
-    crate::modules::sys::INT_MAX_STR_DIGITS.store(n as i32, Relaxed);
+    crate::modules::sys::set_int_max_str_digits(n as i32);
     Ok(none::none_ref())
 }
 

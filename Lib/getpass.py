@@ -32,6 +32,34 @@ _CTRL_V = '\x16'   # insert next character literally
 _CTRL_W = '\x17'   # erase previous word
 _BACKSPACES = ('\x7f', '\b')
 
+_DEFAULT_KEYS = {
+    _CTRL_A: 'home', _CTRL_C: 'intr', _CTRL_D: 'eof', _CTRL_E: 'end',
+    _CTRL_K: 'kill_to_end', _CTRL_U: 'kill', _CTRL_V: 'lnext',
+    _CTRL_W: 'werase', '\x7f': 'erase', '\b': 'erase',
+}
+
+
+def _terminal_ctrl_chars(attrs):
+    """The editing characters configured in termios attributes, as
+    {action: char}; empty when they cannot be read."""
+    roles = {'erase': 'VERASE', 'kill': 'VKILL', 'werase': 'VWERASE',
+             'lnext': 'VLNEXT', 'intr': 'VINTR', 'eof': 'VEOF'}
+    found = {}
+    try:
+        cc = attrs[6]
+        for action, name in roles.items():
+            index = getattr(termios, name, None)
+            if index is None:
+                continue
+            value = cc[index]
+            if isinstance(value, int):
+                value = bytes([value])
+            if isinstance(value, bytes) and len(value) == 1 and value != b'\0':
+                found[action] = value.decode('latin-1')
+    except Exception:
+        return {}
+    return found
+
 
 def _check_echo_char(echo_char):
     if echo_char is None:
@@ -47,8 +75,14 @@ class _EchoingLineEditor:
     """Reads a line character by character, showing echo_char for every
     character and supporting a few editing keys."""
 
-    def __init__(self, prompt, stream, source, echo_char):
+    def __init__(self, prompt, stream, source, echo_char, term_ctrl_chars=None):
         self.prompt = prompt
+        # control character -> editing action; the terminal's own settings
+        # (erase, kill, ...) are honoured in addition to the defaults
+        self.keys = dict(_DEFAULT_KEYS)
+        for action, char in (term_ctrl_chars or {}).items():
+            if isinstance(char, str) and len(char) == 1 and char not in '\n\r':
+                self.keys[char] = action
         self.stream = stream
         self.source = source
         self.echo = echo_char
@@ -91,25 +125,26 @@ class _EchoingLineEditor:
                 break
             if char == '\x00':
                 continue
-            if char == _CTRL_V:
+            action = self.keys.get(char)
+            if action == 'lnext':
                 literal = True
-            elif char == _CTRL_C:
+            elif action == 'intr':
                 raise KeyboardInterrupt
-            elif char == _CTRL_D:
+            elif action == 'eof':
                 if not self.text:
                     raise EOFError
                 break
-            elif char in _BACKSPACES:
+            elif action == 'erase':
                 if self.cursor:
                     self.cursor -= 1
                     del self.text[self.cursor]
                     self._redraw()
-            elif char == _CTRL_U:
+            elif action == 'kill':
                 if self.text:
                     del self.text[:]
                     self.cursor = 0
                     self._redraw()
-            elif char == _CTRL_W:
+            elif action == 'werase':
                 start = self.cursor
                 while start and self.text[start - 1] == ' ':
                     start -= 1
@@ -119,15 +154,15 @@ class _EchoingLineEditor:
                     del self.text[start:self.cursor]
                     self.cursor = start
                     self._redraw()
-            elif char == _CTRL_A:
+            elif action == 'home':
                 if self.cursor:
                     self.cursor = 0
                     self._redraw()
-            elif char == _CTRL_E:
+            elif action == 'end':
                 if self.cursor != len(self.text):
                     self.cursor = len(self.text)
                     self._redraw()
-            elif char == _CTRL_K:
+            elif action == 'kill_to_end':
                 if self.cursor != len(self.text):
                     del self.text[self.cursor:]
                     self._redraw()
@@ -136,7 +171,8 @@ class _EchoingLineEditor:
         return ''.join(self.text)
 
 
-def _raw_input(prompt="", stream=None, input=None, echo_char=None):
+def _raw_input(prompt="", stream=None, input=None, echo_char=None,
+               term_ctrl_chars=None):
     """Write the prompt to `stream` (default stderr) and read a line from
     `input` (default stdin) without its newline."""
     if not stream:
@@ -153,7 +189,8 @@ def _raw_input(prompt="", stream=None, input=None, echo_char=None):
             stream.write(prompt)
         stream.flush()
     if echo_char:
-        return _EchoingLineEditor(prompt, stream, input, echo_char).read()
+        return _EchoingLineEditor(prompt, stream, input, echo_char,
+                                  term_ctrl_chars).read()
     line = input.readline()
     if not line:
         raise EOFError
@@ -194,7 +231,7 @@ def unix_getpass(prompt='Password: ', stream=None, *, echo_char=None):
                 fd = sys.stdin.fileno()
             except (AttributeError, ValueError):
                 fd = None
-                password = fallback_getpass(prompt, stream, echo_char=echo_char)
+                password = fallback_getpass(prompt, stream)
             source = sys.stdin
             if not stream:
                 stream = sys.stderr
@@ -209,8 +246,9 @@ def unix_getpass(prompt='Password: ', stream=None, *, echo_char=None):
                 when = termios.TCSAFLUSH | getattr(termios, 'TCSASOFT', 0)
                 try:
                     termios.tcsetattr(fd, when, quiet)
-                    password = _raw_input(prompt, stream, input=source,
-                                          echo_char=echo_char)
+                    password = _raw_input(
+                        prompt, stream, input=source, echo_char=echo_char,
+                        term_ctrl_chars=_terminal_ctrl_chars(saved))
                 finally:
                     termios.tcsetattr(fd, when, saved)
                     stream.flush()
@@ -220,7 +258,7 @@ def unix_getpass(prompt='Password: ', stream=None, *, echo_char=None):
                     raise
                 if stream is not source:
                     cleanup.close()
-                password = fallback_getpass(prompt, stream, echo_char=echo_char)
+                password = fallback_getpass(prompt, stream)
 
         stream.write('\n')
         return password

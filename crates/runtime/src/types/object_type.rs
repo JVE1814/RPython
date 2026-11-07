@@ -1299,6 +1299,13 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
     if !dict::is_anydict(ns) {
         raise!(TypeError, "type.__new__() argument 3 must be dict, not {}", tname(ns));
     }
+    // bases that would need __mro_entries__ are refused before the metaclass is
+    // worked out (their types are no metaclasses)
+    for b in tuple::tuple_items(bases) {
+        if !is_type(b) && ab::getattr_opt(b, name!("__mro_entries__"))?.is_some() {
+            raise!(TypeError, "type() doesn't support MRO entry resolution; use types.new_class()");
+        }
+    }
     // metaclass
     let winner = calculate_metaclass(meta, bases)?;
     if winner != meta {
@@ -1316,13 +1323,6 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
     let bases_owned: PyRef = if tuple::tuple_len(bases) == 0 {
         tuple::new_tuple(vec![type_ref(object_type())])
     } else {
-        for b in tuple::tuple_items(bases) {
-            if !is_type(b) {
-                if ab::getattr_opt(b, name!("__mro_entries__"))?.is_some() {
-                    raise!(TypeError, "type() doesn't support MRO entry resolution; use types.new_class()");
-                }
-            }
-        }
         bases.to_ref()
     };
     for b in tuple::tuple_items(&bases_owned) {
@@ -1643,9 +1643,10 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
         }
         if let Some(cd) = dict::get_item_str(&dict, name!("__classdictcell__")) {
             if cd.is_type(funcobject::cell_type()) {
-                // the class-body namespace (not the type dict, which would make
-                // class -> dict -> __annotate__ -> cell -> dict cycles)
-                funcobject::cell_set(&cd, Some(ns.to_ref()));
+                // the type's own dict: lazily evaluated annotations, bounds and
+                // alias values see later changes to class attributes (the cycle
+                // dict -> function -> cell -> dict is left to the collector)
+                funcobject::cell_set(&cd, Some(dict.clone()));
             }
             dict::del_item(&dict, name!("__classdictcell__"))?;
         }

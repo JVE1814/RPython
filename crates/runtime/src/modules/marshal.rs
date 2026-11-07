@@ -923,6 +923,10 @@ fn str_count(o: &PyObject) -> Option<usize> {
 
 /// `no_debug_ranges` is fixed at startup (-X / environment): look it up once.
 fn no_debug_ranges_cached() -> bool {
+    // _loads_without_positions asks for it per call, whatever the startup setting
+    if STRIP_COLUMNS.with(|c| c.get()) {
+        return true;
+    }
     static V: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
     match V.load(std::sync::atomic::Ordering::Relaxed) {
         2 => {

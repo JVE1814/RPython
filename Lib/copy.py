@@ -181,8 +181,14 @@ d[dict] = _deepcopy_dict
 
 try:
     def _deepcopy_frozendict(x, memo, deepcopy=deepcopy):
-        y = frozendict({deepcopy(k, memo): deepcopy(v, memo)
-                        for k, v in x.items()})
+        items = [(deepcopy(k, memo), deepcopy(v, memo)) for k, v in x.items()]
+        # as for tuples: a recursive frozendict may have been copied already
+        # while its values were
+        try:
+            return memo[id(x)]
+        except KeyError:
+            pass
+        y = frozendict(items)
         for (k1, v1), (k2, v2) in zip(x.items(), y.items()):
             if k1 is not k2 or v1 is not v2:
                 return y
