@@ -675,6 +675,7 @@ pub fn update_slot(tp: *mut PyTypeObject, attr: &PyObject) {
             update_one_slot(tp, s);
         }
         for sub in subclasses(tp) {
+            let sub = sub.p();
             if is_heap_type(sub) {
                 rec(sub, slots);
             }
@@ -772,6 +773,7 @@ pub fn type_modified(tp: *mut PyTypeObject) {
         (*tp).tp_version_tag = 0;
         (*tp).tp_flags &= !Py_TPFLAGS_VALID_VERSION_TAG;
         for s in subclasses(tp) {
+            let s = s.p();
             type_modified(s);
         }
     }

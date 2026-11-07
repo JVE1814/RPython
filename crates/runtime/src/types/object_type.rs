@@ -757,10 +757,13 @@ fn type_set_bases(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         // conflict), everything goes back to how it was and the error propagates
         if (*tp).tp_bases == ours {
             let mut changed: Vec<(*mut PyTypeObject, *mut PyObject)> = Vec::new();
+            let mut keep = Vec::new(); // keeps the subclasses in `changed` alive
             let mut todo = subclasses(tp);
             let mut seen = std::collections::HashSet::new();
             let mut failed = false;
-            while let Some(sub) = todo.pop() {
+            while let Some(subr) = todo.pop() {
+                let sub = subr.p();
+                keep.push(subr);
                 if !seen.insert(sub as usize) {
                     continue;
                 }
@@ -810,7 +813,8 @@ fn type_set_bases(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         // inherited slots of all subclasses may come from the new bases
         let mut todo = subclasses(tp);
         let mut seen = std::collections::HashSet::new();
-        while let Some(sub) = todo.pop() {
+        while let Some(subr) = todo.pop() {
+            let sub = subr.p();
             if seen.insert(sub as usize) {
                 crate::types::slots::fixup_slots(sub);
                 todo.extend(subclasses(sub));
@@ -981,7 +985,7 @@ fn type_mro_method(o: &PyObject) -> PyResult {
     Ok(list::new_list(tuple::tuple_to_vec(&r)))
 }
 fn type_subclasses_method(o: &PyObject) -> PyResult {
-    Ok(list::new_list(subclasses(t(o)).into_iter().map(type_ref).collect()))
+    Ok(list::new_list(subclasses(t(o)).into_iter().map(|s| s.into_ref()).collect()))
 }
 fn type_instancecheck(o: &PyObject, inst: &PyObject) -> PyResult {
     let tp = t(o);

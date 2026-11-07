@@ -856,6 +856,7 @@ pub fn add_subclass(base: *mut PyTypeObject, sub: *mut PyTypeObject) {
             (*base).tp_subclasses = Box::into_raw(Box::new(Vec::<usize>::new())) as *mut c_void;
         }
         let v = &mut *((*base).tp_subclasses as *mut Vec<usize>);
+        crate::object::enable_try_incref(sub as *mut PyObject); // see subclasses()
         if !v.contains(&(sub as usize)) {
             v.push(sub as usize);
         }
@@ -873,14 +874,34 @@ pub fn remove_subclass(base: *mut PyTypeObject, sub: *mut PyTypeObject) {
     }
 }
 
-pub fn subclasses(tp: *mut PyTypeObject) -> Vec<*mut PyTypeObject> {
+/// A subclass reached through `tp_subclasses` (which holds no references), kept
+/// alive while the caller works on it: another thread may drop the last reference
+/// to it at any time (classes are created and freed concurrently).
+pub struct SubType(PyRef);
+impl SubType {
+    #[inline]
+    pub fn p(&self) -> *mut PyTypeObject {
+        self.0.as_ptr() as *mut PyTypeObject
+    }
+    pub fn into_ref(self) -> PyRef {
+        self.0
+    }
+}
+
+/// The live direct subclasses of `tp` (dying ones are skipped).
+pub fn subclasses(tp: *mut PyTypeObject) -> Vec<SubType> {
     let _g = SUBCLASSES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     unsafe {
         if (*tp).tp_subclasses.is_null() {
             return Vec::new();
         }
         let v = &*((*tp).tp_subclasses as *mut Vec<usize>);
-        v.iter().map(|&x| x as *mut PyTypeObject).collect()
+        // a subclass is removed from the list in its dealloc, which needs this lock:
+        // its memory is valid here, and try_incref refuses one that is dying
+        v.iter()
+            .filter(|&&x| crate::object::try_incref(x as *mut PyObject))
+            .map(|&x| SubType(PyRef::from_raw(x as *mut PyObject)))
+            .collect()
     }
 }
 
