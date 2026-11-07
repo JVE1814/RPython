@@ -84,8 +84,17 @@ pub fn assign_type_tag(tp: *mut PyTypeObject) -> u32 {
         TYPE_VERSION.store(u32::MAX - 1, Relaxed);
         return 0;
     }
-    match tag_cell(tp).compare_exchange(0, v, AcqRel, Acquire) {
+    if TYPE_WRITERS.load(SeqCst) != 0 {
+        return 0;
+    }
+    match tag_cell(tp).compare_exchange(0, v, SeqCst, Acquire) {
         Ok(_) => {
+            // (stability3) a type attribute store that began meanwhile may already
+            // have reset the tags; caching now could pair this tag with the old value
+            if TYPE_WRITERS.load(SeqCst) != 0 {
+                let _ = tag_cell(tp).compare_exchange(v, 0, SeqCst, Relaxed);
+                return 0;
+            }
             unsafe { (*tp).tp_flags |= Py_TPFLAGS_VALID_VERSION_TAG };
             register_tag(tp, v);
             v
@@ -93,6 +102,13 @@ pub fn assign_type_tag(tp: *mut PyTypeObject) -> u32 {
         Err(cur) => cur,
     }
 }
+
+/// (stability3) Type attribute stores in progress (`type.__setattr__`). The store
+/// resets the version tags of the type and its subclasses *before* changing the dict
+/// and no tag is assigned while any store runs, so a cache hit can never return a
+/// value older than one a lock-free read of the type's dict already saw (CPython
+/// does both under its type lock).
+pub static TYPE_WRITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// True when a custom mro() put a class into `tp`'s MRO that is not an ancestor
 /// through its bases: changes to that class do not reach `tp` (it is not one of

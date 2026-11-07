@@ -34,7 +34,7 @@ pub fn is_dict(o: &PyObject) -> bool {
 /// (stability3) `ob_flags` bit of a dict object: it was materialised from an instance's
 /// inline values, i.e. it holds attribute names shared with its class (what CPython
 /// calls a split table). Only `_testinternalcapi.has_split_table` reads it.
-pub const OBF_FROM_INSTANCE: u16 = 1 << 7;
+pub const OBF_FROM_INSTANCE: u16 = 1 << 4; // (not 5-7: sharded.rs)
 #[inline(always)]
 pub fn is_dict_exact(o: &PyObject) -> bool {
     o.is_type(dict_type())
