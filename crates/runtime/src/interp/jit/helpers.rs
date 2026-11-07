@@ -24,12 +24,23 @@ pub const OK: u64 = 0;
 pub const ERR: u64 = 1;
 
 #[inline(always)]
+/// Take a stack entry as an owned reference (refs1: a borrowed entry is converted).
 unsafe fn take(p: *mut *mut PyObject) -> PyRef {
-    unsafe { PyRef::from_raw(std::ptr::replace(p, std::ptr::null_mut())) }
+    unsafe { PyRef::from_raw(crate::interp::borrow::own(std::ptr::replace(p, std::ptr::null_mut()))) }
+}
+/// (refs1) Take a stack entry for a consumer that only looks at it.
+#[inline(always)]
+unsafe fn take_sr(p: *mut *mut PyObject) -> crate::interp::borrow::SRef {
+    unsafe { crate::interp::borrow::SRef::from_slot(std::ptr::replace(p, std::ptr::null_mut())) }
+}
+/// (refs1) The object of a stack entry (the entry keeps its ownership).
+#[inline(always)]
+unsafe fn view(p: *mut *mut PyObject) -> *mut PyObject {
+    crate::interp::borrow::untag(unsafe { *p })
 }
 #[inline(always)]
 unsafe fn take_opt(p: *mut *mut PyObject) -> Option<PyRef> {
-    unsafe { PyRef::from_raw_opt(std::ptr::replace(p, std::ptr::null_mut())) }
+    unsafe { PyRef::from_raw_opt(crate::interp::borrow::own(std::ptr::replace(p, std::ptr::null_mut()))) }
 }
 #[inline(always)]
 unsafe fn put(p: *mut *mut PyObject, v: PyRef) {
@@ -56,6 +67,8 @@ macro_rules! helper {
 /// profile word, `b` (may be NULL) in the high byte.
 pub unsafe extern "C" fn h_prof(p: *const std::sync::atomic::AtomicU16, a: *mut PyObject, b: *mut PyObject) {
     unsafe {
+        // (refs1) stack entries: a borrowed one carries the tag bit
+        let (a, b) = (crate::interp::borrow::untag(a), crate::interp::borrow::untag(b));
         let mut bits = if a.is_null() { 0 } else { specialize::profile_bits(&*a) as u16 };
         if !b.is_null() {
             bits |= (specialize::profile_bits(&*b) as u16) << 8;
@@ -190,7 +203,7 @@ pub unsafe extern "C" fn h_unbound_local(f: *mut Frame, idx: u64) -> u64 {
 /// truth value of TOS, consuming it: 0 false, 1 true, 2 error
 pub unsafe extern "C" fn h_truth_pop(sp: *mut *mut PyObject) -> u64 {
     unsafe {
-        let v = take(sp.sub(1));
+        let v = take_sr(sp.sub(1));
         match ab::is_true(&v) {
             Ok(t) => t as u64,
             Err(_) => 2,
@@ -200,7 +213,7 @@ pub unsafe extern "C" fn h_truth_pop(sp: *mut *mut PyObject) -> u64 {
 /// truth value of TOS without popping: 0 false, 1 true, 2 error (TOS still owned)
 pub unsafe extern "C" fn h_truth_peek(sp: *mut *mut PyObject) -> u64 {
     unsafe {
-        match ab::is_true(&**sp.sub(1)) {
+        match ab::is_true(&*view(sp.sub(1))) {
             Ok(t) => t as u64,
             Err(_) => 2,
         }
@@ -223,7 +236,7 @@ pub unsafe extern "C" fn h_load_global(f: *mut Frame, sp: *mut *mut PyObject, na
 
 pub unsafe extern "C" fn h_load_attr(sp: *mut *mut PyObject, name: *mut PyObject, e: *const Entry) -> u64 {
     unsafe {
-        let o = take(sp.sub(1));
+        let o = take_sr(sp.sub(1));
         match specialize::load_attr(&o, &*name, std::slice::from_raw_parts(e, crate::interp::cache::POLY)) {
             Ok(v) => {
                 put(sp.sub(1), v);
@@ -236,11 +249,12 @@ pub unsafe extern "C" fn h_load_attr(sp: *mut *mut PyObject, name: *mut PyObject
 
 pub unsafe extern "C" fn h_load_method(sp: *mut *mut PyObject, name: *mut PyObject, e: *const Entry) -> u64 {
     unsafe {
-        let o = take(sp.sub(1));
-        match specialize::load_method(&o, &*name, std::slice::from_raw_parts(e, crate::interp::cache::POLY)) {
-            Ok((m, s)) => {
+        let o = take_sr(sp.sub(1));
+        match specialize::load_method_r(&o, &*name, std::slice::from_raw_parts(e, crate::interp::cache::POLY)) {
+            Ok((m, recv)) => {
                 put(sp.sub(1), m);
-                *sp = s.map_or(std::ptr::null_mut(), |s| s.into_raw());
+                // (refs1) `self` is the receiver entry itself (borrowed stays borrowed)
+                *sp = if recv { o.into_slot() } else { std::ptr::null_mut() };
                 OK
             }
             Err(_) => ERR,
@@ -250,8 +264,8 @@ pub unsafe extern "C" fn h_load_method(sp: *mut *mut PyObject, name: *mut PyObje
 
 pub unsafe extern "C" fn h_store_attr(sp: *mut *mut PyObject, name: *mut PyObject, e: *const Entry) -> u64 {
     unsafe {
-        let o = take(sp.sub(1));
-        let v = take(sp.sub(2));
+        let o = take_sr(sp.sub(1));
+        let v = take_sr(sp.sub(2));
         match specialize::store_attr(&o, &*name, &v, std::slice::from_raw_parts(e, crate::interp::cache::POLY)) {
             Ok(()) => OK,
             Err(_) => ERR,
@@ -261,7 +275,7 @@ pub unsafe extern "C" fn h_store_attr(sp: *mut *mut PyObject, name: *mut PyObjec
 
 pub unsafe extern "C" fn h_delete_attr(sp: *mut *mut PyObject, name: *mut PyObject) -> u64 {
     unsafe {
-        let o = take(sp.sub(1));
+        let o = take_sr(sp.sub(1));
         match ab::delattr(&o, &*name) {
             Ok(()) => OK,
             Err(_) => ERR,
@@ -355,8 +369,8 @@ pub unsafe extern "C" fn h_copy_free_vars(f: *mut Frame, n: u64) -> u64 {
 
 pub unsafe extern "C" fn h_binary_op(sp: *mut *mut PyObject, op: u64) -> u64 {
     unsafe {
-        let b = take(sp.sub(1));
-        let a = take(sp.sub(2));
+        let b = take_sr(sp.sub(1));
+        let a = take_sr(sp.sub(2));
         let op: BinOp = std::mem::transmute(op as u8);
         match eval::binary_op_on_stack(op, &a, &b) {
             Ok(r) => {
@@ -379,8 +393,8 @@ fn compare_obj(a: &PyObject, b: &PyObject, arg: u32) -> PyResult {
 
 pub unsafe extern "C" fn h_compare(sp: *mut *mut PyObject, arg: u64) -> u64 {
     unsafe {
-        let b = take(sp.sub(1));
-        let a = take(sp.sub(2));
+        let b = take_sr(sp.sub(1));
+        let a = take_sr(sp.sub(2));
         match compare_obj(&a, &b, arg as u32) {
             Ok(r) => {
                 put(sp.sub(2), r);
@@ -394,8 +408,8 @@ pub unsafe extern "C" fn h_compare(sp: *mut *mut PyObject, arg: u64) -> u64 {
 /// CompareOp (bool result) fused with a conditional jump: 0 false, 1 true, 2 error.
 pub unsafe extern "C" fn h_compare_truth(sp: *mut *mut PyObject, arg: u64) -> u64 {
     unsafe {
-        let b = take(sp.sub(1));
-        let a = take(sp.sub(2));
+        let b = take_sr(sp.sub(1));
+        let a = take_sr(sp.sub(2));
         let cop = (arg & 15) as std::ffi::c_int;
         if let Some(t) = specialize::compare_fast(cop, &a, &b) {
             return t as u64;
@@ -415,8 +429,8 @@ pub unsafe extern "C" fn h_compare_truth(sp: *mut *mut PyObject, arg: u64) -> u6
 
 pub unsafe extern "C" fn h_is_op(sp: *mut *mut PyObject, arg: u64) -> u64 {
     unsafe {
-        let b = take(sp.sub(1));
-        let a = take(sp.sub(2));
+        let b = take_sr(sp.sub(1));
+        let a = take_sr(sp.sub(2));
         put(sp.sub(2), bool_::new_bool(a.is(&b) != (arg == 1)));
         OK
     }
@@ -424,8 +438,8 @@ pub unsafe extern "C" fn h_is_op(sp: *mut *mut PyObject, arg: u64) -> u64 {
 
 pub unsafe extern "C" fn h_contains_op(sp: *mut *mut PyObject, arg: u64) -> u64 {
     unsafe {
-        let b = take(sp.sub(1));
-        let a = take(sp.sub(2));
+        let b = take_sr(sp.sub(1));
+        let a = take_sr(sp.sub(2));
         match ab::contains(&b, &a) {
             Ok(r) => {
                 put(sp.sub(2), bool_::new_bool(r != (arg == 1)));
@@ -439,7 +453,7 @@ pub unsafe extern "C" fn h_contains_op(sp: *mut *mut PyObject, arg: u64) -> u64 
 /// which: 0 negative, 1 positive, 2 invert, 3 not, 4 to_bool
 pub unsafe extern "C" fn h_unary(sp: *mut *mut PyObject, which: u64) -> u64 {
     unsafe {
-        let a = take(sp.sub(1));
+        let a = take_sr(sp.sub(1));
         let r = match which {
             0 => {
                 if int::is_int_exact(&a) && int::is_compact(&a) {
@@ -465,8 +479,8 @@ pub unsafe extern "C" fn h_unary(sp: *mut *mut PyObject, which: u64) -> u64 {
 
 pub unsafe extern "C" fn h_binary_subscr(sp: *mut *mut PyObject) -> u64 {
     unsafe {
-        let k = take(sp.sub(1));
-        let c = take(sp.sub(2));
+        let k = take_sr(sp.sub(1));
+        let c = take_sr(sp.sub(2));
         helper!({
             let r = if list::is_list_exact(&c) && int::is_int_exact(&k) && int::is_compact(&k) {
                 match list::get_signed(&c, int::compact_value(&k)) {
@@ -506,9 +520,9 @@ pub unsafe extern "C" fn h_binary_subscr(sp: *mut *mut PyObject) -> u64 {
 
 pub unsafe extern "C" fn h_store_subscr(sp: *mut *mut PyObject) -> u64 {
     unsafe {
-        let k = take(sp.sub(1));
-        let c = take(sp.sub(2));
-        let v = take(sp.sub(3));
+        let k = take_sr(sp.sub(1));
+        let c = take_sr(sp.sub(2));
+        let v = take_sr(sp.sub(3));
         let r = if dict::is_dict_exact(&c) { dict::set_item(&c, &k, &v) } else { ab::setitem(&c, &k, Some(&v)) };
         if r.is_ok() { OK } else { ERR }
     }
@@ -516,8 +530,8 @@ pub unsafe extern "C" fn h_store_subscr(sp: *mut *mut PyObject) -> u64 {
 
 pub unsafe extern "C" fn h_delete_subscr(sp: *mut *mut PyObject) -> u64 {
     unsafe {
-        let k = take(sp.sub(1));
-        let c = take(sp.sub(2));
+        let k = take_sr(sp.sub(1));
+        let c = take_sr(sp.sub(2));
         if ab::setitem(&c, &k, None).is_ok() { OK } else { ERR }
     }
 }
@@ -542,9 +556,9 @@ fn simple_bounds(start: &PyObject, stop: &PyObject, len: usize) -> Option<(usize
 
 pub unsafe extern "C" fn h_binary_slice(sp: *mut *mut PyObject) -> u64 {
     unsafe {
-        let stop = take(sp.sub(1));
-        let start = take(sp.sub(2));
-        let c = take(sp.sub(3));
+        let stop = take_sr(sp.sub(1));
+        let start = take_sr(sp.sub(2));
+        let c = take_sr(sp.sub(3));
         // (jit5) exact list/tuple with None/int bounds: no slice object
         if list::is_list_exact(&c) {
             let _g = crate::types::dict::ob_lock(&c);
@@ -557,7 +571,7 @@ pub unsafe extern "C" fn h_binary_slice(sp: *mut *mut PyObject) -> u64 {
             let items = tuple::tuple_items(&c);
             if let Some((lo, hi)) = simple_bounds(&start, &stop, items.len()) {
                 let r = if lo == 0 && hi == items.len() {
-                    c.clone()
+                    c.to_ref()
                 } else {
                     tuple::new_tuple(items[lo..hi].iter().map(|x| x.to_ref()).collect())
                 };
@@ -633,6 +647,14 @@ pub unsafe extern "C" fn h_build_slice(sp: *mut *mut PyObject, n: u64) -> u64 {
 
 // ------------------------------------------------------------------ builders
 
+/// (refs1) Convert the n entries at `base` to owned references (before they are moved
+/// into a container).
+unsafe fn own_n(base: *mut *mut PyObject, n: usize) {
+    for i in 0..n {
+        unsafe { *base.add(i) = crate::interp::borrow::own(*base.add(i)) };
+    }
+}
+
 unsafe fn take_n(sp: *mut *mut PyObject, n: usize) -> Vec<PyRef> {
     unsafe { (0..n).map(|i| take(sp.sub(n - i))).collect() }
 }
@@ -642,6 +664,7 @@ pub unsafe extern "C" fn h_build_tuple(sp: *mut *mut PyObject, n: u64) -> u64 {
         let n = n as usize;
         // (perf4) items moved straight from the stack, no vector
         let base = sp.sub(n);
+        own_n(base, n);
         let t = tuple::new_tuple_steal(base, n);
         for i in 1..n {
             *base.add(i) = std::ptr::null_mut();
@@ -655,6 +678,7 @@ pub unsafe extern "C" fn h_build_list(sp: *mut *mut PyObject, n: u64) -> u64 {
     unsafe {
         let n = n as usize;
         let base = sp.sub(n);
+        own_n(base, n);
         let l = list::new_list_steal(base, n);
         for i in 1..n {
             *base.add(i) = std::ptr::null_mut();
@@ -715,12 +739,12 @@ pub unsafe extern "C" fn h_container_op(sp: *mut *mut PyObject, which: u64, arg:
             match which {
                 0 => {
                     let v = take(sp.sub(1));
-                    let l = *sp.sub(1 + arg);
+                    let l = view(sp.sub(1 + arg));
                     list::append(&*l, v);
                 }
                 1 => {
                     let v = take(sp.sub(1));
-                    let s = *sp.sub(1 + arg);
+                    let s = view(sp.sub(1 + arg));
                     if !crate::types::set::is_set(&*s) {
                         let _ = err!(TypeError, "'{}' object is not a set", tname(&*s));
                         return Err(ERR);
@@ -730,12 +754,12 @@ pub unsafe extern "C" fn h_container_op(sp: *mut *mut PyObject, which: u64, arg:
                 2 => {
                     let v = take(sp.sub(1));
                     let k = take(sp.sub(2));
-                    let d = *sp.sub(2 + arg);
+                    let d = view(sp.sub(2 + arg));
                     st(dict::set_item(&*d, &k, &v))?;
                 }
                 3 => {
                     let it = take(sp.sub(1));
-                    let l = *sp.sub(1 + arg);
+                    let l = view(sp.sub(1 + arg));
                     // perf3: list::extend copies tuples/lists without a temporary vector
                     match list::extend(&*l, &it) {
                         Ok(()) => {}
@@ -753,18 +777,18 @@ pub unsafe extern "C" fn h_container_op(sp: *mut *mut PyObject, which: u64, arg:
                 }
                 4 => {
                     let it = take(sp.sub(1));
-                    let s = *sp.sub(1 + arg);
+                    let s = view(sp.sub(1 + arg));
                     st(crate::types::set::set_update(&*s, &it))?;
                 }
                 5 => {
                     let o = take(sp.sub(1));
-                    let d = *sp.sub(1 + arg);
+                    let d = view(sp.sub(1 + arg));
                     st(crate::types::dict_methods::dict_update_display(&*d, &o))?;
                 }
                 _ => {
                     let o = take(sp.sub(1));
-                    let d = *sp.sub(1 + arg);
-                    let func = *sp.sub(1 + arg + 3); // callable, self-or-NULL, args, dict
+                    let d = view(sp.sub(1 + arg));
+                    let func = view(sp.sub(1 + arg + 3)); // callable, self-or-NULL, args, dict
                     st(crate::types::dict_methods::dict_merge_kwargs(&*d, &o, func))?;
                 }
             }
@@ -827,7 +851,7 @@ pub unsafe extern "C" fn h_unpack_ex(sp: *mut *mut PyObject, arg: u64) -> u64 {
 
 pub unsafe extern "C" fn h_get_iter(sp: *mut *mut PyObject) -> u64 {
     unsafe {
-        let o = take(sp.sub(1));
+        let o = take_sr(sp.sub(1));
         match ab::get_iter(&o) {
             Ok(it) => {
                 put(sp.sub(1), it);
@@ -1014,7 +1038,7 @@ pub unsafe extern "C" fn h_get_yield_from_iter(sp: *mut *mut PyObject, code_flag
 /// a method descriptor found by LoadMethod (`[descr, self, args..]`), positional
 /// arguments only. None: not such a call (or a convention `call_methoddef_fast`
 /// leaves to the general path).
-#[inline]
+#[inline(always)]
 unsafe fn call_builtin_fast(callable: *mut PyObject, self_or_null: *mut PyObject, base: *mut *mut PyObject, n: usize) -> Option<*mut PyObject> {
     unsafe {
         let c = &*callable;
@@ -1050,24 +1074,52 @@ unsafe fn call_builtin_fast(callable: *mut PyObject, self_or_null: *mut PyObject
 pub unsafe extern "C" fn h_unpack_method(base: *mut *mut PyObject) {
     unsafe {
         let m = *base;
-        let pm = m as *mut crate::ffi::PyMethodObject;
+        let pm = crate::interp::borrow::untag(m) as *mut crate::ffi::PyMethodObject;
         let (f, s) = ((*pm).im_func, (*pm).im_self);
         incref(f);
         incref(s);
         *base = f;
         *base.add(1) = s;
-        decref(m);
+        crate::interp::borrow::release(m);
     }
 }
 
-/// Call / CallKw: [callable, self_or_null, args..(, kwnames)] -> [result]
+/// (refs1) The n entries at `base` as plain pointers: an untagged copy in `tmp`, or,
+/// for more than 16 entries (rare), the entries themselves made owned in place.
+#[inline(always)]
+unsafe fn untagged_args(base: *mut *mut PyObject, n: usize, tmp: &mut std::mem::MaybeUninit<[*mut PyObject; 16]>) -> *mut *mut PyObject {
+    unsafe {
+        if n > 16 {
+            for i in 0..n {
+                *base.add(i) = crate::interp::borrow::own(*base.add(i));
+            }
+            return base;
+        }
+        let dst = tmp.as_mut_ptr() as *mut *mut PyObject;
+        crate::interp::borrow::copy_untagged(dst, base, n);
+        dst
+    }
+}
+
+/// Call / CallKw: [callable, self_or_null, args..(, kwnames)] -> [result]. No entry
+/// may be borrowed (refs1: compiled code calls `h_call_t` when one may be).
 pub unsafe extern "C" fn h_call(sp: *mut *mut PyObject, n: u64, kw: u64) -> u64 {
+    unsafe { call_impl::<false>(sp, n, kw) }
+}
+
+/// (refs1) `h_call` where entries may be borrowed (tagged).
+pub unsafe extern "C" fn h_call_t(sp: *mut *mut PyObject, n: u64, kw: u64) -> u64 {
+    unsafe { call_impl::<true>(sp, n, kw) }
+}
+
+#[inline(always)]
+unsafe fn call_impl<const TAGS: bool>(sp: *mut *mut PyObject, n: u64, kw: u64) -> u64 {
     unsafe {
         let n = n as usize;
         let (top, kwnames) = if kw != 0 { (sp.sub(1), take_opt(sp.sub(1))) } else { (sp, None) };
         let base = top.sub(n + 2);
-        let mut callable = *base;
-        let mut self_or_null = *base.add(1);
+        let mut callable = if TAGS { view(base) } else { *base };
+        let mut self_or_null = if TAGS { view(base.add(1)) } else { *base.add(1) };
         if self_or_null.is_null() && funcobject::is_method(&*callable) {
             // (perf4) bound method of a Python function: unpack it into the stack (self
             // into the free slot, the function in place of the method; both owned and
@@ -1077,16 +1129,21 @@ pub unsafe extern "C" fn h_call(sp: *mut *mut PyObject, n: u64, kw: u64) -> u64 
                 let (mf, ms) = (mf.as_ptr(), ms.as_ptr());
                 incref(mf);
                 incref(ms);
-                let old = callable;
+                let old = *base;
                 *base = mf;
                 *base.add(1) = ms;
-                decref(old);
+                if TAGS { crate::interp::borrow::release(old) } else { decref(old) }
                 callable = mf;
                 self_or_null = ms;
             }
         }
         let nkw = kwnames.as_ref().map_or(0, |k| tuple::tuple_len(k));
         let kwp = kwnames.as_ref().map_or(std::ptr::null_mut(), |k| k.as_ptr());
+        // (refs1) callees see plain pointers: borrowed entries are passed through a copy
+        // (the stack keeps them tagged for the release below)
+        let mut tmp = std::mem::MaybeUninit::<[*mut PyObject; 16]>::uninit();
+        let stack_base = base;
+        let base = if TAGS { untagged_args(base, n + 2, &mut tmp) } else { base };
         // (perf4) builtin functions and method descriptors with the common calling
         // conventions: their C function directly
         let fast = if nkw == 0 { call_builtin_fast(callable, self_or_null, base, n) } else { None };
@@ -1110,10 +1167,12 @@ pub unsafe extern "C" fn h_call(sp: *mut *mut PyObject, n: u64, kw: u64) -> u64 
             }
         };
         drop(kwnames);
+        let base = stack_base;
         let mut p = top;
         while p > base {
             p = p.sub(1);
-            xdecref(std::ptr::replace(p, std::ptr::null_mut()));
+            let v = std::ptr::replace(p, std::ptr::null_mut());
+            if TAGS { crate::interp::borrow::release(v) } else { xdecref(v) }
         }
         if r.is_null() {
             return ERR;
@@ -1319,7 +1378,7 @@ pub unsafe extern "C" fn h_load_super_attr(sp: *mut *mut PyObject, arg: u64, nam
 /// is its own awaitable (the common `await coro()` case needs no further work).
 pub unsafe extern "C" fn h_get_awaitable(sp: *mut *mut PyObject, arg: u64) -> u64 {
     unsafe {
-        let o = &**sp.sub(1);
+        let o = &*view(sp.sub(1));
         if crate::types::genobject::is_coroutine_exact(o) && !crate::types::genobject::coro_is_running_await(o) {
             return OK;
         }
@@ -1418,7 +1477,7 @@ pub unsafe extern "C" fn h_misc(ts: *const ThreadState, f: *mut Frame, sp: *mut 
                 let e = err_top as usize;
                 while f.stack_top > e {
                     f.stack_top -= 1;
-                    xdecref(std::mem::replace(&mut f.slots[f.stack_top], std::ptr::null_mut()));
+                    crate::interp::borrow::release(std::mem::replace(&mut f.slots[f.stack_top], std::ptr::null_mut()));
                 }
                 ERR
             }

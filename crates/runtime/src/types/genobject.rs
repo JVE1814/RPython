@@ -1376,7 +1376,7 @@ unsafe extern "C" fn gen_traverse(o: *mut PyObject, visit: visitproc, arg: *mut 
             let f = &*gn.frame;
             for i in 0..f.stack_top {
                 let p = f.slots[i];
-                if !p.is_null() {
+                if !p.is_null() && !crate::interp::borrow::is_borrowed(p) {
                     let r = v(p, arg);
                     if r != 0 {
                         return r;
@@ -1478,8 +1478,11 @@ fn get_code(o: &PyObject) -> PyResult {
 fn get_yieldfrom(o: &PyObject) -> PyResult {
     Ok(yieldfrom_shared(o).unwrap_or_else(none::none_ref))
 }
+/// (capi3) Reported as free-threaded CPython's generator object, which embeds its
+/// interpreter frame: our frame lives apart from the generator (frame pool), so the
+/// struct size alone would understate it. Decision recorded in notes/capi3.md.
 fn gen_sizeof(_o: &PyObject) -> PyResult {
-    Ok(crate::types::int::new_int(std::mem::size_of::<GenObject>() as i64))
+    Ok(crate::types::int::new_int(crate::types::frameobject::CPY_GEN_SIZE as i64))
 }
 fn gen_close_m(o: &PyObject) -> PyResult {
     gen_close(o)

@@ -603,6 +603,15 @@ unsafe extern "C" fn str_iter_next(o: *mut PyObject) -> *mut PyObject {
             decref(p);
             return std::ptr::null_mut();
         }
+        let c = sd(s).get(it.idx);
+        if c > 0x10ffff {
+            // (capi3) only C code (PyUnicode_FromKindAndData, PyUnicodeWriter_WriteUCS4)
+            // can store such a value; it never becomes a character object
+            return into_c(Err(crate::errors::system_error(&format!(
+                "character U+{:x} is not in range [U+0000; U+10ffff]",
+                c
+            ))));
+        }
         let r = char_at(s, it.idx);
         it.idx += 1;
         r.into_raw()

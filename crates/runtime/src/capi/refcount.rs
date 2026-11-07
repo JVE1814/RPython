@@ -149,6 +149,11 @@ pub fn fatal(msg: &str) -> ! {
     fatal_func(None, msg)
 }
 
+/// (capi3) Py_FatalError with the name of the reporting function.
+pub fn fatal_with_func(func: &str, msg: &str) -> ! {
+    fatal_func(Some(func), msg)
+}
+
 /// (tail2) Py_FatalError output as CPython prints it: message, runtime state, the
 /// Python stack, loaded extension modules and the C stack (faulthandler's dumper).
 fn fatal_func(func: Option<&str>, msg: &str) -> ! {

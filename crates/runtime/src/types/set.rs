@@ -3,8 +3,9 @@
 //! linear run followed by perturbation like CPython, so iteration orders match.
 //!
 //! Thread safety: table accesses happen under the object's `ob_mutex`
-//! (`dict::ob_lock`), which is released around Python-level `__eq__` calls; a
-//! private `version` counter (after the public fields) detects concurrent changes.
+//! (`dict::ob_lock`), which is released around Python-level `__eq__` calls; a lookup
+//! that compared outside the lock restarts when the table, its mask or the compared
+//! entry changed meanwhile (capi3: no private field may follow the public layout).
 
 use crate::abstract_ as ab;
 use crate::errors::*;
@@ -36,8 +37,7 @@ pub struct PySetObject {
     pub finger: Py_ssize_t,
     pub smalltable: [SetEntry; MINSIZE],
     pub weakreflist: *mut PyObject,
-    /// private: bumped whenever the entry table is replaced (resize/clear)
-    pub version: u64,
+    // (capi3) nothing may follow: C extensions subclass PySetObject with the header layout
 }
 
 #[unsafe(no_mangle)]
@@ -74,7 +74,7 @@ pub fn so(o: &PyObject) -> &mut PySetObject {
     unsafe { &mut *(o.as_ptr() as *mut PySetObject) }
 }
 
-static DUMMY_CELL: u64 = 0;
+pub(crate) static DUMMY_CELL: u64 = 0; // (remote1) address published in the debug table
 #[inline(always)]
 fn dummy() -> *mut PyObject {
     &DUMMY_CELL as *const u64 as *mut PyObject
@@ -193,7 +193,7 @@ fn find(o: &PyObject, key: &PyObject, hash: isize) -> PyResult<(ObGuard, SFound)
                             return Ok((g, SFound::Active(idx)));
                         }
                     } else {
-                        let version = s.version;
+                        let (tab, msk) = (s.table, s.mask);
                         let ek_owned = ek.to_ref();
                         drop(g);
                         let eq = ab::rich_eq(&ek_owned, key);
@@ -201,7 +201,7 @@ fn find(o: &PyObject, key: &PyObject, hash: isize) -> PyResult<(ObGuard, SFound)
                         let eq = eq?;
                         g = ob_lock(o);
                         let s2 = so(o);
-                        if s2.version != version || entry(s2, idx).key != e.key {
+                        if s2.table != tab || s2.mask != msk || entry(s2, idx).key != e.key {
                             drop(g);
                             continue 'restart;
                         }
@@ -276,7 +276,6 @@ fn table_resize(s: &mut PySetObject, minused: usize) {
     s.table = newtable;
     s.mask = (newsize - 1) as isize;
     s.fill = s.used;
-    s.version += 1;
     if is_oldtable_malloced {
         unsafe { crate::alloc::buf_free(oldtable as *mut u8) };
     }
@@ -551,7 +550,6 @@ pub fn clear(o: &PyObject) {
     s.mask = (MINSIZE - 1) as isize;
     s.fill = 0;
     s.used = 0;
-    s.version += 1;
     drop(g);
     for k in keys {
         unsafe { decref(k) };
@@ -1214,8 +1212,6 @@ fn swap_bodies(o: &PyObject, src: &PyObject) {
     let (ta, tb) = (a.table, b.table);
     a.table = if b_small { a.smalltable.as_mut_ptr() } else { tb };
     b.table = if a_small { b.smalltable.as_mut_ptr() } else { ta };
-    a.version += 1;
-    b.version += 1;
     drop(g2);
     drop(g1);
 }

@@ -914,7 +914,7 @@ impl<'a, 'b> Cg<'a, 'b> {
                 self.a().test_rr(Rax, Rax);
                 self.a().jcc(Cc::NE, l);
             }
-            Template(i, exit_snap) => {
+            Template(i, exit_snap, tags) => {
                 let i = *i as usize;
                 let saved = self.g.exit;
                 // with stale unboxed locals: publish where they live for the duration
@@ -937,7 +937,10 @@ impl<'a, 'b> Cg<'a, 'b> {
                         tramp = Some((t, orig));
                     }
                 }
+                // (refs1) borrowed inputs the builder stored tagged
+                self.g.tagm = *tags;
                 let r = self.g.emit(i);
+                self.g.tagm = 0;
                 self.g.exit = saved;
                 r?;
                 if exit_snap.is_some() {

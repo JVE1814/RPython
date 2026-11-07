@@ -33,6 +33,7 @@ pub fn decode(code: &[u32]) -> Vec<Instr> {
 }
 
 /// Stack effect: (fallthrough delta, jump delta).
+#[inline]
 pub fn effect(op: Op, arg: u32) -> (i32, i32) {
     use Op::*;
     let a = arg as i32;
@@ -45,7 +46,7 @@ pub fn effect(op: Op, arg: u32) -> (i32, i32) {
         | ContainsOp | BinarySubscr | ListAppend | SetAdd | ListExtend | SetUpdate | DictUpdate | DictMerge
         | CallIntrinsic2 | SetFunctionAttribute | PopExcept | ImportName | FormatWithSpec | BuildTemplate
         | CleanupThrow => -1,
-        PushNull | Copy | LoadConst | LoadFast | LoadFastCheck | LoadFastAndClear | LoadDeref | LoadLocals | LoadName
+        PushNull | Copy | LoadConst | LoadFast | LoadFastBorrow | LoadFastCheck | LoadFastAndClear | LoadDeref | LoadLocals | LoadName
         | LoadGlobal | LoadMethod | GetAnext | LoadBuildClass | PushExcInfo | WithExceptStart | ImportFrom
         | MatchMapping | MatchSequence | MatchKeys | GetLen | LoadCommonConstant => 1,
         StoreAttr | MapAdd | DeleteSubscr | BinarySlice | EndAsyncFor | MatchClass => -2,
@@ -76,12 +77,13 @@ pub fn effect(op: Op, arg: u32) -> (i32, i32) {
         JumpIfFalseOrPop | JumpIfTrueOrPop => return (-1, 0),
         ForIter => return (1, -1),
         Send => return (0, -1),
-        Unused1 | Unused2 | Unused3 | ReturnGenerator => 0,
+        Unused1 | Unused3 | ReturnGenerator => 0,
         LoadSpecial => 1,
     };
     (d, d)
 }
 
+#[inline]
 pub fn is_terminator(op: Op) -> bool {
     matches!(op, Op::Jump | Op::ReturnValue | Op::RaiseVarargs | Op::Reraise)
 }
@@ -91,7 +93,7 @@ pub fn is_terminator(op: Op) -> bool {
 pub fn may_raise(ins: Instr) -> bool {
     use Op::*;
     match ins.op {
-        Nop | LoadConst | LoadFast | StoreFast | PopTop | PushNull | Copy | Swap | ReturnValue => false,
+        Nop | LoadConst | LoadFast | LoadFastBorrow | StoreFast | PopTop | PushNull | Copy | Swap | ReturnValue => false,
         Jump => ins.arg <= ins.start, // a backedge polls the eval breaker
         _ => true,
     }

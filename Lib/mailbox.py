@@ -1,5 +1,12 @@
-"""Read and write mailboxes in the Maildir, mbox, MH, Babyl and MMDF
-formats, and the format-specific message classes."""
+"""Mailboxes in the Maildir, mbox, MH, Babyl and MMDF formats.
+
+A mailbox is a dictionary-like collection of messages: keys are chosen by
+the mailbox when a message is added, values are message objects (by
+default instances of the format's Message subclass).  Each format also has
+a Message subclass that carries its format-specific state (flags, labels,
+sequences, envelope sender, ...) and converts it when a message moves to
+another format.
+"""
 
 import os
 import time
@@ -24,20 +31,17 @@ __all__ = ['Mailbox', 'Maildir', 'mbox', 'MH', 'Babyl', 'MMDF',
            'BabylMessage', 'MMDFMessage', 'Error', 'NoSuchMailboxError',
            'NotEmptyError', 'ExternalClashError', 'FormatError']
 
-# Line separator used inside mailbox files.
+# Mailbox files use the platform's line ending; messages handed out use \n.
 linesep = os.linesep.encode('ascii')
 
 
-def _to_disk(data):
-    return data.replace(b'\n', linesep)
-
-
-def _from_disk(data):
+def _to_internal(data):
+    """Bytes read from a mailbox file, with \\n line endings."""
     return data.replace(linesep, b'\n')
 
 
-def _normalize_eol(line):
-    """Turn a CRLF or lone CR line ending into LF."""
+def _universal_line(line):
+    """A line read from a file object, with its ending turned into \\n."""
     if line.endswith(b'\r\n'):
         return line[:-2] + b'\n'
     if line.endswith(b'\r'):
@@ -45,27 +49,22 @@ def _normalize_eol(line):
     return line
 
 
-def _flatten(message, mangle_from_=False):
-    buffer = io.BytesIO()
-    email.generator.BytesGenerator(buffer, mangle_from_, 0).flatten(message)
-    return buffer.getvalue()
+def _not_implemented(*args, **kwargs):
+    raise NotImplementedError('Method must be implemented by subclass')
 
 
 class Mailbox:
-    """Common interface of all mailbox formats: a mapping from keys to
-    messages."""
+    """The interface every mailbox format implements."""
 
     def __init__(self, path, factory=None, create=True):
         self._path = os.path.abspath(os.path.expanduser(path))
         self._factory = factory
 
-    def add(self, message):
-        """Add *message* and return its key."""
-        raise NotImplementedError('Method must be implemented by subclass')
+    # The format classes provide these.
+    add = remove = __setitem__ = get_message = get_bytes = get_file = \
+        iterkeys = __contains__ = __len__ = flush = lock = unlock = \
+        close = _not_implemented
 
-    def remove(self, key):
-        """Remove the message with *key* (KeyError if there is none)."""
-        raise NotImplementedError('Method must be implemented by subclass')
 
     def __delitem__(self, key):
         self.remove(key)
@@ -76,9 +75,6 @@ class Mailbox:
             self.remove(key)
         except KeyError:
             pass
-
-    def __setitem__(self, key, message):
-        raise NotImplementedError('Method must be implemented by subclass')
 
     def get(self, key, default=None):
         try:
@@ -92,21 +88,10 @@ class Mailbox:
         with contextlib.closing(self.get_file(key)) as file:
             return self._factory(file)
 
-    def get_message(self, key):
-        raise NotImplementedError('Method must be implemented by subclass')
-
     def get_string(self, key):
-        """The message as a str (converted through email.message)."""
+        """The message as a str (8-bit content goes through the email
+        package's surrogate handling)."""
         return email.message_from_bytes(self.get_bytes(key)).as_string()
-
-    def get_bytes(self, key):
-        raise NotImplementedError('Method must be implemented by subclass')
-
-    def get_file(self, key):
-        raise NotImplementedError('Method must be implemented by subclass')
-
-    def iterkeys(self):
-        raise NotImplementedError('Method must be implemented by subclass')
 
     def keys(self):
         return list(self.iterkeys())
@@ -116,7 +101,7 @@ class Mailbox:
             try:
                 value = self[key]
             except KeyError:
-                continue
+                continue        # removed meanwhile
             yield value
 
     def __iter__(self):
@@ -131,16 +116,10 @@ class Mailbox:
                 value = self[key]
             except KeyError:
                 continue
-            yield (key, value)
+            yield key, value
 
     def items(self):
         return list(self.iteritems())
-
-    def __contains__(self, key):
-        raise NotImplementedError('Method must be implemented by subclass')
-
-    def __len__(self):
-        raise NotImplementedError('Method must be implemented by subclass')
 
     def clear(self):
         for key in self.keys():
@@ -148,26 +127,27 @@ class Mailbox:
 
     def pop(self, key, default=None):
         try:
-            result = self[key]
+            message = self[key]
         except KeyError:
             return default
         self.discard(key)
-        return result
+        return message
 
     def popitem(self):
         for key in self.iterkeys():
-            return (key, self.pop(key))
+            return key, self.pop(key)
         raise KeyError('No messages in mailbox')
 
     def update(self, arg=None):
+        """Replace messages from a mapping or an iterable of pairs."""
         if hasattr(arg, 'iteritems'):
-            source = arg.iteritems()
+            pairs = arg.iteritems()
         elif hasattr(arg, 'items'):
-            source = arg.items()
+            pairs = arg.items()
         else:
-            source = arg
+            pairs = arg
         missing = False
-        for key, message in source:
+        for key, message in pairs:
             try:
                 self[key] = message
             except KeyError:
@@ -175,24 +155,15 @@ class Mailbox:
         if missing:
             raise KeyError('No message with key(s)')
 
-    def flush(self):
-        raise NotImplementedError('Method must be implemented by subclass')
-
-    def lock(self):
-        raise NotImplementedError('Method must be implemented by subclass')
-
-    def unlock(self):
-        raise NotImplementedError('Method must be implemented by subclass')
-
-    def close(self):
-        raise NotImplementedError('Method must be implemented by subclass')
-
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, *exc_info):
         self.close()
 
+    # Mailbox files only hold 8-bit data written by us as bytes, but in
+    # the past strings with arbitrary characters were accepted; refuse
+    # those clearly now.
     def _string_to_bytes(self, message):
         try:
             return message.encode('ascii')
@@ -200,18 +171,20 @@ class Mailbox:
             raise ValueError("String input must be ASCII-only; "
                              "use bytes or a Message instead") from None
 
-    # Formats that need a blank line after each message set this.
+    # mbox wants every message to end with a line ending
     _append_newline = False
 
     def _dump_message(self, message, target, mangle_from_=False):
-        """Write *message* (Message, str, bytes or binary file) to the
-        binary file *target*, with os.linesep line endings."""
+        """Write *message* (a Message, str, bytes or binary file) to the
+        binary file *target* with the mailbox's line endings."""
         if isinstance(message, email.message.Message):
-            data = _to_disk(_flatten(message, mangle_from_))
-            target.write(data)
-            if self._append_newline and not data.endswith(linesep):
-                target.write(linesep)
-        elif isinstance(message, (str, bytes, io.StringIO)):
+            out = io.BytesIO()
+            email.generator.BytesGenerator(out, mangle_from_, 0).flatten(
+                message)
+            data = out.getvalue().replace(b'\n', linesep)
+            self._write_body(target, data)
+            return
+        if isinstance(message, (str, bytes, io.StringIO)):
             if isinstance(message, io.StringIO):
                 warnings.warn("Use of StringIO input is deprecated, "
                               "use BytesIO instead", DeprecationWarning, 3)
@@ -220,98 +193,106 @@ class Mailbox:
                 message = self._string_to_bytes(message)
             if mangle_from_:
                 message = message.replace(b'\nFrom ', b'\n>From ')
-            message = _to_disk(message)
-            target.write(message)
-            if self._append_newline and not message.endswith(linesep):
-                target.write(linesep)
-        elif hasattr(message, 'read'):
+            self._write_body(target, message.replace(b'\n', linesep))
+            return
+        if hasattr(message, 'read'):
             if hasattr(message, 'buffer'):
                 warnings.warn("Use of text mode files is deprecated, "
                               "use a binary mode file instead",
                               DeprecationWarning, 3)
                 message = message.buffer
             last = None
-            while True:
-                line = message.readline()
-                if not line:
-                    break
-                line = _normalize_eol(line)
+            for line in iter(message.readline, b''):
+                line = _universal_line(line)
                 if mangle_from_ and line.startswith(b'From '):
                     line = b'>From ' + line[5:]
-                line = _to_disk(line)
+                line = line.replace(b'\n', linesep)
                 target.write(line)
                 last = line
             if self._append_newline and last and not last.endswith(linesep):
                 target.write(linesep)
-        else:
-            raise TypeError('Invalid message type: %s' % type(message))
+            return
+        raise TypeError('Invalid message type: %s' % type(message))
+
+    def _write_body(self, target, data):
+        target.write(data)
+        if self._append_newline and not data.endswith(linesep):
+            target.write(linesep)
 
     __class_getitem__ = classmethod(GenericAlias)
 
 
 class Maildir(Mailbox):
-    """A directory with new/, cur/ and tmp/ subdirectories, one file per
-    message."""
+    """A directory with tmp/, new/ and cur/ subdirectories, one file per
+    message; extra info (flags) follows a colon in the file name."""
 
     colon = ':'
 
+    # serial number in names of files created by this process
+    _count = 1
+
     def __init__(self, dirname, factory=None, create=True):
         Mailbox.__init__(self, dirname, factory, create)
-        self._paths = {
-            'tmp': os.path.join(self._path, 'tmp'),
-            'new': os.path.join(self._path, 'new'),
-            'cur': os.path.join(self._path, 'cur'),
-        }
+        self._paths = {sub: os.path.join(self._path, sub)
+                       for sub in ('tmp', 'new', 'cur')}
         if not os.path.exists(self._path):
             if not create:
                 raise NoSuchMailboxError(self._path)
             os.mkdir(self._path, 0o700)
-            for path in self._paths.values():
-                os.mkdir(path, 0o700)
-        self._toc = {}               # key -> 'new/name' or 'cur/name'
+            for sub in self._paths.values():
+                os.mkdir(sub, 0o700)
+        self._toc = {}                          # key -> "new/name" etc.
         self._toc_mtimes = {'cur': 0, 'new': 0}
-        self._last_read = 0          # when the TOC was last rebuilt
-        self._skewfactor = 0.1       # tolerance for clock skew (seconds)
+        self._last_read = 0
+        # Directory mtimes may be coarse (2 s on FAT): within this window
+        # after a scan, rescan regardless of mtimes.
+        self._skewfactor = 0.1
+
+    def _full(self, subpath):
+        return os.path.join(self._path, subpath)
+
+    @staticmethod
+    def _info_of(message):
+        """(subdirectory, file name suffix) for a message being stored."""
+        if not isinstance(message, MaildirMessage):
+            return 'new', ''
+        info = message.get_info()
+        return message.get_subdir(), (Maildir.colon + info if info else '')
 
     def add(self, message):
-        tmp_file = self._create_tmp()
+        tmp = self._create_tmp()
         try:
-            self._dump_message(message, tmp_file)
+            self._dump_message(message, tmp)
         except BaseException:
-            tmp_file.close()
-            os.remove(tmp_file.name)
+            tmp.close()
+            os.remove(tmp.name)
             raise
-        _close_to_disk(tmp_file)
+        _fsync_close(tmp)
+
+        subdir, suffix = self._info_of(message)
+        key = os.path.basename(tmp.name).split(self.colon)[0]
+        dest = os.path.join(self._path, subdir, key + suffix)
         if isinstance(message, MaildirMessage):
-            subdir = message.get_subdir()
-            suffix = self.colon + message.get_info()
-            if suffix == self.colon:
-                suffix = ''
-        else:
-            subdir = 'new'
-            suffix = ''
-        uniq = os.path.basename(tmp_file.name).split(self.colon)[0]
-        dest = os.path.join(self._path, subdir, uniq + suffix)
-        if isinstance(message, MaildirMessage):
-            os.utime(tmp_file.name,
-                     (os.path.getatime(tmp_file.name), message.get_date()))
+            os.utime(tmp.name,
+                     (os.path.getatime(tmp.name), message.get_date()))
+        # link() refuses to replace an existing file, rename() would not
         try:
             try:
-                os.link(tmp_file.name, dest)
+                os.link(tmp.name, dest)
             except (AttributeError, PermissionError):
-                os.rename(tmp_file.name, dest)
+                os.rename(tmp.name, dest)
             else:
-                os.remove(tmp_file.name)
-        except OSError as e:
-            os.remove(tmp_file.name)
-            if e.errno == errno.EEXIST:
-                raise ExternalClashError('Name clash with existing message: %s'
-                                         % dest)
+                os.remove(tmp.name)
+        except OSError as err:
+            os.remove(tmp.name)
+            if err.errno == errno.EEXIST:
+                raise ExternalClashError(
+                    'Name clash with existing message: %s' % dest)
             raise
-        return uniq
+        return key
 
     def remove(self, key):
-        os.remove(os.path.join(self._path, self._lookup(key)))
+        os.remove(self._full(self._lookup(key)))
 
     def discard(self, key):
         try:
@@ -321,35 +302,27 @@ class Maildir(Mailbox):
 
     def __setitem__(self, key, message):
         old_subpath = self._lookup(key)
-        temp_key = self.add(message)
-        temp_subpath = self._lookup(temp_key)
-        # a MaildirMessage brings its own subdir and info; otherwise the
-        # old message's are kept
-        if isinstance(message, MaildirMessage):
-            dominant = temp_subpath
-        else:
-            dominant = old_subpath
-        subdir = os.path.dirname(dominant)
-        if self.colon in dominant:
-            suffix = self.colon + dominant.split(self.colon)[-1]
-        else:
-            suffix = ''
+        new_key = self.add(message)
+        new_subpath = self._lookup(new_key)
+        # The new message's own subdirectory/info wins only if it carries
+        # Maildir state; otherwise the old file's placement is kept.
+        model = (new_subpath if isinstance(message, MaildirMessage)
+                 else old_subpath)
+        subdir = os.path.dirname(model)
+        name = os.path.basename(model)
+        suffix = (self.colon + name.split(self.colon)[-1]
+                  if self.colon in name else '')
         self.discard(key)
-        tmp_path = os.path.join(self._path, temp_subpath)
-        new_path = os.path.join(self._path, subdir, key + suffix)
+        source = self._full(new_subpath)
         if isinstance(message, MaildirMessage):
-            os.utime(tmp_path,
-                     (os.path.getatime(tmp_path), message.get_date()))
-        os.rename(tmp_path, new_path)
+            os.utime(source, (os.path.getatime(source), message.get_date()))
+        os.rename(source, os.path.join(self._path, subdir, key + suffix))
 
     def get_message(self, key):
         subpath = self._lookup(key)
-        path = os.path.join(self._path, subpath)
+        path = self._full(subpath)
         with open(path, 'rb') as f:
-            if self._factory:
-                msg = self._factory(f)
-            else:
-                msg = MaildirMessage(f)
+            msg = (self._factory or MaildirMessage)(f)
         subdir, name = os.path.split(subpath)
         msg.set_subdir(subdir)
         if self.colon in name:
@@ -358,20 +331,16 @@ class Maildir(Mailbox):
         return msg
 
     def get_bytes(self, key):
-        with open(os.path.join(self._path, self._lookup(key)), 'rb') as f:
-            return _from_disk(f.read())
+        with open(self._full(self._lookup(key)), 'rb') as f:
+            return _to_internal(f.read())
 
     def get_file(self, key):
-        f = open(os.path.join(self._path, self._lookup(key)), 'rb')
-        return _ProxyFile(f)
-
-    # the info part of the file name (flags)
+        return _ProxyFile(open(self._full(self._lookup(key)), 'rb'))
 
     def get_info(self, key):
-        subpath = self._lookup(key)
-        if self.colon in subpath:
-            return subpath.split(self.colon)[-1]
-        return ''
+        """The text after the colon in the message's file name."""
+        name = self._lookup(key)
+        return name.split(self.colon)[-1] if self.colon in name else ''
 
     def set_info(self, key, info):
         if not isinstance(info, str):
@@ -380,21 +349,13 @@ class Maildir(Mailbox):
         new_subpath = old_subpath.split(self.colon)[0]
         if info:
             new_subpath += self.colon + info
-        if new_subpath == old_subpath:
-            return
-        old_path = os.path.join(self._path, old_subpath)
-        new_path = os.path.join(self._path, new_subpath)
-        if os.path.exists(new_path):
-            raise ExternalClashError(
-                f'Name clash prevents setting info: {new_path}')
-        os.rename(old_path, new_path)
-        self._toc[key] = new_subpath
+        if new_subpath != old_subpath:
+            os.rename(self._full(old_subpath), self._full(new_subpath))
+            self._toc[key] = new_subpath
 
     def get_flags(self, key):
         info = self.get_info(key)
-        if info.startswith('2,'):
-            return info[2:]
-        return ''
+        return info[2:] if info.startswith('2,') else ''
 
     def set_flags(self, key, flags):
         if not isinstance(flags, str):
@@ -402,20 +363,16 @@ class Maildir(Mailbox):
         self.set_info(key, '2,' + ''.join(sorted(set(flags))))
 
     def add_flag(self, key, flag):
-        if not isinstance(flag, str):
-            raise TypeError(f'flag must be a string: {type(flag)}')
         self.set_flags(key, ''.join(set(self.get_flags(key)) | set(flag)))
 
     def remove_flag(self, key, flag):
-        if not isinstance(flag, str):
-            raise TypeError(f'flag must be a string: {type(flag)}')
-        if self.get_flags(key):
-            self.set_flags(key,
-                           ''.join(set(self.get_flags(key)) - set(flag)))
+        current = self.get_flags(key)
+        if current:
+            self.set_flags(key, ''.join(set(current) - set(flag)))
 
     def iterkeys(self):
         self._refresh()
-        for key in self._toc:
+        for key in list(self._toc):
             try:
                 self._lookup(key)
             except KeyError:
@@ -430,8 +387,8 @@ class Maildir(Mailbox):
         self._refresh()
         return len(self._toc)
 
+    # Maildir needs neither locking nor flushing.
     def flush(self):
-        # changes are written immediately
         pass
 
     def lock(self):
@@ -443,11 +400,10 @@ class Maildir(Mailbox):
     def close(self):
         pass
 
-    # folders are subdirectories named ".name"
-
     def list_folders(self):
+        """Names of the subfolders (".name" directories)."""
         return [entry[1:] for entry in os.listdir(self._path)
-                if len(entry) > 1 and entry[0] == '.'
+                if len(entry) > 1 and entry.startswith('.')
                 and os.path.isdir(os.path.join(self._path, entry))]
 
     def get_folder(self, folder):
@@ -464,10 +420,11 @@ class Maildir(Mailbox):
 
     def remove_folder(self, folder):
         path = os.path.join(self._path, '.' + folder)
-        for entry in (os.listdir(os.path.join(path, 'new'))
-                      + os.listdir(os.path.join(path, 'cur'))):
-            if len(entry) < 1 or entry[0] != '.':
-                raise NotEmptyError('Folder contains message(s): %s' % folder)
+        for sub in ('new', 'cur'):
+            for entry in os.listdir(os.path.join(path, sub)):
+                if not entry.startswith('.'):
+                    raise NotEmptyError('Folder contains message(s): %s'
+                                        % folder)
         for entry in os.listdir(path):
             if (entry not in ('new', 'cur', 'tmp')
                     and os.path.isdir(os.path.join(path, entry))):
@@ -482,69 +439,59 @@ class Maildir(Mailbox):
 
     def clean(self):
         """Delete files in tmp/ not accessed for 36 hours."""
-        now = time.time()
-        tmp = os.path.join(self._path, 'tmp')
+        cutoff = time.time() - 36 * 60 * 60
+        tmp = self._paths['tmp']
         for entry in os.listdir(tmp):
             path = os.path.join(tmp, entry)
-            if now - os.path.getatime(path) > 129600:
+            if os.path.getatime(path) < cutoff:
                 os.remove(path)
 
-    _count = 1  # per-process counter for unique names
-
     def _create_tmp(self):
+        """Create a uniquely named file in tmp/ and open it."""
         now = time.time()
-        hostname = socket.gethostname()
-        if '/' in hostname:
-            hostname = hostname.replace('/', r'\057')
-        if ':' in hostname:
-            hostname = hostname.replace(':', r'\072')
-        uniq = "%s.M%sP%sQ%s.%s" % (int(now), int(now % 1 * 1e6),
-                                    os.getpid(), Maildir._count, hostname)
-        path = os.path.join(self._path, 'tmp', uniq)
-        try:
-            os.stat(path)
-        except FileNotFoundError:
+        host = socket.gethostname().replace('/', r'\057').replace(':', r'\072')
+        name = '%d.M%dP%dQ%d.%s' % (int(now), int(now % 1 * 1e6),
+                                     os.getpid(), Maildir._count, host)
+        path = os.path.join(self._paths['tmp'], name)
+        if not os.path.exists(path):
             Maildir._count += 1
             try:
-                return _create_new(path)
+                return _open_new_file(path)
             except FileExistsError:
                 pass
+        # Two deliveries this close together mean another process uses
+        # the same name: refuse rather than guess.
         raise ExternalClashError('Name clash prevented file creation: %s'
                                  % path)
 
     def _refresh(self):
-        """Rebuild the key -> subpath table from the directories.
-
-        Directory mtimes have a granularity of a second or more, so the
-        table is always rebuilt within two seconds of the last rebuild;
-        after that only if new/ or cur/ changed."""
+        """Rescan new/ and cur/ when they may have changed."""
         if time.time() - self._last_read > 2 + self._skewfactor:
             changed = False
-            for subdir in self._toc_mtimes:
-                mtime = os.path.getmtime(self._paths[subdir])
-                if mtime > self._toc_mtimes[subdir]:
+            for sub in self._toc_mtimes:
+                mtime = os.path.getmtime(self._paths[sub])
+                if mtime > self._toc_mtimes[sub]:
                     changed = True
-                self._toc_mtimes[subdir] = mtime
+                    self._toc_mtimes[sub] = mtime
             if not changed:
                 return
-        self._toc = {}
-        for subdir in self._toc_mtimes:
-            path = self._paths[subdir]
-            for entry in os.listdir(path):
-                if entry.startswith('.'):
-                    continue  # hidden files are not messages
-                if os.path.isdir(os.path.join(path, entry)):
+        toc = {}
+        for sub in self._toc_mtimes:
+            folder = self._paths[sub]
+            for entry in os.listdir(folder):
+                # dot files are not messages (editors, sync tools, ...)
+                if (entry.startswith('.')
+                        or os.path.isdir(os.path.join(folder, entry))):
                     continue
-                uniq = entry.split(self.colon)[0]
-                self._toc[uniq] = os.path.join(subdir, entry)
+                toc[entry.split(self.colon)[0]] = os.path.join(sub, entry)
+        self._toc = toc
         self._last_read = time.time()
 
     def _lookup(self, key):
-        try:
-            if os.path.exists(os.path.join(self._path, self._toc[key])):
-                return self._toc[key]
-        except KeyError:
-            pass
+        """The subpath ("new/name") of *key*'s file; rescans if needed."""
+        subpath = self._toc.get(key)
+        if subpath is not None and os.path.exists(self._full(subpath)):
+            return subpath
         self._refresh()
         try:
             return self._toc[key]
@@ -552,42 +499,44 @@ class Maildir(Mailbox):
             raise KeyError('No message with key: %s' % key) from None
 
     def next(self):
-        """The next message in an arbitrary order, or None at the end."""
+        """The next message in a one-pass iteration (None at the end)."""
         if not hasattr(self, '_onetime_keys'):
             self._onetime_keys = self.iterkeys()
-        while True:
+        for key in self._onetime_keys:
             try:
-                return self[next(self._onetime_keys)]
-            except StopIteration:
-                return None
+                return self[key]
             except KeyError:
                 continue
+        return None
 
 
-class _SingleFileMailbox(Mailbox):
-    """A mailbox stored in one file; the table of contents maps keys to
-    (start, stop) byte offsets."""
+class _FlatFileMailbox(Mailbox):
+    """Formats that keep every message in one file.
+
+    The table of contents maps keys to (start, stop) byte offsets.  Adding
+    appends to the file; removing or replacing only marks the file for a
+    rewrite, which flush() performs through a temporary file.
+    """
 
     def __init__(self, path, factory=None, create=True):
         Mailbox.__init__(self, path, factory, create)
         try:
             f = open(self._path, 'rb+')
-        except OSError as e:
-            if e.errno == errno.ENOENT:
-                if not create:
-                    raise NoSuchMailboxError(self._path)
-                f = open(self._path, 'wb+')
-            elif e.errno in (errno.EACCES, errno.EROFS):
-                f = open(self._path, 'rb')
-            else:
+        except FileNotFoundError:
+            if not create:
+                raise NoSuchMailboxError(self._path)
+            f = open(self._path, 'wb+')
+        except OSError as err:
+            if err.errno not in (errno.EACCES, errno.EROFS):
                 raise
+            f = open(self._path, 'rb')      # read-only mailbox
         self._file = f
-        self._toc = None
+        self._toc = None            # built on first use
         self._next_key = 0
-        self._pending = False       # the file must be rewritten
-        self._pending_sync = False  # the file only needs an fsync
+        self._pending = False       # removals/replacements need a rewrite
+        self._pending_sync = False  # appends need an fsync
         self._locked = False
-        self._file_length = None
+        self._file_length = None    # size when last read or written
 
     def add(self, message):
         self._lookup()
@@ -608,7 +557,7 @@ class _SingleFileMailbox(Mailbox):
 
     def iterkeys(self):
         self._lookup()
-        yield from self._toc.keys()
+        yield from list(self._toc)
 
     def __contains__(self, key):
         self._lookup()
@@ -620,60 +569,46 @@ class _SingleFileMailbox(Mailbox):
 
     def lock(self):
         if not self._locked:
-            _acquire_locks(self._file)
+            _lock(self._file)
             self._locked = True
 
     def unlock(self):
         if self._locked:
-            _release_locks(self._file)
+            _unlock(self._file)
             self._locked = False
 
     def flush(self):
-        """Write pending changes: rewrite the file through a temporary copy
-        when messages were removed or replaced."""
+        """Write changes to disk."""
         if not self._pending:
             if self._pending_sync:
-                _flush_to_disk(self._file)
+                # only appends: the file itself is already complete
+                _fsync(self._file)
                 self._pending_sync = False
             return
 
-        assert self._toc is not None
         self._file.seek(0, 2)
-        length = self._file.tell()
-        if length != self._file_length:
+        size = self._file.tell()
+        if size != self._file_length:
             raise ExternalClashError('Size of mailbox file changed '
-                                     '(expected %i, found %i)' %
-                                     (self._file_length, length))
+                                     '(expected %i, found %i)'
+                                     % (self._file_length, size))
 
-        new_file = _create_unique(self._path)
+        # Copy the surviving messages into a new file next to the old one,
+        # then move it into place, keeping the old file's mode and owner.
+        new_file = _open_side_file(self._path)
         try:
-            new_toc = {}
-            self._pre_mailbox_hook(new_file)
-            for key in sorted(self._toc):
-                start, stop = self._toc[key]
-                self._file.seek(start)
-                self._pre_message_hook(new_file)
-                new_start = new_file.tell()
-                while True:
-                    chunk = self._file.read(min(4096,
-                                                stop - self._file.tell()))
-                    if not chunk:
-                        break
-                    new_file.write(chunk)
-                new_toc[key] = (new_start, new_file.tell())
-                self._post_message_hook(new_file)
+            new_toc = self._copy_messages_to(new_file)
             self._file_length = new_file.tell()
-        except:
+        except BaseException:
             new_file.close()
             os.remove(new_file.name)
             raise
-        _close_to_disk(new_file)
+        _fsync_close(new_file)
         self._file.close()
-        st = os.stat(self._path)
-        os.chmod(new_file.name, st.st_mode)
+        info = os.stat(self._path)
+        os.chmod(new_file.name, info.st_mode)
         try:
-            # keep the owner of the original file
-            os.chown(new_file.name, st.st_uid, st.st_gid)
+            os.chown(new_file.name, info.st_uid, info.st_gid)
         except (AttributeError, OSError):
             pass
         try:
@@ -686,12 +621,28 @@ class _SingleFileMailbox(Mailbox):
         self._pending = False
         self._pending_sync = False
         if self._locked:
-            _acquire_locks(self._file, dotlock=False)
+            _lock(self._file, dotlock=False)
 
-    def __enter__(self):
-        self.lock()
-        return self
+    def _copy_messages_to(self, target):
+        toc = {}
+        self._pre_mailbox_hook(target)
+        for key in sorted(self._toc):
+            start, stop = self._toc[key]
+            self._file.seek(start)
+            self._pre_message_hook(target)
+            new_start = target.tell()
+            remaining = stop - start
+            while remaining > 0:
+                chunk = self._file.read(min(4096, remaining))
+                if not chunk:
+                    break
+                target.write(chunk)
+                remaining -= len(chunk)
+            toc[key] = (new_start, target.tell())
+            self._post_message_hook(target)
+        return toc
 
+    # Format hooks around the mailbox and each message.
     def _pre_mailbox_hook(self, f):
         pass
 
@@ -701,7 +652,12 @@ class _SingleFileMailbox(Mailbox):
     def _post_message_hook(self, f):
         pass
 
+    def __enter__(self):
+        self.lock()
+        return self
+
     def close(self):
+        """Flush, unlock and close the mailbox file."""
         try:
             self.flush()
         finally:
@@ -712,19 +668,22 @@ class _SingleFileMailbox(Mailbox):
                 self._file.close()
 
     def _lookup(self, key=None):
+        """Build the table of contents if needed; return *key*'s offsets."""
         if self._toc is None:
             self._generate_toc()
-        if key is not None:
-            try:
-                return self._toc[key]
-            except KeyError:
-                raise KeyError('No message with key: %s' % key) from None
+        if key is None:
+            return None
+        try:
+            return self._toc[key]
+        except KeyError:
+            raise KeyError('No message with key: %s' % key) from None
 
     def _append_message(self, message):
+        """Append *message* at the end of the file; return its offsets."""
         self._file.seek(0, 2)
         before = self._file.tell()
-        if len(self._toc) == 0 and not self._pending:
-            # an empty mailbox gets its header first
+        if not self._toc and not self._pending:
+            # An empty mailbox may still lack its header (Babyl).
             self._pre_mailbox_hook(self._file)
         try:
             self._pre_message_hook(self._file)
@@ -737,19 +696,34 @@ class _SingleFileMailbox(Mailbox):
         self._file_length = self._file.tell()
         return offsets
 
+    def _scan_lines(self):
+        """Yield (offset, line) for every line of the file, from the top."""
+        self._file.seek(0)
+        while True:
+            offset = self._file.tell()
+            line = self._file.readline()
+            yield offset, line
+            if not line:
+                return
 
-class _FromLineMailbox(_SingleFileMailbox):
-    """Shared code of mbox and MMDF: each message starts with a
-    'From ' line."""
+    def _set_toc(self, spans):
+        self._toc = dict(enumerate(spans))
+        self._next_key = len(self._toc)
+        self._file_length = self._file.tell()
+
+
+class _FromLineMailbox(_FlatFileMailbox):
+    """mbox and MMDF: each message starts with a "From " envelope line."""
 
     _mangle_from_ = True
 
     def get_message(self, key):
         start, stop = self._lookup(key)
         self._file.seek(start)
-        from_line = self._file.readline().replace(linesep, b'').decode('ascii')
-        data = self._file.read(stop - self._file.tell())
-        msg = self._message_factory(_from_disk(data))
+        from_line = self._file.readline().replace(linesep, b'')
+        body = self._file.read(stop - self._file.tell())
+        msg = self._message_factory(_to_internal(body))
+        from_line = from_line.decode('ascii')
         msg.set_unixfrom(from_line)
         msg.set_from(from_line[5:])
         return msg
@@ -763,7 +737,7 @@ class _FromLineMailbox(_SingleFileMailbox):
         self._file.seek(start)
         if not from_:
             self._file.readline()
-        return _from_disk(self._file.read(stop - self._file.tell()))
+        return _to_internal(self._file.read(stop - self._file.tell()))
 
     def get_file(self, key, from_=False):
         start, stop = self._lookup(key)
@@ -772,37 +746,39 @@ class _FromLineMailbox(_SingleFileMailbox):
             self._file.readline()
         return _PartialFile(self._file, self._file.tell(), stop)
 
-    def _install_message(self, message):
-        from_line = None
+    def _envelope_of(self, message):
+        """Split off the "From " line: (from line or None, rest)."""
         if isinstance(message, str):
             message = self._string_to_bytes(message)
-        if isinstance(message, bytes) and message.startswith(b'From '):
-            newline = message.find(b'\n')
-            if newline == -1:
-                from_line, message = message, b''
-            else:
-                from_line = message[:newline]
-                message = message[newline + 1:]
-        elif isinstance(message, _mboxMMDFMessage):
-            from_line = b'From ' + message.get_from().encode('ascii')
-        elif isinstance(message, email.message.Message):
+        if isinstance(message, bytes):
+            if message.startswith(b'From '):
+                head, newline, rest = message.partition(b'\n')
+                return head, rest
+            return None, message
+        if isinstance(message, _mboxMMDFMessage):
+            return b'From ' + message.get_from().encode('ascii'), message
+        if isinstance(message, email.message.Message):
             unixfrom = message.get_unixfrom()
             if unixfrom is not None:
-                from_line = unixfrom.encode('ascii')
+                return unixfrom.encode('ascii'), message
+        return None, message
+
+    def _install_message(self, message):
+        from_line, message = self._envelope_of(message)
         if from_line is None:
             from_line = (b'From MAILER-DAEMON '
                          + time.asctime(time.gmtime()).encode())
         start = self._file.tell()
         self._file.write(from_line + linesep)
         self._dump_message(message, self._file, self._mangle_from_)
-        stop = self._file.tell()
-        return (start, stop)
+        return start, self._file.tell()
 
 
 class mbox(_FromLineMailbox):
-    """The classic Unix mailbox: messages separated by 'From ' lines."""
+    """The classic Unix mailbox: messages separated by "From " lines."""
 
     _mangle_from_ = True
+    # each message ends with a line ending, then one empty line follows
     _append_newline = True
 
     def __init__(self, path, factory=None, create=True):
@@ -813,35 +789,29 @@ class mbox(_FromLineMailbox):
         f.write(linesep)
 
     def _generate_toc(self):
-        starts, stops = [], []
-        after_blank = False
-        self._file.seek(0)
-        while True:
-            pos = self._file.tell()
-            line = self._file.readline()
-            if line.startswith(b'From '):
-                if len(stops) < len(starts):
-                    # the blank line before a From line is not content
-                    stops.append(pos - len(linesep) if after_blank else pos)
-                starts.append(pos)
-                after_blank = False
-            elif not line:
-                stops.append(pos - len(linesep) if after_blank else pos)
-                break
-            elif line == linesep:
-                after_blank = True
+        spans = []
+        start = None
+        blank_before = False
+        for offset, line in self._scan_lines():
+            if line.startswith(b'From ') or not line:
+                if start is not None:
+                    # the empty separator line belongs to no message
+                    end = offset - len(linesep) if blank_before else offset
+                    spans.append((start, end))
+                if not line:
+                    break
+                start = offset
+                blank_before = False
             else:
-                after_blank = False
-        self._toc = dict(enumerate(zip(starts, stops)))
-        self._next_key = len(self._toc)
-        self._file_length = self._file.tell()
+                blank_before = line == linesep
+        self._set_toc(spans)
 
 
 _MMDF_SEP = b'\001\001\001\001'
 
 
 class MMDF(_FromLineMailbox):
-    """MMDF: messages framed by lines of four ^A characters."""
+    """Messages framed by lines of four Control-A characters."""
 
     def __init__(self, path, factory=None, create=True):
         self._message_factory = MMDFMessage
@@ -854,34 +824,29 @@ class MMDF(_FromLineMailbox):
         f.write(linesep + _MMDF_SEP + linesep)
 
     def _generate_toc(self):
-        starts, stops = [], []
-        self._file.seek(0)
-        next_pos = 0
-        while True:
-            line = self._file.readline()
-            next_pos = self._file.tell()
-            if line.startswith(_MMDF_SEP + linesep):
-                starts.append(next_pos)
-                while True:
-                    line_pos = next_pos
-                    line = self._file.readline()
-                    next_pos = self._file.tell()
-                    if line == _MMDF_SEP + linesep:
-                        stops.append(line_pos - len(linesep))
-                        break
-                    if not line:
-                        stops.append(line_pos)
-                        break
-            elif not line:
+        spans = []
+        frame = _MMDF_SEP + linesep
+        lines = self._scan_lines()
+        for offset, line in lines:
+            if not line:
                 break
-        self._toc = dict(enumerate(zip(starts, stops)))
-        self._next_key = len(self._toc)
-        self._file.seek(0, 2)
-        self._file_length = self._file.tell()
+            if not line.startswith(frame):
+                continue
+            start = offset + len(line)
+            for offset, line in lines:
+                if line == frame:
+                    spans.append((start, offset - len(linesep)))
+                    break
+                if not line:
+                    spans.append((start, offset))
+                    break
+            if not line:
+                break
+        self._set_toc(spans)
 
 
 class MH(Mailbox):
-    """A directory of numbered message files plus .mh_sequences."""
+    """A directory of numbered message files plus a .mh_sequences file."""
 
     def __init__(self, path, factory=None, create=True):
         Mailbox.__init__(self, path, factory, create)
@@ -889,104 +854,93 @@ class MH(Mailbox):
             if not create:
                 raise NoSuchMailboxError(self._path)
             os.mkdir(self._path, 0o700)
-            os.close(os.open(os.path.join(self._path, '.mh_sequences'),
+            os.close(os.open(self._sequences_path(),
                              os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
         self._locked = False
 
     def _msg_path(self, key):
         return os.path.join(self._path, str(key))
 
-    def _open_existing(self, key, mode):
+    def _sequences_path(self):
+        return os.path.join(self._path, '.mh_sequences')
+
+    def _open_message(self, key, mode):
         try:
             return open(self._msg_path(key), mode)
-        except OSError as e:
-            if e.errno == errno.ENOENT:
-                raise KeyError('No message with key: %s' % key) from None
-            raise
+        except FileNotFoundError:
+            raise KeyError('No message with key: %s' % key) from None
+
+    @contextlib.contextmanager
+    def _file_lock(self, f):
+        # While the folder is locked, individual message files are locked
+        # around each access as well.
+        if self._locked:
+            _lock(f)
+        try:
+            yield
+        finally:
+            if self._locked and not f.closed:
+                _unlock(f)
 
     def add(self, message):
         keys = self.keys()
-        new_key = max(keys) + 1 if keys else 1
-        new_path = self._msg_path(new_key)
-        f = _create_new(new_path)
-        closed = False
+        key = keys[-1] + 1 if keys else 1
+        path = self._msg_path(key)
+        f = _open_new_file(path)
         try:
-            if self._locked:
-                _acquire_locks(f)
-            try:
+            with self._file_lock(f):
                 try:
                     self._dump_message(message, f)
                 except BaseException:
+                    # unlock and close first: Windows cannot delete it open
                     if self._locked:
-                        _release_locks(f)
-                    _close_to_disk(f)
-                    closed = True
-                    os.remove(new_path)
+                        _unlock(f)
+                    _fsync_close(f)
+                    os.remove(path)
                     raise
                 if isinstance(message, MHMessage):
-                    self._dump_sequences(message, new_key)
-            finally:
-                if self._locked:
-                    _release_locks(f)
+                    self._dump_sequences(message, key)
         finally:
-            if not closed:
-                _close_to_disk(f)
-        return new_key
+            if not f.closed:
+                _fsync_close(f)
+        return key
 
     def remove(self, key):
-        f = self._open_existing(key, 'rb+')
-        f.close()
+        self._open_message(key, 'rb+').close()
         os.remove(self._msg_path(key))
 
     def __setitem__(self, key, message):
-        f = self._open_existing(key, 'rb+')
+        f = self._open_message(key, 'rb+')
         try:
-            if self._locked:
-                _acquire_locks(f)
-            try:
+            with self._file_lock(f):
                 os.close(os.open(self._msg_path(key),
                                  os.O_WRONLY | os.O_TRUNC))
                 self._dump_message(message, f)
                 if isinstance(message, MHMessage):
                     self._dump_sequences(message, key)
-            finally:
-                if self._locked:
-                    _release_locks(f)
         finally:
-            _close_to_disk(f)
+            _fsync_close(f)
 
     def get_message(self, key):
-        f = self._open_existing(key, 'rb+' if self._locked else 'rb')
-        with f:
-            if self._locked:
-                _acquire_locks(f)
-            try:
+        with self._open_message(key, 'rb+' if self._locked else 'rb') as f:
+            with self._file_lock(f):
                 msg = MHMessage(f)
-            finally:
-                if self._locked:
-                    _release_locks(f)
-        for name, key_list in self.get_sequences().items():
-            if key in key_list:
+        for name, members in self.get_sequences().items():
+            if key in members:
                 msg.add_sequence(name)
         return msg
 
     def get_bytes(self, key):
-        f = self._open_existing(key, 'rb+' if self._locked else 'rb')
-        with f:
-            if self._locked:
-                _acquire_locks(f)
-            try:
-                return _from_disk(f.read())
-            finally:
-                if self._locked:
-                    _release_locks(f)
+        with self._open_message(key, 'rb+' if self._locked else 'rb') as f:
+            with self._file_lock(f):
+                return _to_internal(f.read())
 
     def get_file(self, key):
-        return _ProxyFile(self._open_existing(key, 'rb'))
+        return _ProxyFile(self._open_message(key, 'rb'))
 
     def iterkeys(self):
-        return iter(sorted(int(entry) for entry in os.listdir(self._path)
-                           if entry.isdigit()))
+        return iter(sorted(int(name) for name in os.listdir(self._path)
+                           if name.isdigit()))
 
     def __contains__(self, key):
         return os.path.exists(self._msg_path(key))
@@ -994,22 +948,19 @@ class MH(Mailbox):
     def __len__(self):
         return len(list(self.iterkeys()))
 
-    def _sequences_path(self):
-        return os.path.join(self._path, '.mh_sequences')
-
     def lock(self):
+        """Lock the folder (through its .mh_sequences file)."""
         if not self._locked:
             path = self._sequences_path()
-            if not os.path.exists(path):
-                os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
+            os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
             self._file = open(path, 'rb+')
-            _acquire_locks(self._file)
+            _lock(self._file)
             self._locked = True
 
     def unlock(self):
         if self._locked:
-            _release_locks(self._file)
-            _close_to_disk(self._file)
+            _unlock(self._file)
+            _fsync_close(self._file)
             del self._file
             self._locked = False
 
@@ -1021,8 +972,8 @@ class MH(Mailbox):
             self.unlock()
 
     def list_folders(self):
-        return [entry for entry in os.listdir(self._path)
-                if os.path.isdir(os.path.join(self._path, entry))]
+        return [name for name in os.listdir(self._path)
+                if os.path.isdir(os.path.join(self._path, name))]
 
     def get_folder(self, folder):
         return MH(os.path.join(self._path, folder),
@@ -1041,145 +992,148 @@ class MH(Mailbox):
         os.rmdir(path)
 
     def get_sequences(self):
-        """Map sequence names to the sorted keys they contain."""
-        results = {}
+        """A dict mapping sequence names to sorted lists of existing keys."""
+        existing = set(self.keys())
+        result = {}
         try:
-            f = open(self._sequences_path(), 'r')
+            f = open(self._sequences_path(), 'r', encoding='ASCII')
         except FileNotFoundError:
-            return results
+            return result       # a folder made by another program
         with f:
-            existing = set(self.keys())
             for line in f:
                 try:
-                    name, contents = line.split(':')
-                    keys = set()
-                    for spec in contents.split():
-                        if spec.isdigit():
-                            keys.add(int(spec))
-                        else:
-                            first, last = (int(x) for x in spec.split('-'))
-                            keys.update(range(first, last + 1))
-                    members = [k for k in sorted(keys) if k in existing]
-                    if members:
-                        results[name] = members
+                    name, spec = line.split(':')
+                    members = _parse_ranges(spec)
                 except ValueError:
                     raise FormatError('Invalid sequence specification: %s'
-                                      % line.rstrip()) from None
-        return results
+                                      % line.rstrip())
+                present = [key for key in sorted(members) if key in existing]
+                if present:
+                    result[name] = present
+        return result
 
     def set_sequences(self, sequences):
-        f = open(self._sequences_path(), 'w')
+        """Replace the .mh_sequences file (empty sequences are dropped)."""
+        # truncated in place (created if missing): a lock held on the
+        # file stays valid
+        f = open(self._sequences_path(), 'w', encoding='ASCII')
         try:
             for name, keys in sequences.items():
-                if not keys:
-                    continue
-                f.write(name + ':' + _format_ranges(sorted(set(keys))) + '\n')
+                if keys:
+                    f.write('%s: %s\n' % (name, _format_ranges(keys)))
         finally:
-            _close_to_disk(f)
+            _fsync_close(f)
 
     def pack(self):
-        """Renumber the messages 1..n without gaps."""
+        """Renumber the messages 1..n, keeping sequences consistent."""
         sequences = self.get_sequences()
-        prev = 0
-        changes = []
-        for key in self.iterkeys():
-            if key - 1 != prev:
-                changes.append((key, prev + 1))
-                old_path = self._msg_path(key)
-                new_path = self._msg_path(prev + 1)
-                try:
-                    os.link(old_path, new_path)
-                except (AttributeError, PermissionError):
-                    os.rename(old_path, new_path)
-                else:
-                    os.unlink(old_path)
-            prev += 1
-        self._next_key = prev + 1
-        if not changes:
+        renamed = {}
+        for new, old in enumerate(self.iterkeys(), 1):
+            if new == old:
+                continue
+            renamed[old] = new
+            src, dst = self._msg_path(old), self._msg_path(new)
+            try:
+                os.link(src, dst)
+            except (AttributeError, PermissionError):
+                os.rename(src, dst)
+            else:
+                os.unlink(src)
+        self._next_key = len(self) + 1
+        if not renamed:
             return
-        for name, key_list in sequences.items():
-            for old, new in changes:
-                if old in key_list:
-                    key_list[key_list.index(old)] = new
+        for members in sequences.values():
+            members[:] = [renamed.get(key, key) for key in members]
         self.set_sequences(sequences)
 
     def _dump_sequences(self, message, key):
+        """Record in .mh_sequences which sequences *key* belongs to."""
         wanted = message.get_sequences()
         sequences = self.get_sequences()
-        for name, key_list in sequences.items():
+        for name, members in sequences.items():
             if name in wanted:
-                key_list.append(key)
-            elif key in key_list:
-                key_list.remove(key)
+                members.append(key)
+            elif key in members:
+                members.remove(key)
         for name in wanted:
-            if name not in sequences:
-                sequences[name] = [key]
+            sequences.setdefault(name, [key])
         self.set_sequences(sequences)
 
 
-def _format_ranges(keys):
-    """' 1-3 5 7-8' for [1, 2, 3, 5, 7, 8] (sorted, unique)."""
-    out = []
-    i = 0
-    while i < len(keys):
-        j = i
-        while j + 1 < len(keys) and keys[j + 1] == keys[j] + 1:
-            j += 1
-        if j > i:
-            out.append(' %s-%s' % (keys[i], keys[j]))
+def _parse_ranges(spec):
+    """Keys named by an MH sequence specification such as "1-3 7"."""
+    keys = set()
+    for item in spec.split():
+        if item.isdigit():
+            keys.add(int(item))
         else:
-            out.append(' %s' % keys[i])
-        i = j + 1
-    return ''.join(out)
+            low, high = (int(part) for part in item.split('-'))
+            keys.update(range(low, high + 1))
+    return keys
+
+
+def _format_ranges(keys):
+    """The MH notation for *keys*: runs of consecutive numbers as "a-b"."""
+    runs = []
+    for key in sorted(set(keys)):
+        if runs and runs[-1][1] == key - 1:
+            runs[-1][1] = key
+        else:
+            runs.append([key, key])
+    return ' '.join(str(a) if a == b else '%d-%d' % (a, b) for a, b in runs)
 
 
 _BABYL_EOOH = b'*** EOOH ***'
 
 
-class Babyl(_SingleFileMailbox):
-    """Emacs RMAIL (Babyl) files."""
+class Babyl(_FlatFileMailbox):
+    """The Emacs RMAIL format: messages with labels and a copy of the
+    headers as last displayed ("visible" headers)."""
 
     _special_labels = frozenset({'unseen', 'deleted', 'filed', 'answered',
                                  'forwarded', 'edited', 'resent'})
 
     def __init__(self, path, factory=None, create=True):
-        _SingleFileMailbox.__init__(self, path, factory, create)
+        _FlatFileMailbox.__init__(self, path, factory, create)
         self._labels = {}
 
     def add(self, message):
-        key = _SingleFileMailbox.add(self, message)
+        key = _FlatFileMailbox.add(self, message)
         if isinstance(message, BabylMessage):
             self._labels[key] = message.get_labels()
         return key
 
     def remove(self, key):
-        _SingleFileMailbox.remove(self, key)
+        _FlatFileMailbox.remove(self, key)
         self._labels.pop(key, None)
 
     def __setitem__(self, key, message):
-        _SingleFileMailbox.__setitem__(self, key, message)
+        _FlatFileMailbox.__setitem__(self, key, message)
         if isinstance(message, BabylMessage):
             self._labels[key] = message.get_labels()
 
-    def _read_until(self, terminators):
-        """Read lines (normalized to LF) up to one in *terminators* or
-        EOF; the terminator is consumed but not returned."""
-        out = io.BytesIO()
-        while True:
-            line = self._file.readline()
-            if not line or line in terminators:
-                return out.getvalue()
-            out.write(_from_disk(line))
+    def _read_until(self, stop_lines):
+        """Read lines (converted to \\n endings) up to, not including, the
+        first one in *stop_lines* or the end of the file."""
+        out = []
+        for line in iter(self._file.readline, b''):
+            if line in stop_lines:
+                break
+            out.append(_to_internal(line))
+        return b''.join(out)
 
-    def get_message(self, key):
+    def _read_parts(self, key):
+        """(original headers, visible headers, body) of message *key*."""
         start, stop = self._lookup(key)
         self._file.seek(start)
-        self._file.readline()   # the labels line
+        self._file.readline()           # the "1,..." labels line
         original = self._read_until((_BABYL_EOOH + linesep,))
         visible = self._read_until((linesep,))
-        n = stop - self._file.tell()
-        assert n >= 0
-        body = _from_disk(self._file.read(n))
+        body = self._file.read(max(stop - self._file.tell(), 0))
+        return original, visible, _to_internal(body)
+
+    def get_message(self, key):
+        original, visible, body = self._read_parts(key)
         msg = BabylMessage(original + body)
         msg.set_visible(visible)
         if key in self._labels:
@@ -1187,60 +1141,49 @@ class Babyl(_SingleFileMailbox):
         return msg
 
     def get_bytes(self, key):
-        start, stop = self._lookup(key)
-        self._file.seek(start)
-        self._file.readline()   # the labels line
-        original = self._read_until((_BABYL_EOOH + linesep,))
-        self._read_until((linesep,))
-        n = stop - self._file.tell()
-        assert n >= 0
-        return original + _from_disk(self._file.read(n))
+        original, visible, body = self._read_parts(key)
+        return original + body
 
     def get_file(self, key):
-        return io.BytesIO(_to_disk(self.get_bytes(key)))
+        return io.BytesIO(self.get_bytes(key).replace(b'\n', linesep))
 
     def get_labels(self):
-        """All user-defined labels used in the mailbox."""
+        """Every user-defined label used in the mailbox."""
         self._lookup()
         labels = set()
-        for label_list in self._labels.values():
-            labels.update(label_list)
-        labels.difference_update(self._special_labels)
-        return list(labels)
+        for names in self._labels.values():
+            labels.update(names)
+        return list(labels - self._special_labels)
 
     def _generate_toc(self):
-        starts, stops = [], []
-        label_lists = []
-        self._file.seek(0)
-        next_pos = 0
-        while True:
-            line_pos = next_pos
-            line = self._file.readline()
-            next_pos = self._file.tell()
-            if line == b'\037\014' + linesep:
-                if len(stops) < len(starts):
-                    stops.append(line_pos - len(linesep))
-                starts.append(next_pos)
-                labels = [label.strip().decode('ascii', 'replace')
-                          for label in self._file.readline()[1:].split(b',')
-                          if label.strip()]
-                label_lists.append(labels)
-            elif line == b'\037' or line == b'\037' + linesep:
-                if len(stops) < len(starts):
-                    stops.append(line_pos - len(linesep))
+        spans = []
+        labels = []
+        start = None
+        for offset, line in self._scan_lines():
+            if line == b'\037\014' + linesep or line in (b'\037',
+                                                         b'\037' + linesep):
+                if start is not None:
+                    spans.append((start, offset - len(linesep)))
+                    start = None
+                if line.endswith(b'\014' + linesep):
+                    start = offset + len(line)
+                    names = self._file.readline()[1:].split(b',')
+                    labels.append([name.strip().decode()
+                                   for name in names if name.strip()])
             elif not line:
-                stops.append(line_pos - len(linesep))
+                if start is not None:
+                    spans.append((start, offset - len(linesep)))
                 break
-        self._toc = dict(enumerate(zip(starts, stops)))
-        self._labels = dict(enumerate(label_lists))
+        self._toc = dict(enumerate(spans))
+        self._labels = dict(enumerate(labels))
         self._next_key = len(self._toc)
         self._file.seek(0, 2)
         self._file_length = self._file.tell()
 
     def _pre_mailbox_hook(self, f):
-        labels = b','.join(label.encode() for label in self.get_labels())
+        names = b','.join(label.encode() for label in self.get_labels())
         f.write(b'BABYL OPTIONS:' + linesep + b'Version: 5' + linesep
-                + b'Labels:' + labels + linesep + b'\037')
+                + b'Labels:' + names + linesep + b'\037')
 
     def _pre_message_hook(self, f):
         f.write(b'\014' + linesep)
@@ -1248,94 +1191,93 @@ class Babyl(_SingleFileMailbox):
     def _post_message_hook(self, f):
         f.write(linesep + b'\037')
 
+    def _labels_line(self, message):
+        if not isinstance(message, BabylMessage):
+            return b'1,,'
+        labels = message.get_labels()
+        special = [l for l in labels if l in self._special_labels]
+        user = [l for l in labels if l not in self._special_labels]
+        return (b'1' + b''.join(b', ' + l.encode() for l in special) + b',,'
+                + b''.join(b' ' + l.encode() + b',' for l in user))
+
     def _write_header_block(self, data):
-        """Write the header lines of *data* (a BytesIO positioned at the
-        start) including the blank line ending them."""
-        while True:
-            line = data.readline()
-            self._file.write(_to_disk(line))
-            if line == b'\n' or not line:
-                return
+        """Write header lines from *data* (a binary file) up to and
+        including the empty line that ends them."""
+        for line in iter(data.readline, b''):
+            self._file.write(line.replace(b'\n', linesep))
+            if line == b'\n':
+                break
 
     def _install_message(self, message):
         start = self._file.tell()
-        if isinstance(message, BabylMessage):
-            special, plain = [], []
-            for label in message.get_labels():
-                (special if label in self._special_labels
-                 else plain).append(label)
-            self._file.write(b'1')
-            for label in special:
-                self._file.write(b', ' + label.encode())
-            self._file.write(b',')
-            for label in plain:
-                self._file.write(b' ' + label.encode() + b',')
-            self._file.write(linesep)
-        else:
-            self._file.write(b'1,,' + linesep)
+        self._file.write(self._labels_line(message) + linesep)
+
         if isinstance(message, email.message.Message):
-            original = io.BytesIO(_flatten(message))
-            self._write_header_block(original)
+            flat = io.BytesIO()
+            email.generator.BytesGenerator(flat, False, 0).flatten(message)
+            flat.seek(0)
+            self._write_header_block(flat)
             self._file.write(_BABYL_EOOH + linesep)
             if isinstance(message, BabylMessage):
-                visible = io.BytesIO(_flatten(message.get_visible()))
-                self._write_header_block(visible)
+                shown = io.BytesIO()
+                email.generator.BytesGenerator(shown, False, 0).flatten(
+                    message.get_visible())
+                shown.seek(0)
+                self._write_header_block(shown)
             else:
-                original.seek(0)
-                self._write_header_block(original)
-            while True:
-                chunk = original.read(4096)
-                if not chunk:
-                    break
-                self._file.write(_to_disk(chunk))
-        elif isinstance(message, (bytes, str, io.StringIO)):
+                body_at = flat.tell()
+                flat.seek(0)
+                self._write_header_block(flat)
+                flat.seek(body_at)
+            self._file.write(flat.read().replace(b'\n', linesep))
+            return start, self._file.tell()
+
+        if isinstance(message, (bytes, str, io.StringIO)):
             if isinstance(message, io.StringIO):
                 warnings.warn("Use of StringIO input is deprecated, "
                               "use BytesIO instead", DeprecationWarning, 3)
                 message = message.getvalue()
             if isinstance(message, str):
                 message = self._string_to_bytes(message)
-            body_start = message.find(b'\n\n') + 2
-            if body_start - 2 != -1:
-                headers = _to_disk(message[:body_start])
-                self._file.write(headers)
-                self._file.write(_BABYL_EOOH + linesep)
-                self._file.write(headers)
-                self._file.write(_to_disk(message[body_start:]))
-            else:
+            split = message.find(b'\n\n')
+            if split == -1:
                 self._file.write(_BABYL_EOOH + linesep + linesep)
-                self._file.write(_to_disk(message))
-        elif hasattr(message, 'readline'):
+                self._file.write(message.replace(b'\n', linesep))
+            else:
+                headers = message[:split + 2].replace(b'\n', linesep)
+                self._file.write(headers + _BABYL_EOOH + linesep + headers)
+                self._file.write(message[split + 2:].replace(b'\n', linesep))
+            return start, self._file.tell()
+
+        if hasattr(message, 'readline'):
             if hasattr(message, 'buffer'):
                 warnings.warn("Use of text mode files is deprecated, "
                               "use a binary mode file instead",
                               DeprecationWarning, 3)
                 message = message.buffer
-            origin = message.tell()
-            # the headers are written twice: original and visible copy
-            for copy_number in (1, 2):
-                while True:
-                    line = _normalize_eol(message.readline())
-                    self._file.write(_to_disk(line))
-                    if line == b'\n' or not line:
-                        break
-                if copy_number == 1:
-                    self._file.write(_BABYL_EOOH + linesep)
-                    message.seek(origin)
-            while True:
-                line = message.readline()
-                if not line:
+            header_at = message.tell()
+            headers = []
+            for line in iter(message.readline, b''):
+                line = _universal_line(line)
+                headers.append(line)
+                if line == b'\n':
                     break
-                self._file.write(_to_disk(_normalize_eol(line)))
-        else:
-            raise TypeError('Invalid message type: %s' % type(message))
-        stop = self._file.tell()
-        return (start, stop)
+            block = b''.join(headers).replace(b'\n', linesep)
+            self._file.write(block + _BABYL_EOOH + linesep)
+            message.seek(header_at)
+            # the same headers again as the visible copy, then the body
+            for line in iter(message.readline, b''):
+                self._file.write(_universal_line(line).replace(b'\n', linesep))
+            return start, self._file.tell()
 
+        raise TypeError('Invalid message type: %s' % type(message))
+
+
+# ---------------------------------------------------------------------------
+# Messages
 
 class Message(email.message.Message):
-    """A message with format-specific extras; converting between the
-    subclasses translates their flags."""
+    """An email message that also carries mailbox-format state."""
 
     def __init__(self, message=None):
         if isinstance(message, email.message.Message):
@@ -1356,20 +1298,50 @@ class Message(email.message.Message):
             raise TypeError('Invalid message type: %s' % type(message))
 
     def _become_message(self, message):
-        # take over the state of *message* except format-specific fields
-        own = getattr(message, '_type_specific_attributes', [])
-        for name in message.__dict__:
+        """Take over *message*'s email state (not its format state)."""
+        own = getattr(message, '_type_specific_attributes', ())
+        for name, value in message.__dict__.items():
             if name not in own:
-                self.__dict__[name] = message.__dict__[name]
+                self.__dict__[name] = value
+
+    # Conversion between two formats goes through a neutral summary of the
+    # message's status (see _status()); within a format the state is
+    # copied as is.  A plain Message has no state to give or take.
+    _family = None           # the class whose instances share our state
+    _takes_status = False    # whether _absorb() means anything
+
+    def _status(self):
+        """Keys: seen, cur (no longer new), deleted, flagged, answered,
+        passed (forwarded/resent), date (an mbox envelope date, for a
+        Maildir delivery date), delivered (a Maildir delivery date, for an
+        mbox envelope)."""
+        raise NotImplementedError
+
+    def _absorb(self, status):
+        pass
+
+    def _copy_state_to(self, other):
+        pass
+
+    def _after_export(self, message):
+        pass
 
     def _explain_to(self, message):
-        if isinstance(message, Message):
+        """Pass this message's format state on to *message*."""
+        if not isinstance(message, Message):
+            raise TypeError('Cannot convert to specified type: %s'
+                            % type(message))
+        if self._family is None:
             return
-        raise TypeError('Cannot convert to specified type')
+        if isinstance(message, self._family):
+            self._copy_state_to(message)
+        elif message._takes_status:
+            message._absorb(self._status())
+            self._after_export(message)
 
 
 class MaildirMessage(Message):
-    """A message from a Maildir: subdir ('new'/'cur'), info, date."""
+    """A message with Maildir state: subdirectory, info/flags, date."""
 
     _type_specific_attributes = ['_subdir', '_info', '_date']
 
@@ -1388,9 +1360,7 @@ class MaildirMessage(Message):
         self._subdir = subdir
 
     def get_flags(self):
-        if self._info.startswith('2,'):
-            return self._info[2:]
-        return ''
+        return self._info[2:] if self._info.startswith('2,') else ''
 
     def set_flags(self, flags):
         self._info = '2,' + ''.join(sorted(flags))
@@ -1419,45 +1389,36 @@ class MaildirMessage(Message):
             raise TypeError('info must be a string: %s' % type(info))
         self._info = info
 
-    def _explain_to(self, message):
-        flags = set(self.get_flags())
-        if isinstance(message, MaildirMessage):
-            message.set_flags(self.get_flags())
-            message.set_subdir(self.get_subdir())
-            message.set_date(self.get_date())
-        elif isinstance(message, _mboxMMDFMessage):
-            if 'S' in flags:
-                message.add_flag('R')
-            if self.get_subdir() == 'cur':
-                message.add_flag('O')
-            for mine, theirs in (('T', 'D'), ('F', 'F'), ('R', 'A')):
-                if mine in flags:
-                    message.add_flag(theirs)
-            message.set_from('MAILER-DAEMON', time.gmtime(self.get_date()))
-        elif isinstance(message, MHMessage):
-            if 'S' not in flags:
-                message.add_sequence('unseen')
-            if 'R' in flags:
-                message.add_sequence('replied')
-            if 'F' in flags:
-                message.add_sequence('flagged')
-        elif isinstance(message, BabylMessage):
-            if 'S' not in flags:
-                message.add_label('unseen')
-            for mine, label in (('T', 'deleted'), ('R', 'answered'),
-                                ('P', 'forwarded')):
-                if mine in flags:
-                    message.add_label(label)
-        elif isinstance(message, Message):
-            pass
-        else:
-            raise TypeError('Cannot convert to specified type: %s'
-                            % type(message))
+    def _copy_state_to(self, other):
+        other.set_flags(self.get_flags())
+        other.set_subdir(self.get_subdir())
+        other.set_date(self.get_date())
+
+    def _status(self):
+        flags = self.get_flags()
+        return dict(seen='S' in flags, cur=self._subdir == 'cur',
+                    deleted='T' in flags, flagged='F' in flags,
+                    answered='R' in flags, passed='P' in flags,
+                    date=None, delivered=self.get_date())
+
+    def _absorb(self, status):
+        if status['cur']:
+            self.set_subdir('cur')
+        wanted = ''.join(flag for flag, key in (('S', 'seen'),
+                                                ('T', 'deleted'),
+                                                ('F', 'flagged'),
+                                                ('R', 'answered'),
+                                                ('P', 'passed'))
+                         if status[key])
+        if wanted:
+            self.add_flag(wanted)
+        if status['date'] is not None:
+            self.set_date(status['date'])
 
 
 class _mboxMMDFMessage(Message):
-    """Shared code of mboxMessage and MMDFMessage: the From line and the
-    Status / X-Status flags."""
+    """State shared by mbox and MMDF messages: the envelope sender line
+    and the Status/X-Status flag headers."""
 
     _type_specific_attributes = ['_from']
 
@@ -1473,6 +1434,8 @@ class _mboxMMDFMessage(Message):
         return self._from
 
     def set_from(self, from_, time_=None):
+        """Set the envelope text; *time_* (a struct_time, or True for now)
+        appends a date."""
         if time_ is not None:
             if time_ is True:
                 time_ = time.gmtime()
@@ -1487,11 +1450,11 @@ class _mboxMMDFMessage(Message):
         status = ''.join(f for f in 'RO' if f in flags)
         xstatus = ''.join(f for f in 'DFA' if f in flags)
         xstatus += ''.join(sorted(flags - set('RODFA')))
-        for name, value in (('Status', status), ('X-Status', xstatus)):
+        for header, value in (('Status', status), ('X-Status', xstatus)):
             try:
-                self.replace_header(name, value)
+                self.replace_header(header, value)
             except KeyError:
-                self.add_header(name, value)
+                self.add_header(header, value)
 
     def add_flag(self, flag):
         self.set_flags(''.join(set(self.get_flags()) | set(flag)))
@@ -1500,49 +1463,40 @@ class _mboxMMDFMessage(Message):
         if 'Status' in self or 'X-Status' in self:
             self.set_flags(''.join(set(self.get_flags()) - set(flag)))
 
-    def _explain_to(self, message):
-        flags = set(self.get_flags())
-        if isinstance(message, MaildirMessage):
-            if 'O' in flags:
-                message.set_subdir('cur')
-            for mine, theirs in (('F', 'F'), ('A', 'R'), ('R', 'S'),
-                                 ('D', 'T')):
-                if mine in flags:
-                    message.add_flag(theirs)
-            del message['status']
-            del message['x-status']
-            date = ' '.join(self.get_from().split()[-5:])
-            try:
-                message.set_date(calendar.timegm(
-                    time.strptime(date, '%a %b %d %H:%M:%S %Y')))
-            except (ValueError, OverflowError):
-                pass
-        elif isinstance(message, _mboxMMDFMessage):
-            message.set_flags(self.get_flags())
-            message.set_from(self.get_from())
-        elif isinstance(message, MHMessage):
-            if 'R' not in flags:
-                message.add_sequence('unseen')
-            if 'A' in flags:
-                message.add_sequence('replied')
-            if 'F' in flags:
-                message.add_sequence('flagged')
-            del message['status']
-            del message['x-status']
-        elif isinstance(message, BabylMessage):
-            if 'R' not in flags:
-                message.add_label('unseen')
-            if 'D' in flags:
-                message.add_label('deleted')
-            if 'A' in flags:
-                message.add_label('answered')
-            del message['status']
-            del message['x-status']
-        elif isinstance(message, Message):
-            pass
-        else:
-            raise TypeError('Cannot convert to specified type: %s'
-                            % type(message))
+    def _copy_state_to(self, other):
+        other.set_flags(self.get_flags())
+        other.set_from(self.get_from())
+
+    def _envelope_date(self):
+        stamp = ' '.join(self.get_from().split()[-5:])
+        try:
+            return calendar.timegm(time.strptime(stamp,
+                                                 '%a %b %d %H:%M:%S %Y'))
+        except (ValueError, OverflowError):
+            return None
+
+    def _status(self):
+        flags = self.get_flags()
+        return dict(seen='R' in flags, cur='O' in flags,
+                    deleted='D' in flags, flagged='F' in flags,
+                    answered='A' in flags, passed=False,
+                    date=self._envelope_date(), delivered=None)
+
+    def _after_export(self, message):
+        # the flag headers mean nothing in the other formats
+        del message['status']
+        del message['x-status']
+
+    def _absorb(self, status):
+        wanted = ''.join(flag for flag, key in (('R', 'seen'), ('O', 'cur'),
+                                                ('D', 'deleted'),
+                                                ('F', 'flagged'),
+                                                ('A', 'answered'))
+                         if status[key])
+        if wanted:
+            self.add_flag(wanted)
+        if status['delivered'] is not None:
+            self.set_from('MAILER-DAEMON', time.gmtime(status['delivered']))
 
 
 class mboxMessage(_mboxMMDFMessage):
@@ -1550,7 +1504,7 @@ class mboxMessage(_mboxMMDFMessage):
 
 
 class MHMessage(Message):
-    """A message from an MH mailbox, with its sequences."""
+    """A message with the list of MH sequences it belongs to."""
 
     _type_specific_attributes = ['_sequences']
 
@@ -1571,44 +1525,29 @@ class MHMessage(Message):
             self._sequences.append(sequence)
 
     def remove_sequence(self, sequence):
-        try:
+        if sequence in self._sequences:
             self._sequences.remove(sequence)
-        except ValueError:
-            pass
 
-    def _explain_to(self, message):
-        sequences = set(self.get_sequences())
-        if isinstance(message, MaildirMessage):
-            message.set_subdir('cur')
-            if 'unseen' not in sequences:
-                message.add_flag('S')
-            if 'flagged' in sequences:
-                message.add_flag('F')
-            if 'replied' in sequences:
-                message.add_flag('R')
-        elif isinstance(message, _mboxMMDFMessage):
-            message.add_flag('O' if 'unseen' in sequences else 'RO')
-            if 'flagged' in sequences:
-                message.add_flag('F')
-            if 'replied' in sequences:
-                message.add_flag('A')
-        elif isinstance(message, MHMessage):
-            for sequence in self.get_sequences():
-                message.add_sequence(sequence)
-        elif isinstance(message, BabylMessage):
-            if 'unseen' in sequences:
-                message.add_label('unseen')
-            if 'replied' in sequences:
-                message.add_label('answered')
-        elif isinstance(message, Message):
-            pass
-        else:
-            raise TypeError('Cannot convert to specified type: %s'
-                            % type(message))
+    def _copy_state_to(self, other):
+        for name in self.get_sequences():
+            other.add_sequence(name)
+
+    def _status(self):
+        names = self._sequences
+        return dict(seen='unseen' not in names, cur=True, deleted=False,
+                    flagged='flagged' in names, answered='replied' in names,
+                    passed=False, date=None, delivered=None)
+
+    def _absorb(self, status):
+        for name, key, value in (('unseen', 'seen', False),
+                                 ('replied', 'answered', True),
+                                 ('flagged', 'flagged', True)):
+            if status[key] == value:
+                self.add_sequence(name)
 
 
 class BabylMessage(Message):
-    """A message from a Babyl mailbox, with labels and visible headers."""
+    """A message with Babyl labels and visible headers."""
 
     _type_specific_attributes = ['_labels', '_visible']
 
@@ -1630,10 +1569,8 @@ class BabylMessage(Message):
             self._labels.append(label)
 
     def remove_label(self, label):
-        try:
+        if label in self._labels:
             self._labels.remove(label)
-        except ValueError:
-            pass
 
     def get_visible(self):
         return Message(self._visible)
@@ -1642,7 +1579,8 @@ class BabylMessage(Message):
         self._visible = Message(visible)
 
     def update_visible(self):
-        """Refresh the visible headers from the message's own headers."""
+        """Refresh the visible headers from the message's own headers and
+        add the usual ones (Date, From, Reply-To, To, CC, Subject)."""
         for header in self._visible.keys():
             if header in self:
                 self._visible.replace_header(header, self[header])
@@ -1652,50 +1590,64 @@ class BabylMessage(Message):
             if header in self and header not in self._visible:
                 self._visible[header] = self[header]
 
-    def _explain_to(self, message):
-        labels = set(self.get_labels())
-        if isinstance(message, MaildirMessage):
-            message.set_subdir('cur')
-            if 'unseen' not in labels:
-                message.add_flag('S')
-            if 'forwarded' in labels or 'resent' in labels:
-                message.add_flag('P')
-            if 'answered' in labels:
-                message.add_flag('R')
-            if 'deleted' in labels:
-                message.add_flag('T')
-        elif isinstance(message, _mboxMMDFMessage):
-            message.add_flag('O' if 'unseen' in labels else 'RO')
-            if 'deleted' in labels:
-                message.add_flag('D')
-            if 'answered' in labels:
-                message.add_flag('A')
-        elif isinstance(message, MHMessage):
-            if 'unseen' in labels:
-                message.add_sequence('unseen')
-            if 'answered' in labels:
-                message.add_sequence('replied')
-        elif isinstance(message, BabylMessage):
-            message.set_visible(self.get_visible())
-            for label in self.get_labels():
-                message.add_label(label)
-        elif isinstance(message, Message):
-            pass
-        else:
-            raise TypeError('Cannot convert to specified type: %s'
-                            % type(message))
+    def _copy_state_to(self, other):
+        other.set_visible(self.get_visible())
+        for label in self.get_labels():
+            other.add_label(label)
+
+    def _status(self):
+        labels = self._labels
+        return dict(seen='unseen' not in labels, cur=True,
+                    deleted='deleted' in labels, flagged=False,
+                    answered='answered' in labels,
+                    passed='forwarded' in labels or 'resent' in labels,
+                    date=None, delivered=None)
+
+    def _absorb(self, status):
+        for label, key, value in (('unseen', 'seen', False),
+                                  ('deleted', 'deleted', True),
+                                  ('answered', 'answered', True),
+                                  ('forwarded', 'passed', True)):
+            if status[key] == value:
+                self.add_label(label)
 
 
 class MMDFMessage(_mboxMMDFMessage):
     """A message from an MMDF mailbox."""
 
 
+# Each format class shares its state with its own subclasses only.
+for _cls in (MaildirMessage, _mboxMMDFMessage, MHMessage, BabylMessage):
+    _cls._family = _cls
+    _cls._takes_status = True
+del _cls
+
+
+
+
+# ---------------------------------------------------------------------------
+# File views handed out by get_file()
+
 class _ProxyFile:
-    """A read-only file view keeping its own position in a shared file."""
+    """A read-only view of an open binary file that keeps its own
+    position, so several views (and the mailbox) can share the file."""
 
     def __init__(self, f, pos=None):
         self._file = f
         self._pos = f.tell() if pos is None else pos
+
+    def _limit(self, size):
+        """How much a read of *size* (None/negative: all) may return."""
+        return -1 if size is None else size
+
+    def _read(self, size, read_method):
+        size = self._limit(size)
+        if size == 0:
+            return b''
+        self._file.seek(self._pos)
+        data = read_method(size)
+        self._pos = self._file.tell()
+        return data
 
     def read(self, size=None):
         return self._read(size, self._file.read)
@@ -1717,11 +1669,7 @@ class _ProxyFile:
         return lines
 
     def __iter__(self):
-        while True:
-            line = self.readline()
-            if not line:
-                return
-            yield line
+        return iter(self.readline, b'')
 
     def tell(self):
         return self._pos
@@ -1740,18 +1688,10 @@ class _ProxyFile:
             finally:
                 del self._file
 
-    def _read(self, size, read_method):
-        if size is None:
-            size = -1
-        self._file.seek(self._pos)
-        result = read_method(size)
-        self._pos = self._file.tell()
-        return result
-
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, *exc_info):
         self.close()
 
     def readable(self):
@@ -1770,138 +1710,121 @@ class _ProxyFile:
     def closed(self):
         if not hasattr(self, '_file'):
             return True
-        if not hasattr(self._file, 'closed'):
-            return False
-        return self._file.closed
+        return getattr(self._file, 'closed', False)
 
     __class_getitem__ = classmethod(GenericAlias)
 
 
 class _PartialFile(_ProxyFile):
-    """A _ProxyFile limited to the byte range [start, stop)."""
+    """A view of the byte range [start, stop) of a shared file."""
 
     def __init__(self, f, start=None, stop=None):
         _ProxyFile.__init__(self, f, start)
         self._start = start
         self._stop = stop
 
+    def _limit(self, size):
+        left = max(self._stop - self._pos, 0)
+        if size is None or size < 0 or size > left:
+            return left
+        return size
+
     def tell(self):
-        return _ProxyFile.tell(self) - self._start
+        return self._pos - self._start
 
     def seek(self, offset, whence=0):
-        if whence == 0:
-            self._pos = self._start
-            whence = 1
-        elif whence == 2:
-            self._pos = self._stop
-            whence = 1
-        _ProxyFile.seek(self, offset, whence)
-
-    def _read(self, size, read_method):
-        remaining = self._stop - self._pos
-        if remaining <= 0:
-            return b''
-        if size is None or size < 0 or size > remaining:
-            size = remaining
-        return _ProxyFile._read(self, size, read_method)
+        base = {0: self._start, 1: self._pos, 2: self._stop}[whence]
+        self._pos = base
+        _ProxyFile.seek(self, offset, 1)
 
     def close(self):
-        # the underlying file belongs to the mailbox
+        # the underlying file belongs to the mailbox: only forget it
         if hasattr(self, '_file'):
             del self._file
 
 
-def _acquire_locks(f, dotlock=True):
-    """Lock the open mailbox file f: an exclusive, non-blocking lockf()
-    lock and, if dotlock, a "<name>.lock" file put in place atomically
-    (hard link, or rename where links are not possible).
+# ---------------------------------------------------------------------------
+# Locking and file helpers
 
-    ExternalClashError means another process holds one of the locks; on
-    any failure the locks taken so far are released again.  A read-only
-    directory silently means no dot lock.
-    """
-    lock_path = f.name + '.lock'
-    have_lockf = have_dotlock = False
+def _lock(f, dotlock=True):
+    """Lock *f* with lockf() (where available) and a "<name>.lock" file."""
+    made_dotlock = False
     try:
         if fcntl:
             try:
                 fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError as exc:
-                if exc.errno in (errno.EAGAIN, errno.EACCES, errno.EROFS):
+            except OSError as err:
+                if err.errno in (errno.EAGAIN, errno.EACCES, errno.EROFS):
                     raise ExternalClashError('lockf: lock unavailable: %s'
                                              % f.name)
                 raise
-            have_lockf = True
-        if not dotlock:
-            return
-        try:
-            scratch = _create_unique(lock_path)
-        except OSError as exc:
-            if exc.errno in (errno.EACCES, errno.EROFS):
-                return
-            raise
-        scratch.close()
-        try:
+        if dotlock:
+            lock_name = f.name + '.lock'
             try:
-                os.link(scratch.name, lock_path)
-            except (AttributeError, PermissionError):
-                os.rename(scratch.name, lock_path)
-                have_dotlock = True
-            else:
-                have_dotlock = True
-                os.unlink(scratch.name)
-        except FileExistsError:
-            os.remove(scratch.name)
-            raise ExternalClashError('dot lock unavailable: %s' % f.name)
+                scratch = _open_side_file(lock_name)
+                scratch.close()
+            except OSError as err:
+                if err.errno in (errno.EACCES, errno.EROFS):
+                    return      # no write access: skip dot-locking
+                raise
+            # link() fails if the lock exists; rename() is the fallback for
+            # file systems without hard links
+            try:
+                try:
+                    os.link(scratch.name, lock_name)
+                    made_dotlock = True
+                except (AttributeError, PermissionError):
+                    os.rename(scratch.name, lock_name)
+                    made_dotlock = True
+                else:
+                    os.unlink(scratch.name)
+            except FileExistsError:
+                os.remove(scratch.name)
+                raise ExternalClashError('dot lock unavailable: %s' % f.name)
     except BaseException:
-        if have_lockf:
+        if fcntl:
             fcntl.lockf(f, fcntl.LOCK_UN)
-        if have_dotlock:
-            os.remove(lock_path)
+        if made_dotlock:
+            os.remove(f.name + '.lock')
         raise
 
 
-def _release_locks(f):
-    """Undo _acquire_locks()."""
+def _unlock(f):
     if fcntl:
         fcntl.lockf(f, fcntl.LOCK_UN)
-    try:
+    if os.path.exists(f.name + '.lock'):
         os.remove(f.name + '.lock')
-    except FileNotFoundError:
-        pass
 
 
-def _create_new(path):
-    """Create path, failing if it already exists, and return it opened
-    for reading and writing in binary mode."""
-    descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o666)
+def _open_new_file(path):
+    """Create *path* (it must not exist) and open it for binary update."""
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o666)
     try:
         return open(path, 'rb+')
     finally:
-        os.close(descriptor)
+        os.close(fd)
 
 
-def _create_unique(path):
-    """_create_new() on path plus time, host name and process id."""
-    suffix = '%d.%s.%d' % (time.time(), socket.gethostname(), os.getpid())
-    return _create_new(f'{path}.{suffix}')
+def _open_side_file(path):
+    """Create a file next to *path* with a name unique to this moment,
+    host and process."""
+    return _open_new_file('%s.%s.%s.%s' % (path, int(time.time()),
+                                           socket.gethostname(), os.getpid()))
 
 
-def _flush_to_disk(f):
-    """Flush f's buffers and ask the OS to write the data out."""
+def _fsync(f):
     f.flush()
-    fsync = getattr(os, 'fsync', None)
-    if fsync is not None:
-        fsync(f.fileno())
+    if hasattr(os, 'fsync'):
+        os.fsync(f.fileno())
 
 
-def _close_to_disk(f):
-    _flush_to_disk(f)
+def _fsync_close(f):
+    _fsync(f)
     f.close()
 
 
 class Error(Exception):
-    """Base class of mailbox exceptions."""
+    """Base class for this module's errors."""
 
 
 class NoSuchMailboxError(Error):
@@ -1909,12 +1832,13 @@ class NoSuchMailboxError(Error):
 
 
 class NotEmptyError(Error):
-    """The folder to remove still contains messages."""
+    """The folder still contains messages."""
 
 
 class ExternalClashError(Error):
-    """Another process interfered (name clash, lock held, size change)."""
+    """Another program got in the way (lock held, name taken, file size
+    changed behind our back)."""
 
 
 class FormatError(Error):
-    """The mailbox data could not be parsed."""
+    """A file could not be parsed."""

@@ -504,13 +504,21 @@ fn type_meta_guard(o: &PyObject, s: &cache::Snapshot) -> bool {
 /// (attribute, None) otherwise.
 #[inline]
 pub fn load_method(o: &PyObject, nm: &PyObject, es: &[Entry]) -> PyResult<(PyRef, Option<PyRef>)> {
+    let (m, recv) = load_method_r(o, nm, es)?;
+    Ok((m, if recv { Some(o.to_ref()) } else { None }))
+}
+
+/// (refs1) `load_method` that reports "self is the receiver" (true) instead of taking a
+/// new reference to it, so a borrowed receiver can stay borrowed as `self`.
+#[inline]
+pub fn load_method_r(o: &PyObject, nm: &PyObject, es: &[Entry]) -> PyResult<(PyRef, bool)> {
     let tp = o.type_ptr();
     for e in es {
         if let Some(s) = e.read() {
             match s.kind {
                 kind::METHOD => {
                     if cache::type_tag(tp) as u64 == s.a {
-                        return Ok((unsafe { PyRef::from_borrowed(s.c as *mut PyObject) }, Some(o.to_ref())));
+                        return Ok((unsafe { PyRef::from_borrowed(s.c as *mut PyObject) }, true));
                     }
                 }
                 kind::METHOD_SHADOWABLE => {
@@ -518,29 +526,31 @@ pub fn load_method(o: &PyObject, nm: &PyObject, es: &[Entry]) -> PyResult<(PyRef
                         // (jit6) held across the probe (see load_attr_hit)
                         let keep = unsafe { PyRef::from_borrowed(s.c as *mut PyObject) };
                         if let Some(v) = instance_get_hinted(o, nm, u64::MAX, e) {
-                            return Ok((unsafe { PyRef::from_borrowed(v) }, None));
+                            return Ok((unsafe { PyRef::from_borrowed(v) }, false));
                         }
-                        return Ok((keep, Some(o.to_ref())));
+                        return Ok((keep, true));
                     }
                 }
                 kind::TYPE_CLASSMETHOD => {
                     // (perf5) no bound method: the function with the class as self
                     if type_meta_guard(o, &s) {
                         if let Some(f) = funcobject::sm_callable(unsafe { &*(s.c as *mut PyObject) }) {
-                            return Ok((f.to_ref(), Some(o.to_ref())));
+                            return Ok((f.to_ref(), true));
                         }
                     }
                 }
                 kind::EMPTY => {}
                 _ => {
                     if let Some(r) = load_attr_hit(o, nm, e) {
-                        return Ok((r?, None));
+                        return Ok((r?, false));
                     }
                 }
             }
         }
     }
-    load_method_miss(o, nm, es)
+    let (m, s) = load_method_miss(o, nm, es)?;
+    // (the generic lookup binds `self` to the receiver or to nothing)
+    Ok((m, s.is_some()))
 }
 
 #[cold]

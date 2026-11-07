@@ -874,6 +874,11 @@ pub fn translate(inp: &Input) -> Result<Output, String> {
         }
     }
 
+    // (refs1) loads whose stack copies cannot outlive their local become borrowed
+    if super::borrow::enabled() {
+        super::borrow::mark(&mut code, &exception_table);
+    }
+
     Ok(Output {
         code,
         locations,

@@ -221,8 +221,11 @@ pub enum Op {
     ExtendedArg,
     /// [x] -> [] ; x must be None at generator/coroutine end of `yield from` cleanup (unused)
     Unused1,
-    /// [exc] -> raise RuntimeError if StopIteration leaks from a generator (handled by VM)
-    Unused2,
+    /// (refs1) [] -> [fast[arg]] as a *borrowed* stack reference (tag bit 1 in the value
+    /// stack slot, no incref): the runtime's translator proved that the local is not
+    /// rebound or deleted before every copy of the value has been consumed inside the
+    /// same basic block (runtime interp/borrow.rs). Never emitted by the compiler.
+    LoadFastBorrow,
     /// [value] -> [] (for `print` of interactive expressions, also see Intrinsic1::Print)
     Unused3,
     /// ADDED by bc-vm (internal form of LOAD_SPECIAL): [obj] -> [method, self_or_null],

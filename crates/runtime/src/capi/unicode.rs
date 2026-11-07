@@ -153,7 +153,12 @@ pub unsafe extern "C" fn PyUnicode_FromKindAndData(kind: c_int, buffer: *const s
             2 => pystr::from_ucs2(std::slice::from_raw_parts(buffer as *const u16, n)).into_raw(),
             4 => {
                 let s = std::slice::from_raw_parts(buffer as *const u32, n);
-                if let Some(&bad) = s.iter().find(|&&c| c > 0x10ffff) {
+                // (capi3) a single code point outside the Unicode range is refused; longer
+                // data is stored as given, as in a CPython release build (decision in
+                // notes/capi3.md): iterating over the string raises SystemError there
+                if let [bad] = s
+                    && *bad > 0x10ffff
+                {
                     let _ = system_error(&format!("character U+{:x} is not in range [U+0000; U+10ffff]", bad));
                     return std::ptr::null_mut();
                 }
@@ -1373,6 +1378,12 @@ pub unsafe extern "C" fn PyUnicodeWriter_Discard(wr: *mut Writer) {
 pub unsafe extern "C" fn PyUnicodeWriter_Finish(wr: *mut Writer) -> *mut PyObject {
     unsafe {
         let b = Box::from_raw(wr);
+        // (capi3) the result is a new allocation unless it is a singleton
+        let n = b.b.len();
+        if n > 1 && crate::capi::mem::hook_installed() && crate::capi::mem::hooked_alloc_refuses(n) {
+            let _ = memory_error();
+            return std::ptr::null_mut();
+        }
         b.b.finish().into_raw()
     }
 }
@@ -1431,11 +1442,11 @@ pub unsafe extern "C" fn PyUnicodeWriter_WriteUCS4(wr: *mut Writer, s: *const Py
             let _ = value_error("size must be positive");
             return -1;
         }
-        let sl = std::slice::from_raw_parts(s, size as usize);
-        if let Some(&bad) = sl.iter().find(|&&c| c > 0x10ffff) {
-            let _ = value_error(&format!("character U+{:x} is not in range [U+0000; U+10ffff]", bad));
-            return -1;
+        if size == 0 {
+            return 0;
         }
+        // (capi3) values above U+10FFFF are stored as given (see PyUnicode_FromKindAndData)
+        let sl = std::slice::from_raw_parts(s, size as usize);
         for &c in sl {
             w(wr).push(c);
         }
@@ -1447,6 +1458,12 @@ pub unsafe extern "C" fn PyUnicodeWriter_WriteStr(wr: *mut Writer, o: *mut PyObj
     unsafe {
         match ab::str(&*o) {
             Ok(s) => {
+                // (capi3) growing the buffer is an allocation a failure-injecting hook may refuse
+                let n = pystr::str_len(&s);
+                if crate::capi::mem::hook_installed() && w(wr).would_grow(n) && crate::capi::mem::hooked_alloc_refuses(n * 4) {
+                    let _ = memory_error();
+                    return -1;
+                }
                 w(wr).push_obj(&s);
                 0
             }

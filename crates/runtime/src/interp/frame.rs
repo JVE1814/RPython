@@ -63,6 +63,10 @@ pub struct Frame {
     /// (set by compiled `YieldValue`, or to the code's entry for a created frame), 0
     /// when the interpreter must resume it (genobject.rs `gen_send_fast`).
     pub resume: usize,
+    /// (refs1) Values of locals rebound/deleted from outside the frame's code while it
+    /// ran (interp/borrow.rs `keep_alive`): borrowed stack copies may still point to
+    /// them, so they are released with the frame. NULL when empty.
+    pub keep: *mut Vec<*mut PyObject>,
 }
 
 fn borrows_globals(func: Option<&PyObject>, globals: &PyObject, builtins: &PyObject) -> bool {
@@ -167,6 +171,7 @@ impl Frame {
             t2_site: 0,
             t2_sp: 0,
             resume: 0,
+            keep: std::ptr::null_mut(),
         })
     }
 
@@ -253,6 +258,7 @@ impl Frame {
             t2_site: 0,
             t2_sp: 0,
             resume: 0,
+            keep: std::ptr::null_mut(),
         })
     }
 
@@ -274,7 +280,7 @@ impl Frame {
         while self.stack_top > self.nlocalsplus {
             self.stack_top -= 1;
             let p = std::mem::replace(&mut self.slots[self.stack_top], std::ptr::null_mut());
-            unsafe { xdecref(p) };
+            unsafe { super::borrow::release(p) };
         }
     }
 
@@ -314,11 +320,19 @@ impl Frame {
                 let o = *p.add(i);
                 if !o.is_null() {
                     *p.add(i) = std::ptr::null_mut();
-                    decref(o);
+                    super::borrow::release(o);
                 }
             }
         }
         self.stack_top = self.nlocalsplus;
+        if !self.keep.is_null() {
+            // (refs1) values parked by borrow::keep_alive
+            let k = unsafe { Box::from_raw(self.keep) };
+            self.keep = std::ptr::null_mut();
+            for p in k.into_iter() {
+                unsafe { decref(p) };
+            }
+        }
         unsafe {
             if self.owns_fc {
                 xdecref(self.code);
@@ -467,7 +481,7 @@ pub fn recycle(mut f: Box<Frame>) {
 /// the slots and the fields compiled code changes are reset.
 #[inline]
 pub fn recycle_call(mut f: Box<Frame>) {
-    if !f.frame_obj.is_null() || !f.locals.is_null() || !f.f_trace.is_null() || f.owns_fc || !f.borrowed_gb {
+    if !f.frame_obj.is_null() || !f.locals.is_null() || !f.f_trace.is_null() || f.owns_fc || !f.borrowed_gb || !f.keep.is_null() {
         f.state = FrameState::Completed;
         crate::interp::frame_finished(f);
         return;
@@ -479,7 +493,7 @@ pub fn recycle_call(mut f: Box<Frame>) {
             let p = *s.add(i);
             if !p.is_null() {
                 *s.add(i) = std::ptr::null_mut();
-                decref(p);
+                super::borrow::release(p);
             }
         }
         f.stack_top = f.nlocalsplus;

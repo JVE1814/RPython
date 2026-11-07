@@ -66,13 +66,16 @@ pub fn initialize(cfg: &Config) -> PyResult<()> {
     modules::sys::INT_MAX_STR_DIGITS.store(rc.int_max_str_digits, std::sync::atomic::Ordering::Relaxed);
     modules::sys::BYTES_WARNING.store(rc.bytes_warning, std::sync::atomic::Ordering::Relaxed);
     modules::sys::OPTIMIZE.store(rc.optimize, std::sync::atomic::Ordering::Relaxed);
+    let dev_mode = rc.dev_mode;
     modules::sys_full::set_config(rc);
+    capi::mem::setup_from_config(dev_mode, ignore_env); // (capi3) PYTHONMALLOC=debug hooks
     hash::init_hash_secret(cfg.hash_seed);
     scalestats::init();
     let _ = threads::current();
     threads::set_main_thread();
     types::int::init_small_ints();
     types::init_all()?;
+    capi::typeobj::set_builtin_flag_bits(); // (capi3)
     modules::register_all();
     modules::sys::init_bootstrap_types();
     let _b = builtins::init()?;
@@ -126,6 +129,8 @@ pub fn initialize(cfg: &Config) -> PyResult<()> {
             errors::clear_exc();
         }
     }
+    // (remote1) publish the debug table (its run-time fields) once config is known
+    modules::remote_debug::init_table();
     let r = modules::sys_full::import_site();
     // (perf4) automatic collections start with the program (see gc::startup_complete)
     gc::startup_complete();
