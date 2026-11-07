@@ -55,6 +55,8 @@ pub struct RtConfig {
     pub tracemalloc: i32,
     pub check_hash_based_pycs: String,
     pub stdlib_dir: Option<String>,
+    /// -X cpu_count / PYTHON_CPU_COUNT: what os.cpu_count() reports (-1: the real count).
+    pub cpu_count: i32,
 }
 
 impl Default for RtConfig {
@@ -80,6 +82,7 @@ impl Default for RtConfig {
             int_max_str_digits: 4300,
             gil: -1,
             thread_inherit_context: 1,
+            cpu_count: -1,
             context_aware_warnings: 1,
             lazy_imports: -1,
             unbuffered: false,
@@ -804,6 +807,10 @@ fn thread_frames_and_excs(want_exc: bool) -> PyResult {
     }
     Ok(d)
 }
+fn sys_get_cpu_count_config(_m: &PyObject) -> PyResult {
+    Ok(int::new_int(config().cpu_count as i64))
+}
+
 fn sys_current_frames(_m: &PyObject) -> PyResult {
     thread_frames_and_excs(false)
 }
@@ -1366,6 +1373,15 @@ pub(crate) fn call_module_func(module: &str, func: &str) {
 pub(crate) fn flush_std(name: &str) -> bool {
     if let Some(s) = crate::modules::sys::get_sys_attr(name) {
         if !s.is(none::none()) {
+            // a stream the program closed has nothing left to flush
+            match ab::getattr_opt(&s, crate::name!("closed")) {
+                Ok(Some(c)) if ab::is_true(&c).unwrap_or(false) => return true,
+                Ok(_) => {}
+                Err(_) => clear_exc(),
+            }
+            if err_occurred() {
+                clear_exc();
+            }
             if ab::call_method_str(&s, "flush", &[]).is_err() {
                 write_unraisable(Some(&format!("Exception ignored while flushing sys.{}", name)), None);
                 return false;
@@ -1538,6 +1554,7 @@ pub fn populate(d: &PyObject) -> PyResult<()> {
         ("_clear_type_cache", NOARGS, sys_clear_type_cache),
         ("_clear_internal_caches", NOARGS, sys_clear_internal_caches),
         ("_current_frames", NOARGS, sys_current_frames),
+        ("_get_cpu_count_config", NOARGS, sys_get_cpu_count_config),
         ("_current_exceptions", NOARGS, sys_current_exceptions),
         ("activate_stack_trampoline", FASTKW, sys_activate_stack_trampoline, "activate_stack_trampoline(backend, /)\n--\n\nTurn on the perf profiler trampoline for the given backend."),
         ("deactivate_stack_trampoline", NOARGS, sys_deactivate_stack_trampoline),

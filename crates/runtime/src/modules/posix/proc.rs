@@ -384,6 +384,11 @@ pub fn os_uname(_m: &PyObject) -> PyResult {
 }
 
 pub fn os_cpu_count(_m: &PyObject) -> PyResult {
+    // -X cpu_count=N / PYTHON_CPU_COUNT=N
+    let forced = crate::modules::sys_full::config().cpu_count;
+    if forced > 0 {
+        return Ok(i(forced as i64));
+    }
     let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
     if n < 1 { ok_none() } else { Ok(i(n as i64)) }
 }

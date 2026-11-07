@@ -235,6 +235,7 @@ fn real_main() -> i32 {
     let mut i = 1;
     let mut stdin_dash = false;
     let mut no_site_user = false;
+    let mut force_hash_random = false;
     'outer: while i < args.len() {
         let a = &args[i];
         if a == "--" {
@@ -343,7 +344,7 @@ fn real_main() -> i32 {
                 'O' => cfg.optimize += 1,
                 'P' => cfg.safe_path = true,
                 'q' => cfg.quiet = 1,
-                'R' => {}
+                'R' => force_hash_random = true,
                 's' => no_site_user = true,
                 'S' => cfg.no_site = 1,
                 'u' => cfg.unbuffered = true,
@@ -368,7 +369,8 @@ fn real_main() -> i32 {
     if no_site_user || env(&cfg, "PYTHONNOUSERSITE").is_some() {
         cfg.no_user_site = 1;
     }
-    cfg.debug = cfg.debug.max(env_level(&cfg, "PYTHONDEBUG"));
+    // PYTHONDEBUG only switches parser debugging on (unlike -d, it has no levels)
+    cfg.debug = cfg.debug.max(env_level(&cfg, "PYTHONDEBUG").min(1));
     if env(&cfg, "PYTHONINSPECT").is_some() {
         cfg.inspect = cfg.inspect.max(1);
     }
@@ -422,6 +424,19 @@ fn real_main() -> i32 {
             _ => fatal("PYTHON_LAZY_IMPORTS: invalid value; expected 'all' or 'normal'"),
         };
     }
+    if let Some(v) = env(&cfg, "PYTHON_TLBC") {
+        if v != "0" && v != "1" {
+            fatal("config_read_tlbc: PYTHON_TLBC=N: N is missing or invalid");
+        }
+    }
+    if let Some(v) = env(&cfg, "PYTHON_CPU_COUNT") {
+        if v != "default" {
+            match v.parse::<i32>() {
+                Ok(n) if n >= 1 => cfg.cpu_count = n,
+                _ => fatal("config_init_cpu_count: PYTHON_CPU_COUNT=n option: n is missing or an invalid number, n must be greater than 0"),
+            }
+        }
+    }
     if let Some(v) = env(&cfg, "PYTHON_THREAD_INHERIT_CONTEXT") {
         cfg.thread_inherit_context = if v == "0" { 0 } else { 1 };
     }
@@ -439,7 +454,20 @@ fn real_main() -> i32 {
             "faulthandler" => cfg.faulthandler = true,
             "utf8" => cfg.utf8_mode = if v == Some("0") { 0 } else { 1 },
             "warn_default_encoding" => cfg.warn_default_encoding = 1,
-            "pycache_prefix" => cfg.pycache_prefix = v.map(|s| s.to_string()),
+            // `-X pycache_prefix` or an empty value: no prefix, whatever the environment says
+            "pycache_prefix" => cfg.pycache_prefix = v.filter(|s| !s.is_empty()).map(|s| s.to_string()),
+            "tlbc" => match v {
+                Some("0") | Some("1") => {}
+                _ => fatal("config_read_tlbc: -X tlbc=n: n is missing or invalid"),
+            },
+            "cpu_count" => match v {
+                Some("default") => cfg.cpu_count = -1,
+                Some(s) => match s.parse::<i32>() {
+                    Ok(n) if n >= 1 => cfg.cpu_count = n,
+                    _ => fatal("config_init_cpu_count: -X cpu_count=n option: n is missing or an invalid number, n must be greater than 0"),
+                },
+                None => fatal("config_init_cpu_count: -X cpu_count=n option: n is missing or an invalid number, n must be greater than 0"),
+            },
             "tracemalloc" => {
                 cfg.tracemalloc = match v {
                     None => 1,
@@ -476,10 +504,18 @@ fn real_main() -> i32 {
     cfg.bytes_warning = cfg.bytes_warning.min(2);
     // warnings: PYTHONWARNINGS first, then -b/-W (CPython ordering: env, then cmdline)
     let mut warn = Vec::new();
+    if cfg.dev_mode {
+        warn.push("default".to_string());
+    }
     if let Some(w) = env(&cfg, "PYTHONWARNINGS") {
         warn.extend(w.split(',').filter(|s| !s.is_empty()).map(|s| s.trim().to_string()));
     }
     warn.extend(warn_cli);
+    match cfg.bytes_warning {
+        0 => {}
+        1 => warn.push("default::BytesWarning".to_string()),
+        _ => warn.push("error::BytesWarning".to_string()),
+    }
     cfg.warnoptions = warn;
     let seed = match env(&cfg, "PYTHONHASHSEED") {
         Some(s) if s == "random" => None,
@@ -494,6 +530,9 @@ fn real_main() -> i32 {
         },
         None => None,
     };
+    if force_hash_random {
+        cfg.hash_randomization = 1;
+    }
     if let Some(b) = &cmd_undecodable {
         // the command must be valid source text: report the first undecodable byte the way
         // encoding the surrogateescape-decoded text back to UTF-8 fails
