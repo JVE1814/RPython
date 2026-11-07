@@ -21,7 +21,7 @@ struct SimpleQueue {
 }
 
 static mut SQ_TYPE: PyTypeObject = PyTypeObject::ZERO;
-static EMPTY: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
+static EMPTY: crate::subinterp::InterpPtr = crate::subinterp::InterpPtr::new(); // (interp1) per interpreter
 
 fn sq(o: &PyObject) -> &SimpleQueue {
     unsafe { &*(o.as_ptr() as *const SimpleQueue) }

@@ -104,12 +104,46 @@ pub unsafe extern "C" fn PyUnstable_AtExit(interp: *mut c_void, f: Option<unsafe
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Py_NewInterpreter() -> *mut c_void {
-    super::pystate::new_interpreter()
+    super::pystate::new_interpreter(crate::subinterp::Config::LEGACY, crate::subinterp::WHENCE_LEGACY_CAPI)
+}
+/// PyInterpreterConfig (cpython/pylifecycle.h).
+#[repr(C)]
+pub struct PyInterpreterConfig {
+    pub use_main_obmalloc: c_int,
+    pub allow_fork: c_int,
+    pub allow_exec: c_int,
+    pub allow_threads: c_int,
+    pub allow_daemon_threads: c_int,
+    pub check_multi_interp_extensions: c_int,
+    pub gil: c_int,
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn Py_NewInterpreterFromConfig(tstate: *mut *mut c_void, _cfg: *const c_void) -> PyStatus {
+pub unsafe extern "C" fn Py_NewInterpreterFromConfig(tstate: *mut *mut c_void, cfg: *const c_void) -> PyStatus {
     unsafe {
-        *tstate = super::pystate::new_interpreter();
+        let config = if cfg.is_null() {
+            crate::subinterp::Config::ISOLATED
+        } else {
+            let c = &*(cfg as *const PyInterpreterConfig);
+            crate::subinterp::Config {
+                use_main_obmalloc: c.use_main_obmalloc != 0,
+                allow_fork: c.allow_fork != 0,
+                allow_exec: c.allow_exec != 0,
+                allow_threads: c.allow_threads != 0,
+                allow_daemon_threads: c.allow_daemon_threads != 0,
+                check_multi_interp_extensions: c.check_multi_interp_extensions != 0,
+                gil: c.gil,
+            }
+        };
+        if let Err(msg) = config.validate() {
+            *tstate = std::ptr::null_mut();
+            return PyStatus_Error(msg.as_ptr());
+        }
+        let ts = super::pystate::new_interpreter(config, crate::subinterp::WHENCE_CAPI);
+        *tstate = ts;
+        if ts.is_null() {
+            crate::errors::clear_exc();
+            return PyStatus_Error(c"sub-interpreter creation failed".as_ptr());
+        }
         PyStatus_Ok()
     }
 }

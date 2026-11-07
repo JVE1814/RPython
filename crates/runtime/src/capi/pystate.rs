@@ -3,37 +3,22 @@
 //! PEP 788 guards/views/tokens, pending calls.
 //!
 //! Model: the current (attached) thread state lives in `threads::CURRENT`; each OS
-//! thread also remembers its "GILState" thread state. There is one real interpreter;
-//! `Py_NewInterpreter` creates additional interpreter *identities* (own id, dict and
-//! atexit list) that share the runtime — enough for the C-level thread-state API, not
-//! for isolation (sub-interpreter isolation is not supported).
+//! thread also remembers its "GILState" thread state. Interpreters (main and
+//! subinterpreters) are `subinterp::Interp`; a `PyInterpreterState *` points to one.
 
 use super::*;
+use crate::subinterp::{self, Interp};
 use crate::threads::{self, ThreadMode, ThreadState};
 use crate::types::dict;
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::sync::Mutex;
 
-pub struct Interp {
-    pub id: i64,
-    pub alive: std::sync::atomic::AtomicBool,
-    pub dict: Mutex<usize>,
-    pub atexit: Mutex<Vec<(usize, usize)>>,
-}
-static MAIN_INTERP: Interp = Interp {
-    id: 0,
-    alive: std::sync::atomic::AtomicBool::new(true),
-    dict: Mutex::new(0),
-    atexit: Mutex::new(Vec::new()),
-};
-static NEXT_INTERP_ID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
-
 pub fn interp_ptr() -> *mut c_void {
-    &MAIN_INTERP as *const Interp as *mut c_void
+    subinterp::MAIN.as_ptr()
 }
 unsafe fn interp<'a>(p: *mut c_void) -> &'a Interp {
-    unsafe { if p.is_null() { &MAIN_INTERP } else { &*(p as *const Interp) } }
+    unsafe { subinterp::from_ptr(p) }
 }
 unsafe fn interp_of(ts: *mut ThreadState) -> *mut c_void {
     unsafe {
@@ -67,6 +52,10 @@ fn gilstate() -> *mut ThreadState {
 fn attach(ts: *mut ThreadState) {
     threads::set_current(ts);
     if !ts.is_null() {
+        // (jit6) see threads::MT_HANDSHAKE
+        if threads::MT_HANDSHAKE.load(std::sync::atomic::Ordering::Relaxed) && threads::MT_HANDSHAKE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            crate::gc::handshake_safepoint();
+        }
         unsafe { (*ts).mode.set(ThreadMode::InVm) };
     }
 }
@@ -314,14 +303,20 @@ pub unsafe extern "C" fn PyInterpreterState_Head() -> *mut c_void {
     interp_ptr()
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyInterpreterState_Next(_i: *mut c_void) -> *mut c_void {
-    std::ptr::null_mut()
+pub unsafe extern "C" fn PyInterpreterState_Next(i: *mut c_void) -> *mut c_void {
+    let all = subinterp::list_all();
+    let cur = unsafe { interp(i) } as *const Interp;
+    match all.iter().position(|&x| std::ptr::eq(x, cur)) {
+        Some(k) if k + 1 < all.len() => all[k + 1].as_ptr(),
+        _ => std::ptr::null_mut(),
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInterpreterState_ThreadHead(i: *mut c_void) -> *mut c_void {
+    let want = unsafe { interp(i) } as *const Interp;
     let g = threads::ALL_THREADS.lock().unwrap();
     g.iter()
-        .find(|&&t| unsafe { interp_of(t as *mut ThreadState) } == if i.is_null() { interp_ptr() } else { i })
+        .find(|&&t| std::ptr::eq(subinterp::of_ts(t as *const ThreadState), want))
         .map_or(std::ptr::null_mut(), |&t| t as *mut c_void)
 }
 #[unsafe(no_mangle)]
@@ -338,69 +333,69 @@ pub unsafe extern "C" fn PyInterpreterState_GetDict(i: *mut c_void) -> *mut PyOb
         *g as *mut PyObject
     }
 }
-fn new_interp() -> *mut c_void {
-    let i = Box::leak(Box::new(Interp {
-        id: NEXT_INTERP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        alive: std::sync::atomic::AtomicBool::new(true),
-        dict: Mutex::new(0),
-        atexit: Mutex::new(Vec::new()),
-    }));
-    i as *mut Interp as *mut c_void
-}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInterpreterState_New() -> *mut c_void {
-    new_interp()
+    subinterp::new_uninitialized().as_ptr()
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInterpreterState_Clear(_i: *mut c_void) {}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInterpreterState_Delete(i: *mut c_void) {
     unsafe {
-        if !i.is_null() && i != interp_ptr() {
-            interp(i).alive.store(false, std::sync::atomic::Ordering::Release);
+        let it = interp(i);
+        if !it.is_main() {
+            subinterp::mark_destroyed(it);
         }
     }
 }
 /// Run (and clear) the PyUnstable_AtExit callbacks of an interpreter.
 pub fn run_interp_atexit(i: *mut c_void) {
-    let v: Vec<(usize, usize)> = std::mem::take(&mut *unsafe { interp(i) }.atexit.lock().unwrap());
+    let v: Vec<(usize, usize)> = std::mem::take(&mut *unsafe { interp(i) }.c_atexit.lock().unwrap());
     for (f, d) in v.into_iter().rev() {
         let f: unsafe extern "C" fn(*mut c_void) = unsafe { std::mem::transmute(f) };
         unsafe { f(d as *mut c_void) };
     }
 }
 pub fn add_interp_atexit(i: *mut c_void, f: usize, data: usize) {
-    unsafe { interp(i) }.atexit.lock().unwrap().push((f, data));
+    unsafe { interp(i) }.c_atexit.lock().unwrap().push((f, data));
 }
-/// Py_NewInterpreter: a new interpreter identity with an attached thread state.
-pub fn new_interpreter() -> *mut c_void {
-    let i = new_interp();
-    let ts = new_tstate(i);
-    attach(ts);
-    GILSTATE.with(|c| c.set(ts));
-    ts as *mut c_void
+/// Py_NewInterpreter(FromConfig): a new, initialised interpreter whose thread
+/// state is attached on return (null on failure, with the previous state back).
+pub fn new_interpreter(config: subinterp::Config, whence: i32) -> *mut c_void {
+    match subinterp::create(config, whence) {
+        Ok((ts, _prev)) => ts as *mut c_void,
+        Err(_) => std::ptr::null_mut(),
+    }
 }
 pub unsafe fn end_interpreter(ts: *mut c_void) {
     unsafe {
         let ts = ts as *mut ThreadState;
-        let i = interp_of(ts);
-        run_interp_atexit(i);
-        interp(i).alive.store(false, std::sync::atomic::Ordering::Release);
-        if threads::current_ptr() == ts {
-            threads::set_current(std::ptr::null_mut());
+        if ts.is_null() || subinterp::of_ts(ts).is_main() {
+            return;
         }
         if GILSTATE.with(|c| c.get()) == ts {
             GILSTATE.with(|c| c.set(std::ptr::null_mut()));
         }
-        PyThreadState_Delete(ts as *mut c_void);
+        if threads::current_ptr() != ts {
+            // Py_EndInterpreter wants the interpreter's thread state attached
+            let prev = threads::current_ptr();
+            threads::set_current(ts);
+            (*ts).mode.set(ThreadMode::InVm);
+            subinterp::end_interpreter(ts);
+            attach(prev);
+            return;
+        }
+        subinterp::end_interpreter(ts);
     }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn _PyInterpreterState_RequiresIDRef(_i: *mut c_void) -> c_int {
-    0
+pub unsafe extern "C" fn _PyInterpreterState_RequiresIDRef(i: *mut c_void) -> c_int {
+    unsafe { interp(i) }.requires_idref.load(std::sync::atomic::Ordering::Relaxed) as c_int
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn _PyInterpreterState_RequireIDRef(_i: *mut c_void, _req: c_int) {}
+pub unsafe extern "C" fn _PyInterpreterState_RequireIDRef(i: *mut c_void, req: c_int) {
+    unsafe { interp(i) }.requires_idref.store(req != 0, std::sync::atomic::Ordering::Relaxed)
+}
 static EVAL_FRAME_FUNC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _PyInterpreterState_GetEvalFrameFunc(_i: *mut c_void) -> *mut c_void {
@@ -553,12 +548,20 @@ pub unsafe extern "C" fn PyThreadState_Release(tok: *mut c_void) {
 }
 // ---------------------------------------------------------------- pending calls
 
-// Two queues as in CPython: calls for the main thread (Py_AddPendingCall, at most 32 queued)
-// and calls any thread of the interpreter may run (at most 300). Queuing sets EVAL_PENDING
-// in the eval breaker of the thread(s) that may run them; the interpreter then calls
-// `run_pending_calls` between instructions.
-static PENDING_MAIN: Mutex<std::collections::VecDeque<(usize, usize)>> = Mutex::new(std::collections::VecDeque::new());
-static PENDING_ANY: Mutex<std::collections::VecDeque<(usize, usize)>> = Mutex::new(std::collections::VecDeque::new());
+// Two queues per interpreter, as in CPython: calls for the main thread
+// (Py_AddPendingCall in the main interpreter, at most 32 queued) and calls any
+// thread of the interpreter may run (at most 300). Queuing sets EVAL_PENDING in
+// the eval breaker of the thread(s) that may run them; the interpreter then
+// calls `run_pending_calls` between instructions. (interp1: per interpreter;
+// a subinterpreter has no main thread, so all its calls go to the second queue.)
+struct Pending {
+    main: Mutex<std::collections::VecDeque<(usize, usize)>>,
+    any: Mutex<std::collections::VecDeque<(usize, usize)>>,
+}
+static PENDING: subinterp::PerInterp<Pending> = subinterp::PerInterp::new(|| Pending {
+    main: Mutex::new(std::collections::VecDeque::new()),
+    any: Mutex::new(std::collections::VecDeque::new()),
+});
 const MAX_PENDING_MAIN: usize = 32;
 const MAX_PENDING_ANY: usize = 300;
 
@@ -567,9 +570,16 @@ fn request_pending(ts: *const ThreadState) {
         unsafe { (*ts).c.eval_breaker.fetch_or(threads::EVAL_PENDING, std::sync::atomic::Ordering::Release) };
     }
 }
-/// Queue `f(arg)`; `main_only`: only the main thread runs it. -1 if the queue is full.
+/// Queue `f(arg)` for the current interpreter; `main_only`: only the main
+/// thread runs it. -1 if the queue is full.
 pub(crate) fn add_pending_call(f: unsafe extern "C" fn(*mut c_void) -> c_int, arg: *mut c_void, main_only: bool) -> c_int {
-    let (q, max) = if main_only { (&PENDING_MAIN, MAX_PENDING_MAIN) } else { (&PENDING_ANY, MAX_PENDING_ANY) };
+    add_pending_call_to(subinterp::current(), f, arg, main_only)
+}
+/// Queue `f(arg)` for interpreter `i`.
+pub(crate) fn add_pending_call_to(i: &'static Interp, f: unsafe extern "C" fn(*mut c_void) -> c_int, arg: *mut c_void, main_only: bool) -> c_int {
+    let main_only = main_only && i.is_main();
+    let p = PENDING.get_in(i);
+    let (q, max) = if main_only { (&p.main, MAX_PENDING_MAIN) } else { (&p.any, MAX_PENDING_ANY) };
     {
         let mut g = q.lock().unwrap();
         if g.len() >= max {
@@ -577,11 +587,16 @@ pub(crate) fn add_pending_call(f: unsafe extern "C" fn(*mut c_void) -> c_int, ar
         }
         g.push_back((f as usize, arg as usize));
     }
-    request_pending(threads::MAIN_THREAD_STATE.load(std::sync::atomic::Ordering::Acquire));
+    if i.is_main() {
+        request_pending(threads::MAIN_THREAD_STATE.load(std::sync::atomic::Ordering::Acquire));
+    }
     if !main_only {
-        // any thread may serve it: wake them all (the first to look takes it)
+        // any thread of the interpreter may serve it: wake them all (the first
+        // to look takes it)
         for &t in threads::ALL_THREADS.lock().unwrap().iter() {
-            request_pending(t as *const ThreadState);
+            if std::ptr::eq(subinterp::of_ts(t as *const ThreadState), i) {
+                request_pending(t as *const ThreadState);
+            }
         }
     }
     0
@@ -592,20 +607,22 @@ pub(crate) fn run_pending_calls() -> PyResult<()> {
     if !ts.is_null() {
         unsafe { (*ts).c.eval_breaker.fetch_and(!threads::EVAL_PENDING, std::sync::atomic::Ordering::AcqRel) };
     }
-    let main = threads::is_main_thread();
+    let interp = subinterp::current();
+    let p = PENDING.get_in(interp);
+    let main = interp.is_main() && threads::is_main_thread();
     loop {
         let item = {
-            let a = if main { PENDING_MAIN.lock().unwrap().pop_front() } else { None };
+            let a = if main { p.main.lock().unwrap().pop_front() } else { None };
             match a {
                 Some(x) => Some(x),
-                None => PENDING_ANY.lock().unwrap().pop_front(),
+                None => p.any.lock().unwrap().pop_front(),
             }
         };
         let Some((f, arg)) = item else { return Ok(()) };
         let f: unsafe extern "C" fn(*mut c_void) -> c_int = unsafe { std::mem::transmute(f) };
         if unsafe { f(arg as *mut c_void) } < 0 {
             // leave the rest for the next check
-            if !PENDING_ANY.lock().unwrap().is_empty() || (main && !PENDING_MAIN.lock().unwrap().is_empty()) {
+            if !p.any.lock().unwrap().is_empty() || (main && !p.main.lock().unwrap().is_empty()) {
                 request_pending(ts);
             }
             if !err_occurred() {
@@ -618,7 +635,8 @@ pub(crate) fn run_pending_calls() -> PyResult<()> {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Py_AddPendingCall(func: Option<unsafe extern "C" fn(*mut c_void) -> c_int>, arg: *mut c_void) -> c_int {
     let Some(f) = func else { return -1 };
-    add_pending_call(f, arg, true)
+    // the main thread of the main interpreter serves these
+    add_pending_call_to(subinterp::main(), f, arg, true)
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Py_MakePendingCalls() -> c_int {

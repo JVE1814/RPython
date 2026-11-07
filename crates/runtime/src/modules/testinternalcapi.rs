@@ -217,10 +217,8 @@ fn reset_rare_event_counters(_m: &PyObject) -> PyResult {
     Ok(none::none_ref())
 }
 
-const SRC: &str = r#"
-def get_interp_settings(interp=None):
-    return 0
-"#;
+// (interp1) get_interp_settings is provided by subinterp::testapi
+const SRC: &str = "";
 
 /// Runs a queued Python callable (the queue owns one reference to it).
 unsafe extern "C" fn run_pending_callable(arg: *mut std::ffi::c_void) -> std::ffi::c_int {
@@ -319,6 +317,8 @@ pub fn init() -> PyResult {
     }
     dict::set_item_str(&d, "__builtins__", &crate::builtins::builtins_module())?;
     crate::modules::compiler_hooks::install(&d, &m)?;
+    // (interp1) interpreter helpers (create/exec/destroy, ids, configs, XI data)
+    crate::subinterp::testapi::install(&d, &m)?;
     let sicm_tp = sicm_type()?;
     dict::set_item_str(&d, "SelfInterruptingContextManager", &sicm_tp)?;
     let code = crate::compile::compile_str(SRC, "<_testinternalcapi>", crate::compile::Mode::Exec, 0, -1)?;

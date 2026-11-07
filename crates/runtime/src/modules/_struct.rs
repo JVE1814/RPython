@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 
 // ------------------------------------------------------------------ module state
 
-static STRUCT_ERROR: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
+static STRUCT_ERROR: crate::subinterp::InterpPtr = crate::subinterp::InterpPtr::new(); // (interp1) per interpreter
 
 fn struct_error_type() -> *mut PyTypeObject {
     STRUCT_ERROR.load(Ordering::Acquire) as *mut PyTypeObject

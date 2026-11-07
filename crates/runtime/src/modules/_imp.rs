@@ -259,10 +259,10 @@ fn imp_override_frozen(_m: &PyObject, v: &PyObject) -> PyResult {
     crate::frozen::set_override(n);
     Ok(none::none_ref())
 }
-static MULTI_INTERP_OVERRIDE: AtomicI32 = AtomicI32::new(-1);
+// (interp1) the override is per interpreter: subinterp::Interp::override_ext_check
 fn imp_override_multi_interp(_m: &PyObject, v: &PyObject) -> PyResult {
     let n = ab::as_i64(v)? as i32;
-    Ok(int::new_int(MULTI_INTERP_OVERRIDE.swap(n, AcqRel) as i64))
+    Ok(int::new_int(crate::subinterp::current().override_ext_check.swap(n, AcqRel) as i64))
 }
 
 // ------------------------------------------------------------------ extensions

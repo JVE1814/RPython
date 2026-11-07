@@ -813,6 +813,53 @@ pub unsafe extern "C" fn h_get_iter(sp: *mut *mut PyObject) -> u64 {
 }
 
 /// 0: value pushed; 1: exhausted (iterator popped); 2: error (iterator still on the stack)
+/// (jit6) ForIter at the head of a draining consumer loop (tier1.rs `drain_pattern`)
+/// whose iterator is an exact generator: a generator that has not started yet runs
+/// in drain mode and hands its values to the consumer directly (genobject.rs
+/// `jit_send_drain`). kind_arg = DRAIN_* | container distance below sp << 8.
+/// Returns 0: a value for the consumer's own loop body at *sp, 1: exhausted
+/// (iterator released), 2: error, 3: not applicable (nothing changed).
+pub unsafe extern "C" fn h_drain(sp: *mut *mut PyObject, ts: *const ThreadState, kind_arg: u64) -> u64 {
+    use crate::types::genobject as gm;
+    unsafe {
+        let it = *sp.sub(1);
+        let fp = gm::gen_frame(&*it);
+        if fp.is_null() || (*fp).state != crate::interp::frame::FrameState::Created {
+            return 3;
+        }
+        let code = &*(*fp).code;
+        let cd = crate::types::code::code_data(code);
+        let Some(c) = super::drain_code(cd, code) else { return 3 };
+        let entry = match (&(*c).entries).get((*fp).next_instr as usize) {
+            Some(&o) if o != u32::MAX => (*c).addr + o as usize,
+            _ => return 3,
+        };
+        let kind = kind_arg & 0xff;
+        let container = if kind <= gm::DRAIN_SET { *sp.sub((kind_arg >> 8) as usize) } else { std::ptr::null_mut() };
+        let (st, v) = gm::jit_send_drain(&*ts, it, container, kind, entry);
+        match st {
+            gm::JS_YIELD => {
+                *sp = v;
+                0
+            }
+            gm::JS_RETURN => {
+                decref(v);
+                decref(std::ptr::replace(sp.sub(1), std::ptr::null_mut()));
+                1
+            }
+            gm::JS_ERROR => {
+                if !exc_matches(crate::types::exceptions::StopIteration()) {
+                    return 2;
+                }
+                clear_exc();
+                decref(std::ptr::replace(sp.sub(1), std::ptr::null_mut()));
+                1
+            }
+            _ => 3,
+        }
+    }
+}
+
 pub unsafe extern "C" fn h_for_iter(sp: *mut *mut PyObject, ts: *const ThreadState) -> u64 {
     unsafe {
         let it = &**sp.sub(1);

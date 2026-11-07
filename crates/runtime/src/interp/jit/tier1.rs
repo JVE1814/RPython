@@ -74,6 +74,7 @@ const CD_FAST_ENTRY: i32 = (offset_of!(CodeData, caches) + offset_of!(crate::int
 
 const LIST_SIZE: i32 =offset_of!(PyVarObject, ob_size) as i32;
 const LIST_ITEMS: i32 = offset_of!(PyListObject, ob_item) as i32;
+const LIST_ALLOCATED: i32 = offset_of!(PyListObject, allocated) as i32;
 const TUPLE_ITEMS: i32 = offset_of!(PyTupleObject, ob_item) as i32;
 
 /// The range/list/tuple iterator structs are private to their modules; the inline
@@ -159,6 +160,8 @@ pub(crate) struct Gen<'a> {
     flags: u32,
     /// do not fuse CompareOp with a following branch (embedded in tier 2)
     pub(crate) no_fuse: bool,
+    /// (jit6) drain-mode code of a generator expression (see YieldValue)
+    pub(crate) drain: bool,
 }
 
 fn fnaddr<T>(f: T) -> usize
@@ -486,6 +489,35 @@ impl<'a> Gen<'a> {
                 let flags = self.flags as i64;
                 self.helper_sp(&ins, d, addr!(h::h_get_yield_from_iter), Some(flags), None, d - 1);
             }
+            Op::YieldValue if self.drain && i + 1 < self.ilabel.len() => {
+                // (jit6) drain mode: the consumer takes the value directly
+                // (`h_drain_add`); the yield's result is then None and execution goes
+                // on. If the consumer must see the value itself, an ordinary
+                // suspension follows whose continuation is left to the general
+                // resumption path (resume = 0: normal code, not this drain code).
+                let next = self.an.instrs[i + 1].start;
+                let normal = self.a.label();
+                let m = self.slot(d - 1);
+                self.a.mov_rr(Rdi, Rbx);
+                self.a.load(Rsi, m);
+                self.call(addr!(crate::types::genobject::h_drain_add));
+                self.a.test_rr(Rax, Rax);
+                self.a.jcc(Cc::NE, normal);
+                self.a.mov_ri(Rax, crate::types::none::none().as_ptr() as i64);
+                self.a.store(m, Rax);
+                self.a.jmp(self.ilabel[i + 1]);
+                self.a.bind(normal);
+                self.a.load(Rax, m);
+                self.a.load(Rcx, M(Rsp, 0));
+                self.a.store(M(Rcx, 0), Rax);
+                self.a.store32_i(M(Rbx, LASTI), pc as i32);
+                self.a.store32_i(M(Rbx, NEXT_INSTR), next as i32);
+                self.a.store32_i(M(Rbx, YIELD_FROM_SEND), -1);
+                self.a.store_i(M(Rbx, STACK_TOP), self.nlp + d - 1);
+                self.a.store_i(M(Rbx, RESUME), 0);
+                self.a.mov_ri(Rax, ST_YIELD as i64);
+                self.a.jmp(self.exit);
+            }
             Op::YieldValue => {
                 // suspend: the interpreter resumes the generator at the next instruction
                 // (an entry point of this code) and pushes the sent value there
@@ -524,7 +556,7 @@ impl<'a> Gen<'a> {
                 let t = self.an.index_of[arg as usize] as usize;
                 if arg <= ins.start {
                     self.poll(pc, d);
-                    if !self.no_fuse && super::opt::enabled() {
+                    if !self.no_fuse && !self.drain && super::opt::enabled() {
                         // tier-2 backedge countdown; on expiry compile and continue
                         // in the tier-2 OSR entry of this loop header if one exists
                         let stub = self.a.label();
@@ -764,7 +796,34 @@ impl<'a> Gen<'a> {
             Op::BuildSet => self.helper_sp(&ins, d, addr!(h::h_build_set), Some(arg as i64), None, d - arg as i32),
             Op::BuildMap => self.helper_sp(&ins, d, addr!(h::h_build_map), Some(arg as i64), None, d - 2 * arg as i32),
             Op::BuildString => self.helper_sp(&ins, d, addr!(h::h_build_string), Some(arg as i64), None, d - arg as i32),
-            Op::ListAppend | Op::SetAdd | Op::ListExtend | Op::SetUpdate | Op::DictUpdate | Op::DictMerge => {
+            Op::ListAppend => {
+                // (jit6) inline append to the comprehension's exact list while it has
+                // room (single-threaded, as the other lock-free list paths)
+                let generic = self.a.label();
+                let done = self.a.label();
+                let lm = self.slot(d - 1 - arg as i32);
+                let vm = self.slot(d - 1);
+                self.a.mov_ri(Rdx, (&raw const crate::threads::MULTI_THREADED) as i64);
+                self.a.cmp_mi(M(Rdx, 0), 0);
+                self.a.jcc(Cc::NE, generic);
+                self.a.load(Rax, lm);
+                self.a.mov_ri(Rcx, crate::types::list::list_type() as i64);
+                self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
+                self.a.jcc(Cc::NE, generic);
+                self.a.load(Rcx, M(Rax, LIST_SIZE));
+                self.a.cmp_rm(Rcx, M(Rax, LIST_ALLOCATED));
+                self.a.jcc(Cc::GE, generic);
+                self.a.load(Rdx, M(Rax, LIST_ITEMS));
+                self.a.load(Rsi, vm);
+                self.a.store_idx(Rdx, Rcx, 8, 0, Rsi);
+                self.a.add_ri(Rcx, 1);
+                self.a.store(M(Rax, LIST_SIZE), Rcx);
+                self.a.jmp(done);
+                self.a.bind(generic);
+                self.helper_sp(&ins, d, addr!(h::h_container_op), Some(0), Some(arg as i64), d - 1);
+                self.a.bind(done);
+            }
+            Op::SetAdd | Op::ListExtend | Op::SetUpdate | Op::DictUpdate | Op::DictMerge => {
                 let which = match ins.op {
                     Op::ListAppend => 0,
                     Op::SetAdd => 1,
@@ -810,7 +869,14 @@ impl<'a> Gen<'a> {
                 self.set_lasti(pc);
                 self.lea_sp(Rdi, base);
                 self.a.mov_ri(Rsi, arg as i64);
-                self.call(addr!(super::h_call_py));
+                // (jit6) the machine-code call routine (falls back to h_call_py)
+                let r = super::callpy::routine();
+                if r != 0 {
+                    self.a.mov_rr(Rdx, Rcx);
+                    self.call(r);
+                } else {
+                    self.call(addr!(super::h_call_py));
+                }
                 self.check(pc, base);
                 self.a.jmp(done);
                 self.a.bind(generic);
@@ -1019,6 +1085,32 @@ impl<'a> Gen<'a> {
             self.a.jmp(pushed);
         }
         self.a.bind(generic);
+        if let Some(kind_arg) = self.drain_pattern(ins) {
+            // (jit6) a consumer loop that can drain a fresh generator: the generator
+            // runs in drain mode and hands its values over itself (helpers.rs h_drain)
+            let not_gen = self.a.label();
+            let item = self.a.label();
+            let it = self.slot(d - 1);
+            self.a.load(Rax, it);
+            self.a.mov_ri(Rcx, crate::types::genobject::gen_type() as i64);
+            self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
+            self.a.jcc(Cc::NE, not_gen);
+            self.set_lasti(ins.pc);
+            self.lea_sp(Rdi, d);
+            self.a.mov_rr(Rsi, R13);
+            self.a.mov_ri(Rdx, kind_arg as i64);
+            self.call(addr!(h::h_drain));
+            let err = self.error_label(ins.pc, d);
+            self.a.cmp_ri(Rax, 1);
+            self.a.jcc(Cc::E, t);
+            self.a.jcc(Cc::B, item);
+            self.a.cmp_ri(Rax, 2);
+            self.a.jcc(Cc::E, err);
+            self.a.jmp(not_gen);
+            self.a.bind(item);
+            self.a.jmp(pushed);
+            self.a.bind(not_gen);
+        }
         let noprof = self.a.label();
         self.prof_gate(noprof);
         let p = self.prof_addr(ins.pc);
@@ -1036,6 +1128,36 @@ impl<'a> Gen<'a> {
         self.a.jcc(Cc::E, t);
         self.a.jcc(Cc::A, err);
         self.a.bind(pushed);
+    }
+
+    /// (jit6) Is this ForIter the head of a loop that only collects into a container
+    /// (`ListAppend`/`SetAdd`, then the backedge) or searches like any()/all()
+    /// (`ToBool`, a conditional exit, the backedge)? Some(kind | container distance
+    /// << 8) for `h_drain`.
+    fn drain_pattern(&self, ins: &Instr) -> Option<u64> {
+        use crate::types::genobject::{DRAIN_ALL, DRAIN_ANY, DRAIN_LIST, DRAIN_SET};
+        let i = self.an.index_of[ins.start as usize] as usize;
+        let at = |k: usize| self.an.instrs.get(i + k).copied();
+        let back = |n: Option<Instr>| n.is_some_and(|n| n.op == Op::Jump && n.arg <= n.start && self.an.index_of[n.arg as usize] as usize == i);
+        let n1 = at(1)?;
+        match n1.op {
+            Op::ListAppend | Op::SetAdd if back(at(2)) && n1.arg >= 1 => {
+                let kind = if n1.op == Op::ListAppend { DRAIN_LIST } else { DRAIN_SET };
+                Some(kind | (n1.arg as u64) << 8)
+            }
+            Op::ToBool => {
+                let n2 = at(2)?;
+                if !back(at(3)) {
+                    return None;
+                }
+                match n2.op {
+                    Op::PopJumpIfTrue => Some(DRAIN_ANY),
+                    Op::PopJumpIfFalse => Some(DRAIN_ALL),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     // ------------------------------------------------------------ inline caches
@@ -1595,13 +1717,38 @@ impl<'a> Gen<'a> {
     }
 }
 
+/// (jit6) The routines below exist once per process; every unit binds its routine
+/// labels to a 13-byte `jmp` to them (each unit used to carry its own copies, which
+/// multiplied the instruction-cache footprint of hot code).
+pub(crate) fn emit_routines(a: &mut Asm, box_int: Label, box_float: Label, free_num: Label) {
+    static SHARED: std::sync::OnceLock<Option<[usize; 3]>> = std::sync::OnceLock::new();
+    let shared = SHARED.get_or_init(|| {
+        let mut b = Asm::new();
+        let l = [b.label(), b.label(), b.label()];
+        emit_routines_body(&mut b, l[0], l[1], l[2]);
+        b.resolve().ok()?;
+        let base = super::mem::install(&b.buf, |_, _| {})?;
+        Some([base + b.label_pos(l[0])?, base + b.label_pos(l[1])?, base + b.label_pos(l[2])?])
+    });
+    match shared {
+        Some(s) => {
+            for (l, &t) in [box_int, box_float, free_num].into_iter().zip(s.iter()) {
+                a.bind(l);
+                a.mov_ri(R11, t as i64);
+                a.jmp_r(R11);
+            }
+        }
+        None => emit_routines_body(a, box_int, box_float, free_num),
+    }
+}
+
 /// Shared per-function routines (called with `call`, SysV-like clobbers):
 /// * box_int:   rdi = i64 value -> rax = new int object (small-int cache, inline
 ///              TLAB allocation of 1-digit ints, else the runtime helper)
 /// * box_float: xmm0 = f64 -> rax = new float object
 /// * free_num:  rdi = object whose local refcount just dropped to zero: inline free
 ///              for exact int/float, else the generic path.
-fn emit_routines(a: &mut Asm, box_int: Label, box_float: Label, free_num: Label) {
+fn emit_routines_body(a: &mut Asm, box_int: Label, box_float: Label, free_num: Label) {
     let tl = crate::tlab::jit_layout();
     let tls = tl.tls_offset as i32;
     let heads = tl.heads as i32;
@@ -1716,7 +1863,7 @@ impl<'a> Gen<'a> {
     pub(crate) fn new_embedded(a: Asm, an: &'a Analysis, cd: &'a CodeData, nlp: usize, flags: u32, tables: &'a crate::interp::cache::Tables, ilabel: Vec<Label>, exit: Label) -> Gen<'a> {
         let mut a = a;
         let (rt_box_int, rt_box_float, rt_free_num) = (a.label(), a.label(), a.label());
-        Gen { a, nlp: nlp as i32, an, cd, tables, ilabel, exit, stubs: Vec::new(), rt_box_int, rt_box_float, rt_free_num, flags, no_fuse: true }
+        Gen { a, nlp: nlp as i32, an, cd, tables, ilabel, exit, stubs: Vec::new(), rt_box_int, rt_box_float, rt_free_num, flags, no_fuse: true, drain: false }
     }
     /// Emit the out-of-line stubs and shared routines; resolve labels.
     pub(crate) fn finish(mut self) -> Result<Asm, String> {
@@ -1748,12 +1895,17 @@ impl<'a> Gen<'a> {
 
 /// Compile a code object. Err: not compilable (stays in the interpreter).
 pub fn compile(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crate::interp::cache::Tables) -> Result<Output, String> {
+    compile_mode(cd, nlocalsplus, flags, tables, false)
+}
+
+/// `compile`, optionally in drain mode (jit6, see the YieldValue template).
+pub fn compile_mode(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crate::interp::cache::Tables, drain: bool) -> Result<Output, String> {
     let an = super::analysis::analyze(&cd.code, &cd.exception_table)?;
     let mut a = Asm::new();
     let ilabel: Vec<Label> = (0..an.instrs.len()).map(|_| a.label()).collect();
     let exit = a.label();
     let (rt_box_int, rt_box_float, rt_free_num) = (a.label(), a.label(), a.label());
-    let mut g = Gen { a, nlp: nlocalsplus as i32, an: &an, cd, tables, ilabel, exit, stubs: Vec::new(), rt_box_int, rt_box_float, rt_free_num, flags, no_fuse: false };
+    let mut g = Gen { a, nlp: nlocalsplus as i32, an: &an, cd, tables, ilabel, exit, stubs: Vec::new(), rt_box_int, rt_box_float, rt_free_num, flags, no_fuse: false, drain };
 
     // prologue
     g.a.push(Rbp);

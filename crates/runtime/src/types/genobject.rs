@@ -32,6 +32,10 @@ pub struct GenObject {
     pub finalizer: *mut PyObject,
     /// object being delegated to by yield from/await (borrowed from frame stack)
     pub yieldfrom_hint: *mut PyObject,
+    /// (jit6) while a consumer drains this generator (jit/helpers.rs `h_drain`): the
+    /// container its values go to (borrowed) and the kind of consumer (DRAIN_*)
+    pub drain: *mut PyObject,
+    pub drain_kind: u64,
 }
 
 #[unsafe(no_mangle)]
@@ -203,6 +207,31 @@ fn gen_send_claimed(o: &PyObject, arg: Option<&PyObject>, throw: Option<PyRef>, 
 #[inline]
 pub fn gen_send_fast(o: &PyObject, arg: *mut PyObject) -> PyResult<SendResult> {
     let gn = g(o);
+    // (jit6) suspended in `yield from` another generator: resume the innermost one
+    let fp = gn.frame;
+    if !fp.is_null() && unsafe { (*fp).yield_from_send >= 0 && (*fp).state == FrameState::Suspended } {
+        let ts = crate::threads::current();
+        crate::tlab::ensure_registered();
+        unsafe {
+            if !arg.is_null() {
+                incref(arg);
+            }
+            match jit_send_chain(ts, o.as_ptr(), arg) {
+                Some((st, val)) => {
+                    return match st {
+                        JS_YIELD => Ok(SendResult::Yield(PyRef::from_raw(val))),
+                        JS_RETURN => Ok(SendResult::Return(PyRef::from_raw(val))),
+                        _ => Err(PyErr),
+                    };
+                }
+                None => {
+                    if !arg.is_null() {
+                        decref(arg);
+                    }
+                }
+            }
+        }
+    }
     let argo = || if arg.is_null() { None } else { Some(unsafe { &*arg }) };
     // claim the generator (as gen_send_ex does); a failed claim reports "already
     // executing" through the general path
@@ -251,8 +280,316 @@ pub const JS_SLOW: u32 = 3;
 /// (status, value) is returned: JS_YIELD with the yielded value, JS_RETURN with the
 /// return value (the generator is finished), JS_ERROR with the exception set (also
 /// finished). Anything else returns JS_SLOW without consuming `v`.
+///
+/// (jit6) A generator suspended in `yield from`/`await` of another exact generator
+/// goes through `jit_send_chain`, which resumes the innermost one directly.
 #[inline(always)]
 pub unsafe fn jit_send(ts: &crate::threads::ThreadState, o: *mut PyObject, v: *mut PyObject) -> (u32, *mut PyObject) {
+    unsafe {
+        let fp = (*(o as *mut GenObject)).frame;
+        if !fp.is_null() && (*fp).yield_from_send >= 0 && (*fp).state == FrameState::Suspended {
+            if let Some(r) = jit_send_chain(ts, o, v) {
+                return r;
+            }
+        }
+        jit_send_one(ts, o, v)
+    }
+}
+
+/// Longest chain of pass-through levels `jit_send_chain` links in one go.
+const CHAIN_MAX: usize = 32;
+
+static CHAIN_ENABLED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(2);
+fn chain_enabled() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match CHAIN_ENABLED.load(Relaxed) {
+        2 => {
+            // (off with the JIT: RPYTHON_JIT=0 is the reference semantics)
+            let en = !matches!(std::env::var("RPYTHON_JIT_GENCHAIN").as_deref(), Ok("0")) && crate::interp::jit::enabled();
+            CHAIN_ENABLED.store(en as u32, Relaxed);
+            en
+        }
+        v => v != 0,
+    }
+}
+
+/// (jit6) Resumption of a `yield from`/`await` chain without resuming every level.
+///
+/// When generator G0 is suspended in the send loop of a `yield from` whose receiver
+/// is the exact generator (or coroutine) G1, and G1 likewise on G2, ..., resuming
+/// G0 with `v` only sends `v` on to the innermost Gk: every level in between would
+/// just pass the value down and the yielded value back up, unchanged. So the
+/// levels G0..G(k-1) are made to look as if they were running (claimed, frames and
+/// exception states linked, recursion depth counted, f_lasti at their Send), Gk is
+/// resumed (`jit_send_one`, which may recurse into a new chain), and on a yield the
+/// levels are simply unlinked again. When Gk finishes, the level above it continues
+/// from its Send in the ordinary way (the value replaces the receiver and execution
+/// goes on at the Send's exit; an exception is raised at the Send), and so on upwards.
+/// None: not applicable (nothing consumed or changed).
+#[inline(never)]
+unsafe fn jit_send_chain(ts: &crate::threads::ThreadState, o: *mut PyObject, v: *mut PyObject) -> Option<(u32, *mut PyObject)> {
+    use std::sync::atomic::{AtomicBool, Ordering::*};
+    unsafe {
+        if crate::modules::sys::tracing_active() || !chain_enabled() || !crate::interp::jit::genfast_enabled() {
+            return None;
+        }
+        let depth0 = ts.recursion_depth.get();
+        if crate::interp::stack_pointer() < ts.stack_soft_limit() {
+            return None;
+        }
+        // levels allowed by the recursion limit (the leaf counts one more)
+        let room = (ts.c.py_recursion_limit - depth0 - 1).clamp(0, CHAIN_MAX as i32) as usize;
+        let (gt, ct) = (gen_type(), coro_type());
+        let mt = crate::threads::MULTI_THREADED.load(Relaxed) != 0;
+        let tsm = ts as *const _ as *mut crate::threads::ThreadState;
+        let mut lv: [std::mem::MaybeUninit<*mut GenObject>; CHAIN_MAX] = [std::mem::MaybeUninit::uninit(); CHAIN_MAX];
+        let mut lasti: [std::mem::MaybeUninit<u32>; CHAIN_MAX] = [std::mem::MaybeUninit::uninit(); CHAIN_MAX];
+        // levels whose exception state is linked (only those holding a handled
+        // exception: an empty state in the chain changes nothing sys.exc_info() sees)
+        let mut excmask = 0u32;
+        let mut k = 0usize;
+        let mut g = o as *mut GenObject;
+        // walk, claim and link the pass-through levels in one pass
+        while k < room {
+            let f = (*g).frame;
+            if f.is_null() || (*f).state != FrameState::Suspended || (*f).yield_from_send < 0 || (*f).stack_top <= (*f).nlocalsplus {
+                break;
+            }
+            let recv = *(*f).slots.as_ptr().add((*f).stack_top - 1);
+            let rt = (*recv).type_ptr();
+            if rt != gt && rt != ct {
+                break;
+            }
+            // claim (a plain store while single-threaded, see jit_send_one); a level
+            // that is already running ends the chain (resuming it reports that)
+            let flag = &*(&raw mut (*g).running as *const AtomicBool);
+            if mt {
+                if flag.compare_exchange(false, true, AcqRel, Acquire).is_err() {
+                    break;
+                }
+            } else {
+                if flag.load(Relaxed) {
+                    break;
+                }
+                flag.store(true, Relaxed);
+            }
+            let gn = &mut *g;
+            let f = &mut *f;
+            if !gn.exc_state.exc_value.is_null() {
+                gn.exc_state.previous_item = (*tsm).c.exc_info;
+                (*tsm).c.exc_info = &mut gn.exc_state;
+                excmask |= 1 << k;
+            }
+            f.prev = ts.frame.get();
+            ts.frame.set(f);
+            f.state = FrameState::Executing;
+            lasti[k].write(f.lasti);
+            f.lasti = f.yield_from_send as u32;
+            lv[k].write(g);
+            k += 1;
+            g = recv as *mut GenObject;
+        }
+        if k == 0 {
+            return None;
+        }
+        let lv = |i: usize| lv[i].assume_init();
+        let lasti = |i: usize| lasti[i].assume_init();
+        let leaf = g as *mut PyObject;
+        ts.recursion_depth.set(depth0 + k as i32);
+        let (mut st, mut val) = jit_send_one(ts, leaf, v);
+        if st == JS_SLOW {
+            let r = gen_send_fast(&*leaf, v);
+            if !v.is_null() {
+                decref(v);
+            }
+            (st, val) = match r {
+                Ok(SendResult::Yield(y)) => (JS_YIELD, y.into_raw()),
+                Ok(SendResult::Return(r)) => (JS_RETURN, r.into_raw()),
+                Err(_) => (JS_ERROR, std::ptr::null_mut()),
+            };
+        }
+        // levels still linked as pass-through: 0..level
+        let mut level = k;
+        while st != JS_YIELD && level > 0 {
+            let i = level - 1;
+            let gn = &mut *lv(i);
+            let f = &mut *gn.frame;
+            ts.frame.set(f.prev);
+            f.prev = std::ptr::null_mut();
+            f.lasti = lasti(i);
+            let send_pc = f.yield_from_send as usize;
+            if st == JS_ERROR && exc_matches(exc::StopIteration()) {
+                // (as h_send: a StopIteration from the delegate carries its result)
+                let x = take_exc().unwrap();
+                val = exc::stop_iteration_value(&x).into_raw();
+                st = JS_RETURN;
+            }
+            let throw = if st == JS_RETURN {
+                // the Send finished with `val`: it replaces the receiver and execution
+                // continues at the Send's exit
+                let top = f.stack_top - 1;
+                let recv = std::mem::replace(&mut f.slots[top], val);
+                decref(recv);
+                let d = crate::types::code::code_data(f.code());
+                f.next_instr = bc::decode(d.code[send_pc]).1;
+                None
+            } else {
+                // the delegate raised: the exception comes out of the Send
+                f.next_instr = send_pc as u32 + 1;
+                take_exc()
+            };
+            f.yield_from_send = -1;
+            f.resume = 0;
+            // (running for real now: its exception state is linked like gen_send_claimed's)
+            if excmask & (1 << i) == 0 {
+                gn.exc_state.previous_item = (*tsm).c.exc_info;
+                (*tsm).c.exc_info = &mut gn.exc_state;
+            }
+            let r = eval_frame(ts, f, throw);
+            (st, val) = match r {
+                Ok(Exit::Yield(y)) => (JS_YIELD, y.into_raw()),
+                Ok(Exit::Return(rv)) => (JS_RETURN, rv.into_raw()),
+                Err(_) => (JS_ERROR, std::ptr::null_mut()),
+            };
+            (*tsm).c.exc_info = gn.exc_state.previous_item;
+            gn.exc_state.previous_item = std::ptr::null_mut();
+            ts.recursion_depth.set(ts.recursion_depth.get() - 1);
+            if st != JS_YIELD {
+                f.state = FrameState::Completed;
+                finish(gn);
+            }
+            (*(&raw mut gn.running as *const AtomicBool)).store(false, Release);
+            level = i;
+        }
+        for i in (0..level).rev() {
+            let gn = &mut *lv(i);
+            let f = &mut *gn.frame;
+            ts.frame.set(f.prev);
+            f.prev = std::ptr::null_mut();
+            f.lasti = lasti(i);
+            f.state = FrameState::Suspended;
+            if excmask & (1 << i) != 0 {
+                (*tsm).c.exc_info = gn.exc_state.previous_item;
+                gn.exc_state.previous_item = std::ptr::null_mut();
+            }
+            (*(&raw mut gn.running as *const AtomicBool)).store(false, Release);
+        }
+        ts.recursion_depth.set(depth0);
+        Some((st, val))
+    }
+}
+
+/// Consumers that can drain a generator expression (`GenObject::drain_kind`).
+pub const DRAIN_LIST: u64 = 0;
+pub const DRAIN_SET: u64 = 1;
+pub const DRAIN_ANY: u64 = 2;
+pub const DRAIN_ALL: u64 = 3;
+
+/// (jit6) Run a just-created generator expression `o` in its drain-mode code (entry
+/// address `entry`) for a consumer of kind `kind` collecting into `container`: its
+/// values go straight to the consumer (`h_drain_add`) until it finishes (JS_RETURN),
+/// raises (JS_ERROR), or produces a value the consumer must see itself (JS_YIELD,
+/// an ordinary suspension). JS_SLOW: not applicable, nothing changed.
+pub unsafe fn jit_send_drain(ts: &crate::threads::ThreadState, o: *mut PyObject, container: *mut PyObject, kind: u64, entry: usize) -> (u32, *mut PyObject) {
+    unsafe {
+        let gn = &mut *(o as *mut GenObject);
+        let fp = gn.frame;
+        if fp.is_null() || (*fp).state != FrameState::Created || (*fp).resume == 0 || !gn.drain.is_null() {
+            return (JS_SLOW, std::ptr::null_mut());
+        }
+        let saved = (*fp).resume;
+        (*fp).resume = entry;
+        gn.drain = container;
+        gn.drain_kind = kind;
+        let r = jit_send_one(ts, o, std::ptr::null_mut());
+        gn.drain = std::ptr::null_mut();
+        if r.0 == JS_SLOW {
+            (*fp).resume = saved;
+        }
+        r
+    }
+}
+
+/// (jit6) Drain-mode YieldValue: hand `v` (owned) to the consumer draining the
+/// generator of `frame`. 0: taken (and consumed); 1: the consumer must see it itself
+/// (`v` untouched; the generator suspends normally). Only work that cannot run Python
+/// code is done here, so nothing is evaluated twice.
+pub unsafe extern "C" fn h_drain_add(frame: *mut Frame, v: *mut PyObject) -> u64 {
+    unsafe {
+        let g = (*frame).generator as *mut GenObject;
+        if g.is_null() || (*g).drain.is_null() {
+            return 1;
+        }
+        let c = &*(*g).drain;
+        let vo = &*v;
+        match (*g).drain_kind {
+            DRAIN_LIST => {
+                crate::types::list::append(c, PyRef::from_raw(v));
+                0
+            }
+            DRAIN_SET => {
+                // hashing a str/int/float/tuple of those runs no Python code; anything
+                // else goes through the consumer's own SetAdd
+                if !hash_is_builtin(vo) {
+                    return 1;
+                }
+                match crate::types::set::set_add(c, vo) {
+                    Ok(()) => {
+                        decref(v);
+                        0
+                    }
+                    Err(_) => {
+                        clear_exc();
+                        1
+                    }
+                }
+            }
+            kind @ (DRAIN_ANY | DRAIN_ALL) => {
+                let t = match builtin_truth(vo) {
+                    Some(t) => t,
+                    None => return 1,
+                };
+                // any(): falsy values are skipped; all(): truthy ones
+                if t == (kind == DRAIN_ALL) {
+                    decref(v);
+                    0
+                } else {
+                    1
+                }
+            }
+            _ => 1,
+        }
+    }
+}
+
+fn hash_is_builtin(o: &PyObject) -> bool {
+    let t = o.type_ptr();
+    if t == crate::types::str::str_type() || t == crate::types::int::int_type() || t == crate::types::float::float_type() || o.is(none::none()) || t == crate::types::bool_::bool_type() {
+        return true;
+    }
+    if t == tuple::tuple_type() {
+        return tuple::tuple_items(o).iter().all(|x| hash_is_builtin(x));
+    }
+    false
+}
+
+fn builtin_truth(o: &PyObject) -> Option<bool> {
+    let t = o.type_ptr();
+    if o.is(none::none()) {
+        return Some(false);
+    }
+    if t == crate::types::bool_::bool_type() {
+        return Some(o.is(crate::types::bool_::true_obj()));
+    }
+    if t == crate::types::int::int_type() || t == crate::types::str::str_type() || t == tuple::tuple_type() || t == crate::types::list::list_type() || t == crate::types::float::float_type() {
+        return crate::abstract_::is_true(o).ok();
+    }
+    None
+}
+
+/// One level of `jit_send` (the jit5 lean path).
+#[inline(always)]
+unsafe fn jit_send_one(ts: &crate::threads::ThreadState, o: *mut PyObject, v: *mut PyObject) -> (u32, *mut PyObject) {
     use crate::interp::jit::tier1::ST_YIELD;
     unsafe {
         let gn = &mut *(o as *mut GenObject);
@@ -438,6 +775,11 @@ fn finish(gn: &mut GenObject) {
 
 /// Send for `Send` opcode / yield from: handles generators natively and other iterators.
 pub fn send_to(recv: &PyObject, v: &PyObject) -> PyResult<SendResult> {
+    // (jit6) `async for` / `await anext(..)`: the asend object's result comes back as
+    // a value, not as a StopIteration exception object
+    if recv.type_ptr() == (&raw mut crate::types::asyncgen::ASEND_TYPE) {
+        return crate::types::asyncgen::asend_send_result(recv, v);
+    }
     if is_generator_exact(recv) || is_coroutine_exact(recv) {
         return match gen_send_fast(recv, v.as_ptr()) {
             Ok(r) => Ok(r),

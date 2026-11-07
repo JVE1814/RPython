@@ -131,6 +131,7 @@ pub fn register_all() {
     crate::import::register_builtin("array", array::init_module);
     crate::import::register_builtin("_datetime", _datetime::init_module);
     crate::import::register_builtin("_tracemalloc", _tracemalloc::init_module);
+    crate::subinterp::module::register(); // (interp1) _interpreters, _interpqueues, _interpchannels
     crate::import::register_builtin("_csv", _csv::init_module);
     crate::import::register_builtin("_multiprocessing", _multiprocessing::init);
     crate::import::register_builtin("_testinternalcapi", testinternalcapi::init);

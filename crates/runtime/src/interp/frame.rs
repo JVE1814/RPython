@@ -75,7 +75,9 @@ fn borrows_globals(func: Option<&PyObject>, globals: &PyObject, builtins: &PyObj
     }
 }
 
+/// (u8 with fixed discriminants: compiled code stores it, jit/callpy.rs)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
 pub enum FrameState {
     Created,
     Executing,
@@ -105,7 +107,7 @@ impl Frame {
     #[inline]
     pub unsafe fn new_call_raw(code: *mut PyObject, func: *mut PyObject, globals: *mut PyObject, builtins: *mut PyObject, nlp: usize, total: usize) -> Box<Frame> {
         unsafe {
-            match (*(&raw mut POOL)).pop() {
+            match pool_pop() {
                 Some(mut f) => {
                     if f.slots.capacity() < total {
                         f.slots.reserve(total - f.slots.len());
@@ -189,7 +191,7 @@ impl Frame {
         let cd = crate::types::code::code(code);
         let nlp = cd.obj.co_nlocalsplus as usize;
         let total = nlp + cd.obj.co_stacksize as usize + 1;
-        if let Some(mut f) = unsafe { (*(&raw mut POOL)).pop() } {
+        if let Some(mut f) = pool_pop() {
             unsafe { f.slots.set_len(0) };
             f.slots.resize(total, std::ptr::null_mut());
             f.code = code.to_ref().into_raw();
@@ -370,11 +372,84 @@ impl Drop for Frame {
     }
 }
 
-/// Per-thread pool of released frames (plain `#[thread_local]`: no lazy-init check
-/// or RefCell on the call path). Drained by `drain_pool` when the thread exits.
+/// Per-thread pool of released frames: an intrusive list linked through `Frame::prev`
+/// (plain `#[thread_local]`: no lazy-init check or RefCell on the call path; jit6:
+/// compiled code pops and pushes frames itself, at `pool_tls_offset()` from the
+/// thread pointer). Drained by `drain_pool` when the thread exits.
+#[repr(C)]
+pub struct FramePool {
+    pub head: *mut Frame,
+    pub count: usize,
+}
 #[thread_local]
-static mut POOL: Vec<Box<Frame>> = Vec::new();
-const POOL_MAX: usize = 128;
+static mut POOL: FramePool = FramePool { head: std::ptr::null_mut(), count: 0 };
+pub const POOL_MAX: usize = 128;
+
+#[inline(always)]
+fn pool_pop() -> Option<Box<Frame>> {
+    unsafe {
+        let p = &mut *(&raw mut POOL);
+        let f = p.head;
+        if f.is_null() {
+            return None;
+        }
+        p.head = (*f).prev;
+        p.count -= 1;
+        (*f).prev = std::ptr::null_mut();
+        Some(Box::from_raw(f))
+    }
+}
+
+/// Push a released, reset frame (dropped when the pool is full).
+#[inline(always)]
+fn pool_push(f: Box<Frame>) {
+    unsafe {
+        let p = &mut *(&raw mut POOL);
+        if p.count < POOL_MAX {
+            let f = Box::into_raw(f);
+            (*f).prev = p.head;
+            p.head = f;
+            p.count += 1;
+        }
+    }
+}
+
+/// Where compiled code finds the pool: its address minus the thread pointer (the same
+/// for every thread: static TLS of the executable, like `tlab::jit_layout`).
+pub fn pool_tls_offset() -> isize {
+    (&raw const POOL) as isize - crate::object::thread_id() as isize
+}
+
+/// (jit6) Byte offsets of a `Vec<*mut PyObject>`'s (pointer, capacity, length) words,
+/// probed at run time (the layout of `Vec` is not specified); None if the probe is
+/// ambiguous (compiled code then leaves frame slot vectors alone).
+pub fn vec_layout() -> Option<(i32, i32, i32)> {
+    if std::mem::size_of::<Vec<*mut PyObject>>() != 24 {
+        return None;
+    }
+    let mut v: Vec<*mut PyObject> = Vec::with_capacity(13);
+    for _ in 0..5 {
+        v.push(std::ptr::null_mut());
+    }
+    let (p, c, l) = (v.as_ptr() as usize, v.capacity(), v.len());
+    let words: [usize; 3] = unsafe { std::mem::transmute_copy(&v) };
+    let find = |x: usize| -> Option<i32> {
+        let mut r = None;
+        for (i, &w) in words.iter().enumerate() {
+            if w == x {
+                if r.is_some() {
+                    return None;
+                }
+                r = Some(8 * i as i32);
+            }
+        }
+        r
+    };
+    let r = (find(p), find(c), find(l));
+    drop(v);
+    let (p, c, l) = (r.0?, r.1?, r.2?);
+    if p == c || p == l || c == l { None } else { Some((p, c, l)) }
+}
 
 /// Return a finished frame to the per-thread pool.
 #[inline]
@@ -383,13 +458,8 @@ pub fn recycle(mut f: Box<Frame>) {
     if f.slots.capacity() > 4096 {
         return;
     }
-    unsafe {
-        let pool = &mut *(&raw mut POOL);
-        if pool.len() < POOL_MAX {
-            f.reset();
-            pool.push(f);
-        }
-    }
+    f.reset();
+    pool_push(f);
 }
 
 /// Recycle a `new_call` frame whose activation returned normally in compiled code:
@@ -425,17 +495,13 @@ pub fn recycle_call(mut f: Box<Frame>) {
         if f.slots.capacity() > 4096 {
             return;
         }
-        let pool = &mut *(&raw mut POOL);
-        if pool.len() < POOL_MAX {
-            pool.push(f);
-        }
+        pool_push(f);
     }
 }
 
 /// Free the calling thread's pooled frames (thread exit).
 pub fn drain_pool() {
-    unsafe {
-        let pool = std::mem::take(&mut *(&raw mut POOL));
-        drop(pool);
+    while let Some(f) = pool_pop() {
+        drop(f);
     }
 }

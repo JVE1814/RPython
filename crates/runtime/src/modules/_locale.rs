@@ -86,7 +86,7 @@ const LANGINFO: &[(&str, NlItem)] = &[
 const ERA: NlItem = 0x2002C;
 const ALT_DIGITS: NlItem = 0x2002F;
 
-static ERROR: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
+static ERROR: crate::subinterp::InterpPtr = crate::subinterp::InterpPtr::new(); // (interp1) per interpreter
 
 fn locale_error(msg: &str) -> PyErr {
     let p = ERROR.load(Ordering::Acquire);

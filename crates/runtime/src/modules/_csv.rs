@@ -24,8 +24,8 @@ const CR: u32 = '\r' as u32;
 const LF: u32 = '\n' as u32;
 const SPACE: u32 = ' ' as u32;
 
-static ERROR: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
-static REGISTRY: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
+static ERROR: crate::subinterp::InterpPtr = crate::subinterp::InterpPtr::new(); // (interp1) per interpreter
+static REGISTRY: crate::subinterp::InterpPtr = crate::subinterp::InterpPtr::new(); // (interp1) per interpreter
 static FIELD_LIMIT: AtomicIsize = AtomicIsize::new(128 * 1024);
 
 static mut DIALECT_TYPE: PyTypeObject = PyTypeObject::ZERO;

@@ -331,3 +331,25 @@ try:
     print(use_half([1, 2, None]))
 except TypeError as e:
     print("TypeError", [f.name for f in traceback.extract_tb(e.__traceback__)])
+
+# (jit6) truth of an unboxed int inside an inlined callee
+class TB:
+    def __init__(self, x):
+        self.x = x
+    def m(self, y):
+        if y:
+            return self.x
+        return -y
+    def n(self, y):
+        return not y
+
+def tb_loop(n):
+    c = TB(3)
+    s = 0
+    for i in range(-5, n):
+        s += c.m(i) + c.n(i)
+    return s
+
+for _ in range(30):
+    r = tb_loop(200)
+print('tb', r)

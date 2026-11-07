@@ -14,9 +14,24 @@ use crate::types::{dict, int, list, none, str as pystr, tuple};
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
-static FILTERS: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
-static ONCEREGISTRY: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
-static DEFAULTACTION: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
+/// (interp1) filters, onceregistry and defaultaction exist once per interpreter.
+struct WarnState {
+    filters: AtomicPtr<PyObject>,
+    onceregistry: AtomicPtr<PyObject>,
+    defaultaction: AtomicPtr<PyObject>,
+}
+impl Drop for WarnState {
+    fn drop(&mut self) {
+        for p in [&self.filters, &self.onceregistry, &self.defaultaction] {
+            unsafe { crate::object::xdecref(p.swap(std::ptr::null_mut(), Ordering::AcqRel)) };
+        }
+    }
+}
+static WSTATE: crate::subinterp::PerInterp<WarnState> = crate::subinterp::PerInterp::new(|| WarnState {
+    filters: AtomicPtr::new(std::ptr::null_mut()),
+    onceregistry: AtomicPtr::new(std::ptr::null_mut()),
+    defaultaction: AtomicPtr::new(std::ptr::null_mut()),
+});
 static FILTERS_VERSION: AtomicU64 = AtomicU64::new(1);
 
 // ---------------------------------------------------------------- the lock
@@ -79,7 +94,7 @@ fn state_obj(p: &AtomicPtr<PyObject>) -> PyRef {
 }
 
 fn init_state() {
-    if !FILTERS.load(Ordering::Acquire).is_null() {
+    if !WSTATE.get().filters.load(Ordering::Acquire).is_null() {
         return;
     }
     let filters = list::new_list_empty();
@@ -99,9 +114,9 @@ fn init_state() {
     list::append(&filters, mk("ignore", crate::exc_type!(PendingDeprecationWarning), None));
     list::append(&filters, mk("ignore", crate::exc_type!(ImportWarning), None));
     list::append(&filters, mk("ignore", crate::exc_type!(ResourceWarning), None));
-    FILTERS.store(filters.into_raw(), Ordering::Release);
-    ONCEREGISTRY.store(dict::new_dict().into_raw(), Ordering::Release);
-    DEFAULTACTION.store(pystr::new_str("default").into_raw(), Ordering::Release);
+    WSTATE.get().filters.store(filters.into_raw(), Ordering::Release);
+    WSTATE.get().onceregistry.store(dict::new_dict().into_raw(), Ordering::Release);
+    WSTATE.get().defaultaction.store(pystr::new_str("default").into_raw(), Ordering::Release);
 }
 
 fn warnings_module(try_import: bool) -> Option<PyRef> {
@@ -144,13 +159,13 @@ fn get_filters() -> PyResult {
             return Ok(f);
         }
     }
-    Ok(state_obj(&FILTERS))
+    Ok(state_obj(&WSTATE.get().filters))
 }
 
 fn get_onceregistry() -> PyResult {
     let r = match warnings_attr("onceregistry", false)? {
         Some(r) => r,
-        None => state_obj(&ONCEREGISTRY),
+        None => state_obj(&WSTATE.get().onceregistry),
     };
     if !dict::is_dict(&r) {
         raise!(TypeError, "warnings.onceregistry must be a dict, not '{}'", crate::types::typeobject::tname(&r));
@@ -161,7 +176,7 @@ fn get_onceregistry() -> PyResult {
 fn get_default_action() -> PyResult {
     let r = match warnings_attr("defaultaction", false)? {
         Some(r) => r,
-        None => state_obj(&DEFAULTACTION),
+        None => state_obj(&WSTATE.get().defaultaction),
     };
     if !pystr::is_str(&r) {
         raise!(TypeError, "warnings.defaultaction must be a string, not '{}'", crate::types::typeobject::tname(&r));
@@ -721,9 +736,9 @@ pub fn init_module() -> PyResult {
         ("_release_lock", NOARGS, py_release_lock),
     ];
     crate::builtins::add_methods_to_dict(&d, methods, Some(&m))?;
-    dict::set_item_str(&d, "filters", &state_obj(&FILTERS))?;
-    dict::set_item_str(&d, "_onceregistry", &state_obj(&ONCEREGISTRY))?;
-    dict::set_item_str(&d, "_defaultaction", &state_obj(&DEFAULTACTION))?;
+    dict::set_item_str(&d, "filters", &state_obj(&WSTATE.get().filters))?;
+    dict::set_item_str(&d, "_onceregistry", &state_obj(&WSTATE.get().onceregistry))?;
+    dict::set_item_str(&d, "_defaultaction", &state_obj(&WSTATE.get().defaultaction))?;
     // A ContextVar holding the warnings context (used when
     // sys.flags.context_aware_warnings is set), if contextvars is available.
     match crate::import::import_absolute("_contextvars") {

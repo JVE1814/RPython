@@ -151,6 +151,8 @@ pub fn debug_level() -> u8 {
 }
 /// deoptimisations after which code is discarded
 const DEOPT_LIMIT: u32 = 64;
+/// (jit6) deoptimisations at one pc after which code is discarded
+const TRAP_LIMIT: u32 = 8;
 /// compilations per code object
 const MAX_TRIES: u8 = 4;
 
@@ -613,11 +615,39 @@ pub fn note_deopt(cc: &CodeCaches, f: &crate::interp::frame::Frame) {
         let cd = crate::types::code::code_data(f.code());
         eprintln!("[jit] tier2 deopt {} -> pc {}", crate::types::str::to_string_lossy(&cd.co_qualname), f.next_instr);
     }
+    // (jit6) per-pc trap counts: a guard that keeps failing (a site that turned
+    // polymorphic after compilation) discards the code early; the recompilation
+    // takes the generic path at that pc (build.rs `cautious_at`)
+    let pc = f.next_instr;
+    let cdx = crate::types::code::code_data(f.code());
+    // (only attribute sites count: their recompilation can avoid the guard)
+    let speculative = cdx.code.get(pc as usize).is_some_and(|&w| {
+        use rpy_compiler::bytecode::Op;
+        matches!(
+            rpy_compiler::bytecode::decode(w).0,
+            Op::LoadAttr | Op::LoadMethod | Op::StoreAttr
+        )
+    });
+    let hot_trap = speculative && {
+        let mut t = cc.traps.lock().unwrap_or_else(|e| e.into_inner());
+        match t.iter_mut().find(|e| e.0 == pc) {
+            Some(e) => {
+                e.1 = e.1.saturating_add(1);
+                e.1 == TRAP_LIMIT
+            }
+            None => {
+                if t.len() < 64 {
+                    t.push((pc, 1));
+                }
+                false
+            }
+        }
+    };
     for p in [&cc.opt, &cc.osr] {
         let o = p.load(Acquire);
         if !o.is_null() {
             let n = unsafe { (*o).deopts.load(Relaxed) };
-            if n > DEOPT_LIMIT {
+            if n > DEOPT_LIMIT || hot_trap {
                 if DEBUG.load(Relaxed) != 0 {
                     eprintln!("[jit] tier2 code discarded after {} deopts", n);
                 }

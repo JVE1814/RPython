@@ -1249,11 +1249,35 @@ fn restore_all(a: &mut Asm) {
     }
 }
 
+/// (jit6) One process-wide copy of the routines below; units bind their labels to a
+/// `jmp` there (r11 is free at every entry, see the register contract).
+fn emit_routines(a: &mut Asm, box_int: Label, box_float: Label, dshared: Label, mzero: Label) {
+    static SHARED: std::sync::OnceLock<Option<[usize; 4]>> = std::sync::OnceLock::new();
+    let shared = SHARED.get_or_init(|| {
+        let mut b = Asm::new();
+        let l = [b.label(), b.label(), b.label(), b.label()];
+        emit_routines_body(&mut b, l[0], l[1], l[2], l[3]);
+        b.resolve().ok()?;
+        let base = crate::interp::jit::mem::install(&b.buf, |_, _| {})?;
+        Some([base + b.label_pos(l[0])?, base + b.label_pos(l[1])?, base + b.label_pos(l[2])?, base + b.label_pos(l[3])?])
+    });
+    match shared {
+        Some(s) => {
+            for (l, &t) in [box_int, box_float, dshared, mzero].into_iter().zip(s.iter()) {
+                a.bind(l);
+                a.mov_ri(R11, t as i64);
+                a.jmp_r(R11);
+            }
+        }
+        None => emit_routines_body(a, box_int, box_float, dshared, mzero),
+    }
+}
+
 /// Shared tier-2 routines (all preserve every register except rax, r10, r11):
 /// * box_int:  rax = i64 -> rax = int object
 /// * box_float: xmm0 = f64 -> rax = float object
 /// * decref_shared / merge_zero: rax = object
-fn emit_routines(a: &mut Asm, box_int: Label, box_float: Label, dshared: Label, mzero: Label) {
+fn emit_routines_body(a: &mut Asm, box_int: Label, box_float: Label, dshared: Label, mzero: Label) {
     let tl = crate::tlab::jit_layout();
     let tls = tl.tls_offset as i32;
     let heads = tl.heads as i32;

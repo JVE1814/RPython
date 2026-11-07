@@ -672,7 +672,7 @@ fn sys_getfilesystemencodeerrors(_m: &PyObject) -> PyResult {
     Ok(pystr::new_str("surrogateescape"))
 }
 fn sys_is_gil_enabled(_m: &PyObject) -> PyResult {
-    Ok(bool_::new_bool(false))
+    Ok(bool_::new_bool(crate::subinterp::gil_enabled())) // (interp1)
 }
 fn sys_settrace(_m: &PyObject, f: &PyObject) -> PyResult {
     crate::modules::sys_trace_api::settrace(f)
@@ -795,6 +795,10 @@ fn thread_frames_and_excs(want_exc: bool) -> PyResult {
     for t in threads {
         let ts = unsafe { &*(t as *const crate::threads::ThreadState) };
         if !crate::threads::is_live(ts) {
+            continue;
+        }
+        // (interp1) only the threads of the calling interpreter
+        if !std::ptr::eq(crate::subinterp::of_ts(ts), crate::subinterp::current()) {
             continue;
         }
         let key = int::new_int_u128(ts.c.thread_id as u128);
