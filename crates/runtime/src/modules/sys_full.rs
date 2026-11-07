@@ -392,7 +392,7 @@ fn sys_getrefcount(_m: &PyObject, o: &PyObject) -> PyResult {
     // Our value stack owns that reference: when a fast local of the calling frame
     // holds the object, that is where the argument came from, and the count leaves
     // it out. pandas' chained-assignment detection compares these counts.
-    if n > 1 && caller_local_holds(o) {
+    if n > 1 && !o.is_immortal() && caller_local_holds(o) {
         n -= 1;
         // CPython also moves the arguments of a Python-to-Python call from the
         // caller's value stack into the callee's frame. Ours copies them: while

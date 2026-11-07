@@ -63,13 +63,24 @@ the binary of a snapshot/venv; the pandas parts skip without pandas).
 13. **tokenize**: `tokenize._tokenize` exists; TokenizerIter runs each next() under the
     object lock; without extra tokens ENDMARKER is at (last line, -1) with that line's text.
 
+14. **sys.getrefcount and CPython 3.14+ reference ownership** (sys_full.rs): pandas detects
+    chained assignment by comparing `sys.getrefcount(self)` with CPython's counts (2 in
+    `__setitem__` of a temporary, 1 in a method of a temporary). CPython loads a local
+    argument borrowed (LOAD_FAST_BORROW) and moves a Python call's arguments from the
+    caller's stack into the callee frame; our interpreter owns/copies them. getrefcount now
+    leaves out (a) the argument's own stack reference when a fast local of the calling frame
+    holds the object, and then (b) the parent frame's call operand when that frame is
+    executing CALL/CALL_KW with the object on its value stack. Results match CPython for
+    named/temporary objects in setitem, methods, plain arguments (also with the JIT on);
+    spec test_list.test_list_overwrite_local passes now. This is an emulation in
+    getrefcount only (Py_REFCNT from C still sees the real count); the real fix would be
+    borrowed stack references + argument stealing in the interpreter/JIT.
+15. **csv.Sniffer**: only ASCII characters are delimiter candidates (a lone "�" line is
+    "Could not determine delimiter"); when no punctuation qualifies, letters/digits are
+    tried, the highest character winning a tie ("aob" splits at "o").
+16. `'x' in obj` without __contains__/__iter__: the message names tp_name.
+
 ## Left (root causes known)
-* Chained-assignment detection (~31 pandas tests: indexing/test_chaining_and_caching,
-  copy_view/test_chained_assignment_deprecation, ...): pandas compares `sys.getrefcount(self)`
-  with CPython 3.14+'s counts (2 in `__setitem__` of a temporary, 1 in a method of a
-  temporary). Our counts are one/two higher: the interpreter increfs call arguments into the
-  callee frame instead of moving them, and `getrefcount`'s own argument is an owned reference
-  (CPython: LOAD_FAST_BORROW). Needs stack-ownership work in the interpreter/JIT.
 * xz presets (3 tests, io/test_compression::test_xz_compression_level_read): our LZMA encoder
   has no price-based optimal parser, so presets 1..9 give the same size on pickled frames.
 * test_capi.test_watchers: type/function/code/context watchers still do not fire (28).
