@@ -97,6 +97,9 @@ os, subprocess. Largest failure counts: importlib 20, call 17, inspect 15, dict 
 Run 11: no crashes, no timeouts. The jump in failures is test_capi (433), which timed out in run 10 and now finishes in 89 s
 (capi2 is on it). Excluding it: 241 failures (225 in run 10; test_asyncio, cmd_line_script, multiprocessing_*, os were
 also timeouts before). Top remaining: importlib 20, call 17, inspect 15 (both 0 after core6), asyncio 10, dict 8.
+Errors (tests that raise; regrtest's total line omits them, run_tests.sh now records them in column 7): run 9 411,
+run 10 484, run 11 616. Largest in run 11: builtin 163, capi 110, inspect 102, fileutils 35, stable_abi_ctypes 34, codecs 31,
+crossinterp 30. Baseline (free-threaded CPython, tools/baseline_ft_results.tsv): 416 PASS / 18 FAIL, 24 failures.
 Run 10: no crashes. Timeouts = asyncio, capi, cmd_line_script, multiprocessing_fork/forkserver/spawn, os, subprocess
 (all fixed by hang1 since: each now finishes in 8–130 s). test_free_threading runs to completion (6 behavioural failures).
 Run 3 top blockers: array (39 modules), http (21), urllib (12), multiprocessing (11),
