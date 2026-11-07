@@ -1409,6 +1409,9 @@ unsafe extern "C" fn set_iter(o: *mut PyObject) -> *mut PyObject {
     unsafe { into_c(new_set_iter(&*o)) }
 }
 fn setiter_next_rs(o: &PyObject) -> PyResult<Option<PyRef>> {
+    // An iterator shared by several threads: without this, one thread can drop the
+    // exhausted set (and clear `set`) while another is still scanning its table.
+    let _g = crate::objlock::lock_held(o);
     let it = unsafe { &mut *(o.as_ptr() as *mut SetIter) };
     if it.set.is_null() {
         return Ok(None);

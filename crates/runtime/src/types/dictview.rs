@@ -380,6 +380,8 @@ fn finish(it: &mut DictIter) {
 }
 
 fn iter_next_rs(o: &PyObject) -> PyResult<Option<PyRef>> {
+    // shared between threads: one thread may drop the exhausted dict while another reads it
+    let _g = crate::objlock::lock_held(o);
     let it = unsafe { &mut *(o.as_ptr() as *mut DictIter) };
     if it.dict.is_null() {
         return Ok(None);
