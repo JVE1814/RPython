@@ -284,11 +284,16 @@ pub fn instance_dict(o: &PyObject) -> Option<PyRef> {
         if slot.is_null() {
             return None;
         }
-        if (*slot).is_null() {
-            let d = dict::new_dict();
-            *slot = d.into_raw();
+        // create it with a CAS: threads setting the first attribute concurrently must
+        // all end up in the same dict (a plain store lost the other threads' items)
+        let a = std::sync::atomic::AtomicPtr::from_ptr(slot);
+        if a.load(std::sync::atomic::Ordering::Acquire).is_null() {
+            let d = dict::new_dict().into_raw();
+            if a.compare_exchange(std::ptr::null_mut(), d, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire).is_err() {
+                decref(d);
+            }
         }
-        Some(PyRef::from_borrowed(*slot))
+        Some(PyRef::from_borrowed(a.load(std::sync::atomic::Ordering::Acquire)))
     }
 }
 

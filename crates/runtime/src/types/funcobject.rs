@@ -216,10 +216,13 @@ unsafe extern "C" fn func_descr_get(f: *mut PyObject, obj: *mut PyObject, _tp: *
 fn opt(p: *mut PyObject) -> PyResult {
     unsafe { Ok(if p.is_null() { none::none_ref() } else { PyRef::from_borrowed(p) }) }
 }
+/// Replace a function attribute. Getters on other threads take a new reference to
+/// the field without a lock, so the old value is released through QSBR (two threads
+/// assigning f.__dict__ also no longer drop the same old value twice: the swap is
+/// atomic).
 fn replace(slot: &mut *mut PyObject, v: Option<&PyObject>) {
-    let old = *slot;
-    *slot = v.map_or(std::ptr::null_mut(), |x| x.to_ref().into_raw());
-    unsafe { xdecref(old) };
+    let new = v.map_or(std::ptr::null_mut(), |x| x.to_ref().into_raw());
+    unsafe { crate::qsbr::swap_field(slot as *mut *mut PyObject, new) };
 }
 
 fn f_code(o: &PyObject) -> PyResult {
@@ -331,10 +334,14 @@ fn f_set_module(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
 }
 fn f_dict(o: &PyObject) -> PyResult {
     let f = func(o);
-    if f.func_dict.is_null() {
-        f.func_dict = dict::new_dict().into_raw();
+    let slot = unsafe { std::sync::atomic::AtomicPtr::from_ptr(&raw mut f.func_dict) };
+    if slot.load(std::sync::atomic::Ordering::Acquire).is_null() {
+        let d = dict::new_dict().into_raw();
+        if slot.compare_exchange(std::ptr::null_mut(), d, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire).is_err() {
+            unsafe { decref(d) }; // created concurrently by another thread
+        }
     }
-    opt(f.func_dict)
+    opt(slot.load(std::sync::atomic::Ordering::Acquire))
 }
 fn f_set_dict(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     match v {
