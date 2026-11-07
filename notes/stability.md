@@ -262,3 +262,29 @@ type_refcount_drift, deque_race, weakref_race, shared_objects, join_releases).
   test_ssl, test_subprocess/test_cmd_line_script timeouts.
 * Remaining Rust-state objects without locking (not seen crashing): ElementTree, pyexpat
   parsers, curses/tkinter objects, _pickle Pickler/Unpickler, _json scanners.
+
+## stability2, follow-up round
+* **test_free_threading.test_io heap corruption** (3/6 runs on snap11): the merge of master
+  into this branch resolved a conflict in io/bytesio.rs by taking master's whole file, which
+  dropped BytesIO's `lock_self_methods` and its iterator lock. Restored. Also: the
+  `_BytesIOBuffer` export/release procs run under the BytesIO's lock (they unshare storage
+  and count exports), and IncrementalNewlineDecoder methods are locked. 10/10 runs pass.
+  New stress test: bytesio_race.py.
+* **test_super abort:** `__class__` assignment read the old type, stored the new one and
+  released the old one; two threads assigning at once both released the same type (the
+  other one never). Now an atomic swap releases exactly the replaced type, through QSBR
+  (a concurrent `type(o)` may still be taking a reference). Stress: class_swap_race.py (does
+  not reproduce the old failure reliably; the race was found by reading the code).
+* **objlock deadlock avoidance:** a thread that finds an entry taken by another thread first
+  gives up the suspendable entries it holds and then takes them back together with the new
+  one in address order (`objlock::lock`). `objlock::lock_held` entries (METH_LOCKSELF_HELD /
+  `lock_self_methods_held`, and `locked_slot!`) are never given up; they are used for every
+  object whose Rust state is borrowed across Python calls (buffered/text/String/BytesIO,
+  itertools, array, OrderedDict, csv, dbm, bz2/lzma, mmap, ElementTree, pyexpat, pickle).
+  Suspendable: deque, lru_cache, heapq (state re-read after every Python call).
+  tools/stress/objlock_order.py (two deques searched in opposite orders through `__eq__`)
+  times out on the previous build and passes now. A cycle made only of held entries can
+  still deadlock.
+* **Newly locked:** ElementTree Element (methods, sequence/mapping slots, child and tree
+  iterators), TreeBuilder, XMLParser; pyexpat xmlparser; Pickler/Unpickler. json scanners
+  were left alone: since perf3 the key memo is per call, and encoders are created per call.
