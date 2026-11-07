@@ -98,7 +98,7 @@ fn run_handlers() -> PyResult<()> {
     let we = WAKEUP_ERRNO.swap(0, Relaxed);
     if we != 0 {
         let _ = crate::types::exceptions::os_error_from_errno(we, None, None);
-        crate::modules::sys_full::write_unraisable(Some("Exception ignored when trying to write to the signal wakeup fd"), None);
+        crate::modules::sys_full::write_unraisable(Some("Exception ignored while trying to write to the signal wakeup fd"), None);
     }
     let frame = || -> PyRef {
         let f = crate::interp::current_frame_ptr();
@@ -156,6 +156,13 @@ pub fn set_interrupt(signum: i32) -> PyResult<()> {
     let h = unsafe { &*h };
     if int::is_int(h) {
         return Ok(()); // SIG_IGN / SIG_DFL
+    }
+    if crate::modules::sys_full::is_finalizing() {
+        // the Python-level handlers are going away with the interpreter: CPython finds
+        // the handler gone when it would run it and reports that
+        let _ = crate::err!(OSError, "Signal {} ignored due to race condition", signum);
+        crate::modules::sys_full::write_unraisable(None, None);
+        return Ok(());
     }
     trip(signum);
     Ok(())
