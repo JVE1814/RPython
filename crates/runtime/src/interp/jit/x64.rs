@@ -791,40 +791,54 @@ impl Asm {
             return;
         }
         let save = |cc: u8| if cc == JMP_OP { 3usize } else { 4 };
-        let mut short = vec![false; n];
-        let mut cum = vec![0usize; n + 1];
         // candidates: (jump index, index of the first jump at or after the target), only
         // jumps that could come within reach if every jump in between shrank (most jumps
         // to the out-of-line stubs at the end cannot)
-        let mut cand: Vec<(usize, usize)> = Vec::new();
+        let mut short = vec![false; n];
+        let mut unsure: Vec<(usize, usize)> = Vec::new();
         for i in 0..n {
-            let (p, l, _) = self.relax[i];
+            let (p, l, cc) = self.relax[i];
             let Some(t) = self.labels[l.0 as usize] else { continue };
+            // fits even if no other jump shrinks: short for good (the common case, skips
+            // over a few instructions)
+            let own = if t > p { save(cc) } else { 0 };
+            let rel0 = (t - own) as isize - (p as isize + 2);
+            if (-128..=127).contains(&rel0) {
+                short[i] = true;
+                continue;
+            }
+            // a jump in between saves at most 4 of its 5-6 bytes: beyond 5 x the reach
+            // nothing can bring the target close enough (most jumps to the stubs)
+            if t.abs_diff(p) > 5 * 136 {
+                continue;
+            }
             let k = self.relax.partition_point(|r| r.0 < t);
             let between = if k > i { k - i - 1 } else { i - k };
             if t.abs_diff(p) <= 127 + 6 + 4 * between {
-                cand.push((i, k));
+                unsure.push((i, k));
+                short[i] = true;
             }
         }
+        // optimistic start (every candidate short), then lengthen the unsure ones out of
+        // reach until none is: lengthening only moves targets away, so this ends, and the
+        // last pass checked every unsure short jump against the final layout (the sure
+        // ones fit in any layout)
+        let mut cum = vec![0usize; n + 1];
         loop {
             for i in 0..n {
                 cum[i + 1] = cum[i] + if short[i] { save(self.relax[i].2) } else { 0 };
             }
             let mut changed = false;
-            for &(i, k) in &cand {
-                if short[i] {
+            for &(i, k) in &unsure {
+                if !short[i] {
                     continue;
                 }
-                let (p, l, cc) = self.relax[i];
+                let (p, l, _) = self.relax[i];
                 let t = self.labels[l.0 as usize].unwrap();
-                let newp = p - cum[i];
-                let mut newt = t - cum[k];
-                if t > p {
-                    newt -= save(cc);
-                }
-                let rel = newt as isize - (newp as isize + 2);
-                if (-128..=127).contains(&rel) {
-                    short[i] = true;
+                // (cum[k] includes this jump's own saving when the target is after it)
+                let rel = (t - cum[k]) as isize - ((p - cum[i]) as isize + 2);
+                if !(-128..=127).contains(&rel) {
+                    short[i] = false;
                     changed = true;
                 }
             }
@@ -872,8 +886,24 @@ impl Asm {
                 self.labels[i] = Some(self.map_pos(p));
             }
         }
+        // fixups are in code order: one merged walk over them, `dropped` and `moved`
         let fixups = std::mem::take(&mut self.fixups);
-        self.fixups = fixups.into_iter().filter(|f| dropped.binary_search(&f.0).is_err()).map(|(at, l)| (self.map_pos(at), l)).collect();
+        let mut kept = Vec::with_capacity(fixups.len());
+        let (mut di, mut mi, mut shift) = (0usize, 0usize, 0usize);
+        for (at, l) in fixups {
+            while di < dropped.len() && dropped[di] < at {
+                di += 1;
+            }
+            if di < dropped.len() && dropped[di] == at {
+                continue;
+            }
+            while mi < self.moved.len() && self.moved[mi].0 < at {
+                shift = self.moved[mi].1;
+                mi += 1;
+            }
+            kept.push((at - shift, l));
+        }
+        self.fixups = kept;
         let abs = std::mem::take(&mut self.abs_fixups);
         self.abs_fixups = abs.into_iter().map(|(at, l)| (self.map_pos(at), l)).collect();
         let sh = std::mem::take(&mut self.short_fixups);
