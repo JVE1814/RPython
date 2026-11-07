@@ -1,7 +1,7 @@
 # PROGRESS
 
 ## Status 2026-11-07 (day 7, afternoon)
-Master 24d1c6a: core6, perf4, tail1, capi2, cleanroom1+2 (20 Lib modules rewritten clean-room), scale1 (multi-core scaling), tail2 (re.DEBUG, _zoneinfo, ssl PSK, alloc-failure injection, 22 modules), perf5, stability3 (test_free_threading passes), scale2 checkpoint (concurrent_futures + multiprocessing pass), pdb1 (clean-room pdb: test_pdb, test_remote_pdb pass), tail3 (crossinterp, getpath, nturl2path, ast, multiprocessing, httpservers, asyncio 10→2), cleanroom3, scale2 merged today; suite run 14 running; suite run 13: 396/434 pass or whole-module skip; suite run 12: 367/434 modules pass, 129 failures, 70 errors. Smoke on snap19: test_capi 40 failures (was 433 in run 11),
+Master 24d1c6a: core6, perf4, tail1, capi2, cleanroom1+2 (20 Lib modules rewritten clean-room), scale1 (multi-core scaling), tail2 (re.DEBUG, _zoneinfo, ssl PSK, alloc-failure injection, 22 modules), perf5, stability3 (test_free_threading passes), scale2 checkpoint (concurrent_futures + multiprocessing pass), pdb1 (clean-room pdb: test_pdb, test_remote_pdb pass), tail3 (crossinterp, getpath, nturl2path, ast, multiprocessing, httpservers, asyncio 10→2), cleanroom3, scale2 merged today; suite run 14: 417/434 pass or whole-module skip, 10 modules fail that pass on CPython, fewer skips than CPython; suite run 13: 396/434 pass or whole-module skip; suite run 12: 367/434 modules pass, 129 failures, 70 errors. Smoke on snap19: test_capi 40 failures (was 433 in run 11),
 stable_abi_ctypes/fileutils pass, cmd_line_script 1; tail1 fixed ~60 long-tail modules (inspect, codecs, time,
 path modules, math, buffer, logging, json, ...). Run 11 (pre-merges):
 294/434 modules pass, 674 failures (241 without test_capi), 616 errors. Baseline free-threaded CPython: 416/434.
@@ -92,6 +92,7 @@ Ours (tools/run_tests.sh, 434 modules):
 | 11 | 9af79cb (hang1, pre-wheels2/core6) | 294 | 140 | 0 | 0 | 49,781 | 674 (241 excl. test_capi) | 3,200 |
 | 12 | f66b390 (core6+perf4+tail1+capi2) | 367 | 67 | 0 | 0 | 49,880 | 129 (+70 errors) | 3,202 |
 | 13 | 0a2f1fa (tail2+cleanroom2+scale1, pre-perf5/stability3) | 360 (+36 whole-module skips) | 37 | 0 | 1 | 50,095 | 111 (+68 errors) | 3,190 |
+| 14 | bcb91fa (tail3+pdb1+stability3+scale2 ckpt) | 381 (+36 whole-module skips) | 17 | 0 | 0 | 50,644 | 75 (+36 errors) | 3,224 |
 Run 7 (pre-core4): crashes = test_capi (segfault after a lone-surrogate print), test_free_threading
 (deque race, test_collections), test_itertools (flaky; passes now), test_multiprocessing_fork/spawn
 (heap corruption in test_manager); timeouts = asyncio, cmd_line_script, os, subprocess. Largest
@@ -103,6 +104,9 @@ subprocess. Largest failure counts: importlib 20, call 17, inspect 15, dict 8, c
 Run 9: crashes = test_free_threading (io heap corruption), test_functools (lru_cache race; fixed since), test_super
 (__class__ assignment race), test_multiprocessing_fork/forkserver/spawn; timeouts = asyncio, capi, cmd_line_script,
 os, subprocess. Largest failure counts: importlib 20, call 17, inspect 15, dict 8, concurrent_futures 7.
+Run 14: 417/434 pass or whole-module skip (baseline 416 incl. its own whole-module skips). Only 10 modules fail that pass
+on CPython: capi 40+13E, asyncio 2, gc 2, descr 1+1E, dict 1, opcache 1, repl 1, sys 1+1E, sys_settrace 1E,
+thread_local_bytecode 1. Skipped tests: 3,224 vs the baseline's 3,371 (fewer than CPython). Baseline failures: 24.
 Run 13: 396/434 pass or skip as a whole module (D28 now labels whole-module skips SKIP; the baseline's 416 counts them
 as PASS). 31 modules fail that pass on CPython: capi 40+13E, asyncio 10, concurrent_futures 9 (fixed since by
 stability3: 2), crossinterp 30E, import 3 (new: builtins missing in teardown), multiprocessing_* 2 each (1 since), ast 2,
