@@ -317,7 +317,8 @@ pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
     // instructions without a line number (artificial cleanup code) never start a line
     let line = crate::types::code::frame_line(f.code(), lasti as usize).map_or(-1, |l| l as i32);
     // A line event fires on the first instruction of a line (entered by falling
-    // through or by a jump, including a backward jump to the same line); never on
+    // through or by a jump; a backward jump within one line counts only when it lands
+    // on the first instruction of that line); never on
     // RESUME (the `def` line) and not when resuming in the middle of a line.
     let op = crate::types::code::code_data(f.code()).code.get(lasti as usize).map(|w| (w & 0xff) as u8);
     let is_resume = op == Some(rpy_compiler::bytecode::Op::Resume as u8);
@@ -325,7 +326,7 @@ pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
     let jumped = prev != u32::MAX && lasti != prev.wrapping_add(1);
     let new_line = line >= 0
         && !is_resume
-        && ((start && (line != f.trace_line || (jumped && lasti <= prev))) || (jumped && (line != f.trace_line || lasti <= prev)));
+        && ((start && (line != f.trace_line || (jumped && lasti <= prev))) || (jumped && line != f.trace_line));
     if MON_ANY.load(Relaxed) & (1 << LINE) != 0 && line >= 0 && !is_resume {
         // sys.monitoring LINE: at line starts, at jump targets on another line than the
         // jump, and at exception handlers entered with a line number
@@ -657,6 +658,24 @@ pub fn async_for_exit(ts: &ThreadState, f: &mut Frame, next: usize) -> PyResult<
 #[inline]
 pub fn wants(ev: usize) -> bool {
     MON_ANY.load(Relaxed) & (1 << ev) != 0
+}
+
+/// Does the frame's legacy trace function (sys.settrace) want 'exception' events?
+pub fn wants_legacy_exception(ts: &ThreadState, f: &Frame) -> bool {
+    ts.tracing_depth.get() == 0 && !ts.trace_func.get().is_null() && !f.f_trace.is_null()
+}
+
+/// Report `exc` to the frame's legacy trace function as an 'exception' event.
+pub fn legacy_exception_event(ts: &ThreadState, f: &mut Frame, exc: &PyObject) -> PyResult<()> {
+    if !wants_legacy_exception(ts, f) {
+        return Ok(());
+    }
+    let t = crate::types::typeobject::type_ref(exc.type_ptr());
+    let arg = tuple::new_tuple(vec![t, exc.to_ref(), none::none_ref()]);
+    let ftr = unsafe { PyRef::from_borrowed(f.f_trace) };
+    let r = call_trace(ts, ftr.as_ptr(), f, "exception", &arg)?;
+    set_f_trace(f, r);
+    Ok(())
 }
 
 /// A generator or coroutine driven by FOR_ITER / SEND finished (no exception is raised
