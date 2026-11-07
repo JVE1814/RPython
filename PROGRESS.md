@@ -79,6 +79,7 @@ Ours (tools/run_tests.sh, 434 modules):
 | 6 | cd9478e | 259 | 158 | 13 | 4 | 39,273 | 660 | 2,377 |
 | 7 | c8fda7a | 268 | 157 | 5 | 4 | 42,747 | 542 | 2,539 |
 | 8 | 0b5f6a0 (jit5+core5, pre-lib6) | 280 | 144 | 3 | 7 | 42,339 | 275 | 2,485 |
+| 9 | 433df5d (jit6+interp1, pre-stability2) | 288 | 135 | 6 | 5 | 42,388 | 224 | 2,486 |
 Run 7 (pre-core4): crashes = test_capi (segfault after a lone-surrogate print), test_free_threading
 (deque race, test_collections), test_itertools (flaky; passes now), test_multiprocessing_fork/spawn
 (heap corruption in test_manager); timeouts = asyncio, cmd_line_script, os, subprocess. Largest
@@ -87,6 +88,9 @@ cmd_line 28, call 17, inspect 15, lazy_import 13, descr 13, compile 12, tracebac
 Run 8: crashes = test_free_threading (deque race), test_itertools (count race; fixed by lib6 since),
 test_multiprocessing_fork; timeouts = asyncio, capi, cmd_line_script, multiprocessing_forkserver/spawn, os,
 subprocess. Largest failure counts: importlib 20, call 17, inspect 15, dict 8, concurrent_futures 7.
+Run 9: crashes = test_free_threading (io heap corruption), test_functools (lru_cache race; fixed since), test_super
+(__class__ assignment race), test_multiprocessing_fork/forkserver/spawn; timeouts = asyncio, capi, cmd_line_script,
+os, subprocess. Largest failure counts: importlib 20, call 17, inspect 15, dict 8, concurrent_futures 7.
 Run 3 top blockers: array (39 modules), http (21), urllib (12), multiprocessing (11),
 importlib.resources (11), datetime (11), concurrent (9), xml/email (7 each), html (6).
 Run 1 top blockers: py_compile (230 modules; merged since), unittest.mock (57), doctest (24),
