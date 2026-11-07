@@ -310,6 +310,24 @@ pub fn yieldfrom(o: &PyObject) -> Option<PyRef> {
     None
 }
 
+/// Run `f` with the delegating generator's frame on the thread's frame stack (it is the
+/// caller of whatever its `yield from` delegates to).
+fn with_frame_on_stack<R>(o: &PyObject, f: impl FnOnce() -> R) -> R {
+    let ts = crate::threads::current();
+    let gf = g(o).frame;
+    let saved = ts.frame.get();
+    if !gf.is_null() {
+        unsafe { (*gf).prev = saved };
+        ts.frame.set(gf);
+    }
+    let r = f();
+    ts.frame.set(saved);
+    if !gf.is_null() {
+        unsafe { (*gf).prev = std::ptr::null_mut() };
+    }
+    r
+}
+
 pub fn gen_throw_impl(o: &PyObject, typ: &PyObject, val: Option<&PyObject>, tb: Option<&PyObject>, close_on_genexit: bool) -> PyResult {
     // delegate to sub-iterator first
     if let Some(yf) = yieldfrom(o) {
@@ -325,19 +343,7 @@ pub fn gen_throw_impl(o: &PyObject, typ: &PyObject, val: Option<&PyObject>, tb: 
         }
         let r = if is_any_gen(&yf) {
             g(o).running = true;
-            // the delegating generator's frame is the caller of the sub-generator
-            let ts = crate::threads::current();
-            let gf = g(o).frame;
-            let saved = ts.frame.get();
-            if !gf.is_null() {
-                unsafe { (*gf).prev = saved };
-                ts.frame.set(gf);
-            }
-            let r = gen_throw_impl(&yf, typ, val, tb, close_on_genexit);
-            ts.frame.set(saved);
-            if !gf.is_null() {
-                unsafe { (*gf).prev = std::ptr::null_mut() };
-            }
+            let r = with_frame_on_stack(o, || gen_throw_impl(&yf, typ, val, tb, close_on_genexit));
             g(o).running = false;
             r
         } else {
@@ -355,7 +361,7 @@ pub fn gen_throw_impl(o: &PyObject, typ: &PyObject, val: Option<&PyObject>, tb: 
                         }
                         args.push(t);
                     }
-                    let r = ab::call(&m, &args);
+                    let r = with_frame_on_stack(o, || ab::call(&m, &args));
                     g(o).running = false;
                     r
                 }

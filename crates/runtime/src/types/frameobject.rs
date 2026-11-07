@@ -216,9 +216,10 @@ fn f_lasti(o: &PyObject) -> PyResult {
 fn f_back(o: &PyObject) -> PyResult {
     let f = need(o)?;
     if f.prev.is_null() {
-        // a finished frame remembers its caller; a suspended one has none
+        // a finished function frame remembers its caller; a suspended or finished
+        // generator frame has none
         let fo = unsafe { &*(o.as_ptr() as *const PyFrameObject) };
-        if !fo._f_back.is_null() && f.state == crate::interp::frame::FrameState::Completed {
+        if !fo._f_back.is_null() && f.state == crate::interp::frame::FrameState::Completed && f.generator.is_null() {
             return Ok(unsafe { PyRef::from_borrowed(fo._f_back) });
         }
         return Ok(none::none_ref());
