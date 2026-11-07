@@ -125,6 +125,13 @@ def run(n, kind):
             isinstance(i, str)
             id(l)
             l.copy()
+    elif kind == 'counter':
+        import collections
+        words = [[bytes([b]) for b in b'abcdefghij']] * (n // 9 + 1)
+        stats = collections.Counter()
+        for piece in words:
+            for pair in zip(piece[:-1], piece[1:]):
+                stats[pair] += 1
     elif kind == 'exc':
         for i in range(n):
             catcher(i)

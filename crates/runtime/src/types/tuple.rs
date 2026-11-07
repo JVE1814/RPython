@@ -224,6 +224,11 @@ pub unsafe extern "C" fn tuple_dealloc(op: *mut PyObject) {
             xdecref(*base.add(i));
         }
         let tp = (*op).type_ptr();
+        if tp == tuple_type() {
+            // (perf4) exact tuple: static type with the generic free
+            crate::alloc::free_object(op);
+            return;
+        }
         crate::types::typeobject::generic_free_and_type_decref(op, tp);
     }
 }

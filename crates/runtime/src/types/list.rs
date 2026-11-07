@@ -617,6 +617,11 @@ pub unsafe extern "C" fn list_dealloc(op: *mut PyObject) {
         (*l).ob_base.ob_size = 0;
         release_array(arr, n, false);
         let tp = (*op).type_ptr();
+        if tp == list_type() {
+            // (perf4) exact list: static type with the generic free
+            crate::alloc::free_object(op);
+            return;
+        }
         crate::types::typeobject::generic_free_and_type_decref(op, tp);
     }
 }
