@@ -777,6 +777,200 @@ yaml.
   could drop the per-call kind/class computation (`c % NCLASSES` for the zeroing size)
   and keep slow paths out of line.
 
+## jit6 workstream (call path in machine code, generator chains/draining, code size)
+
+Branch `worktree-agent-a736ee13a861bb2b0` (master 0b5f6a0 + jit6 commits).
+
+### Calls
+* `jit/callpy.rs`: one process-wide machine-code routine replaces `h_call_py` +
+  `run_call_frame` + `recycle_call` for compiled `Call` sites (tier 1, and tier 2 through
+  the embedded template) whose callee has a fast entry: frame popped from the per-thread
+  pool (frame.rs `POOL` is now an intrusive `#[thread_local]` list reached via r15 like the
+  TLAB caches; the `Vec` layout of `Frame::slots` is probed at run time, `vec_layout`),
+  arguments moved, `__defaults__` filled, recursion/stack/tracing checks, tier-2 countdown,
+  entry through the shared trampoline, and on a plain return: release of the slots (inline
+  int/float free), frame back to the pool, result into the caller's slot. Deopt/exception,
+  frame objects, empty pool etc. take the Rust paths (`h_call_py`, `h_callpy_finish`,
+  `h_callpy_recycle`). `RPYTHON_JIT_CALLPY=0` disables it. Method call micro (`c.m(i)`,
+  not inlinable): 770 -> 563 instructions/iteration; with defaults 1013 -> 797.
+* Tier-2 ToBool/UnaryNot of an unboxed int needs no template: callees testing an int
+  argument are inlined again (`c.m(i)` loop 563 -> 113).
+* Boxing/release routines exist once per process (units jump to them).
+
+### Generators
+* `yield from`/`await` chains (genobject.rs `jit_send_chain`): resuming a generator that is
+  suspended in the send loop of another exact generator/coroutine resumes the innermost one
+  directly; the pass-through levels are claimed and linked (frames, f_lasti at their Send,
+  exception states that hold an exception, recursion depth) but not executed. When the
+  innermost one finishes, the level above continues from its Send (value replaces the
+  receiver, or the exception is raised at the Send) through `eval_frame`. Used by compiled
+  ForIter/Send and by `gen_send_fast`. `RPYTHON_JIT_GENCHAIN=0` disables; off with
+  RPYTHON_JIT=0. Depth-16 chain: 195 -> 96 ns/item; generators 351.8 -> 278.5 M/loop.
+* Drain mode (tier1.rs `drain_pattern`, YieldValue template, helpers.rs `h_drain`,
+  genobject.rs `jit_send_drain`/`h_drain_add`): a ForIter heading a loop that only collects
+  (`ListAppend`/`SetAdd` + backedge, i.e. CPython 3.15's inlined list()/set()/tuple() of a
+  genexpr and comprehensions over generators) or searches (`ToBool` + conditional exit:
+  any()/all()) runs a not-yet-started generator in a second tier-1 compilation of its code
+  whose YieldValue hands the value to the consumer (list append; set add when hashing runs
+  no Python code; any/all skip builtin values of the wrong truth) and continues; any value
+  the consumer must see itself is an ordinary suspension (resume = 0, so later resumptions
+  use the normal code). No generator materialisation is needed: the generator object exists
+  all along. `RPYTHON_JIT_DRAIN=0` disables. `set(c + k for c in cols)` (8 items):
+  10305 -> 8748 instructions; nqueens 1040 -> 951 M/loop.
+* async generators (runtime, flagged): `send_to` on an asend object returns the yielded
+  value instead of raising StopIteration (`asyncgen::asend_send_result`); completed
+  asend/athrow objects skip the finalizer protocol. async_generators 6.68G -> 4.45G/loop.
+
+### Code size / other
+* Tier 2: `UnpackSequence n` followed by >= 4 `StoreFast` to frame locals is one call to
+  `h2_unpack_store` (bm_unpack_sequence's function: 713 KB -> 138 KB of tier-2 code; it was
+  instruction-fetch bound: 0.11 M instructions/loop vs CPython's 0.25 but 1.5x the time).
+* Tier 1: ListAppend inline while the list has room.
+* Per-pc tier-2 trap counts (`CodeCaches::traps`): an attribute site that deoptimises 8 times
+  discards the unit; its recompilation uses the generic path at that site only (was: 64
+  deopts, then every monomorphic site of the unit generic). deltablue 2x65 -> 2x8 deopts.
+* Runtime (flagged): tuple comparison without per-item closures/refcounting; tuple
+  subclasses (namedtuples) cache their hash (all allocation paths start at -1). mdp wall
+  1.86 -> 1.62 s.
+* Valgrind: freed code blocks are not reused under valgrind (code written through the other
+  mapping into a block valgrind had translated ran stale translations: callgrind crashed in
+  async_generators and other long runs; jit5's numbers there were affected).
+  `RPYTHON_JIT_NOREUSE=1` forces it.
+* Fixes requested by core5: `load_attr_hit`/`load_method` hold the descriptor across the
+  instance-dict probe (use-after-free, test_vicious_descriptor_nonsense); members stored
+  after a tuple subclass's items (or with negative offsets) are never cached as inline slot
+  offsets.
+* Free threading: MULTI_THREADED set by a self-registering thread (PyGILState_Ensure from a
+  foreign thread) now makes the first attach do a safepoint handshake with all other threads
+  (`threads::MT_HANDSHAKE`, `gc::handshake_safepoint`), closing the window in which a thread
+  could still be inside a single-threaded fast path (jit5's open race).
+
+### Measurements
+Steady-state instructions per loop (millions, perloop.sh, same windows as jit3-jit5; binary =
+jit6 before the ToBool commit). CPython columns from the jit3 table.
+
+| bench | CPython default | CPython ft | jit5 | jit6 | ratio |
+|---|---|---|---|---|---|
+| richards | 461.1 | 565.8 | 282.8-322.6 | 301.6 | 0.65 |
+| nbody | 1107.5 | 1401.5 | 359.8 | 365.7 | 0.33 |
+| spectral_norm | 1207.8 | 1403.9 | 643.5 | 611.5 | 0.51 |
+| float | 778.4 | 870.1 | 702.9 | 658.9 | 0.85 |
+| richards_super | 530.4 | 639.0 | 454.0 | 394.5 | 0.74 |
+| chaos | 610.7 | 682.6 | 408.0 | 398.9 | 0.65 |
+| raytrace | 2757.1 | 3200.8 | 2704.8 | 2535.9 | 0.92 |
+| go | 1138.4 | 1259.6 | 1173-1244 | 1101.3 | 0.97 |
+| generators | 337.1 | 372.4 | 351.8 | 279.5 | 0.83 |
+| coroutines | 294.4 | 299.9 | 281.6 | 285.0 | 0.97 |
+| nqueens | 841.8 | 942.5 | 1043.7 | 949.4 | 1.13 |
+| deltablue | 29.1 | 42.4 | 23.1-34.4 | 20.4-31.2 | 0.70-1.07 |
+| hexiom | 58.1 | 65.7 | 53.8 | 53.1 | 0.91 |
+| fannkuch | 4392.7 | 4962.9 | 3849.2 | 3859.6 | 0.88 |
+| unpack_sequence | 0.25 | 0.15 | 0.11 | 0.20 | 1.33 (wall 0.99: smaller code) |
+| comprehensions | 0.19 | 0.24 | 0.18-0.24 | 0.23 | 1.21 |
+
+(async_generators, mdp, meteor_contest could not be measured by jit5 under callgrind, see
+the valgrind item above; async_generators now 4.45 G/loop.)
+
+Wall clock (s/loop, run_bench.sh shim, ours / py-default / py-ft back to back on core 3).
+Targeted runs at load ~4 during development (ratio = ours / best CPython; "jit5" = the
+same harness at the start of jit6, binary = jit5 head):
+
+| bench | jit5 | jit6 |
+|---|---|---|
+| generators | 1.49 | 0.94-1.11 |
+| async_generators | 1.98 | 1.34-1.38 |
+| mdp | 1.95 | 1.62 (ours 1.86 -> 1.62 s) |
+| comprehensions | 1.62 | 1.38 |
+| nqueens | 1.38 | 1.30 |
+| unpack_sequence | 1.50 | 0.99 |
+| go | 1.21 | 1.12 |
+| fannkuch | 1.08 | 1.09 |
+| barnes_hut | 1.25 | 1.00 |
+| deltablue | 1.00 | 0.95-1.10 |
+| hexiom | 1.02 | 0.84 |
+| richards | 0.76 | 0.61 |
+| raytrace | - | 0.95 |
+| chaos | - | 0.80 |
+
+Full suite (all benchmarks back to back, load average 6-7 from other agents: every number,
+baselines included, ~2x slower than on a quiet machine; indicative only, D22):
+
+| bench | ours | CPython default | CPython ft | ratio |
+|---|---|---|---|---|
+| async_generators | 0.466884 | 0.300619 | 0.367917 | 1.55 |
+| asyncio_tcp | 2.88378 | 0.673696 | 0.669116 | 4.31 |
+| barnes_hut | 0.73614 | 1.37374 | 1.45255 | 0.54 |
+| base64 | 0.00102255 | 0.000430091 | 0.000435427 | 2.38 |
+| bpe_tokeniser | 10.846 | 6.86655 | 6.05737 | 1.79 |
+| chaos | 0.0623853 | 0.0767399 | 0.0869108 | 0.81 |
+| comprehensions | 3.12925e-05 | 2.09154e-05 | 2.32494e-05 | 1.50 |
+| concurrent_imap | 0.0757767 | 0.0412037 | 0.0691436 | 1.84 |
+| coroutines | 0.0300957 | 0.0298001 | 0.030148 | 1.01 |
+| decimal_pi | 0.43306 | 9.98948 | 10.961 | 0.04 |
+| deepcopy | 0.000370903 | 0.000209401 | 0.000233607 | 1.77 |
+| deltablue | 0.00247146 | 0.00223747 | 0.00284362 | 1.10 |
+| fannkuch | 0.289322 | 0.309124 | 0.357697 | 0.94 |
+| float | 0.0495928 | 0.0578585 | 0.0555729 | 0.89 |
+| gc_collect | 0.00074997 | 0.00124066 | 0.00088343 | 0.85 |
+| gc_traversal | 0.00330798 | 0.0028154 | 0.00111107 | 2.98 |
+| generators | 0.0236681 | 0.0213546 | 0.0246967 | 1.11 |
+| go | 0.0961099 | 0.0790627 | 0.0917053 | 1.22 |
+| hexiom | 0.00388013 | 0.00390246 | 0.00450825 | 0.99 |
+| json_dumps | 0.0126857 | 0.00624576 | 0.00712758 | 2.03 |
+| json_loads | 2.43509e-05 | 1.59475e-05 | 1.95397e-05 | 1.53 |
+| logging | 8.08218e-06 | 4.22406e-06 | 5.16378e-06 | 1.91 |
+| mdp | 1.99083 | 1.04474 | 1.11469 | 1.91 |
+| meteor_contest | 0.139978 | 0.08019 | 0.0976302 | 1.75 |
+| nbody | 0.0279932 | 0.0546973 | 0.0770503 | 0.51 |
+| nqueens | 0.0700816 | 0.0528353 | 0.0679892 | 1.33 |
+| pathlib | 0.0204869 | 0.00932866 | 0.0114206 | 2.20 |
+| pidigits | 0.0828641 | 0.194365 | 0.179306 | 0.46 |
+| pprint | 0.894564 | 0.593653 | 0.546107 | 1.64 |
+| pyflate | 0.334143 | 0.3009 | 0.365709 | 1.11 |
+| python_startup | 0.0144118 | 0.00971017 | 0.0119734 | 1.48 |
+| raytrace | 0.269996 | 0.245754 | 0.28848 | 1.10 |
+| regex_compile | 0.017041 | 0.118563 | 0.153799 | 0.14 |
+| regex_dna | 0.119753 | 0.198982 | 0.208177 | 0.60 |
+| regex_effbot | 0.00139291 | 0.00276939 | 0.00320424 | 0.50 |
+| regex_v8 | 0.0160081 | 0.0312951 | 0.0299508 | 0.53 |
+| richards | 0.0202084 | 0.033013 | 0.0413528 | 0.61 |
+| richards_super | 0.0324517 | 0.0362846 | 0.049356 | 0.89 |
+| scimark | 0.228647 | 0.22154 | 0.287809 | 1.03 |
+| spectral_norm | 0.0464822 | 0.0677577 | 0.0769551 | 0.69 |
+| sqlite_synth | 2.60691e-06 | 1.67211e-06 | 1.57124e-06 | 1.66 |
+| telco | 0.00877254 | 0.129321 | 0.142104 | 0.07 |
+| typing_runtime_protocols | 0.000403219 | 0.000177749 | 0.000198018 | 2.27 |
+| unpack_sequence | 4.22776e-08 | 4.13367e-08 | 4.6158e-08 | 1.02 |
+| xml_etree | 0.216867 | 0.115561 | 0.1103 | 1.97 |
+
+(asyncio_tcp's 4.3 and barnes_hut's 0.54 are load artefacts of this run: 2.5 / 1.0 in quieter
+targeted runs.)
+
+### Open items (measured causes)
+* meteor_contest (~2x): set operations snapshot every item with a reference
+  (`set::items_with_hash`, 25% of its instructions) - runtime, not JIT.
+* mdp (~1.6x): tuple-keyed dicts (dict find + deep tuple compares), allocation; call path
+  through the generic binder for keyword calls (`h_call` -> `call_function`).
+* async_generators (~1.35x): one asend object and one wrapped value allocated per level per
+  step (CPython keeps freelists), plus the generic Send path per level.
+* comprehensions/nqueens: generator expression creation (function + generator + frame,
+  ~700 instructions) per genexpr; full fusion of the genexpr body into the consumer loop
+  (tier 2, with generator materialisation on deopt) would remove it.
+* IPC: our code still has I1 misses where CPython has none (comprehensions: 460 vs 0 per
+  loop in cachegrind); Rust helpers are large. Code size is now a first-class concern.
+* deltablue steady state is bimodal between processes (20 or 31 M/loop, same binary).
+* Generator resume from compiled ForIter/Send still goes through Rust (`h_for_iter` ->
+  `jit_send_one` -> trampoline, ~300 instructions/item for a plain generator).
+
+### Testing
+New differential tests: t_genchain.py (chains, send/throw/close, exceptions through levels,
+f_back/gi_running from the leaf, sys.exc_info, coroutine chains), t_drain.py (list/set/tuple/
+any/all of genexprs, side-effect order, unhashable items, custom __bool__/__hash__, errors
+mid-way), t_unpack.py (fused unpacking: swaps, wrong lengths, __del__ of old values,
+first binding, lists), t_inline.py (int truth in inlined callees). run.sh passes in all six
+configurations; smoke.sh (14 modules) gives identical results with the JIT off, default and
+tier 2 forced.
+
 ## Missing / next steps (previous jit workstream)
 * Tier 2 (optimising JIT): SSA from bytecode plus profiles, type speculation with guards
   and deopt by materialising the frame (the frame layout is already shared), unboxed

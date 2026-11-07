@@ -189,7 +189,9 @@ unsafe fn member_offset(descr: &PyObject, tp: *mut PyTypeObject, for_store: bool
         if tc != Py_T_OBJECT_EX && tc != Py_T_OBJECT {
             return None;
         }
-        if (*m).flags & Py_AUDIT_READ != 0 || (for_store && (*m).flags & Py_READONLY != 0) {
+        // (jit6) members stored after a tuple subclass's items have no fixed offset
+        // (negative `offset`, descr::member_addr): never cached as an inline offset
+        if (*m).flags & (Py_AUDIT_READ | crate::types::descr::RPY_MEMBER_AFTER_ITEMS) != 0 || (*m).offset < 0 || (for_store && (*m).flags & Py_READONLY != 0) {
             return None;
         }
         // the descriptor must belong to a base of tp (it does if lookup found it, but be strict)
@@ -234,13 +236,14 @@ fn load_attr_hit(o: &PyObject, nm: &PyObject, e: &Entry) -> Option<PyResult<PyRe
             if cache::type_tag(tp) as u64 != s.a {
                 return None;
             }
+            // (jit6) the instance-dict probe can run Python code (`__eq__` of a key
+            // with the same hash) that deletes the class attribute: the descriptor is
+            // held across the probe and that one is bound
+            let keep = if s.c != 0 { Some(unsafe { PyRef::from_borrowed(s.c as *mut PyObject) }) } else { None };
             if let Some(v) = instance_get_hinted(o, nm, s.b, e) {
                 return Some(Ok(unsafe { PyRef::from_borrowed(v) }));
             }
-            if s.c != 0 {
-                return Some(bind(s.c as *mut PyObject, o));
-            }
-            None
+            keep.map(|d| bind(d.as_ptr(), o))
         }
         kind::SLOT => {
             if cache::type_tag(tp) as u64 != s.a {
@@ -273,10 +276,12 @@ fn load_attr_hit(o: &PyObject, nm: &PyObject, e: &Entry) -> Option<PyResult<PyRe
             if cache::type_tag(tp) as u64 != s.a {
                 return None;
             }
+            // (jit6) held across the probe (see INSTANCE_DICT)
+            let keep = unsafe { PyRef::from_borrowed(s.c as *mut PyObject) };
             if let Some(v) = instance_get_hinted(o, nm, u64::MAX, e) {
                 return Some(Ok(unsafe { PyRef::from_borrowed(v) }));
             }
-            Some(bind(s.c as *mut PyObject, o))
+            Some(bind(keep.as_ptr(), o))
         }
         kind::MODULE => {
             if !o.is_type(module::module_type()) {
@@ -454,10 +459,12 @@ pub fn load_method(o: &PyObject, nm: &PyObject, es: &[Entry]) -> PyResult<(PyRef
                 }
                 kind::METHOD_SHADOWABLE => {
                     if cache::type_tag(tp) as u64 == s.a {
+                        // (jit6) held across the probe (see load_attr_hit)
+                        let keep = unsafe { PyRef::from_borrowed(s.c as *mut PyObject) };
                         if let Some(v) = instance_get_hinted(o, nm, u64::MAX, e) {
                             return Ok((unsafe { PyRef::from_borrowed(v) }, None));
                         }
-                        return Ok((unsafe { PyRef::from_borrowed(s.c as *mut PyObject) }, Some(o.to_ref())));
+                        return Ok((keep, Some(o.to_ref())));
                     }
                 }
                 kind::EMPTY => {}

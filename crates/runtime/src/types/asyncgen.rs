@@ -282,6 +282,48 @@ fn asend_send(o: &PyObject, arg: Option<&PyObject>) -> PyResult {
     }
     r
 }
+/// (jit6, flagged: used by genobject::send_to for `await`/`async for` on an asend
+/// object) `asend_send` with the outcome as a SendResult: a value the async generator
+/// yielded is Return(value) instead of a StopIteration exception object (one fewer
+/// exception allocation per `async for` step per level).
+pub fn asend_send_result(o: &PyObject, arg: &PyObject) -> PyResult<SendResult> {
+    let agen = agen_of(o);
+    let st = state(o);
+    if st == STATE_CLOSED {
+        raise!(RuntimeError, "cannot reuse already awaited __anext__()/asend()");
+    }
+    let mut arg = arg.to_ref();
+    if st == STATE_INIT {
+        if g(&agen).running_async {
+            set_state(o, STATE_CLOSED);
+            raise!(RuntimeError, "anext(): asynchronous generator is already running");
+        }
+        if arg.is(none::none()) {
+            if let Some(a) = field_ref(o, A_ARG) {
+                arg = a;
+            }
+        }
+        set_state(o, STATE_ITER);
+    }
+    g(&agen).running_async = true;
+    let r = gobj::gen_send_ex(&agen, Some(&arg), None, false);
+    if let Ok(SendResult::Yield(v)) = &r {
+        if is_wrapped(v) {
+            let inner = field_ref(v, 0).unwrap_or_else(none::none_ref);
+            g(&agen).running_async = false;
+            set_state(o, STATE_CLOSED);
+            return Ok(SendResult::Return(inner));
+        }
+    }
+    let r = unwrap_value(&agen, r);
+    match r {
+        Ok(v) => Ok(SendResult::Yield(v)),
+        Err(e) => {
+            set_state(o, STATE_CLOSED);
+            Err(e)
+        }
+    }
+}
 fn asend_send_m(o: &PyObject, v: &PyObject) -> PyResult {
     asend_send(o, Some(v))
 }
@@ -484,6 +526,18 @@ unsafe extern "C" fn self_iter(o: *mut PyObject) -> *mut PyObject {
 }
 
 /// tp_finalize of asend/athrow: warn about never-awaited awaitables.
+/// (jit6, flagged) An asend/athrow that already completed has nothing to finalize:
+/// skip the finalizer protocol on dealloc (one per `async for` step per level).
+unsafe extern "C" fn awaitable_dealloc(o: *mut PyObject) {
+    unsafe {
+        if state(&*o) == STATE_CLOSED {
+            lu::ptrs_dealloc_unfinalized(o);
+        } else {
+            lu::ptrs_dealloc(o);
+        }
+    }
+}
+
 unsafe extern "C" fn awaitable_finalize(o: *mut PyObject) {
     unsafe {
         let o = &*o;
@@ -640,6 +694,7 @@ pub fn init_types() -> PyResult<()> {
         (*t).tp_iter = Some(self_iter);
         (*t).tp_iternext = Some(asend_iternext);
         (*t).tp_finalize = Some(awaitable_finalize);
+        (*t).tp_dealloc = Some(awaitable_dealloc);
         (*t).tp_methods = crate::mdefs![
             ("send", O, asend_send_m, "send(arg) -> send 'arg' into coroutine,\nreturn next yielded value or raise StopIteration."),
             ("throw", FAST, asend_throw, "throw(value)\nthrow(type[,value[,traceback]])\n\nRaise exception in coroutine, return next yielded value or raise\nStopIteration.\nthe (type, val, tb) signature is deprecated, \nand may be removed in a future version of Python."),

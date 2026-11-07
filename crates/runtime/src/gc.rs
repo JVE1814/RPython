@@ -756,6 +756,33 @@ pub fn flush_deferred() {
     release_mature();
 }
 
+/// (jit6) Wait until every other thread has passed a safepoint (or is outside the VM).
+/// Used once when MULTI_THREADED was set by a self-registering thread
+/// (threads::MT_HANDSHAKE): afterwards no thread is still inside a fast path that
+/// assumed a single thread. The caller must not be counted as running Python code.
+pub fn handshake_safepoint() {
+    let me = crate::threads::current_mut();
+    if me.is_null() {
+        return;
+    }
+    let mut spins = 0u32;
+    while COLLECTING.compare_exchange(false, true, AcqRel, Acquire).is_err() {
+        // a collection stops the world itself, which is just as good
+        std::thread::sleep(std::time::Duration::from_micros(100));
+        spins += 1;
+        if spins > 20000 {
+            return;
+        }
+    }
+    for _ in 0..40 {
+        if stop_the_world(me) {
+            start_the_world();
+            break;
+        }
+    }
+    COLLECTING.store(false, Release);
+}
+
 /// All tracked objects (for gc.get_objects / get_referrers).
 pub fn all_tracked() -> Vec<PyRef> {
     if !crate::threads::multi_threaded() {

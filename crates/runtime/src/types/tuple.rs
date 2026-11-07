@@ -210,7 +210,10 @@ pub unsafe extern "C" fn tuple_traverse(op: *mut PyObject, visit: visitproc, arg
 pub fn tuple_hash(t: &PyObject) -> PyResult<isize> {
     let cached = unsafe { std::sync::atomic::AtomicIsize::from_ptr(&raw mut (*(t.as_ptr() as *mut PyTupleObject)).ob_hash) };
     let h0 = cached.load(std::sync::atomic::Ordering::Relaxed);
-    if h0 != -1 && is_tuple_exact(t) {
+    // (jit6) subclasses too (namedtuples as dict keys): every allocation path of a
+    // tuple type starts with -1 (alloc_tuple_of, typeobject generic_alloc, capi
+    // _PyObject_NewVar), and the items never change
+    if h0 != -1 {
         return Ok(h0);
     }
     let items = tuple_items(t);
@@ -226,9 +229,7 @@ pub fn tuple_hash(t: &PyObject) -> PyResult<isize> {
     crate::interp::leave_recursive_call(ts);
     r?;
     let v = h.finish();
-    if is_tuple_exact(t) {
-        cached.store(v, std::sync::atomic::Ordering::Relaxed);
-    }
+    cached.store(v, std::sync::atomic::Ordering::Relaxed);
     Ok(v)
 }
 
@@ -336,15 +337,42 @@ unsafe extern "C" fn tuple_richcompare(a: *mut PyObject, b: *mut PyObject, op: c
         if !is_tuple(b) || !is_tuple(a) {
             return none::not_implemented().to_ref().into_raw();
         }
+        // (jit6, flagged: runtime fast path for mdp's tuple-keyed dicts) tuples are
+        // immutable and kept alive by the caller, so their items are compared borrowed,
+        // without the generic per-item closures and reference counting
         let (x, y) = (tuple_items(a), tuple_items(b));
-        let r = crate::types::list::seq_richcompare(
-            &|i| x.get(i).map(|o| o.to_ref()),
-            &|| x.len(),
-            &|i| y.get(i).map(|o| o.to_ref()),
-            &|| y.len(),
-            op,
-        );
-        into_c(r.map(bool_::new_bool))
+        if (op == Py_EQ || op == Py_NE) && x.len() != y.len() {
+            return bool_::new_bool(op == Py_NE).into_raw();
+        }
+        let n = x.len().min(y.len());
+        for i in 0..n {
+            let (xi, yi) = (&x[i], &y[i]);
+            if xi.is(yi) {
+                continue;
+            }
+            match ab::rich_compare_bool(xi, yi, Py_EQ) {
+                Ok(true) => continue,
+                Ok(false) => {
+                    let r = match op {
+                        Py_EQ => Ok(false),
+                        Py_NE => Ok(true),
+                        _ => ab::rich_compare_bool(xi, yi, op),
+                    };
+                    return into_c(r.map(bool_::new_bool));
+                }
+                Err(e) => return into_c(Err::<PyRef, _>(e)),
+            }
+        }
+        let (la, lb) = (x.len(), y.len());
+        let r = match op {
+            Py_LT => la < lb,
+            Py_LE => la <= lb,
+            Py_EQ => la == lb,
+            Py_NE => la != lb,
+            Py_GT => la > lb,
+            _ => la >= lb,
+        };
+        bool_::new_bool(r).into_raw()
     }
 }
 unsafe extern "C" fn tuple_contains(a: *mut PyObject, v: *mut PyObject) -> c_int {

@@ -474,6 +474,10 @@ pub unsafe extern "C" fn generic_alloc(tp: *mut PyTypeObject, nitems: Py_ssize_t
         if (*tp).tp_itemsize != 0 {
             set_var_size(op, nitems);
         }
+        if (*tp).tp_flags & Py_TPFLAGS_TUPLE_SUBCLASS != 0 {
+            // (jit6) tuples of every type cache their hash (tuple.rs `tuple_hash`)
+            (*(op as *mut PyTupleObject)).ob_hash = -1;
+        }
         if (*tp).tp_flags & Py_TPFLAGS_HAVE_GC != 0 {
             crate::gc::track(op);
         }

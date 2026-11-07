@@ -333,6 +333,10 @@ pub unsafe extern "C" fn _PyObject_NewVar(tp: *mut PyTypeObject, n: Py_ssize_t) 
             return op as *mut PyVarObject;
         }
         set_var_size(op, n);
+        if (*tp).tp_flags & Py_TPFLAGS_TUPLE_SUBCLASS != 0 {
+            // (jit6) tuples of every type cache their hash (types/tuple.rs `tuple_hash`)
+            (*(op as *mut PyTupleObject)).ob_hash = -1;
+        }
         op as *mut PyVarObject
     }
 }

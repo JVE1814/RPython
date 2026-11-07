@@ -543,6 +543,12 @@ pub struct CodeCaches {
     /// Generator expression prologue shape (interp::genexpr_prologue): 0 not yet
     /// examined, 1 not the plain `iter(.0)` prologue, 2 + n: plain, with n free variables.
     pub genexpr: AtomicU32,
+    /// (jit6) tier-1 "drain mode" code of a generator expression (YieldValue hands the
+    /// value to its consumer directly, jit/helpers.rs `h_drain`); 1 = cannot be built
+    pub drain: AtomicPtr<crate::interp::jit::Compiled>,
+    /// (jit6) tier-2 deoptimisations per resume pc ((pc, count)); recompilations use
+    /// generic paths instead of deoptimising guards at pcs that trapped
+    pub traps: std::sync::Mutex<Vec<(u32, u32)>>,
 }
 
 impl CodeCaches {
@@ -567,6 +573,8 @@ impl CodeCaches {
             t2_prof: AtomicU8::new(1),
             t2_retired: std::sync::Mutex::new(Vec::new()),
             genexpr: AtomicU32::new(0),
+            drain: AtomicPtr::new(std::ptr::null_mut()),
+            traps: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -611,6 +619,10 @@ impl Drop for CodeCaches {
         let j = *self.jit.get_mut();
         if !j.is_null() {
             crate::interp::jit::release_compiled(j);
+        }
+        let d = *self.drain.get_mut();
+        if !d.is_null() && d as usize != 1 {
+            crate::interp::jit::release_compiled(d);
         }
     }
 }
