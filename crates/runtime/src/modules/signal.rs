@@ -98,7 +98,7 @@ fn run_handlers() -> PyResult<()> {
     let we = WAKEUP_ERRNO.swap(0, Relaxed);
     if we != 0 {
         let _ = crate::types::exceptions::os_error_from_errno(we, None, None);
-        crate::modules::sys_full::write_unraisable(Some("Exception ignored when trying to write to the signal wakeup fd"), None);
+        crate::modules::sys_full::write_unraisable(Some("Exception ignored while trying to write to the signal wakeup fd"), None);
     }
     let frame = || -> PyRef {
         let f = crate::interp::current_frame_ptr();
@@ -113,13 +113,19 @@ fn run_handlers() -> PyResult<()> {
             continue;
         }
         let h = HANDLERS[sig].load(Acquire);
-        if h.is_null() {
+        // (hang1) once the interpreter is finalizing, Python-level handlers
+        // are gone (as after CPython's signal teardown): a signal that arrives
+        // then (e.g. _thread.interrupt_main() from a __del__ run by module
+        // teardown) is reported instead of raising inside the teardown
+        let gone = h.is_null() || crate::modules::sys_full::is_finalizing();
+        if gone || int::is_int(unsafe { &*h }) || !ab::is_callable(unsafe { &*h }) {
+            if gone {
+                let _ = crate::err!(OSError, "Signal {} ignored due to race condition", sig);
+                crate::modules::sys_full::write_unraisable(None, Some(none::none()));
+            }
             continue;
         }
         let h = unsafe { PyRef::from_borrowed(h) };
-        if int::is_int(&h) || !ab::is_callable(&h) {
-            continue;
-        }
         let fr = frame();
         // Handlers run between two instructions of whatever frame is current,
         // possibly one right at the recursion limit: give the call some headroom

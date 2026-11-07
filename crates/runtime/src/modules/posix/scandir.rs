@@ -90,33 +90,52 @@ pub fn os_scandir(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> P
     }
 }
 
+/// (hang1) An iterator may be shared between threads: readdir() and closedir()
+/// run under the object's leaf lock, and the entry's fields are copied out
+/// before the lock is released (the next readdir() may reuse the buffer).
+fn close_locked(o: &PyObject) {
+    let _g = crate::types::dict::ob_lock(o);
+    close_iter(it(o));
+}
+
 unsafe extern "C" fn iter_next(op: *mut PyObject) -> *mut PyObject {
     unsafe {
         let s = &mut *(op as *mut ScandirIter);
-        if s.dir.is_null() {
-            return std::ptr::null_mut();
-        }
         loop {
-            *libc::__errno_location() = 0;
-            let ent = libc::readdir64(s.dir);
-            if ent.is_null() {
-                let e = errno();
-                close_iter(s);
-                if e != 0 {
-                    let pathobj = if s.narrow {
-                        bytes::new_bytes(&*s.prefix)
-                    } else {
-                        fs_decode(&*s.prefix).unwrap_or_else(|_| none::none_ref())
-                    };
-                    let _ = crate::types::exceptions::os_error_from_errno(e, Some(&pathobj), None);
+            let next = {
+                let _g = crate::types::dict::ob_lock(&*op);
+                if s.dir.is_null() {
+                    return std::ptr::null_mut();
                 }
-                return std::ptr::null_mut();
-            }
-            let name = std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()).to_bytes();
+                *libc::__errno_location() = 0;
+                let ent = libc::readdir64(s.dir);
+                if ent.is_null() {
+                    let e = errno();
+                    close_iter(s);
+                    Err(e)
+                } else {
+                    let name = std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()).to_bytes().to_vec();
+                    Ok((name, (*ent).d_type, (*ent).d_ino))
+                }
+            };
+            let (name, d_type, d_ino) = match next {
+                Ok(x) => x,
+                Err(e) => {
+                    if e != 0 {
+                        let pathobj = if s.narrow {
+                            bytes::new_bytes(&*s.prefix)
+                        } else {
+                            fs_decode(&*s.prefix).unwrap_or_else(|_| none::none_ref())
+                        };
+                        let _ = crate::types::exceptions::os_error_from_errno(e, Some(&pathobj), None);
+                    }
+                    return std::ptr::null_mut();
+                }
+            };
             if name == b"." || name == b".." {
                 continue;
             }
-            let r = make_entry(s, name, (*ent).d_type, (*ent).d_ino);
+            let r = make_entry(s, &name, d_type, d_ino);
             return into_c(r);
         }
     }
@@ -180,14 +199,14 @@ unsafe extern "C" fn iter_dealloc(op: *mut PyObject) {
 }
 
 fn iter_close(o: &PyObject) -> PyResult {
-    close_iter(it(o));
+    close_locked(o);
     Ok(none::none_ref())
 }
 fn iter_enter(o: &PyObject) -> PyResult {
     Ok(o.to_ref())
 }
 fn iter_exit(o: &PyObject, _args: &[&PyObject]) -> PyResult {
-    close_iter(it(o));
+    close_locked(o);
     Ok(none::none_ref())
 }
 fn iter_reduce(o: &PyObject) -> PyResult {

@@ -454,7 +454,9 @@ class Barrier:
     before they are released."""
 
     # phases of one round
-    _FILLING, _DRAINING, _RESETTING, _BROKEN = 'filling', 'draining', 'resetting', 'broken'
+    # (ints, kept in `_state`/`_count`: multiprocessing's Barrier keeps them in
+    # shared memory by overriding those two attributes with properties)
+    _FILLING, _DRAINING, _RESETTING, _BROKEN = 0, 1, -1, -2
 
     def __init__(self, parties, action=None, timeout=None):
         if parties < 1:
@@ -463,8 +465,8 @@ class Barrier:
         self._action = action
         self._timeout = timeout
         self._parties = parties
-        self._phase = self._FILLING
-        self._inside = 0       # threads currently in wait()
+        self._state = self._FILLING
+        self._count = 0       # threads currently in wait()
 
     def __repr__(self):
         cls = type(self)
@@ -481,12 +483,12 @@ class Barrier:
             timeout = self._timeout
         with self._cond:
             # threads of the previous round have to leave first
-            while self._phase in (self._DRAINING, self._RESETTING):
+            while self._state in (self._DRAINING, self._RESETTING):
                 self._cond.wait()
-            if self._phase is self._BROKEN:
+            if self._state == self._BROKEN:
                 raise BrokenBarrierError
-            index = self._inside
-            self._inside += 1
+            index = self._count
+            self._count += 1
             try:
                 if index + 1 == self._parties:
                     self._release_all()
@@ -494,9 +496,9 @@ class Barrier:
                     self._await_release(timeout)
                 return index
             finally:
-                self._inside -= 1
-                if self._inside == 0 and self._phase in (self._DRAINING, self._RESETTING):
-                    self._phase = self._FILLING
+                self._count -= 1
+                if self._count == 0 and self._state in (self._DRAINING, self._RESETTING):
+                    self._state = self._FILLING
                     self._cond.notify_all()
 
     def _release_all(self):
@@ -506,29 +508,29 @@ class Barrier:
         except BaseException:
             self._break()
             raise
-        self._phase = self._DRAINING
+        self._state = self._DRAINING
         self._cond.notify_all()
 
     def _await_release(self, timeout):
-        if not self._cond.wait_for(lambda: self._phase is not self._FILLING, timeout):
+        if not self._cond.wait_for(lambda: self._state != self._FILLING, timeout):
             self._break()
             raise BrokenBarrierError
-        if self._phase in (self._BROKEN, self._RESETTING):
+        if self._state in (self._BROKEN, self._RESETTING):
             raise BrokenBarrierError
 
     def _break(self):
-        self._phase = self._BROKEN
+        self._state = self._BROKEN
         self._cond.notify_all()
 
     def reset(self):
         """Return the barrier to its initial state; threads waiting in it get
         BrokenBarrierError."""
         with self._cond:
-            if self._inside > 0:
-                if self._phase in (self._FILLING, self._BROKEN):
-                    self._phase = self._RESETTING
+            if self._count > 0:
+                if self._state in (self._FILLING, self._BROKEN):
+                    self._state = self._RESETTING
             else:
-                self._phase = self._FILLING
+                self._state = self._FILLING
             self._cond.notify_all()
 
     def abort(self):
@@ -545,12 +547,12 @@ class Barrier:
     @property
     def n_waiting(self):
         """The number of threads waiting in the current round."""
-        return self._inside if self._phase is self._FILLING else 0
+        return self._count if self._state == self._FILLING else 0
 
     @property
     def broken(self):
         """Whether the barrier is broken."""
-        return self._phase is self._BROKEN
+        return self._state == self._BROKEN
 
 
 # ---------------------------------------------------------------- registry

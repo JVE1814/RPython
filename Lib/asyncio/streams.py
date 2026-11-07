@@ -324,11 +324,19 @@ class StreamWriter:
         server_side = self._protocol._client_connected_cb is not None
         protocol = self._protocol
         await self.drain()
+        # (hang1) bytes the reader already holds are the start of the TLS
+        # stream (e.g. the peer's ClientHello): the TLS layer gets them, or
+        # the handshake would wait for data that never comes again
+        extra = {}
+        reader = getattr(protocol, '_stream_reader', None)
+        if reader is not None and reader._buffer:
+            extra['_buffered'] = bytes(reader._buffer)
+            reader._buffer.clear()
         new_transport = await self._loop.start_tls(
             self._transport, protocol, sslcontext,
             server_side=server_side, server_hostname=server_hostname,
             ssl_handshake_timeout=ssl_handshake_timeout,
-            ssl_shutdown_timeout=ssl_shutdown_timeout)
+            ssl_shutdown_timeout=ssl_shutdown_timeout, **extra)
         self._transport = new_transport
         protocol._replace_transport(new_transport)
 

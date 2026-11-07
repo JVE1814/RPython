@@ -340,6 +340,13 @@ fn real_main() -> i32 {
     let args: Vec<String> = raw.iter().map(|b| String::from_utf8_lossy(b).into_owned()).collect();
     let any_undecodable = raw.iter().any(|b| std::str::from_utf8(b).is_err());
     let mut cfg = RtConfig { orig_argv: args.clone(), closed_std_fds: CLOSED_STD_FDS.load(std::sync::atomic::Ordering::Relaxed), ..Default::default() };
+    // (hang1) a stdin the process was started without stays closed (Rust put
+    // /dev/null there): os.fstat(0) fails with EBADF as under CPython. Closed
+    // stdout/stderr keep the placeholder so that runtime diagnostics can never
+    // land in a file that happened to get descriptor 1 or 2.
+    if cfg.closed_std_fds & 1 != 0 {
+        unsafe { libc::close(0) };
+    }
     if any_undecodable {
         cfg.orig_argv_bytes = raw.clone();
     }

@@ -1,4 +1,5 @@
 //! The `posix` module (Linux).
+pub mod extra;
 pub mod fs;
 pub mod path;
 pub mod proc;
@@ -556,6 +557,8 @@ fn int_constants() -> Vec<(&'static str, i64)> {
         ("SCHED_RR", SCHED_RR as i64),
         ("SCHED_BATCH", SCHED_BATCH as i64),
         ("SCHED_IDLE", SCHED_IDLE as i64),
+        ("SCHED_DEADLINE", 6), // (hang1) Linux value; libc does not export it
+        ("NODEV", -1),         // (hang1) (dev_t)-1
         ("SCHED_RESET_ON_FORK", SCHED_RESET_ON_FORK as i64),
         ("RTLD_LAZY", RTLD_LAZY as i64),
         ("RTLD_NOW", RTLD_NOW as i64),
@@ -581,6 +584,16 @@ fn int_constants() -> Vec<(&'static str, i64)> {
         ("SPLICE_F_MOVE", 1),
         ("SPLICE_F_NONBLOCK", 2),
         ("SPLICE_F_MORE", 4),
+        // (hang1)
+        ("TFD_NONBLOCK", libc::TFD_NONBLOCK as i64),
+        ("TFD_CLOEXEC", libc::TFD_CLOEXEC as i64),
+        ("TFD_TIMER_ABSTIME", extra::TFD_TIMER_ABSTIME as i64),
+        ("TFD_TIMER_CANCEL_ON_SET", extra::TFD_TIMER_CANCEL_ON_SET as i64),
+        ("RWF_HIPRI", 1),
+        ("RWF_DSYNC", 2),
+        ("RWF_SYNC", 4),
+        ("RWF_NOWAIT", 8),
+        ("RWF_APPEND", 16),
     ]
 }
 
@@ -665,6 +678,17 @@ fn methods() -> *mut crate::ffi::PyMethodDef {
         ("eventfd", FASTKW, os_eventfd, "eventfd($module, /, initval, flags=EFD_CLOEXEC)\n--\n\nCreate an event notification descriptor."),
         ("eventfd_read", FASTKW, os_eventfd_read, "eventfd_read($module, /, fd)\n--\n\nRead the counter of an eventfd."),
         ("eventfd_write", FASTKW, os_eventfd_write, "eventfd_write($module, /, fd, value)\n--\n\nAdd value to the counter of an eventfd."),
+        // (hang1) timer descriptors, vectored positional I/O, splice, groups
+        ("timerfd_create", FASTKW, extra::os_timerfd_create, "timerfd_create($module, clockid, /, *, flags=0)\n--\n\nCreate a timer file descriptor."),
+        ("timerfd_settime", FASTKW, extra::os_timerfd_settime, "timerfd_settime($module, fd, /, *, flags=0, initial=0.0, interval=0.0)\n--\n\nArm or disarm a timer descriptor (seconds); return the previous setting."),
+        ("timerfd_settime_ns", FASTKW, extra::os_timerfd_settime_ns, "timerfd_settime_ns($module, fd, /, *, flags=0, initial=0, interval=0)\n--\n\nArm or disarm a timer descriptor (nanoseconds); return the previous setting."),
+        ("timerfd_gettime", FAST, extra::os_timerfd_gettime, "timerfd_gettime($module, fd, /)\n--\n\nReturn (next expiration, interval) of a timer descriptor in seconds."),
+        ("timerfd_gettime_ns", FAST, extra::os_timerfd_gettime_ns, "timerfd_gettime_ns($module, fd, /)\n--\n\nReturn (next expiration, interval) of a timer descriptor in nanoseconds."),
+        ("preadv", FAST, extra::os_preadv, "preadv($module, fd, buffers, offset, flags=0, /)\n--\n\nRead into several buffers at offset; return the number of bytes read."),
+        ("pwritev", FAST, extra::os_pwritev, "pwritev($module, fd, buffers, offset, flags=0, /)\n--\n\nWrite several buffers at offset; return the number of bytes written."),
+        ("splice", FASTKW, extra::os_splice, "splice($module, /, src, dst, count, offset_src=None, offset_dst=None, flags=0)\n--\n\nMove data between descriptors without copying through user space."),
+        ("getgrouplist", FAST, extra::os_getgrouplist, "getgrouplist($module, user, group, /)\n--\n\nReturn the groups user belongs to, group included."),
+        ("initgroups", FAST, extra::os_initgroups, "initgroups($module, username, gid, /)\n--\n\nInitialize the group access list of the process for username."),
         ("getpid", NOARGS, os_getpid),
         ("getppid", NOARGS, os_getppid),
         ("getpgrp", NOARGS, os_getpgrp),

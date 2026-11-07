@@ -349,6 +349,11 @@ fn f_fork_exec(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     let uid = if none::is_none(args[19]) { None } else { Some(id_of(args[19], "uid")?) };
     let child_umask = c_int_of(args[20])?;
     let preexec_fn = if none::is_none(args[21]) { None } else { Some(args[21].to_ref()) };
+    // (hang1) running Python code in a child forked from a finalizer is not
+    // possible (the runtime is half torn down)
+    if preexec_fn.is_some() && crate::modules::sys_full::is_finalizing() {
+        raise!(PythonFinalizationError, "preexec_fn not supported at interpreter shutdown");
+    }
 
     crate::modules::sys_full::audit(
         "_posixsubprocess.fork_exec",

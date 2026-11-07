@@ -262,6 +262,16 @@ fn pending_threadfunc(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) 
     Ok(int::new_int(added as i64))
 }
 
+/// tuple_from_pair(a, b) / tuple_from_pair_steal(a, b): a 2-tuple built like the
+/// internal pair constructors build it (tracked only if an item may be in a
+/// cycle). (hang1)
+fn tuple_from_pair(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    if args.len() != 2 {
+        raise!(TypeError, "tuple_from_pair expected 2 arguments, got {}", args.len());
+    }
+    Ok(tuple::new_tuple_from_refs(&[args[0], args[1]]))
+}
+
 pub fn init() -> PyResult {
     let m = crate::types::module::new_module("_testinternalcapi")?;
     let d = crate::types::module::module_dict(&m);
@@ -270,6 +280,8 @@ pub fn init() -> PyResult {
         crate::mdefs![
             ("has_inline_values", O, has_inline_values),
             ("pending_threadfunc", FASTKW, pending_threadfunc),
+            ("tuple_from_pair", FAST, tuple_from_pair),
+            ("tuple_from_pair_steal", FAST, tuple_from_pair),
             ("has_split_table", O, has_split_table),
             ("get_recursion_depth", NOARGS, get_recursion_depth),
             ("get_long_lived_total", NOARGS, get_long_lived_total),

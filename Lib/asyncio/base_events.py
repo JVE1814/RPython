@@ -950,8 +950,13 @@ class BaseEventLoop(events.AbstractEventLoop):
                         server_side=False,
                         server_hostname=None,
                         ssl_handshake_timeout=None,
-                        ssl_shutdown_timeout=None):
-        """Upgrade an existing connection to TLS."""
+                        ssl_shutdown_timeout=None,
+                        _buffered=None):
+        """Upgrade an existing connection to TLS.
+
+        (hang1) *_buffered*: TLS bytes the caller already read from the
+        transport (a stream reader's buffer); they are handed to the TLS
+        layer before anything else arrives."""
         if ssl is None:
             raise RuntimeError('Python ssl module is not available')
         if not isinstance(sslcontext, ssl.SSLContext):
@@ -967,6 +972,8 @@ class BaseEventLoop(events.AbstractEventLoop):
             ssl_handshake_timeout=ssl_handshake_timeout,
             ssl_shutdown_timeout=ssl_shutdown_timeout,
             call_connection_made=False)
+        if _buffered:
+            ssl_protocol._incoming.write(_buffered)
         transport.pause_reading()
         transport.set_protocol(ssl_protocol)
         resume = self.call_soon(ssl_protocol.connection_made, transport)

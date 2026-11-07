@@ -147,12 +147,17 @@ class ForkServer(object):
                 self._forkserver_pid = None
 
             kwargs = {'on_error': self._preload_on_error}
+            # (hang1) sent through the key pipe, not the command line: a
+            # large sys.argv would exceed the per-argument length limit
+            extra = {}
             if self._preload_modules:
                 data = spawn.get_preparation_data('ignore')
                 if 'sys_path' in data:
-                    kwargs['sys_path'] = data['sys_path']
+                    extra['sys_path'] = data['sys_path']
+                if 'sys_argv' in data:
+                    extra['sys_argv'] = data['sys_argv']
                 if 'init_main_from_path' in data:
-                    kwargs['main_path'] = data['init_main_from_path']
+                    extra['main_path'] = data['init_main_from_path']
 
             with socket.socket(socket.AF_UNIX) as listener:
                 address = connection.arbitrary_address('AF_UNIX')
@@ -184,7 +189,11 @@ class ForkServer(object):
                     os.close(alive_r)
                     os.close(authkey_r)
                 try:
-                    write_all(authkey_w, self._forkserver_authkey)
+                    payload = self._forkserver_authkey
+                    if extra:
+                        import json
+                        payload += json.dumps(extra).encode('ascii')
+                    write_all(authkey_w, payload)
                 finally:
                     os.close(authkey_w)
                 self._forkserver_address = address
@@ -192,7 +201,8 @@ class ForkServer(object):
                 self._forkserver_pid = pid
 
 
-def _handle_preload(preload, main_path=None, sys_path=None, on_error='ignore'):
+def _handle_preload(preload, main_path=None, sys_path=None, on_error='ignore',
+                    sys_argv=None):
     """Import the modules to preload in the server."""
     if not preload:
         return
@@ -201,6 +211,9 @@ def _handle_preload(preload, main_path=None, sys_path=None, on_error='ignore'):
             f"on_error must be 'ignore', 'warn', or 'fail', not {on_error!r}")
     if sys_path is not None:
         sys.path[:] = sys_path
+    if sys_argv is not None:
+        # the main module sees the parent's arguments while it is preloaded
+        sys.argv[:] = sys_argv
 
     if '__main__' in preload and main_path is not None:
         process.current_process()._inheriting = True
@@ -234,17 +247,28 @@ def _handle_preload(preload, main_path=None, sys_path=None, on_error='ignore'):
 
 
 def main(listener_fd, alive_r, preload, main_path=None, sys_path=None,
-         *, authkey_r=None, on_error='ignore'):
+         *, authkey_r=None, on_error='ignore', sys_argv=None):
     """The server's main loop."""
     if authkey_r is not None:
         try:
             authkey = read_all(authkey_r, _AUTHKEY_LEN)
+            # the preload settings follow the key on the same pipe (JSON):
+            # they can be far larger than one command-line argument may be
+            rest = []
+            while chunk := os.read(authkey_r, 65536):
+                rest.append(chunk)
         finally:
             os.close(authkey_r)
+        if rest:
+            import json
+            extra = json.loads(b''.join(rest))
+            main_path = extra.get('main_path', main_path)
+            sys_path = extra.get('sys_path', sys_path)
+            sys_argv = extra.get('sys_argv', sys_argv)
     else:
         authkey = b''
 
-    _handle_preload(preload, main_path, sys_path, on_error)
+    _handle_preload(preload, main_path, sys_path, on_error, sys_argv)
 
     util._close_stdin()
 
