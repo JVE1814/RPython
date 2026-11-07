@@ -6,14 +6,14 @@ test_cmd_line_script if time allows; later also test_stable_abi_ctypes and test_
 ## Before / after (test_capi, installed snapshot, `-m test test_capi -v`)
 
 Before: run 1531, 427 failures (535 FAIL/ERROR lines incl. subtests), 353 skipped.
-After (rev 4a05448 + see below): run 1533 (the 2 extra are `_testcapi.test_immortal_*` from
-immortal.c, now built), failures ~40, skipped 353.
+After (final rev): run 1533 (the 2 extra are `_testcapi.test_immortal_*` from immortal.c, now
+built), regrtest failures 41 (was 427), skipped 353.
 
 | sub-module | before | after |
 |---|---|---|
 | test_slots | 121 | 0 |
 | test_run | 88 | 0 |
-| test_watchers | 43 | 0 |
+| test_watchers | 43 | 0 alone; 2 in the full package run (watched type freed late, see Left) |
 | test_unicode | 35 | 6 (invalid-codepoint strings, MemoryError injection) |
 | test_config | 34 | 0 |
 | test_float | 32 | 0 |
@@ -27,10 +27,17 @@ immortal.c, now built), failures ~40, skipped 353.
 | test_bytes | 11 | 11 (bytes/bytearray writer MemoryError injection, concat with memoryview, join) |
 | test_immortal | 9 | 0 |
 | test_complex | 9 | 0 |
-| test_sys, test_object, test_type, test_file, test_capsule, ... | 30 | ~25 (not attempted) |
+| test_sys | 6 | 0 |
+| test_capsule | 4 | 0 |
+| test_set | 2 | 0 |
+| test_eval_code_ex | 2 | 0 |
+| test_type | 5 | 2 (flag bits of builtin types, custom-MRO cache invalidation) |
+| test_object, test_file, test_abstract | 12 | 12 (not attempted) |
 
 test_stable_abi_ctypes: 34 errors -> 0 (stable-ABI-only symbols exported, capi/abi_only.rs).
 test_fileutils: 35 errors -> 0 (`_testinternalcapi.normalize_path`).
+test_cmd_line_script: 7 -> 2 (NUL bytes in scripts, main-script SyntaxWarning module, -m from a
+ZIP on PYTHONPATH fixed; left: non-UTF-8 script path in argv, SyntaxWarning module for a ZIP __main__).
 test_embed: all 91 skipped — same as the CPython ft baseline (an installed CPython has no
 `Programs/_testembed` either; the test needs the build tree). Nothing to fix.
 
@@ -77,3 +84,12 @@ methods.rs, tools/build_test_exts.sh.
 * test_unicode (6): strings holding code points > 0x10ffff (CPython creates them in release
   builds and `list()` raises SystemError), MemoryError injection.
 * ref tracer (PyRefTracer_SetTracer) events; Fatal error for C API calls without thread state.
+* test_watchers in the full test_capi run: a watched type deleted by a test is freed only after
+  deferred reclamation (threads left by earlier tests hold QSBR batches / merge queues), so its
+  dealloc event can arrive after the test looked (passes when the module runs alone).
+* test_type: `_Py_TPFLAGS_STATIC_BUILTIN` and the other exact flag bits of builtin types;
+  `Base.value = 2` with a metaclass `mro()` naming Base without subclassing it does not
+  invalidate the class's method cache.
+* PEP 523 from C: `_PyInterpreterState_SetEvalFrameFunc` with a C function is stored but never
+  called (our frames are not `_PyInterpreterFrame`s); only the Rust-side hooks of
+  `_testinternalcapi` exist.

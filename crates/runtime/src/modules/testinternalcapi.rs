@@ -481,6 +481,34 @@ fn normalize_path(_m: &PyObject, p: &PyObject) -> PyResult {
     Ok(pystr::from_codepoints(&out))
 }
 
+/// set_update(set, iterable) -> 0: in-place update of a (mutable) set. (capi2)
+fn set_update_fn(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    if args.len() != 2 {
+        raise!(TypeError, "set_update expected 2 arguments, got {}", args.len());
+    }
+    if !crate::types::set::is_set(args[0]) {
+        return Err(crate::errors::system_error("bad argument to internal function"));
+    }
+    crate::types::set::set_update(args[0], args[1])?;
+    Ok(int::new_int(0))
+}
+
+/// set_next_entry(set, pos) -> (1, next_pos, hash, item) or None at the end. (capi2)
+fn set_next_entry(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    if args.len() != 2 {
+        raise!(TypeError, "set_next_entry expected 2 arguments, got {}", args.len());
+    }
+    if !crate::types::set::is_anyset(args[0]) {
+        return Err(crate::errors::system_error("bad argument to internal function"));
+    }
+    let pos = ab::as_i64(args[1])?.max(0) as usize;
+    let items = crate::types::set::items_with_hash(args[0]);
+    match items.get(pos) {
+        Some((k, h)) => Ok(tuple::new_tuple(vec![int::new_int(1), int::new_int(pos as i64 + 1), int::new_int(*h as i64), k.clone()])),
+        None => Ok(none::none_ref()),
+    }
+}
+
 pub fn init() -> PyResult {
     let m = crate::types::module::new_module("_testinternalcapi")?;
     let d = crate::types::module::module_dict(&m);
@@ -491,6 +519,8 @@ pub fn init() -> PyResult {
             ("module_get_gc_hooks", O, module_get_gc_hooks),
             ("get_configs", NOARGS, get_configs),
             ("_pyerr_setkeyerror", O, pyerr_setkeyerror),
+            ("set_update", FAST, set_update_fn),
+            ("set_next_entry", FAST, set_next_entry),
             ("normalize_path", O, normalize_path),
             ("set_eval_frame_record", O, set_eval_frame_record),
             ("set_eval_frame_interp", O, set_eval_frame_interp),

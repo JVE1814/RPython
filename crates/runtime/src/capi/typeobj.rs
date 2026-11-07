@@ -155,6 +155,17 @@ pub unsafe extern "C" fn PyType_GetModuleName(t: *mut PyTypeObject) -> *mut PyOb
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyType_Freeze(t: *mut PyTypeObject) -> c_int {
     unsafe {
+        // (capi2) every other class on the MRO must be immutable already
+        let mro = (*t).tp_mro;
+        if !mro.is_null() {
+            for b in tuple::tuple_items(&*mro) {
+                let bt = b.as_ptr() as *mut PyTypeObject;
+                if bt != t && (*bt).tp_flags & Py_TPFLAGS_IMMUTABLETYPE == 0 {
+                    let _ = type_error(&format!("PyType_Freeze: base class '{}' is not immutable", to::type_fqname(bt)));
+                    return -1;
+                }
+            }
+        }
         (*t).tp_flags |= Py_TPFLAGS_IMMUTABLETYPE;
         PyType_Modified(t);
         0
@@ -251,17 +262,34 @@ pub unsafe extern "C" fn PyType_GetBaseByToken_DuringGC(t: *mut PyTypeObject, to
         if !result.is_null() {
             *result = std::ptr::null_mut();
         }
+        if t.is_null() || !is_type(&*(t as *mut PyObject)) {
+            return -1; // (capi2) not a type: an error (reported by the non-GC variant)
+        }
         if token.is_null() {
-            return 0;
+            return -1; // (capi2) a NULL token is an error (reported by the non-GC variant)
         }
         let mro = (*t).tp_mro;
         let list: Vec<*mut PyTypeObject> = if mro.is_null() {
-            let mut v = vec![];
-            let mut b = t;
-            while !b.is_null() {
-                v.push(b);
-                b = (*b).tp_base;
+            // (capi2) without an MRO (type being built or torn down): the type, then its
+            // bases depth-first in declaration order
+            fn walk(t: *mut PyTypeObject, out: &mut Vec<*mut PyTypeObject>) {
+                unsafe {
+                    if out.contains(&t) {
+                        return;
+                    }
+                    out.push(t);
+                    let bases = (*t).tp_bases;
+                    if !bases.is_null() && tuple::is_tuple(&*bases) {
+                        for b in tuple::tuple_items(&*bases) {
+                            walk(as_type(b), out);
+                        }
+                    } else if !(*t).tp_base.is_null() {
+                        walk((*t).tp_base, out);
+                    }
+                }
             }
+            let mut v = vec![];
+            walk(t, &mut v);
             v
         } else {
             tuple::tuple_items(&*mro).iter().map(|x| as_type(x)).collect()
@@ -288,6 +316,13 @@ pub unsafe extern "C" fn PyType_GetBaseByToken(t: *mut PyTypeObject, token: *mut
                 "expected a type, got a '{}' object",
                 if t.is_null() { "NULL".into() } else { tname(&*(t as *mut PyObject)) }
             ));
+            return -1;
+        }
+        if token.is_null() {
+            if !result.is_null() {
+                *result = std::ptr::null_mut();
+            }
+            let _ = system_error("PyType_GetBaseByToken called with token=NULL");
             return -1;
         }
         let r = PyType_GetBaseByToken_DuringGC(t, token, result);
@@ -522,6 +557,12 @@ pub(crate) unsafe fn type_from_desc(desc: TypeDesc, token: *mut c_void) -> PyRes
             .or_else(|| given(base_slot as *mut PyObject))
             .filter(|t| tuple::tuple_len(t) > 0)
             .unwrap_or_else(|| tuple::new_tuple(vec![type_ref(to::object_type())]));
+        // (capi2) managed weakref/dict storage lives in the GC pre-header
+        for (flag, fname) in [(Py_TPFLAGS_MANAGED_WEAKREF, "Py_TPFLAGS_MANAGED_WEAKREF"), (Py_TPFLAGS_MANAGED_DICT, "Py_TPFLAGS_MANAGED_DICT")] {
+            if desc.flags & flag != 0 && desc.flags & Py_TPFLAGS_HAVE_GC == 0 {
+                return Err(system_error(&format!("type {} has the {} flag but not Py_TPFLAGS_HAVE_GC flag", desc.name, fname)));
+            }
+        }
         // the best base
         let mut base: *mut PyTypeObject = std::ptr::null_mut();
         for b in tuple::tuple_items(&bases) {
