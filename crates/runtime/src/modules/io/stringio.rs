@@ -124,7 +124,7 @@ fn configure(newline: Option<Vec<u32>>) -> State {
 }
 
 /// Write code points at the current position, applying newline translation.
-fn write_cps(s: &mut State, input: &[u32]) -> usize {
+fn write_cps(s: &mut State, input: &[u32]) -> PyResult<usize> {
     let n = input.len();
     let mut data: Vec<u32>;
     let mut slice: &[u32] = input;
@@ -148,10 +148,14 @@ fn write_cps(s: &mut State, input: &[u32]) -> usize {
         }
     }
     let pos = s.pos;
+    let end = pos + slice.len();
+    // big buffers (pytest's junit XML of a 200k-test run): MemoryError, not an abort
+    if end > s.buf.len() && s.buf.try_reserve(end - s.buf.len()).is_err() {
+        return Err(memory_error());
+    }
     if pos > s.buf.len() {
         s.buf.resize(pos, 0);
     }
-    let end = pos + slice.len();
     if end > s.buf.len() {
         s.buf.resize(end, 0);
     }
@@ -159,7 +163,7 @@ fn write_cps(s: &mut State, input: &[u32]) -> usize {
     s.pos = end;
     data = Vec::new();
     drop(data);
-    n
+    Ok(n)
 }
 
 unsafe extern "C" fn stringio_new(tp: *mut PyTypeObject, _a: *mut PyObject, _k: *mut PyObject) -> *mut PyObject {
@@ -176,7 +180,7 @@ fn init_impl(o: &PyObject, value: Option<&PyObject>, newline: Option<&PyObject>)
     let mut st = configure(nl);
     if let Some(v) = value.filter(|v| !v.is(none::none())) {
         let cps = str_cps(v);
-        write_cps(&mut st, &cps);
+        write_cps(&mut st, &cps)?;
         st.pos = 0;
     }
     let s = sio(o);
@@ -328,7 +332,7 @@ fn s_write(o: &PyObject, v: &PyObject) -> PyResult {
     }
     let s = state(o)?;
     let cps = str_cps(v);
-    let n = if cps.is_empty() { 0 } else { write_cps(s, &cps) };
+    let n = if cps.is_empty() { 0 } else { write_cps(s, &cps)? };
     Ok(int::new_int(n as i64))
 }
 
