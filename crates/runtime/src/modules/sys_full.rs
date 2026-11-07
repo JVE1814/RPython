@@ -923,8 +923,21 @@ fn sys_deactivate_stack_trampoline(_m: &PyObject) -> PyResult {
 fn sys_is_stack_trampoline_active(_m: &PyObject) -> PyResult {
     Ok(bool_::new_bool(TRAMPOLINE.load(Relaxed)))
 }
+/// (pdb1) Remote debugging (pdb's client/server protocol) is available unless
+/// switched off with PYTHON_DISABLE_REMOTE_DEBUG or -X disable-remote-debug.
+pub fn remote_debug_enabled() -> bool {
+    let cfg = config();
+    if cfg.ignore_environment == 0 {
+        if let Ok(v) = std::env::var("PYTHON_DISABLE_REMOTE_DEBUG") {
+            if !v.is_empty() {
+                return false;
+            }
+        }
+    }
+    !cfg.xoptions.iter().any(|x| x == "disable-remote-debug" || x == "disable_remote_debug")
+}
 fn sys_is_remote_debug_enabled(_m: &PyObject) -> PyResult {
-    Ok(bool_::new_bool(false))
+    Ok(bool_::new_bool(remote_debug_enabled()))
 }
 fn sys_remote_exec(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     crate::args::check_pos("remote_exec", args, 2, 2)?;
