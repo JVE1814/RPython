@@ -1133,8 +1133,9 @@ fn baiter_length_hint(o: &PyObject) -> PyResult {
     Ok(int::new_int(n.max(0) as i64))
 }
 fn baiter_reduce(o: &PyObject) -> PyResult {
+    let f = crate::builtins::eval_builtin("iter")?;
     let (seq, index) = baiter_snapshot(o);
-    bm::iter_reduce(seq.as_ref().map_or(std::ptr::null_mut(), |s| s.as_ptr()), index)
+    bm::iter_reduce(f, seq.as_ref().map_or(std::ptr::null_mut(), |s| s.as_ptr()), index)
 }
 fn baiter_setstate(o: &PyObject, state: &PyObject) -> PyResult {
     let it = unsafe { &mut *(o.as_ptr() as *mut BaIter) };
@@ -1165,7 +1166,7 @@ pub fn init_types() {
         let t = &mut *bytearray_type();
         t.tp_name = c"bytearray".as_ptr();
         t.tp_basicsize = std::mem::size_of::<PyByteArrayObject>() as isize;
-        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_SEQUENCE;
+        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE; // not a sequence for `match` (like str/bytes)
         t.tp_dealloc = Some(bytearray_dealloc);
         t.tp_repr = Some(bytearray_repr);
         t.tp_str = Some(bytearray_str);

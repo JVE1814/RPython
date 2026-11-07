@@ -292,7 +292,7 @@ pub fn get_m(o: &PyObject, args: &[&PyObject]) -> PyResult {
 
 pub fn sizeof_m(o: &PyObject) -> PyResult {
     let base = o.ty().tp_basicsize as usize;
-    Ok(int::new_int((base + dict::table_sizeof(o)) as i64))
+    Ok(int::new_int((base + dict::model_table_sizeof(o)) as i64))
 }
 
 pub fn keys_m(o: &PyObject) -> PyResult {
@@ -386,6 +386,10 @@ unsafe extern "C" fn dict_ass_subscript(o: *mut PyObject, k: *mut PyObject, v: *
         }
         int_into_c(dict::set_item(o, k, &*v))
     }
+}
+/// `dict.__contains__` as a one-argument method (it coexists with the sq_contains slot)
+fn contains_m(o: &PyObject, k: &PyObject) -> PyResult {
+    Ok(crate::types::bool_::new_bool(dict::contains(o, k)?))
 }
 pub unsafe extern "C" fn dict_contains(o: *mut PyObject, k: *mut PyObject) -> c_int {
     unsafe {
@@ -496,6 +500,10 @@ fn clear_m(o: &PyObject) -> PyResult {
     Ok(none::none_ref())
 }
 fn copy_m(o: &PyObject) -> PyResult {
+    // (a refusing allocator hook makes even an empty copy fail, as in CPython)
+    if crate::capi::mem::hooked_alloc_refuses(o.ty().tp_basicsize as usize) {
+        return Err(crate::errors::memory_error());
+    }
     dict::copy(o)
 }
 fn fromkeys_m(cls: &PyObject, args: &[&PyObject]) -> PyResult {
@@ -539,6 +547,7 @@ pub fn init_types() {
         n.nb_inplace_or = Some(dict_ior);
         t.tp_as_number = n;
         t.tp_methods = crate::mdefs![
+            ("__contains__", O, contains_m, "__contains__($self, key, /)\n--\n\nTrue if the dictionary has the specified key, else False."; METH_COEXIST),
             ("__sizeof__", NOARGS, sizeof_m, "__sizeof__($self, /)\n--\n\nReturn the size of the dict in memory, in bytes."),
             ("__reversed__", NOARGS, reversed_m, "__reversed__($self, /)\n--\n\nReturn a reverse iterator over the dict keys."),
             ("__class_getitem__", O, class_getitem_m, "See PEP 585"; METH_CLASS),

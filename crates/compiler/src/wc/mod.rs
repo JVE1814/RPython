@@ -1662,13 +1662,14 @@ impl<'a> Compiler<'a> {
             let slot = self.ur().cell_slot("__classdict__").unwrap();
             self.emit(O::STORE_DEREF, slot);
         }
-        self.emit_name(O::LOAD_NAME, "__name__");
-        self.emit_name(O::STORE_NAME, "__module__");
+        // resolved like any name (a `nonlocal __firstlineno__` in the body redirects the store)
+        self.nameop("__name__", ast::ExprContext::Load)?;
+        self.nameop("__module__", ast::ExprContext::Store)?;
         let q = self.ur().qualname.clone();
         self.load_const(str_const(&q));
-        self.emit_name(O::STORE_NAME, "__qualname__");
+        self.nameop("__qualname__", ast::ExprContext::Store)?;
         self.load_const(Constant::Int(firstlineno as i64));
-        self.emit_name(O::STORE_NAME, "__firstlineno__");
+        self.nameop("__firstlineno__", ast::ExprContext::Store)?;
         if generic {
             self.nameop(".type_params", ast::ExprContext::Load)?;
             self.emit_name(O::STORE_NAME, "__type_params__");

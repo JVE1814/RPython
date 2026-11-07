@@ -325,7 +325,13 @@ fn ast_init_impl(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyR
                 if let Some(i) = pos {
                     remaining.remove(i);
                 } else if !contains_eq(&attributes, &key)? {
-                    raise!(TypeError, "{}.__init__ got an unexpected keyword argument {}", tpname, ab::repr_string(&key)?);
+                    let msg = format!("{}.__init__ got an unexpected keyword argument {}", tpname, ab::repr_string(&key)?);
+                    if !pystr::is_str(&key) {
+                        // (a non-str key only warns; storing it then fails like any setattr)
+                        crate::modules::warnings::warn(crate::types::exceptions::DeprecationWarning(), &msg, 1)?;
+                    } else {
+                        return Err(crate::errors::type_error(&msg));
+                    }
                 }
                 ab::setattr(o, &key, &value)?;
             }
@@ -506,6 +512,8 @@ fn init_ast_type() -> PyResult<()> {
         ];
         t.tp_getset = crate::getset_table![("__dict__", fc::get_dict_attr, fc::set_dict_attr)];
         tobj::type_ready(ast_type())?;
+        // (core6) a heap type in CPython: its attributes (e.g. _fields) can be replaced
+        (*ast_type()).tp_flags &= !Py_TPFLAGS_IMMUTABLETYPE;
         let d = tobj::type_dict(ast_type());
         dict::set_item(d, name!("_fields"), &tuple::empty_tuple())?;
         dict::set_item(d, name!("_attributes"), &tuple::empty_tuple())?;

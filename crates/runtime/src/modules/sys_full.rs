@@ -1213,6 +1213,7 @@ fn compute_paths() -> PathConfig {
 
     // The base installation: <prefix>/bin/python3.15t -> <prefix>.
     let pythonhome = if use_env { std::env::var("PYTHONHOME").ok().filter(|v| !v.is_empty()) } else { None };
+    let home_from_env = pythonhome.is_some() && std::env::var("RPYTHON_PREFIX").is_err();
     let (base_prefix, base_exec_prefix) = if let Ok(p) = std::env::var("RPYTHON_PREFIX") {
         (p.clone(), p)
     } else if let Some(h) = pythonhome {
@@ -1239,7 +1240,8 @@ fn compute_paths() -> PathConfig {
         d
     } else {
         let p = format!("{}/lib/python3.15t", base_prefix);
-        if std::path::Path::new(&p).join("os.py").is_file() {
+        if std::path::Path::new(&p).join("os.py").is_file() || home_from_env {
+            // (an explicit PYTHONHOME is taken at its word, even when nothing is there)
             p
         } else {
             let dev = concat!(env!("CARGO_MANIFEST_DIR"), "/../../Lib");
@@ -1272,6 +1274,36 @@ pub fn stdlib_dir() -> String {
 
 /// The default module search path after PYTHONPATH: the stdlib zip, the
 /// stdlib directory and (if present) lib-dynload.
+/// (core6) With PYTHONHOME pointing where there is no standard library, startup cannot
+/// import `encodings`: report the path configuration and stop, as CPython does.
+pub fn check_stdlib_present() {
+    let c = config();
+    if c.ignore_environment != 0 || std::env::var("RPYTHON_PREFIX").is_ok() || c.stdlib_dir.is_some() {
+        return;
+    }
+    let Some(home) = std::env::var("PYTHONHOME").ok().filter(|v| !v.is_empty()) else { return };
+    let p = paths();
+    if std::path::Path::new(&p.stdlib_dir).join("encodings").join("__init__.py").is_file() {
+        return;
+    }
+    let pythonpath = std::env::var("PYTHONPATH").ok().filter(|v| !v.is_empty());
+    let mut msg = String::from("Python path configuration:\n");
+    msg.push_str(&format!("  PYTHONHOME = '{}'\n", home));
+    msg.push_str(&format!("  PYTHONPATH = {}\n", pythonpath.map_or("(not set)".to_string(), |v| format!("'{}'", v))));
+    msg.push_str(&format!("  isolated = {}\n  environment = 1\n", c.isolated));
+    msg.push_str(&format!("  sys.executable = '{}'\n  sys.prefix = '{}'\n  sys.exec_prefix = '{}'\n", p.executable, p.prefix, p.exec_prefix));
+    msg.push_str("  sys.path = [\n");
+    for e in default_search_path() {
+        msg.push_str(&format!("    '{}',\n", e));
+    }
+    msg.push_str("  ]\n");
+    msg.push_str("Fatal Python error: Failed to import encodings module\n");
+    msg.push_str("Python runtime state: core initialized\n");
+    msg.push_str("ModuleNotFoundError: No module named 'encodings'\n");
+    crate::modules::sys::write_fd(2, msg.as_bytes());
+    std::process::exit(1);
+}
+
 pub fn default_search_path() -> Vec<String> {
     let p = paths();
     let mut v = vec![p.zip_path.clone(), p.stdlib_dir.clone()];
@@ -1571,7 +1603,7 @@ pub fn populate(d: &PyObject) -> PyResult<()> {
         ("version", vi.clone()),
         ("hexversion", int::new_int(HEXVERSION)),
         ("_multiarch", s(MULTIARCH)),
-        ("supports_isolated_interpreters", bool_::new_bool(false)),
+        ("supports_isolated_interpreters", bool_::new_bool(true)), // D26 (subinterpreters)
     ])?;
     set("implementation", &impl_ns)?;
     let abi = crate::modules::sys_namespace::new_namespace(&[

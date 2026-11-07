@@ -553,7 +553,7 @@ fn copy_members(pure: &PyObject, native: *mut PyTypeObject) -> PyResult<()> {
         // methods implemented natively win over their pure counterparts
         if let Some(existing) = dict::get_item(dst, &k)? {
             let kind = type_name(existing.ty());
-            if kind == "method_descriptor" || kind == "classmethod_descriptor" {
+            if kind == "method_descriptor" || kind == "classmethod_descriptor" || kind == "member_descriptor" {
                 continue;
             }
         }
@@ -592,6 +592,19 @@ fn run_in(ns: &PyObject, src: &str, filename: &str) -> PyResult<()> {
 }
 
 static NS: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
+/// The pure `datetime.utcnow` function, run by the native classmethod.
+static PURE_UTCNOW: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
+
+/// `datetime.utcnow()` is a builtin classmethod (as in CPython); the work, including the
+/// deprecation warning, is the pure implementation's (no Python frame of its own is
+/// added between it and the caller, so the warning's stacklevel stays right).
+fn m_utcnow(cls: &PyObject) -> PyResult {
+    let f = PURE_UTCNOW.load(Ordering::Acquire);
+    if f.is_null() {
+        raise!(SystemError, "_datetime: utcnow is not initialised");
+    }
+    ab::call(unsafe { &*f }, &[cls])
+}
 
 const DATETIME_TEXT_SIGNATURES: &str = r#"
 def _with_text_signature(cls, name, sig):
@@ -637,6 +650,12 @@ fn build_namespace() -> PyResult<()> {
         let Some(pure) = dict::get_item_rs(&ns, name) else {
             raise!(SystemError, "_datetime: pure implementation lacks {}", name);
         };
+        if name == "datetime" {
+            if let Some(cm) = dict::get_item_rs(type_dict(pure.as_ptr() as *mut PyTypeObject), "utcnow") {
+                let f = ab::getattr(&cm, crate::name!("__func__"))?;
+                PURE_UTCNOW.store(f.into_raw(), Ordering::Release);
+            }
+        }
         copy_members(&pure, tp)?;
     }
     for (name, tp) in pairs {
@@ -890,6 +909,16 @@ fn init_types() -> PyResult<()> {
     unsafe {
         (*delta_type()).tp_methods = mdefs![
             ("total_seconds", NOARGS, m_total_seconds, "total_seconds($self, /)\n--\n\nThe duration expressed in seconds, as a float."),
+        ];
+        // (core6) the public fields are plain read-only members of the C struct, as in
+        // CPython (inspect.ismemberdescriptor(timedelta.days))
+        (*delta_type()).tp_members = crate::member_table![
+            ("days", Py_T_INT, std::mem::offset_of!(DeltaObj, days), Py_READONLY; "Whole days of the duration."),
+            ("seconds", Py_T_INT, std::mem::offset_of!(DeltaObj, seconds), Py_READONLY; "Seconds part of the duration, 0 <= seconds < 86400."),
+            ("microseconds", Py_T_INT, std::mem::offset_of!(DeltaObj, microseconds), Py_READONLY; "Microseconds part of the duration, 0 <= microseconds < 1000000."),
+        ];
+        (*datetime_type()).tp_methods = mdefs![
+            ("utcnow", NOARGS, m_utcnow, "utcnow($type, /)\n--\n\nThe current UTC date and time, naive (deprecated)."; METH_CLASS),
         ];
         (*date_type()).tp_methods = mdefs![
             ("isocalendar", NOARGS, m_isocalendar, "isocalendar($self, /)\n--\n\nThe ISO 8601 (year, week, weekday) of this date as a named tuple."),

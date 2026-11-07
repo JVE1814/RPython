@@ -14,6 +14,9 @@ pub struct Pos {
 }
 
 pub const NO_POS: Pos = Pos { line: -1, end_line: -1, col: -1, end_col: -1 };
+/// "The location of the next instruction" (resolved by `cfg::resolve_next_positions`): used
+/// where a branch event should report the code it leads to.
+pub const NEXT_POS: Pos = Pos { line: -2, end_line: -2, col: -2, end_col: -2 };
 
 impl Pos {
     pub fn is_some(&self) -> bool {

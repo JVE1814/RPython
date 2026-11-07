@@ -93,6 +93,19 @@ unsafe extern "C" fn cfunction_vectorcall(
         // Static methods of builtin types keep their type as __self__ (for
         // __qualname__ and pickling) but are called without a self.
         let slf = if (*(*ff).m_ml).ml_flags & METH_STATIC != 0 && !(*ff).m_self.is_null() && is_type(&*(*ff).m_self) { std::ptr::null_mut() } else { (*ff).m_self };
+        if nkw != 0 && (*(*ff).m_ml).ml_flags & METH_KEYWORDS == 0 {
+            // named like other call errors: `module.name()` for functions outside builtins
+            let mut n = cfunction_qualname(fo);
+            if self_is_meaningful(fo).is_none() {
+                if let Some(m) = (!(*ff).m_module.is_null()).then(|| &*(*ff).m_module).filter(|m| crate::types::str::is_str(m)) {
+                    let m = crate::types::str::to_string_lossy(m);
+                    if m != "builtins" {
+                        n = format!("{}.{}", m, n);
+                    }
+                }
+            }
+            return into_c(Err(crate::err!(TypeError, "{}() takes no keyword arguments", n)));
+        }
         into_c(crate::methods::call_methoddef((*ff).m_ml, slf, cls, all, kwnames, &|| cfunction_qualname(fo)))
     }
 }
@@ -171,13 +184,40 @@ fn get_name(o: &PyObject) -> PyResult {
 fn get_qualname(o: &PyObject) -> PyResult {
     Ok(pystr::new_str(&cfunction_qualname(o)))
 }
+/// A builtin type's static method keeps its type in m_self (for __qualname__), but has no
+/// __self__ and takes __module__ from the type.
+fn static_of_type(o: &PyObject) -> Option<&PyObject> {
+    unsafe {
+        let f = fptr(o);
+        let s = (*f).m_self;
+        ((*(*f).m_ml).ml_flags & METH_STATIC != 0 && !s.is_null() && is_type(&*s)).then(|| &*s)
+    }
+}
 fn get_self(o: &PyObject) -> PyResult {
+    if static_of_type(o).is_some() {
+        return Ok(none::none_ref());
+    }
     unsafe {
         let s = (*fptr(o)).m_self;
         Ok(if s.is_null() { none::none_ref() } else { PyRef::from_borrowed(s) })
     }
 }
 fn get_module(o: &PyObject) -> PyResult {
+    if let Some(t) = static_of_type(o) {
+        if unsafe { (*fptr(o)).m_module.is_null() } {
+            // static types: the module is the dotted prefix of tp_name (never fails, also
+            // while the builtin types are still being set up)
+            let tp = as_type(t);
+            if unsafe { (*tp).tp_flags & Py_TPFLAGS_HEAPTYPE == 0 } {
+                let n = unsafe { CStr::from_ptr((*tp).tp_name).to_string_lossy() };
+                return Ok(pystr::new_str(n.rfind('.').map_or("builtins", |i| &n[..i])));
+            }
+            if let Ok(Some(m)) = crate::abstract_::getattr_opt(t, crate::name!("__module__")) {
+                return Ok(m);
+            }
+            crate::errors::clear_exc();
+        }
+    }
     unsafe {
         let s = (*fptr(o)).m_module;
         Ok(if s.is_null() { none::none_ref() } else { PyRef::from_borrowed(s) })

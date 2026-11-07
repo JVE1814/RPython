@@ -14,15 +14,175 @@ use crate::types::code::CodeData;
 use crate::types::typeobject::*;
 use crate::types::{bool_, dict, float, frozendict, funcobject, genobject, int, list, none, set, str as pystr, tuple};
 use rpy_compiler::wordcode::{self as wc, opcodes as o};
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering::Relaxed;
 
 /// Marker: observed operands that no specialisation covers.
 pub const GENERIC: u8 = 1;
 
-/// Record observation `k` (a specialised opcode, or GENERIC) for internal pc `pc`.
+// ---- thread-local bytecode (core6)
+//
+// A free-threaded CPython gives every thread its own copy of the specialised bytecode
+// (`-X tlbc=1`, the default) or does not specialise at all (`-X tlbc=0`). The view
+// follows that: the main thread records into `CodeData.spec`, every other thread into a
+// copy of its own, indexed by a small per-thread number that a later thread reuses once
+// its owner has exited (so short-lived threads share one copy, as in CPython).
+
+/// Number of distinct per-thread copies; threads beyond share the last one.
+const MAX_VIEWS: usize = 63;
+
+/// The per-thread copies of one code object's view (allocated on first use).
+#[derive(Default)]
+pub struct ThreadViews {
+    table: std::sync::atomic::AtomicPtr<[std::sync::atomic::AtomicPtr<AtomicU8>; MAX_VIEWS]>,
+    len: std::sync::atomic::AtomicUsize,
+}
+
+impl Drop for ThreadViews {
+    fn drop(&mut self) {
+        let t = *self.table.get_mut();
+        if t.is_null() {
+            return;
+        }
+        let len = *self.len.get_mut();
+        unsafe {
+            let t = Box::from_raw(t);
+            for p in t.iter() {
+                let p = p.load(Relaxed);
+                if !p.is_null() {
+                    drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(p, len)));
+                }
+            }
+        }
+    }
+}
+
+impl ThreadViews {
+    fn get(&self, idx: usize, len: usize) -> &[AtomicU8] {
+        use std::sync::atomic::{AtomicPtr, Ordering::{AcqRel, Acquire}};
+        let mut t = self.table.load(Acquire);
+        if t.is_null() {
+            self.len.store(len, Relaxed);
+            let fresh = Box::into_raw(Box::new([const { AtomicPtr::new(std::ptr::null_mut()) }; MAX_VIEWS]));
+            match self.table.compare_exchange(std::ptr::null_mut(), fresh, AcqRel, Acquire) {
+                Ok(_) => t = fresh,
+                Err(cur) => {
+                    unsafe { drop(Box::from_raw(fresh)) };
+                    t = cur;
+                }
+            }
+        }
+        let slot = unsafe { &(*t)[(idx - 1).min(MAX_VIEWS - 1)] };
+        let mut p = slot.load(Acquire);
+        if p.is_null() {
+            let fresh: Box<[AtomicU8]> = (0..len).map(|_| AtomicU8::new(0)).collect();
+            let fresh = Box::into_raw(fresh) as *mut AtomicU8;
+            match slot.compare_exchange(std::ptr::null_mut(), fresh, AcqRel, Acquire) {
+                Ok(_) => p = fresh,
+                Err(cur) => {
+                    unsafe { drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(fresh, len))) };
+                    p = cur;
+                }
+            }
+        }
+        unsafe { std::slice::from_raw_parts(p, len) }
+    }
+}
+
+/// `-X tlbc` / PYTHON_TLBC (default on).
+pub fn tlbc_enabled() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| {
+        let c = crate::modules::sys_full::config();
+        for x in c.xoptions.iter().rev() {
+            if let Some(v) = x.strip_prefix("tlbc=") {
+                return v != "0";
+            }
+        }
+        if c.ignore_environment == 0 {
+            if let Ok(v) = std::env::var("PYTHON_TLBC") {
+                return v != "0";
+            }
+        }
+        true
+    })
+}
+
+static VIEW_SLOTS: std::sync::Mutex<Vec<bool>> = std::sync::Mutex::new(Vec::new());
+
+/// Returns the thread's view number to the pool when the OS thread exits.
+struct ViewSlot(usize);
+impl Drop for ViewSlot {
+    fn drop(&mut self) {
+        if let Ok(mut v) = VIEW_SLOTS.lock() {
+            if let Some(b) = v.get_mut(self.0) {
+                *b = false;
+            }
+        }
+    }
+}
+
+thread_local! {
+    static VIEW_INDEX: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    static VIEW_SLOT: std::cell::RefCell<Option<ViewSlot>> = const { std::cell::RefCell::new(None) };
+}
+
+/// This thread's view number: 0 for the main thread (and for every thread without
+/// thread-local bytecode), else the smallest number no live thread holds.
+fn view_index() -> usize {
+    let i = VIEW_INDEX.with(|c| c.get());
+    if i != usize::MAX {
+        return i;
+    }
+    let main = crate::threads::MAIN_THREAD_STATE.load(std::sync::atomic::Ordering::Acquire);
+    let me = crate::threads::current() as *const crate::threads::ThreadState as *mut crate::threads::ThreadState;
+    let i = if !tlbc_enabled() || main.is_null() || main == me {
+        0
+    } else {
+        let mut v = VIEW_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        if v.is_empty() {
+            v.push(true); // 0: the main thread
+        }
+        let i = match v.iter().position(|b| !b) {
+            Some(i) => i,
+            None => {
+                v.push(false);
+                v.len() - 1
+            }
+        };
+        v[i] = true;
+        drop(v);
+        let _ = VIEW_SLOT.try_with(|s| *s.borrow_mut() = Some(ViewSlot(i)));
+        i
+    };
+    VIEW_INDEX.with(|c| c.set(i));
+    i
+}
+
+/// The current thread's specialisation view of `cd` (empty: nothing is recorded).
+#[inline]
+pub fn view(cd: &CodeData) -> &[AtomicU8] {
+    if cd.spec.is_empty() || !tlbc_enabled() {
+        return &[];
+    }
+    match view_index() {
+        0 => &cd.spec,
+        i => cd.spec_tl.get(i, cd.spec.len()),
+    }
+}
+
+/// Identity of the current thread's view (`_testinternalcapi.get_tlbc_id`).
+pub fn view_id(cd: &CodeData) -> usize {
+    if cd.spec.is_empty() || !tlbc_enabled() {
+        return cd.spec.as_ptr() as usize;
+    }
+    view(cd).as_ptr() as usize
+}
+
+/// Record observation `k` (a specialised opcode, or GENERIC) for internal pc `pc` in `spec`.
 #[inline(always)]
-pub fn note(cd: &CodeData, pc: usize, k: u16) {
-    if let Some(s) = cd.spec.get(pc) {
+pub fn note_in(spec: &[AtomicU8], pc: usize, k: u16) {
+    if let Some(s) = spec.get(pc) {
         let old = s.load(Relaxed);
         let k = k as u8;
         if old != k {
@@ -31,21 +191,27 @@ pub fn note(cd: &CodeData, pc: usize, k: u16) {
     }
 }
 
+/// Record observation `k` for internal pc `pc` in the current thread's view.
+#[inline]
+pub fn note(cd: &CodeData, pc: usize, k: u16) {
+    note_in(view(cd), pc, k)
+}
+
 /// Has this instruction already been classified (generic or specialised)? Callers skip
 /// expensive classifications then.
 #[inline(always)]
-pub fn seen(cd: &CodeData, pc: usize) -> bool {
-    cd.spec.get(pc).is_none_or(|s| s.load(Relaxed) != 0)
+pub fn seen_in(spec: &[AtomicU8], pc: usize) -> bool {
+    spec.get(pc).is_none_or(|s| s.load(Relaxed) != 0)
 }
 
-#[inline(always)]
+#[inline]
 pub fn is_generic(cd: &CodeData, pc: usize) -> bool {
-    cd.spec.get(pc).is_none_or(|s| s.load(Relaxed) == GENERIC)
+    view(cd).get(pc).is_none_or(|s| s.load(Relaxed) == GENERIC)
 }
 
-#[inline(always)]
+#[inline]
 pub fn active(cd: &CodeData) -> bool {
-    !cd.spec.is_empty()
+    !view(cd).is_empty()
 }
 
 const G: u16 = GENERIC as u16;
@@ -513,7 +679,8 @@ pub fn adaptive_code(co: &PyObject) -> Vec<u8> {
         return out;
     }
     let cd = crate::types::code::code_data(co);
-    if cd.spec.is_empty() {
+    let spec = view(cd);
+    if spec.is_empty() {
         return out;
     }
     for ins in wc::instructions(&out.clone()) {
@@ -529,7 +696,7 @@ pub fn adaptive_code(co: &PyObject) -> Vec<u8> {
         if cd.pub_of_internal.get(ipc) != Some(&ins.offset) {
             continue; // the instruction has no internal word of its own
         }
-        let v = cd.spec[ipc].load(Relaxed) as u16;
+        let v = spec[ipc].load(Relaxed) as u16;
         if v >= wc::opcodes::MIN_SPECIALIZED_OPCODE && wc::deopt(v) == wc::deopt(ins.op as u16) {
             out[2 * ins.offset as usize] = v as u8;
         }

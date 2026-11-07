@@ -130,6 +130,8 @@ pub fn call_function(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwna
             && flags & (bc::co::VARARGS | bc::co::VARKEYWORDS) == 0
             && cobj.co_kwonlyargcount == 0
             && !code::code_data(co).eager_prologue
+            // (module-level code with top-level await stores names: general path)
+            && flags & bc::co::OPTIMIZED != 0
         {
             let mut frame = Frame::new_call(co, func, unsafe { &*f.func_globals }, unsafe { &*f.func_builtins });
             for (i, &a) in args[..nargs].iter().enumerate() {
@@ -137,6 +139,10 @@ pub fn call_function(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwna
                 frame.slots[i] = a;
             }
             frame.make_owned();
+            copy_free_vars(&mut frame, f);
+            if crate::modules::testinternalcapi::eval_hook_active() {
+                crate::modules::testinternalcapi::record_frame(co); // the creating call evaluates the frame too
+            }
             return crate::types::genobject::new_generator_for(frame, func, flags);
         }
         if kwnames.is_none() && nargs == 1 {
@@ -165,6 +171,14 @@ pub fn call_function(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwna
             // RETURN_GENERATOR is preceded by real work (a genexpr's `iter()`): run the
             // frame up to it now, so errors surface at call time.
             frame = run_generator_prologue(frame)?;
+        } else {
+            // the free variables are in place from creation on (CPython copies them before
+            // RETURN_GENERATOR), so f_locals of a not yet started frame shows them; the
+            // CopyFreeVars at the first resume stores the same cells again
+            copy_free_vars(&mut frame, f);
+            if crate::modules::testinternalcapi::eval_hook_active() {
+                crate::modules::testinternalcapi::record_frame(co); // the creating call evaluates the frame too
+            }
         }
         return crate::types::genobject::new_generator_for(frame, func, flags);
     }
@@ -263,6 +277,9 @@ fn new_genexpr(func: &PyObject, f: &PyFunctionObject, co: &PyObject, arg: *mut P
     frame.lasti = cd.gen_start - 1;
     frame.next_instr = cd.gen_start;
     frame.make_owned();
+    if crate::modules::testinternalcapi::eval_hook_active() {
+        crate::modules::testinternalcapi::record_frame(co);
+    }
     Some(crate::types::genobject::new_generator_for(frame, func, flags))
 }
 
@@ -348,6 +365,22 @@ fn prepare_cells(frame: &mut Frame, f: &PyFunctionObject) {
     let _ = (frame, f);
 }
 
+fn copy_free_vars(frame: &mut Frame, f: &PyFunctionObject) {
+    if f.func_closure.is_null() {
+        return;
+    }
+    let n = code::code(frame.code()).nfreevars();
+    let items = tuple::tuple_items(unsafe { &*f.func_closure });
+    if n == 0 || items.len() < n || frame.nlocalsplus < n {
+        return;
+    }
+    let base = frame.nlocalsplus - n;
+    for i in 0..n {
+        let old = std::mem::replace(&mut frame.slots[base + i], items[i].to_ref().into_raw());
+        unsafe { xdecref(old) };
+    }
+}
+
 /// Put arguments into localsplus according to CPython's binding rules.
 pub fn bind_arguments(func: &PyObject, frame: &mut Frame, args: &[*mut PyObject], nargs: usize, kwnames: Option<&PyObject>) -> PyResult<()> {
     let f = funcobject::func(func);
@@ -394,6 +427,9 @@ pub fn bind_arguments(func: &PyObject, frame: &mut Frame, args: &[*mut PyObject]
     if let Some(kn) = kwnames {
         let names = &cd.d.localsplusnames;
         for (j, key) in tuple::tuple_items(kn).iter().enumerate() {
+            if !pystr::is_str(key) {
+                raise!(TypeError, "{}() keywords must be strings", qualname());
+            }
             let value = args[nargs + j];
             let mut found = None;
             // identity first, then equality
@@ -447,7 +483,7 @@ pub fn bind_arguments(func: &PyObject, frame: &mut Frame, args: &[*mut PyObject]
                         );
                     }
                     let ks = pystr::to_string_lossy(key);
-                    let suggestion = crate::modules::suggestions::suggest_keyword(&ks, &names[..total_named]);
+                    let suggestion = crate::modules::suggestions::suggest_keyword(&ks, &names[posonly..total_named]);
                     match suggestion {
                         Some(s) => raise!(
                             TypeError,
@@ -584,6 +620,18 @@ pub fn eval_code(code: &PyObject, globals: &PyObject, locals: Option<&PyObject>)
         }
     };
     let frame = Frame::new(code, None, globals, &builtins, locals);
+    run_or_wrap(frame)
+}
+
+/// Run a frame of module-level code; code compiled with top-level await (a coroutine
+/// flag on non-function code) gives the coroutine to run instead, as CPython's eval does.
+fn run_or_wrap(mut frame: Box<Frame>) -> PyResult {
+    let co = frame.code().to_ref();
+    let flags = code::code(&co).flags();
+    if flags & (bc::co::GENERATOR | bc::co::COROUTINE | bc::co::ASYNC_GENERATOR) != 0 {
+        frame.make_owned();
+        return crate::types::genobject::new_generator_named(frame, &code::code_name(&co), &code::code_qualname(&co), flags);
+    }
     run_frame(frame)
 }
 
@@ -599,7 +647,7 @@ pub fn eval_code_with_closure(code: &PyObject, globals: &PyObject, locals: Optio
             for (i, cell) in tuple::tuple_items(c).iter().enumerate() {
                 frame.slots[nlp - n + i] = cell.to_ref().into_raw();
             }
-            run_frame(frame)
+            run_or_wrap(frame)
         }
     }
 }

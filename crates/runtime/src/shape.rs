@@ -672,6 +672,27 @@ pub fn transitions_adding(tp: *mut PyTypeObject, name: *mut PyObject, ix: usize)
         .collect()
 }
 
+/// (core6) Every attribute name any instance of `tp` has stored inline, in the order the
+/// names first appeared (the counterpart of CPython's per-class shared keys; read by
+/// `_testinternalcapi.get_object_dict_values`). Shapes are kept in creation order and
+/// each adds one name, so the last key of each shape, deduplicated, is that order.
+pub fn type_key_order(tp: *mut PyTypeObject) -> Vec<*mut PyObject> {
+    let t = tree_of(tp);
+    if t.is_null() {
+        return Vec::new();
+    }
+    let g = unsafe { (*t).inner.lock().unwrap_or_else(|e| e.into_inner()) };
+    let mut out: Vec<*mut PyObject> = Vec::new();
+    for &s in g.shapes.iter() {
+        if let Some(&k) = unsafe { (*s).keys().last() } {
+            if !out.contains(&k) {
+                out.push(k);
+            }
+        }
+    }
+    out
+}
+
 /// Layout constants for JIT code: byte offsets of (shape.id, shape.len, shape.keys,
 /// shape.voff). The managed-dict word holds `shape | 1`; value `i` of an object `o`
 /// is at `o + shape.voff + 8 * i`.

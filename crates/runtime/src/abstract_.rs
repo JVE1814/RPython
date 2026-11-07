@@ -289,11 +289,12 @@ pub fn call_with_kwargs_dict(callable: &PyObject, args: &[&PyObject], kw: Option
 /// (perf3): callables without vectorcall get that tuple as is (no vector, no second
 /// tuple); others get a stack vector.
 pub fn call_ex_tuple(callable: &PyObject, self_or_null: Option<&PyObject>, args: &PyObject, kw: Option<&PyObject>) -> PyResult {
-    let kw = kw.filter(|k| dict::dict_len(k) > 0);
-    let items = tuple::tuple_items(args);
+    // a callable without vectorcall gets the tuple and the keyword dict exactly as built (core6)
     if self_or_null.is_none() && vectorcall_func(callable).is_none() && callable.ty().tp_call.is_some() {
         return call_tp_call(callable, args, kw);
     }
+    let kw = kw.filter(|k| dict::dict_len(k) > 0);
+    let items = tuple::tuple_items(args);
     let n = items.len() + self_or_null.is_some() as usize;
     if n <= 8 {
         let mut buf: [&PyObject; 8] = [callable; 8];

@@ -163,6 +163,13 @@ pub fn set_interrupt(signum: i32) -> PyResult<()> {
     if int::is_int(h) {
         return Ok(()); // SIG_IGN / SIG_DFL
     }
+    if crate::modules::sys_full::is_finalizing() {
+        // the Python-level handlers are going away with the interpreter: CPython finds
+        // the handler gone when it would run it and reports that
+        let _ = crate::err!(OSError, "Signal {} ignored due to race condition", signum);
+        crate::modules::sys_full::write_unraisable(None, None);
+        return Ok(());
+    }
     trip(signum);
     Ok(())
 }

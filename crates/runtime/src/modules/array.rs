@@ -1262,7 +1262,7 @@ unsafe extern "C" fn iter_next(o: *mut PyObject) -> *mut PyObject {
 
 fn iter_reduce(o: &PyObject) -> PyResult {
     let it = unsafe { &*(o.as_ptr() as *const IterObj) };
-    let iterf = crate::builtins::builtin("iter")?;
+    let iterf = crate::builtins::eval_builtin("iter")?;
     if it.ao.is_null() {
         return Ok(tuple::tuple2(iterf, tuple::new_tuple(vec![tuple::empty_tuple()])));
     }
