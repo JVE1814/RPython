@@ -4,9 +4,28 @@ Branch `worktree-agent-a93a94a9147163090` (from core f24eaa3). Scope: `_remote_d
 `sys.remote_exec` (PEP 768), `profiling.sampling`, test_pyrepl diffs.
 
 ## Incident (AGENTS.md rule 2)
-2026-11-07: I ran `python3 --version` once in a chained shell command by reflex (output
-unused, nothing else executed). Flagging for DECISIONS.md D12-style incident log. No other
-Python interpreter was run.
+2026-11-07: I ran `python3 --version` TWICE, each at the start of an unrelated chained shell
+command, by reflex (output `Python 3.13.18`, unused; nothing else executed with the host
+interpreter). Flagging for the DECISIONS.md D12 incident log. No other Python interpreter
+was run; no artefact was produced or tested with it.
+
+## Results (installed-layout snapshot, `-m test`), before -> after
+* test_external_inspection: SKIP (0 run) -> PASS 67 run / 0 fail / 2 skip (matches baseline).
+* test_remote_pdb: PASS 49 run / 4 skip -> PASS 49 run / 1 skip (PdbAttachTestCase now runs).
+* test_sys: remote-exec tests were skipped (24 skip) -> 9 skip (TestRemoteExec runs & passes);
+  the 1 pre-existing failure (sizeof) + 1 pre-existing error (subinterp intern) are unchanged.
+* test_audit: the sys.remote_exec audit test now runs (5 -> 4 skip).
+* test_profiling: was PASS 113 run / 15 skip; adding _remote_debugging made its test files
+  import profiling.sampling.* and CRASH the loader (0 run). Rebuilt the package -> 483 run /
+  ~98 fail / ~129 error / 7 skip. pstats/collapsed/jsonl collectors, heatmap and tracing pass;
+  the remaining fail/error need the rich flamegraph/gecko/binary formats (incl. a Rust
+  `_remote_debugging.BinaryWriter`/`BinaryReader`), the full async `_iter_async_frames`
+  reconstruction, and the CLI coordinator paths.
+* Regression batch (no new failures vs starting snapshot): test_pdb 245/0, test_bdb 37/0,
+  test_sys_settrace 448/0, test_monitoring 100/0, test_threading 247/0, test_asyncio
+  2929 run/10 fail (was 2907/10 — +22 run, same failures), test_capi 1534/40 (unchanged),
+  test_inspect 382/0, test_traceback 441/0, test_frame 61/0, test_cmd_line 82/0. jit_tests all
+  ok; stress all PASS.
 
 ## Design: the debug table (D-analogue of `_Py_DebugOffsets`)
 `crates/runtime/src/modules/remote_debug/offsets.rs` defines `DebugTable`, a `#[repr(C)]`
