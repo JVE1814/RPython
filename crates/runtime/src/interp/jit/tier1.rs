@@ -681,6 +681,11 @@ impl<'a> Gen<'a> {
                 let slow = self.a.label();
                 let done = self.a.label();
                 let l = self.local(arg);
+                // (stability3) with threads the contents are read under the cell's
+                // lock (funcobject::cell_get): helper
+                self.a.mov_ri(Rdi, (&raw const crate::threads::MULTI_THREADED) as i64);
+                self.a.cmp_mi(M(Rdi, 0), 0);
+                self.a.jcc(Cc::NE, slow);
                 self.a.load(Rax, l);
                 self.a.test_rr(Rax, Rax);
                 self.a.jcc(Cc::E, slow);
