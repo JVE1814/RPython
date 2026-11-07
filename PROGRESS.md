@@ -1,11 +1,11 @@
 # PROGRESS
 
 ## Status 2026-11-07 (day 7, afternoon)
-Master 24d1c6a: core6, perf4, tail1, capi2, cleanroom1+2 (20 Lib modules rewritten clean-room), scale1 (multi-core scaling), tail2 (re.DEBUG, _zoneinfo, ssl PSK, alloc-failure injection, 22 modules), perf5, stability3 (test_free_threading passes), scale2 checkpoint (concurrent_futures + multiprocessing pass), pdb1 (clean-room pdb: test_pdb, test_remote_pdb pass), tail3 (crossinterp, getpath, nturl2path, ast, multiprocessing, httpservers, asyncio 10→2), cleanroom3, scale2 merged today; suite run 14: 417/434 pass or whole-module skip, 10 modules fail that pass on CPython, fewer skips than CPython; suite run 13: 396/434 pass or whole-module skip; suite run 12: 367/434 modules pass, 129 failures, 70 errors. Smoke on snap19: test_capi 40 failures (was 433 in run 11),
+Master 24d1c6a: core6, perf4, tail1, capi2, cleanroom1+2 (20 Lib modules rewritten clean-room), scale1 (multi-core scaling), tail2 (re.DEBUG, _zoneinfo, ssl PSK, alloc-failure injection, 22 modules), perf5, stability3 (test_free_threading passes), scale2 checkpoint (concurrent_futures + multiprocessing pass), pdb1 (clean-room pdb: test_pdb, test_remote_pdb pass), tail3 (crossinterp, getpath, nturl2path, ast, multiprocessing, httpservers, asyncio 10→2), cleanroom3, scale2, perf6 (startup image: python_startup 0.88x) merged today; suite run 14: 417/434 pass or whole-module skip, 10 modules fail that pass on CPython, fewer skips than CPython; suite run 13: 396/434 pass or whole-module skip; suite run 12: 367/434 modules pass, 129 failures, 70 errors. Smoke on snap19: test_capi 40 failures (was 433 in run 11),
 stable_abi_ctypes/fileutils pass, cmd_line_script 1; tail1 fixed ~60 long-tail modules (inspect, codecs, time,
 path modules, math, buffer, logging, json, ...). Run 11 (pre-merges):
 294/434 modules pass, 674 failures (241 without test_capi), 616 errors. Baseline free-threaded CPython: 416/434.
-Running agents: refs1 (borrowed stack references), perf6 (startup image, slow call paths, xml engine, memory), cleanroom4 (D19 Lib audit, round 4),
+Running agents: refs1 (borrowed stack references), perf7 (remaining benchmark gaps, memory), cleanroom4 (D19 Lib audit, round 4),
 capi3 (remaining test_capi, test_sys sizes, per-interpreter interning), remote1 (_remote_debugging, sys.remote_exec,
 profiling.sampling, pyrepl).
 Earlier history (2026-11-02): agents stopped when the weekly API limit was hit; resumed Nov 5.
@@ -131,7 +131,28 @@ Run 1 top blockers: py_compile (230 modules; merged since), unittest.mock (57), 
 array (24), socket (17), pathlib (16), http (14), multiprocessing, decimal, datetime, ntpath.
 
 ## Benchmarks
-### Latest (perf5, 2026-11-07; wall ratio ours / best CPython, pinned one core, one run each, load 6–7, ±10–15%)
+### Latest (perf6, 2026-11-07; wall ratio ours / best CPython, pinned, ±10–15%)
+| benchmark | perf5 | perf6 |
+|---|---|---|
+| python_startup | 1.29 | 0.88 |
+| pprint | 1.02 | 0.82 |
+| concurrent_imap | 1.08 | 0.97 |
+| xml_etree | 1.55 | 1.21 |
+| deepcopy | 1.36 | 1.48 |
+| mdp | 1.24 | 1.32 |
+| typing_runtime_protocols | 1.25 | 1.32 |
+| logging | 1.30 | 1.31 |
+| bpe_tokeniser | 1.30 | 1.29 |
+| comprehensions | 1.27 | 1.27 |
+| nqueens | 1.14 | 1.22 |
+| pathlib | 1.16 | 1.17 |
+| base64 | 1.18 | 1.15 |
+| async_generators | 1.17 | 1.12 |
+(perf5 and perf6 columns are separate noisy sweeps; perf6's own base→head showed no regressions.) Startup `-c pass`:
+39.2M instructions (CPython 40.5M), 8.9 ms vs 10.1 ms (D30 startup image). Peak RSS 35.8 MB (CPython 32.3); start-up RSS
+12.0 vs 9.2 MB, mostly file-backed. perf7 is on the remaining gaps.
+
+### Previous (perf5, 2026-11-07; wall ratio ours / best CPython, pinned one core, one run each, load 6–7, ±10–15%)
 | benchmark | perf4 | perf5 |
 |---|---|---|
 | xml_etree | 1.55 | 1.55 |
