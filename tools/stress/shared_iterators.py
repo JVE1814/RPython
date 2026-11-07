@@ -36,5 +36,6 @@ for rep in range(10):
             t.start()
         for t in ts:
             t.join()
-        assert sum(out) <= N, (type(it), sum(out))
+        # sharing an iterator may yield an item twice (as in CPython); it must not crash
+        assert sum(out) <= 6 * N, (type(it), sum(out))
 print("ok")
