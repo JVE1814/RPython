@@ -383,6 +383,9 @@ class Pdb(bdb.Bdb, cmd.Cmd):
         self._status_pending = False
         self._convenience_globals = None
         self._stop_variables = {}
+        self._continuing_block = False
+        self._readline_active = False
+        self._resumed_coroutine = None
         self._async_frame = None
         self._pending_awaitable = None
         self.lineno = None
@@ -515,6 +518,9 @@ class Pdb(bdb.Bdb, cmd.Cmd):
                 not self.breaks):
             # continue without breakpoints: nothing left to watch
             return
+        # if the coroutine was suspended by an awaitable run at the prompt,
+        # its resumption may be reported only now: it is not a new call
+        self._resumed_coroutine = frame
         self.start_trace()
 
     # ---- bdb hooks
@@ -527,6 +533,9 @@ class Pdb(bdb.Bdb, cmd.Cmd):
         if self._wait_for_mainpyfile:
             if self._is_main_file(frame):
                 self._main_frame_started = True
+            return
+        if frame is self._resumed_coroutine:
+            self._resumed_coroutine = None
             return
         if self.stop_here(frame):
             self.message('--Call--')
@@ -661,6 +670,7 @@ class Pdb(bdb.Bdb, cmd.Cmd):
         """Stop: show where we are and run the command loop."""
         self._restore_sigint_handler()
         self._cmd_frame = None
+        self._resumed_coroutine = None
         exceptions = ()
         if isinstance(tb_or_exc, BaseException):
             exc = tb_or_exc
@@ -942,6 +952,8 @@ class Pdb(bdb.Bdb, cmd.Cmd):
             import readline
         except ImportError:
             return None
+        # importing rlcompleter installs its own completer: do it first
+        import rlcompleter
         previous = readline.get_completer()
         previous_delims = readline.get_completer_delims()
         readline.set_completer(self.complete)
@@ -950,6 +962,7 @@ class Pdb(bdb.Bdb, cmd.Cmd):
             readline.parse_and_bind('bind ^I rl_complete')
         else:
             readline.parse_and_bind(self.completekey + ': complete')
+        self._readline_active = True
         return readline, previous, previous_delims
 
     def _read_line(self, prompt, state='pdb'):
@@ -989,6 +1002,7 @@ class Pdb(bdb.Bdb, cmd.Cmd):
             self.postloop()
         finally:
             if saved is not None:
+                self._readline_active = False
                 readline, previous, delims = saved
                 readline.set_completer(previous)
                 readline.set_completer_delims(delims)
@@ -1259,8 +1273,8 @@ class Pdb(bdb.Bdb, cmd.Cmd):
             if self._async_frame is None:
                 raise
             import ast
-            return codeop.compile_command(source, '<stdin>', 'single',
-                                          flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+            return compile(source, '<stdin>', 'exec',
+                           ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
 
     def default(self, line):
         """Execute a line that is not a command as Python code."""
@@ -1279,15 +1293,20 @@ class Pdb(bdb.Bdb, cmd.Cmd):
             if compiled is None:
                 # an incomplete statement: read until it is complete
                 prompt = '...'.ljust(len(self.prompt))
-                while compiled is None:
-                    try:
-                        more = self._read_continuation(prompt)
-                    except (EOFError, KeyboardInterrupt):
-                        self.lastcmd = ''
-                        self.message('')
-                        return
-                    source += '\n' + more
-                    compiled = self._compile_input(source)
+                lines = [source]
+                with self._block_editing(lines):
+                    while compiled is None:
+                        try:
+                            more = self._read_continuation(prompt)
+                        except (EOFError, KeyboardInterrupt):
+                            self.lastcmd = ''
+                            self.message('')
+                            return
+                        if not more.strip():
+                            more = ''
+                        lines.append(more)
+                        source += '\n' + more
+                        compiled = self._compile_input(source)
                 self.lastcmd = source
         except:
             self._error_exc()
@@ -2283,8 +2302,9 @@ class Pdb(bdb.Bdb, cmd.Cmd):
         had_ps1 = hasattr(sys, 'ps1')
         saved_ps = getattr(sys, 'ps1', None), getattr(sys, 'ps2', None)
         try:
-            console.interact(banner='*pdb interact start*',
-                             exitmsg='*exit from pdb interact command*')
+            with self._python_completion(ns):
+                console.interact(banner='*pdb interact start*',
+                                 exitmsg='*exit from pdb interact command*')
         except SystemExit:
             pass
         finally:
@@ -2474,10 +2494,25 @@ class Pdb(bdb.Bdb, cmd.Cmd):
                        if name.startswith('do_')} | set(self.aliases))
 
     def completenames(self, text, line, begidx, endidx):
+        if self._continuing_block:
+            # inside a multi-line statement: Python only; a tab before any
+            # text indents to the next multiple of four columns
+            if not text.strip():
+                typed = self._readline_line_before_cursor()
+                return [' ' * (4 - len(typed) % 4)]
+            return self._complete_expression(text, line, begidx, endidx)
         commands = [name for name in self._command_names() if name.startswith(text)]
         if commands:
             return commands
         return self._complete_expression(text, line, begidx, endidx)
+
+    @staticmethod
+    def _readline_line_before_cursor():
+        try:
+            import readline
+            return readline.get_line_buffer()[:readline.get_endidx()]
+        except Exception:
+            return ''
 
     def _completion_namespace(self):
         if self.curframe is None:
@@ -2485,23 +2520,31 @@ class Pdb(bdb.Bdb, cmd.Cmd):
         return {**self.curframe.f_globals, **self.curframe.f_locals}
 
     def _complete_expression(self, text, line, begidx, endidx):
+        """Names (or attributes, after a dot) of the current frame; builtins
+        and keywords only when nothing else matches."""
         if self.curframe is None:
             return []
         ns = self._completion_namespace()
-        if text.startswith('$'):
-            store = self.curframe.f_globals.get('__pdb_convenience_variables', {})
-            return ['$' + name for name in store if name.startswith(text[1:])]
-        dotted = line[:endidx].split()[-1] if line[:endidx].split() else text
-        if '.' in dotted:
-            # attribute completion: evaluate everything before the last dot
-            head, _, tail = dotted.rpartition('.')
-            head = re.split(r'[^\w.$]', head)[-1]
+        store = self.curframe.f_globals.get('__pdb_convenience_variables', {})
+        if '.' in text:
+            parts = text.split('.')
+            head = parts[0]
             try:
-                obj = self._eval(head)
-            except Exception:
+                if head.startswith('$'):
+                    obj = store[head[1:]]
+                else:
+                    obj = ns[head]
+                for part in parts[1:-1]:
+                    obj = getattr(obj, part)
+            except (KeyError, AttributeError):
                 return []
-            prefix = text[:len(text) - len(tail)] if text.endswith(tail) else ''
-            return [prefix + name for name in dir(obj) if name.startswith(tail)]
+            prefix = '.'.join(parts[:-1]) + '.'
+            return [prefix + name for name in dir(obj) if name.startswith(parts[-1])]
+        if text.startswith('$'):
+            return ['$' + name for name in store if name.startswith(text[1:])]
+        names = [name for name in ns if isinstance(name, str) and name.startswith(text)]
+        if names:
+            return names
         import rlcompleter
         completer = rlcompleter.Completer(ns)
         matches = []
@@ -2546,6 +2589,51 @@ class Pdb(bdb.Bdb, cmd.Cmd):
 
     def complete_unalias(self, text, line, begidx, endidx):
         return [name for name in self.aliases if name.startswith(text)]
+
+    @contextmanager
+    def _block_editing(self, lines):
+        """While the rest of a multi-line statement is read: indent each
+        new line like the previous one (one level more after a colon)."""
+        self._continuing_block = True
+        readline = None
+        if self._readline_active:
+            try:
+                import readline
+            except ImportError:
+                readline = None
+        if readline is not None:
+            def indent():
+                last = lines[-1] if lines else ''
+                if not last.strip():
+                    return
+                width = len(last) - len(last.lstrip())
+                if last.rstrip().endswith(':'):
+                    width += 4
+                if width:
+                    readline.insert_text(' ' * width)
+                    readline.redisplay()
+            readline.set_pre_input_hook(indent)
+        try:
+            yield
+        finally:
+            self._continuing_block = False
+            if readline is not None:
+                readline.set_pre_input_hook(None)
+
+    @contextmanager
+    def _python_completion(self, ns):
+        """Complete Python names of `ns` (and nothing else) in readline."""
+        if not self._readline_active:
+            yield
+            return
+        import readline
+        import rlcompleter
+        previous = readline.get_completer()
+        readline.set_completer(rlcompleter.Completer(ns).complete)
+        try:
+            yield
+        finally:
+            readline.set_completer(previous)
 
     # ---- running programs
 

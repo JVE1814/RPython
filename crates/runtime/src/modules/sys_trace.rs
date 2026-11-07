@@ -370,6 +370,10 @@ pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
             }
         }
     }
+    if f.jump_to >= 0 {
+        // (pdb1) a callback moved execution elsewhere: nothing more to report here
+        return Ok(());
+    }
     if new_line {
         f.trace_line = line;
     }
@@ -406,6 +410,9 @@ pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
         let ftr = unsafe { PyRef::from_borrowed(ft) };
         let r = call_trace(ts, ftr.as_ptr(), f, "line", none::none())?;
         set_f_trace(f, r);
+    }
+    if f.jump_to >= 0 {
+        return Ok(());
     }
     if first_word && f.f_trace_opcodes && !f.f_trace.is_null() {
         let ftr = unsafe { PyRef::from_borrowed(f.f_trace) };
