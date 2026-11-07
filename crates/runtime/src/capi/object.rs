@@ -504,12 +504,17 @@ pub unsafe extern "C" fn PyObject_Dump(o: *mut PyObject) {
             eprintln!("<object at {:p} is freed>", o);
             return;
         }
+        // (capi3) callable without an attached thread state: attach one the proper way
+        // for the repr (an implicitly created state would stay registered and hold back
+        // deferred reclamation for good)
+        let g = super::pystate::PyGILState_Ensure();
         let saved = take_exc();
         let r = ab::repr_string(&*o).unwrap_or_else(|_| "<repr failed>".into());
         clear_exc();
         if let Some(s) = saved {
             set_exc(s);
         }
+        super::pystate::PyGILState_Release(g);
         eprintln!("object address  : {:p}\nobject refcount : {}\nobject type     : {:p}\nobject type name: {}\nobject repr     : {}",
             o, (*o).refcnt(), (*o).type_ptr(), tname(&*o), r);
     }

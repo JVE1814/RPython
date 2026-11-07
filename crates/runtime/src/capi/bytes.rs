@@ -231,7 +231,13 @@ pub unsafe extern "C" fn _PyBytes_Resize(p: *mut *mut PyObject, newsize: Py_ssiz
         // (reallocated). To a reference tracer that looks like the old object dying and
         // a new one being born; when the reallocation fails, the old object comes back
         // to life just to be released.
-        if old > 0 && bytes::is_bytes_exact(&*o) && super::object::PyUnstable_Object_IsUniquelyReferenced(o) != 0 && !(*o).is_immortal() {
+        if old > 0
+            && newsize > 0
+            && bytes::is_bytes_exact(&*o)
+            && (*(o as *mut PyBytesObject)).ob_shash == -1
+            && super::object::PyUnstable_Object_IsUniquelyReferenced(o) != 0
+            && !(*o).is_immortal()
+        {
             let tracing = crate::capi::pystate::REF_TRACING.load(std::sync::atomic::Ordering::Relaxed);
             if tracing {
                 crate::capi::pystate::ref_trace(o, 1);
