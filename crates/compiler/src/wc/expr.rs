@@ -1219,9 +1219,14 @@ impl<'a> Compiler<'a> {
         }
         // (a synchronous genexpr's prologue already pushed [iterator, NULL])
         self.comprehension_generator(e, generators, 0, 0, elt, value, kind)?;
-        if kind == CompKind::Gen {
+        if kind == CompKind::Gen && !async_outer {
             // the implicit return keeps the location of the loop exit
             self.u().loc = NO_LOC;
+            self.load_none();
+        } else if kind == CompKind::Gen {
+            // an async loop ends in its exception handler: the return belongs to the
+            // whole expression
+            self.set_loc(e.loc);
             self.load_none();
         } else {
             self.set_loc(e.loc);
