@@ -194,6 +194,8 @@ static DEPOT: Mutex<Option<Depot>> = Mutex::new(None);
 
 const BATCH: usize = 64;
 const CACHE_LIMIT: usize = 256;
+/// (scale3) Most bytes a thread keeps cached per free list once its limit adapted.
+const SLOT_BUDGET: usize = 1024 * 1024;
 /// Bytes of fresh blocks linked into a thread's free list per refill.
 const CARVE_BYTES: usize = 2048;
 
@@ -215,6 +217,10 @@ fn new_depot() -> Depot {
 struct ThreadCache {
     heads: [usize; NSLOTS],
     counts: [u32; NSLOTS],
+    /// (scale3) Per-slot spill limits (adaptive, see `spill`) and whether the slot took
+    /// blocks from the depot since it last spilled.
+    limits: [u32; NSLOTS],
+    took: [bool; NSLOTS],
     carve_next: [usize; NSLOTS],
     carve_end: [usize; NSLOTS],
     registered: bool,
@@ -228,6 +234,8 @@ struct ThreadCache {
 static mut TC: ThreadCache = ThreadCache {
     heads: [0; NSLOTS],
     counts: [0; NSLOTS],
+    limits: [CACHE_LIMIT as u32; NSLOTS],
+    took: [false; NSLOTS],
     carve_next: [0; NSLOTS],
     carve_end: [0; NSLOTS],
     registered: false,
@@ -314,6 +322,10 @@ fn refill(slot: usize, tc: &mut ThreadCache) {
         };
         match got {
             Ok(blocks) => {
+                if crate::scalestats::on() {
+                    crate::scalestats::DEPOT_REFILLS.fetch_add(1, Relaxed);
+                }
+                tc.took[slot] = true;
                 for p in blocks {
                     unsafe { *(p as *mut usize) = tc.heads[slot] };
                     tc.heads[slot] = p;
@@ -356,8 +368,36 @@ fn refill(slot: usize, tc: &mut ThreadCache) {
     tc.carve_next[slot] = next + n * size;
 }
 
+/// (scale3) A free list grew past its limit (initially CACHE_LIMIT; JIT-inlined frees
+/// stop at CACHE_LIMIT and take the generic path). Per-slot limits adapt (tcmalloc style):
+/// a slot that spilled to the depot and then had to take blocks back from it (a
+/// thread freeing and re-allocating bursts of objects) keeps twice as many blocks
+/// before spilling again, up to SLOT_BUDGET bytes. Depot round trips take the global
+/// depot lock and move blocks between threads (their cache lines with them): with
+/// several threads allocating in bursts they dominated (cpu_float, alloc_cycles).
 #[cold]
 fn spill(slot: usize, tc: &mut ThreadCache) {
+    let n = tc.counts[slot];
+    if n <= tc.limits[slot] {
+        return;
+    }
+    if tc.took[slot] {
+        tc.took[slot] = false;
+        let max = (SLOT_BUDGET / CLASSES[slot % NCLASSES]).max(CACHE_LIMIT) as u32;
+        if tc.limits[slot] < max {
+            tc.limits[slot] = (tc.limits[slot] * 2).min(max);
+            if n <= tc.limits[slot] {
+                return;
+            }
+        }
+    }
+    spill_batch(slot, tc);
+}
+
+fn spill_batch(slot: usize, tc: &mut ThreadCache) {
+    if crate::scalestats::on() {
+        crate::scalestats::DEPOT_SPILLS.fetch_add(1, Relaxed);
+    }
     let mut batch = Vec::with_capacity(BATCH);
     for _ in 0..BATCH {
         let p = tc.heads[slot];
@@ -613,7 +653,7 @@ pub fn free_small(p: *mut u8) {
             *tc.heads.get_unchecked_mut(c) = p as usize;
             let n = *tc.counts.get_unchecked(c) + 1;
             *tc.counts.get_unchecked_mut(c) = n;
-            if n as usize > CACHE_LIMIT {
+            if n > *tc.limits.get_unchecked(c) {
                 spill(c, tc);
             }
             return;
@@ -642,7 +682,7 @@ fn free_small_slow(p: *mut u8, c: usize) {
         *(p as *mut usize) = tc.heads[c];
         tc.heads[c] = p as usize;
         tc.counts[c] += 1;
-        if tc.counts[c] as usize > CACHE_LIMIT {
+        if tc.counts[c] > tc.limits[c] {
             spill(c, tc);
         }
     }

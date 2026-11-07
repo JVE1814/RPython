@@ -112,6 +112,9 @@ pub const PHASES: [&str; 8] = ["pre-stop", "prepare", "snapshot", "analyse", "st
 pub static PHASE_CPU_NS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 pub static PHASE_WALL_NS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 pub static GC_STOPPED_NS: AtomicU64 = AtomicU64::new(0);
+/// Allocator depot traffic: batches spilled by thread caches / taken back.
+pub static DEPOT_SPILLS: AtomicU64 = AtomicU64::new(0);
+pub static DEPOT_REFILLS: AtomicU64 = AtomicU64::new(0);
 pub static GC_EXAMINED: AtomicU64 = AtomicU64::new(0);
 pub static GC_GARBAGE: AtomicU64 = AtomicU64::new(0);
 
@@ -148,6 +151,7 @@ impl PhaseClock {
 fn report_phases(e: &mut impl std::io::Write) {
     let _ = writeln!(e, "gcphase stopped {:.3} ms  examined {}  unreachable {}  parallel jobs {} helps {} (serial: {} no helper, {} small) handed {}", GC_STOPPED_NS.load(Relaxed) as f64 / 1e6,
         GC_EXAMINED.load(Relaxed), GC_GARBAGE.load(Relaxed), crate::gcpar::JOBS.load(Relaxed), crate::gcpar::HELPS.load(Relaxed), crate::gcpar::NO_HELPERS.load(Relaxed), crate::gcpar::TOO_SMALL.load(Relaxed), crate::gc::HANDED.load(Relaxed));
+    let _ = writeln!(e, "allocator depot: {} batches spilled, {} taken", DEPOT_SPILLS.load(Relaxed), DEPOT_REFILLS.load(Relaxed));
     let mut s = String::from("gcphase cpu/wall ms:");
     for (i, n) in PHASES.iter().enumerate() {
         s.push_str(&format!(" {}={:.1}/{:.1}", n, PHASE_CPU_NS[i].load(Relaxed) as f64 / 1e6, PHASE_WALL_NS[i].load(Relaxed) as f64 / 1e6));
