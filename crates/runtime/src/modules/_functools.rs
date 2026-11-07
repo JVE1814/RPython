@@ -681,47 +681,60 @@ fn make_key(args: &[&PyObject], kw: Option<&PyObject>, typed: bool) -> PyResult 
     Ok(tuple::new_tuple(v))
 }
 
+/// The wrapper's bookkeeping (counters, the cache dict pointer, the LRU list) is
+/// shared by every thread calling the cached function: it is read and changed under
+/// the wrapper's object lock (objlock.rs; recursive, so key hashing/comparison and
+/// finalizers may call back in), while the user function itself runs unlocked.
 fn lru_call_impl(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
-    let w = lobj(o);
-    let func = unsafe { (*w.func).to_ref() };
-    if w.maxsize == 0 {
-        w.misses += 1;
+    let (func, maxsize, typed) = {
+        let _g = crate::objlock::lock(o);
+        let w = lobj(o);
+        (unsafe { (*w.func).to_ref() }, w.maxsize, w.typed)
+    };
+    if maxsize == 0 {
+        crate::objlock::with(o, || lobj(o).misses += 1);
         return ab::call_with_kwargs_dict(&func, args, kw);
     }
-    let key = make_key(args, kw, w.typed)?;
+    let key = make_key(args, kw, typed)?;
     let hash = ab::hash(&key)?;
-    let cache = unsafe { (*w.cache).to_ref() };
-    if w.maxsize < 0 {
-        // unbounded
+    if maxsize < 0 {
+        // unbounded: the dict is the whole cache
+        let cache = crate::objlock::with(o, || unsafe { (*lobj(o).cache).to_ref() });
         if let Some(r) = dict::get_item_hash(&cache, &key, hash)? {
-            w.hits += 1;
+            crate::objlock::with(o, || lobj(o).hits += 1);
             return Ok(r);
         }
-        w.misses += 1;
+        crate::objlock::with(o, || lobj(o).misses += 1);
         let r = ab::call_with_kwargs_dict(&func, args, kw)?;
         dict::set_item_hash(&cache, &key, hash, &r)?;
         return Ok(r);
     }
     // bounded
-    if let Some(ix) = dict::get_item_hash(&cache, &key, hash)? {
-        let i = int::as_i64(&ix).unwrap_or(0) as usize;
-        let l = unsafe { &mut *lobj(o).list };
-        if let Some(r) = l.nodes.get(i).and_then(|n| n.result.clone()) {
-            l.unlink(i);
-            l.append(i);
-            lobj(o).hits += 1;
-            return Ok(r);
+    {
+        let _g = crate::objlock::lock(o);
+        let cache = unsafe { (*lobj(o).cache).to_ref() };
+        if let Some(ix) = dict::get_item_hash(&cache, &key, hash)? {
+            let i = int::as_i64(&ix).unwrap_or(0) as usize;
+            let l = unsafe { &mut *lobj(o).list };
+            if let Some(r) = l.nodes.get(i).and_then(|n| n.result.clone()) {
+                l.unlink(i);
+                l.append(i);
+                lobj(o).hits += 1;
+                return Ok(r);
+            }
         }
+        lobj(o).misses += 1;
     }
-    lobj(o).misses += 1;
     let result = ab::call_with_kwargs_dict(&func, args, kw)?;
+    let _g = crate::objlock::lock(o);
     let w = lobj(o);
-    // The call may have re-entered and already cached this key.
+    let cache = unsafe { (*w.cache).to_ref() };
+    // The call may have re-entered (or another thread may have) cached this key.
     if dict::get_item_hash(&cache, &key, hash)?.is_some() {
         return Ok(result);
     }
-    let l = unsafe { &mut *w.list };
-    if (dict::dict_len(&cache) as isize) < w.maxsize {
+    let l = unsafe { &mut *lobj(o).list };
+    if (dict::dict_len(&cache) as isize) < maxsize {
         let i = l.alloc(key.clone(), result.clone(), hash);
         dict::set_item_hash(&cache, &key, hash, &int::new_int(i as i64))?;
         l.append(i);
@@ -740,11 +753,14 @@ fn lru_call_impl(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyR
             // should not happen; keep going
         }
     }
+    let l = unsafe { &mut *lobj(o).list };
     let i = l.alloc(key.clone(), result.clone(), hash);
     if let Err(e) = dict::set_item_hash(&cache, &key, hash, &int::new_int(i as i64)) {
+        let l = unsafe { &mut *lobj(o).list };
         l.release(i);
         return Err(e);
     }
+    let l = unsafe { &mut *lobj(o).list };
     l.append(i);
     drop(okey);
     drop(oresult);
@@ -813,6 +829,7 @@ fn lru_cache_info(o: &PyObject) -> PyResult {
 }
 
 fn lru_cache_clear(o: &PyObject) -> PyResult {
+    let _g = crate::objlock::lock(o);
     let w = lobj(o);
     w.hits = 0;
     w.misses = 0;

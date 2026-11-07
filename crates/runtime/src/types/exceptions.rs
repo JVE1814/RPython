@@ -263,10 +263,11 @@ pub fn fill_attribute_error_context(o: &PyObject, name: &PyObject) {
     }
 }
 
+/// Replace an exception field. Other threads may be reading it (getters take a new
+/// reference without a lock), so the old value is released through QSBR.
 fn set_field(slot: &mut *mut PyObject, v: Option<&PyObject>) {
-    let old = *slot;
-    *slot = v.map_or(std::ptr::null_mut(), |v| v.to_ref().into_raw());
-    unsafe { xdecref(old) };
+    let new = v.map_or(std::ptr::null_mut(), |v| v.to_ref().into_raw());
+    unsafe { crate::qsbr::swap_field(slot as *mut *mut PyObject, new) };
 }
 fn get_field(p: *mut PyObject) -> PyRef {
     unsafe { if p.is_null() { none::none_ref() } else { PyRef::from_borrowed(p) } }
@@ -473,10 +474,14 @@ fn set_cause(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
 }
 fn get_dict(o: &PyObject) -> PyResult {
     let e = exc(o);
-    if e.dict.is_null() {
-        e.dict = dict::new_dict().into_raw();
+    let slot = unsafe { std::sync::atomic::AtomicPtr::from_ptr(&raw mut e.dict) };
+    if slot.load(std::sync::atomic::Ordering::Acquire).is_null() {
+        let d = dict::new_dict().into_raw();
+        if slot.compare_exchange(std::ptr::null_mut(), d, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire).is_err() {
+            unsafe { decref(d) }; // another thread created it first
+        }
     }
-    Ok(get_field(e.dict))
+    Ok(get_field(slot.load(std::sync::atomic::Ordering::Acquire)))
 }
 fn set_dict(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     match v {

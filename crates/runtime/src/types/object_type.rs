@@ -1521,9 +1521,8 @@ fn subtype_set_dict(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         if crate::alloc::has_managed(o.as_ptr()) {
             o.ob_gc_bits.fetch_or(crate::alloc::GC_BIT_DICT_DETACHED, std::sync::atomic::Ordering::Relaxed);
         }
-        let old = *slot;
-        *slot = v.map_or(std::ptr::null_mut(), |v| v.to_ref().into_raw());
-        xdecref(old);
+        // readers take the dict without a lock: the old one goes through QSBR
+        crate::qsbr::swap_field(slot, v.map_or(std::ptr::null_mut(), |v| v.to_ref().into_raw()));
     }
     Ok(())
 }

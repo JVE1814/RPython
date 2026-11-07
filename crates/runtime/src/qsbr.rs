@@ -112,6 +112,18 @@ pub unsafe fn decref_deferred(p: *mut PyObject) {
     retire(Item::Decref(p));
 }
 
+/// Store `new` (an owned reference or null) into an object field that other threads
+/// read without a lock (getters taking a new reference to the current value), and
+/// release the previous value once no such reader can still hold the old pointer.
+pub unsafe fn swap_field(slot: *mut *mut PyObject, new: *mut PyObject) {
+    unsafe {
+        let old = std::sync::atomic::AtomicPtr::from_ptr(slot).swap(new, AcqRel);
+        if !old.is_null() {
+            decref_deferred(old);
+        }
+    }
+}
+
 /// Free raw storage `p` with `f` once no thread can still be reading it lock-free.
 pub unsafe fn free_deferred(p: *mut u8, f: unsafe fn(*mut u8)) {
     if !multi_threaded() {
