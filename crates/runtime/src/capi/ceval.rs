@@ -28,6 +28,16 @@ unsafe fn flags_of(f: *mut PyCompilerFlags) -> u32 {
 
 pub(crate) fn compile_source(src: &[u8], filename: &str, start: c_int, flags: u32, optimize: i32) -> PyResult {
     let mode = mode_of(start)?;
+    // (tail2) PyCF_IGNORE_COOKIE: the caller promises UTF-8 text; bytes that are not
+    // are a decoding error of that text, not a missing-encoding-declaration error
+    if flags & 0x0800 != 0 {
+        if let Err(e) = std::str::from_utf8(src) {
+            let start = e.valid_up_to();
+            let end = start + e.error_len().unwrap_or(src.len() - start);
+            let reason = if e.error_len().is_none() { "unexpected end of data" } else { "invalid start byte" };
+            return Err(crate::types::exceptions::unicode_decode_error("utf-8", src, start, end, reason));
+        }
+    }
     if flags & 0x0400 != 0 {
         // PyCF_ONLY_AST: go through builtins.compile
         let b = crate::builtins::builtins_module();

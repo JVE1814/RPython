@@ -302,6 +302,21 @@ pub fn fire_deferred_line(ts: &ThreadState, f: &mut Frame, ok: bool) -> PyResult
     Ok(())
 }
 
+/// (tail2) Public opcode of the instruction holding internal pc `i` (EXTENDED_ARG
+/// prefixes skipped); None for legacy code objects.
+fn public_op_of_pc(code: &PyObject, i: usize) -> Option<u8> {
+    let meta = crate::types::code::code_meta(code);
+    if !meta.public {
+        return None;
+    }
+    let words = crate::types::bytes::bytes_data(&meta.co_code);
+    let mut cu = crate::types::code::code_data(code).pub_offset(i) as usize;
+    while words.get(cu * 2).copied() == Some(crate::interp::wc::op::EXTENDED_ARG) {
+        cu += 1;
+    }
+    words.get(cu * 2).copied()
+}
+
 pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
     if ts.tracing_depth.get() > 0 {
         return Ok(());
@@ -371,7 +386,19 @@ pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
     if ts.trace_func.get().is_null() || f.f_trace.is_null() {
         return Ok(());
     }
-    if new_line && f.f_trace_lines {
+    // (tail2) settrace also reports a line each time a JUMP_BACKWARD goes back within
+    // its own line (a one-line loop or comprehension), wherever it lands; the
+    // JUMP_BACKWARD_NO_INTERRUPT of a yield-from loop does not count
+    let back_in_line = !new_line
+        && jumped
+        && lasti <= prev
+        && line >= 0
+        && !is_resume
+        && f.f_trace_lines
+        && !f.f_trace.is_null()
+        && crate::types::code::frame_line(f.code(), prev as usize).map(|l| l as i32) == Some(line)
+        && public_op_of_pc(f.code(), prev as usize) == Some(crate::interp::wc::op::JUMP_BACKWARD);
+    if (new_line || back_in_line) && f.f_trace_lines {
         let ft = f.f_trace;
         let ftr = unsafe { PyRef::from_borrowed(ft) };
         let r = call_trace(ts, ftr.as_ptr(), f, "line", none::none())?;
