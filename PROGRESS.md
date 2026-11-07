@@ -121,7 +121,31 @@ Run 1 top blockers: py_compile (230 modules; merged since), unittest.mock (57), 
 array (24), socket (17), pathlib (16), http (14), multiprocessing, decimal, datetime, ntpath.
 
 ## Benchmarks
-### Latest (perf4, 2026-11-07; wall-clock ratio ours / best CPython, pinned to one core, one run each, loaded machine, ±10%)
+### Latest (perf5, 2026-11-07; wall ratio ours / best CPython, pinned one core, one run each, load 6–7, ±10–15%)
+| benchmark | perf4 | perf5 |
+|---|---|---|
+| xml_etree | 1.55 | 1.55 |
+| deepcopy | 1.52 | 1.36 |
+| bpe_tokeniser | 1.27 | 1.30 |
+| logging | 1.34 | 1.30 |
+| python_startup | 1.33 | 1.29 |
+| comprehensions | 1.35 | 1.27 |
+| typing_runtime_protocols | 1.37 | 1.25 |
+| mdp | 1.33 | 1.24 |
+| base64 | 1.28 | 1.18 |
+| async_generators | 1.25 | 1.17 |
+| pathlib | 1.87 | 1.16 |
+| nqueens | 1.30 | 1.14 |
+| concurrent_imap | 1.00 | 1.08 |
+| pprint | 1.11 | 1.02 |
+| go | 1.03 | 0.97 |
+| gc_traversal | 1.42 | 0.70 |
+| gc_collect | 0.66 | 0.51 |
+Instructions per call: bound method 447 (CPython 502), property read 401 (441), kw call 743 (701), raise+catch 4042
+(3686). Peak memory 35.3 MB (CPython 32.4). Startup `-c pass` 55.8M instructions (40.5M). perf6 is on startup
+(CDS-style startup image), slow call paths, xml_etree's expat engine, raise/catch, memory.
+
+### Previous (perf4, 2026-11-07; wall-clock ratio ours / best CPython, pinned to one core, one run each, loaded machine, ±10%)
 About 11 of 32 benchmarks beat or match the best CPython build (json_dumps 0.83, json_loads, raytrace, richards 0.60,
 deltablue, chaos 0.65, float, hexiom, gc_collect, coroutines 0.98, unpack_sequence); fannkuch and go within a few %.
 
