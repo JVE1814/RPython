@@ -643,6 +643,18 @@ fn textio_init_impl(
                 e.reset(false)?;
             }
         }
+    } else if writable {
+        // (wheels2) on a stream that cannot tell where it is, "utf-16"/"utf-32"
+        // write no byte order mark (native byte order), as CPython's
+        // TextIOWrapper does; pandas relies on it for bz2/xz files
+        if let Some(e @ Encoder::Py(_)) = &st.encoder {
+            let enc = pystr::to_string_lossy(&st.encoding);
+            let name = ab::getattr_str(&*lookup_codec(&enc)?, "name")?;
+            let name = pystr::to_string_lossy(&name);
+            if name == "utf-16" || name == "utf-32" {
+                e.reset(false)?;
+            }
+        }
     }
     tio(o).st = Box::into_raw(Box::new(st));
     Ok(())
