@@ -58,7 +58,7 @@ pub fn is_view(o: &PyObject) -> bool {
 pub fn is_setlike_view(o: &PyObject) -> bool {
     of_type(o, &raw mut PyDictKeys_Type) || of_type(o, &raw mut PyDictItems_Type)
 }
-fn is_view_exact(o: &PyObject) -> bool {
+pub fn is_view_exact(o: &PyObject) -> bool {
     o.is_type(&raw mut PyDictKeys_Type) || o.is_type(&raw mut PyDictValues_Type) || o.is_type(&raw mut PyDictItems_Type)
 }
 fn subtype_view_items(o: &PyObject) -> PyResult<Vec<PyRef>> {

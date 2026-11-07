@@ -578,6 +578,19 @@ pub fn clear(o: &PyObject) {
     release_array(arr, n, true);
 }
 
+/// Reverse the items in place under the lock (stability3: the list keeps its size
+/// throughout, so concurrent `l[i]` readers never see it empty).
+pub fn reverse(o: &PyObject) {
+    let _g = ob_lock(o);
+    unsafe {
+        let l = lp(o);
+        let n = (*l).ob_base.ob_size as usize;
+        if n > 1 {
+            std::slice::from_raw_parts_mut((*l).ob_item, n).reverse();
+        }
+    }
+}
+
 /// Take the item array out of the list (leaving it empty). Used by sort.
 pub fn take_items(o: &PyObject) -> Vec<*mut PyObject> {
     let _g = ob_lock(o);
@@ -700,8 +713,24 @@ pub fn extend(o: &PyObject, it: &PyObject) -> PyResult<()> {
         }
         return Ok(());
     }
-    if is_list_exact(it) || o.is(it) {
-        let items: Vec<PyRef> = if tuple::is_tuple_exact(it) { tuple::tuple_to_vec(it) } else { list_to_vec(it) };
+    // (stability3) exact dicts, sets and dict views are copied in one snapshot taken
+    // under their lock, as free-threaded CPython does: `list(d)` never sees `d`
+    // change size half way (no "changed size during iteration" under concurrent
+    // mutation).
+    let snapshot: Option<Vec<PyRef>> = if crate::types::dict::is_dict_exact(it) {
+        Some(crate::types::dict::keys_vec(it))
+    } else if crate::types::set::is_anyset_exact(it) {
+        Some(crate::types::set::set_items(it))
+    } else if crate::types::dictview::is_view_exact(it) && crate::types::dict::is_dict_exact(crate::types::dictview::view_dict(it)) {
+        Some(crate::types::dictview::view_items(it))
+    } else {
+        None
+    };
+    if snapshot.is_some() || is_list_exact(it) || o.is(it) {
+        let items: Vec<PyRef> = match snapshot {
+            Some(v) => v,
+            None => list_to_vec(it),
+        };
         if items.is_empty() {
             return Ok(());
         }
@@ -917,32 +946,41 @@ pub fn ass_slice(o: &PyObject, k: &PyObject, v: Option<&PyObject>) -> PyResult<(
             if n <= 0 {
                 return Ok(());
             }
-            let removed: Vec<PyRef>;
-            {
-                let mut cur = take_items(o);
-                let (mut s, st) = (start, step);
-                if st < 0 {
+            // (stability3) compact in place under the lock: the list never looks
+            // empty to concurrent readers while the slice is deleted
+            let removed: Vec<*mut PyObject> = {
+                let _g = ob_lock(o);
+                unsafe {
+                    let l = lp(o);
+                    let cur = (*l).ob_base.ob_size as usize;
                     // normalise to increasing order
-                    s = start + st * (n - 1);
-                }
-                let ast = st.abs() as usize;
-                let mut rem = Vec::with_capacity(n as usize);
-                let mut keep = Vec::with_capacity(cur.len().saturating_sub(n as usize));
-                let mut next_del = s as usize;
-                let mut left = n;
-                for (i, p) in cur.drain(..).enumerate() {
-                    if left > 0 && i == next_del {
-                        rem.push(unsafe { PyRef::from_raw(p) });
-                        next_del = next_del.wrapping_add(ast);
-                        left -= 1;
-                    } else {
-                        keep.push(p);
+                    let s = if step < 0 { start + step * (n - 1) } else { start };
+                    let ast = step.unsigned_abs();
+                    let arr = (*l).ob_item;
+                    let mut rem = Vec::with_capacity(n as usize);
+                    let mut w = 0usize;
+                    let mut next_del = s as usize;
+                    let mut left = n;
+                    for i in 0..cur {
+                        let p = *arr.add(i);
+                        if left > 0 && i == next_del {
+                            rem.push(p);
+                            next_del = next_del.wrapping_add(ast);
+                            left -= 1;
+                        } else {
+                            *arr.add(w) = p;
+                            w += 1;
+                        }
                     }
+                    if w != cur {
+                        resize_locked(o, w);
+                    }
+                    rem
                 }
-                let extra = restore_items(o, keep);
-                removed = rem.into_iter().chain(extra.into_iter().map(|p| unsafe { PyRef::from_raw(p) })).collect();
+            };
+            for p in removed {
+                unsafe { release_item(p) };
             }
-            drop(removed);
             Ok(())
         }
         Some(seq) => {

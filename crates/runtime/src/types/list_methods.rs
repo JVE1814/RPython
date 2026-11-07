@@ -64,9 +64,7 @@ fn sort_m(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
     Ok(none::none_ref())
 }
 fn reverse_m(o: &PyObject) -> PyResult {
-    let mut v = list::take_items(o);
-    v.reverse();
-    list::release_items(list::restore_items(o, v));
+    list::reverse(o);
     Ok(none::none_ref())
 }
 fn index_m(o: &PyObject, args: &[&PyObject]) -> PyResult {

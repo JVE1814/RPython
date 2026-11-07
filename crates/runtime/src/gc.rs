@@ -377,6 +377,9 @@ pub fn safepoint_poll(ts: &ThreadState) {
 /// `_testinternalcapi.test_stop_the_world()`: stop every other thread and restart
 /// them at once (stability3).
 pub fn test_stop_the_world() {
+    if IN_COLLECTION.get() {
+        return; // called from a finalizer of this thread's own collection
+    }
     while COLLECTING.compare_exchange(false, true, AcqRel, Acquire).is_err() {
         crate::threads::blocking(|| std::thread::sleep(std::time::Duration::from_micros(100)));
     }
@@ -684,6 +687,12 @@ fn promote(objs: &[*mut PyObject]) {
     }
 }
 
+thread_local! {
+    /// (stability3) The calling thread is running a collection (it owns COLLECTING);
+    /// code reached from its finalizers must not wait for COLLECTING.
+    static IN_COLLECTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Run a full collection; returns the number of unreachable objects found.
 pub fn collect() -> usize {
     collect_gen(false)
@@ -696,7 +705,9 @@ fn collect_gen(young_only: bool) -> usize {
     let me = crate::threads::current_mut();
     let saved_exc = crate::errors::take_exc();
     let t0 = std::time::Instant::now();
+    IN_COLLECTION.set(true);
     let n = unsafe { collect_phases(me, young_only) };
+    IN_COLLECTION.set(false);
     release_mature();
     if let Some(e) = saved_exc {
         crate::errors::set_exc(e);
@@ -920,22 +931,32 @@ pub fn all_tracked() -> Vec<PyRef> {
     }
     // the heap walk needs the other threads parked (they allocate and free on the
     // pages being walked); take references before they run again
-    while COLLECTING.compare_exchange(false, true, AcqRel, Acquire).is_err() {
-        crate::threads::blocking(|| std::thread::sleep(std::time::Duration::from_micros(200)));
-    }
     let me = crate::threads::current_mut();
+    // (stability3) a finalizer run by this thread's own collection (gc.get_objects()
+    // in __del__) must not wait for that collection to end: it owns COLLECTING already
+    let nested = IN_COLLECTION.get();
+    if !nested {
+        while COLLECTING.compare_exchange(false, true, AcqRel, Acquire).is_err() {
+            crate::threads::blocking(|| std::thread::sleep(std::time::Duration::from_micros(200)));
+        }
+    }
     let mut stopped = false;
-    for _ in 0..40 {
-        if stop_the_world(me) {
-            stopped = true;
-            break;
+    let already = !RELEASE.load(SeqCst) && STW_OWNER.load(SeqCst) == unsafe { &(*me).mode as *const _ as usize };
+    if !already {
+        for _ in 0..40 {
+            if stop_the_world(me) {
+                stopped = true;
+                break;
+            }
         }
     }
     let v: Vec<PyRef> = snapshot().into_iter().map(|o| unsafe { PyRef::from_borrowed(o) }).collect();
     if stopped {
         start_the_world();
     }
-    COLLECTING.store(false, Release);
+    if !nested {
+        COLLECTING.store(false, Release);
+    }
     v
 }
 
