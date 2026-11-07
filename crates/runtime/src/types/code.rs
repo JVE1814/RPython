@@ -70,6 +70,9 @@ pub struct CodeMeta {
     pub filename: PyRef,
     /// Indices of cell variables in localsplus.
     pub cell_slots: Vec<u32>,
+    /// (perf6) Translated form recorded in the start-up image (decoded on first use
+    /// instead of translating).
+    pub image_tx: Option<&'static [u8]>,
 }
 
 /// Executable representation.
@@ -259,6 +262,36 @@ fn exec_extra_obj(e: &crate::interp::translate::Extra) -> PyRef {
 /// Translate the public form into the executable form (never fails: invalid code gets a
 /// body that raises SystemError when run).
 fn build_exec(c: &PyCodeObject, m: &CodeMeta) -> CodeData {
+    if let Some(tx) = m.image_tx {
+        // (perf6) translated at build time (start-up image)
+        let t = crate::startup_image::decode_translation(tx);
+        let mut consts = m.consts.clone();
+        consts.extend(t.extra_consts.iter().map(exec_extra_obj));
+        return CodeData {
+            caches: crate::interp::cache::CodeCaches::new(t.code.len()),
+            spec: (0..t.code.len()).map(|_| std::sync::atomic::AtomicU8::new(0)).collect(),
+            code: t.code,
+            locations: Vec::new(),
+            exception_table: t.exception_table,
+            consts,
+            names: m.names.clone(),
+            localsplusnames: m.localsplusnames.clone(),
+            localspluskinds: m.localspluskinds.clone(),
+            co_name: m.co_name.clone(),
+            co_qualname: m.co_qualname.clone(),
+            filename: m.filename.clone(),
+            cell_slots: m.cell_slots.clone(),
+            invocation_count: std::sync::atomic::AtomicU32::new(0),
+            backedge_count: std::sync::atomic::AtomicU32::new(0),
+            pub_of_internal: t.pub_of_internal,
+            internal_of_pub: t.internal_of_pub,
+            eager_prologue: t.eager_prologue,
+            gen_start: t.gen_start,
+            invalid: None,
+            pub_lines: t.pub_lines,
+            spec_tl: Default::default(),
+        };
+    }
     let code = bytes::bytes_data(&m.co_code);
     let lt = bytes::bytes_data(unsafe { &*c.co_linetable });
     let et = bytes::bytes_data(unsafe { &*c.co_exceptiontable });
@@ -664,6 +697,7 @@ pub fn new_code_from_parts(p: CodeParts) -> PyResult {
         co_qualname: p.qualname.clone(),
         filename: p.filename.clone(),
         cell_slots: cell_slots.clone(),
+        image_tx: None,
     };
     let data = Box::new(CodeData {
         code: p.code,
@@ -752,6 +786,7 @@ pub fn new_code_from_public(p: PublicParts) -> PyResult {
         names: names.clone(),
         localsplusnames: lpn,
         cell_slots: cell_slots_of(&p.kinds),
+        image_tx: None,
         localspluskinds: p.kinds,
         co_name: if pystr::is_str_exact(&p.name) { pystr::intern(p.name) } else { p.name },
         co_qualname: p.qualname,
@@ -782,6 +817,39 @@ pub fn new_code_from_public(p: PublicParts) -> PyResult {
             }
         }
     })
+}
+
+/// (perf6) Code object from a start-up image record: the parts come from our own compiler
+/// (valid, names already interned), and `tx` is the recorded translation.
+pub fn new_code_from_image(p: PublicParts, tx: Option<&'static [u8]>) -> PyRef {
+    let meta = CodeMeta {
+        public: true,
+        co_code: p.code,
+        consts: p.consts.clone(),
+        names: p.names.clone(),
+        localsplusnames: p.localsplusnames,
+        cell_slots: cell_slots_of(&p.kinds),
+        image_tx: tx,
+        localspluskinds: p.kinds,
+        co_name: p.name,
+        co_qualname: p.qualname,
+        filename: p.filename,
+    };
+    unsafe {
+        alloc_code(
+            p.argcount,
+            p.posonlyargcount,
+            p.kwonlyargcount,
+            p.stacksize,
+            p.flags,
+            p.firstlineno,
+            meta,
+            tuple::new_tuple(p.consts),
+            tuple::new_tuple(p.names),
+            p.exceptiontable,
+            p.linetable,
+        )
+    }
 }
 
 fn encode_exception_table(t: &[ExceptionEntry]) -> Vec<u8> {

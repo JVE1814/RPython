@@ -63,8 +63,10 @@ elif 'nt' in sys.builtin_module_names:
 else:
     raise ImportError('no os specific module found')
 
-__all__.extend(n for n in _public_names(_platform) if n not in __all__)
-del _platform
+# (perf6) membership through a set: a list scan per name made this quadratic
+_listed = set(__all__)
+__all__.extend([n for n in _public_names(_platform) if not (n in _listed or _listed.add(n))])
+del _platform, _listed
 
 sys.modules['os.path'] = path
 from os.path import (curdir, pardir, sep, pathsep, defpath, extsep, altsep,

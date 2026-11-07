@@ -30,6 +30,7 @@ pub mod qsbr;
 pub mod scalestats;
 pub mod sharded;
 pub mod shape;
+pub mod startup_image;
 pub mod subinterp;
 pub mod threads;
 pub mod fork;
