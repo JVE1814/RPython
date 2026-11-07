@@ -168,11 +168,11 @@ unsafe impl Send for ItemSend {}
 /// Close the open batch once it holds this many items ...
 const BATCH: usize = 1024;
 /// ... or after this many eval-breaker polls.
-const POLLS: u32 = 32;
+const POLLS: u32 = 256;
 /// Eval-breaker visits a thread re-arms itself for while it has pending items; after
 /// that it comes back only when it retires more, another thread closes a batch, or a
 /// collection stops the world (which releases everything retired before it).
-const REARM: u32 = 64;
+const REARM: u32 = 300;
 /// While a closed batch waits, rescan the other threads every this many polls.
 const SCAN_EVERY: u32 = 16;
 static PENDING_TOTAL: AtomicUsize = AtomicUsize::new(0);

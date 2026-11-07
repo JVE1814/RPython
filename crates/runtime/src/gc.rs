@@ -722,6 +722,10 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
             } else if crate::sharded::is_sharded(&*o) {
                 crate::sharded::unshard(o);
             }
+            // (scale1) garbage becomes ownerless: the references dropped while it is
+            // cleared (by this thread, on behalf of the threads that created it) then
+            // go to the shared field instead of the owners' merge queues
+            crate::object::explicit_merge(o);
         }
         // (after the unsharding above: the registry must not keep entries for objects
         // that are about to be freed)
