@@ -24,31 +24,41 @@ macro_rules! push {
         $f.stack_top += 1;
     }};
 }
+/// The raw slot value (refs1: may be a borrowed reference, see interp/borrow.rs;
+/// release it with `borrow::release` or convert it with `borrow::own`).
 macro_rules! pop {
     ($f:expr) => {{
         $f.stack_top -= 1;
         std::mem::replace(&mut $f.slots[$f.stack_top], std::ptr::null_mut())
     }};
 }
+/// The object at the top (a plain pointer; the slot keeps its ownership).
 macro_rules! top {
     ($f:expr) => {
-        $f.slots[$f.stack_top - 1]
+        super::borrow::untag($f.slots[$f.stack_top - 1])
     };
 }
 macro_rules! peek {
     ($f:expr, $n:expr) => {
-        $f.slots[$f.stack_top - $n]
+        super::borrow::untag($f.slots[$f.stack_top - $n])
     };
 }
 /// Pop into an owned PyRef (must not be NULL).
 macro_rules! popref {
     ($f:expr) => {
-        unsafe { PyRef::from_raw(pop!($f)) }
+        unsafe { PyRef::from_raw(super::borrow::own(pop!($f))) }
     };
 }
 macro_rules! popopt {
     ($f:expr) => {
-        unsafe { PyRef::from_raw_opt(pop!($f)) }
+        unsafe { PyRef::from_raw_opt(super::borrow::own(pop!($f))) }
+    };
+}
+/// (refs1) Pop for a consumer that only looks at the value (owned or borrowed; must
+/// not be NULL).
+macro_rules! popsr {
+    ($f:expr) => {
+        unsafe { super::borrow::SRef::from_slot(pop!($f)) }
     };
 }
 
@@ -848,7 +858,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                                 handle_eval_breaker(ts)?;
                             }
                         }
-                        Op::PopTop => unsafe { xdecref(pop!(f)) },
+                        Op::PopTop => unsafe { super::borrow::release(pop!(f)) },
                         Op::PushNull => push!(f, std::ptr::null_mut()),
                         Op::Copy => {
                             let v = peek!(f, arg as usize);
@@ -872,6 +882,14 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             unsafe { incref(v) };
                             push!(f, v);
                         }
+                        Op::LoadFastBorrow => {
+                            // (refs1) the frame keeps the local bound until the copy is consumed
+                            let v = f.slots[arg as usize];
+                            if v.is_null() {
+                                return Err(unbound_local(f, arg as usize));
+                            }
+                            push!(f, super::borrow::tag(v));
+                        }
                         Op::LoadFastCheck => {
                             let v = f.slots[arg as usize];
                             if v.is_null() {
@@ -885,7 +903,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             push!(f, v);
                         }
                         Op::StoreFast => {
-                            let v = pop!(f);
+                            let v = unsafe { super::borrow::own(pop!(f)) };
                             let old = std::mem::replace(&mut f.slots[arg as usize], v);
                             unsafe { xdecref(old) };
                         }
@@ -1010,26 +1028,27 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             dict::set_item(f.globals(), &cd.names[arg as usize], &v)?;
                         }
                         Op::LoadAttr => {
-                            let o = popref!(f);
+                            let o = popsr!(f);
                             adapt!(super::adaptive::load_attr(&o, &cd.names[arg as usize], false));
                             let v = super::specialize::load_attr(&o, &cd.names[arg as usize], caches.poly(f.lasti as usize))?;
                             push!(f, v.into_raw());
                         }
                         Op::LoadMethod => {
-                            let o = popref!(f);
+                            let o = popsr!(f);
                             adapt!(super::adaptive::load_attr(&o, &cd.names[arg as usize], true));
-                            let (m, s) = super::specialize::load_method(&o, &cd.names[arg as usize], caches.poly(f.lasti as usize))?;
+                            let (m, recv) = super::specialize::load_method_r(&o, &cd.names[arg as usize], caches.poly(f.lasti as usize))?;
                             push!(f, m.into_raw());
-                            push!(f, s.map_or(std::ptr::null_mut(), |s| s.into_raw()));
+                            // (refs1) `self` is the receiver entry itself (borrowed stays borrowed)
+                            push!(f, if recv { o.into_slot() } else { std::ptr::null_mut() });
                         }
                         Op::StoreAttr => {
-                            let o = popref!(f);
+                            let o = popsr!(f);
                             adapt!(super::adaptive::store_attr(&o, &cd.names[arg as usize]));
-                            let v = popref!(f);
+                            let v = popsr!(f);
                             super::specialize::store_attr(&o, &cd.names[arg as usize], &v, caches.poly(f.lasti as usize))?;
                         }
                         Op::DeleteAttr => {
-                            let o = popref!(f);
+                            let o = popsr!(f);
                             ab::delattr(&o, &cd.names[arg as usize])?;
                         }
                         Op::LoadSuperAttr => {
@@ -1084,13 +1103,13 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                         }
                         Op::BinaryOp => {
                             adapt!(super::adaptive::binary(arg, unsafe { &*peek!(f, 2) }, unsafe { &*peek!(f, 1) }));
-                            let b = popref!(f);
-                            let a = popref!(f);
+                            let b = popsr!(f);
+                            let a = popsr!(f);
                             let r = binary_op_on_stack(BINOPS[arg as usize], &a, &b)?;
                             push!(f, r.into_raw());
                         }
                         Op::UnaryNegative => {
-                            let a = popref!(f);
+                            let a = popsr!(f);
                             let r = if int::is_int_exact(&a) && int::is_compact(&a) {
                                 int::new_int(-int::compact_value(&a))
                             } else {
@@ -1099,28 +1118,28 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             push!(f, r.into_raw());
                         }
                         Op::UnaryPositive => {
-                            let a = popref!(f);
+                            let a = popsr!(f);
                             push!(f, ab::positive(&a)?.into_raw());
                         }
                         Op::UnaryInvert => {
-                            let a = popref!(f);
+                            let a = popsr!(f);
                             push!(f, ab::invert(&a)?.into_raw());
                         }
                         Op::UnaryNot => {
-                            let a = popref!(f);
+                            let a = popsr!(f);
                             let t = ab::is_true(&a)?;
                             push!(f, bool_::new_bool(!t).into_raw());
                         }
                         Op::ToBool => {
                             adapt!(super::adaptive::to_bool(unsafe { &*peek!(f, 1) }));
-                            let a = popref!(f);
+                            let a = popsr!(f);
                             let t = ab::is_true(&a)?;
                             push!(f, bool_::new_bool(t).into_raw());
                         }
                         Op::CompareOp => {
                             adapt!(super::adaptive::compare(arg & 15, unsafe { &*peek!(f, 2) }, unsafe { &*peek!(f, 1) }));
-                            let b = popref!(f);
-                            let a = popref!(f);
+                            let b = popsr!(f);
+                            let a = popsr!(f);
                             let cop = (arg & 15) as std::ffi::c_int;
                             let r = if let Some(t) = super::specialize::compare_fast(cop, &a, &b) {
                                 bool_::new_bool(t)
@@ -1131,21 +1150,21 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             push!(f, r.into_raw());
                         }
                         Op::IsOp => {
-                            let b = popref!(f);
-                            let a = popref!(f);
+                            let b = popsr!(f);
+                            let a = popsr!(f);
                             push!(f, bool_::new_bool(a.is(&b) != (arg == 1)).into_raw());
                         }
                         Op::ContainsOp => {
                             adapt!(super::adaptive::contains(unsafe { &*peek!(f, 1) }));
-                            let b = popref!(f);
-                            let a = popref!(f);
+                            let b = popsr!(f);
+                            let a = popsr!(f);
                             let r = ab::contains(&b, &a)?;
                             push!(f, bool_::new_bool(r != (arg == 1)).into_raw());
                         }
                         Op::BinarySubscr => {
                             adapt!(super::adaptive::binary(26, unsafe { &*peek!(f, 2) }, unsafe { &*peek!(f, 1) }));
-                            let k = popref!(f);
-                            let c = popref!(f);
+                            let k = popsr!(f);
+                            let c = popsr!(f);
                             let r = if list::is_list_exact(&c) && int::is_int_exact(&k) && int::is_compact(&k) {
                                 match list::get_signed(&c, int::compact_value(&k)) {
                                     Some(v) => v,
@@ -1176,9 +1195,9 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                         }
                         Op::StoreSubscr => {
                             adapt!(super::adaptive::store_subscr(unsafe { &*peek!(f, 2) }, unsafe { &*peek!(f, 1) }));
-                            let k = popref!(f);
-                            let c = popref!(f);
-                            let v = popref!(f);
+                            let k = popsr!(f);
+                            let c = popsr!(f);
+                            let v = popsr!(f);
                             if dict::is_dict_exact(&c) {
                                 dict::set_item(&c, &k, &v)?;
                             } else {
@@ -1186,8 +1205,8 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             }
                         }
                         Op::DeleteSubscr => {
-                            let k = popref!(f);
-                            let c = popref!(f);
+                            let k = popsr!(f);
+                            let c = popsr!(f);
                             ab::setitem(&c, &k, None)?;
                         }
                         Op::BinarySlice => {
@@ -1216,10 +1235,14 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             // (perf4) items moved from the stack without a vector
                             let n = arg as usize;
                             let base = f.stack_top - n;
+                            // (refs1) the new container owns its items
+                            for i in base..f.stack_top {
+                                f.slots[i] = unsafe { super::borrow::own(f.slots[i]) };
+                            }
                             // (a failure-injecting allocator hook refuses the list too)
                             if op == Op::BuildList && crate::capi::mem::hooked_alloc_refuses(std::mem::size_of::<PyListObject>()) {
                                 for i in 0..n {
-                                    drop(unsafe { PyRef::from_raw(std::mem::replace(&mut f.slots[base + i], std::ptr::null_mut())) });
+                                    drop(unsafe { PyRef::from_raw(super::borrow::own(std::mem::replace(&mut f.slots[base + i], std::ptr::null_mut()))) });
                                 }
                                 f.stack_top = base;
                                 return Err(crate::errors::memory_error());
@@ -1236,7 +1259,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             let n = arg as usize;
                             let base = f.stack_top - n;
                             let items: Vec<PyRef> = (0..n)
-                                .map(|i| unsafe { PyRef::from_raw(std::mem::replace(&mut f.slots[base + i], std::ptr::null_mut())) })
+                                .map(|i| unsafe { PyRef::from_raw(super::borrow::own(std::mem::replace(&mut f.slots[base + i], std::ptr::null_mut()))) })
                                 .collect();
                             f.stack_top = base;
                             let s = crate::types::set::new_set_from_vec(items)?;
@@ -1248,8 +1271,8 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             let d = dict::new_dict_presized(n);
                             let mut res = Ok(());
                             for i in 0..n {
-                                let k = unsafe { PyRef::from_raw(std::mem::replace(&mut f.slots[base + 2 * i], std::ptr::null_mut())) };
-                                let v = unsafe { PyRef::from_raw(std::mem::replace(&mut f.slots[base + 2 * i + 1], std::ptr::null_mut())) };
+                                let k = unsafe { PyRef::from_raw(super::borrow::own(std::mem::replace(&mut f.slots[base + 2 * i], std::ptr::null_mut()))) };
+                                let v = unsafe { PyRef::from_raw(super::borrow::own(std::mem::replace(&mut f.slots[base + 2 * i + 1], std::ptr::null_mut()))) };
                                 if res.is_ok() {
                                     res = dict::set_item(&d, &k, &v);
                                 }
@@ -1263,7 +1286,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             let base = f.stack_top - n;
                             let mut sb = pystr::StrBuilder::new();
                             for i in 0..n {
-                                let s = unsafe { PyRef::from_raw(std::mem::replace(&mut f.slots[base + i], std::ptr::null_mut())) };
+                                let s = unsafe { PyRef::from_raw(super::borrow::own(std::mem::replace(&mut f.slots[base + i], std::ptr::null_mut()))) };
                                 sb.push_obj(&s);
                             }
                             f.stack_top = base;
@@ -1367,7 +1390,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             pc = arg as usize;
                         }
                         Op::PopJumpIfFalse => {
-                            let v = popref!(f);
+                            let v = popsr!(f);
                             let t = if v.is(bool_::false_obj()) { false } else if v.is(bool_::true_obj()) { true } else { ab::is_true(&v)? };
                             if !t {
                                 pc = arg as usize;
@@ -1377,7 +1400,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             }
                         }
                         Op::PopJumpIfTrue => {
-                            let v = popref!(f);
+                            let v = popsr!(f);
                             let t = if v.is(bool_::true_obj()) { true } else if v.is(bool_::false_obj()) { false } else { ab::is_true(&v)? };
                             if t {
                                 pc = arg as usize;
@@ -1387,7 +1410,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             }
                         }
                         Op::PopJumpIfNone => {
-                            let v = popref!(f);
+                            let v = popsr!(f);
                             if v.is(none::none()) {
                                 pc = arg as usize;
                             }
@@ -1396,7 +1419,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             }
                         }
                         Op::PopJumpIfNotNone => {
-                            let v = popref!(f);
+                            let v = popsr!(f);
                             if !v.is(none::none()) {
                                 pc = arg as usize;
                             }
@@ -1409,7 +1432,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             if !t {
                                 pc = arg as usize;
                             } else {
-                                unsafe { decref(pop!(f)) };
+                                unsafe { super::borrow::release(pop!(f)) };
                             }
                             if crate::modules::sys::tracing_active() {
                                 branch_event(ts, f, !t, pc)?;
@@ -1420,7 +1443,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             if t {
                                 pc = arg as usize;
                             } else {
-                                unsafe { decref(pop!(f)) };
+                                unsafe { super::borrow::release(pop!(f)) };
                             }
                             if crate::modules::sys::tracing_active() {
                                 branch_event(ts, f, t, pc)?;
@@ -1428,7 +1451,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                         }
                         Op::GetIter => {
                             adapt!(super::adaptive::get_iter(unsafe { &*peek!(f, 1) }));
-                            let o = popref!(f);
+                            let o = popsr!(f);
                             push!(f, ab::get_iter(&o)?.into_raw());
                         }
                         Op::ForIter => {
@@ -1452,7 +1475,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             match next {
                                 Some(v) => push!(f, v.into_raw()),
                                 None => {
-                                    unsafe { decref(pop!(f)) };
+                                    unsafe { super::borrow::release(pop!(f)) };
                                     pc = arg as usize;
                                 }
                             }
@@ -1487,7 +1510,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                                     if gen_recv {
                                         crate::modules::sys_trace::stop_iteration_event(ts, f, &r, arg as usize)?;
                                     }
-                                    unsafe { decref(pop!(f)) };
+                                    unsafe { super::borrow::release(pop!(f)) };
                                     push!(f, r.into_raw());
                                     pc = arg as usize;
                                     if crate::modules::sys::tracing_active() {
@@ -1517,8 +1540,8 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                                 let nk = if op == Op::CallKw { 1 } else { 0 };
                                 let n = arg as usize;
                                 let base = f.stack_top - n - 2 - nk;
-                                let c = unsafe { &*f.slots[base] };
-                                let s = f.slots[base + 1];
+                                let c = unsafe { &*super::borrow::untag(f.slots[base]) };
+                                let s = super::borrow::untag(f.slots[base + 1]);
                                 let so = if s.is_null() { None } else { Some(unsafe { &*s }) };
                                 if op == Op::CallKw { adapt!(super::adaptive::call_kw(c, so)); } else { adapt!(super::adaptive::call(c, so, n)); }
                             }
@@ -1528,10 +1551,30 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                                 (arg as usize, None)
                             };
                             let base = f.stack_top - n - 2;
-                            let callable = f.slots[base];
-                            let self_or_null = f.slots[base + 1];
+                            // (refs1) callees see plain pointers: borrowed entries are passed
+                            // through a copy (the frame keeps the slots tagged, so the GC and
+                            // the unwinding below still know they are borrowed)
+                            let mut tmp = std::mem::MaybeUninit::<[*mut PyObject; 16]>::uninit();
+                            let mut argv: *const *mut PyObject = unsafe { f.slots.as_ptr().add(base) };
+                            let nall = f.stack_top - base;
+                            // (up to 8 entries are copied without looking: cheaper than the test)
+                            if nall <= 8 || unsafe { super::borrow::any_borrowed(argv, nall) } {
+                                if nall <= 16 {
+                                    let dst = tmp.as_mut_ptr() as *mut *mut PyObject;
+                                    unsafe { super::borrow::copy_untagged(dst, argv, nall) };
+                                    argv = dst;
+                                } else {
+                                    // (rare) more than 16 entries: owned in place
+                                    for i in base..f.stack_top {
+                                        f.slots[i] = unsafe { super::borrow::own(f.slots[i]) };
+                                    }
+                                    argv = unsafe { f.slots.as_ptr().add(base) };
+                                }
+                            }
+                            let callable = unsafe { *argv };
+                            let self_or_null = unsafe { *argv.add(1) };
                             let call_info = if crate::modules::sys::tracing_active() {
-                                let first = if n > 0 { Some(unsafe { &*f.slots[base + 2] }) } else { None };
+                                let first = if n > 0 { Some(unsafe { &**argv.add(2) }) } else { None };
                                 let so = if self_or_null.is_null() { None } else { Some(unsafe { &*self_or_null }) };
                                 crate::modules::sys_trace::before_call(ts, f, unsafe { &*callable }, so, first, true)?
                             } else {
@@ -1539,7 +1582,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             };
                             let r = unsafe {
                                 if self_or_null.is_null() {
-                                    let args = f.slots.as_ptr().add(base + 2) as *const *mut PyObject;
+                                    let args = argv.add(2);
                                     let nkw = kwnames.as_ref().map_or(0, |k| tuple::tuple_len(k));
                                     ab::vectorcall_raw(
                                         &*callable,
@@ -1548,7 +1591,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                                         kwnames.as_ref().map_or(std::ptr::null_mut(), |k| k.as_ptr()),
                                     )
                                 } else {
-                                    let args = f.slots.as_ptr().add(base + 1) as *const *mut PyObject;
+                                    let args = argv.add(1);
                                     let nkw = kwnames.as_ref().map_or(0, |k| tuple::tuple_len(k));
                                     ab::vectorcall_raw(
                                         &*callable,
@@ -1561,7 +1604,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             // pop args, self, callable
                             for i in (base..f.stack_top).rev() {
                                 let p = std::mem::replace(&mut f.slots[i], std::ptr::null_mut());
-                                unsafe { xdecref(p) };
+                                unsafe { super::borrow::release(p) };
                             }
                             f.stack_top = base;
                             if let Some(info) = call_info {
@@ -1716,7 +1759,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             push!(f, r.into_raw());
                         }
                         Op::ExtendedArg => unreachable!(),
-                        Op::Unused1 | Op::Unused2 | Op::Unused3 => match &cd.invalid {
+                        Op::Unused1 | Op::Unused3 => match &cd.invalid {
                             Some(msg) => raise!(SystemError, "{}", msg),
                             None => raise!(SystemError, "unknown opcode {}", op as u8),
                         },
@@ -1789,7 +1832,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                 let depth = f.nlocalsplus + h.depth as usize;
                 while f.stack_top > depth {
                     let p = pop!(f);
-                    unsafe { xdecref(p) };
+                    unsafe { super::borrow::release(p) };
                 }
                 if h.lasti {
                     push!(f, int::new_int(f.lasti as i64).into_raw());
@@ -1845,7 +1888,7 @@ pub(crate) fn unwind_compiled(ts: &ThreadState, f: &mut Frame) -> Unwound {
             let depth = f.nlocalsplus + h.depth as usize;
             while f.stack_top > depth {
                 let p = pop!(f);
-                unsafe { xdecref(p) };
+                unsafe { super::borrow::release(p) };
             }
             if h.lasti {
                 push!(f, int::new_int(f.lasti as i64).into_raw());
@@ -2139,7 +2182,7 @@ pub fn finish_send_loop(f: &mut Frame) {
     if f.stack_top > f.nlocalsplus {
         f.stack_top -= 1;
         let p = std::mem::replace(&mut f.slots[f.stack_top], std::ptr::null_mut());
-        unsafe { xdecref(p) };
+        unsafe { super::borrow::release(p) };
     }
     f.next_instr = target;
     f.yield_from_send = -1;
@@ -2321,14 +2364,14 @@ pub(crate) fn exec_misc(ts: &ThreadState, f: &mut Frame, cd: &crate::types::code
             }
         }
         Op::PushExcInfo => {
-            let e = pop!(f);
+            let e = unsafe { super::borrow::own(pop!(f)) };
             unsafe { incref(e) };
             let prev = set_handled_exception(ts, e);
             push!(f, if prev.is_null() { none::none_ref().into_raw() } else { prev });
             push!(f, e);
         }
         Op::PopExcept => {
-            let prev = pop!(f);
+            let prev = unsafe { super::borrow::own(pop!(f)) };
             let prevv = if !prev.is_null() && unsafe { (*prev).is(none::none()) } {
                 unsafe { decref(prev) };
                 std::ptr::null_mut()

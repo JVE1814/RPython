@@ -800,17 +800,17 @@ class ProxyBasicAuthHandler(AbstractBasicAuthHandler, BaseHandler):
                                           req, headers)
 
 
-def _randombytes(n):
-    return os.urandom(n)
-
-
 class AbstractDigestAuthHandler:
-    # RFC 2617 digest authentication (no auth-int, no MD5-sess).
+    # Digest access authentication (RFC 7616 / RFC 2617): qop "auth" or no
+    # qop, algorithms MD5, SHA (SHA-1) and SHA-256.  Entity digests
+    # ("auth-int") are not produced.
+
+    # hash constructors by the algorithm token of the challenge
+    _DIGESTS = {'MD5': hashlib.md5, 'SHA': hashlib.sha1,
+                'SHA-256': hashlib.sha256}
 
     def __init__(self, passwd=None):
-        if passwd is None:
-            passwd = HTTPPasswordMgr()
-        self.passwd = passwd
+        self.passwd = HTTPPasswordMgr() if passwd is None else passwd
         self.add_password = self.passwd.add_password
         self.retried = 0
         self.nonce_count = 0
@@ -820,103 +820,107 @@ class AbstractDigestAuthHandler:
         self.retried = 0
 
     def http_error_auth_reqed(self, auth_header, host, req, headers):
-        authreq = headers.get(auth_header, None)
+        challenge = headers.get(auth_header, None)
         if self.retried > 5:
-            # don't loop forever on a server that keeps refusing
+            # a server that rejects every answer must not make us loop
             raise HTTPError(req.full_url, 401, 'digest auth failed',
                             headers, None)
         self.retried += 1
-        if authreq:
-            scheme = authreq.split()[0]
-            if scheme.lower() == 'digest':
-                return self.retry_http_digest_auth(req, authreq)
-            if scheme.lower() != 'basic':
-                raise ValueError('AbstractDigestAuthHandler does not support '
-                                 f"the following scheme: '{scheme}'")
+        if not challenge:
+            return None
+        scheme = challenge.split()[0].lower()
+        if scheme == 'digest':
+            return self.retry_http_digest_auth(req, challenge)
+        if scheme != 'basic':
+            raise ValueError('AbstractDigestAuthHandler does not support '
+                             f"the following scheme: '{challenge.split()[0]}'")
         return None
 
     def retry_http_digest_auth(self, req, auth):
-        token, challenge = auth.split(' ', 1)
-        chal = parse_keqv_list(filter(None, parse_http_list(challenge)))
-        auth = self.get_authorization(req, chal)
-        if not auth:
+        params = auth.split(' ', 1)[1]
+        fields = parse_keqv_list(filter(None, parse_http_list(params)))
+        answer = self.get_authorization(req, fields)
+        if not answer:
             return None
-        auth_val = f'Digest {auth}'
-        if req.headers.get(self.auth_header, None) == auth_val:
+        header = 'Digest ' + answer
+        if req.headers.get(self.auth_header, None) == header:
+            # this exact answer was refused already
             return None
-        req.add_unredirected_header(self.auth_header, auth_val)
+        req.add_unredirected_header(self.auth_header, header)
         return self.parent.open(req, timeout=req.timeout)
 
     def get_cnonce(self, nonce):
-        seed = f'{self.nonce_count}:{nonce}:{time.ctime()}:'.encode('ascii')
-        return hashlib.sha1(seed + _randombytes(8)).hexdigest()[:16]
+        # client nonce: 16 hex digits derived from the server nonce, our
+        # counter, the clock and fresh random bytes
+        material = f'{self.nonce_count}:{nonce}:{time.ctime()}:'.encode('ascii')
+        return hashlib.sha1(material + os.urandom(8)).hexdigest()[:16]
+
+    def _next_nonce_count(self, nonce):
+        # the count restarts at 1 for every new server nonce
+        self.nonce_count = self.nonce_count + 1 if nonce == self.last_nonce else 1
+        self.last_nonce = nonce
+        return self.nonce_count
 
     def get_authorization(self, req, chal):
-        try:
-            realm = chal['realm']
-            nonce = chal['nonce']
-            qop = chal.get('qop')
-            algorithm = chal.get('algorithm', 'MD5')
-            opaque = chal.get('opaque', None)
-        except KeyError:
+        """The parameters of the Authorization header answering the parsed
+        challenge *chal*, or None when it cannot be answered."""
+        if 'realm' not in chal or 'nonce' not in chal:
             return None
+        realm, nonce = chal['realm'], chal['nonce']
+        qop = chal.get('qop')
+        algorithm = chal.get('algorithm', 'MD5')
+        opaque = chal.get('opaque', None)
 
         H, KD = self.get_algorithm_impls(algorithm)
         if H is None:
             return None
-        user, pw = self.passwd.find_user_password(realm, req.full_url)
+        user, password = self.passwd.find_user_password(realm, req.full_url)
         if user is None:
             return None
+        entity = (self.get_entity_digest(req.data, chal)
+                  if req.data is not None else None)
 
-        entdig = None
-        if req.data is not None:
-            entdig = self.get_entity_digest(req.data, chal)
-
-        A1 = f'{user}:{realm}:{pw}'
-        A2 = f'{req.get_method()}:{req.selector}'
+        secret = H(f'{user}:{realm}:{password}')
+        request_hash = H(f'{req.get_method()}:{req.selector}')
+        params = [('username', f'"{user}"'), ('realm', f'"{realm}"'),
+                  ('nonce', f'"{nonce}"'), ('uri', f'"{req.selector}"')]
         if qop is None:
-            respdig = KD(H(A1), f'{nonce}:{H(A2)}')
+            response = KD(secret, f'{nonce}:{request_hash}')
+            tail = []
         elif 'auth' in qop.split(','):
-            if nonce == self.last_nonce:
-                self.nonce_count += 1
-            else:
-                self.nonce_count = 1
-                self.last_nonce = nonce
-            ncvalue = '%08x' % self.nonce_count
+            count = '%08x' % self._next_nonce_count(nonce)
             cnonce = self.get_cnonce(nonce)
-            respdig = KD(H(A1), f'{nonce}:{ncvalue}:{cnonce}:auth:{H(A2)}')
+            response = KD(secret, f'{nonce}:{count}:{cnonce}:auth:{request_hash}')
+            tail = [('qop', 'auth'), ('nc', count), ('cnonce', f'"{cnonce}"')]
         else:
             raise URLError(f"qop '{qop}' is not supported.")
-
-        base = (f'username="{user}", realm="{realm}", nonce="{nonce}", '
-                f'uri="{req.selector}", response="{respdig}"')
+        params.append(('response', f'"{response}"'))
         if opaque:
-            base += f', opaque="{opaque}"'
-        if entdig:
-            base += f', digest="{entdig}"'
-        base += f', algorithm="{algorithm}"'
-        if qop:
-            base += f', qop=auth, nc={ncvalue}, cnonce="{cnonce}"'
-        return base
+            params.append(('opaque', f'"{opaque}"'))
+        if entity:
+            params.append(('digest', f'"{entity}"'))
+        params.append(('algorithm', f'"{algorithm}"'))
+        params.extend(tail)
+        return ', '.join(f'{name}={value}' for name, value in params)
 
     def get_algorithm_impls(self, algorithm):
-        """Return the (H, KD) functions for a digest *algorithm*."""
-        constructors = {'MD5': hashlib.md5, 'SHA': hashlib.sha1,
-                        'SHA-256': hashlib.sha256}
+        """The (H, KD) pair of RFC 2617 for *algorithm*: H hashes a string
+        to hex digits, KD(secret, data) is H('secret:data')."""
         try:
-            make = constructors[algorithm]
+            new = self._DIGESTS[algorithm]
         except KeyError:
             raise ValueError('Unsupported digest authentication algorithm '
                              f'{algorithm!r}') from None
 
         def H(text):
-            return make(text.encode('ascii')).hexdigest()
+            return new(text.encode('ascii')).hexdigest()
 
         def KD(secret, data):
-            return H(f'{secret}:{data}')
+            return H(secret + ':' + data)
         return H, KD
 
     def get_entity_digest(self, data, chal):
+        # entity digests are not supported
         return None
 
 
@@ -1194,64 +1198,47 @@ class FileHandler(BaseHandler):
             raise URLError(exc, exc.filename)
 
 
-
-def _safe_gethostbyname(host):
-    try:
-        return socket.gethostbyname(host)
-    except socket.gaierror:
-        return None
-
-
 class FTPHandler(BaseHandler):
     """Fetch ftp: URLs (anonymous unless the URL has user:password)."""
+
+    # transfer types a ";type=" attribute may request
+    _TYPES = frozenset('aAiIdD')
 
     def ftp_open(self, req):
         import ftplib
         import mimetypes
-        host = req.host
-        if not host:
+        if not req.host:
             raise URLError('ftp error: no host given')
-        host, port = _splitport(host)
-        if port is None:
-            port = ftplib.FTP_PORT
-        else:
-            port = int(port)
-
-        user, host = _splituser(host)
-        if user:
-            user, passwd = _splitpasswd(user)
-        else:
-            passwd = None
-        host = unquote(host)
-        user = user or ""
-        passwd = passwd or ""
-
+        authority, port = _splitport(req.host)
+        port = ftplib.FTP_PORT if port is None else int(port)
+        credentials, authority = _splituser(authority)
+        user, passwd = _splitpasswd(credentials) if credentials else (None, None)
         try:
-            host = socket.gethostbyname(host)
-        except OSError as msg:
-            raise URLError(msg)
+            address = socket.gethostbyname(unquote(authority))
+        except OSError as exc:
+            raise URLError(exc)
+
         path, attrs = _splitattr(req.selector)
-        dirs = [unquote(d) for d in path.split('/')]
-        dirs, filename = dirs[:-1], dirs[-1]
-        if dirs and not dirs[0]:
-            dirs = dirs[1:]
+        *dirs, filename = (unquote(part) for part in path.split('/'))
+        if dirs and dirs[0] == '':
+            del dirs[0]
+        kind = 'I' if filename else 'D'
+        for attr in attrs:
+            name, value = _splitvalue(attr)
+            if name.lower() == 'type' and value in self._TYPES:
+                kind = value.upper()
         try:
-            fw = self.connect_ftp(user, passwd, host, port, dirs, req.timeout)
-            kind = 'I' if filename else 'D'
-            for attr in attrs:
-                name, value = _splitvalue(attr)
-                if name.lower() == 'type' and value in ('a', 'A', 'i', 'I',
-                                                        'd', 'D'):
-                    kind = value.upper()
-            fp, retrlen = fw.retrfile(filename, kind)
-            header_text = ''
+            conn = self.connect_ftp(user or '', passwd or '', address, port,
+                                    dirs, req.timeout)
+            fp, length = conn.retrfile(filename, kind)
+            lines = []
             mtype = mimetypes.guess_type(req.full_url)[0]
             if mtype:
-                header_text += f'Content-type: {mtype}\n'
-            if retrlen is not None and retrlen >= 0:
-                header_text += f'Content-length: {retrlen}\n'
-            headers = email.message_from_string(header_text)
-            return addinfourl(fp, headers, req.full_url)
+                lines.append(f'Content-type: {mtype}\n')
+            if length is not None and length >= 0:
+                lines.append(f'Content-length: {length}\n')
+            return addinfourl(fp, email.message_from_string(''.join(lines)),
+                              req.full_url)
         except ftplib.all_errors as exc:
             raise URLError(f'ftp error: {exc}') from exc
 
@@ -1261,12 +1248,13 @@ class FTPHandler(BaseHandler):
 
 
 class CacheFTPHandler(FTPHandler):
-    """An FTPHandler that keeps connections open for reuse."""
+    """An FTPHandler that keeps up to max_conns connections open for
+    reuse; a connection unused for `delay` seconds is closed."""
 
     def __init__(self):
-        self.cache = {}
-        self.timeout = {}
-        self.soonest = 0
+        self.cache = {}         # key -> ftpwrapper
+        self.timeout = {}       # key -> time after which it expires
+        self.soonest = 0        # earliest expiry time in self.timeout
         self.delay = 60
         self.max_conns = 16
 
@@ -1277,31 +1265,29 @@ class CacheFTPHandler(FTPHandler):
         self.max_conns = m
 
     def connect_ftp(self, user, passwd, host, port, dirs, timeout):
-        key = user, host, port, '/'.join(dirs), timeout
-        if key in self.cache:
-            self.timeout[key] = time.time() + self.delay
-        else:
-            self.cache[key] = ftpwrapper(user, passwd, host, port, dirs,
-                                         timeout)
-            self.timeout[key] = time.time() + self.delay
+        key = (user, host, port, '/'.join(dirs), timeout)
+        conn = self.cache.get(key)
+        if conn is None:
+            conn = self.cache[key] = ftpwrapper(user, passwd, host, port,
+                                                dirs, timeout)
+        self.timeout[key] = time.time() + self.delay
         self.check_cache()
-        return self.cache[key]
+        return conn
+
+    def _drop(self, key):
+        self.cache.pop(key).close()
+        del self.timeout[key]
 
     def check_cache(self):
         now = time.time()
         if self.soonest <= now:
-            for key, deadline in list(self.timeout.items()):
-                if deadline < now:
-                    self.cache[key].close()
-                    del self.cache[key]
-                    del self.timeout[key]
+            for key in [k for k, t in self.timeout.items() if t < now]:
+                self._drop(key)
         self.soonest = min(self.timeout.values(), default=0)
-        if len(self.cache) == self.max_conns:
-            for key, deadline in list(self.timeout.items()):
-                if deadline == self.soonest:
-                    del self.cache[key]
-                    del self.timeout[key]
-                    break
+        if len(self.cache) >= self.max_conns:
+            # make room by discarding the connection expiring first
+            oldest = min(self.timeout, key=self.timeout.__getitem__)
+            self._drop(oldest)
             self.soonest = min(self.timeout.values(), default=0)
 
     def clear_cache(self):
@@ -1492,47 +1478,54 @@ def proxy_bypass_environment(host, proxies=None):
     return False
 
 
+def _dotted_number(text):
+    # '10', '192.168', '10.0.0.1': missing trailing parts count as 0
+    parts = [int(p) for p in text.split('.')]
+    parts += [0] * (4 - len(parts))
+    value = 0
+    for part in parts[:4]:
+        value = (value << 8) | part
+    return value
+
+
 def _proxy_bypass_macosx_sysconf(host, proxy_settings):
     """Decide a proxy bypass from macOS system settings (a dict with
-    'exclude_simple' and 'exceptions')."""
+    'exclude_simple' and 'exceptions').
+
+    An exception that starts with a dotted number ('10', '172.16/12') is an
+    IPv4 prefix (its length defaults to 8 bits per given part) and only
+    applies to hosts given as IPv4 addresses; anything else is a
+    shell-style host pattern.
+    """
     from fnmatch import fnmatch
     from ipaddress import AddressValueError, IPv4Address
 
-    hostonly, port = _splitport(host)
-
-    def ip2num(ipaddr):
-        parts = list(map(int, ipaddr.split('.')))
-        parts += [0] * (4 - len(parts))
-        return parts[0] << 24 | parts[1] << 16 | parts[2] << 8 | parts[3]
-
     if '.' not in host and proxy_settings['exclude_simple']:
         return True
-
-    hostIP = None
     try:
-        hostIP = int(IPv4Address(hostonly))
+        address = int(IPv4Address(_splitport(host)[0]))
     except AddressValueError:
-        pass
+        address = None
 
-    for value in proxy_settings.get('exceptions', ()):
-        if not value:
+    for entry in proxy_settings.get('exceptions', ()):
+        if not entry:
             continue
-        match = re.match(r'(\d+(?:\.\d+)*)(/\d+)?', value)
-        if match is not None and hostIP is not None:
-            base = ip2num(match.group(1))
-            mask = match.group(2)
-            if mask is None:
-                mask = 8 * (match.group(1).count('.') + 1)
-            else:
-                mask = int(mask[1:])
-            if mask < 0 or mask > 32:
-                continue
-            shift = 32 - mask
-            if (hostIP >> shift) == (base >> shift):
+        prefix = _IPV4_PREFIX.match(entry) if address is not None else None
+        if prefix is None:
+            if fnmatch(host, entry):
                 return True
-        elif fnmatch(host, value):
+            continue
+        digits, bits = prefix.groups()
+        bits = 8 * (digits.count('.') + 1) if bits is None else int(bits)
+        if not 0 <= bits <= 32:
+            continue
+        drop = 32 - bits
+        if address >> drop == _dotted_number(digits) >> drop:
             return True
     return False
+
+
+_IPV4_PREFIX = re.compile(r'(\d+(?:\.\d+)*)(?:/(\d+))?')
 
 
 def _proxy_bypass_winreg_override(host, override):
@@ -1566,7 +1559,9 @@ def proxy_bypass(host):
 # FTP connections
 
 class ftpwrapper:
-    """An FTP connection used by FTPHandler, opened for a directory."""
+    """An FTP session logged in and positioned in a directory, used by
+    FTPHandler.  With persistent=False the session closes once the last
+    file it handed out is closed."""
 
     def __init__(self, user, passwd, host, port, dirs, timeout=None,
                  persistent=True):
@@ -1576,72 +1571,77 @@ class ftpwrapper:
         self.port = port
         self.dirs = dirs
         self.timeout = timeout
-        self.refcount = 0
+        self.refcount = 0           # files handed out and not yet closed
         self.keepalive = persistent
         try:
             self.init()
-        except:
+        except BaseException:
             self.close()
             raise
 
     def init(self):
         import ftplib
-        self.busy = 0
+        self.busy = False           # a transfer reply is still pending
         self.ftp = ftplib.FTP()
         self.ftp.connect(self.host, self.port, self.timeout)
         self.ftp.login(self.user, self.passwd)
         self.ftp.cwd('/'.join(self.dirs))
 
+    def _set_type(self, command):
+        import ftplib
+        try:
+            self.ftp.voidcmd(command)
+        except ftplib.all_errors:
+            # the server dropped the idle session: log in again
+            self.init()
+            self.ftp.voidcmd(command)
+
+    def _listing(self, name):
+        # a directory listing of *name* (checked to be a directory) or of
+        # the current directory
+        import ftplib
+        self.ftp.voidcmd('TYPE A')
+        if not name:
+            return self.ftp.ntransfercmd('LIST')
+        here = self.ftp.pwd()
+        try:
+            self.ftp.cwd(name)
+        except ftplib.error_perm as exc:
+            raise URLError(f'ftp error: {exc}') from exc
+        finally:
+            self.ftp.cwd(here)
+        return self.ftp.ntransfercmd('LIST ' + name)
+
     def retrfile(self, file, type):
+        """(file object, length or None) for *file* in transfer *type*
+        ('A', 'I' or 'D' for a directory listing)."""
         import ftplib
         self.endtransfer()
-        if type in ('d', 'D'):
-            cmd = 'TYPE A'
-            isdir = 1
-        else:
-            cmd = 'TYPE ' + type
-            isdir = 0
-        try:
-            self.ftp.voidcmd(cmd)
-        except ftplib.all_errors:
-            self.init()
-            self.ftp.voidcmd(cmd)
+        listing = type in ('d', 'D')
+        self._set_type('TYPE A' if listing else 'TYPE ' + type)
         conn = None
-        if file and not isdir:
+        if file and not listing:
             try:
-                conn, retrlen = self.ftp.ntransfercmd('RETR ' + file)
-            except ftplib.error_perm as reason:
-                if str(reason)[:3] != '550':
-                    raise URLError(f'ftp error: {reason}') from reason
-        if not conn:
-            self.ftp.voidcmd('TYPE A')
-            if file:
-                pwd = self.ftp.pwd()
-                try:
-                    try:
-                        self.ftp.cwd(file)
-                    except ftplib.error_perm as reason:
-                        raise URLError(f'ftp error: {reason}') from reason
-                finally:
-                    self.ftp.cwd(pwd)
-                cmd = 'LIST ' + file
-            else:
-                cmd = 'LIST'
-            conn, retrlen = self.ftp.ntransfercmd(cmd)
-        self.busy = 1
-        ftpobj = addclosehook(conn.makefile('rb'), self.file_close)
+                conn, length = self.ftp.ntransfercmd('RETR ' + file)
+            except ftplib.error_perm as exc:
+                # 550 (no such file) may mean it is a directory
+                if not str(exc).startswith('550'):
+                    raise URLError(f'ftp error: {exc}') from exc
+        if conn is None:
+            conn, length = self._listing(file)
+        self.busy = True
+        stream = addclosehook(conn.makefile('rb'), self.file_close)
         self.refcount += 1
         conn.close()
-        return ftpobj, retrlen
+        return stream, length
 
     def endtransfer(self):
-        if not self.busy:
-            return
-        self.busy = 0
-        try:
-            self.ftp.voidresp()
-        except Exception:
-            pass
+        if self.busy:
+            self.busy = False
+            try:
+                self.ftp.voidresp()
+            except Exception:
+                pass
 
     def close(self):
         self.keepalive = False

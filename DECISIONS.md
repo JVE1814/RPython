@@ -341,3 +341,36 @@ runs at build time. Frozen modules are used by default, as in CPython, except wh
 (running target/release/python3 from a checkout keeps using the files on disk). Consequence: after editing a frozen
 module's source, rebuild before snapshotting. Result (perf6): `-c pass` 64.8M → 39.2M instructions (CPython 40.5M),
 python_startup 0.88x the best CPython build.
+
+## D31 — Reported object sizes (capi3, 2026-11-07)
+`tp_basicsize` always equals what we allocate and is never smaller than our own struct (C extensions subclass and
+allocate by it). Where CPython's layout is larger we pad to CPython's size (dict iterators, enumerate, capsule, module,
+EncodingMap); where our object is internally different, `__sizeof__` (a reporting API) reports CPython's size instead
+(frame and generator 184, range, split instance dicts, heap types with inline values plus the shared-keys block).
+`list(x)` rounds capacity up to an even slot count. set's private trailing field beyond the public PySetObject layout
+was removed (a corruption risk for C subclasses).
+
+## D32 — Interning with subinterpreters (capi3)
+One shared intern table stays (shapes key on interned pointers). Strings that `sys.intern` in the main interpreter newly
+made canonical are marked dynamic and are not handed to subinterpreters, which keep their own table for those; code
+constants count as static (shared).
+
+## D33 — Code points above U+10FFFF created from C (capi3)
+Stored as given, as a CPython release build does: a single such code point is refused, iterating over such a string
+raises SystemError (the behaviour test_capi checks).
+
+## D34 — Debug allocator hooks under -X dev (capi3)
+`PYTHONMALLOC=debug`/`*_debug` and `-X dev` install guard-byte debug hooks (capi/memdebug.rs). Blocks the hooks did not
+allocate (runtime objects freed via tp_free) pass through to the wrapped allocator. With hooks, tracemalloc or a
+reference tracer installed, the allocator takes its slow paths (one combined flag, no cost otherwise).
+
+## D35 — Borrowed value-stack references (refs1)
+A value-stack slot may hold a borrowed reference to a local's object, tagged with pointer bit 0. Locals, cells and
+anything C code sees are never tagged. The runtime's translator does its own analysis and marks a load
+`LoadFastBorrow` only if every copy of the value is consumed in the same basic block, the local is not stored or
+deleted in between, and no handler would keep a copy. The marks in the public bytecode are not trusted. The
+interpreter and both JIT tiers accept tagged inputs. A write to a running frame's locals from outside the frame
+releases the old value only when the frame ends. `sys.getrefcount` reports real counts, so D27's caller-stack
+emulation is retired; only its part about arguments copied into callees remains. HotSpot comparison: the JIT knows
+which values are live in which slots without paying a refcount for each one. `RPYTHON_BORROW=0` turns it off.
+Details: notes/refs1.md.

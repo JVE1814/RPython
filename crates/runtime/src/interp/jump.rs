@@ -75,7 +75,7 @@ fn step(op: Op, arg: u32, s: &Stack) -> (Option<Stack>, Option<(usize, Stack)>) 
     let mut jump: Option<(usize, Stack)> = None;
     match op {
         Op::Nop | Op::Resume | Op::ExtendedArg | Op::SetupAnnotations | Op::DeleteFast | Op::MakeCell | Op::CopyFreeVars => {}
-        Op::DeleteDeref | Op::DeleteName | Op::DeleteGlobal | Op::Unused2 => {}
+        Op::DeleteDeref | Op::DeleteName | Op::DeleteGlobal => {}
         Op::PopTop | Op::StoreFast | Op::StoreDeref | Op::StoreName | Op::StoreGlobal | Op::DeleteAttr | Op::Unused1 | Op::Unused3 => pop(&mut f, 1),
         Op::ListAppend | Op::SetAdd | Op::ListExtend | Op::SetUpdate | Op::DictUpdate | Op::DictMerge => pop(&mut f, 1),
         Op::PushNull => f.push(Null),
@@ -89,7 +89,7 @@ fn step(op: Op, arg: u32, s: &Stack) -> (Option<Stack>, Option<(usize, Stack)>) 
                 f.swap(l - 1, l - n);
             }
         }
-        Op::LoadConst | Op::LoadFast | Op::LoadFastCheck | Op::LoadFastAndClear | Op::LoadDeref | Op::LoadLocals | Op::LoadName => f.push(Object),
+        Op::LoadConst | Op::LoadFast | Op::LoadFastBorrow | Op::LoadFastCheck | Op::LoadFastAndClear | Op::LoadDeref | Op::LoadLocals | Op::LoadName => f.push(Object),
         Op::LoadGlobal | Op::LoadBuildClass | Op::LoadCommonConstant | Op::ImportFrom | Op::GetLen => f.push(Object),
         Op::MatchMapping | Op::MatchSequence | Op::MatchKeys | Op::GetAnext => f.push(Object),
         Op::LoadFromDictOrDeref | Op::LoadFromDictOrGlobals | Op::LoadAttr | Op::UnaryNegative | Op::UnaryPositive | Op::UnaryInvert => {
@@ -357,6 +357,8 @@ pub fn set_lineno(f: &mut Frame, value: Option<&PyObject>) -> PyResult<()> {
         let k = cur[f.stack_top - base - 1];
         f.stack_top -= 1;
         let p = std::mem::replace(&mut f.slots[f.stack_top], std::ptr::null_mut());
+        // (refs1) borrowed entries own nothing
+        let p = if k == Kind::ExcInfo { unsafe { crate::interp::borrow::own(p) } } else { p };
         if k == Kind::ExcInfo {
             let prev = if !p.is_null() && unsafe { crate::types::none::is_none(&*p) } {
                 unsafe { decref(p) };
@@ -367,9 +369,12 @@ pub fn set_lineno(f: &mut Frame, value: Option<&PyObject>) -> PyResult<()> {
             let old = crate::interp::eval::restore_handled_exception(prev);
             unsafe { xdecref(old) };
         } else {
-            unsafe { xdecref(p) };
+            unsafe { crate::interp::borrow::release(p) };
         }
     }
+    // (refs1) the entries kept are now consumed by the code at the target, which the
+    // borrow analysis did not see: they must own their objects
+    crate::interp::borrow::own_stack(f);
     let unbound = fill_unbound_locals(f, &ins, target);
     f.jump_to = target as i32;
     if unbound > 0 {

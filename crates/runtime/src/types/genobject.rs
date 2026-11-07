@@ -1376,7 +1376,7 @@ unsafe extern "C" fn gen_traverse(o: *mut PyObject, visit: visitproc, arg: *mut 
             let f = &*gn.frame;
             for i in 0..f.stack_top {
                 let p = f.slots[i];
-                if !p.is_null() {
+                if !p.is_null() && !crate::interp::borrow::is_borrowed(p) {
                     let r = v(p, arg);
                     if r != 0 {
                         return r;

@@ -171,8 +171,9 @@ pub enum Inst {
     /// lea of a frame slot address as call argument helper: dst = &slots[i]
     SlotAddr(V, u32),
     /// Emit the tier-1 template for bytecode instruction #i (all state materialised,
-    /// clobbers every allocatable register).
-    Template(u32, Option<SnapId>),
+    /// clobbers every allocatable register). The mask (refs1): value-stack depths
+    /// holding borrowed (tagged) entries the template consumes.
+    Template(u32, Option<SnapId>, u64),
     /// eval-breaker poll; the slow path syncs `snap`, calls the handler, and either
     /// continues or exits with an error.
     Poll(SnapId),
@@ -433,7 +434,7 @@ impl Inst {
             | Inst::TryLock(_, s) => Some(*s),
             Inst::LoadLocalUnboxed { snap, .. } => Some(*snap),
             Inst::CallChecked { err, .. } => Some(*err),
-            Inst::Template(_, s) => *s,
+            Inst::Template(_, s, _) => *s,
             _ => None,
         }
     }
