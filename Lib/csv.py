@@ -246,8 +246,11 @@ class Sniffer:
         return dialect
 
     @staticmethod
-    def _delimiter_candidate(ch, delimiters):
-        if ch in '\r\n"\'' or ch.isalnum() or ch == '_':
+    def _delimiter_candidate(ch, delimiters, alnum=False):
+        # only ASCII characters can be guessed as delimiters
+        if ch in '\r\n"\'' or ord(ch) >= 127:
+            return False
+        if (ch.isalnum() or ch == '_') and not alnum:
             return False
         return delimiters is None or ch in delimiters
 
@@ -362,6 +365,14 @@ class Sniffer:
         Returns (delimiter, skipinitialspace); delimiter is '' when no
         character qualifies.
         """
+        found = self._guess_delimiter_from(data, delimiters, False)
+        if not found[0]:
+            # no punctuation qualifies: letters and digits may separate too
+            # ("aob" splits at "o"); among equals the highest character wins
+            found = self._guess_delimiter_from(data, delimiters, True)
+        return found
+
+    def _guess_delimiter_from(self, data, delimiters, alnum):
         lines = [line for line in data.split('\n') if line]
         if not lines:
             return '', False
@@ -370,7 +381,7 @@ class Sniffer:
         for number, line in enumerate(lines):
             counts = {}
             for ch in line:
-                if self._delimiter_candidate(ch, delimiters):
+                if self._delimiter_candidate(ch, delimiters, alnum):
                     counts[ch] = counts.get(ch, 0) + 1
                     seen.setdefault(ch, number)
             per_line.append(counts)
@@ -402,8 +413,13 @@ class Sniffer:
                     delimiter = ch
                     break
             else:
-                delimiter = min(candidates, key=lambda ch: (-scores[ch],
-                                                            seen[ch]))
+                if alnum:
+                    best = max(scores[ch] for ch in candidates)
+                    delimiter = max(ch for ch in candidates
+                                    if scores[ch] == best)
+                else:
+                    delimiter = min(candidates, key=lambda ch: (-scores[ch],
+                                                                seen[ch]))
         occurrences = data.count(delimiter)
         followed = data.count(delimiter + ' ')
         return delimiter, occurrences == followed and delimiter != ' '

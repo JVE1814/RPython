@@ -1143,7 +1143,7 @@ pub fn iter_search_contains(container: &PyObject, item: &PyObject) -> PyResult<b
         Err(e) => {
             if exc_matches(crate::types::exceptions::TypeError()) {
                 clear_exc();
-                raise!(TypeError, "argument of type '{}' is not a container or iterable", tname(container));
+                raise!(TypeError, "argument of type '{}' is not a container or iterable", tp_name_of(container));
             }
             return Err(e);
         }

@@ -386,7 +386,62 @@ fn sys_is_immortal(_m: &PyObject, o: &PyObject) -> PyResult {
 }
 
 fn sys_getrefcount(_m: &PyObject, o: &PyObject) -> PyResult {
-    Ok(int::new_int(crate::object::visible_refcnt(o) as i64))
+    let mut n = crate::object::visible_refcnt(o) as i64;
+    // (wheels2) CPython 3.14+ loads a local argument with a borrowed reference
+    // (LOAD_FAST_BORROW), so `getrefcount(x)` no longer counts the argument itself.
+    // Our value stack owns that reference: when a fast local of the calling frame
+    // holds the object, that is where the argument came from, and the count leaves
+    // it out. pandas' chained-assignment detection compares these counts.
+    if n > 1 && caller_local_holds(o) {
+        n -= 1;
+        // CPython also moves the arguments of a Python-to-Python call from the
+        // caller's value stack into the callee's frame. Ours copies them: while
+        // the calling frame is still inside that call with the object among its
+        // operands, one of the counted references is that stack slot.
+        if n > 1 && parent_call_operand(o) {
+            n -= 1;
+        }
+    }
+    Ok(int::new_int(n))
+}
+
+fn parent_call_operand(o: &PyObject) -> bool {
+    use rpy_compiler::bytecode::{self as bc, Op};
+    let f = crate::interp::current_frame_ptr();
+    if f.is_null() {
+        return false;
+    }
+    unsafe {
+        let p = (*f).prev;
+        if p.is_null() || (*p).code.is_null() {
+            return false;
+        }
+        let p = &*p;
+        let cd = crate::types::code::code_data(&*p.code);
+        let Some(&w) = cd.code.get(p.lasti as usize) else { return false };
+        let (op, _) = bc::decode(w);
+        if !matches!(op, Op::Call | Op::CallKw) {
+            return false;
+        }
+        let lo = p.nlocalsplus.min(p.slots.len());
+        let hi = p.stack_top.min(p.slots.len());
+        lo < hi && p.slots[lo..hi].iter().any(|&q| q == o.as_ptr())
+    }
+}
+
+fn caller_local_holds(o: &PyObject) -> bool {
+    let f = crate::interp::current_frame_ptr();
+    if f.is_null() {
+        return false;
+    }
+    unsafe {
+        let f = &*f;
+        if !f.locals.is_null() {
+            return false; // module/class frames load names, not fast locals
+        }
+        let n = f.nlocalsplus.min(f.slots.len());
+        f.slots[..n].iter().any(|&p| p == o.as_ptr())
+    }
 }
 
 fn sys_displayhook(_m: &PyObject, o: &PyObject) -> PyResult {
