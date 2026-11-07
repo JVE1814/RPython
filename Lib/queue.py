@@ -25,11 +25,11 @@ try:
     from _queue import Empty
 except ImportError:
     class Empty(Exception):
-        'Exception raised by Queue.get(block=0)/get_nowait().'
+        'Raised by a non-blocking (or timed-out) get() on an empty queue.'
         pass
 
 class Full(Exception):
-    'Exception raised by Queue.put(block=0)/put_nowait().'
+    'Raised by a non-blocking (or timed-out) put() on a full queue.'
     pass
 
 

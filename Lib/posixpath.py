@@ -2,7 +2,7 @@
 
 Usually accessed as os.path rather than imported directly."""
 
-# Strings representing various path-related bits and pieces.
+# The POSIX spellings of the special path components and separators.
 curdir = '.'
 pardir = '..'
 extsep = '.'

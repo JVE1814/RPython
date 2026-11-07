@@ -56,7 +56,12 @@ impl Drop for ObGuard {
     #[inline(always)]
     fn drop(&mut self) {
         if !self.m.is_null() {
-            unsafe { (*self.m).store(0, Release) }
+            // (scale1) waiters may have parked (bit 1): wake them
+            unsafe {
+                if (*self.m).compare_exchange(1, 0, Release, Relaxed).is_err() {
+                    crate::capi::pythread::mutex_unlock(&*self.m);
+                }
+            }
         }
     }
 }
@@ -83,6 +88,12 @@ fn lock_slow(m: &AtomicU8) -> bool {
         spins += 1;
         if spins == 1 && crate::capi::pythread::cs_holds_mutex(m as *const AtomicU8 as usize) {
             return false;
+        }
+        if spins == 2 {
+            // (scale1) spin briefly, then park (PyMutex protocol) instead of thousands
+            // of sched_yield calls: contended writers burned whole cores
+            crate::capi::pythread::mutex_lock(m);
+            return true;
         }
         if spins < 64 {
             std::hint::spin_loop();
@@ -150,6 +161,12 @@ pub struct DictTable {
     /// up without any EMPTY slot and lookups of missing keys would probe forever.
     fill: usize,
     data_bytes: usize,
+    /// (scale1) Sequence lock for lock-free readers (`lookup_lockfree`): odd while a
+    /// writer (holding the object lock) changes the index or entry layout.
+    pub wseq: std::sync::atomic::AtomicU64,
+    /// (scale1) Set (under the object lock) once a thread other than the owner reads or
+    /// writes the table: from then on, replaced data blocks wait for lock-free readers.
+    shared_read: std::sync::atomic::AtomicBool,
 }
 
 /// A fresh, globally unique dict version stamp (the JIT's allocator). Every
@@ -200,14 +217,24 @@ unsafe fn raw_free(p: *mut u8, bytes: usize) {
     }
 }
 
+/// Bytes before the index array in a data block: (size, cap) of the block.
+const BLOCK_HDR: usize = 16;
+
 impl DictTable {
     /// A table with room for `cap` entries (data block allocated, header by value).
     pub fn new(cap: usize) -> DictTable {
         let size = size_for(cap);
         let ecap = usable_for(size);
         let ibytes = (size * 4 + 7) & !7;
-        let bytes = ibytes + ecap * std::mem::size_of::<Entry>();
+        // (scale1) the block starts with its own (size, cap): a lock-free reader derives
+        // everything from the one `indices_p` pointer it loaded (no torn snapshot)
+        let bytes = BLOCK_HDR + ibytes + ecap * std::mem::size_of::<Entry>();
         let data = raw_alloc(bytes);
+        unsafe {
+            *(data as *mut usize) = size;
+            *(data as *mut usize).add(1) = ecap;
+        }
+        let data = unsafe { data.add(BLOCK_HDR) };
         unsafe { std::ptr::write_bytes(data, 0xff, size * 4) };
         DictTable {
             version: next_version(),
@@ -221,7 +248,38 @@ impl DictTable {
             used: 0,
             fill: 0,
             data_bytes: bytes,
+            wseq: std::sync::atomic::AtomicU64::new(0),
+            shared_read: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+    /// Start a change of the index/entry layout (object lock held).
+    #[inline(always)]
+    fn wbegin(&self) {
+        let s = self.wseq.load(Relaxed);
+        self.wseq.store(s + 1, Relaxed);
+        std::sync::atomic::fence(Release);
+    }
+    #[inline(always)]
+    fn wend(&self) {
+        let s = self.wseq.load(Relaxed);
+        self.wseq.store(s + 1, Release);
+    }
+    /// Give up the data block (after a resize swapped it in here): freed now, or after
+    /// a grace period while lock-free readers on other threads may still be reading it.
+    fn retire_block(&mut self) {
+        if self.indices_p.is_null() {
+            return;
+        }
+        let p = unsafe { (std::mem::replace(&mut self.indices_p, std::ptr::null_mut()) as *mut u8).sub(BLOCK_HDR) };
+        if !self.shared_read.load(Relaxed) {
+            // only the owner ever touched this table: nobody can be reading the block
+            unsafe { raw_free(p, self.data_bytes) };
+            return;
+        }
+        unsafe fn free_block(p: *mut u8) {
+            unsafe { crate::alloc::buf_free(p) }
+        }
+        unsafe { crate::qsbr::free_deferred(p, free_block) };
     }
     #[inline(always)]
     fn indices(&self) -> &[i32] {
@@ -260,6 +318,11 @@ impl DictTable {
     }
     /// Rebuild with room for at least `min_usable` entries (compacts holes).
     fn resize(&mut self, min_usable: usize) {
+        self.wbegin();
+        self.resize_inner(min_usable);
+        self.wend();
+    }
+    fn resize_inner(&mut self, min_usable: usize) {
         let mut fresh = DictTable::new(min_usable.max(self.used));
         {
             let mask = fresh.size - 1;
@@ -282,16 +345,23 @@ impl DictTable {
         }
         // the old data block goes; the header (and `version`) stay in place
         std::mem::swap(&mut self.entries_p, &mut fresh.entries_p);
-        std::mem::swap(&mut self.indices_p, &mut fresh.indices_p);
         std::mem::swap(&mut self.size, &mut fresh.size);
         std::mem::swap(&mut self.cap, &mut fresh.cap);
         std::mem::swap(&mut self.data_bytes, &mut fresh.data_bytes);
+        // (scale1) lock-free readers derive the whole layout from this one pointer:
+        // published last, after the block is complete
+        let new_ip = fresh.indices_p;
+        fresh.indices_p = self.indices_p;
+        unsafe { std::sync::atomic::AtomicPtr::from_ptr(&raw mut self.indices_p).store(new_ip, Release) };
         self.nentries = fresh.nentries;
         self.fill = fresh.fill;
         fresh.nentries = 0;
         self.version = next_version();
         self.layout = next_version();
         self.keys_version = next_version();
+        // `fresh` holds the old block now: it is retired under this table's rules
+        fresh.shared_read.store(self.shared_read.load(Relaxed), Relaxed);
+        fresh.retire_block();
         drop(fresh);
     }
     #[inline]
@@ -300,17 +370,20 @@ impl DictTable {
             // (perf4) like CPython: the new index size is at least 3 * used (usable = 2/3 of it)
             self.resize(self.used * 2);
         }
+        self.wbegin();
         let slot = self.find_empty_slot(h);
         if self.indices()[slot] == EMPTY {
             self.fill += 1;
         }
         let n = self.nentries;
-        self.indices_mut()[slot] = n as i32;
+        // (scale1) entry first, then the index that makes it reachable for lock-free readers
         unsafe { *self.entries_p.add(n) = Entry { hash: h, key, value } };
+        unsafe { std::sync::atomic::AtomicI32::from_ptr(self.indices_p.add(slot)).store(n as i32, Release) };
         self.nentries = n + 1;
         self.used += 1;
         self.version = next_version();
         self.keys_version = self.version;
+        self.wend();
     }
     /// Find the index slot holding entry `ix` (which has hash `h`).
     fn slot_of(&self, ix: usize, h: isize) -> usize {
@@ -330,6 +403,7 @@ impl DictTable {
     fn remove(&mut self, ix: usize) -> (*mut PyObject, *mut PyObject) {
         let e = self.entries()[ix];
         let s = self.slot_of(ix, e.hash);
+        self.wbegin();
         self.indices_mut()[s] = DUMMY;
         let en = &mut self.entries_mut()[ix];
         en.key = std::ptr::null_mut();
@@ -337,6 +411,7 @@ impl DictTable {
         self.used -= 1;
         self.version = next_version();
         self.keys_version = self.version;
+        self.wend();
         (e.key, e.value)
     }
     pub fn used(&self) -> usize {
@@ -350,7 +425,7 @@ impl DictTable {
 impl Drop for DictTable {
     fn drop(&mut self) {
         if !self.indices_p.is_null() {
-            unsafe { raw_free(self.indices_p as *mut u8, self.data_bytes) };
+            unsafe { raw_free((self.indices_p as *mut u8).sub(BLOCK_HDR), self.data_bytes) };
             self.indices_p = std::ptr::null_mut();
         }
     }
@@ -440,7 +515,43 @@ unsafe fn is_shared_empty(d: &PyObject) -> bool {
 /// Unsynchronized table access (callers must hold the object lock or own the object).
 #[inline(always)]
 pub fn table(d: &PyObject) -> &mut DictTable {
-    unsafe { &mut *raw_table(d) }
+    unsafe {
+        let t = raw_table(d);
+        // (scale1) a thread other than the owner works on the table (with the lock held,
+        // as every caller that is not the owner does): see `shared_read`
+        if !(*t).shared_read.load(Relaxed) && d.ob_tid.load(Relaxed) != thread_id() {
+            (*t).shared_read.store(true, Relaxed);
+        }
+        &mut *t
+    }
+}
+
+/// Before a thread other than the owner reads `d` without the lock for the first time:
+/// mark the table (under the lock, so that a writer that frees blocks immediately
+/// cannot be running).
+#[inline(always)]
+fn mark_shared_read(d: &PyObject, tp: *mut DictTable) {
+    unsafe {
+        if !(*tp).shared_read.load(Relaxed) && (*tp).cap != 0 && d.ob_tid.load(Relaxed) != thread_id() {
+            mark_shared_read_slow(d);
+        }
+    }
+}
+/// For code outside this module that reads a dict's entries without the lock
+/// (the specialiser's hinted lookups).
+pub fn prepare_unlocked_read(d: &PyObject) {
+    unsafe {
+        let tp = (*(d.as_ptr() as *mut PyDictObject)).ma_keys as *mut DictTable;
+        if !tp.is_null() {
+            mark_shared_read(d, tp);
+        }
+    }
+}
+#[cold]
+fn mark_shared_read_slow(d: &PyObject) {
+    let g = ob_lock(d);
+    let _ = table(d);
+    drop(g);
 }
 
 /// Table for reading only: may be the shared empty table (never written through).
@@ -634,7 +745,134 @@ pub fn find(d: &PyObject, key: &PyObject, hash: isize) -> PyResult<(ObGuard, Fou
 }
 
 /// Look up `key` with precomputed `hash`. Returns the entry index.
+// ------------------------------------------------------------------ lock-free reads (scale1)
+//
+// Readers that only need identity or exact-str key comparison (no Python code) read
+// the table without the object lock, validated by the table's sequence lock (`wseq`,
+// odd while a writer changes the index/entry layout). What they may still be looking
+// at after a concurrent change stays valid until they reach a quiescent point: old
+// data blocks (`retire_block`), removed keys and replaced values (`qsbr::decref_deferred`)
+// are released through QSBR while other threads exist, and table headers live as long
+// as their dict. A value read under a valid snapshot was the value at that moment;
+// it is still alive, so taking a reference to it afterwards is safe. Contended dict
+// locks were the scaling bottleneck of shared read-mostly dicts (module globals,
+// class dicts, lookup tables): every reader wrote the lock word.
+
+enum LfRead {
+    /// entry index, value (null while being removed: undecided)
+    Hit(usize, *mut PyObject),
+    Miss,
+    /// needs a comparison that can run Python code, or kept changing
+    Undecided,
+}
+
+/// The current data block of table `tp`, read without the lock: (indices, entries,
+/// index slots, entry capacity), all derived from the one `indices_p` pointer, so they
+/// always describe the same block (the current one or one retired after this thread's
+/// last quiescent point).
+#[inline(always)]
+unsafe fn block_layout(tp: *mut DictTable) -> Option<(*mut i32, *mut Entry, usize, usize)> {
+    unsafe {
+        let ip = std::sync::atomic::AtomicPtr::from_ptr(&raw mut (*tp).indices_p).load(Acquire);
+        if ip.is_null() {
+            return None;
+        }
+        let hdr = (ip as *mut u8).sub(BLOCK_HDR) as *const usize;
+        let size = *hdr;
+        let cap = *hdr.add(1);
+        let ep = (ip as *mut u8).add((size * 4 + 7) & !7) as *mut Entry;
+        Some((ip, ep, size, cap))
+    }
+}
+
+#[inline]
+fn lookup_lockfree_raw(d: &PyObject, key: &PyObject, hash: isize) -> LfRead {
+    use std::sync::atomic::{AtomicI32, AtomicIsize, AtomicPtr};
+    let kp = key.as_ptr();
+    let str_key = crate::types::str::is_str_exact(key);
+    unsafe {
+        let tp = AtomicPtr::from_ptr(&raw mut (*(d.as_ptr() as *mut PyDictObject)).ma_keys).load(Acquire) as *mut DictTable;
+        if tp.is_null() {
+            return LfRead::Undecided;
+        }
+        mark_shared_read(d, tp);
+        for _ in 0..8 {
+            let s1 = (*tp).wseq.load(Acquire);
+            if s1 & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let Some((ip, ep, size, cap)) = block_layout(tp) else {
+                return LfRead::Undecided;
+            };
+            let mut res = LfRead::Undecided;
+            {
+                let mask = size - 1;
+                let mut perturb = hash as usize;
+                let mut i = (hash as usize) & mask;
+                for _ in 0..=size {
+                    let ix = AtomicI32::from_ptr(ip.add(i)).load(Relaxed);
+                    if ix == EMPTY {
+                        res = LfRead::Miss;
+                        break;
+                    }
+                    if ix >= 0 {
+                        if ix as usize >= cap {
+                            break; // torn snapshot: decided by the sequence check
+                        }
+                        let e = ep.add(ix as usize);
+                        let ek = AtomicPtr::from_ptr(&raw mut (*e).key).load(Relaxed);
+                        if ek == kp {
+                            res = LfRead::Hit(ix as usize, AtomicPtr::from_ptr(&raw mut (*e).value).load(Acquire));
+                            break;
+                        }
+                        if !ek.is_null() && AtomicIsize::from_ptr(&raw mut (*e).hash).load(Relaxed) == hash {
+                            if str_key && crate::types::str::is_str_exact(&*ek) {
+                                if crate::types::str::str_eq(&*ek, key) {
+                                    res = LfRead::Hit(ix as usize, AtomicPtr::from_ptr(&raw mut (*e).value).load(Acquire));
+                                    break;
+                                }
+                            } else {
+                                break; // a comparison that may run Python code: locked path
+                            }
+                        }
+                    }
+                    perturb >>= 5;
+                    i = (i.wrapping_mul(5).wrapping_add(perturb).wrapping_add(1)) & mask;
+                }
+            }
+            std::sync::atomic::fence(Acquire);
+            if (*tp).wseq.load(Relaxed) != s1 {
+                continue;
+            }
+            if AtomicPtr::from_ptr(&raw mut (*(d.as_ptr() as *mut PyDictObject)).ma_keys).load(Acquire) as *mut DictTable != tp {
+                return LfRead::Undecided; // a private table replaced the shared empty one
+            }
+            return match res {
+                LfRead::Hit(_, v) if v.is_null() => LfRead::Undecided,
+                r => r,
+            };
+        }
+        LfRead::Undecided
+    }
+}
+
+/// d[key] without the object lock: Some(result) when it could be decided that way.
+#[inline]
+fn get_lockfree(d: &PyObject, key: &PyObject, hash: isize) -> Option<Option<PyRef>> {
+    match lookup_lockfree_raw(d, key, hash) {
+        LfRead::Hit(_, v) => Some(Some(unsafe { PyRef::from_borrowed(v) })),
+        LfRead::Miss => Some(None),
+        LfRead::Undecided => None,
+    }
+}
+
 pub fn lookup_index(d: &PyObject, key: &PyObject, hash: isize) -> PyResult<Option<usize>> {
+    match lookup_lockfree_raw(d, key, hash) {
+        LfRead::Hit(ix, _) => return Ok(Some(ix)),
+        LfRead::Miss => return Ok(None),
+        LfRead::Undecided => {}
+    }
     let (_g, f) = find(d, key, hash)?;
     Ok(match f {
         Found::At(ix) => Some(ix),
@@ -708,6 +946,9 @@ pub fn get_item(d: &PyObject, key: &PyObject) -> PyResult<Option<PyRef>> {
 }
 
 pub fn get_item_hash(d: &PyObject, key: &PyObject, h: isize) -> PyResult<Option<PyRef>> {
+    if let Some(r) = get_lockfree(d, key, h) {
+        return Ok(r);
+    }
     let (g, f) = find(d, key, h)?;
     let r = match f {
         Found::At(ix) => Some(unsafe { PyRef::from_borrowed(table(d).entries()[ix].value) }),
@@ -738,6 +979,30 @@ pub fn str_key_index(d: &PyObject, key: &PyObject) -> Option<(Option<usize>, u64
 /// (jit5) The value (new reference) at entry `ix` of exact dict `d` if its key layout
 /// is still `keys_version`.
 pub fn value_at_if(d: &PyObject, keys_version: u64, ix: usize) -> Option<PyRef> {
+    // (scale1) without the lock, validated by the sequence lock (see lookup_lockfree_raw)
+    unsafe {
+        use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize};
+        let tp = AtomicPtr::from_ptr(&raw mut (*(d.as_ptr() as *mut PyDictObject)).ma_keys).load(Acquire) as *mut DictTable;
+        if !tp.is_null() {
+            mark_shared_read(d, tp);
+            let s1 = (*tp).wseq.load(Acquire);
+            let lay = if s1 & 1 == 0 { block_layout(tp) } else { None };
+            if let Some((_, ep, _, cap)) = lay {
+                let kv = AtomicU64::from_ptr(&raw mut (*tp).keys_version).load(Relaxed);
+                let n = AtomicUsize::from_ptr(&raw mut (*tp).nentries).load(Relaxed);
+                let v = if kv == keys_version && ix < n && ix < cap { AtomicPtr::from_ptr(&raw mut (*ep.add(ix)).value).load(Acquire) } else { std::ptr::null_mut() };
+                std::sync::atomic::fence(Acquire);
+                if (*tp).wseq.load(Relaxed) == s1 {
+                    if kv != keys_version || ix >= n {
+                        return None;
+                    }
+                    if !v.is_null() {
+                        return Some(PyRef::from_borrowed(v));
+                    }
+                }
+            }
+        }
+    }
     let g = ob_lock(d);
     let t = table(d);
     let r = if t.keys_version == keys_version && ix < t.nentries {
@@ -784,7 +1049,8 @@ pub fn set_item_hash(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) -
     match f {
         Found::At(ix) => {
             let old = t.entries()[ix].value;
-            t.entries_mut()[ix].value = value.as_ptr();
+            // (scale1) read without the lock by `lookup_lockfree`
+            unsafe { std::sync::atomic::AtomicPtr::from_ptr(&raw mut t.entries_mut()[ix].value).store(value.as_ptr(), Release) };
             t.version = next_version();
             crate::interp::cache::on_dict_write(d, key.as_ptr()); // jit
             drop(g);
@@ -928,8 +1194,39 @@ pub fn clear(d: &PyObject) {
         return;
     }
     let mut fresh = DictTable::new(0);
-    fresh.version = next_version();
-    let old = std::mem::replace(t, fresh);
+    // (scale1) lock-free readers: the header is updated field by field inside the
+    // sequence lock, the new block published through `indices_p`, and the old block
+    // outlives them (`old` takes it over and retires it)
+    t.wbegin();
+    let mut old = DictTable {
+        version: t.version,
+        layout: t.layout,
+        keys_version: t.keys_version,
+        entries_p: t.entries_p,
+        nentries: t.nentries,
+        indices_p: t.indices_p,
+        size: t.size,
+        cap: t.cap,
+        used: t.used,
+        fill: t.fill,
+        data_bytes: t.data_bytes,
+        wseq: std::sync::atomic::AtomicU64::new(0),
+        shared_read: std::sync::atomic::AtomicBool::new(t.shared_read.load(Relaxed)),
+    };
+    t.entries_p = fresh.entries_p;
+    t.nentries = 0;
+    t.size = fresh.size;
+    t.cap = fresh.cap;
+    t.used = 0;
+    t.fill = 0;
+    t.data_bytes = fresh.data_bytes;
+    t.version = next_version();
+    t.layout = fresh.layout;
+    t.keys_version = fresh.keys_version;
+    unsafe { std::sync::atomic::AtomicPtr::from_ptr(&raw mut t.indices_p).store(fresh.indices_p, Release) };
+    fresh.indices_p = std::ptr::null_mut();
+    drop(fresh);
+    t.wend();
     set_used(d, 0, std::ptr::null_mut());
     drop(g);
     for e in old.entries().iter() {
@@ -940,6 +1237,7 @@ pub fn clear(d: &PyObject) {
             }
         }
     }
+    old.retire_block();
 }
 
 /// Live entry at or after `*pos` (advances `pos` past it).
@@ -1061,7 +1359,9 @@ pub fn merge_dict(d: &PyObject, other: &PyObject, overwrite: bool) -> PyResult<(
         let t = table(d);
         if t.used == 0 {
             if t.size < size_for(items.len()) {
-                *t = DictTable::new(items.len());
+                // (scale1) not `*t = DictTable::new(..)`: lock-free readers may be on
+                // the old block, and the header's sequence/sharing state must stay
+                t.resize(items.len());
             }
             for (k, v, h) in items {
                 t.insert_new(h, k.into_raw(), v.into_raw());
@@ -1127,6 +1427,15 @@ pub fn pop_last(d: &PyObject) -> Option<(PyRef, PyRef)> {
             t.nentries = ix;
             set_used(d, t.used, k);
             drop(g);
+            if crate::qsbr::multi_threaded() {
+                // (scale1) lock-free readers may still be looking at both
+                unsafe {
+                    incref(k);
+                    crate::qsbr::decref_deferred(k);
+                    incref(v);
+                    crate::qsbr::decref_deferred(v);
+                }
+            }
             return unsafe { Some((PyRef::from_raw(k), PyRef::from_raw(v))) };
         }
     }

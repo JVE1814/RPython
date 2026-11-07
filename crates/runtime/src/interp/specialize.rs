@@ -151,6 +151,7 @@ fn dict_get_hinted(d: *mut PyObject, nm: &PyObject, hint: u64, e: &Entry) -> Opt
                 p
             });
         }
+        dict::prepare_unlocked_read(d); // (scale1) entries are read without the lock
         let t = dict::table(d);
         if let Some(en) = t.entries().get(hint as usize) {
             if en.key == nm.as_ptr() {

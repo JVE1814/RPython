@@ -32,8 +32,9 @@ fn remove_dead_weakref(_m: &PyObject, args: &[&PyObject]) -> PyResult {
             let (k, v) = dict::remove_at(d, ix, h);
             drop(g);
             unsafe {
-                decref(k);
-                decref(v);
+                // (scale1) lock-free dict readers may still be looking at both
+                crate::qsbr::decref_deferred(k);
+                crate::qsbr::decref_deferred(v);
             }
             return Ok(none::none_ref());
         }

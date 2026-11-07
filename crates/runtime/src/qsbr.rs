@@ -1,4 +1,5 @@
-//! Safe memory reclamation for lock-free readers (DECISIONS D5/D6; perf-runtime).
+//! Safe memory reclamation for lock-free readers (DECISIONS D5/D6; perf-runtime,
+//! reworked for multi-core scaling by scale1).
 //!
 //! Lock-free readers (inline attribute values, dict entries read by the inline caches
 //! and JIT code without the object lock) may load a pointer that a concurrent writer
@@ -8,14 +9,22 @@
 //! retirement (quiescent-state based reclamation, HotSpot handshake flavour):
 //!
 //! * a global sequence counter `GLOBAL`;
-//! * every thread publishes the value of `GLOBAL` it saw at its last quiescent point
-//!   (an eval-breaker poll at a backedge/call, which never happens in the middle of a
-//!   lock-free read); threads in native/blocked mode count as quiescent;
+//! * every thread state publishes the value of `GLOBAL` it saw at its last quiescent
+//!   point (`ThreadState::qsbr_seen`; an eval-breaker poll at a backedge/call, which
+//!   never happens in the middle of a lock-free read); threads in native/blocked mode
+//!   count as quiescent;
 //! * retired items collect in a per-thread open batch; the batch is closed (goal =
 //!   `GLOBAL.fetch_add(1) + 1`) when it is big enough or after a number of polls, and
 //!   closing it asks the other threads to report (sets `EVAL_QSBR` in their eval
 //!   breakers, i.e. a handshake);
 //! * a closed batch is released when every running thread's published value >= goal.
+//!
+//! Scalability (scale1): nothing on the per-item or per-poll path takes a lock or
+//! allocates. The set of thread states is mirrored into a fixed array guarded by a
+//! sequence lock (`publish`, written under the `ALL_THREADS` lock by `note_threads`),
+//! so the minimum over the published values is a plain scan; the scan runs at most
+//! every `SCAN_EVERY` polls while a batch waits; batches hold up to `BATCH` items so
+//! the cross-thread handshake is rare; immortal objects are never retired.
 //!
 //! With a single attached thread nothing is deferred (and anything still pending is
 //! released at the next poll), so single-threaded programs keep exact CPython
@@ -41,18 +50,77 @@ pub fn multi_threaded() -> bool {
     LIVE.load(Relaxed) > 1
 }
 
-/// Called whenever a thread state is created or retired; `n` = attached states.
-pub fn note_threads(n: usize) {
-    LIVE.store(n, SeqCst);
+// ---------------------------------------------------------------- thread-state mirror
+
+const CAP: usize = 2048;
+static LIST: [AtomicUsize; CAP] = [const { AtomicUsize::new(0) }; CAP];
+static LIST_LEN: AtomicUsize = AtomicUsize::new(0);
+/// Sequence lock over LIST/LIST_LEN: odd while being rewritten.
+static LIST_VER: AtomicU64 = AtomicU64::new(0);
+/// More thread states than CAP: scans fall back to the locked `ALL_THREADS` list.
+static OVERFLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Called (with the `ALL_THREADS` lock held) whenever a thread state is created or
+/// retired; `all` is the new list.
+pub fn note_threads(all: &[usize]) {
+    LIVE.store(all.len(), SeqCst);
+    LIST_VER.fetch_add(1, SeqCst);
+    if all.len() > CAP {
+        OVERFLOW.store(true, SeqCst);
+    } else {
+        for (i, &t) in all.iter().enumerate() {
+            LIST[i].store(t, Relaxed);
+        }
+        LIST_LEN.store(all.len(), Relaxed);
+        OVERFLOW.store(false, SeqCst);
+    }
+    LIST_VER.fetch_add(1, SeqCst);
 }
 
-/// Per-thread record, registered on first report.
-struct Rec {
-    ts: usize,
-    seen: AtomicU64,
+/// Call `f` for every registered thread state (a consistent snapshot of the list).
+fn for_each_thread(mut f: impl FnMut(&ThreadState)) {
+    loop {
+        let v0 = LIST_VER.load(SeqCst);
+        if v0 & 1 == 1 {
+            std::hint::spin_loop();
+            continue;
+        }
+        if OVERFLOW.load(SeqCst) {
+            let threads: Vec<usize> = crate::threads::ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            for t in threads {
+                f(unsafe { &*(t as *const ThreadState) });
+            }
+            return;
+        }
+        // Thread-state memory is never freed (dead states are recycled), so reading a
+        // pointer of a concurrently retired state is harmless; the version check
+        // below decides whether the snapshot was consistent.
+        let n = LIST_LEN.load(Relaxed).min(CAP);
+        let mut buf = [0usize; 64];
+        if n <= buf.len() {
+            for (i, b) in buf.iter_mut().enumerate().take(n) {
+                *b = LIST[i].load(Relaxed);
+            }
+            if LIST_VER.load(SeqCst) != v0 {
+                continue;
+            }
+            for &t in &buf[..n] {
+                f(unsafe { &*(t as *const ThreadState) });
+            }
+            return;
+        }
+        let v: Vec<usize> = (0..n).map(|i| LIST[i].load(Relaxed)).collect();
+        if LIST_VER.load(SeqCst) != v0 {
+            continue;
+        }
+        for t in v {
+            f(unsafe { &*(t as *const ThreadState) });
+        }
+        return;
+    }
 }
 
-static RECS: Mutex<Vec<&'static Rec>> = Mutex::new(Vec::new());
+// ---------------------------------------------------------------- per-thread batches
 
 enum Item {
     Decref(*mut PyObject),
@@ -60,25 +128,59 @@ enum Item {
 }
 
 struct Local {
-    rec: *const Rec,
     open: Vec<Item>,
-    /// Closed batches waiting for their goal.
-    closed: Vec<(u64, Vec<Item>)>,
+    /// Closed batches waiting for their goal (goals increase).
+    closed: std::collections::VecDeque<(u64, Vec<Item>)>,
     polls: u32,
+    /// Last computed minimum over the other threads' published values.
+    known_min: u64,
+    /// Polls left until the next scan of the other threads.
+    scan_in: u32,
+    /// Remaining self re-arms of the eval breaker (see REARM).
+    rearm: u32,
+    retires: u32,
+    /// `retires` at the last eval-breaker visit (changed: still retiring, it comes back by itself).
+    last_open: usize,
+    /// The thread state this OS thread last retired items under.
+    ts: *const ThreadState,
+    /// Listed in LOCALS (for collections to take the pending items).
+    registered: bool,
+    /// The thread has run `thread_exit`: later items go straight to the orphans.
+    dead: bool,
 }
 
 #[thread_local]
-static LOCAL: UnsafeCell<Local> = UnsafeCell::new(Local { rec: std::ptr::null(), open: Vec::new(), closed: Vec::new(), polls: 0 });
+static LOCAL: UnsafeCell<Local> = UnsafeCell::new(Local {
+    open: Vec::new(),
+    closed: std::collections::VecDeque::new(),
+    polls: 0,
+    known_min: 0,
+    scan_in: 0,
+    rearm: 0,
+    retires: 0,
+    last_open: 0,
+    ts: std::ptr::null(),
+    registered: false,
+    dead: false,
+});
 
 /// Items retired by threads that exited before their batches matured.
 static ORPHANS: Mutex<Vec<(u64, Vec<ItemSend>)>> = Mutex::new(Vec::new());
+/// Smallest goal among the orphaned batches (u64::MAX: none).
+static ORPHAN_MIN: AtomicU64 = AtomicU64::new(u64::MAX);
 struct ItemSend(Item);
 unsafe impl Send for ItemSend {}
 
 /// Close the open batch once it holds this many items ...
-const BATCH: usize = 128;
+const BATCH: usize = 1024;
 /// ... or after this many eval-breaker polls.
-const POLLS: u32 = 64;
+const POLLS: u32 = 256;
+/// Eval-breaker visits a thread re-arms itself for while it has pending items; after
+/// that it comes back only when it retires more, another thread closes a batch, or a
+/// collection stops the world (which releases everything retired before it).
+const REARM: u32 = 300;
+/// While a closed batch waits, rescan the other threads every this many polls.
+const SCAN_EVERY: u32 = 16;
 static PENDING_TOTAL: AtomicUsize = AtomicUsize::new(0);
 
 #[inline(always)]
@@ -86,28 +188,35 @@ fn local() -> &'static mut Local {
     unsafe { &mut *LOCAL.get() }
 }
 
-fn my_rec() -> &'static Rec {
-    let l = local();
-    if l.rec.is_null() {
-        let ts = crate::threads::current_ptr() as usize;
-        let r: &'static Rec = Box::leak(Box::new(Rec { ts, seen: AtomicU64::new(GLOBAL.load(SeqCst)) }));
-        RECS.lock().unwrap().push(r);
-        l.rec = r;
-    }
-    unsafe { &*l.rec }
-}
-
 #[inline(always)]
 fn me() -> *const ThreadState {
     crate::threads::current_ptr()
 }
 
+/// Initial published value for a new thread state: it cannot hold pointers that
+/// were retired before it existed.
+pub fn initial_seen() -> u64 {
+    GLOBAL.load(SeqCst)
+}
+
+#[inline(always)]
+fn report(t: *const ThreadState) {
+    if !t.is_null() {
+        unsafe { (*t).qsbr_seen.store(GLOBAL.load(SeqCst), SeqCst) };
+    }
+}
+
 /// Release `p` (one reference) once no thread can still be reading it lock-free.
 #[inline]
 pub unsafe fn decref_deferred(p: *mut PyObject) {
-    if !multi_threaded() {
-        unsafe { crate::object::decref(p) };
-        return;
+    unsafe {
+        if !multi_threaded() {
+            crate::object::decref(p);
+            return;
+        }
+        if (*p).is_immortal() {
+            return;
+        }
     }
     retire(Item::Decref(p));
 }
@@ -133,61 +242,173 @@ pub unsafe fn free_deferred(p: *mut u8, f: unsafe fn(*mut u8)) {
     retire(Item::Free(p, f));
 }
 
-#[cold]
+#[inline]
 fn retire(it: Item) {
     let l = local();
     if l.open.is_empty() {
-        // come back at the next polls to close the batch
-        let t = me();
-        if !t.is_null() {
-            unsafe { (*t).c.eval_breaker.fetch_or(EVAL_QSBR, Release) };
+        if l.dead {
+            return retire_after_exit(it);
         }
+        retire_first();
     }
     l.open.push(it);
+    // Nothing is released here: the caller may hold locks, and releasing runs
+    // deallocators (Python code). Releases happen at the next eval-breaker poll.
     if l.open.len() >= BATCH {
-        close_batch();
-        poll();
+        retire_full();
+    } else {
+        l.retires = l.retires.wrapping_add(1);
+        if l.retires & 63 == 0 {
+            come_back_soon(l);
+        }
+    }
+}
+
+/// Have this thread visit `on_eval_breaker` at its next poll(s).
+#[cold]
+fn come_back_soon(l: &mut Local) {
+    l.rearm = l.rearm.max(POLLS + 8);
+    let t = me();
+    if !t.is_null() {
+        unsafe { (*t).c.eval_breaker.fetch_or(EVAL_QSBR, Release) };
+    }
+}
+
+/// Collections take the pending items of every thread (`take_all_for_gc`).
+static LOCALS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+#[cold]
+fn retire_first() {
+    let l = local();
+    if !l.registered {
+        LOCALS.lock().unwrap_or_else(|e| e.into_inner()).push(LOCAL.get() as usize);
+        l.registered = true;
+    }
+    // come back at the next polls to close the batch
+    l.rearm = REARM;
+    let t = me();
+    l.ts = t;
+    if !t.is_null() {
+        unsafe { (*t).c.eval_breaker.fetch_or(EVAL_QSBR, Release) };
+    }
+    if l.open.capacity() == 0 {
+        l.open.reserve(BATCH);
+    }
+}
+
+/// An item retired by a thread after its `thread_exit` (teardown): an orphan of its own.
+#[cold]
+fn retire_after_exit(it: Item) {
+    let goal = GLOBAL.fetch_add(1, SeqCst) + 1;
+    PENDING_TOTAL.fetch_add(1, Relaxed);
+    let mut o = ORPHANS.lock().unwrap_or_else(|e| e.into_inner());
+    o.push((goal, vec![ItemSend(it)]));
+    ORPHAN_MIN.store(o.iter().map(|b| b.0).min().unwrap_or(u64::MAX), Relaxed);
+}
+
+#[cold]
+fn retire_full() {
+    close_batch();
+    let l = local();
+    come_back_soon(l);
+    l.scan_in = 0;
+}
+
+/// The world is stopped for a collection: every thread is at a quiescent point, so
+/// everything retired so far, by any thread, can be released. The items are taken
+/// here and released by the caller once the world runs again (`release_taken`).
+/// This bounds how long items wait when their thread stopped polling for them.
+pub fn take_all_for_gc() -> Vec<ItemSendBatch> {
+    let mut out = Vec::new();
+    // Each thread's items are released by the thread itself (its own objects: cheap
+    // owner-side frees) at its next eval-breaker visit: everything retired so far gets
+    // a goal that every thread has passed, since all of them are stopped right now.
+    let goal = GLOBAL.fetch_add(1, SeqCst) + 1;
+    let locals = LOCALS.lock().unwrap_or_else(|e| e.into_inner());
+    for &lp in locals.iter() {
+        let l = unsafe { &mut *(lp as *mut Local) };
+        if !l.open.is_empty() {
+            let items = std::mem::take(&mut l.open);
+            PENDING_TOTAL.fetch_add(items.len(), Relaxed);
+            l.closed.push_back((goal, items));
+        }
+        l.polls = 0;
+        if !l.closed.is_empty() {
+            l.known_min = l.known_min.max(goal);
+            l.rearm = l.rearm.max(8);
+            if !l.ts.is_null() {
+                unsafe { (*l.ts).c.eval_breaker.fetch_or(EVAL_QSBR, Release) };
+            }
+        }
+    }
+    drop(locals);
+    let mut o = ORPHANS.lock().unwrap_or_else(|e| e.into_inner());
+    for (_, items) in o.drain(..) {
+        out.push(ItemSendBatch(items.into_iter().map(|i| i.0).collect(), true));
+    }
+    ORPHAN_MIN.store(u64::MAX, Relaxed);
+    out
+}
+
+/// Items taken by `take_all_for_gc` (`.1`: counted in PENDING_TOTAL).
+pub struct ItemSendBatch(Vec<Item>, bool);
+unsafe impl Send for ItemSendBatch {}
+
+/// Release what `take_all_for_gc` took (world running).
+pub fn release_taken(v: Vec<ItemSendBatch>) {
+    for b in v {
+        if b.1 {
+            unsafe { release(b.0) };
+        } else {
+            for it in b.0 {
+                match it {
+                    Item::Decref(p) => unsafe { crate::object::decref(p) },
+                    Item::Free(p, f) => unsafe { f(p) },
+                }
+            }
+        }
     }
 }
 
 fn close_batch() {
     let l = local();
     l.polls = 0;
+    l.rearm = REARM;
     if l.open.is_empty() {
         return;
     }
-    let items = std::mem::take(&mut l.open);
+    let items = std::mem::replace(&mut l.open, Vec::new());
+    if crate::scalestats::on() {
+        crate::scalestats::QSBR_BATCHES.fetch_add(1, Relaxed);
+        crate::scalestats::QSBR_ITEMS.fetch_add(items.len() as u64, Relaxed);
+    }
     PENDING_TOTAL.fetch_add(items.len(), Relaxed);
     let goal = GLOBAL.fetch_add(1, SeqCst) + 1;
-    l.closed.push((goal, items));
+    l.closed.push_back((goal, items));
+    // (no report here: a batch can be closed in the middle of an operation that holds
+    // pointers read without a lock; only eval-breaker polls are quiescent points)
     // handshake: ask every other thread to report a quiescent state soon
     let me = me() as usize;
-    for t in crate::threads::ALL_THREADS.lock().unwrap().iter() {
-        let ts = unsafe { &*(*t as *const ThreadState) };
-        if *t != me && ts.alive() {
+    for_each_thread(|ts| {
+        if ts as *const ThreadState as usize != me && ts.alive() {
             ts.c.eval_breaker.fetch_or(EVAL_QSBR, Release);
         }
-    }
+    });
 }
 
 /// Smallest sequence value published by a running thread other than the caller.
 fn min_seen() -> u64 {
     let me = me() as usize;
-    let threads: Vec<usize> = crate::threads::ALL_THREADS.lock().unwrap().clone();
-    let recs = RECS.lock().unwrap();
     let mut m = u64::MAX;
-    for t in threads {
-        if t == me {
-            continue;
+    for_each_thread(|ts| {
+        if ts as *const ThreadState as usize == me {
+            return;
         }
-        let ts = unsafe { &*(t as *const ThreadState) };
         if !ts.alive() || ts.mode.get() != crate::threads::ThreadMode::InVm {
-            continue;
+            return;
         }
-        // a thread that never reported has seen nothing yet
-        let seen = recs.iter().find(|r| r.ts == t).map_or(0, |r| r.seen.load(Acquire));
-        m = m.min(seen);
-    }
+        m = m.min(ts.qsbr_seen.load(SeqCst));
+    });
     m
 }
 
@@ -201,39 +422,58 @@ unsafe fn release(items: Vec<Item>) {
     }
 }
 
-/// Process matured batches of the calling thread (and orphans).
-fn poll() {
+/// Process matured batches of the calling thread (and orphans). `scan`: recompute
+/// the minimum now (otherwise only when the countdown expires).
+fn poll(scan: bool) {
     let l = local();
-    if l.closed.is_empty() && PENDING_TOTAL.load(Relaxed) == 0 {
+    let orphan_goal = ORPHAN_MIN.load(Relaxed);
+    let first_goal = l.closed.front().map_or(u64::MAX, |b| b.0);
+    let need = first_goal.min(orphan_goal);
+    if need == u64::MAX {
         return;
     }
-    let m = if multi_threaded() { min_seen() } else { u64::MAX };
-    let mut ready = Vec::new();
-    l.closed.retain_mut(|(goal, items)| {
-        if *goal <= m {
-            ready.push(std::mem::take(items));
-            false
+    if need > l.known_min {
+        if !multi_threaded() {
+            l.known_min = u64::MAX;
+        } else if scan || l.scan_in == 0 {
+            l.scan_in = SCAN_EVERY;
+            // Capped by GLOBAL as read before the scan: a thread skipped because it
+            // was blocked is only known to be quiescent for batches closed so far.
+            let g = GLOBAL.load(SeqCst);
+            l.known_min = min_seen().min(g);
         } else {
-            true
+            l.scan_in -= 1;
         }
-    });
-    let orphans: Vec<Vec<ItemSend>> = {
-        let mut o = ORPHANS.lock().unwrap();
-        let mut out = Vec::new();
+    }
+    let m = l.known_min;
+    if !multi_threaded() {
+        // alone now: nobody can read anything retired; start afresh next time
+        l.known_min = 0;
+    }
+    let mut ready = Vec::new();
+    while let Some(b) = l.closed.front() {
+        if b.0 > m {
+            break;
+        }
+        ready.push(l.closed.pop_front().unwrap().1);
+    }
+    let mut orphan_ready: Vec<Vec<ItemSend>> = Vec::new();
+    if orphan_goal <= m {
+        let mut o = ORPHANS.lock().unwrap_or_else(|e| e.into_inner());
         o.retain_mut(|(goal, items)| {
             if *goal <= m {
-                out.push(std::mem::take(items));
+                orphan_ready.push(std::mem::take(items));
                 false
             } else {
                 true
             }
         });
-        out
-    };
+        ORPHAN_MIN.store(o.iter().map(|b| b.0).min().unwrap_or(u64::MAX), Relaxed);
+    }
     for b in ready {
         unsafe { release(b) };
     }
-    for b in orphans {
+    for b in orphan_ready {
         unsafe { release(b.into_iter().map(|i| i.0).collect()) };
     }
 }
@@ -241,8 +481,7 @@ fn poll() {
 /// Eval-breaker handler (`EVAL_QSBR`): this thread is at a quiescent point.
 pub fn on_eval_breaker(ts: &ThreadState) {
     ts.c.eval_breaker.fetch_and(!EVAL_QSBR, AcqRel);
-    let r = my_rec();
-    r.seen.store(GLOBAL.load(SeqCst), Release);
+    report(ts);
     let l = local();
     if !l.open.is_empty() {
         l.polls += 1;
@@ -250,41 +489,53 @@ pub fn on_eval_breaker(ts: &ThreadState) {
             close_batch();
         }
     }
-    poll();
+    poll(false);
     let l = local();
-    if !l.closed.is_empty() || !l.open.is_empty() {
-        // not yet matured: check again at the next poll
+    // A thread that is retiring quickly comes back by itself (every 64 retires and
+    // whenever a batch fills up): re-arming at every poll would only cost time.
+    let progressing = l.retires as usize != l.last_open;
+    l.last_open = l.retires as usize;
+    if (!l.closed.is_empty() || !l.open.is_empty() || ORPHAN_MIN.load(Relaxed) != u64::MAX) && l.rearm > 0 && !progressing {
+        // not yet matured: check again at the next poll (a bounded number of times)
+        l.rearm -= 1;
         ts.c.eval_breaker.fetch_or(EVAL_QSBR, Release);
     }
 }
 
-/// The calling thread is exiting: hand pending batches over, unregister and let the
-/// remaining threads re-check (they may be alone now).
+/// The calling thread is exiting: hand pending batches over and let the remaining
+/// threads re-check (they may be alone now).
 pub fn thread_exit() {
     let l = local();
-    if !l.rec.is_null() || !l.open.is_empty() {
+    if !l.open.is_empty() {
         close_batch();
-        let closed = std::mem::take(&mut l.closed);
-        if !closed.is_empty() {
-            let mut o = ORPHANS.lock().unwrap();
-            for (g, items) in closed {
-                o.push((g, items.into_iter().map(ItemSend).collect()));
-            }
+    }
+    if l.registered {
+        // (scale1) under the LOCALS lock: a collection may be taking items right now
+        let me = LOCAL.get() as usize;
+        LOCALS.lock().unwrap_or_else(|e| e.into_inner()).retain(|&x| x != me);
+        l.registered = false;
+    }
+    l.dead = true;
+    let closed = std::mem::take(&mut l.closed);
+    if std::env::var_os("RPY_QSBR_DEBUG").is_some() {
+        eprintln!("qsbr: thread {:p} exits with {} closed batches (goals {:?}), GLOBAL={}", me(), closed.len(),
+            closed.iter().map(|b| b.0).collect::<Vec<_>>(), GLOBAL.load(SeqCst));
+    }
+    if !closed.is_empty() {
+        let mut o = ORPHANS.lock().unwrap_or_else(|e| e.into_inner());
+        for (g, items) in closed {
+            o.push((g, items.into_iter().map(ItemSend).collect()));
         }
+        ORPHAN_MIN.store(o.iter().map(|b| b.0).min().unwrap_or(u64::MAX), Relaxed);
     }
-    if !l.rec.is_null() {
-        let r = l.rec;
-        RECS.lock().unwrap().retain(|&x| !std::ptr::eq(x, r));
-        l.rec = std::ptr::null();
-        unsafe { drop(Box::from_raw(r as *mut Rec)) };
-    }
+    l.known_min = 0;
+    l.scan_in = 0;
     let me = me() as usize;
-    for t in crate::threads::ALL_THREADS.lock().unwrap().iter() {
-        if *t != me {
-            let ts = unsafe { &*(*t as *const ThreadState) };
+    for_each_thread(|ts| {
+        if ts as *const ThreadState as usize != me {
             ts.c.eval_breaker.fetch_or(EVAL_QSBR, Release);
         }
-    }
+    });
 }
 
 /// The caller is at a quiescent point and wants deferred releases done as far as
@@ -296,14 +547,13 @@ pub fn quiesce_now() {
     if crate::threads::current_ptr().is_null() {
         return;
     }
-    let r = my_rec();
-    r.seen.store(GLOBAL.load(SeqCst), Release);
+    report(me());
     if std::env::var_os("RPY_QSBR_DEBUG").is_some() {
-        eprintln!("qsbr: quiesce mt={} pending={} orphans={}", multi_threaded(), PENDING_TOTAL.load(SeqCst), ORPHANS.lock().unwrap().len());
+        eprintln!("qsbr: quiesce mt={} pending={} orphans={}", multi_threaded(), PENDING_TOTAL.load(SeqCst), ORPHAN_MIN.load(SeqCst));
     }
     if !multi_threaded() {
         close_batch();
-        poll();
+        poll(true);
         return;
     }
     // Other threads are running: ask them to report a quiescent state and wait a
@@ -312,29 +562,26 @@ pub fn quiesce_now() {
     // this only waits for threads executing Python, which poll at backedges and calls.
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
     loop {
-        poll();
-        let pending_orphans = !ORPHANS.lock().unwrap().is_empty();
+        poll(true);
+        let pending_orphans = ORPHAN_MIN.load(SeqCst) != u64::MAX;
         if !pending_orphans || std::time::Instant::now() >= deadline {
             if pending_orphans && std::env::var_os("RPY_QSBR_DEBUG").is_some() {
-                let recs = RECS.lock().unwrap();
                 eprintln!("qsbr: orphans left; LIVE={} GLOBAL={}", LIVE.load(SeqCst), GLOBAL.load(SeqCst));
-                for &t in crate::threads::ALL_THREADS.lock().unwrap().iter() {
-                    let ts = unsafe { &*(t as *const ThreadState) };
-                    let seen = recs.iter().find(|r| r.ts == t).map(|r| r.seen.load(SeqCst));
-                    eprintln!("  ts {:#x} alive={} mode={:?} seen={:?} me={} tid={} native={} gil={} frame={:?}", t, ts.alive(), ts.mode.get(), seen, t == me() as usize, ts.c.thread_id, ts.c.native_thread_id, ts.c.gilstate_counter, ts.frame.get());
-                }
+                for_each_thread(|ts| {
+                    eprintln!("  ts {:#x} alive={} mode={:?} seen={} me={} tid={} native={} frame={:?}", ts as *const ThreadState as usize,
+                        ts.alive(), ts.mode.get(), ts.qsbr_seen.load(SeqCst), std::ptr::eq(ts, me()), ts.c.thread_id, ts.c.native_thread_id, ts.frame.get());
+                });
             }
             break;
         }
         let me = me() as usize;
-        for t in crate::threads::ALL_THREADS.lock().unwrap().iter() {
-            if *t != me {
-                let ts = unsafe { &*(*t as *const ThreadState) };
+        for_each_thread(|ts| {
+            if ts as *const ThreadState as usize != me {
                 ts.c.eval_breaker.fetch_or(EVAL_QSBR, Release);
             }
-        }
+        });
         crate::threads::blocking(|| std::thread::sleep(std::time::Duration::from_micros(200)));
-        r.seen.store(GLOBAL.load(SeqCst), Release);
+        report(me as *const ThreadState);
     }
 }
 

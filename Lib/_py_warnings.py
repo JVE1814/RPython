@@ -1,4 +1,4 @@
-"""Python part of the warnings subsystem."""
+"""The warnings machinery written in Python (filters, registries, showwarning)."""
 
 import sys
 try:

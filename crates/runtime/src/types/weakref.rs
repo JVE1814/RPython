@@ -438,7 +438,9 @@ impl DetachedWeakrefs {
 /// any Python code or releasing anything (usable while the world is stopped).
 pub unsafe fn detach_weakrefs_for_gc(garbage: &[*mut PyObject], callbacks_only: bool) -> DetachedWeakrefs {
     unsafe {
-        let set: crate::gc::PtrSet = garbage.iter().map(|&p| p as usize).collect();
+        // (scale1) built only if a callback needs it: hashing every garbage object on every
+        // collection was ~8% of a cycle-heavy workload
+        let mut set: Option<crate::gc::PtrSet> = None;
         let mut pending: Vec<(PyRef, PyRef)> = Vec::new();
         let mut dropped: Vec<PyRef> = Vec::new();
         {
@@ -460,6 +462,7 @@ pub unsafe fn detach_weakrefs_for_gc(garbage: &[*mut PyObject], callbacks_only: 
                     let cb = std::mem::replace(&mut (*r).wr_callback, std::ptr::null_mut());
                     if !cb.is_null() {
                         let ro = r as *mut PyObject;
+                        let set = set.get_or_insert_with(|| garbage.iter().map(|&p| p as usize).collect());
                         if !set.contains(&(ro as usize)) && (*ro).refcnt() > 0 {
                             pending.push((PyRef::from_borrowed(ro), PyRef::from_raw(cb)));
                         } else {
