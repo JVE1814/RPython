@@ -33,6 +33,92 @@ fn has_inline_values(_m: &PyObject, o: &PyObject) -> PyResult {
     Ok(bool_::new_bool(r))
 }
 
+/// The instance's attribute values in its class's key order ('<NULL>' for names this
+/// instance lacks), as CPython reports the inline values array. A dict materialised
+/// from the inline values counts as still sharing them; an assigned dict (or one with
+/// names the class never stored inline) has no values array: None.
+fn get_object_dict_values(_m: &PyObject, o: &PyObject) -> PyResult {
+    let tp = o.type_ptr();
+    let order = crate::shape::type_key_order(tp);
+    if order.is_empty() || unsafe { !crate::alloc::has_managed(o.as_ptr()) } {
+        return Ok(none::none_ref());
+    }
+    let null = || pystr::new_str("<NULL>");
+    let mut out = Vec::with_capacity(order.len());
+    if crate::shape::has_inline_values(o) {
+        for &k in &order {
+            out.push(match crate::shape::get(o, unsafe { &*k }) {
+                crate::shape::Get::Found(v) => v,
+                _ => null(),
+            });
+        }
+        return Ok(tuple::new_tuple(out));
+    }
+    if o.ob_gc_bits.load(std::sync::atomic::Ordering::Relaxed) & crate::alloc::GC_BIT_DICT_DETACHED != 0 {
+        return Ok(none::none_ref());
+    }
+    let d = unsafe { *crate::alloc::managed_dict_slot(o.as_ptr()) };
+    if d.is_null() || d as usize & 1 != 0 || !dict::is_dict_exact(unsafe { &*d }) {
+        return Ok(none::none_ref());
+    }
+    let d = unsafe { &*d };
+    for k in dict::keys_vec(d) {
+        if !pystr::is_str_exact(&k) || !order.iter().any(|&n| pystr::str_eq(unsafe { &*n }, &k)) {
+            return Ok(none::none_ref());
+        }
+    }
+    for &k in &order {
+        out.push(dict::get_item_str(d, unsafe { &*k }).unwrap_or_else(null));
+    }
+    Ok(tuple::new_tuple(out))
+}
+
+fn tlbc_code(f: &PyObject) -> PyResult<PyRef> {
+    let co = if crate::types::code::is_code(f) { f.to_ref() } else { ab::getattr(f, crate::name!("__code__"))? };
+    if !crate::types::code::is_code(&co) {
+        raise!(TypeError, "expected a function or code object");
+    }
+    Ok(co)
+}
+
+/// The current thread's copy of the (specialised) bytecode of a function.
+fn get_tlbc(_m: &PyObject, f: &PyObject) -> PyResult {
+    let co = tlbc_code(f)?;
+    let _ = crate::types::code::code_data(&co);
+    Ok(crate::types::bytes::new_bytes(&crate::interp::adaptive::adaptive_code(&co)))
+}
+
+/// An identifier of the current thread's copy of a function's bytecode.
+fn get_tlbc_id(_m: &PyObject, f: &PyObject) -> PyResult {
+    let co = tlbc_code(f)?;
+    let cd = crate::types::code::code_data(&co);
+    Ok(int::new_int(crate::interp::adaptive::view_id(cd) as i64))
+}
+
+fn compiler_cleandoc(_m: &PyObject, s: &PyObject) -> PyResult {
+    if !pystr::is_str(s) {
+        raise!(TypeError, "compiler_cleandoc() argument must be str, not {}", crate::types::typeobject::tname(s));
+    }
+    let cps = pystr::str_data(s).to_vec();
+    Ok(pystr::from_codepoints(&rpy_compiler::clean_docstring(&cps)))
+}
+
+/// `_PyDict_GetItem_KnownHash` with the hash supplied by the caller.
+fn dict_getitem_knownhash(_m: &PyObject, a: &[&PyObject]) -> PyResult {
+    crate::args::check_pos("dict_getitem_knownhash", a, 3, 3)?;
+    if !dict::is_dict(a[0]) {
+        raise!(SystemError, "bad argument to internal function");
+    }
+    let _hash = ab::as_i64(a[2])?;
+    match dict::get_item(a[0], a[1])? {
+        Some(v) => Ok(v),
+        None => {
+            crate::types::dict_methods::raise_key_error(a[1]);
+            Err(PyErr)
+        }
+    }
+}
+
 fn has_split_table(_m: &PyObject, _o: &PyObject) -> PyResult {
     // instance dicts are combined tables in this runtime
     Ok(bool_::new_bool(false))
@@ -202,18 +288,94 @@ fn get_static_builtin_types(_m: &PyObject) -> PyResult {
     Ok(out)
 }
 
+// ---- PEP 523 frame-evaluation hook (test form) and rare-event counters
+
+/// While set, the list every evaluated Python frame's code name is appended to
+/// (`set_eval_frame_record`); compiled code is bypassed so that every frame is seen.
+pub static EVAL_RECORD: std::sync::atomic::AtomicPtr<PyObject> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static EVAL_ALLOWS_SPECIALIZATION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[inline(always)]
+pub fn eval_hook_active() -> bool {
+    !EVAL_RECORD.load(std::sync::atomic::Ordering::Relaxed).is_null()
+}
+
+/// Called by the interpreter when it starts or resumes a frame while the hook is set.
+#[cold]
+pub fn record_frame(code: &PyObject) {
+    let l = EVAL_RECORD.load(std::sync::atomic::Ordering::Acquire);
+    if !l.is_null() {
+        list::append(unsafe { &*l }, crate::types::code::code_name(code));
+    }
+}
+
+fn set_eval_hook(l: Option<&PyObject>, allow_specialization: bool) {
+    let new = l.map_or(std::ptr::null_mut(), |l| l.to_ref().into_raw());
+    EVAL_ALLOWS_SPECIALIZATION.store(allow_specialization, std::sync::atomic::Ordering::Relaxed);
+    let old = EVAL_RECORD.swap(new, std::sync::atomic::Ordering::AcqRel);
+    crate::modules::sys_trace::recompute_tracing();
+    if !old.is_null() {
+        unsafe { decref(old) };
+    }
+}
+
+fn set_eval_frame_record(_m: &PyObject, l: &PyObject) -> PyResult {
+    if !list::is_list(l) {
+        raise!(TypeError, "argument must be a list");
+    }
+    set_eval_hook(Some(l), false);
+    rare_event(RareEvent::SetEvalFrameFunc);
+    Ok(none::none_ref())
+}
+fn set_eval_frame_interp(_m: &PyObject, l: &PyObject) -> PyResult {
+    if !list::is_list(l) {
+        raise!(TypeError, "argument must be a list");
+    }
+    set_eval_hook(Some(l), true);
+    rare_event(RareEvent::SetEvalFrameFunc);
+    Ok(none::none_ref())
+}
+fn set_eval_frame_default(_m: &PyObject) -> PyResult {
+    if eval_hook_active() {
+        rare_event(RareEvent::SetEvalFrameFunc);
+    }
+    set_eval_hook(None, false);
+    Ok(none::none_ref())
+}
+
 fn is_specialization_enabled(_m: &PyObject) -> PyResult {
-    Ok(bool_::new_bool(false))
+    Ok(bool_::new_bool(!eval_hook_active() || EVAL_ALLOWS_SPECIALIZATION.load(std::sync::atomic::Ordering::Relaxed)))
+}
+
+/// Events that invalidate optimistic assumptions of the specializer/JIT, counted as
+/// CPython counts them for `_testinternalcapi.get_rare_event_counters()`.
+#[derive(Clone, Copy)]
+pub enum RareEvent {
+    SetClass = 0,
+    SetBases = 1,
+    SetEvalFrameFunc = 2,
+    BuiltinDict = 3,
+    FuncModification = 4,
+}
+const RARE_NAMES: [&str; 5] = ["set_class", "set_bases", "set_eval_frame_func", "builtin_dict", "func_modification"];
+static RARE: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+#[inline]
+pub fn rare_event(e: RareEvent) {
+    RARE[e as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn get_rare_event_counters(_m: &PyObject) -> PyResult {
     let d = dict::new_dict();
-    for k in ["set_class", "set_bases", "set_eval_frame_func", "builtin_dict", "func_modification"] {
-        dict::set_item_str(&d, k, &int::new_int(0))?;
+    for (i, k) in RARE_NAMES.iter().enumerate() {
+        dict::set_item_str(&d, k, &int::new_int(RARE[i].load(std::sync::atomic::Ordering::Relaxed) as i64))?;
     }
     Ok(d)
 }
 fn reset_rare_event_counters(_m: &PyObject) -> PyResult {
+    for c in RARE.iter() {
+        c.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(none::none_ref())
 }
 
@@ -283,6 +445,11 @@ pub fn init() -> PyResult {
             ("tuple_from_pair", FAST, tuple_from_pair),
             ("tuple_from_pair_steal", FAST, tuple_from_pair),
             ("has_split_table", O, has_split_table),
+            ("get_object_dict_values", O, get_object_dict_values),
+            ("compiler_cleandoc", O, compiler_cleandoc),
+            ("get_tlbc", O, get_tlbc),
+            ("get_tlbc_id", O, get_tlbc_id),
+            ("dict_getitem_knownhash", FAST, dict_getitem_knownhash),
             ("get_recursion_depth", NOARGS, get_recursion_depth),
             ("get_long_lived_total", NOARGS, get_long_lived_total),
             ("pymem_getallocatorsname", NOARGS, pymem_getallocatorsname),
@@ -298,6 +465,9 @@ pub fn init() -> PyResult {
             ("py_thread_id", NOARGS, py_thread_id),
             ("get_static_builtin_types", NOARGS, get_static_builtin_types),
             ("is_specialization_enabled", NOARGS, is_specialization_enabled),
+            ("set_eval_frame_record", O, set_eval_frame_record),
+            ("set_eval_frame_interp", O, set_eval_frame_interp),
+            ("set_eval_frame_default", NOARGS, set_eval_frame_default),
             ("get_rare_event_counters", NOARGS, get_rare_event_counters),
             ("reset_rare_event_counters", NOARGS, reset_rare_event_counters),
             ("get_co_localskinds", O, crate::types::code_introspect::get_co_localskinds),

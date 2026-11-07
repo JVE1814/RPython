@@ -36,7 +36,9 @@ class InteractiveInterpreter:
         showsyntaxerror()/showtraceback()."""
         try:
             code = self.compile(source, filename, symbol)
-        except (OverflowError, SyntaxError, ValueError):
+        except Exception:
+            # any compile() failure (also MemoryError, RecursionError) is
+            # reported like a syntax error: without a traceback
             self.showsyntaxerror(filename, source=source)
             return False
         if code is None:
@@ -49,7 +51,7 @@ class InteractiveInterpreter:
         reported with showtraceback()."""
         try:
             exec(code, self.locals)
-        except SystemExit:
+        except (SystemExit, _LocalExit):
             raise
         except BaseException:
             self.showtraceback()
@@ -134,10 +136,12 @@ class InteractiveConsole(InteractiveInterpreter):
         """Run the prompt loop until end of file (or exit() with
         local_exit=True).  `banner` defaults to a version message; an
         empty exitmsg suppresses the farewell message."""
-        ps1 = getattr(sys, 'ps1', None)
-        if ps1 is None:
-            sys.ps1 = ps1 = ">>> "
-        if getattr(sys, 'ps2', None) is None:
+        # the prompts are set for the session only if sys has none of its own
+        added_ps1 = getattr(sys, 'ps1', None) is None
+        if added_ps1:
+            sys.ps1 = ">>> "
+        added_ps2 = getattr(sys, 'ps2', None) is None
+        if added_ps2:
             sys.ps2 = "... "
         name = type(self).__name__
         if banner is None:
@@ -168,6 +172,10 @@ class InteractiveConsole(InteractiveInterpreter):
                     break
         finally:
             self._restore_exits(saved_exits)
+            if added_ps1:
+                del sys.ps1
+            if added_ps2:
+                del sys.ps2
 
         if exitmsg is None:
             self.write('now exiting %s...\n' % name)

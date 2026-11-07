@@ -29,7 +29,7 @@ fn call_annotate_value(f: &PyObject) -> PyResult {
     let one = int::new_int(1);
     let r = ab::call(f, &[&one])?;
     if !dict::is_dict(&r) {
-        raise!(TypeError, "__annotate__ returned non-dict of type '{}'", type_name(r.ty()));
+        raise!(TypeError, "__annotate__() must return a dict, not {}", type_name(r.ty()));
     }
     Ok(r)
 }

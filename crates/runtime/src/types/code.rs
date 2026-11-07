@@ -108,6 +108,8 @@ pub struct CodeData {
     pub pub_lines: Vec<i32>,
     /// Public objects: observed CPython specialisation per internal word (interp::adaptive).
     pub spec: Box<[std::sync::atomic::AtomicU8]>,
+    /// (core6) The same view for the other threads (thread-local bytecode, `-X tlbc`).
+    pub spec_tl: crate::interp::adaptive::ThreadViews,
 }
 
 impl CodeData {
@@ -291,6 +293,7 @@ fn build_exec(c: &PyCodeObject, m: &CodeMeta) -> CodeData {
         invalid: None,
         pub_lines: Vec::new(),
         spec: Box::new([]),
+        spec_tl: Default::default(),
     };
     match crate::interp::translate::translate(&inp) {
         Ok(out) => {
@@ -677,6 +680,7 @@ pub fn new_code_from_parts(p: CodeParts) -> PyResult {
         invalid: None,
         pub_lines: Vec::new(),
         spec: Box::new([]),
+        spec_tl: Default::default(),
     });
     unsafe {
         let r = alloc_code(

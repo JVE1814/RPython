@@ -14,7 +14,7 @@ methods, frames, tracebacks and code objects:
 
 __all__ = [
     "AGEN_CLOSED", "AGEN_CREATED", "AGEN_RUNNING", "AGEN_SUSPENDED",
-    "ArgInfo", "Attribute", "BlockFinder", "BoundArguments", "BufferFlags",
+    "ArgInfo", "Arguments", "Attribute", "BlockFinder", "BoundArguments", "BufferFlags",
     "CORO_CLOSED", "CORO_CREATED", "CORO_RUNNING", "CORO_SUSPENDED",
     "CO_ASYNC_GENERATOR", "CO_COROUTINE", "CO_GENERATOR",
     "CO_ITERABLE_COROUTINE", "CO_NESTED", "CO_NEWLOCALS", "CO_NOFREE",
@@ -126,9 +126,6 @@ def ismethoddescriptor(object):
     objects with __get__ but without __set__/__delete__, that are not
     classes, methods or functions."""
     if isclass(object) or ismethod(object) or isfunction(object):
-        return False
-    if isinstance(object, functools.partial):
-        # partial grew a __get__ but is not treated as a method descriptor.
         return False
     kind = type(object)
     return (hasattr(kind, "__get__") and not hasattr(kind, "__set__")
@@ -709,6 +706,22 @@ class ClassFoundException(Exception):
     pass
 
 
+def _code_of(object):
+    """The code object behind a function, method, frame, traceback or code
+    object (None for anything else)."""
+    if ismethod(object):
+        object = object.__func__
+    if isfunction(object):
+        return object.__code__
+    if istraceback(object):
+        object = object.tb_frame
+    if isframe(object):
+        return object.f_code
+    if iscode(object):
+        return object
+    return None
+
+
 def findsource(object):
     """Return (all lines of the source file, index of the first line of
     *object*).  OSError is raised if the source is unavailable."""
@@ -727,6 +740,12 @@ def findsource(object):
         lines = linecache.getlines(file, module.__dict__)
     else:
         lines = linecache.getlines(file)
+    if not lines:
+        # Code typed at the interactive prompt is registered with linecache
+        # per code object rather than per file name.
+        code = _code_of(object)
+        if code is not None:
+            lines = linecache._getlines_from_code(code)
     if not lines:
         raise OSError('could not get source code')
 
@@ -836,6 +855,11 @@ class BlockFinder:
             elif token in ("def", "class", "lambda"):
                 if token == "lambda":
                     self.islambda = True
+                self.started = True
+            elif type != tokenize.ENDMARKER:
+                # Any other statement (e.g. the assignment holding a
+                # multi-line generator expression) ends with its line.
+                self.islambda = True
                 self.started = True
             self.passline = True
         elif type == tokenize.NEWLINE:
@@ -971,13 +995,14 @@ def getargs(co):
 Arguments = collections.namedtuple('Arguments', 'args, varargs, varkw')
 
 
-def getfullargspec(func):
+def getfullargspec(func, *, annotation_format=Format.VALUE):
     """Legacy view of a callable's signature as a FullArgSpec named
     tuple; positional-only parameters are folded into args."""
     try:
         sig = _signature_from_callable(func, follow_wrapper_chains=False,
                                        skip_bound_arg=False,
-                                       sigcls=Signature, eval_str=False)
+                                       sigcls=Signature, eval_str=False,
+                                       annotation_format=annotation_format)
     except Exception as exc:
         raise TypeError('unsupported callable') from exc
 
@@ -1210,8 +1235,6 @@ def getclosurevars(func):
                 builtin_vars[name] = builtin_ns[name]
             except KeyError:
                 unbound_names.add(name)
-        else:
-            unbound_names.discard(name)
     return ClosureVars(nonlocal_vars, global_vars, builtin_vars, unbound_names)
 
 
@@ -1549,8 +1572,15 @@ def _signature_get_user_defined_method(cls, method_name, *,
     if method is None:
         return None
     if follow_wrapper_chains:
-        method = unwrap(method, stop=(lambda m: hasattr(m, "__signature__")
-                                      or _signature_is_builtin(m)))
+        unwrapped = unwrap(method, stop=(lambda m: hasattr(m, "__signature__")
+                                         or _signature_is_builtin(m)))
+        if method_name != "__new__":
+            method = unwrapped
+        elif isinstance(unwrapped, _NonUserDefinedCallables):
+            # a wrapper around a builtin __new__ (e.g. warnings.deprecated)
+            return None
+        # (otherwise __new__ stays as looked up, bound: unwrapping a bound
+        # method would lose the binding; the caller follows the chain)
     if isinstance(method, _NonUserDefinedCallables):
         return None
     if method_name != '__new__':
@@ -1627,8 +1657,9 @@ def _signature_bound_method(sig):
 
 def _signature_is_builtin(obj):
     """True for callables implemented in C (incl. slot wrappers)."""
+    # (functools.partial is a method descriptor but has its own signature rule)
     return (isbuiltin(obj) or
-            ismethoddescriptor(obj) or
+            (ismethoddescriptor(obj) and not isinstance(obj, functools.partial)) or
             isinstance(obj, _NonUserDefinedCallables) or
             obj is type or obj is object)
 
@@ -2570,8 +2601,10 @@ def _get_details_for_cli(module, nominal_target, target):
         name = target.__name__
     else:
         defining = getmodule(target) or module
-        qualname = getattr(target, '__qualname__', None)
-        modname = getattr(target, '__module__', None)
+        qualname = getattr(target, "__qualname__", None)
+        # named after the module object it lives in now (a frozen module may
+        # have been renamed since the target was defined)
+        modname = getattr(defining, "__name__", None)
         if isinstance(qualname, str) and isinstance(modname, str):
             name = f"{modname}:{qualname}"
         else:

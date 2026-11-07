@@ -24,6 +24,28 @@ pub fn builtin(nm: &str) -> PyResult {
         None => raise!(NameError, "name '{}' is not defined", nm),
     }
 }
+/// A builtin as the running code sees it (its frame's builtins mapping); AttributeError(name)
+/// when that mapping lacks it (`_PyEval_GetBuiltin`: iterator `__reduce__` methods).
+pub fn eval_builtin(nm: &str) -> PyResult {
+    let b = crate::interp::current_builtins();
+    let key = pystr::new_str(nm);
+    let r = if dict::is_dict(&b) { dict::get_item(&b, &key)? } else {
+        match ab::getitem(&b, &key) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                if !crate::errors::exc_matches(crate::types::exceptions::KeyError()) {
+                    return Err(e);
+                }
+                crate::errors::clear_exc();
+                None
+            }
+        }
+    };
+    match r {
+        Some(v) => Ok(v),
+        None => Err(crate::errors::set_err_obj(crate::types::exceptions::AttributeError(), key)),
+    }
+}
 pub fn is_our_import(f: &PyObject) -> bool {
     f.as_ptr() == crate::subinterp::current().import_fn.load(Relaxed)
 }
@@ -60,7 +82,7 @@ fn b_print(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult
             "end" => end = Some(v.to_ref()),
             "file" => file = Some(v.to_ref()),
             "flush" => flush = ab::is_true(v)?,
-            other => raise!(TypeError, "print() got an unexpected keyword argument '{}'", other),
+            _ => return Err(args::unexpected_keyword("print", k, &["sep", "end", "file", "flush"])),
         }
     }
     let check = |o: &Option<PyRef>, what: &str| -> PyResult<()> {
@@ -444,6 +466,9 @@ fn minmax(args: &[&PyObject], kw: Option<&PyObject>, op: std::ffi::c_int, fname:
     let (pos, kws) = args::split(args, kw);
     let mut key: Option<PyRef> = None;
     let mut default: Option<PyRef> = None;
+    if kws.len() > 2 {
+        raise!(TypeError, "{}() takes at most 2 keyword arguments ({} given)", fname, kws.len());
+    }
     for (k, v) in kws {
         match pystr::to_string_lossy(k).as_str() {
             "key" => {
@@ -452,7 +477,7 @@ fn minmax(args: &[&PyObject], kw: Option<&PyObject>, op: std::ffi::c_int, fname:
                 }
             }
             "default" => default = Some(v.to_ref()),
-            other => raise!(TypeError, "{}() got an unexpected keyword argument '{}'", fname, other),
+            _ => return Err(args::unexpected_keyword(fname, k, &["key", "default"])),
         }
     }
     if pos.is_empty() {
@@ -595,6 +620,9 @@ fn exec_or_eval(args: &[&PyObject], kw: Option<&PyObject>, is_eval: bool) -> PyR
         (s.unwrap(), g, l, None)
     } else {
         let [s, g, l, c] = args::parse::<4>(&PX, args, kw)?;
+        if c.is_some_and(|c| !c.is(none::none())) && !crate::types::code::is_code(s.unwrap()) {
+            raise!(TypeError, "closure can only be used when source is a code object");
+        }
         (s.unwrap(), g, l, c)
     };
     let globals = globals.filter(|g| !g.is(none::none()));
@@ -646,12 +674,16 @@ fn exec_or_eval(args: &[&PyObject], kw: Option<&PyObject>, is_eval: bool) -> PyR
         }
         let mode = if is_eval { crate::compile::Mode::Eval } else { crate::compile::Mode::Exec };
         let flags = crate::modules::ast_bridge::inherited_future_flags();
+        // compile-time warnings are attributed to the module whose globals the code runs in
+        let module = dict::get_item_str(&g, name!("__name__")).filter(|n| pystr::is_str(n));
+        let mut o = crate::compile::Opts::new("<string>", mode, flags, -1);
+        o.module = module.as_deref();
         if pystr::is_str(src) {
             // str source: an encoding declaration is ignored (the text is already decoded)
             let text = String::from_utf8(b).unwrap_or_default();
-            crate::compile::compile_str(&text, "<string>", mode, flags, -1)?.code
+            crate::compile::compile_source(crate::compile::Source::Str(&text), &o)?.code
         } else {
-            crate::compile::compile_bytes(&b, "<string>", mode, flags, -1)?.code
+            crate::compile::compile_source(crate::compile::Source::Bytes(&b), &o)?.code
         }
     };
     // auditing hooks see every code object exec()/eval() is about to run
@@ -662,6 +694,9 @@ fn exec_or_eval(args: &[&PyObject], kw: Option<&PyObject>, is_eval: bool) -> PyR
             Some(c) => {
                 if !tuple::is_tuple(c) || tuple::tuple_len(c) != nfree {
                     raise!(TypeError, "code object requires a closure of exactly length {}", nfree);
+                }
+                if tuple::tuple_items(c).iter().any(|x| !x.is_type(crate::types::funcobject::cell_type())) {
+                    raise!(TypeError, "closure can only contain cells");
                 }
                 crate::interp::eval_code_with_closure(&code, &g, l.as_deref(), Some(c))?;
                 return Ok(none::none_ref());
@@ -689,16 +724,22 @@ fn b_input(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     if let Some(r) = crate::modules::tty::input::tty_input(args.first().copied())? {
         return Ok(r);
     }
-    let out = crate::modules::sys::get_sys_attr("stdout");
-    if let (Some(p), Some(o)) = (args.first(), &out) {
-        let s = ab::str(p)?;
-        ab::call_method_str(o, "write", &[&s])?;
-        let _ = ab::call_method_str(o, "flush", &[]);
-    }
     let inp = match crate::modules::sys::get_sys_attr("stdin") {
         Some(i) if !i.is(none::none()) => i,
         _ => raise!(RuntimeError, "input(): lost sys.stdin"),
     };
+    let out = match crate::modules::sys::get_sys_attr("stdout") {
+        Some(o) if !o.is(none::none()) => Some(o),
+        _ => raise!(RuntimeError, "input(): lost sys.stdout"),
+    };
+    if let (Some(p), Some(o)) = (args.first(), &out) {
+        let s = ab::str(p)?;
+        ab::call_method_str(o, "write", &[&s])?;
+        // a stream without a working flush() is fine (the error is dropped)
+        if ab::call_method_str(o, "flush", &[]).is_err() {
+            clear_exc();
+        }
+    }
     let line = ab::call_method_str(&inp, "readline", &[])?;
     let s = pystr::to_string_lossy(&line);
     if s.is_empty() {

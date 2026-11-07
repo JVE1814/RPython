@@ -95,7 +95,7 @@ fn seqiter_len(o: &PyObject) -> PyResult {
 }
 fn seqiter_reduce(o: &PyObject) -> PyResult {
     let it = si(o);
-    let iter_fn = crate::builtins::builtin("iter")?;
+    let iter_fn = crate::builtins::eval_builtin("iter")?;
     if it.seq.is_null() {
         return Ok(tuple::new_tuple(vec![iter_fn, tuple::new_tuple(vec![tuple::empty_tuple()])]));
     }
@@ -197,7 +197,7 @@ unsafe extern "C" fn calliter_traverse(o: *mut PyObject, visit: visitproc, arg: 
 }
 fn calliter_reduce(o: &PyObject) -> PyResult {
     let it = unsafe { &*(o.as_ptr() as *mut CallIter) };
-    let iter_fn = crate::builtins::builtin("iter")?;
+    let iter_fn = crate::builtins::eval_builtin("iter")?;
     if it.func.is_null() || it.sentinel.is_null() {
         return Ok(tuple::new_tuple(vec![iter_fn, tuple::new_tuple(vec![tuple::empty_tuple()])]));
     }

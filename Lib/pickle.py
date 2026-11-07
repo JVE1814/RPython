@@ -841,7 +841,9 @@ class _Pickler:
 
     def save_frozendict(self, obj):
         if self.proto < 2:
-            self.save_reduce(type(obj), (dict(obj),), obj=obj)
+            # protocols 0 and 1 have no way to express a frozendict: the
+            # generic reduction refuses it (copyreg._reduce_ex)
+            self.save_reduce(obj=obj, *obj.__reduce_ex__(self.proto))
             return
         # Emitted as frozendict({...}) with the same "built while saving
         # the items" check as tuples, so that cycles through mutable

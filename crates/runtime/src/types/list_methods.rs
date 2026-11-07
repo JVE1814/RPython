@@ -12,7 +12,9 @@ use crate::types::{exceptions, float, int, none, str as pystr, tuple};
 // ================================================================== methods
 
 fn append_m(o: &PyObject, v: &PyObject) -> PyResult {
-    list::append(o, v.to_ref());
+    if !list::try_append(o, v.to_ref()) {
+        return Err(crate::errors::memory_error());
+    }
     Ok(none::none_ref())
 }
 fn extend_m(o: &PyObject, v: &PyObject) -> PyResult {

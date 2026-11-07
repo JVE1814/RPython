@@ -127,7 +127,9 @@ pub fn new_function(code: &PyObject, globals: &PyObject, qualname: Option<&PyObj
                 return Ok(PyRef::from_raw(op));
             }
         }
-        // __builtins__ from globals, else the builtins module dict
+        // __builtins__ from globals, else the builtins of the running frame (only the first
+        // kind of result is remembered in NEWFUNC_CACHE)
+        let mut cacheable = true;
         let b = match dict::get_item_str(globals, name!("__builtins__")) {
             Some(b) => {
                 if crate::types::module::is_module(&b) {
@@ -136,7 +138,10 @@ pub fn new_function(code: &PyObject, globals: &PyObject, qualname: Option<&PyObj
                     b
                 }
             }
-            None => crate::builtins::builtins_dict(),
+            None => {
+                cacheable = false;
+                crate::interp::current_builtins()
+            }
         };
         f.func_builtins = b.into_raw();
         f.func_doc = match crate::types::code::code_docstring(code) {
@@ -148,7 +153,7 @@ pub fn new_function(code: &PyObject, globals: &PyObject, qualname: Option<&PyObj
             Some(m) => m.into_raw(),
             None => std::ptr::null_mut(),
         };
-        if ver0 != 0 && dict::table(globals).version == ver0 {
+        if cacheable && ver0 != 0 && dict::table(globals).version == ver0 {
             *(&raw mut NEWFUNC_CACHE) = (globals.as_ptr() as usize, ver0, f.func_builtins, f.func_module);
         }
         f.vectorcall = Some(crate::interp::function_vectorcall);
@@ -279,6 +284,16 @@ fn f_set_code(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
             nfree
         );
     }
+    // generator / coroutine / async generator kind
+    const KIND: u32 = 0x20 | 0x80 | 0x200;
+    let old_kind = unsafe { crate::types::code::code(&*func(o).func_code).flags() } & KIND;
+    if crate::types::code::code(v).flags() & KIND != old_kind {
+        crate::modules::warnings::warn(
+            crate::types::exceptions::DeprecationWarning(),
+            "assigning a code object of non-matching type (plain function, generator, coroutine or async generator) to __code__ is deprecated",
+            1,
+        )?;
+    }
     // perf-runtime: running call frames borrow their code object from the function
     // (interp::frame, no refcount traffic per call), so the old code object must
     // outlive any frame still executing it: it is retired instead of released.
@@ -287,6 +302,7 @@ fn f_set_code(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         static RETIRED_CODE: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
         RETIRED_CODE.lock().unwrap().push(old as usize);
     }
+    crate::modules::testinternalcapi::rare_event(crate::modules::testinternalcapi::RareEvent::FuncModification);
     func(o).func_version = FUNC_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
@@ -302,6 +318,7 @@ fn f_set_defaults(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     };
     replace(&mut func(o).func_defaults, v);
     func(o).func_version = FUNC_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::modules::testinternalcapi::rare_event(crate::modules::testinternalcapi::RareEvent::FuncModification);
     Ok(())
 }
 fn f_kwdefaults(o: &PyObject) -> PyResult {
@@ -315,6 +332,8 @@ fn f_set_kwdefaults(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         Some(_) => raise!(TypeError, "__kwdefaults__ must be set to a dict object"),
     };
     replace(&mut func(o).func_kwdefaults, v);
+    func(o).func_version = FUNC_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::modules::testinternalcapi::rare_event(crate::modules::testinternalcapi::RareEvent::FuncModification);
     Ok(())
 }
 fn f_globals(o: &PyObject) -> PyResult {
@@ -410,7 +429,7 @@ fn f_annotations(o: &PyObject) -> PyResult {
             let one = crate::types::int::new_int(1);
             let r = ab::call(unsafe { &*f.func_annotate }, &[&one])?;
             if !dict::is_dict(&r) {
-                raise!(TypeError, "__annotate__ returned non-dict of type '{}'", tname(&r));
+                raise!(TypeError, "__annotate__() must return a dict, not {}", tname(&r));
             }
             f.func_annotations = r.into_raw();
         } else {
