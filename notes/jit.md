@@ -593,3 +593,17 @@ This is the first thing to fix next.
 * Thread safety caveats: cached borrowed pointers (cache values, dict entries read by
   JIT code) rely on deferred reclamation at safepoints (D6), which the containers do not
   implement fully yet. This is the same exposure as their own lock-free readers.
+
+## From core5 (for jit5)
+* specialize.rs `load_attr_hit`, kinds `CLASS_ATTR_SHADOWABLE` and `INSTANCE_DICT` (s.c != 0): the instance-dict
+  probe can run Python code (`__eq__` of a non-str key with the same hash, test_descr
+  test_vicious_descriptor_nonsense), which may delete the class attribute; `bind(s.c, o)` then uses a borrowed
+  pointer to a possibly freed descriptor. CPython holds a strong reference to the descriptor across the dict
+  lookup and binds that one (the test expects `c.attr == 1` although the attribute was deleted during the lookup).
+  Fix: take `PyRef::from_borrowed(s.c)` (tag still valid) before `instance_get_hinted` and bind it afterwards.
+* Member offsets: tuple subclasses may now have named `__slots__`; those members are stored after the tuple's
+  items, flagged with `descr::RPY_MEMBER_AFTER_ITEMS`, with a negative `offset` (`!position`), so
+  `member_offset`'s `off <= 0` check already keeps them out of the SLOT cache. Any other code that caches member
+  offsets must use `descr::member_addr(obj, m)` or skip negative offsets.
+* (core4's request still stands: tier-1/2 call paths should poll the eval breaker after calls to non-Python
+  callables, as the interpreter does after CALL.)
