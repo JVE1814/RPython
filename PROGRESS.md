@@ -1,13 +1,13 @@
 # PROGRESS
 
 ## Status 2026-11-07 (day 7, afternoon)
-Master f66b390: core6, perf4, tail1, capi2 merged today; suite run 12: 367/434 modules pass, 129 failures, 70 errors. Smoke on snap19: test_capi 40 failures (was 433 in run 11),
+Master ca5cdc8: core6, perf4, tail1, capi2, cleanroom1 (14 Lib modules rewritten clean-room), scale1 (multi-core scaling) merged today; suite run 12: 367/434 modules pass, 129 failures, 70 errors. Smoke on snap19: test_capi 40 failures (was 433 in run 11),
 stable_abi_ctypes/fileutils pass, cmd_line_script 1; tail1 fixed ~60 long-tail modules (inspect, codecs, time,
 path modules, math, buffer, logging, json, ...). Run 11 (pre-merges):
 294/434 modules pass, 674 failures (241 without test_capi), 616 errors. Baseline free-threaded CPython: 416/434.
-Running agents: scale1 (multi-core scaling), perf5 (remaining slow benchmarks), stability3 (test_free_threading races,
+Running agents: scale2 (scaling round 2 + prompt-free regression in test_concurrent_futures), perf5 (remaining slow benchmarks), stability3 (test_free_threading races,
 flaky crashes, gc hang), tail2 (alloc-failure injection, re.DEBUG, _zoneinfo, pdb, tkinter, leftovers),
-cleanroom1 (D19 audit/rewrite of Lib/ files that read like recalled text).
+cleanroom2 (continuing the D19 Lib audit).
 Earlier history (2026-11-02): agents stopped when the weekly API limit was hit; resumed Nov 5.
 
 ## RESUMED (2026-11-01, 22:15 UTC) after a pause at user request
@@ -145,6 +145,28 @@ deltablue, chaos 0.65, float, hexiom, gc_collect, coroutines 0.98, unpack_sequen
 Startup `-c pass`: 56.6M instructions (CPython 40.5M); `-S -c pass` 29.2M (27.7M). Peak RSS (startup_mem.sh):
 34.9 MB (CPython default 32.3, free-threaded 38.6). Instructions per call shape and per loop: notes/perf4.md.
 Multi-core scaling: being measured by scale1.
+
+### Multi-core scaling (scale1, 2026-11-07; tools/bench/scaling, loaded machine — CPU inflation at 4 threads, ideal 1.00)
+| workload | before scale1 | ours | py-ft |
+|---|---|---|---|
+| cpu_nbody | 1.48 | 1.08 | 1.07 |
+| cpu_oo | 3.23 | 1.55 | 1.07 |
+| cpu_float | 2.43 | 1.15 | 1.08 |
+| cpu_comp | 3.09 | 1.07 | 1.15 |
+| cpu_gen | 1.35 | 1.14 | 1.08 |
+| shr_dict | 1.19 | 1.02 | 1.12 |
+| shr_list | 1.36 | 0.95 | 1.33 |
+| shr_attrs | 2.08 | 1.15 | 1.00 |
+| alloc_cycles | 2.66 | 1.45 | 0.81 |
+| mut_queue | 1.78 | 1.05 | 1.78 |
+| mut_dict | 3.85 | 1.69 | 1.74 |
+| mut_list | 3.42 | 1.70 | 1.52 |
+| jit_calls | 9.16 | 2.60 | 1.03 |
+| misc_classes | 3.49 | 5.22 | 2.43 |
+| misc_cext | 1.42 | 1.08 | 1.05 |
+Wall speedup at 4 threads beats py-ft on cpu_regex, shr_dict, shr_list (2.26 vs 0.89), alloc_dicts, mut_queue,
+misc_import; behind on cpu_oo, jit_calls, shr_attrs, alloc_cycles, misc_classes, mut_list (scale2 is on these). Full
+table and causes: notes/scale1.md. Quiet-machine run still due (D22).
 
 ### Previous (jit6 + perf3, 2026-11-07; wall-clock ratio ours / best CPython, targeted runs at load ~4, not quiet-machine)
 | bench | jit5 | now | source |
