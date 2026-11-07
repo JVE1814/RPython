@@ -48,6 +48,9 @@ pub fn finalize() -> bool {
     collect();
     crate::gc_support::dump_shutdown_stats();
     finalize_modules();
+    // the main thread's state goes last: its contextvars context
+    super::_contextvars::clear_thread_context();
+    clear_exc();
     collect();
     super::sys_full::flush_std("stdout");
     super::sys_full::flush_std("stderr");
@@ -89,6 +92,13 @@ fn finalize_modules() {
     let bd = crate::builtins::builtins_dict();
     // state that keeps user objects alive and is not needed any more
     set_none(&bd, "_");
+    // pending lazy imports are not going to be resolved any more
+    if let Some(s) = dict::get_item_rs(&sysd, "lazy_modules") {
+        if crate::types::set::is_set(&s) {
+            crate::types::set::clear(&s);
+            clear_exc();
+        }
+    }
     for k in ["last_exc", "last_type", "last_value", "last_traceback", "ps1", "ps2"] {
         set_none(&sysd, k);
     }

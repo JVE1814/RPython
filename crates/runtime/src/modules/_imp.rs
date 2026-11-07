@@ -379,6 +379,20 @@ fn imp_rpy_getcwd(_m: &PyObject) -> PyResult {
     use std::os::unix::ffi::OsStrExt;
     Ok(crate::modules::_thread::decode_surrogateescape(d.as_os_str().as_bytes()))
 }
+/// `_imp._set_lazy_attributes(module, name)`: called once `name` has been imported, so its pending
+/// lazily imported submodules become reachable as attributes. Our module attribute lookup
+/// already falls back to pending `sys.lazy_modules` entries (types/lazyimport.rs), so
+/// nothing has to be stored; the call only validates its arguments.
+fn imp_set_lazy_attributes(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    if args.len() != 2 {
+        raise!(TypeError, "_set_lazy_attributes expected 2 arguments, got {}", args.len());
+    }
+    if !pystr::is_str(args[1]) {
+        raise!(TypeError, "_set_lazy_attributes() argument 2 must be str, not {}", crate::types::typeobject::tname(args[1]));
+    }
+    Ok(crate::types::none::none_ref())
+}
+
 fn imp_rpy_read_file(_m: &PyObject, p: &PyObject) -> PyResult {
     let path = path_arg(p)?;
     let data = crate::threads::blocking(|| std::fs::read(&path)).map_err(|e| os_err(e, &path))?;
@@ -420,6 +434,7 @@ pub fn init_module() -> PyResult {
             ("_rpy_listdir", O, imp_rpy_listdir),
             ("_rpy_getcwd", NOARGS, imp_rpy_getcwd),
             ("_rpy_read_file", O, imp_rpy_read_file),
+            ("_set_lazy_attributes", FAST, imp_set_lazy_attributes),
         ],
         Some(&m),
     )?;

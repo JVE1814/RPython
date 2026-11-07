@@ -98,6 +98,12 @@ pub fn current_context() -> PyResult {
     }
 }
 
+/// Drop the current thread's context (interpreter shutdown: what its variables hold is
+/// finalized like the rest of the thread state).
+pub fn clear_thread_context() {
+    set_current(None);
+}
+
 fn set_current(c: Option<PyRef>) {
     let ts = crate::threads::current_mut();
     unsafe {

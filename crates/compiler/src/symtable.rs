@@ -705,7 +705,9 @@ impl Builder {
                         return Err(err("lazy from ... import * is not allowed", loc));
                     }
                     if module.as_deref() == Some("__future__") {
-                        return Err(err("lazy from __future__ import is not allowed", loc));
+                        // the error points at the `lazy` keyword
+                        let kw = Loc::new(loc.lineno, loc.col_offset, loc.lineno, loc.col_offset + 4);
+                        return Err(err("lazy from __future__ import is not allowed", kw));
                     }
                 }
                 for a in names {

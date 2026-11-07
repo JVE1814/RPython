@@ -94,8 +94,24 @@ fn lazy_modules_set() -> Option<PyRef> {
     if p.is_null() { None } else { Some(unsafe { PyRef::from_borrowed(p) }) }
 }
 
+/// Is `nm` imported (in sys.modules and not still executing its body)? Only plain storage is
+/// read: neither the module's nor the spec's descriptors run, and `_initializing` counts
+/// as "done" only when it is the `False` object itself.
 fn in_sys_modules(nm: &str) -> bool {
-    crate::import::get_loaded_module(nm).is_some()
+    let Some(m) = crate::import::get_loaded_module(nm) else { return false };
+    if !crate::types::module::is_module(&m) {
+        return true;
+    }
+    let md = crate::types::module::module_dict(&m);
+    let Some(spec) = dict::get_item_str(&md, crate::name!("__spec__")) else { return true };
+    let Some(sd) = crate::types::typeobject::instance_dict_existing(&spec) else { return true };
+    if !dict::is_dict(&sd) {
+        return true;
+    }
+    match dict::get_item_str(&sd, crate::name!("_initializing")) {
+        None => true,
+        Some(v) => v.is(crate::types::bool_::false_obj()),
+    }
 }
 
 fn track(nm: &str, is_module: bool) -> PyResult<()> {
@@ -135,6 +151,47 @@ fn clear_exc_if_set() {
     if err_occurred() {
         clear_exc();
     }
+}
+
+/// Is `full` an entry of sys.lazy_modules (a module or a `module.attr` of a lazy
+/// from-import)?
+fn pending_entry(full: &str) -> bool {
+    match lazy_modules_set() {
+        Some(s) => crate::types::set::set_contains(&s, &pystr::new_str(full)).unwrap_or_else(|_| {
+            clear_exc_if_set();
+            false
+        }),
+        None => false,
+    }
+}
+
+/// Import the pending submodule `full`; false (nothing raised) when there is no such
+/// module, so the caller reports a missing attribute instead.
+fn import_pending(full: &str) -> PyResult<bool> {
+    let nm = pystr::new_str(full);
+    let leaf = full.rsplit('.').next().unwrap_or(full);
+    let fl = tuple::new_tuple(vec![pystr::new_str(leaf)]);
+    if crate::import::import_module_level(&nm, None, &fl, 0).is_err() {
+        if exc_matches(crate::types::exceptions::ModuleNotFoundError()) {
+            let e = take_exc();
+            let same = e
+                .as_ref()
+                .and_then(|e| ab::getattr_opt(e, name!("name")).ok().flatten())
+                .is_some_and(|n| pystr::is_str(&n) && pystr::to_string_lossy(&n) == full);
+            clear_exc_if_set();
+            if same {
+                return Ok(false);
+            }
+            if let Some(e) = e {
+                set_exc(e);
+            }
+        }
+        return Err(PyErr);
+    }
+    if in_sys_modules(full) {
+        untrack(full, true);
+    }
+    Ok(true)
 }
 
 /// Is `full` a module name declared by a lazy import that is still pending?
@@ -445,13 +502,16 @@ pub fn import_from(p: &PyObject, attr: &PyObject) -> PyResult {
     let mut tracked: Vec<PyRef> = Vec::new();
     if attrs.is_empty() && from_form {
         let resolved = pystr::to_string_lossy(unsafe { &*r.resolved });
+        let parent_loaded = in_sys_modules(&resolved);
         if let Some(m) = crate::import::get_loaded_module(&resolved) {
             if let Some(v) = module_dict_value(&m, attr) {
                 return Ok(v);
             }
         }
+        // a loaded parent without the attribute: pending even when the submodule itself is
+        // in sys.modules (it was removed from the parent), so attribute access finds it
         let full = format!("{}.{}", resolved, pystr::to_string_lossy(attr));
-        if !in_sys_modules(&full) {
+        if parent_loaded || !in_sys_modules(&full) {
             track(&full, false)?;
             tracked.push(pystr::new_str(&full));
         }
@@ -483,6 +543,17 @@ fn lookup_attr(v: &PyObject, attr: &PyObject) -> PyResult {
                     let full = format!("{}.{}", pystr::to_string_lossy(&pkg), pystr::to_string_lossy(attr));
                     if let Some(m) = crate::import::get_loaded_module(&full) {
                         return Ok(m);
+                    }
+                    if pending_entry(&full) {
+                        match import_pending(&full) {
+                            Ok(true) => {
+                                if let Some(m) = crate::import::get_loaded_module(&full) {
+                                    return Ok(m);
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(e) => return Err(e),
+                        }
                     }
                 }
             }
@@ -529,6 +600,40 @@ fn add_origin_note(p: &PyObject) {
     set_exc(e);
 }
 
+fn root_is_from_form(p: &PyObject) -> bool {
+    let l = li(p);
+    !l.fromlist.is_null() && ab::is_true(unsafe { &*l.fromlist }).unwrap_or_else(|_| {
+        clear_exc_if_set();
+        false
+    })
+}
+
+/// The module a `lazy from m import ...` root stands for, imported without its from-list:
+/// each name is looked up on its own when its placeholder is used, so using one name
+/// imports only that name's submodule.
+fn resolve_from_module(p: &PyObject) -> PyResult {
+    let l = li(p);
+    let globals = opt_ref(l.globals);
+    let locals = opt_ref(l.locals);
+    let name = unsafe { PyRef::from_borrowed(l.name) };
+    let level = opt_ref(l.level).unwrap_or_else(|| int::new_int(0));
+    let top = eager_import(&name, globals.as_deref(), locals.as_deref(), &tuple::empty_tuple(), &level)?;
+    let resolved = pystr::to_string_lossy(unsafe { &*l.resolved });
+    let m = match crate::import::get_loaded_module(&resolved) {
+        Some(m) => m,
+        None => {
+            // a custom import hook: walk down from what it returned
+            let mut v = top;
+            for part in resolved.split('.').skip(1) {
+                v = ab::getattr(&v, &pystr::new_str(part))?;
+            }
+            v
+        }
+    };
+    finish(p);
+    Ok(m)
+}
+
 fn resolve_root(p: &PyObject) -> PyResult {
     let l = li(p);
     let globals = opt_ref(l.globals);
@@ -546,13 +651,56 @@ fn finish(p: &PyObject) {
     let l = li(p);
     if let Some(t) = opt_ref(l.tracked) {
         for n in tuple::tuple_items(&t) {
+            // a name whose module is still executing (a circular import returned the
+            // partial module) or failed stays pending
             let s = pystr::to_string_lossy(n);
-            let loaded = in_sys_modules(&s);
-            untrack(&s, loaded);
+            let module_entry = with_track(|t| t.modules.contains(&s));
+            if !module_entry || in_sys_modules(&s) {
+                untrack(&s, true);
+            }
         }
         let old = std::mem::replace(&mut l.tracked, tuple::empty_tuple().into_raw());
         unsafe { xdecref(old) };
     }
+}
+
+thread_local! {
+    /// Root placeholders this thread is resolving (their import is running).
+    static RESOLVING: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Resolve a root placeholder (`from_module`: as the module of a from-import). Code run by
+/// the import may use the binding again before it is replaced: a from-import then sees the
+/// (possibly partial) module, a plain import the module it binds if that is fully imported;
+/// anything else is a circular lazy import and an ImportError.
+fn guarded_root(root: &PyObject, from_module: bool) -> PyResult {
+    let key = root.as_ptr() as usize;
+    if RESOLVING.with(|r| r.borrow().contains(&key)) {
+        let l = li(root);
+        let resolved = pystr::to_string_lossy(unsafe { &*l.resolved });
+        let from_form = from_module || root_is_from_form(root);
+        let target = if from_form { resolved.clone() } else { resolved.split('.').next().unwrap_or("").to_string() };
+        if let Some(m) = crate::import::get_loaded_module(&target) {
+            if from_form || in_sys_modules(&target) {
+                return Ok(m);
+            }
+        }
+        return Err(crate::import::import_error_with(
+            &format!("cannot resolve the lazy import of '{}' while it is being imported (circular lazy import)", resolved),
+            Some(&pystr::new_str(&resolved)),
+            None,
+            None,
+        ));
+    }
+    RESOLVING.with(|r| r.borrow_mut().push(key));
+    let r = if from_module { resolve_from_module(root) } else { resolve_root(root) };
+    RESOLVING.with(|r| {
+        let mut v = r.borrow_mut();
+        if let Some(i) = v.iter().rposition(|&k| k == key) {
+            v.remove(i);
+        }
+    });
+    r
 }
 
 /// Reify a placeholder (does not replace any binding).
@@ -562,10 +710,10 @@ pub fn resolve(p: &PyObject) -> PyResult {
     let r = (|| -> PyResult {
         let l = li(p);
         if l.base.is_null() {
-            return resolve_root(p);
+            return guarded_root(p, false);
         }
         let root = unsafe { PyRef::from_borrowed(l.base) };
-        let mut v = resolve_root(&root)?;
+        let mut v = guarded_root(&root, root_is_from_form(&root))?;
         let attrs = unsafe { PyRef::from_borrowed(l.attrs) };
         for a in tuple::tuple_items(&attrs) {
             v = lookup_attr(&v, a)?;
@@ -613,12 +761,12 @@ pub fn pending_submodule(module: &PyObject, attr: &PyObject) -> PyResult<Option<
         return Ok(None);
     }
     let full = format!("{}.{}", pystr::to_string_lossy(&mn), pystr::to_string_lossy(attr));
-    if !pending_module(&full) {
+    if !pending_entry(&full) {
         return Ok(None);
     }
-    let fl = tuple::new_tuple(vec![attr.to_ref()]);
-    crate::import::import_module_level(&pystr::new_str(&full), None, &fl, 0)?;
-    untrack(&full, true);
+    if !import_pending(&full)? {
+        return Ok(None);
+    }
     if let Some(v) = dict::get_item_str(&d, attr) {
         return Ok(Some(v));
     }
