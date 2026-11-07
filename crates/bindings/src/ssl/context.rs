@@ -15,11 +15,14 @@ pub struct Ctx {
     pub msg_callback: Option<PyRef>,
     pub keylog_filename: Option<PyRef>,
     pub alpn: Vec<u8>,
+    /// (tail2) TLS-PSK callbacks
+    pub psk_client_callback: Option<PyRef>,
+    pub psk_server_callback: Option<PyRef>,
 }
 
 impl Trav for Ctx {
     fn trav(&self, v: &mut dyn FnMut(*mut PyObject) -> c_int) -> c_int {
-        for o in [&self.sni_callback, &self.msg_callback, &self.keylog_filename] {
+        for o in [&self.sni_callback, &self.msg_callback, &self.keylog_filename, &self.psk_client_callback, &self.psk_server_callback] {
             if let Some(r) = o {
                 let x = v(r.as_ptr());
                 if x != 0 {
@@ -113,6 +116,8 @@ fn ctx_new_impl(tp: *mut PyTypeObject, a: &fc::VcArgs) -> PyResult {
             msg_callback: None,
             keylog_filename: None,
             alpn: Vec::new(),
+            psk_client_callback: None,
+            psk_server_callback: None,
         },
     )?;
     sl!(SSL_CTX_set_ex_data(c, CTX_EX_INDEX, obj.as_ptr() as *mut c_void));
@@ -128,8 +133,12 @@ fn ctx_new_impl(tp: *mut PyTypeObject, a: &fc::VcArgs) -> PyResult {
     if matches!(protocol, 2 | 0x10 | 0x11) {
         sl!(SSL_CTX_ctrl(c, SSL_CTRL_SET_MIN_PROTO_VERSION, 0x303, std::ptr::null_mut()));
     }
-    let sid = b"Python";
-    sl!(SSL_CTX_set_session_id_context(c, sid.as_ptr(), sid.len() as c_uint));
+    // (tail2) the session id context matters for servers resuming sessions; a client-only
+    // context keeps none, so sessions OpenSSL makes for a TLS 1.3 PSK are accepted
+    if protocol != 0x10 {
+        let sid = b"Python";
+        sl!(SSL_CTX_set_session_id_context(c, sid.as_ptr(), sid.len() as c_uint));
+    }
     let store = sl!(SSL_CTX_get_cert_store(c));
     let param = cr!(X509_STORE_get0_param(store));
     cr!(X509_VERIFY_PARAM_set_flags(param, 0x8000)); // trusted first
@@ -1125,8 +1134,162 @@ fn m_set_server_sigalgs(o: &PyObject, s: &PyObject) -> PyResult {
     ctrl_str(o, 98, s, "set_server_sigalgs")
 }
 
-fn m_psk_unsupported(_o: &PyObject, _args: &[&PyObject], _kw: Option<&PyObject>) -> PyResult {
-    raise!(NotImplementedError, "TLS-PSK is not supported by this build")
+// ------------------------------------------------------------------ TLS-PSK (tail2)
+
+const PROTOCOL_TLS_CLIENT: i64 = 0x10;
+const PROTOCOL_TLS_SERVER: i64 = 0x11;
+
+/// The checked callback argument: Some(callable) or None (unset).
+fn psk_callable(v: &PyObject) -> PyResult<Option<PyRef>> {
+    if is_none(v) {
+        return Ok(None);
+    }
+    if !rpy_runtime::abstract_::is_callable(v) {
+        raise!(TypeError, "callback must be callable");
+    }
+    Ok(Some(v.to_ref()))
+}
+
+fn m_set_psk_client_callback(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
+    static P: rpy_runtime::args::Params = rpy_runtime::args::Params::new("set_psk_client_callback", &["callback"], 0, 1);
+    let [cb] = rpy_runtime::args::parse::<1>(&P, args, kw)?;
+    let c = ctx(o);
+    if c.protocol == PROTOCOL_TLS_SERVER {
+        return Err(raise_simple(&st().ssl_error, 0, "Cannot add PSK client callback to a PROTOCOL_TLS_SERVER context"));
+    }
+    let cb = psk_callable(cb.unwrap())?;
+    let f = if cb.is_some() { psk_client_cb as *mut c_void } else { std::ptr::null_mut() };
+    let old = std::mem::replace(&mut c.psk_client_callback, cb);
+    sl!(SSL_CTX_set_psk_client_callback(c.ctx, f));
+    drop(old);
+    Ok(none())
+}
+
+fn m_set_psk_server_callback(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
+    static P: rpy_runtime::args::Params =
+        rpy_runtime::args::Params::new("set_psk_server_callback", &["callback", "identity_hint"], 0, 1);
+    let [cb, hint] = rpy_runtime::args::parse::<2>(&P, args, kw)?;
+    let c = ctx(o);
+    if c.protocol == PROTOCOL_TLS_CLIENT {
+        return Err(raise_simple(&st().ssl_error, 0, "Cannot add PSK server callback to a PROTOCOL_TLS_CLIENT context"));
+    }
+    let cb = psk_callable(cb.unwrap())?;
+    let hint = match hint {
+        Some(h) if !is_none(h) => {
+            if !is_str(h) {
+                raise!(TypeError, "identity_hint must be str or None");
+            }
+            Some(CString::new(str_of(h)).map_err(|_| rpy_runtime::err!(ValueError, "embedded null character"))?)
+        }
+        _ => None,
+    };
+    if sl!(SSL_CTX_use_psk_identity_hint(c.ctx, hint.as_ref().map_or(std::ptr::null(), |h| h.as_ptr()))) != 1 {
+        return Err(raise_from_queue(None, "failed to set identity hint"));
+    }
+    let f = if cb.is_some() { psk_server_cb as *mut c_void } else { std::ptr::null_mut() };
+    let old = std::mem::replace(&mut c.psk_server_callback, cb);
+    sl!(SSL_CTX_set_psk_server_callback(c.ctx, f));
+    drop(old);
+    Ok(none())
+}
+
+/// The Python context object behind an SSL connection.
+unsafe fn ctx_obj_of(ssl: *mut c_void) -> Option<PyRef> {
+    let c = sl!(SSL_get_SSL_CTX(ssl));
+    if c.is_null() {
+        return None;
+    }
+    let o = sl!(SSL_CTX_get_ex_data(c, CTX_EX_INDEX)) as *mut PyObject;
+    if o.is_null() { None } else { Some(unsafe { (*o).to_ref() }) }
+}
+
+/// A str argument from a C string (None for NULL).
+unsafe fn opt_utf8(p: *const c_char) -> PyResult {
+    if p.is_null() {
+        return Ok(none());
+    }
+    unsafe { from_c(capi::PyUnicode_Decode(p, libc::strlen(p) as isize, cs!("utf-8"), cs!("strict"))) }
+}
+
+/// Copy the key bytes into OpenSSL's buffer; the key length, 0 when it does not fit.
+fn put_psk(key: &PyObject, out: *mut u8, max: c_uint) -> PyResult<c_uint> {
+    if !is_bytes(key) {
+        raise!(TypeError, "psk must be bytes");
+    }
+    let k = bytes::bytes_data(key);
+    if k.len() > max as usize {
+        raise!(ValueError, "psk is longer than {} bytes", max);
+    }
+    unsafe { std::ptr::copy_nonoverlapping(k.as_ptr(), out, k.len()) };
+    Ok(k.len() as c_uint)
+}
+
+/// Client side: callback(identity_hint) -> (identity or None, psk bytes).
+unsafe extern "C" fn psk_client_cb(
+    ssl: *mut c_void,
+    hint: *const c_char,
+    identity: *mut c_char,
+    max_identity_len: c_uint,
+    psk: *mut u8,
+    max_psk_len: c_uint,
+) -> c_uint {
+    unsafe {
+        let g = crate::gil::ensure();
+        let r = (|| -> PyResult<c_uint> {
+            let Some(co) = ctx_obj_of(ssl) else { return Ok(0) };
+            let Some(cb) = ctx(&co).psk_client_callback.clone() else { return Ok(0) };
+            let res = call(&cb, &[&*opt_utf8(hint)?])?;
+            let t = rpy_runtime::abstract_::sequence_tuple(&res)?;
+            let items = rpy_runtime::types::tuple::tuple_items(&t);
+            if items.len() != 2 {
+                raise!(TypeError, "psk client callback must return (identity, psk)");
+            }
+            let id: Vec<u8> = if is_none(items[0]) {
+                Vec::new()
+            } else if is_str(items[0]) {
+                str_of(items[0]).into_bytes()
+            } else {
+                raise!(TypeError, "identity must be str or None");
+            };
+            if id.len() + 1 > max_identity_len as usize {
+                raise!(ValueError, "identity is longer than {} bytes", max_identity_len.saturating_sub(1));
+            }
+            std::ptr::copy_nonoverlapping(id.as_ptr() as *const c_char, identity, id.len());
+            *identity.add(id.len()) = 0;
+            put_psk(items[1], psk, max_psk_len)
+        })();
+        let n = match r {
+            Ok(n) => n,
+            Err(_) => {
+                capi::PyErr_WriteUnraisable(std::ptr::null_mut());
+                0
+            }
+        };
+        crate::gil::release(g);
+        n
+    }
+}
+
+/// Server side: callback(identity) -> psk bytes.
+unsafe extern "C" fn psk_server_cb(ssl: *mut c_void, identity: *const c_char, psk: *mut u8, max_psk_len: c_uint) -> c_uint {
+    unsafe {
+        let g = crate::gil::ensure();
+        let r = (|| -> PyResult<c_uint> {
+            let Some(co) = ctx_obj_of(ssl) else { return Ok(0) };
+            let Some(cb) = ctx(&co).psk_server_callback.clone() else { return Ok(0) };
+            let key = call(&cb, &[&*opt_utf8(identity)?])?;
+            put_psk(&key, psk, max_psk_len)
+        })();
+        let n = match r {
+            Ok(n) => n,
+            Err(_) => {
+                capi::PyErr_WriteUnraisable(std::ptr::null_mut());
+                0
+            }
+        };
+        crate::gil::release(g);
+        n
+    }
 }
 
 fn wrap_args(args: &[&PyObject], kw: Option<&PyObject>, bio: bool) -> PyResult<Vec<Option<PyRef>>> {
@@ -1170,6 +1333,8 @@ pub fn init_type() -> PyResult<()> {
             ("_wrap_socket", FASTKW, m_wrap_socket),
             ("_wrap_bio", FASTKW, m_wrap_bio),
             ("set_ciphers", O, m_set_ciphers),
+            ("set_psk_client_callback", FASTKW, m_set_psk_client_callback),
+            ("set_psk_server_callback", FASTKW, m_set_psk_server_callback),
             ("set_ciphersuites", O, m_set_ciphersuites),
             ("set_groups", O, m_set_groups),
             ("set_client_sigalgs", O, m_set_client_sigalgs),
@@ -1184,8 +1349,6 @@ pub fn init_type() -> PyResult<()> {
             ("get_ca_certs", FASTKW, m_get_ca_certs),
             ("set_ecdh_curve", O, m_set_ecdh_curve),
             ("session_stats", NOARGS, m_session_stats),
-            ("set_psk_client_callback", FASTKW, m_psk_unsupported),
-            ("set_psk_server_callback", FASTKW, m_psk_unsupported),
         ];
         (*t).tp_getset = rpy_runtime::getset_table![
             ("check_hostname", get_check_hostname, set_check_hostname),

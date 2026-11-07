@@ -192,6 +192,10 @@ crate::dyn_lib!(LibSsl, ["libssl.so.3", "libssl.so"], {
     fn SSL_get_servername(s: P, t: c_int) -> *const c_char;
     fn SSL_set_SSL_CTX(s: P, c: P) -> P;
     fn SSL_get_SSL_CTX(s: P) -> P;
+    // (tail2) TLS-PSK
+    fn SSL_CTX_set_psk_client_callback(c: P, cb: P);
+    fn SSL_CTX_set_psk_server_callback(c: P, cb: P);
+    fn SSL_CTX_use_psk_identity_hint(c: P, hint: *const c_char) -> c_int;
     fn SSL_verify_client_post_handshake(s: P) -> c_int;
     fn SSL_get_verify_result(s: P) -> c_long;
     fn SSL_set_ex_data(s: P, i: c_int, d: P) -> c_int;
