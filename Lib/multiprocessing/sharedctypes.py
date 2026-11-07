@@ -27,6 +27,17 @@ typecode_to_type = {
     }
 
 
+def _resolve_type(typecode_or_type):
+    if isinstance(typecode_or_type, str):
+        try:
+            return typecode_to_type[typecode_or_type]
+        except KeyError:
+            raise TypeError(
+                f"bad typecode {typecode_or_type!r} (must be one of "
+                f"{''.join(typecode_to_type)} or a ctypes type)") from None
+    return typecode_or_type
+
+
 def _new_value(type_):
     size = ctypes.sizeof(type_)
     wrapper = heap.BufferWrapper(size)
@@ -35,7 +46,7 @@ def _new_value(type_):
 
 def RawValue(typecode_or_type, *args):
     """A ctypes object in shared memory (no lock)."""
-    type_ = typecode_to_type.get(typecode_or_type, typecode_or_type)
+    type_ = _resolve_type(typecode_or_type)
     obj = _new_value(type_)
     ctypes.memset(ctypes.addressof(obj), 0, ctypes.sizeof(obj))
     obj.__init__(*args)
@@ -44,7 +55,7 @@ def RawValue(typecode_or_type, *args):
 
 def RawArray(typecode_or_type, size_or_initializer):
     """A ctypes array in shared memory (no lock)."""
-    type_ = typecode_to_type.get(typecode_or_type, typecode_or_type)
+    type_ = _resolve_type(typecode_or_type)
     if isinstance(size_or_initializer, int):
         type_ = type_ * size_or_initializer
         obj = _new_value(type_)

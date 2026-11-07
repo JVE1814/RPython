@@ -42,6 +42,10 @@ if 'posix' in sys.builtin_module_names:
         from posix import _have_functions
     except ImportError:
         pass
+    try:
+        from posix import _create_environ
+    except ImportError:
+        pass
     import posixpath as path
     import posix as _platform
 elif 'nt' in sys.builtin_module_names:
@@ -113,19 +117,21 @@ SEEK_CUR = 1
 SEEK_END = 2
 
 
-def makedirs(name, mode=0o777, exist_ok=False):
-    """makedirs(name [, mode=0o777][, exist_ok=False])
+def makedirs(name, mode=0o777, exist_ok=False, *, parent_mode=None):
+    """makedirs(name [, mode=0o777][, exist_ok=False][, parent_mode=None])
 
     Create a directory and any missing parent directories.  If the leaf
     already exists, OSError is raised unless exist_ok is true and the leaf
-    is a directory.
+    is a directory.  Missing parents are created with *parent_mode* (default
+    0o777); like *mode*, it is combined with the umask.
     """
     head, tail = path.split(name)
     if not tail:
         head, tail = path.split(head)
     if head and tail and not path.exists(head):
         try:
-            makedirs(head, exist_ok=exist_ok)
+            makedirs(head, 0o777 if parent_mode is None else parent_mode,
+                     exist_ok=exist_ok, parent_mode=parent_mode)
         except FileExistsError:
             pass  # created concurrently
         here = curdir if isinstance(tail, str) else curdir.encode('ascii')

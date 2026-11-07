@@ -423,9 +423,11 @@ fn m_read(o: &PyObject, args: &[&PyObject]) -> PyResult {
         let count = match r {
             Ok(_) => nread,
             Err(_) => {
-                // a clean close by the peer reads as EOF
+                // a clean close by the peer reads as EOF while our side is still
+                // open; once we sent close_notify too it is SSLZeroReturnError
+                // (hang1: readers looping until that error spun forever)
                 let shut = sl!(SSL_get_shutdown(ss(o).ssl));
-                if rpy_runtime::errors::exc_matches(st().zero_return_error.as_ptr() as *mut PyTypeObject) && shut & SSL_RECEIVED_SHUTDOWN != 0 {
+                if rpy_runtime::errors::exc_matches(st().zero_return_error.as_ptr() as *mut PyTypeObject) && shut == SSL_RECEIVED_SHUTDOWN {
                     rpy_runtime::errors::clear_exc();
                     0
                 } else {

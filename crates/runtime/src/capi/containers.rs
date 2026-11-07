@@ -83,7 +83,8 @@ pub unsafe extern "C" fn PyTuple_GetItem(o: *mut PyObject, i: Py_ssize_t) -> *mu
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyTuple_SetItem(o: *mut PyObject, i: Py_ssize_t, v: *mut PyObject) -> c_int {
     unsafe {
-        if o.is_null() || !tuple::is_tuple(&*o) || (*o).refcnt() != 1 && !(*o).is_immortal() && false {
+        // (hang1) only a tuple the caller exclusively owns may be filled in
+        if o.is_null() || !tuple::is_tuple(&*o) || (*o).refcnt() != 1 {
             xdecref(v);
             let _ = bad_internal();
             return -1;
@@ -118,21 +119,18 @@ pub unsafe extern "C" fn PyTuple_GetSlice(o: *mut PyObject, lo: Py_ssize_t, hi: 
 pub unsafe extern "C" fn _PyTuple_Resize(p: *mut *mut PyObject, n: Py_ssize_t) -> c_int {
     unsafe {
         let o = *p;
-        if o.is_null() || !tuple::is_tuple(&*o) || n < 0 {
+        // (hang1) a non-empty tuple must be referenced only by the caller:
+        // resizing moves its items out, which corrupted shared tuples (code
+        // constants) and crashed later tests.
+        if o.is_null() || !tuple::is_tuple(&*o) || n < 0 || (tuple::tuple_len(&*o) != 0 && (*o).refcnt() != 1) {
             *p = std::ptr::null_mut();
             xdecref(o);
             let _ = bad_internal();
             return -1;
         }
         let old_n = tuple::tuple_len(&*o);
-        // the items are moved out of `o`: only allowed for a tuple nobody else sees
-        // (moving them out of a shared tuple, e.g. a code constant, left it with NULL
-        // items); the empty tuple is shared but has nothing to move
-        if old_n != 0 && (*o).refcnt() != 1 {
-            *p = std::ptr::null_mut();
-            decref(o);
-            let _ = bad_internal();
-            return -1;
+        if old_n == n as usize {
+            return 0;
         }
         let new = PyTuple_New(n);
         if new.is_null() {
