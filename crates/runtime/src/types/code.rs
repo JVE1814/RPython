@@ -54,16 +54,44 @@ pub struct PyCodeObject {
     pub meta: *mut CodeMeta,
 }
 
+/// (perf6) The items of a tuple owned by the code object, as a slice of references. The
+/// code object keeps the tuple alive and never changes it after construction (the one
+/// replacement, by an equal shared tuple, re-points the view: `replace_consts`).
+#[derive(Clone, Copy)]
+pub struct ItemsView {
+    ptr: *const PyRef,
+    len: usize,
+}
+unsafe impl Send for ItemsView {}
+unsafe impl Sync for ItemsView {}
+impl ItemsView {
+    pub const EMPTY: ItemsView = ItemsView { ptr: std::ptr::NonNull::<PyRef>::dangling().as_ptr(), len: 0 };
+    /// View of exact tuple `t` (PyRef and &PyObject have the same layout).
+    pub fn of(t: &PyObject) -> ItemsView {
+        let items = tuple::tuple_items(t);
+        ItemsView { ptr: items.as_ptr() as *const PyRef, len: items.len() }
+    }
+}
+impl std::ops::Deref for ItemsView {
+    type Target = [PyRef];
+    #[inline(always)]
+    fn deref(&self) -> &[PyRef] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
 /// Public form of a code object (as objects), always present.
 pub struct CodeMeta {
     /// co_code is CPython 3.15 wordcode (false: legacy internal words, D24 transition)
     pub public: bool,
     /// the co_code bytes object
     pub co_code: PyRef,
-    pub consts: Vec<PyRef>,
+    /// (perf6) views of the co_consts / co_names / co_localsplusnames tuples (a copy of
+    /// each per code object cost memory and start-up time)
+    pub consts: ItemsView,
     /// interned str objects
-    pub names: Vec<PyRef>,
-    pub localsplusnames: Vec<PyRef>,
+    pub names: ItemsView,
+    pub localsplusnames: ItemsView,
     pub localspluskinds: Vec<u8>,
     pub co_name: PyRef,
     pub co_qualname: PyRef,
@@ -265,7 +293,7 @@ fn build_exec(c: &PyCodeObject, m: &CodeMeta) -> CodeData {
     if let Some(tx) = m.image_tx {
         // (perf6) translated at build time (start-up image)
         let t = crate::startup_image::decode_translation(tx);
-        let mut consts = m.consts.clone();
+        let mut consts = m.consts.to_vec();
         consts.extend(t.extra_consts.iter().map(exec_extra_obj));
         return CodeData {
             caches: crate::interp::cache::CodeCaches::new(t.code.len()),
@@ -274,8 +302,8 @@ fn build_exec(c: &PyCodeObject, m: &CodeMeta) -> CodeData {
             locations: Vec::new(),
             exception_table: t.exception_table,
             consts,
-            names: m.names.clone(),
-            localsplusnames: m.localsplusnames.clone(),
+            names: m.names.to_vec(),
+            localsplusnames: m.localsplusnames.to_vec(),
             localspluskinds: m.localspluskinds.clone(),
             co_name: m.co_name.clone(),
             co_qualname: m.co_qualname.clone(),
@@ -312,8 +340,8 @@ fn build_exec(c: &PyCodeObject, m: &CodeMeta) -> CodeData {
         locations,
         exception_table: Vec::new(),
         consts,
-        names: m.names.clone(),
-        localsplusnames: m.localsplusnames.clone(),
+        names: m.names.to_vec(),
+        localsplusnames: m.localsplusnames.to_vec(),
         localspluskinds: m.localspluskinds.clone(),
         co_name: m.co_name.clone(),
         co_qualname: m.co_qualname.clone(),
@@ -332,7 +360,7 @@ fn build_exec(c: &PyCodeObject, m: &CodeMeta) -> CodeData {
     };
     match crate::interp::translate::translate(&inp) {
         Ok(out) => {
-            let mut consts = m.consts.clone();
+            let mut consts = m.consts.to_vec();
             consts.extend(out.extra_consts.iter().map(exec_extra_obj));
             // (perf4) no per-instruction Location table for public code: lines come from
             // `pub_lines` (16 bytes per internal instruction saved)
@@ -350,7 +378,7 @@ fn build_exec(c: &PyCodeObject, m: &CodeMeta) -> CodeData {
         Err(msg) => {
             let line = c.co_firstlineno.max(0) as u32;
             let loc = Location { lineno: line, end_lineno: line, col: u32::MAX, end_col: u32::MAX };
-            let mut d = base(vec![bc::encode(bc::Op::Unused1, 0)], vec![loc], m.consts.clone());
+            let mut d = base(vec![bc::encode(bc::Op::Unused1, 0)], vec![loc], m.consts.to_vec());
             d.pub_of_internal = vec![0];
             d.internal_of_pub = vec![0; ncu + 1];
             d.invalid = Some(msg);
@@ -578,8 +606,7 @@ fn new_code_wc_merged(co: &rpy_compiler::wordcode::CodeObject, filename: &PyRef,
         let mine = unsafe { PyRef::from_borrowed(c.co_consts) };
         let shared = m.consts.entry(k).or_insert(mine).clone();
         if !shared.is(unsafe { &*c.co_consts }) {
-            let old = std::mem::replace(&mut c.co_consts, shared.into_raw());
-            unsafe { xdecref(old) };
+            unsafe { replace_consts(&r, shared) };
         }
     }
     Ok(r)
@@ -636,10 +663,13 @@ fn cell_slots_of(kinds: &[u8]) -> Vec<u32> {
 /// Allocate the object and fill the public prefix.
 #[allow(clippy::too_many_arguments)]
 unsafe fn alloc_code(
-    argcount: i32, posonly: i32, kwonly: i32, stacksize: i32, flags: i32, firstlineno: i32, meta: CodeMeta,
-    consts: PyRef, names: PyRef, exctable: PyRef, linetable: PyRef,
+    argcount: i32, posonly: i32, kwonly: i32, stacksize: i32, flags: i32, firstlineno: i32, mut meta: CodeMeta,
+    consts: PyRef, names: PyRef, lpnames: PyRef, exctable: PyRef, linetable: PyRef,
 ) -> PyRef {
     unsafe {
+        meta.consts = ItemsView::of(&consts);
+        meta.names = ItemsView::of(&names);
+        meta.localsplusnames = ItemsView::of(&lpnames);
         let kinds = &meta.localspluskinds;
         let nlocals = kinds.iter().filter(|&&k| k & bc::fast::LOCAL != 0).count();
         let ncell = kinds.iter().filter(|&&k| k & bc::fast::CELL != 0).count();
@@ -661,7 +691,7 @@ unsafe fn alloc_code(
         c.co_ncellvars = ncell as c_int;
         c.co_nfreevars = nfree as c_int;
         c.co_version = 1;
-        c.co_localsplusnames = tuple::new_tuple(meta.localsplusnames.clone()).into_raw();
+        c.co_localsplusnames = lpnames.into_raw();
         c.co_localspluskinds = bytes::new_bytes(kinds).into_raw();
         c.co_filename = meta.filename.clone().into_raw();
         c.co_name = meta.co_name.clone().into_raw();
@@ -689,9 +719,9 @@ pub fn new_code_from_parts(p: CodeParts) -> PyResult {
     let meta = CodeMeta {
         public: false,
         co_code: bytes::new_bytes(&cob),
-        consts: p.consts.clone(),
-        names: p.names.clone(),
-        localsplusnames: p.localsplusnames.clone(),
+        consts: ItemsView::EMPTY,
+        names: ItemsView::EMPTY,
+        localsplusnames: ItemsView::EMPTY,
         localspluskinds: kinds.clone(),
         co_name: p.name.clone(),
         co_qualname: p.qualname.clone(),
@@ -735,6 +765,7 @@ pub fn new_code_from_parts(p: CodeParts) -> PyResult {
             meta,
             tuple::new_tuple(p.consts),
             tuple::new_tuple(p.names),
+            tuple::new_tuple(p.localsplusnames),
             bytes::new_bytes(&exctable),
             bytes::new_bytes(&linetable),
         );
@@ -782,9 +813,9 @@ pub fn new_code_from_public(p: PublicParts) -> PyResult {
     let meta = CodeMeta {
         public: true,
         co_code: p.code,
-        consts: p.consts.clone(),
-        names: names.clone(),
-        localsplusnames: lpn,
+        consts: ItemsView::EMPTY,
+        names: ItemsView::EMPTY,
+        localsplusnames: ItemsView::EMPTY,
         cell_slots: cell_slots_of(&p.kinds),
         image_tx: None,
         localspluskinds: p.kinds,
@@ -803,6 +834,7 @@ pub fn new_code_from_public(p: PublicParts) -> PyResult {
             meta,
             tuple::new_tuple(p.consts),
             tuple::new_tuple(names),
+            tuple::new_tuple(lpn),
             p.exceptiontable,
             p.linetable,
         ))
@@ -825,9 +857,9 @@ pub fn new_code_from_image(p: PublicParts, tx: Option<&'static [u8]>) -> PyRef {
     let meta = CodeMeta {
         public: true,
         co_code: p.code,
-        consts: p.consts.clone(),
-        names: p.names.clone(),
-        localsplusnames: p.localsplusnames,
+        consts: ItemsView::EMPTY,
+        names: ItemsView::EMPTY,
+        localsplusnames: ItemsView::EMPTY,
         cell_slots: cell_slots_of(&p.kinds),
         image_tx: tx,
         localspluskinds: p.kinds,
@@ -846,9 +878,21 @@ pub fn new_code_from_image(p: PublicParts, tx: Option<&'static [u8]>) -> PyRef {
             meta,
             tuple::new_tuple(p.consts),
             tuple::new_tuple(p.names),
+            tuple::new_tuple(p.localsplusnames),
             p.exceptiontable,
             p.linetable,
         )
+    }
+}
+
+/// (perf6) Replace co_consts by an equal tuple during construction (sharing equal
+/// constant tuples) and re-point the view.
+pub unsafe fn replace_consts(code: &PyObject, new: PyRef) {
+    unsafe {
+        let c = &mut *(code.as_ptr() as *mut PyCodeObject);
+        (*c.meta).consts = ItemsView::of(&new);
+        let old = std::mem::replace(&mut c.co_consts, new.into_raw());
+        xdecref(old);
     }
 }
 
@@ -1429,8 +1473,8 @@ fn code_replace(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRe
     let mut flags = c.co_flags;
     let mut firstlineno = c.co_firstlineno;
     let mut code_b: PyRef = m.co_code.clone();
-    let mut consts: Vec<PyRef> = m.consts.clone();
-    let mut names: Vec<PyRef> = m.names.clone();
+    let mut consts: Vec<PyRef> = m.consts.to_vec();
+    let mut names: Vec<PyRef> = m.names.to_vec();
     let mut varnames: Option<Vec<PyRef>> = None;
     let mut freevars: Option<Vec<PyRef>> = None;
     let mut cellvars: Option<Vec<PyRef>> = None;
@@ -1482,7 +1526,7 @@ fn code_replace(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRe
         }
     }
     let (lpn, mut kinds) = if varnames.is_none() && freevars.is_none() && cellvars.is_none() {
-        (m.localsplusnames.clone(), m.localspluskinds.clone())
+        (m.localsplusnames.to_vec(), m.localspluskinds.clone())
     } else {
         let vn = varnames.unwrap_or_else(|| names_of_kind(m, bc::fast::LOCAL));
         let cv = cellvars.unwrap_or_else(|| names_of_kind(m, bc::fast::CELL));

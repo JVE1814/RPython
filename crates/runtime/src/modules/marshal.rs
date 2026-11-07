@@ -1056,8 +1056,7 @@ fn build_public_code(p: CodeParts) -> PyResult<PyRef> {
     if tuple::is_tuple_exact(&consts) {
         let c = unsafe { &mut *(r.as_ptr() as *mut crate::types::code::PyCodeObject) };
         if !c.co_consts.is_null() && !consts.is(unsafe { &*c.co_consts }) {
-            let old = std::mem::replace(&mut c.co_consts, consts.to_ref().into_raw());
-            unsafe { xdecref(old) };
+            unsafe { crate::types::code::replace_consts(&r, consts.to_ref()) };
         }
     }
     Ok(r)

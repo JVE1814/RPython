@@ -1358,7 +1358,7 @@ impl<'a> Gen<'a> {
         let snap = e.read();
         let mut inline = false;
         let mut attr_kind = false;
-        if snap.is_none() && ins.op == Op::LoadMethod && std::ptr::eq(e, &es[0]) {
+        if snap.is_none_or(|s| s.kind == kind::EMPTY) && ins.op == Op::LoadMethod && std::ptr::eq(e, &es[0]) {
             // (perf6) a LoadMethod site that had not run when the function was compiled
             // (code after the loop that triggered compilation): read the first cache
             // entry at run time and take a METHOD hit inline, instead of calling the
