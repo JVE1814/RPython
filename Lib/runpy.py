@@ -76,11 +76,18 @@ def _run_module_code(code, init_globals=None,
         return namespace.copy()
 
 
+def _err(error, message, name):
+    """An `error` instance; ImportError kinds also record the module name."""
+    if issubclass(error, ImportError):
+        return error(message, name=name)
+    return error(message)
+
+
 def _get_module_details(mod_name, error=ImportError):
     """(mod_name, spec, code) for executing module mod_name; packages are
     executed through their __main__ submodule.  Problems raise `error`."""
     if mod_name.startswith("."):
-        raise error("Relative module names not supported")
+        raise _err(error, "Relative module names not supported", mod_name)
     package, _, _ = mod_name.rpartition(".")
     if package:
         # importing the parent first gives the same errors as an import
@@ -107,29 +114,30 @@ def _get_module_details(mod_name, error=ImportError):
         if mod_name.endswith(".py"):
             message += (f". Try using '{mod_name[:-3]}' instead of "
                         f"'{mod_name}' as the module name.")
-        raise error(message) from exc
+        raise _err(error, message, mod_name) from exc
     if spec is None:
-        raise error(f"No module named {mod_name}")
+        raise _err(error, f"No module named {mod_name}", mod_name)
 
     if spec.submodule_search_locations is not None:
         if mod_name == "__main__" or mod_name.endswith(".__main__"):
-            raise error("Cannot use package as __main__ module")
+            raise _err(error, "Cannot use package as __main__ module", mod_name)
         try:
             return _get_module_details(mod_name + ".__main__", error)
         except error as exc:
             if mod_name not in sys.modules:
                 raise
-            raise error(f"{exc}; {mod_name!r} is a package and cannot "
-                        "be directly executed")
+            raise _err(error, f"{exc}; {mod_name!r} is a package and cannot "
+                       "be directly executed", mod_name)
 
     if spec.loader is None:
-        raise error(f"{mod_name!r} is a namespace package and cannot be executed")
+        raise _err(error, f"{mod_name!r} is a namespace package and cannot "
+                   "be executed", mod_name)
     try:
         code = spec.loader.get_code(mod_name)
     except ImportError as exc:
-        raise error(format(exc)) from exc
+        raise _err(error, format(exc), mod_name) from exc
     if code is None:
-        raise error(f"No code object available for {mod_name}")
+        raise _err(error, f"No code object available for {mod_name}", mod_name)
     return mod_name, spec, code
 
 
@@ -175,7 +183,8 @@ def _get_main_module_details(error=ImportError):
         return _get_module_details("__main__")
     except ImportError as exc:
         if "__main__" in str(exc):
-            raise error(f"can't find '__main__' module in {sys.path[0]!r}") from exc
+            raise _err(error, f"can't find '__main__' module in "
+                       f"{sys.path[0]!r}", "__main__") from exc
         raise
     finally:
         sys.modules["__main__"] = current
@@ -190,14 +199,15 @@ def _read_cached_code(stream):
     return marshal.load(stream)
 
 
-def _get_code_from_file(fname):
+def _get_code_from_file(fname, module=None):
     """Code object for a source or cached bytecode file."""
     path = os.path.abspath(fname)
     with io.open_code(path) as stream:
         code = _read_cached_code(stream)
     if code is None:
         with io.open_code(path) as stream:
-            code = compile(stream.read(), fname, 'exec')
+            # warnings raised while compiling are attributed to `module`
+            code = compile(stream.read(), fname, 'exec', module=module)
     return code
 
 
@@ -214,7 +224,7 @@ def run_path(path_name, init_globals=None, run_name=None):
     finder = get_importer(path_name)
     path_name = os.fsdecode(path_name)
     if finder is None:
-        code = _get_code_from_file(path_name)
+        code = _get_code_from_file(path_name, run_name)
         return _run_module_code(code, init_globals, run_name,
                                 pkg_name=package, script_name=path_name)
     sys.path.insert(0, path_name)
