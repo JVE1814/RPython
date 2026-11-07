@@ -152,3 +152,28 @@
   member data, printdir, testzip, comment, append mode, extractall) — identical; 300
   randomly corrupted archives read by both — identical results and exceptions.
 - Behaviour changes: none found.
+
+### asyncio/streams.py (rewritten)
+- Verdict: FlowControlMixin, StreamReaderProtocol and StreamWriter followed CPython's layout
+  (StreamReader's read methods were already restructured by an earlier agent).
+- Tests (before -> after): test_asyncio 2929 run / 2 failures -> same (the sslproto
+  no_cycles pair); test_streams, test_ssl, test_server, test_server_context,
+  test_subprocess, test_pep492 = (pass).  test_streams' occasional "env changed" (uncaught
+  ValueError "Invalid file descriptor: -1" in socketserver's serve_forever thread of
+  test_utils' HTTP helper) also happens with the old file (baseline run).
+- Kept because pinned: the public API, `_DEFAULT_LIMIT`, StreamReader's `_buffer`, `_waiter`,
+  `_transport`, `_loop`, `_limit`, `_eof`, `_exception`, `_paused`,
+  `_wait_for_data(func_name)`, `_maybe_resume_transport`, `_wakeup_waiter`; the protocol's
+  `_stream_reader` (weak) / `_stream_reader_wr`, `_over_ssl`, `_transport`,
+  `_client_connected_cb`, `_closed`, `_replace_transport`, `_get_close_waiter`,
+  `_drain_helper`, the local callback name `on_handler_done`; StreamWriter's `_transport`,
+  `_protocol`, `_reader`, `_complete_fut`; the hang1 `_buffered` hand-over in start_tls;
+  reprs and messages.
+- New structure: `_client_pair`/`_server_protocol_factory` shared by the four entry points;
+  `_release_drainers` for both drain wake-ups; `_note_transport`, `_start_client_handler`,
+  `_report_handler_failure` (sync and coroutine callbacks fail the same way); reader helpers
+  `_pop_waiter`, `_take`, `_separators`, `_earliest_match`, `_check_error`.
+- Speed: asyncio_tcp old/new interleaved in both orders: equal within noise (with the new
+  file run first: new 0.96/1.03/0.84/1.12 s vs old 1.01/1.01/1.14/0.96 s; the order bias of
+  this box is larger than any difference).
+- Behaviour changes: none intended.
