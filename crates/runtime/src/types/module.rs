@@ -20,6 +20,9 @@ pub struct PyModuleObject {
     pub md_token: *mut c_void,
     /// created by PyModule_FromSlotsAndSpec: md_def is a private synthesized def
     pub md_from_slots: bool,
+    /// (capi3) unused; the size of free-threaded CPython's module object, which
+    /// sys.getsizeof and `__basicsize__` report
+    _reserved: [usize; 4],
 }
 
 #[unsafe(no_mangle)]

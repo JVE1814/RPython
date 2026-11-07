@@ -40,6 +40,22 @@ pub unsafe fn reinit_header(op: *mut PyObject) {
     }
 }
 
+/// (capi3) The allocation/free fast paths are off: tracemalloc traces or a reference
+/// tracer (PyRefTracer_SetTracer) is installed. Recomputed by `refresh_slow_paths`.
+pub static SLOW_PATHS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn refresh_slow_paths() {
+    let on = crate::modules::_tracemalloc::TRACING.load(SeqCst)
+        || crate::capi::pystate::REF_TRACING.load(SeqCst)
+        || crate::capi::memdebug::INSTALLED.load(SeqCst);
+    SLOW_PATHS.store(on, SeqCst);
+}
+
+#[inline(always)]
+fn ref_tracing() -> bool {
+    crate::capi::pystate::REF_TRACING.load(Relaxed)
+}
+
 #[inline]
 pub fn type_is_gc(tp: *const PyTypeObject) -> bool {
     unsafe { (*tp).tp_flags & Py_TPFLAGS_HAVE_GC != 0 }
@@ -104,6 +120,9 @@ pub unsafe fn alloc_object_payload_uninit(tp: *mut PyTypeObject, size: usize) ->
         if crate::modules::_tracemalloc::TRACING.load(Relaxed) {
             crate::modules::_tracemalloc::track(op as *const u8, size);
         }
+        if ref_tracing() {
+            crate::capi::pystate::ref_trace(op, 0);
+        }
         op
     }
 }
@@ -161,7 +180,7 @@ pub fn for_each_large_gc(mut f: impl FnMut(*mut PyObject)) {
 pub unsafe fn alloc_object(tp: *mut PyTypeObject, size: usize) -> *mut PyObject {
     unsafe {
         let flags = (*tp).tp_flags;
-        if flags & Py_TPFLAGS_READY == 0 || size > 512 - MANAGED || crate::modules::_tracemalloc::TRACING.load(Relaxed) {
+        if flags & Py_TPFLAGS_READY == 0 || size > 512 - MANAGED || SLOW_PATHS.load(Relaxed) {
             return alloc_object_slow(tp, size);
         }
         let gc = ((flags >> 14) & 1) as usize; // Py_TPFLAGS_HAVE_GC
@@ -217,6 +236,9 @@ unsafe fn alloc_object_slow(tp: *mut PyTypeObject, size: usize) -> *mut PyObject
         if crate::modules::_tracemalloc::TRACING.load(Relaxed) {
             crate::modules::_tracemalloc::track(op as *const u8, size + pre);
         }
+        if ref_tracing() {
+            crate::capi::pystate::ref_trace(op, 0);
+        }
         op
     }
 }
@@ -268,7 +290,7 @@ pub unsafe fn free_object(op: *mut PyObject) {
     unsafe {
         let bits = (*op).ob_gc_bits.load(Relaxed);
         // (perf4) fast path: a tlab block, no tracemalloc
-        if bits & GC_BIT_LARGE == 0 && !crate::modules::_tracemalloc::TRACING.load(Relaxed) {
+        if bits & GC_BIT_LARGE == 0 && !SLOW_PATHS.load(Relaxed) {
             if bits & GC_BIT_TRACKED != 0 {
                 crate::gc::note_untracked();
             }
@@ -286,6 +308,15 @@ pub unsafe fn free_object(op: *mut PyObject) {
 #[inline(never)]
 unsafe fn free_object_slow(op: *mut PyObject) {
     unsafe {
+        if ref_tracing() {
+            crate::capi::pystate::ref_trace(op, 1);
+        }
+        // (capi3) an object an extension built in PyObject_Malloc memory (PyObject_Init)
+        // under the debug hooks goes back through the object domain
+        if crate::capi::memdebug::INSTALLED.load(Relaxed) && crate::capi::memdebug::is_debug_block(op as *const std::ffi::c_void) {
+            crate::capi::mem::PyObject_Free(op as *mut std::ffi::c_void);
+            return;
+        }
         let bits = (*op).ob_gc_bits.load(Relaxed);
         if bits & GC_BIT_TRACKED != 0 {
             crate::gc::untrack(op);

@@ -15,6 +15,8 @@ use std::collections::HashMap;
 pub struct EncodingMapObj {
     ob_base: PyObject,
     map: *mut HashMap<u32, u8>,
+    /// (capi3) unused; the size of CPython's encoding map object (sys.getsizeof)
+    _reserved: [usize; 5],
 }
 
 pub static mut ENCODING_MAP_TYPE: PyTypeObject = PyTypeObject::ZERO;

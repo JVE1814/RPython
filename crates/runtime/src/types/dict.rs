@@ -1498,6 +1498,17 @@ pub fn table_sizeof(d: &PyObject) -> usize {
 pub fn model_table_sizeof(d: &PyObject) -> usize {
     let _g = ob_lock(d);
     let t = table(d);
+    let entries = if t.nentries == 0 || t.entries_p.is_null() { &[][..] } else { unsafe { std::slice::from_raw_parts(t.entries_p, t.nentries) } };
+    if is_dict_exact(d)
+        && d.ob_flags.load(std::sync::atomic::Ordering::Relaxed) & OBF_FROM_INSTANCE != 0
+        && t.used <= crate::modules::testinternalcapi::INLINE_VALUES_MAX
+        && entries.iter().all(|e| e.key.is_null() || unsafe { crate::types::str::is_str_exact(&*e.key) })
+    {
+        // (capi3) an instance dict still in the class's attribute layout (CPython's split
+        // table): its keys belong to the class; the dict itself holds a values array
+        // (one header word plus one slot per value)
+        return 8 + 8 * t.used;
+    }
     if t.used == 0 && t.nentries == 0 {
         return 0;
     }
@@ -1512,7 +1523,6 @@ pub fn model_table_sizeof(d: &PyObject) -> usize {
     } else {
         8
     };
-    let entries = unsafe { std::slice::from_raw_parts(t.entries_p, t.nentries) };
     let unicode = entries.iter().all(|e| e.key.is_null() || unsafe { crate::types::str::is_str_exact(&*e.key) });
     32 + size * width + usable_for(size) * if unicode { 16 } else { 24 }
 }

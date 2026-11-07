@@ -478,7 +478,12 @@ fn pop_m(o: &PyObject, args: &[&PyObject]) -> PyResult {
 }
 fn popitem_m(o: &PyObject) -> PyResult {
     match dict::pop_last(o) {
-        Some((k, v)) => Ok(tuple::new_tuple(vec![k, v])),
+        Some((k, v)) => {
+            // (capi3) like CPython's split table, an instance dict leaves the class's
+            // attribute layout here (dict::model_table_sizeof, has_split_table)
+            o.ob_flags.fetch_and(!dict::OBF_FROM_INSTANCE, std::sync::atomic::Ordering::Relaxed);
+            Ok(tuple::new_tuple(vec![k, v]))
+        }
         None => raise!(KeyError, "popitem(): dictionary is empty"),
     }
 }
