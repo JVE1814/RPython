@@ -775,6 +775,11 @@ fn finish(gn: &mut GenObject) {
 
 /// Send for `Send` opcode / yield from: handles generators natively and other iterators.
 pub fn send_to(recv: &PyObject, v: &PyObject) -> PyResult<SendResult> {
+    // (jit6) `async for` / `await anext(..)`: the asend object's result comes back as
+    // a value, not as a StopIteration exception object
+    if recv.type_ptr() == (&raw mut crate::types::asyncgen::ASEND_TYPE) {
+        return crate::types::asyncgen::asend_send_result(recv, v);
+    }
     if is_generator_exact(recv) || is_coroutine_exact(recv) {
         return match gen_send_fast(recv, v.as_ptr()) {
             Ok(r) => Ok(r),

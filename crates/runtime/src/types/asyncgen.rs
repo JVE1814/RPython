@@ -282,6 +282,48 @@ fn asend_send(o: &PyObject, arg: Option<&PyObject>) -> PyResult {
     }
     r
 }
+/// (jit6, flagged: used by genobject::send_to for `await`/`async for` on an asend
+/// object) `asend_send` with the outcome as a SendResult: a value the async generator
+/// yielded is Return(value) instead of a StopIteration exception object (one fewer
+/// exception allocation per `async for` step per level).
+pub fn asend_send_result(o: &PyObject, arg: &PyObject) -> PyResult<SendResult> {
+    let agen = agen_of(o);
+    let st = state(o);
+    if st == STATE_CLOSED {
+        raise!(RuntimeError, "cannot reuse already awaited __anext__()/asend()");
+    }
+    let mut arg = arg.to_ref();
+    if st == STATE_INIT {
+        if g(&agen).running_async {
+            set_state(o, STATE_CLOSED);
+            raise!(RuntimeError, "anext(): asynchronous generator is already running");
+        }
+        if arg.is(none::none()) {
+            if let Some(a) = field_ref(o, A_ARG) {
+                arg = a;
+            }
+        }
+        set_state(o, STATE_ITER);
+    }
+    g(&agen).running_async = true;
+    let r = gobj::gen_send_ex(&agen, Some(&arg), None, false);
+    if let Ok(SendResult::Yield(v)) = &r {
+        if is_wrapped(v) {
+            let inner = field_ref(v, 0).unwrap_or_else(none::none_ref);
+            g(&agen).running_async = false;
+            set_state(o, STATE_CLOSED);
+            return Ok(SendResult::Return(inner));
+        }
+    }
+    let r = unwrap_value(&agen, r);
+    match r {
+        Ok(v) => Ok(SendResult::Yield(v)),
+        Err(e) => {
+            set_state(o, STATE_CLOSED);
+            Err(e)
+        }
+    }
+}
 fn asend_send_m(o: &PyObject, v: &PyObject) -> PyResult {
     asend_send(o, Some(v))
 }
