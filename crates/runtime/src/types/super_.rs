@@ -21,11 +21,21 @@ pub fn super_type() -> *mut PyTypeObject {
     &raw mut PySuper_Type
 }
 
+/// Whether `b` is on `a`'s MRO. Unlike `is_subtype` there is no identity shortcut: a class whose
+/// custom mro() left it out of its own MRO is not a subclass of itself here.
+fn in_mro(a: *mut PyTypeObject, b: *mut PyTypeObject) -> bool {
+    let m = unsafe { (*a).tp_mro };
+    if m.is_null() {
+        return is_subtype(a, b);
+    }
+    tuple::tuple_items(unsafe { &*m }).iter().any(|x| x.as_ptr() == b as *mut PyObject)
+}
+
 fn supercheck(typ: *mut PyTypeObject, obj: &PyObject) -> PyResult<PyRef> {
-    if is_type(obj) && is_subtype(as_type(obj), typ) {
+    if is_type(obj) && in_mro(as_type(obj), typ) {
         return Ok(obj.to_ref());
     }
-    if is_subtype(obj.type_ptr(), typ) {
+    if in_mro(obj.type_ptr(), typ) {
         return Ok(type_ref(obj.type_ptr()));
     }
     if let Some(c) = ab::getattr_opt(obj, crate::name!("__class__"))? {

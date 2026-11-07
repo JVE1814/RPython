@@ -848,7 +848,9 @@ fn sm_set_annotations(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     match v {
         Some(v) => dict::set_item(&d, name!("__annotations__"), v),
         None => {
-            dict::del_item(&d, name!("__annotations__"))?;
+            if !dict::del_item(&d, name!("__annotations__"))? {
+                raise!(AttributeError, "__annotations__");
+            }
             Ok(())
         }
     }
@@ -859,7 +861,11 @@ fn sm_annotate(o: &PyObject) -> PyResult {
         return Ok(v);
     }
     match sm_callable(o) {
-        Some(c) => ab::getattr(c, name!("__annotate__")),
+        Some(c) => {
+            let v = ab::getattr(c, name!("__annotate__"))?;
+            dict::set_item(&d, name!("__annotate__"), &v)?;
+            Ok(v)
+        }
         None => Ok(none::none_ref()),
     }
 }
@@ -868,7 +874,9 @@ fn sm_set_annotate(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     match v {
         Some(v) => dict::set_item(&d, name!("__annotate__"), v),
         None => {
-            dict::del_item(&d, name!("__annotate__"))?;
+            if !dict::del_item(&d, name!("__annotate__"))? {
+                raise!(AttributeError, "__annotate__");
+            }
             Ok(())
         }
     }

@@ -728,7 +728,7 @@ pub fn init_types() -> PyResult<()> {
             ("__getstate__", NOARGS, fio_getstate),
         ];
         t.tp_getset = crate::getset_table![
-            ("closed", fio_get_closed),
+            ("closed", fio_get_closed; "True if the file is closed"),
             ("closefd", fio_get_closefd),
             ("mode", fio_get_mode),
             ("_blksize", fio_get_blksize),
