@@ -564,10 +564,53 @@ pub fn rich_compare_bool(a: &PyObject, b: &PyObject, op: c_int) -> PyResult<bool
     is_true(&r)
 }
 
+/// Equality of two objects when it can be decided without running Python code
+/// (perf3): identical objects, exact str/int/float pairs, and exact tuples of such
+/// (compared item by item, nested tuples to a bounded depth). None when the answer
+/// needs an `__eq__` call (or the nesting is deeper than the bound).
+pub fn plain_eq(a: &PyObject, b: &PyObject) -> Option<bool> {
+    plain_eq_depth(a, b, 0)
+}
+
+fn plain_eq_depth(a: &PyObject, b: &PyObject, depth: u32) -> Option<bool> {
+    if a.is(b) {
+        return Some(true);
+    }
+    let ta = a.type_ptr();
+    if ta != b.type_ptr() {
+        return None;
+    }
+    if ta == pystr::str_type() {
+        return Some(pystr::str_eq(a, b));
+    }
+    if ta == int::int_type() {
+        return Some(int::sign(a) == int::sign(b) && int::digits(a) == int::digits(b));
+    }
+    if ta == crate::types::float::float_type() {
+        return Some(crate::types::float::float_value(a) == crate::types::float::float_value(b));
+    }
+    if ta == tuple::tuple_type() && depth < 16 {
+        let (x, y) = (tuple::tuple_items(a), tuple::tuple_items(b));
+        if x.len() != y.len() {
+            return Some(false);
+        }
+        for (p, q) in x.iter().zip(y.iter()) {
+            if !plain_eq_depth(p, q, depth + 1)? {
+                return Some(false);
+            }
+        }
+        return Some(true);
+    }
+    None
+}
+
 #[inline]
 pub fn rich_eq(a: &PyObject, b: &PyObject) -> PyResult<bool> {
     if a.is(b) {
         return Ok(true);
+    }
+    if let Some(r) = plain_eq(a, b) {
+        return Ok(r);
     }
     if pystr::is_str_exact(a) && pystr::is_str_exact(b) {
         return Ok(pystr::str_eq(a, b));

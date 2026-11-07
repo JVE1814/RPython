@@ -215,16 +215,34 @@ pub fn tuple_hash(t: &PyObject) -> PyResult<isize> {
     }
     let items = tuple_items(t);
     let mut h = crate::hash::TupleHasher::new(items.len());
-    let ts = crate::threads::current();
-    crate::interp::enter_recursive_call(ts, " while hashing a tuple")?;
-    let r = (|| {
-        for it in items {
-            h.add(ab::hash(it)?);
-        }
-        Ok(())
-    })();
-    crate::interp::leave_recursive_call(ts);
-    r?;
+    // perf3: leading str/int items hash without the recursion guard (no Python code,
+    // no nesting); the guard covers the rest
+    let mut i = 0;
+    while i < items.len() {
+        let it = items[i];
+        let tp = it.type_ptr();
+        let v = if tp == crate::types::str::str_type() {
+            crate::types::str::str_hash(it)
+        } else if tp == crate::types::int::int_type() {
+            crate::types::int::int_hash(it)
+        } else {
+            break;
+        };
+        h.add(v);
+        i += 1;
+    }
+    if i < items.len() {
+        let ts = crate::threads::current();
+        crate::interp::enter_recursive_call(ts, " while hashing a tuple")?;
+        let r = (|| {
+            for it in &items[i..] {
+                h.add(ab::hash(it)?);
+            }
+            Ok(())
+        })();
+        crate::interp::leave_recursive_call(ts);
+        r?;
+    }
     let v = h.finish();
     if is_tuple_exact(t) {
         cached.store(v, std::sync::atomic::Ordering::Relaxed);
@@ -336,7 +354,11 @@ fn compare_items(x: &[&PyObject], y: &[&PyObject], op: c_int) -> PyResult<bool> 
         return Ok(op == Py_NE);
     }
     for (a, b) in x.iter().zip(y.iter()) {
-        if a.is(b) || ab::rich_compare_bool(a, b, Py_EQ)? {
+        let eq = match ab::plain_eq(a, b) {
+            Some(e) => e,
+            None => ab::rich_compare_bool(a, b, Py_EQ)?,
+        };
+        if eq {
             continue;
         }
         return match op {

@@ -359,16 +359,7 @@ fn can_borrow(o: &PyObject) -> bool {
 /// without calling Python code.
 #[inline]
 fn plain_eq(a: *mut PyObject, b: *mut PyObject) -> Option<bool> {
-    unsafe {
-        let (a, b) = (&*a, &*b);
-        if pystr::is_str_exact(a) {
-            return if pystr::is_str_exact(b) { Some(pystr::str_eq(a, b)) } else { None };
-        }
-        if int::is_int_exact(a) && int::is_int_exact(b) {
-            return Some(int::sign(a) == int::sign(b) && int::digits(a) == int::digits(b));
-        }
-        None
-    }
+    unsafe { ab::plain_eq(&*a, &*b) }
 }
 
 #[derive(Clone, Copy)]

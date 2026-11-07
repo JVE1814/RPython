@@ -561,6 +561,11 @@ pub fn find(d: &PyObject, key: &PyObject, hash: isize) -> PyResult<(ObGuard, Fou
                         if crate::types::str::str_eq(ek, key) {
                             return Ok((g, Found::At(ix as usize)));
                         }
+                    } else if let Some(eq) = crate::abstract_::plain_eq(ek, key) {
+                        // decided without Python code: the lock stays held (perf3)
+                        if eq {
+                            return Ok((g, Found::At(ix as usize)));
+                        }
                     } else {
                         let layout = t.layout;
                         let ek_owned = ek.to_ref();
