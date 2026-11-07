@@ -8,7 +8,6 @@
 #define WITH_DOC_STRINGS 1
 #define WITH_MIMALLOC 1
 #define WITH_THREAD 1
-#define PY_HAVE_THREAD_NATIVE_ID 1
 #define PY_SUPPORT_TIER 1
 
 #define SIZEOF_DOUBLE 8
@@ -29,8 +28,6 @@
 #define SIZEOF_VOID_P 8
 #define SIZEOF_WCHAR_T 4
 #define SIZEOF__BOOL 1
-#define SIZEOF_PY_HASH_T 8
-#define SIZEOF_PY_UHASH_T 8
 #define ALIGNOF_LONG 8
 #define ALIGNOF_SIZE_T 8
 #define ALIGNOF_MAX_ALIGN_T 16

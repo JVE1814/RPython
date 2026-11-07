@@ -1038,6 +1038,64 @@ pub fn value_at_if(d: &PyObject, keys_version: u64, ix: usize) -> Option<PyRef> 
     r
 }
 
+/// (wheels3) The value (borrowed) at entry `ix` of exact dict `d` if that entry holds
+/// the key object `kp`, read without the lock and validated by the sequence lock (see
+/// lookup_lockfree_raw). None: not there, or undecided (a writer was active). The value
+/// stays alive until this thread's next quiescent point (removed and replaced values are
+/// released through QSBR), so the caller takes its reference before that.
+pub fn value_at_if_key(d: &PyObject, ix: usize, kp: *mut PyObject) -> Option<*mut PyObject> {
+    unsafe {
+        use std::sync::atomic::AtomicPtr;
+        let tp = AtomicPtr::from_ptr(&raw mut (*(d.as_ptr() as *mut PyDictObject)).ma_keys).load(Acquire) as *mut DictTable;
+        if tp.is_null() {
+            return None;
+        }
+        mark_shared_read(d, tp);
+        let s1 = (*tp).wseq.load(Acquire);
+        if s1 & 1 != 0 {
+            return None;
+        }
+        let (_, ep, _, cap) = block_layout(tp)?;
+        if ix >= cap {
+            return None;
+        }
+        let e = ep.add(ix);
+        if AtomicPtr::from_ptr(&raw mut (*e).key).load(Relaxed) != kp {
+            return None;
+        }
+        let v = AtomicPtr::from_ptr(&raw mut (*e).value).load(Acquire);
+        std::sync::atomic::fence(Acquire);
+        if (*tp).wseq.load(Relaxed) != s1 || v.is_null() {
+            return None;
+        }
+        if AtomicPtr::from_ptr(&raw mut (*(d.as_ptr() as *mut PyDictObject)).ma_keys).load(Acquire) as *mut DictTable != tp {
+            return None;
+        }
+        Some(v)
+    }
+}
+
+/// (wheels3) Entry index and value (borrowed, alive until this thread's next quiescent
+/// point, as for `value_at_if_key`) of `key` in exact dict `d`: lock-free when that can
+/// be decided, else under the lock.
+pub fn lookup_index_value(d: &PyObject, key: &PyObject, hash: isize) -> PyResult<Option<(usize, *mut PyObject)>> {
+    match lookup_lockfree_raw(d, key, hash) {
+        LfRead::Hit(ix, v) => return Ok(Some((ix, v))),
+        LfRead::Miss => return Ok(None),
+        LfRead::Undecided => {}
+    }
+    let (g, f) = find(d, key, hash)?;
+    let r = match f {
+        Found::At(ix) => {
+            let v = table(d).entries()[ix].value;
+            if v.is_null() { None } else { Some((ix, v)) }
+        }
+        Found::Missing => None,
+    };
+    drop(g);
+    Ok(r)
+}
+
 /// Fast lookup by an exact str key; errors from Python `__eq__` are swallowed.
 pub fn get_item_str(d: &PyObject, key: &PyObject) -> Option<PyRef> {
     let h = crate::types::str::str_hash(key);

@@ -547,9 +547,31 @@ pub unsafe fn generic_free_and_type_decref(op: *mut PyObject, tp: *mut PyTypeObj
             Some(f) => f(op as *mut c_void),
             None => alloc::free_object(op),
         }
-        if is_heap_type(tp) {
+        if is_heap_type(tp) && !extension_drops_type_ref(tp) {
             crate::object::decref_type(tp);
         }
+    }
+}
+
+/// (wheels3) Does an extension's heap-type dealloc between `tp` and the builtin base
+/// run for this instance? Such a dealloc calls the builtin base's tp_dealloc directly
+/// and then drops the type reference itself (Py_DECREF(Py_TYPE(self)): the C-API
+/// contract for heap types, while the builtin deallocs know nothing of heap types),
+/// so ours must not drop it too (multidict's istr, a str subclass, lost one type
+/// reference per instance and the type was freed).
+#[inline]
+pub(crate) unsafe fn extension_drops_type_ref(tp: *mut PyTypeObject) -> bool {
+    unsafe {
+        let mut t = tp;
+        while !t.is_null() && is_heap_type(t) {
+            if let Some(f) = (*t).tp_dealloc {
+                if f as usize != subtype_dealloc as usize && !is_own_code(f as usize) {
+                    return true;
+                }
+            }
+            t = (*t).tp_base;
+        }
+        false
     }
 }
 
