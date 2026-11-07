@@ -597,11 +597,21 @@ pub fn import_module_level(nm: &PyObject, globals: Option<&PyObject>, fromlist: 
                 return Ok(m);
             }
         }
+        // otherwise let importlib's own __import__ search for it: its finders
+        // keep the name a str (file names with undecodable bytes map to
+        // surrogate escapes). -X importtime still shows the escaped name.
         let display = escaped_name(nm);
         let lossy = pystr::to_string_lossy(nm);
         return IT_DISPLAY.with(|d| {
             let old = d.replace(Some((lossy, display)));
-            let r = import_module_level_inner(nm, globals, fromlist, level);
+            let r = match bootstrap() {
+                Some(bs) if importlib_active() => (|| {
+                    let f = ab::getattr_str(&bs, "__import__")?;
+                    let g = globals.map(|g| g.to_ref()).unwrap_or_else(none::none_ref);
+                    ab::call(&f, &[nm, &g, none::none(), fromlist, &crate::types::int::new_int(0)])
+                })(),
+                _ => import_module_level_inner(nm, globals, fromlist, level),
+            };
             d.replace(old);
             r
         });

@@ -441,7 +441,20 @@ struct BytesIOBuffer {
 
 unsafe extern "C" fn buf_getbuffer(op: *mut PyObject, view: *mut Py_buffer, flags: c_int) -> c_int {
     unsafe {
-        let src = &*(*(op as *mut BytesIOBuffer)).source;
+        // a NULL view (the obsolete "lock only" request) and a holder created
+        // behind our back (tp_alloc, no BytesIO attached) are both refused
+        let srcp = (*(op as *mut BytesIOBuffer)).source;
+        if view.is_null() || srcp.is_null() {
+            let refuse = || -> PyResult<()> {
+                if view.is_null() {
+                    raise!(BufferError, "a NULL view is not supported");
+                }
+                raise!(BufferError, "buffer holder is not attached to a BytesIO");
+            };
+            let _ = refuse();
+            return -1;
+        }
+        let src = &*srcp;
         let s = match state(src) {
             Ok(s) => s,
             Err(_) => return -1,

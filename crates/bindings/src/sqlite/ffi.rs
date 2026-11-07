@@ -24,6 +24,8 @@ crate::dyn_lib!(LibSqlite, ["libsqlite3.so.0", "libsqlite3.so"], {
     fn sqlite3_libversion_number() -> c_int;
     fn sqlite3_threadsafe() -> c_int;
     fn sqlite3_complete(sql: *const c_char) -> c_int;
+    fn sqlite3_keyword_count() -> c_int;
+    fn sqlite3_keyword_name(i: c_int, name: *mut *const c_char, len: *mut c_int) -> c_int;
     fn sqlite3_open_v2(filename: *const c_char, db: *mut *mut Db, flags: c_int, vfs: *const c_char) -> c_int;
     fn sqlite3_close_v2(db: *mut Db) -> c_int;
     fn sqlite3_errmsg(db: *mut Db) -> *const c_char;

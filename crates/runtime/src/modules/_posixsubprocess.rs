@@ -352,7 +352,8 @@ fn f_fork_exec(_m: &PyObject, args: &[&PyObject]) -> PyResult {
 
     crate::modules::sys_full::audit(
         "_posixsubprocess.fork_exec",
-        &[args[0], args[1], args[4], args[5]],
+        // (executable_list, args, env)
+        &[args[1], args[0], args[5]],
     )?;
 
     let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };

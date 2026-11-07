@@ -466,8 +466,12 @@ unsafe extern "C" fn range_iter(o: *mut PyObject) -> *mut PyObject {
         }
         // the machine-int iterator only needs start, step and length to fit (the
         // stop of a pickled iterator's range can lie just outside)
+        // -- but every value it yields must fit as well
         if let (Some(s), Some(st), Some(l)) = (i64_of(obj(ro.start)), i64_of(obj(ro.step)), i64_of(obj(ro.length))) {
-            return new_fast_iter(s, st, l).into_raw();
+            let last = s as i128 + (l.max(1) as i128 - 1) * st as i128;
+            if last >= i64::MIN as i128 && last <= i64::MAX as i128 {
+                return new_fast_iter(s, st, l).into_raw();
+            }
         }
         into_c(new_long_iter(obj(ro.start).to_ref(), obj(ro.step).to_ref(), obj(ro.length).to_ref()))
     }

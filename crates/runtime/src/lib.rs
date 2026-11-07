@@ -42,6 +42,9 @@ pub struct Config {
     /// The exact bytes of `argv` (non-UTF-8 arguments); when non-empty, sys.argv is decoded
     /// from these with the filesystem encoding and surrogateescape.
     pub argv_bytes: Vec<Vec<u8>>,
+    /// Decode `argv_bytes` as ASCII + surrogateescape (UTF-8 mode off under a locale
+    /// whose codeset is ASCII, e.g. the C/POSIX locale) instead of UTF-8.
+    pub argv_ascii: bool,
     pub hash_seed: Option<u32>,
     pub optimize: i32,
     /// Full interpreter configuration (sys.flags, -X/-W options, ...).
@@ -69,7 +72,15 @@ pub fn initialize(cfg: &Config) -> PyResult<()> {
     let _b = builtins::init()?;
     let sys = modules::sys::create_sys_module(&cfg.argv)?;
     if !cfg.argv_bytes.is_empty() {
-        let items = cfg.argv_bytes.iter().map(|b| modules::posix::path::fs_decode(b)).collect::<PyResult<Vec<_>>>()?;
+        let items = if cfg.argv_ascii {
+            let ascii = |b: &[u8]| -> PyRef {
+                let cps: Vec<u32> = b.iter().map(|&c| if c < 0x80 { c as u32 } else { 0xDC00 + c as u32 }).collect();
+                types::str::from_codepoints(&cps)
+            };
+            cfg.argv_bytes.iter().map(|b| ascii(b)).collect()
+        } else {
+            cfg.argv_bytes.iter().map(|b| modules::posix::path::fs_decode(b)).collect::<PyResult<Vec<_>>>()?
+        };
         types::dict::set_item_str(&types::module::module_dict(&sys), "argv", &types::list::new_list(items))?;
     }
     let md = modules::sys::modules_dict();

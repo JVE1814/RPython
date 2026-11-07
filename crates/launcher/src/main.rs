@@ -213,6 +213,24 @@ fn underpth_paths() -> Option<(Vec<String>, bool)> {
     Some((paths, site))
 }
 
+/// Whether the character set of the user's LC_CTYPE locale is plain ASCII.
+fn locale_is_ascii() -> bool {
+    unsafe {
+        let prev = libc::setlocale(libc::LC_CTYPE, std::ptr::null());
+        let saved = if prev.is_null() { None } else { Some(std::ffi::CStr::from_ptr(prev).to_owned()) };
+        libc::setlocale(libc::LC_CTYPE, c"".as_ptr());
+        let cs = libc::nl_langinfo(libc::CODESET);
+        let ascii = !cs.is_null() && {
+            let s = std::ffi::CStr::from_ptr(cs).to_bytes();
+            s == b"ANSI_X3.4-1968" || s.eq_ignore_ascii_case(b"ascii") || s == b"US-ASCII"
+        };
+        if let Some(s) = saved {
+            libc::setlocale(libc::LC_CTYPE, s.as_ptr());
+        }
+        ascii
+    }
+}
+
 fn fatal(msg: &str) -> ! {
     eprintln!("Fatal Python error: {}", msg);
     std::process::exit(1);
@@ -500,7 +518,11 @@ fn real_main() -> i32 {
         };
     }
     if let Some(v) = env(&cfg, "PYTHONUTF8") {
-        cfg.utf8_mode = if v == "0" { 0 } else { 1 };
+        cfg.utf8_mode = match v.as_str() {
+            "1" => 1,
+            "0" => 0,
+            _ => fatal("invalid PYTHONUTF8 environment variable value"),
+        };
     }
     if let Some(v) = env(&cfg, "PYTHONPYCACHEPREFIX") {
         cfg.pycache_prefix = Some(v);
@@ -554,7 +576,13 @@ fn real_main() -> i32 {
         match k {
             "dev" => cfg.dev_mode = true,
             "faulthandler" => cfg.faulthandler = true,
-            "utf8" => cfg.utf8_mode = if v == Some("0") { 0 } else { 1 },
+            "utf8" => {
+                cfg.utf8_mode = match v {
+                    None | Some("1") => 1,
+                    Some("0") => 0,
+                    _ => fatal("invalid -X utf8 option value"),
+                }
+            }
             "warn_default_encoding" => cfg.warn_default_encoding = 1,
             // `-X pycache_prefix` or an empty value: no prefix, whatever the environment says
             "pycache_prefix" => cfg.pycache_prefix = v.filter(|s| !s.is_empty()).map(|s| s.to_string()),
@@ -702,10 +730,21 @@ fn real_main() -> i32 {
     let quiet = cfg.quiet != 0;
     let safe_path = cfg.safe_path;
     let opt = cfg.optimize;
-    if !any_undecodable {
+    // Without UTF-8 mode, arguments are decoded with the locale encoding; under an
+    // ASCII locale (C/POSIX) every non-ASCII byte becomes a surrogate escape.
+    let argv_ascii = cfg.utf8_mode == 0 && argv_bytes.iter().any(|b| !b.is_ascii()) && locale_is_ascii();
+    if !any_undecodable && !argv_ascii {
         argv_bytes.clear();
     }
-    let rcfg = rpy_runtime::Config { argv, argv_bytes, hash_seed: seed, optimize: opt, sys: cfg, pth_paths: pth_paths.map(|p| p.0) };
+    let rcfg = rpy_runtime::Config {
+        argv,
+        argv_bytes,
+        argv_ascii,
+        hash_seed: seed,
+        optimize: opt,
+        sys: cfg,
+        pth_paths: pth_paths.map(|p| p.0),
+    };
     rpy_bindings::register();
     if rpy_runtime::initialize(&rcfg).is_err() {
         eprintln!("Fatal Python error: initialization failed");

@@ -323,7 +323,7 @@ class ZipInfo:
         'compress_level', 'comment', 'extra', 'create_system',
         'create_version', 'extract_version', 'reserved', 'flag_bits',
         'volume', 'internal_attr', 'external_attr', 'header_offset', 'CRC',
-        'compress_size', 'file_size', '_raw_time', '_end_offset',
+        'compress_size', 'file_size', '_raw_time', '_end_offset', '_stored_name',
     )
 
     def __init__(self, filename="NoName", date_time=(1980, 1, 1, 0, 0, 0)):
@@ -348,6 +348,8 @@ class ZipInfo:
         self.compress_size = 0
         self.file_size = 0
         self._end_offset = None
+        # (encoded name, decoded name) as found in an archive being read
+        self._stored_name = None
         self.header_offset = 0
         self.CRC = 0
 
@@ -422,6 +424,12 @@ class ZipInfo:
         return header + filename + extra
 
     def _encodeFilenameFlags(self):
+        stored = self._stored_name
+        if (stored is not None and stored[1] == self.filename
+                and not self.flag_bits & _MASK_UTF_FILENAME):
+            # A legacy (non-UTF-8) name read from an archive is written back
+            # byte for byte, so that rewriting the directory keeps it intact.
+            return stored[0], self.flag_bits
         try:
             return self.filename.encode('ascii'), self.flag_bits
         except UnicodeEncodeError:
@@ -1268,11 +1276,14 @@ class ZipFile:
             filename = fp.read(centdir[_CD_FILENAME_LENGTH])
             orig_filename_crc = crc32(filename)
             flags = centdir[_CD_FLAG_BITS]
+            raw_name = filename
             if flags & _MASK_UTF_FILENAME:
                 filename = filename.decode('utf-8')
             else:
                 filename = filename.decode(self.metadata_encoding or 'cp437')
             x = ZipInfo(filename)
+            if not flags & _MASK_UTF_FILENAME:
+                x._stored_name = (raw_name, x.filename)
             x.extra = fp.read(centdir[_CD_EXTRA_FIELD_LENGTH])
             x.comment = fp.read(centdir[_CD_COMMENT_LENGTH])
             x.header_offset = centdir[_CD_LOCAL_HEADER_OFFSET]

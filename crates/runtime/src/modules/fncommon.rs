@@ -362,6 +362,9 @@ pub fn reuse_tuple(slot: &mut Option<PyRef>, items: Vec<PyRef>) -> PyRef {
         }
     }
     let t = tuple::new_tuple(items);
+    // the tuple is refilled in place later, so it must stay visible to the collector
+    // even if its first items are atomic
+    unsafe { crate::gc::track(t.as_ptr()) };
     *slot = Some(t.clone());
     t
 }

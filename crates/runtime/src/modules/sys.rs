@@ -160,6 +160,17 @@ fn create_stdio(fd: i32, write: bool, name: &str, errors: &str, unbuffered: bool
     }
     // PYTHONIOENCODING=encoding[:errors] (errors do not apply to stderr)
     let (enc, errs) = io_encoding();
+    // a chosen encoding is reported under its codec's canonical name
+    // (PYTHONIOENCODING=latin1 gives 'iso8859-1')
+    let enc = enc.map(|e| {
+        match crate::modules::_codecs::lookup(&e).and_then(|ci| crate::abstract_::getattr_str(&ci, "name")) {
+            Ok(n) if pystr::is_str(&n) => pystr::to_string_lossy(&n),
+            _ => {
+                clear_exc();
+                e
+            }
+        }
+    });
     // an explicitly chosen encoding without an error handler is strict
     let errors: &str = if fd != 2 {
         errs.as_deref().unwrap_or(if enc.is_some() { "strict" } else { errors })

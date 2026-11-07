@@ -38,7 +38,14 @@ __all__ = [
     "UNICODE", "NOFLAG", "RegexFlag", "PatternError"
 ]
 
-__version__ = "2.2.1"
+def __getattr__(name):
+    # the module version string survives only as a deprecated attribute
+    if name == "__version__":
+        import warnings
+        warnings.warn("'__version__' is deprecated and slated for removal "
+                      "in Python 3.20", DeprecationWarning, stacklevel=2)
+        return "2.2.1"
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 @enum.global_enum

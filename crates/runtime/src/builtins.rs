@@ -610,6 +610,8 @@ fn exec_or_eval(args: &[&PyObject], kw: Option<&PyObject>, is_eval: bool) -> PyR
             crate::compile::compile_bytes(&b, "<string>", mode, flags, -1)?.code
         }
     };
+    // auditing hooks see every code object exec()/eval() is about to run
+    crate::modules::sys_full::audit("exec", &[&code])?;
     let nfree = crate::types::code::code(&code).nfreevars();
     if !is_eval {
         match closure.filter(|c| !c.is(none::none())) {
