@@ -23,6 +23,9 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
 /// `_suggestions._generate_suggestions(candidates, name)`: closest candidate or None.
 fn generate_suggestions(_m: &crate::ffi::PyObject, args: &[&crate::ffi::PyObject]) -> crate::errors::PyResult {
     crate::args::check_pos("_generate_suggestions", args, 2, 2)?;
+    if !args[0].is_type(crate::types::list::list_type()) {
+        crate::raise!(TypeError, "_generate_suggestions() argument 1 must be list, not {}", crate::types::typeobject::tname(args[0]));
+    }
     let items = crate::abstract_::collect_iterable(args[0])?;
     if !crate::types::str::is_str(args[1]) {
         crate::raise!(TypeError, "_generate_suggestions() argument 2 must be str, not {}", crate::types::typeobject::tname(args[1]));
