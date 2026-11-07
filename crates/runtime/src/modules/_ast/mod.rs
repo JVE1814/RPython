@@ -183,7 +183,7 @@ fn node_dict(o: &PyObject) -> PyRef {
 // ast.AST type
 // ----------------------------------------------------------------------------------------
 
-unsafe extern "C" fn ast_new(tp: *mut PyTypeObject, _a: *mut PyObject, _k: *mut PyObject) -> *mut PyObject {
+pub(crate) unsafe extern "C" fn ast_new(tp: *mut PyTypeObject, _a: *mut PyObject, _k: *mut PyObject) -> *mut PyObject {
     into_c(new_node(tp))
 }
 
@@ -379,7 +379,7 @@ fn ast_init_impl(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyR
     Ok(())
 }
 
-unsafe extern "C" fn ast_init(o: *mut PyObject, args: *mut PyObject, kw: *mut PyObject) -> c_int {
+pub(crate) unsafe extern "C" fn ast_init(o: *mut PyObject, args: *mut PyObject, kw: *mut PyObject) -> c_int {
     unsafe {
         let a = fc::targs(args);
         int_into_c(ast_init_impl(&*o, a, fc::opt(kw)))
@@ -406,12 +406,27 @@ fn ast_reduce(o: &PyObject) -> PyResult {
     Ok(tuple::new_tuple(vec![tp, tuple::new_tuple(pos), d]))
 }
 
-fn ast_replace(o: &PyObject, args: &[&PyObject], kwnames: Option<&PyObject>) -> PyResult {
-    let nkw = kwnames.map_or(0, tuple::tuple_len);
-    if args.len() > nkw {
+/// `node.__replace__(**changes)`: a new node of the same type with the current field
+/// and attribute values, updated by `changes`.  (tail3) Uses the tuple-and-dict calling
+/// convention, so a `**mapping` with non-str keys arrives here and is reported.
+unsafe extern "C" fn ast_replace(o: *mut PyObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        let kw = if kw.is_null() { None } else { Some(&*kw) };
+        into_c(replace_node(&*o, &*args, kw))
+    }
+}
+
+fn replace_node(o: &PyObject, args: &PyObject, kw: Option<&PyObject>) -> PyResult {
+    if tuple::tuple_len(args) > 0 {
         raise!(TypeError, "__replace__() takes no positional arguments");
     }
     let tp = type_ref(o.type_ptr());
+    let changes = kw.map(dict::items_vec).unwrap_or_default();
+    for (key, _) in &changes {
+        if !pystr::is_str(key) {
+            raise!(TypeError, "{}.__replace__ got an unexpected keyword argument {}", tobj::type_name(o.ty()), ab::repr_string(key)?);
+        }
+    }
     let payload = dict::new_dict();
     for which in [name!("_fields"), name!("_attributes")] {
         if let Some(names) = ab::getattr_opt(&tp, which)? {
@@ -422,10 +437,8 @@ fn ast_replace(o: &PyObject, args: &[&PyObject], kwnames: Option<&PyObject>) -> 
             }
         }
     }
-    if let Some(k) = kwnames {
-        for (i, nm) in tuple::tuple_items(k).iter().enumerate() {
-            dict::set_item(&payload, nm, args[args.len() - nkw + i])?;
-        }
+    for (key, value) in &changes {
+        dict::set_item(&payload, key, value)?;
     }
     ab::call_with_kwargs_dict(&tp, &[], Some(&payload))
 }
@@ -508,8 +521,22 @@ fn init_ast_type() -> PyResult<()> {
         t.tp_dictoffset = std::mem::offset_of!(AstObject, dict) as isize;
         t.tp_methods = mdefs![
             ("__reduce__", NOARGS, ast_reduce, "Helper for pickle."),
-            ("__replace__", FASTKW, ast_replace, "__replace__($self, /, **fields)\n--\n\nReturn a copy of the AST node with new values for the specified fields."),
         ];
+        // (tail3) __replace__ takes (args, kwargs) like its C counterpart: appended by hand
+        // since the method-table macro has no tuple-and-dict kind
+        let mut defs: Vec<PyMethodDef> = Vec::new();
+        let mut p = t.tp_methods;
+        while !(*p).ml_name.is_null() {
+            defs.push(std::ptr::read(p));
+            p = p.add(1);
+        }
+        defs.push(crate::methods::def_static(
+            "__replace__\0",
+            ast_replace as *const std::ffi::c_void,
+            METH_VARARGS | METH_KEYWORDS,
+            "__replace__($self, /, **fields)\n--\n\nReturn a copy of the AST node with new values for the specified fields.\0",
+        ));
+        t.tp_methods = crate::methods::table(defs);
         t.tp_getset = crate::getset_table![("__dict__", fc::get_dict_attr, fc::set_dict_attr)];
         tobj::type_ready(ast_type())?;
         // (core6) a heap type in CPython: its attributes (e.g. _fields) can be replaced

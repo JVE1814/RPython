@@ -1163,9 +1163,9 @@ pub unsafe extern "C" fn h_call_ex(sp: *mut *mut PyObject) -> u64 {
             };
             // core6: like the interpreter, a callable without vectorcall gets the tuple and the
             // keyword dict as they are
-            let direct = self_or_null.is_none() && callable.ty().tp_call.is_some() && ab::vectorcall_func(&callable).is_none();
+            // (tail3) which callees get the dict: ab::passes_kwargs_dict
             if let Some(d) = &kwd {
-                if !direct || crate::types::typeobject::is_type(&callable) {
+                if self_or_null.is_some() || !ab::passes_kwargs_dict(&callable) {
                     st(eval::check_kwargs_keys(d))?;
                 }
             }

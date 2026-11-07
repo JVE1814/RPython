@@ -364,15 +364,20 @@ fn pickle_loads(data: &[u8]) -> PyResult {
 fn main_script_file() -> Option<String> {
     let m = crate::import::get_loaded_module("__main__")?;
     let d = pymodule::module_dict(&m);
-    // a module run with -m is found by its real name
-    if dict::get_item_rs(&d, "__spec__").is_some_and(|s| !s.is(none::none())) {
-        return None;
-    }
     let f = dict::get_item_rs(&d, "__file__")?;
     if !pystr::is_str(&f) {
         return None;
     }
     let s = pystr::to_string_lossy(&f);
+    // a module run with -m is never re-run as a script (its file is its spec's
+    // origin); a `__main__` whose `__file__` was pointed elsewhere is (tail3)
+    if let Some(spec) = dict::get_item_rs(&d, "__spec__").filter(|s| !s.is(none::none())) {
+        let origin = ab::getattr_str(&spec, "origin").ok().filter(|o| pystr::is_str(o)).map(|o| pystr::to_string_lossy(&o));
+        clear_exc();
+        if origin.as_deref() == Some(s.as_str()) {
+            return None;
+        }
+    }
     if std::path::Path::new(&s).is_file() { Some(s) } else { None }
 }
 
@@ -417,6 +422,11 @@ impl Xi {
 /// interpreter's main script, loaded (once per interpreter) as `<fake __main__>`.
 fn unpickle(data: &[u8], main_file: Option<&str>) -> PyResult {
     let Some(file) = main_file else { return pickle_loads(data) };
+    // (tail3) the target's own `__main__` first; the script only when that fails
+    if let Ok(o) = pickle_loads(data) {
+        return Ok(o);
+    }
+    clear_exc();
     let fake = fake_main(file)?;
     let md = crate::modules::sys::modules_dict();
     let real = dict::get_item_rs(&md, "__main__");

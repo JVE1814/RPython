@@ -95,6 +95,13 @@ fn get_tlbc_id(_m: &PyObject, f: &PyObject) -> PyResult {
     Ok(int::new_int(crate::interp::adaptive::view_id(cd) as i64))
 }
 
+/// (tail3) The path-calculation program (modules/getpath.py), compiled: test_getpath
+/// executes it against a mocked namespace when no source checkout is around.
+fn get_getpath_codeobject(_m: &PyObject) -> PyResult {
+    let src = include_str!("getpath.py");
+    Ok(crate::compile::compile_str(src, "getpath.py", crate::compile::Mode::Exec, 0, -1)?.code)
+}
+
 fn compiler_cleandoc(_m: &PyObject, s: &PyObject) -> PyResult {
     if !pystr::is_str(s) {
         raise!(TypeError, "compiler_cleandoc() argument must be str, not {}", crate::types::typeobject::tname(s));
@@ -738,6 +745,7 @@ pub fn init() -> PyResult {
             ("has_split_table", O, has_split_table),
             ("get_object_dict_values", O, get_object_dict_values),
             ("compiler_cleandoc", O, compiler_cleandoc),
+            ("get_getpath_codeobject", NOARGS, get_getpath_codeobject),
             ("get_tlbc", O, get_tlbc),
             ("get_tlbc_id", O, get_tlbc_id),
             ("dict_getitem_knownhash", FAST, dict_getitem_knownhash),

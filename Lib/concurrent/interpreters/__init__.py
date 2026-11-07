@@ -159,13 +159,16 @@ class Interpreter:
     def __del__(self):
         self._decref()
 
-    def _decref(self):
-        if not getattr(self, '_ownsref', False):
+    # bound at class creation: may run during an interpreter's teardown, after
+    # this module's globals were cleared (see _queues.Queue.__del__)
+    def _decref(self, _getattr=getattr, _decref=_interpreters.decref,
+                _notfound=InterpreterNotFoundError):
+        if not _getattr(self, '_ownsref', False):
             return
         self._ownsref = False
         try:
-            _interpreters.decref(self._id)
-        except InterpreterNotFoundError:
+            _decref(self._id)
+        except _notfound:
             pass
 
     @property

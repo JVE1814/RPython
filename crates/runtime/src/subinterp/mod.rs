@@ -658,11 +658,24 @@ pub fn finalize_current() {
             unsafe { xdecref(p as *mut PyObject) };
         }
         // the namespaces of sys and builtins hold the rest of the object graph
-        for root in [&i.sys, &i.builtins] {
-            let p = root.load(Acquire);
-            if !p.is_null() {
-                let d = pymodule::module_dict(unsafe { &*p });
-                dict::clear(&d);
+        let p = i.sys.load(Acquire);
+        if !p.is_null() {
+            dict::clear(&pymodule::module_dict(unsafe { &*p }));
+        }
+        // (tail3) builtins keeps its builtin functions, types and constants: functions
+        // of this interpreter that are finalized later (an object whose last reference
+        // goes after this point) still find getattr & co. through their __builtins__.
+        // Everything else (modules, site's helpers, `_`) is dropped as before.
+        let p = i.builtins.load(Acquire);
+        if !p.is_null() {
+            let d = pymodule::module_dict(unsafe { &*p });
+            for (k, v) in dict::items_vec(&d) {
+                let keep = crate::types::typeobject::is_type(&v)
+                    || crate::types::cfunction::is_cfunction(&v)
+                    || v.is_immortal();
+                if !keep {
+                    let _ = dict::del_item(&d, &k);
+                }
             }
         }
         let md = i.modules.load(Acquire);

@@ -22,6 +22,28 @@ pub fn is_cfunction(o: &PyObject) -> bool {
     o.is_type(cfunction_type()) || o.is_type(cmethod_type()) || is_subtype(o.type_ptr(), cfunction_type())
 }
 
+/// (tail3) Is this a builtin function/method using the tuple-and-dict convention
+/// (METH_VARARGS|METH_KEYWORDS)?  CPython calls those through tp_call, so a
+/// `**kwargs` dict reaches the C function unchanged (non-str keys included).
+pub fn takes_args_and_dict(o: &PyObject) -> bool {
+    is_cfunction(o) && unsafe { (*(*fptr(o)).m_ml).ml_flags & !METH_COEXIST == METH_VARARGS | METH_KEYWORDS }
+}
+
+/// Call a [`takes_args_and_dict`] builtin with the argument tuple and keyword dict as is.
+pub fn call_args_and_dict(o: &PyObject, args: &PyObject, kw: Option<&PyObject>) -> PyResult {
+    unsafe {
+        let ff = fptr(o);
+        let f: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> *mut PyObject =
+            std::mem::transmute((*(*ff).m_ml).ml_meth);
+        let slf = if (*(*ff).m_ml).ml_flags & METH_STATIC != 0 && !(*ff).m_self.is_null() && is_type(&*(*ff).m_self) {
+            std::ptr::null_mut()
+        } else {
+            (*ff).m_self
+        };
+        from_c(f(slf, args.as_ptr(), kw.map_or(std::ptr::null_mut(), |d| d.as_ptr())))
+    }
+}
+
 /// Create a builtin function/method object. `slf` is the bound object (or module).
 pub fn new_cfunction(ml: *mut PyMethodDef, slf: Option<PyRef>, module: Option<PyRef>) -> PyRef {
     unsafe {
