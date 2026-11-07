@@ -329,6 +329,7 @@ struct UnwinderState {
     opcodes: bool,
     stats_on: bool,
     stats: RefCell<Stats>,
+    paused: std::cell::Cell<bool>,
     /// cached FrameInfo per (thread native id, frame address)
     frame_cache: RefCell<HashMap<(u64, u64), (u64, u32, PyRef)>>,
     /// cached (filename, qualname, linetable bytes, firstlineno, pub_of_internal) per code addr
@@ -368,6 +369,9 @@ unsafe extern "C" fn unwinder_dealloc(op: *mut PyObject) {
         crate::gc::untrack(op);
         let u = op as *mut Unwinder;
         if !(*u).inner.is_null() {
+            if (*(*u).inner).paused.get() {
+                libc::kill((*(*u).inner).proc.pid, libc::SIGCONT);
+            }
             drop(Box::from_raw((*u).inner));
         }
         crate::types::typeobject::generic_free_and_type_decref(op, (*op).type_ptr());
@@ -403,6 +407,7 @@ unsafe extern "C" fn unwinder_new(tp: *mut PyTypeObject, args: *mut PyObject, kw
                 opcodes: getb(8, false),
                 stats_on: getb(9, false),
                 stats: RefCell::new(Stats::default()),
+                paused: std::cell::Cell::new(false),
                 frame_cache: RefCell::new(HashMap::new()),
                 code_cache: RefCell::new(HashMap::new()),
             };
@@ -778,6 +783,49 @@ fn get_stats(o: &PyObject) -> PyResult {
     Ok(d)
 }
 
+// --- stopping the target (tail4): job-control stop of the whole process, then wait
+// until every thread reports the stopped state so no memory changes while it is read.
+
+fn all_threads_stopped(pid: i32) -> bool {
+    let Ok(rd) = std::fs::read_dir(format!("/proc/{}/task", pid)) else { return true };
+    for e in rd.flatten() {
+        let Ok(tid) = e.file_name().to_string_lossy().parse::<u64>() else { continue };
+        match thread_state(pid, tid) {
+            Some('T') | Some('t') | Some('Z') | Some('X') | None => {}
+            Some(_) => return false,
+        }
+    }
+    true
+}
+
+fn pause_threads(o: &PyObject) -> PyResult {
+    let st = us(o);
+    if st.paused.get() {
+        return Ok(bool_::new_bool(false));
+    }
+    let pid = st.proc.pid;
+    if unsafe { libc::kill(pid, libc::SIGSTOP) } != 0 {
+        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        return Err(crate::types::exceptions::os_error_from_errno(e, None, None));
+    }
+    st.paused.set(true);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !all_threads_stopped(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_micros(50));
+    }
+    Ok(bool_::new_bool(true))
+}
+
+fn resume_threads(o: &PyObject) -> PyResult {
+    let st = us(o);
+    if !st.paused.get() {
+        return Ok(bool_::new_bool(false));
+    }
+    st.paused.set(false);
+    unsafe { libc::kill(st.proc.pid, libc::SIGCONT) };
+    Ok(bool_::new_bool(true))
+}
+
 // --- async (best effort)
 
 mod asyncwalk;
@@ -847,6 +895,8 @@ pub fn init_module() -> PyResult {
             ("get_all_awaited_by", NOARGS, asyncwalk::get_all_awaited_by, "get_all_awaited_by($self, /)\n--\n\nAll asyncio tasks and what awaits them."),
             ("get_async_stack_trace", NOARGS, asyncwalk::get_async_stack_trace, "get_async_stack_trace($self, /)\n--\n\nThe async stack trace of the running tasks."),
             ("get_stats", NOARGS, get_stats, "get_stats($self, /)\n--\n\nSampling statistics (stats=True only)."),
+            ("pause_threads", NOARGS, pause_threads, "pause_threads($self, /)\n--\n\nStop every thread of the target; False if already paused."),
+            ("resume_threads", NOARGS, resume_threads, "resume_threads($self, /)\n--\n\nLet the target's threads run again; False if not paused."),
         ];
         crate::types::typeobject::type_ready(unwinder_type())?;
     }
