@@ -81,6 +81,38 @@
   cached get_opcodes() list (it works on a copy).  Timing ~equal (opcodes/ndiff/unified on a
   1000-line file, char ratio, HtmlDiff).
 
+### posixpath.py, genericpath.py (rewritten); ntpath.py (reviewed, references updated)
+- test_posixpath, test_genericpath, test_ntpath 232 run / 31 skipped = (all pass);
+  test_pathlib, test_shutil, test_tempfile, test_glob, test_import, test_site,
+  test_zipimport, test_inspect, test_pydoc, test___all__, test_unittest =; test_importlib
+  (6 errors) and test_os (urandom EMFILE check) fail the same with the old files.
+- realpath: own design — a work stack of components; a symlink pushes its target's
+  components plus a `_Finished` marker that records the link's resolution in `seen` (None
+  while in progress = loop); the kind of the resolved prefix ('dir'/'other'/unknown) gives
+  NotADirectoryError for "file/", "file/." and "file/.." in the strict modes; ALL_BUT_LAST
+  tolerates a missing component only when nothing but ''/'.' follows.  Loops: ELOOP OSError
+  in strict modes, the link kept literally (rest still processed) in lenient mode.
+- ismount: lstat of path/.. first, realpath(path/..) only when that fails.
+- genericpath: helpers renamed `_splitext` -> `_split_extension`, `_check_arg_types` ->
+  `_reject_mixed_types` (ntpath updated), `_commonprefix` -> `_common_start` (zip-based
+  instead of the min/max trick), `_RealpathMode` -> `_StrictMode` (repr/pickle/copy as the
+  tests require).  Nothing in Lib/crates/spec used the old private names.
+- Pinned and kept: `posix._path_splitroot_ex`/`_path_normpath` are used as splitroot/normpath
+  when present (test_fast_paths_in_use); Python fallbacks `_splitroot`/`_normpath` are own.
+  All messages tests assert ("Can't mix strings and bytes in path components", "no path
+  specified", "Can't mix absolute and relative paths", the commonprefix deprecation must
+  mention "commonpath()").
+- Differential fuzzing against the old files: 13,500 random str/bytes paths through
+  split/splitext/basename/dirname/isabs/splitdrive/normcase/abspath/normpath/splitroot/
+  join/relpath/commonpath/expandvars/expanduser, and 600 random symlink trees x 20 paths x
+  4 strict modes x str/bytes through realpath (+ ismount/islink/exists/isdir/isfile/lexists):
+  0 differences (after fixing join's check order: `part.startswith(sep)` must run before
+  `not path` so join('', b'x') still raises TypeError).
+- Timing (ns/call, same process, interleaved): join 500 = 500, split 430 -> 420, dirname
+  360 -> 350, splitext ~430 =, abspath ~385 =.
+- ntpath.py verdict: own structure already (`_Vocab`, own splitroot/join/expandvars scanner,
+  `_emulated_abspath`, own isreserved tables); only the genericpath helper names changed.
+
 ## Reviewed: own text and structure, no action needed
 (none yet)
 

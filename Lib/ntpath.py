@@ -141,7 +141,7 @@ def join(path, /, *paths):
             return drive + v.sep + tail
         return drive + root + tail
     except (TypeError, AttributeError, BytesWarning):
-        genericpath._check_arg_types('join', path, *paths)
+        genericpath._reject_mixed_types('join', path, *paths)
         raise
 
 
@@ -161,8 +161,8 @@ def splitext(p, /):
     """Split the extension from a pathname: (root, ext) with root + ext == p."""
     p = os.fspath(p)
     if isinstance(p, bytes):
-        return genericpath._splitext(p, b'\\', b'/', b'.')
-    return genericpath._splitext(p, '\\', '/', '.')
+        return genericpath._split_extension(p, b'\\', b'/', b'.')
+    return genericpath._split_extension(p, '\\', '/', '.')
 
 
 def basename(p, /):
@@ -381,7 +381,7 @@ def relpath(path, start=None):
         pieces = [v.dotdot] * (len(start_parts) - common) + path_parts[common:]
         return v.sep.join(pieces) if pieces else v.dot
     except (TypeError, ValueError, AttributeError, BytesWarning, DeprecationWarning):
-        genericpath._check_arg_types('relpath', path, start)
+        genericpath._reject_mixed_types('relpath', path, start)
         raise
 
 
@@ -413,7 +413,7 @@ def commonpath(paths):
             shared += 1
         return drive + root + v.sep.join(spelled[:shared])
     except (TypeError, AttributeError):
-        genericpath._check_arg_types('commonpath', *paths)
+        genericpath._reject_mixed_types('commonpath', *paths)
         raise
 
 
