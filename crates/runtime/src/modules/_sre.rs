@@ -440,6 +440,30 @@ fn raise_compile_error(e: rpy_sre::CompileError, pattern: &PyObject) -> PyErr {
     }
 }
 
+/// re.DEBUG (tail2): write the parse tree and code listing to sys.stdout.
+fn print_debug_dump(pattern: &PyObject, fl: u32) -> PyResult<()> {
+    use rpy_sre::PatternSource as PS;
+    let r = if pystr::is_str(pattern) {
+        match pystr::str_data(pattern) {
+            StrData::L1(s) => rpy_sre::debug_text(PS::Latin1(s), fl, &PROVIDER),
+            StrData::U2(s) => rpy_sre::debug_text(PS::Ucs2(s), fl, &PROVIDER),
+            StrData::U4(s) => rpy_sre::debug_text(PS::Ucs4(s), fl, &PROVIDER),
+        }
+    } else {
+        match tu::byte_data(pattern) {
+            Some(b) => rpy_sre::debug_text(PS::Bytes(b.as_slice()), fl, &PROVIDER),
+            None => return Ok(()),
+        }
+    };
+    let text = r.map_err(|e| raise_compile_error(e, pattern))?;
+    let out = match crate::modules::sys::get_sys_attr("stdout") {
+        Some(o) if !o.is(none::none()) => o,
+        _ => raise!(RuntimeError, "lost sys.stdout"),
+    };
+    ab::call_method_str(&out, "write", &[&pystr::new_str(&text)])?;
+    Ok(())
+}
+
 fn compile_pattern(pattern: &PyObject, flags: i64) -> PyResult {
     use rpy_sre::PatternSource as PS;
     let fl = (flags & 0xffff_ffff) as u32;
@@ -466,6 +490,9 @@ fn compile_pattern(pattern: &PyObject, flags: i64) -> PyResult {
         };
         // user -> re.compile -> re._compile -> re._compiler.compile -> _sre.compile
         tu::warn(cat, &w.message, 4)?;
+    }
+    if fl & rpy_sre::flags::DEBUG != 0 {
+        print_debug_dump(pattern, fl)?;
     }
     let groupindex = dict::new_dict();
     for (name, idx) in re.group_index() {
