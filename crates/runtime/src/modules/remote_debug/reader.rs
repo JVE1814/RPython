@@ -44,6 +44,9 @@ pub struct Table {
     pub thread_list_cap: u64,
     pub main_thread: u64,
     pub gc_collector: u64,
+    pub gc_stats: u64,
+    pub gc_stat_slots: u64,
+    pub gc_stat_words: u64,
     pub task_list_head: u64,
     pub set_dummy: u64,
     pub code_type: u64,
@@ -175,6 +178,9 @@ impl Table {
             thread_list_cap: u64at!(fo!(t.thread_list_cap)),
             main_thread: u64at!(fo!(t.main_thread)),
             gc_collector: u64at!(fo!(t.gc_collector)),
+            gc_stats: u64at!(fo!(t.gc_stats)),
+            gc_stat_slots: u64at!(fo!(t.gc_stat_slots)),
+            gc_stat_words: u64at!(fo!(t.gc_stat_words)),
             task_list_head: u64at!(fo!(t.task_list_head)),
             set_dummy: u64at!(fo!(t.set_dummy)),
             code_type: u64at!(fo!(t.code_type)),
@@ -884,6 +890,7 @@ fn resume_threads(o: &PyObject) -> PyResult {
 // --- async (best effort)
 
 mod asyncwalk;
+mod gcstats; // tail4
 
 // --- module-level functions
 
@@ -959,6 +966,7 @@ pub fn init_module() -> PyResult {
         ("is_python_process", O, is_python_process, "is_python_process($module, pid, /)\n--\n\nIs the process a compatible Python process?"),
         ("get_child_pids", O, get_child_pids, "get_child_pids($module, pid, /)\n--\n\nDescendant process ids of pid."),
         ("zstd_available", NOARGS, zstd_available, "zstd_available($module, /)\n--\n\nWhether zstd compression is available."),
+        ("get_gc_stats", FASTKW, gcstats::module_get_gc_stats, "get_gc_stats($module, /, pid, *, all_interpreters=False)\n--\n\nGarbage collection statistics of process pid."),
     ];
     let (m, d) = crate::modules::fncommon::new_module("_remote_debugging", methods, Some("Inspect another Python process's interpreter state."))?;
     dict::set_item_str(&d, "RemoteUnwinder", &crate::types::typeobject::type_ref(unwinder_type()))?;
@@ -970,6 +978,7 @@ pub fn init_module() -> PyResult {
     dict::set_item_str(&d, "TaskInfo", &crate::types::typeobject::type_ref(task_info_type()))?;
     dict::set_item_str(&d, "AwaitedInfo", &crate::types::typeobject::type_ref(awaited_info_type()))?;
     super::binfmt::init(&d)?; // tail4
+    gcstats::init(&d)?; // tail4
     dict::set_item_str(&d, "PROCESS_VM_READV_SUPPORTED", &bool_::new_bool(true))?;
     for (k, v) in [
         ("THREAD_STATUS_HAS_GIL", super::THREAD_STATUS_HAS_GIL),

@@ -196,6 +196,11 @@ pub struct DebugTable {
     pub main_thread: *const u8,
     /// (tail4) `AtomicUsize`: the thread state running a garbage collection, or 0.
     pub gc_collector: *const u8,
+    /// (tail4) collection statistics: `gc_stat_slots` records of `gc_stat_words` u64s
+    /// (layout in modules/gc_mod.rs).
+    pub gc_stats: *const u8,
+    pub gc_stat_slots: u64,
+    pub gc_stat_words: u64,
     /// Eval-breaker bit a debugger sets for `sys.remote_exec`; it lives alone in its
     /// byte (`remote_exec_byte` inside the word) so a one-byte write cannot clobber
     /// the bits the runtime updates atomically.
@@ -251,6 +256,9 @@ pub static RPY_DEBUG_TABLE: DebugTable = DebugTable {
     thread_list_cap: crate::qsbr::CAP as u64,
     main_thread: &crate::threads::MAIN_THREAD_STATE as *const _ as *const u8,
     gc_collector: &crate::gc::GC_COLLECTOR_TS as *const _ as *const u8,
+    gc_stats: &crate::modules::gc_mod::GC_STATS as *const _ as *const u8,
+    gc_stat_slots: crate::modules::gc_mod::GC_STAT_SLOTS as u64,
+    gc_stat_words: crate::modules::gc_mod::GC_STAT_WORDS as u64,
     eval_remote_exec_bit: EVAL_REMOTE_EXEC as u64,
     remote_exec_byte: off(offset_of!(ThreadState, c) + offset_of!(CThreadState, eval_breaker) + 7),
     remote_exec: &REMOTE_EXEC,
