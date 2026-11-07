@@ -326,8 +326,11 @@ pub fn set_lineno(f: &mut Frame, value: Option<&PyObject>) -> PyResult<()> {
             }
             continue;
         }
-        chosen = Some((t, ts));
-        break;
+        // among compatible targets prefer the deepest stack (fewest pops), e.g. the
+        // exceptional copy of a `finally` body when jumping inside it
+        if chosen.as_ref().is_none_or(|(_, best)| ts.len() > best.len()) {
+            chosen = Some((t, ts));
+        }
     }
     let Some((target, ts)) = chosen else {
         match err {
