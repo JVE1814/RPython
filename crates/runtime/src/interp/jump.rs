@@ -290,7 +290,12 @@ pub fn set_lineno(f: &mut Frame, value: Option<&PyObject>) -> PyResult<()> {
     let co = f.code().to_ref();
     let cd = code::code_data(&co);
     let first = crate::types::code::code(&co).obj.co_firstlineno as i64;
-    let lines: Vec<i64> = cd.locations.iter().map(|l| l.lineno as i64).collect();
+    // (perf4) public code keeps only `pub_lines` (-1 = no line)
+    let lines: Vec<i64> = if cd.locations.is_empty() && !cd.pub_lines.is_empty() {
+        cd.pub_lines.iter().map(|&l| l.max(0) as i64).collect()
+    } else {
+        cd.locations.iter().map(|l| l.lineno as i64).collect()
+    };
     let max_line = lines.iter().copied().max().unwrap_or(first);
     if new_line < first {
         raise!(ValueError, "line {} comes before the current code block", new_line);
