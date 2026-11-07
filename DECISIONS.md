@@ -330,3 +330,13 @@ calls and data loads between our crates into direct `call`/`lea`, about 3–4% o
 measurements). C extensions are unaffected: the exported C-API symbols keep their dynamic binding. Verified by perf5
 with test_ctypes, a test_capi subset, the spec's test extensions and the numpy cp315t wheel. Every agent rebuilds
 fully once after merging this.
+
+## D30 — Start-up image (CDS-style) and frozen modules by default (2026-11-07)
+Modelled on HotSpot's class-data sharing archive. A build script in the runtime crate compiles every frozen module
+(src/frozen.rs) with our own Rust compiler and translates each code object to the interpreter's internal form, writing
+OUT_DIR/startup_image.bin, which is embedded in the executable (format: src/startup_image/fmt.rs). At start-up code
+objects are built straight from the image and a translation is decoded only when that code first runs. No Python
+runs at build time. Frozen modules are used by default, as in CPython, except when the stdlib is a source tree's Lib/
+(running target/release/python3 from a checkout keeps using the files on disk). Consequence: after editing a frozen
+module's source, rebuild before snapshotting. Result (perf6): `-c pass` 64.8M → 39.2M instructions (CPython 40.5M),
+python_startup 0.88x the best CPython build.
