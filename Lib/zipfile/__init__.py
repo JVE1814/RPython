@@ -774,10 +774,19 @@ class _CountingWriter:
 
 
 class ZipExtFile(io.BufferedIOBase):
-    """Readable file object for one archive member."""
+    """Readable file object for one archive member.
 
+    Data is decrypted and decompressed on demand and the CRC-32 is checked
+    when the end of the member is reached.  Seeking is supported when the
+    archive file is seekable (backwards by starting over).
+    """
+
+    # largest request passed to one decompression step by read(-1)
     MAX_N = 1 << 31 - 1
+    # compressed bytes fetched per step; also the smallest output limit
+    # given to the decompressor in one step
     MIN_READ_SIZE = 4096
+    # a forward seek decompresses in pieces of at most this size
     MAX_SEEK_READ = 1 << 24
 
     def __init__(self, fileobj, mode, zipinfo, pwd=None, close_fileobj=False):
@@ -785,82 +794,82 @@ class ZipExtFile(io.BufferedIOBase):
         self._pwd = pwd
         self._close_fileobj = close_fileobj
         self._compress_type = zipinfo.compress_type
-        self._compress_left = zipinfo.compress_size
-        self._left = zipinfo.file_size
-        self._decompressor = _get_decompressor(self._compress_type)
-        self._eof = False
-        self._readbuffer = b''
-        self._offset = 0
+        self._sizes = (zipinfo.compress_size, zipinfo.file_size)
         self.newlines = None
         self.mode = mode
         self.name = zipinfo.filename
-
-        if hasattr(zipinfo, 'CRC') and not zipinfo.is_dir():
-            self._expected_crc = zipinfo.CRC
-        else:
-            self._expected_crc = None
-        self._running_crc = crc32(b'')
-
+        # directories have no meaningful CRC
+        self._crc_original = (zipinfo.CRC if hasattr(zipinfo, 'CRC')
+                              and not zipinfo.is_dir() else None)
         self._seekable = False
+        self._data_start = None
         try:
             if fileobj.seekable():
-                self._orig_compress_start = fileobj.tell()
-                self._orig_compress_size = zipinfo.compress_size
-                self._orig_file_size = zipinfo.file_size
-                self._orig_start_crc = self._running_crc
-                self._orig_crc = self._expected_crc
+                self._data_start = fileobj.tell()
                 self._seekable = True
         except AttributeError:
             pass
-
         self._decrypter = None
+        self._restart()
         if pwd:
+            # the last byte of the encryption header must match the CRC (or
+            # the DOS time when sizes and CRC follow the data)
             if zipinfo.flag_bits & _MASK_USE_DATA_DESCRIPTOR:
-                check_byte = (zipinfo._raw_time >> 8) & 0xff
+                expected = (zipinfo._raw_time >> 8) & 0xff
             else:
-                check_byte = (zipinfo.CRC >> 24) & 0xff
-            h = self._init_decrypter()
-            if h != check_byte:
+                expected = (zipinfo.CRC >> 24) & 0xff
+            if self._start_decryption() != expected:
                 raise RuntimeError("Bad password for file %r" % zipinfo.orig_filename)
 
-    def _init_decrypter(self):
+    def _restart(self):
+        # reading state for the beginning of the member
+        self._compress_left, self._left = self._sizes
+        self._decompressor = _get_decompressor(self._compress_type)
+        self._eof = False
+        self._readbuffer = b''      # decompressed data not yet returned ...
+        self._offset = 0            # ... starting at this index
+        self._crc_seen = crc32(b'')
+        self._crc_wanted = self._crc_original
+
+    def _start_decryption(self):
+        """Set up ZipCrypto from the 12-byte header; return its last
+        decrypted byte."""
         self._decrypter = _ZipCryptoDecoder(self._pwd)
         header = self._fileobj.read(12)
         self._compress_left -= 12
         return self._decrypter(header)[11]
 
     def __repr__(self):
-        r = [f'<{self.__class__.__module__}.{self.__class__.__qualname__}']
-        if not self.closed:
-            r.append(f' name={self.name!r} mode={self.mode!r}')
-            if self._compress_type != ZIP_STORED:
-                r.append(' compress_type=%s' % compressor_names.get(
-                    self._compress_type, self._compress_type))
-        else:
-            r.append(' [closed]')
-        r.append('>')
-        return ''.join(r)
+        cls = type(self)
+        text = f'<{cls.__module__}.{cls.__qualname__}'
+        if self.closed:
+            return text + ' [closed]>'
+        text += f' name={self.name!r} mode={self.mode!r}'
+        if self._compress_type != ZIP_STORED:
+            text += ' compress_type=%s' % compressor_names.get(
+                self._compress_type, self._compress_type)
+        return text + '>'
 
     def readline(self, limit=-1):
         """Read one line (up to limit bytes) of the member."""
         if limit < 0:
-            i = self._readbuffer.find(b'\n', self._offset) + 1
-            if i > 0:
-                line = self._readbuffer[self._offset:i]
-                self._offset = i
-                return line
+            newline = self._readbuffer.find(b'\n', self._offset)
+            if newline >= 0:
+                start, self._offset = self._offset, newline + 1
+                return self._readbuffer[start:self._offset]
         return io.BufferedIOBase.readline(self, limit)
 
     def peek(self, n=1):
         """Return buffered bytes without advancing the position."""
-        if n > len(self._readbuffer) - self._offset:
-            chunk = self.read(n)
-            if len(chunk) > self._offset:
-                self._readbuffer = chunk + self._readbuffer[self._offset:]
-                self._offset = 0
+        if len(self._readbuffer) - self._offset < n:
+            got = self.read(n)
+            if len(got) <= self._offset:
+                # what was read is still in the buffer: step back over it
+                self._offset -= len(got)
             else:
-                self._offset -= len(chunk)
-        return self._readbuffer[self._offset: self._offset + 512]
+                self._readbuffer = got + self._readbuffer[self._offset:]
+                self._offset = 0
+        return self._readbuffer[self._offset:self._offset + 512]
 
     def readable(self):
         if self.closed:
@@ -883,7 +892,7 @@ class ZipExtFile(io.BufferedIOBase):
         while not self._eof and (need is None or need > 0):
             chunk = self._read1(self.MAX_N if need is None else need)
             if need is not None and len(chunk) > need:
-                # Keep the surplus for the next call.
+                # keep the surplus for the next call
                 self._readbuffer = chunk
                 self._offset = need
                 chunk = chunk[:need]
@@ -900,71 +909,65 @@ class ZipExtFile(io.BufferedIOBase):
             raise ValueError("read from closed file.")
         return self._take(n, single=False)
 
-    def _update_crc(self, newdata):
-        if self._expected_crc is None:
-            return
-        self._running_crc = crc32(newdata, self._running_crc)
-        if self._eof and self._running_crc != self._expected_crc:
-            raise BadZipFile("Bad CRC-32 for file %r" % self.name)
-
     def read1(self, n):
         """Read up to n bytes, decompressing at most one chunk."""
-        if n is not None and n >= 0 and len(self._readbuffer) - self._offset > 0:
-            return self._take(min(n, len(self._readbuffer) - self._offset), True)
+        avail = len(self._readbuffer) - self._offset
+        if n is not None and n >= 0 and avail:
+            return self._take(min(n, avail), True)
         return self._take(n, single=True)
 
+    def _check_crc(self, data):
+        if self._crc_wanted is None:
+            return
+        self._crc_seen = crc32(data, self._crc_seen)
+        if self._eof and self._crc_seen != self._crc_wanted:
+            raise BadZipFile("Bad CRC-32 for file %r" % self.name)
+
     def _read1(self, n):
-        # Fetch at most one chunk of compressed data and decompress it.
+        """Decompress at most one chunk of input and return the result,
+        which is bounded by max(n, MIN_READ_SIZE) bytes."""
         if self._eof or n <= 0:
             return b''
-        if self._compress_type == ZIP_DEFLATED:
-            data = self._decompressor.unconsumed_tail
-            if n > len(data):
-                data += self._read2(n - len(data))
-        elif self._compress_type == ZIP_STORED:
-            data = self._read2(n)
-        elif getattr(self._decompressor, 'needs_input', True):
-            data = self._read2(n)
-        else:
-            # The decompressor still holds input: drain it first.
-            data = b''
-
-        if self._compress_type == ZIP_STORED:
+        kind = self._compress_type
+        engine = self._decompressor
+        limit = max(n, self.MIN_READ_SIZE)
+        if kind == ZIP_STORED:
+            data = self._fetch(n)
             self._eof = self._compress_left <= 0
-        elif self._compress_type == ZIP_DEFLATED:
-            n = max(n, self.MIN_READ_SIZE)
-            data = self._decompressor.decompress(data, n)
-            self._eof = (self._decompressor.eof or
-                         self._compress_left <= 0 and
-                         not self._decompressor.unconsumed_tail)
+        elif kind == ZIP_DEFLATED:
+            pending = engine.unconsumed_tail
+            if n > len(pending):
+                pending += self._fetch(n - len(pending))
+            data = engine.decompress(pending, limit)
+            self._eof = engine.eof or (self._compress_left <= 0
+                                       and not engine.unconsumed_tail)
             if self._eof:
-                data += self._decompressor.flush()
-        elif hasattr(self._decompressor, 'needs_input'):
-            # Bound the output of one call (a small member may claim to
-            # expand to a huge size).
-            n = max(n, self.MIN_READ_SIZE)
-            data = self._decompressor.decompress(data, n)
-            self._eof = (self._decompressor.eof or
-                         (self._compress_left <= 0 and
-                          self._decompressor.needs_input))
+                data += engine.flush()
+        elif hasattr(engine, 'needs_input'):
+            # a decompressor still holding input is drained before more is
+            # fed; the output limit protects against huge expansion
+            pending = self._fetch(n) if engine.needs_input else b''
+            data = engine.decompress(pending, limit)
+            self._eof = engine.eof or (self._compress_left <= 0
+                                       and engine.needs_input)
         else:
-            # Third-party decompressors with only decompress(data).
-            data = self._decompressor.decompress(data)
-            self._eof = self._decompressor.eof or self._compress_left <= 0
-
+            # third-party decompressors offering only decompress(data)
+            data = engine.decompress(self._fetch(n))
+            self._eof = engine.eof or self._compress_left <= 0
         data = data[:self._left]
         self._left -= len(data)
         if self._left <= 0:
             self._eof = True
-        self._update_crc(data)
+        self._check_crc(data)
         return data
 
-    def _read2(self, n):
+    def _fetch(self, n):
+        # the next piece of (decrypted) compressed data, MIN_READ_SIZE bytes
+        # at least and never past the member's end
         if self._compress_left <= 0:
             return b''
-        n = max(n, self.MIN_READ_SIZE)
-        n = min(n, self._compress_left)
-        data = self._fileobj.read(n)
+        size = min(max(n, self.MIN_READ_SIZE), self._compress_left)
+        data = self._fileobj.read(size)
         self._compress_left -= len(data)
         if not data:
             raise EOFError
@@ -989,54 +992,45 @@ class ZipExtFile(io.BufferedIOBase):
             raise ValueError("seek on closed file.")
         if not self._seekable:
             raise io.UnsupportedOperation("underlying stream is not seekable")
-        curr_pos = self.tell()
+        here = self.tell()
+        size = self._sizes[1]
         if whence == os.SEEK_SET:
-            new_pos = offset
+            target = offset
         elif whence == os.SEEK_CUR:
-            new_pos = curr_pos + offset
+            target = here + offset
         elif whence == os.SEEK_END:
-            new_pos = self._orig_file_size + offset
+            target = size + offset
         else:
             raise ValueError("whence must be os.SEEK_SET (0), "
                              "os.SEEK_CUR (1), or os.SEEK_END (2)")
-        new_pos = min(max(new_pos, 0), self._orig_file_size)
-        read_offset = new_pos - curr_pos
-        buff_offset = read_offset + self._offset
-
-        if 0 <= buff_offset < len(self._readbuffer):
-            # The target is inside the buffer.
-            self._offset = buff_offset
-            read_offset = 0
-        elif self._compress_type == ZIP_STORED and self._decrypter is None:
-            # Stored data is positioned directly in the archive file (the
-            # CRC can no longer be verified).
-            self._expected_crc = None
-            self._fileobj.seek(self._orig_compress_start + new_pos)
-            self._left = self._orig_file_size - new_pos
-            self._compress_left = self._orig_compress_size - new_pos
+        target = min(max(target, 0), size)
+        distance = target - here
+        if 0 <= self._offset + distance < len(self._readbuffer):
+            # inside the look-ahead buffer
+            self._offset += distance
+            return self.tell()
+        if self._compress_type == ZIP_STORED and self._decrypter is None:
+            # unencrypted stored data maps directly onto the archive file
+            # (the CRC can then no longer be checked)
+            self._crc_wanted = None
+            self._fileobj.seek(self._data_start + target)
+            self._compress_left = self._sizes[0] - target
+            self._left = size - target
             self._eof = self._left <= 0
-            read_offset = 0
             self._readbuffer = b''
             self._offset = 0
-        elif read_offset < 0:
-            # Start over from the beginning of the member.
-            self._fileobj.seek(self._orig_compress_start)
-            self._running_crc = self._orig_start_crc
-            self._expected_crc = self._orig_crc
-            self._compress_left = self._orig_compress_size
-            self._left = self._orig_file_size
-            self._readbuffer = b''
-            self._offset = 0
-            self._decompressor = _get_decompressor(self._compress_type)
-            self._eof = False
-            read_offset = new_pos
+            return self.tell()
+        if distance < 0:
+            # backwards: decompress again from the start
+            self._fileobj.seek(self._data_start)
+            self._restart()
             if self._decrypter is not None:
-                self._init_decrypter()
-
-        while read_offset > 0:
-            n = min(self.MAX_SEEK_READ, read_offset)
-            self.read(n)
-            read_offset -= n
+                self._start_decryption()
+            distance = target
+        while distance > 0:
+            step = min(self.MAX_SEEK_READ, distance)
+            self.read(step)
+            distance -= step
         return self.tell()
 
     def tell(self):
@@ -1044,7 +1038,7 @@ class ZipExtFile(io.BufferedIOBase):
             raise ValueError("tell on closed file.")
         if not self._seekable:
             raise io.UnsupportedOperation("underlying stream is not seekable")
-        return (self._orig_file_size - self._left - len(self._readbuffer)
+        return (self._sizes[1] - self._left - len(self._readbuffer)
                 + self._offset)
 
 
