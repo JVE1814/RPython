@@ -460,6 +460,10 @@ fn warn_explicit_impl(
             raise!(TypeError, "'registry' must be a dict or None");
         }
     }
+    // the dotted names a file path stands for are only tried for a warning
+    // whose module is unknown (derived from its file name); a known module
+    // name (the caller's __name__, or one passed in) is matched as it is
+    let module_known = module.is_some_and(|m| !m.is(none::none()));
     let module: PyRef = match module {
         Some(m) if !m.is(none::none()) => m.to_ref(),
         _ => normalize_module(filename)?,
@@ -484,7 +488,12 @@ fn warn_explicit_impl(
         if already_warned(registry, &key, false)? {
             return Ok(());
         }
-        let (action, item) = get_filter(&category, &text, lineno, &module, filename)?;
+        let prev_exact = if module_known { Some(EXACT_MODULE.with(|c| c.replace(true))) } else { None };
+        let found = get_filter(&category, &text, lineno, &module, filename);
+        if let Some(p) = prev_exact {
+            EXACT_MODULE.with(|c| c.set(p));
+        }
+        let (action, item) = found?;
         let a = pystr::to_string_lossy(&action);
         match a.as_str() {
             "error" => {

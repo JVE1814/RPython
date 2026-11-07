@@ -37,6 +37,7 @@ import io
 import pprint
 import sys
 import threading
+import types as _types_module
 from dataclasses import fields as _dc_fields, is_dataclass as _is_dataclass
 from functools import partial as _partial, wraps as _wraps
 from types import (BuiltinFunctionType, CodeType, FunctionType,
@@ -2031,19 +2032,11 @@ def create_autospec(spec, spec_set=False, instance=False, _parent=None,
 # ---------------------------------------------------------------------------
 
 def _resolve_dotted(path):
-    """Import/look up a dotted name like ``package.module.Class.attr``."""
-    parts = path.split('.')
-    import importlib
-    obj = importlib.import_module(parts[0])
-    prefix = parts[0]
-    for part in parts[1:]:
-        prefix = prefix + '.' + part
-        try:
-            obj = getattr(obj, part)
-        except AttributeError:
-            importlib.import_module(prefix)
-            obj = getattr(obj, part)
-    return obj
+    """Import/look up a name like ``package.module.Class.attr`` (or
+    ``package.module:Class.attr``).  The longest importable module prefix
+    wins over a package attribute of the same name."""
+    import pkgutil
+    return pkgutil.resolve_name(path)
 
 
 def _get_target(target):
@@ -2177,6 +2170,11 @@ class _patch:
             original = getattr(target, name, DEFAULT)
         else:
             local = True
+            # a pending lazy import found in the dict stands for the object
+            # it will import: specs and autospecs are taken from that
+            lazy_type = getattr(_types_module, 'LazyImportType', None)
+            if lazy_type is not None and type(original) is lazy_type:
+                original = getattr(target, name, DEFAULT)
         if name in _builtins and isinstance(target, ModuleType):
             self.create = True
         if not self.create and original is DEFAULT:
@@ -2252,14 +2250,16 @@ class _patch:
                 # the class is patched: instances get the spec too
                 inherit = True
 
-        if spec is None and _is_async_obj(original):
+        options = {}
+        if new_callable is not None:
+            # the original is not inspected at all then (it may be an opaque
+            # proxy that fails on any attribute access)
+            klass = new_callable
+        elif spec is None and _is_async_obj(original):
             klass = AsyncMock
         else:
             klass = MagicMock
-        options = {}
-        if new_callable is not None:
-            klass = new_callable
-        elif spec is not None or spec_set is not None:
+        if new_callable is None and (spec is not None or spec_set is not None):
             effective = spec_set if spec_set is not None else spec
             if _is_list(effective):
                 not_callable = '__call__' not in effective
@@ -2292,6 +2292,9 @@ class _patch:
 
     def __enter__(self):
         """Apply the patch; returns the replacement object."""
+        if self.is_started:
+            # a second activation would lose the saved original
+            raise RuntimeError("Patch is already started")
         self.target = self.getter()
         original, local = self.get_original()
         new = self._make_new(original)

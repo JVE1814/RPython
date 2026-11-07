@@ -356,6 +356,28 @@ class _AssertWarnsContext(_AssertRaisesBaseContext):
         self._raiseFailure('{} not triggered'.format(what))
 
 
+class _AssertNotWarnsContext(_AssertWarnsContext):
+    """Context manager behind _assertNotWarns: fails if a warning of the
+    expected class is issued inside the block."""
+
+    def __exit__(self, exc_type, exc_value, tb):
+        self.warnings_manager.__exit__(exc_type, exc_value, tb)
+        offending = None
+        for record in self.warnings:
+            if isinstance(record.message, self.expected):
+                if offending is None:
+                    offending = record
+            else:
+                # not ours: let it through as if we had not been watching
+                warnings._showwarnmsg(record)
+        if exc_type is not None or offending is None:
+            return
+        what = self._expected_name()
+        if self.obj_name:
+            self._raiseFailure('{} triggered by {}'.format(what, self.obj_name))
+        self._raiseFailure('{} triggered'.format(what))
+
+
 class _OrderedChainMap(collections.ChainMap):
     """ChainMap whose iteration follows the order of the maps (innermost
     first) and of each map's insertion order."""
@@ -748,6 +770,12 @@ class TestCase(object):
         'filename' and 'lineno' of the matching warning."""
         context = _AssertWarnsContext(expected_warning, self)
         return context.handle('assertWarns', args, kwargs)
+
+    def _assertNotWarns(self, expected_warning, *args, **kwargs):
+        """The opposite of assertWarns(): fail if a warning of class
+        *expected_warning* is triggered (private helper)."""
+        context = _AssertNotWarnsContext(expected_warning, self)
+        return context.handle('_assertNotWarns', args, kwargs)
 
     def assertLogs(self, logger=None, level=None, formatter=None):
         """Context manager failing unless at least one message of *level*
