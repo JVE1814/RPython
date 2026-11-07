@@ -1,0 +1,39 @@
+# cleanroom2 — continuation of the D19 audit (see notes/cleanroom1.md for the method)
+
+## Method
+- Same as cleanroom1: a module flagged as recalled is rewritten without opening the old file,
+  from the documented API, the spec tests and a grep of crates/runtime + Lib for the names
+  other code uses.  Tests run on an installed snapshot (target/cleanroom2/snap) with the old
+  file ("before") and the new one ("after"), same binary.
+- Error messages that no test asserts were reworded in own words; messages tests assert are
+  kept verbatim (listed per file).
+- Hot-path modules were timed old-vs-new with a micro benchmark loading each version from a
+  file (scratch script; numbers below are ns/op on the shared, noisy machine).
+
+## Rewritten
+
+| file | tests before -> after | names/texts kept because pinned |
+|------|-----------------------|---------------------------------|
+| functools.py | test_functools 338 ok =; test_inspect 382, test_typing 731, test_genericalias, test_annotationlib, test_reprlib, test_call, test_pydoc, test___all__, test_enum, test_dataclasses = (all pass) | `_CacheInfo` (namedtuple "CacheInfo"), `_c3_mro`, `_compose_mro`, `_find_impl` (tests), `_c3_merge`, `RLock` (test_functools uses `py_functools.RLock`), `_unwrap_partial`, `_unwrap_partialmethod` (inspect), `__partialmethod__` marker on partialmethod's functions (inspect), `cached_property.attrname/.func` (inspect), `singledispatchmethod.dispatcher/.func`, `_PlaceholderType`, `Placeholder`; messages asserted by tests (Placeholder/partial call errors, register()/annotation errors, cached_property errors, "Ambiguous dispatch", "requires at least 1 positional argument", "the first argument must be callable") |
+
+### functools.py notes
+- New structure: total_ordering derives methods from five small factories keyed by a recipe
+  table (the generated methods get a class-qualified `__qualname__`/`__module__`, so they pickle
+  by reference); cmp_to_key returns a closure over one module-level `_ComparisonKey` class;
+  pure-Python LRU uses an OrderedDict (move_to_end/popitem) under an RLock, with keys built by
+  `_call_key` (a lone int/str is its own key, otherwise a `_CallKey` holding the argument
+  tuple and its precomputed hash); partialmethod's unbound form delegates to a
+  `partial(func, Placeholder, *args)`, which also handles Placeholders in partialmethod.
+- `functools._singledispatchmethod_get` is now `_DispatchingMethod` (Lib/inspect.py's
+  `_DISPATCH_GETTERS` updated).  It has slots plus a `__dict__` holding only `__module__`
+  and `__doc__`; other attributes are forwarded to the decorated function (through `__func__`
+  for classmethod/staticmethod).  Class-level calls of a plain-function singledispatchmethod
+  (`C.generic(instance, arg)`) dispatch on the argument after the instance.
+- reduce (Python version) takes `*args, **kwargs`; `function=`/`sequence=` keywords still
+  work with a DeprecationWarning.
+- Timing (old -> new, ns/op): singledispatchmethod call 895 -> 840, wraps 1299 -> 877,
+  singledispatch 1245 -> 1217, total_ordering derived ops 318 -> 329 (noise), cached_property
+  231 -> 233, lru (C wrapper) 293 -> 279.
+- Behaviour changes: partial.__setstate__ copies the namespace dict instead of sharing it;
+  `@register` on a function annotated only for 'return' is rejected; wording of untested
+  error messages.
