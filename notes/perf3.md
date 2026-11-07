@@ -88,6 +88,19 @@ table showed the largest losses against the best CPython build.
 * The collector's helper sets/maps (`countable`, legacy finalizers, finalization order,
   weakref detaching) use the address hasher instead of SipHash (30% of gc_collect).
 
+### Later additions
+* `abstract_::plain_eq`: equality of identical objects, exact str/int/float and tuples (also
+  tuple subclasses that keep tuple equality, e.g. namedtuples) of such, decided without
+  Python code; used by dict lookup (the lock stays held), tuple comparison, `rich_eq` and
+  the set fast paths. Tuple hashing skips the recursion guard for leading str/int items.
+* Class-attribute (TYPE_ATTR) caches also hold method and slot-wrapper descriptors
+  (`dict.__repr__`, `list.append` read through the class are those objects).
+* Builtin keyword-argument parsing (`args::parse`) without a vector or a `String` per
+  keyword; base64 decoding with a prebuilt default table.
+* ElementTree tree builder keeps its text buffer capacity; expat end-tag check without a
+  `String`.
+* `copy.deepcopy` of lists/tuples/dicts skips the recursive call for atomic items.
+
 ### Bug fixed on the way
 * `lru_cache` (bounded): the Rust node list was mutated by concurrent callers without any
   lock — heap corruption ("double free or corruption", "unaligned tcache chunk") in
@@ -96,29 +109,61 @@ table showed the largest losses against the best CPython build.
   a second thread exists (released around the user function call).
 
 ## Measurements
-Callgrind instructions per loop (millions). "before" = master 991be0c built in this
-worktree; CPython columns from the same harness.
+Callgrind instructions per loop (millions, `perloop.sh`, final binary b051c32 unless noted).
+"before" = master 991be0c built in this worktree. Several benchmarks vary 10-30% between runs
+under callgrind (automatic collections, JIT recompiles); ranges are given where repeated runs
+differed. ratio = ours / CPython default (the better baseline in instructions).
 
 | bench | before | after | CPython default | ratio after |
 |---|---|---|---|---|
-| base64 | 1284.3 | 466.5 | 570.9 | 0.82 |
-| json_dumps | 171.5 | 93.9 | 102.1 | 0.92 |
-| json_loads | 7.23 | 5.48 | 5.70 | 0.96 |
-| gc_traversal | 70.8 | 22-33 | 54.0 (ft 13.4) | 0.4-0.6 / 1.6-2.5 vs ft |
-| gc_collect | 3.8-4.3 | 2.8 | 9.2 | 0.31 |
-| meteor_contest | 1527.9 | 994-1045 | 850.8 | 1.17-1.23 |
-| typing_runtime_protocols | (noisy) | 2.70 | 1.73 | 1.56 |
-| pathlib | 115-201 (noisy) | 178-192 | 87.2 | ~2 |
-| deepcopy | 4.21 | 4.38 | 2.83 | 1.55 |
-| xml_etree | 5442 | 5400 | 4075 | 1.33 |
+| base64 | 1284.3 | 463.6 | 570.9 | 0.81 |
+| json_dumps | 171.5 | 65.7-94 | 102.1 | 0.64-0.92 |
+| json_loads | 7.23 | 5.48-5.51 | 5.70 | 0.97 |
+| gc_traversal | 70.8 | 22-33 | 54.0 (ft 13.4) | 0.4-0.6 |
+| gc_collect | 3.8-4.3 (dp) | 2.8 (dp) | 9.2 | 0.31 |
+| meteor_contest | 1527.9 | 994-1009 | 850.8 | 1.17-1.19 |
+| mdp | 18206 | 14547 | 10964 | 1.33 |
+| pprint | 34469 | 30507 | 24396 | 1.25 |
+| xml_etree (all four) | 5442 | 5156 | 4076 | 1.27 |
+| xml_etree parse only | 5375 | 5140 | 4069 | 1.26 |
+| typing_runtime_protocols | (noisy) | 2.53-2.70 | 1.73 | 1.46-1.56 |
+| pathlib | 115-201 (noisy) | 150-192 | 87.2 | 1.7-2.2 |
+| deepcopy | 4.21 | 4.12-5.17 | 2.83 | 1.46-1.83 |
+| logging | 1.76 | 1.69 | 1.05 | 1.61 |
 
-Micro-operations (instructions per operation, ours before -> after, CPython default):
-`str(s)` 1287 -> 301 (348); `list(t)` 1651 -> 910 (877); `f(*t)` 2281 -> 1768 (658);
-`object.__new__(C)` 1814 -> 1443 (924); `N(s)` with Python `__new__`+`__init__` 6532 -> 5100
-(3521); `def f(*a, **k)` call 1758 -> 1468 (903); `inspect.getattr_static` miss 48490 -> 38416
-(26371).
+Wall-clock (s/loop through `tools/bench/run_bench.sh`, ours / py-default / py-ft back to back
+pinned to core 3, other agents running; jit5's ratio from its table):
+
+| bench | ours | default | ft | ratio | jit5 ratio |
+|---|---|---|---|---|---|
+| base64 | 0.000289 | 0.000199 | 0.000220 | 1.45 | 2.98 |
+| json_dumps | 0.00612-0.00670 | 0.00611-0.00632 | 0.00707 | 1.00-1.06 | 2.83 |
+| json_loads | 1.74e-05 | 1.56e-05 | 2.12e-05 | 1.12-1.17 | 1.85 |
+| gc_traversal | 0.00175 | 0.00267 | 0.00130 | 1.35 | 2.77 |
+| gc_collect | 0.00105 | 0.00156 | 0.00129 | 0.81 | 1.49 |
+| meteor_contest | 0.0986 | 0.1145 | 0.1128 | 0.87 | 1.83 |
+| sqlite_synth | 2.02e-06 | 2.48e-06 | 2.52e-06 | 0.82 | 1.37 |
+| typing_runtime_protocols | 0.000222 | 0.000119 | 0.000130 | 1.86 | 2.34 |
+| pathlib | 0.0183 | 0.0093 | 0.0092 | 1.99 | 2.35 |
+| deepcopy | 0.000282 | 0.000183 | 0.000204 | 1.54 | 1.86 |
+| xml_etree | 0.200 | 0.130 | 0.152 | 1.53 | 1.71 |
+| pprint | 0.971 | 0.697 | 0.703 | 1.39 | 1.66 |
+| logging | 8.3e-06 | 4.3-6.1e-06 | 5.8-7.3e-06 | 1.38-1.93 | 1.39 |
+| mdp | 2.06 | 1.25 | 1.72 | 1.65 | 2.05 |
+| bpe_tokeniser | 6.45 | 3.62 | 4.35 | 1.78 | 1.65 |
+| asyncio_tcp | 1.97 | 0.77 | 0.59 | 3.32 | 2.53 |
+| python_startup | 0.0130 | 0.0090 | 0.0141 | 1.44 | 1.46 |
+
+(bpe_tokeniser, asyncio_tcp, python_startup were not worked on; their wall numbers moved with
+machine load.)
 
 ## What is left (measured causes)
+* asyncio_tcp, bpe_tokeniser, python_startup: not investigated in this workstream.
+* mdp / pprint: remaining gap is call overhead (h_call, run_call_frame, h_call_py,
+  call_methoddef ~25% of pprint) and Fraction arithmetic in Python (mdp).
+* xml_etree: the expat engine decodes into `Vec<char>` and allocates a `String` per name,
+  attribute and text piece (and per newline), then a str per piece; malloc/free are ~18% of
+  parse. A byte-slice based engine producing Python strs directly is the real fix.
 * Python-level call overhead dominates pathlib, typing_runtime_protocols, deepcopy: a
   non-inlined Python call costs ~500 instructions here vs ~150-200 in CPython (h_call /
   call_function / bind_arguments / frame release / run_frame; jit5's open item "contiguous
