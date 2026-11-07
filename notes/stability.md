@@ -114,3 +114,75 @@ core-runtime build. Those fixes are now in master and were merged here.
   assertion).
 * `wait_for_release`/`stop_the_world` poll with yield then sleep. A futex would cut
   latency.
+
+# Workstream "stability2"
+
+Branch `worktree-agent-a6ad975e2ae61cb5a`. Stress tests: `tools/stress/run.sh PY` (new:
+type_refcount_drift, deque_race, weakref_race, shared_objects, join_releases).
+
+## Fixed (root causes)
+1. **pandas UAF: heap-type refcount drift (object.rs).** perf2's per-thread type counts
+   gave a type with an id a bias of one reference. An instance's type reference is often
+   taken per thread (generic_alloc) and dropped with a plain decref (Cython heap-type
+   deallocs `Py_DECREF(tp)`, `__class__` assignment), so between collections the fields
+   fell by up to the number of such instances and reached zero: `pandas.Timestamp` was freed
+   under live Timestamps. The bias is now `TYPE_BIAS = 2^50`; a type with an id is only ever
+   freed by the collector (which subtracts the bias, merges counts, then releases the id and
+   the bias under a stopped world). `sys.getrefcount`/`Py_REFCNT` hide the bias
+   (`object::visible_refcnt`).
+2. **subtype_dealloc with an extension *static* base** (numpy ndarray subclasses, Cython
+   static types) never dropped the instance's type reference (leak; classes never freed).
+   Now dropped after the base dealloc unless the dealloc is our own code
+   (`typeobject::is_own_code`, executable segment range from dl_iterate_phdr).
+3. **Inherited `__new__` (slots.rs update_one_slot):** with several C bases the tp_new of the
+   first MRO entry was used; now the solid base's (tp_base) unless the wrapper's type is a
+   subtype of it. pandas `MultiIndexUInt8Engine(BaseMultiIndexCodesEngine, UInt8Engine)` got
+   uninitialised C fields (NULL decref crash in every MultiIndex lookup).
+4. **Thread safety of library objects.** Many Rust-state objects had no synchronisation at
+   all and corrupted memory when shared: `collections.deque` (asyncio's ready queue: the
+   asyncio free-threading crash/hang), buffered/text file objects (concurrent `print` to one
+   file corrupted the malloc heap: test_io/multiprocessing heap-corruption reports),
+   StringIO/BytesIO, array, OrderedDict, itertools (count/cycle/tee...), lru_cache, csv,
+   dbm, bz2/lzma, mmap, contextvars.Context, heapq on a shared list.
+   * New `objlock.rs`: per-object *recursive* locks in a sharded table, waiting threads are
+     in Blocked mode (stop-the-world safe), held across blocking calls (buffered I/O must not
+     change state mid-flush), no-op while single-threaded, reset in a forked child.
+   * `METH_LOCKSELF` (private ml_flags bit) + `methods::lock_self_methods(tp)`: every method
+     of the type runs with `objlock::lock(self)` (taken in `call_methoddef`);
+     `locked_slot!` wraps slot functions. Used for the types above.
+   * deque: all state under its objlock; searches (index/count/in/remove) hold it across the
+     comparisons (test_free_threading.test_collections).
+5. **Weakrefs:** dereferencing used `refcnt() > 0` + incref, which resurrected objects that
+   another thread was deallocating. Now `object::try_incref` (CAS on the shared field; the
+   owner frees directly only when the shared field is exactly 0, which try_incref never
+   increments; weakref creation sets MAYBE_WEAKREF via `enable_try_incref`). Also used for
+   basic-ref reuse, `__weakref__`, callbacks list, PyUnstable_TryIncRef.
+6. **Field replacement races:** setters freed the old value immediately while getters on
+   other threads were taking a reference (`gen.__name__`, `f.__dict__ = d`, `e.__dict__`,
+   exception fields, `__slots__` members, every `fncommon::set_field` user). New
+   `qsbr::swap_field` (atomic swap + QSBR-deferred decref). Lazily created dicts (instance,
+   function, exception) use a CAS (lost attributes in test_free_threading.test_dict).
+   Specialised `__slots__` stores (interpreter, tier 1, tier 2) take that path when threaded.
+7. **`subclasses()`** handed out raw pointers to classes other threads were freeing; it now
+   returns `SubType` (try_incref under the subclass lock).
+8. **Thread join (coordinator item):** references the joined thread dropped while two threads
+   existed sat in QSBR batches; `Thread.join()` + weakref check saw them alive (~1/300 joins
+   under load). `_thread` join now processes the merge queue and calls
+   `qsbr::quiesce_now()` (releases everything when no other thread is attached).
+9. `_thread._local` dealloc dropped its dict map before a subclass's tp_clear used it
+   (valgrind); monitoring callbacks were released while holding MON (self-deadlock in
+   test_free_threading.test_monitoring); `_weakrefset`/`weakref` removal queues were
+   drained with check-then-pop (IndexError under threads); heappop could push None.
+10. `RPY_TLAB_CHECK=1` (tlab.rs): stamps freed small blocks and aborts on a double free
+    (use with RPYTHON_JIT=0). tools/wheels/run_numpy_tests.sh passed its own arguments to
+    pytest (fixed).
+
+## Status
+* pandas `test_multilevel`: 21 passed (crashed on the first test). Full suite: see below.
+* test_asyncio.test_free_threading: 24/24 loops OK with and without the JIT (crashed/hung).
+* test_free_threading (57 modules, run one by one): no crash or hang left in the modules
+  listed as crashing at the start (collections, context, dbm_gnu, dict, functools,
+  generators, monitoring, slots, type, weakref, csv, heapq, mmap). Remaining failures
+  are behavioural: bz2 (compressor returns the header on the first call), lzma decompressor,
+  tokenize (`tokenize._tokenize` missing), threading (`_testinternalcapi.test_stop_the_world`
+  missing).
