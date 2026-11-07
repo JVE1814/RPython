@@ -649,7 +649,7 @@ fn format_bytes(f: &PyObject) -> PyResult<(PyRef, Vec<u8>)> {
         let mut v = Vec::with_capacity(d.len());
         for c in d.iter() {
             if c >= 128 {
-                raise!(ValueError, "struct format must contain only ASCII characters (non-ASCII character found)");
+                raise!(ValueError, "non-ASCII character in struct format");
             }
             v.push(c as u8);
         }
@@ -658,7 +658,7 @@ fn format_bytes(f: &PyObject) -> PyResult<(PyRef, Vec<u8>)> {
     if bytes::is_bytes(f) {
         let d = bytes::bytes_data(f).to_vec();
         if d.iter().any(|&b| b >= 128) {
-            raise!(ValueError, "struct format must contain only ASCII characters (non-ASCII character found)");
+            raise!(ValueError, "non-ASCII character in struct format");
         }
         let s = pystr::new_str(std::str::from_utf8(&d).unwrap_or(""));
         return Ok((s, d));
@@ -688,6 +688,9 @@ unsafe fn set_state(o: &PyObject, st: Option<Box<StructState>>) {
 
 fn init_overridden(tp: *mut PyTypeObject) -> bool {
     unsafe { (*tp).tp_init.map(|f| f as usize) != Some(struct_init as usize) }
+}
+fn new_overridden(tp: *mut PyTypeObject) -> bool {
+    unsafe { (*tp).tp_new.map(|f| f as usize) != Some(struct_new as usize) }
 }
 
 /// Parse the (format) argument of Struct.__new__/__init__: Ok(Some(fmt)) / Ok(None) if missing,
@@ -721,7 +724,10 @@ unsafe extern "C" fn struct_new(tp: *mut PyTypeObject, args: *mut PyObject, kw: 
             }
             (*(op as *mut StructObj)).st = std::ptr::null_mut();
             let obj = PyRef::from_raw(op);
-            let lenient = init_overridden(tp);
+            // When only __init__ is customised, the class call hands __new__ the
+            // arguments meant for __init__, so bad ones merely warn here.  A custom
+            // __new__ calls us with arguments of its own choosing: check strictly.
+            let lenient = init_overridden(tp) && !new_overridden(tp);
             let warn = |msg: &str| crate::modules::warnings::warn(crate::types::exceptions::DeprecationWarning(), msg, 1);
             match struct_args(&*args, kw) {
                 Ok(Some(f)) => match build_state(&f) {
@@ -737,6 +743,9 @@ unsafe extern "C" fn struct_new(tp: *mut PyTypeObject, args: *mut PyObject, kw: 
                 Ok(None) => {
                     if lenient {
                         warn("Struct() missing required argument 'format' (pos 1)")?;
+                    } else if new_overridden(tp) {
+                        // an explicit super().__new__(cls) without a format
+                        raise!(TypeError, "Struct() missing required argument 'format' (pos 1)");
                     }
                 }
                 Err(m) => {
@@ -765,6 +774,11 @@ unsafe extern "C" fn struct_init(o: *mut PyObject, args: *mut PyObject, kw: *mut
     unsafe {
         let r = (|| -> PyResult<()> {
             let o = &*o;
+            // A subclass with its own __new__ (and the inherited __init__) has been
+            // fully set up by that __new__; the class call's arguments are for it.
+            if new_overridden(o.type_ptr()) && !init_overridden(o.type_ptr()) && !(*(o.as_ptr() as *mut StructObj)).st.is_null() {
+                return Ok(());
+            }
             let f = match struct_args(&*args, kw) {
                 Ok(Some(f)) => f,
                 Ok(None) => raise!(TypeError, "Struct() missing required argument 'format' (pos 1)"),

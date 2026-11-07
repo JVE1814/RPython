@@ -117,13 +117,11 @@ def main(*args):
         if args.sql:
             execute(con, args.sql, suppress_errors=False, theme=theme)
         else:
-            try:
-                import readline  # noqa: F401  (line editing when available)
-            except ImportError:
-                pass
+            from sqlite3._completer import completer
             use_color = bool(theme.syntax.prompt)
             console = SqliteInteractiveConsole(con, use_color=use_color)
-            console.interact(banner, exitmsg="")
+            with completer(con):
+                console.interact(banner, exitmsg="")
     finally:
         con.close()
 
