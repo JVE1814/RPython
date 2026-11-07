@@ -1,21 +1,22 @@
 #
-# multiprocessing.queues: process-shared queues built on a pipe.
+# multiprocessing.queues -- queues between processes.
 #
-# Queue.put() appends to a local buffer; a daemon "feeder" thread pickles
-# buffered objects and writes them to the pipe, so put() never blocks on
-# the pipe.  get() reads and unpickles one message under a lock.
+# Queue: put() hands the object to a per-process feeder thread that pickles
+# it and writes it to a pipe; a bounded semaphore counts the items in
+# flight.  JoinableQueue adds task_done()/join().  SimpleQueue writes to
+# the pipe directly, without a thread.
 #
 
 __all__ = ['Queue', 'SimpleQueue', 'JoinableQueue']
 
-import sys
-import os
-import threading
 import collections
+import errno
+import os
+import sys
+import threading
 import time
 import types
 import weakref
-import errno
 
 from queue import Empty, Full
 
@@ -25,11 +26,15 @@ _ForkingPickler = context.reduction.ForkingPickler
 
 from .util import debug, info, Finalize, register_after_fork, is_exiting
 
-# put into the buffer to make the feeder thread close the pipe and exit
+# tells the feeder thread to stop
 _sentinel = object()
+
+# pipe writes are atomic per message on Windows: no write lock there
+_NEEDS_WRITE_LOCK = sys.platform != 'win32'
 
 
 class Queue(object):
+    """A FIFO queue shared between processes (see queue.Queue)."""
 
     def __init__(self, maxsize=0, *, ctx):
         if maxsize <= 0:
@@ -38,16 +43,13 @@ class Queue(object):
         self._reader, self._writer = connection.Pipe(duplex=False)
         self._rlock = ctx.Lock()
         self._opid = os.getpid()
-        if sys.platform == 'win32':
-            self._wlock = None
-        else:
-            self._wlock = ctx.Lock()
+        self._wlock = ctx.Lock() if _NEEDS_WRITE_LOCK else None
         self._sem = ctx.BoundedSemaphore(maxsize)
-        # Set by subclasses that tolerate a closed pipe (e.g. the pool).
+        # concurrent.futures sets this: a feeder writing to a pipe nobody
+        # reads any more just stops
         self._ignore_epipe = False
         self._reset()
-
-        if sys.platform != 'win32':
+        if _NEEDS_WRITE_LOCK:
             register_after_fork(self, Queue._after_fork)
 
     def __getstate__(self):
@@ -65,6 +67,7 @@ class Queue(object):
         self._reset(after_fork=True)
 
     def _reset(self, after_fork=False):
+        """Per-process state: the buffer and the (not yet started) feeder."""
         if after_fork:
             self._notempty._at_fork_reinit()
         else:
@@ -79,45 +82,49 @@ class Queue(object):
         self._recv_bytes = self._reader.recv_bytes
         self._poll = self._reader.poll
 
-    def put(self, obj, block=True, timeout=None):
+    def _check_open(self):
         if self._closed:
             raise ValueError(f"Queue {self!r} is closed")
+
+    def _enqueue(self, obj):
+        # with self._notempty held
+        if self._thread is None:
+            self._start_thread()
+        self._buffer.append(obj)
+        self._notempty.notify()
+
+    def put(self, obj, block=True, timeout=None):
+        self._check_open()
         if not self._sem.acquire(block, timeout):
             raise Full
-
         with self._notempty:
-            if self._thread is None:
-                self._start_thread()
-            self._buffer.append(obj)
-            self._notempty.notify()
+            self._enqueue(obj)
 
     def get(self, block=True, timeout=None):
-        if self._closed:
-            raise ValueError(f"Queue {self!r} is closed")
+        self._check_open()
         if block and timeout is None:
             with self._rlock:
-                res = self._recv_bytes()
+                data = self._recv_bytes()
             self._sem.release()
         else:
-            if block:
-                deadline = time.monotonic() + timeout
+            deadline = time.monotonic() + timeout if block else None
             if not self._rlock.acquire(block, timeout):
                 raise Empty
             try:
+                remaining = 0.0
                 if block:
-                    timeout = deadline - time.monotonic()
-                    if not self._poll(timeout):
-                        raise Empty
-                elif not self._poll():
+                    remaining = deadline - time.monotonic()
+                if not self._poll(remaining):
                     raise Empty
-                res = self._recv_bytes()
+                data = self._recv_bytes()
                 self._sem.release()
             finally:
                 self._rlock.release()
-        # unpickle outside of the lock
-        return _ForkingPickler.loads(res)
+        # unpickle outside the lock
+        return _ForkingPickler.loads(data)
 
     def qsize(self):
+        # sem_getvalue() is missing on macOS: NotImplementedError there
         return self._maxsize - self._sem._semlock._get_value()
 
     def empty(self):
@@ -133,91 +140,77 @@ class Queue(object):
         return self.put(obj, False)
 
     def close(self):
-        """No more puts from this process; the feeder flushes the buffer
-        and closes the pipe."""
+        """No more puts from this process; the feeder writes what is
+        buffered and stops."""
         self._closed = True
-        close = self._close
+        close, self._close = self._close, None
         if close:
-            self._close = None
             close()
 
     def join_thread(self):
-        """Wait for the feeder thread (only after close())."""
+        """Wait for the feeder thread (after close())."""
         debug('Queue.join_thread()')
         assert self._closed, "Queue {0!r} not closed".format(self)
         if self._jointhread:
             self._jointhread()
 
     def cancel_join_thread(self):
-        """Do not wait for the feeder thread at process exit."""
+        """Do not wait for the feeder when the process exits (buffered
+        items may be lost)."""
         debug('Queue.cancel_join_thread()')
         self._joincancelled = True
-        try:
+        if self._jointhread is not None:
             self._jointhread.cancel()
-        except AttributeError:
-            pass
 
     def _terminate_broken(self):
-        # The queue cannot be used any more (e.g. the reading process
-        # died): drop pending data and stop the feeder.
+        # The reading side is gone (a broken process pool): stop writing.
+        # Closing the reader makes a feeder blocked in a write fail.
         self._reader.close()
-        if self._wlock is not None:
-            # a dead process might hold the write lock forever
-            self._wlock = None
+        if not _NEEDS_WRITE_LOCK:
+            self._writer.close()
         self.close()
         self.join_thread()
 
     def _start_thread(self):
         debug('Queue._start_thread()')
-
+        self._buffer.clear()
         self._thread = threading.Thread(
             target=Queue._feed,
             args=(self._buffer, self._notempty, self._send_bytes,
                   self._wlock, self._reader.close, self._writer.close,
                   self._ignore_epipe, self._on_queue_feeder_error,
                   self._sem),
-            name='QueueFeederThread',
-            daemon=True,
-        )
-
+            name='QueueFeederThread', daemon=True)
         try:
-            debug('doing self._thread.start()')
             self._thread.start()
-            debug('... done self._thread.start()')
         except:
+            # starting a thread can fail at interpreter shutdown
             self._thread = None
             raise
-
+        debug('feeder thread started')
         if not self._joincancelled:
-            # Join the feeder at exit so buffered data reaches the pipe;
-            # only a weak reference: the Finalize must not keep it alive.
+            # wait for the feeder at exit, after the queue's own finalizer
             self._jointhread = Finalize(
                 self._thread, Queue._finalize_join,
-                [weakref.ref(self._thread)],
-                exitpriority=-5
-                )
-
-        # Flush the buffer when the queue is collected or at exit (before
-        # the join above, which needs the sentinel).
-        self._close = Finalize(
-            self, Queue._finalize_close,
-            [self._buffer, self._notempty],
-            exitpriority=10
-            )
+                [weakref.ref(self._thread)], exitpriority=-5)
+        # stop the feeder when the queue is collected (or at exit)
+        self._close = Finalize(self, Queue._finalize_close,
+                               [self._buffer, self._notempty],
+                               exitpriority=10)
 
     @staticmethod
     def _finalize_join(twr):
-        debug('joining queue thread')
         thread = twr()
-        if thread is not None:
-            thread.join()
-            debug('... queue thread joined')
-        else:
-            debug('... queue thread already dead')
+        if thread is None:
+            debug('feeder thread already gone')
+            return
+        debug('joining feeder thread')
+        thread.join()
+        debug('feeder thread joined')
 
     @staticmethod
     def _finalize_close(buffer, notempty):
-        debug('telling queue thread to quit')
+        debug('asking the feeder thread to stop')
         with notempty:
             buffer.append(_sentinel)
             notempty.notify()
@@ -225,63 +218,49 @@ class Queue(object):
     @staticmethod
     def _feed(buffer, notempty, send_bytes, writelock, reader_close,
               writer_close, ignore_epipe, onerror, queue_sem):
-        debug('starting thread to feed data to pipe')
-        nacquire = notempty.acquire
-        nrelease = notempty.release
-        nwait = notempty.wait
-        bpopleft = buffer.popleft
-        sentinel = _sentinel
-        if sys.platform != 'win32' and writelock is not None:
-            wacquire = writelock.acquire
-            wrelease = writelock.release
-        else:
-            wacquire = None
-
+        """Feeder thread: pickle buffered objects and write them to the
+        pipe.  It refers to the queue only through these arguments, so the
+        queue can be collected while the thread runs."""
+        debug('feeder thread running')
         while True:
-            try:
-                nacquire()
+            with notempty:
+                while not buffer:
+                    notempty.wait()
+                batch = list(buffer)
+                buffer.clear()
+            for position, obj in enumerate(batch):
+                if obj is _sentinel:
+                    debug('feeder thread got the stop marker')
+                    reader_close()
+                    writer_close()
+                    return
                 try:
-                    if not buffer:
-                        nwait()
-                finally:
-                    nrelease()
-                try:
-                    while True:
-                        obj = bpopleft()
-                        if obj is sentinel:
-                            debug('feeder thread got sentinel -- exiting')
-                            reader_close()
-                            writer_close()
-                            return
-
-                        data = _ForkingPickler.dumps(obj)
-                        if wacquire is None:
+                    data = _ForkingPickler.dumps(obj)
+                    if writelock is None:
+                        send_bytes(data)
+                    else:
+                        with writelock:
                             send_bytes(data)
-                        else:
-                            wacquire()
-                            try:
-                                send_bytes(data)
-                            finally:
-                                wrelease()
-                        del obj, data
-                except IndexError:
-                    pass
-            except Exception as e:
-                if ignore_epipe and getattr(e, 'errno', 0) == errno.EPIPE:
-                    return
-                # At exit the pipe may already be gone: only log.
-                if is_exiting():
-                    info('error in queue thread: %s', e)
-                    return
-                else:
-                    # the object was not delivered: give its slot back
+                except Exception as exc:
+                    if ignore_epipe and getattr(exc, 'errno', 0) == errno.EPIPE:
+                        return
+                    if is_exiting():
+                        # the process is being torn down: whatever this
+                        # thread uses may be gone already
+                        info('error in queue thread: %s', exc)
+                        return
+                    # the object never got into the pipe: the queue holds
+                    # one item less
                     queue_sem.release()
-                    onerror(e, obj)
+                    onerror(exc, obj)
+                finally:
+                    obj = data = None
+            batch = None
 
     @staticmethod
     def _on_queue_feeder_error(e, obj):
-        """Called in the feeder thread when *obj* cannot be sent (e.g. it
-        is not picklable).  Prints the traceback by default."""
+        """Called in the feeder thread when sending obj failed with e.
+        concurrent.futures overrides it."""
         import traceback
         traceback.print_exc()
 
@@ -289,7 +268,8 @@ class Queue(object):
 
 
 class JoinableQueue(Queue):
-    """A Queue with task_done() and join()."""
+    """A Queue whose consumers report task_done(), so that join() can wait
+    until every item has been processed."""
 
     def __init__(self, maxsize=0, *, ctx):
         Queue.__init__(self, maxsize, ctx=ctx)
@@ -304,17 +284,12 @@ class JoinableQueue(Queue):
         self._cond, self._unfinished_tasks = state[-2:]
 
     def put(self, obj, block=True, timeout=None):
-        if self._closed:
-            raise ValueError(f"Queue {self!r} is closed")
+        self._check_open()
         if not self._sem.acquire(block, timeout):
             raise Full
-
         with self._notempty, self._cond:
-            if self._thread is None:
-                self._start_thread()
-            self._buffer.append(obj)
+            self._enqueue(obj)
             self._unfinished_tasks.release()
-            self._notempty.notify()
 
     def task_done(self):
         with self._cond:
@@ -330,16 +305,13 @@ class JoinableQueue(Queue):
 
 
 class SimpleQueue(object):
-    """A pipe with locks: no buffering thread, no size."""
+    """A queue without a feeder thread or a size limit."""
 
     def __init__(self, *, ctx):
         self._reader, self._writer = connection.Pipe(duplex=False)
         self._rlock = ctx.Lock()
         self._poll = self._reader.poll
-        if sys.platform == 'win32':
-            self._wlock = None
-        else:
-            self._wlock = ctx.Lock()
+        self._wlock = ctx.Lock() if _NEEDS_WRITE_LOCK else None
 
     def close(self):
         self._reader.close()
@@ -358,10 +330,11 @@ class SimpleQueue(object):
 
     def get(self):
         with self._rlock:
-            res = self._reader.recv_bytes()
-        return _ForkingPickler.loads(res)
+            data = self._reader.recv_bytes()
+        return _ForkingPickler.loads(data)
 
     def put(self, obj):
+        # pickle before taking the lock
         data = _ForkingPickler.dumps(obj)
         if self._wlock is None:
             self._writer.send_bytes(data)
