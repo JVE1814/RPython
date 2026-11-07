@@ -106,8 +106,9 @@ impl Slot {
     }
     fn set(&self, v: Option<PyRef>) {
         let new = v.map(|r| r.into_raw()).unwrap_or(std::ptr::null_mut());
-        let old = self.0.swap(new, Ordering::AcqRel);
-        unsafe { xdecref(old) };
+        // `get` on another thread may have loaded the old pointer and not yet taken its
+        // reference: release it through QSBR
+        unsafe { crate::qsbr::swap_field(self.0.as_ptr(), new) };
     }
 }
 
@@ -355,6 +356,8 @@ fn set_completer_delims(_m: &PyObject, s: &PyObject) -> PyResult {
 static OWNED_DELIMS: AtomicPtr<c_char> = AtomicPtr::new(std::ptr::null_mut());
 
 fn get_completer_delims(_m: &PyObject) -> PyResult {
+    // under the lock: a concurrent set_completer_delims frees the previous string
+    let _g = RL_LOCK.lock();
     decode(unsafe { *api().rl_completer_word_break_characters })
 }
 
