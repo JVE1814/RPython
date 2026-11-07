@@ -308,6 +308,123 @@ fn pyerr_setkeyerror(_m: &PyObject, arg: &PyObject) -> PyResult {
     Err(PyErr)
 }
 
+// ---- mixed complex/real arithmetic helpers (_py_cr_* / _py_rc_*). (capi2)
+// The real operand only combines with the real part (or scales both parts), so signed
+// zeros and infinities of the other component survive unchanged.
+
+fn cplx_arg(o: &PyObject) -> PyResult<(f64, f64)> {
+    let c = unsafe { crate::capi::long::PyComplex_AsCComplex(o.as_ptr()) };
+    if c.real == -1.0 && err_occurred() {
+        return Err(PyErr);
+    }
+    Ok((c.real, c.imag))
+}
+
+fn real_arg(o: &PyObject) -> PyResult<f64> {
+    let v = unsafe { crate::capi::long::PyFloat_AsDouble(o.as_ptr()) };
+    if v == -1.0 && err_occurred() {
+        return Err(PyErr);
+    }
+    Ok(v)
+}
+
+fn cplx_result(re: f64, im: f64, errno: i64) -> PyResult {
+    Ok(tuple::new_tuple(vec![crate::types::complex::new_complex(re, im), int::new_int(errno)]))
+}
+
+fn two_args<'a>(args: &'a [&'a PyObject], name: &str) -> PyResult<(&'a PyObject, &'a PyObject)> {
+    if args.len() != 2 {
+        raise!(TypeError, "{} expected 2 arguments, got {}", name, args.len());
+    }
+    Ok((args[0], args[1]))
+}
+
+fn py_cr_sum(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    let (a, b) = two_args(args, "_py_cr_sum")?;
+    let ((re, im), r) = (cplx_arg(a)?, real_arg(b)?);
+    cplx_result(re + r, im, 0)
+}
+
+fn py_cr_diff(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    let (a, b) = two_args(args, "_py_cr_diff")?;
+    let ((re, im), r) = (cplx_arg(a)?, real_arg(b)?);
+    cplx_result(re - r, im, 0)
+}
+
+fn py_rc_diff(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    let (a, b) = two_args(args, "_py_rc_diff")?;
+    let (r, (re, im)) = (real_arg(a)?, cplx_arg(b)?);
+    cplx_result(r - re, -im, 0)
+}
+
+fn py_cr_prod(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    let (a, b) = two_args(args, "_py_cr_prod")?;
+    let ((re, im), r) = (cplx_arg(a)?, real_arg(b)?);
+    cplx_result(re * r, im * r, 0)
+}
+
+fn py_cr_quot(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    let (a, b) = two_args(args, "_py_cr_quot")?;
+    let ((re, im), r) = (cplx_arg(a)?, real_arg(b)?);
+    if r == 0.0 {
+        return cplx_result(0.0, 0.0, libc::EDOM as i64);
+    }
+    cplx_result(re / r, im / r, 0)
+}
+
+fn py_rc_quot(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    let (a, b) = two_args(args, "_py_rc_quot")?;
+    let (x, (c, d)) = (real_arg(a)?, cplx_arg(b)?);
+    // x / (c + di), scaled by the larger divisor component to avoid overflow
+    if c.abs() >= d.abs() {
+        if c == 0.0 && d == 0.0 {
+            return cplx_result(0.0, 0.0, libc::EDOM as i64);
+        }
+        let t = d / c;
+        let den = c + d * t;
+        cplx_result(x / den, -x * t / den, 0)
+    } else if d.abs() >= c.abs() {
+        let t = c / d;
+        let den = c * t + d;
+        cplx_result(x * t / den, -x / den, 0)
+    } else if x.is_finite() && (c.is_infinite() || d.is_infinite()) {
+        // a finite value over an infinite divisor is zero (the NaN part only lends its sign)
+        cplx_result(0.0f64.copysign(x) * 1.0f64.copysign(c), 0.0f64.copysign(-x) * 1.0f64.copysign(d), 0)
+    } else {
+        cplx_result(f64::NAN, f64::NAN, 0)
+    }
+}
+
+/// gh_119213_getargs(spam=None): keyword parsing from a subinterpreter. (capi2)
+fn gh_119213_getargs(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
+    static P: crate::args::Params = crate::args::Params::new("gh_119213_getargs", &["spam"], 0, 0);
+    let [spam] = crate::args::parse::<1>(&P, args, kw)?;
+    Ok(spam.map(|s| s.to_ref()).unwrap_or_else(none::none_ref))
+}
+
+/// _PyUnicode_TransformDecimalAndSpaceToASCII(s): decimal digits become ASCII digits,
+/// whitespace a space; the first other non-ASCII character becomes '?' and ends the
+/// result. (capi2)
+fn transform_decimal_and_space(_m: &PyObject, s: &PyObject) -> PyResult {
+    if !pystr::is_str(s) {
+        return Err(crate::errors::system_error("bad argument to internal function"));
+    }
+    let mut out = String::new();
+    for c in pystr::str_data(s).iter() {
+        if rpy_unicode::is_space(c) {
+            out.push(' ');
+        } else if let Some(d) = rpy_unicode::to_decimal(c) {
+            out.push(char::from(b'0' + d as u8));
+        } else if c < 128 {
+            out.push(char::from(c as u8));
+        } else {
+            out.push('?');
+            break;
+        }
+    }
+    Ok(pystr::new_str(&out))
+}
+
 pub fn init() -> PyResult {
     let m = crate::types::module::new_module("_testinternalcapi")?;
     let d = crate::types::module::module_dict(&m);
@@ -318,6 +435,14 @@ pub fn init() -> PyResult {
             ("module_get_gc_hooks", O, module_get_gc_hooks),
             ("get_configs", NOARGS, get_configs),
             ("_pyerr_setkeyerror", O, pyerr_setkeyerror),
+            ("_PyUnicode_TransformDecimalAndSpaceToASCII", O, transform_decimal_and_space),
+            ("gh_119213_getargs", FASTKW, gh_119213_getargs),
+            ("_py_cr_sum", FAST, py_cr_sum),
+            ("_py_cr_diff", FAST, py_cr_diff),
+            ("_py_rc_diff", FAST, py_rc_diff),
+            ("_py_cr_prod", FAST, py_cr_prod),
+            ("_py_cr_quot", FAST, py_cr_quot),
+            ("_py_rc_quot", FAST, py_rc_quot),
             ("pending_threadfunc", FASTKW, pending_threadfunc),
             ("tuple_from_pair", FAST, tuple_from_pair),
             ("tuple_from_pair_steal", FAST, tuple_from_pair),

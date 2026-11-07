@@ -972,6 +972,17 @@ unsafe fn as_complex(o: &PyObject) -> PyResult<Py_complex> {
         if !complex::is_complex(&r) {
             return Err(type_error(&format!("__complex__ returned non-complex (type {})", tname(&r))));
         }
+        if !complex::is_complex_exact(&r) {
+            crate::modules::warnings::warn(
+                crate::types::exceptions::DeprecationWarning(),
+                &format!(
+                    "{}.__complex__ returned an instance of {}, a subclass of complex; returning anything but an exact complex is deprecated",
+                    tname(o),
+                    tname(&r)
+                ),
+                1,
+            )?;
+        }
         return Ok(complex::complex_value(&r));
     }
     let f = ab::float_value(o)?;

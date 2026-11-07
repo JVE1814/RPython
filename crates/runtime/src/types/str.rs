@@ -688,7 +688,10 @@ fn interned_table() -> std::sync::MutexGuard<'static, InternTable> {
 unsafe fn adopt_interned(t: &mut InternTable, slot: usize, s: &PyRef) {
     unsafe {
         make_immortal(s.as_ptr());
-        (*(s.as_ptr() as *mut PyASCIIObject)).state |= 2; // SSTATE_INTERNED_IMMORTAL
+        // SSTATE_INTERNED_IMMORTAL; one-character Latin-1 strings are the process-wide
+        // singletons and report SSTATE_INTERNED_IMMORTAL_STATIC (capi2)
+        let single = str_len(s) == 1 && str_kind(s) == 1;
+        (*(s.as_ptr() as *mut PyASCIIObject)).state |= if single { 3 } else { 2 };
     }
     t.insert_at(slot, s.as_ptr() as usize);
 }
