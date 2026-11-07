@@ -93,6 +93,10 @@ class _PatternOnDemand:
         return compiled
 
 
+# the on-demand marker itself (a subclass can be re-armed with it)
+_TemplatePattern = _PatternOnDemand()
+
+
 class Template:
     """A string containing $-placeholders, see substitute()."""
 
@@ -101,7 +105,7 @@ class Template:
     idpattern = r'(?a:[_a-z][_a-z0-9]*)'
     braceidpattern = None
     flags = None          # None stands for re.IGNORECASE
-    pattern = _PatternOnDemand()
+    pattern = _TemplatePattern
 
     def __init_subclass__(cls):
         super().__init_subclass__()
