@@ -848,6 +848,9 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
         crate::sharded::merge_all();
         // (scale1) everything retired through QSBR before this stop can go
         QSBR_TAKEN.lock().unwrap_or_else(|e| e.into_inner()).extend(crate::qsbr::take_all_for_gc());
+        // (scale2) objects waiting in the merge queues of owners that do not poll
+        // (blocked threads) are merged now and released after the collection
+        DEAD_SHARDED.lock().unwrap_or_else(|e| e.into_inner()).extend(crate::threads::merge_all_queues_stopped());
         // ---- phase 1 (stopped): find the unreachable objects
         let mut objs = snapshot_gen(young_only);
         crate::gc_support::untrack_atomic_tuples(&mut objs);

@@ -151,6 +151,17 @@ pub enum Inst {
     /// acquire the per-object mutex of the object in v, deoptimise if contended
     TryLock(V, SnapId),
     Unlock(V),
+    /// (scale2) qsbr::note_attr_read of the object in v (before a lock-free load of
+    /// its attribute storage)
+    NoteRead(V),
+    /// (scale2) dst = 1 if the per-object mutex of the object in v was free and is now
+    /// held by this thread, else 0
+    TryLockFlag(V, V),
+    /// (scale2) dst = previous qword at [base + off], replaced by src (atomic swap)
+    Xchg(V, Base, i32, V),
+    /// (scale2) qsbr::release_attr(obj, old): release `old` (may be null), just swapped
+    /// out of obj's attribute storage, at once or through QSBR (registers preserved)
+    ReleaseAttr(V, V),
     /// Call a runtime function (SysV); clobbers caller-saved registers. Result in a
     /// gpr (`ret`) or xmm0 (`fret`).
     Call { addr: usize, args: Vec<Opnd>, fargs: Vec<V>, ret: Option<V>, fret: Option<V> },
@@ -311,7 +322,20 @@ impl Inst {
         match self {
             Imm(d, _) | FImm(d, _) | SlotAddr(d, _) => defs.push(*d),
             LoadLocalUnboxed { home, .. } => defs.push(*home),
-            TryLock(v, _) | Unlock(v) => uses.push(*v),
+            TryLock(v, _) | Unlock(v) | NoteRead(v) => uses.push(*v),
+            TryLockFlag(d, v) => {
+                uses.push(*v);
+                defs.push(*d)
+            }
+            Xchg(d, bs, _, s) => {
+                b(bs, uses);
+                uses.push(*s);
+                defs.push(*d)
+            }
+            ReleaseAttr(o, x) => {
+                uses.push(*o);
+                uses.push(*x)
+            }
             Mov(d, s)
             | Neg(d, s)
             | NegOv(d, s, _)

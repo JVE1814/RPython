@@ -432,7 +432,7 @@ impl<'a> B<'a> {
     fn emit(&mut self, i: Inst) {
         // a decref may free the object and run arbitrary code (__del__, weakref
         // callbacks) that mutates classes: type facts guarded earlier no longer hold
-        let forget = matches!(i, Inst::Decref(_) | Inst::XDecref(_)) && !keep_facts();
+        let forget = matches!(i, Inst::Decref(_) | Inst::XDecref(_) | Inst::ReleaseAttr(..)) && !keep_facts();
         self.f.blocks[self.cur as usize].insts.push(i);
         if forget {
             self.forget_tags();
@@ -2169,6 +2169,7 @@ impl<'a> B<'a> {
             let k = self.st.stack.len() - 1;
             if s.kind == kind::SLOT {
                 let x = self.v(Class::G);
+                self.emit(Inst::NoteRead(p)); // scale2
                 self.emit(Inst::Load(x, Base::V(p), s.c as i32));
                 self.emit(Inst::Guard(Cond::Test(x, Opnd::V(x), Cc::E), snap));
                 self.emit(Inst::Incref(x));
@@ -2207,12 +2208,14 @@ impl<'a> B<'a> {
                     self.check_shape_key(w, s.b, name, f);
                     let vb = self.values_base(p, w);
                     let x = self.v(Class::G);
+                    self.emit(Inst::NoteRead(p)); // scale2
                     self.emit(Inst::Load(x, Base::V(vb), 8 * s.b as i32));
                     self.check(Cond::Test(x, Opnd::V(x), Cc::E), f);
                     x
                 }
                 kind::SLOT => {
                     let x = self.v(Class::G);
+                    self.emit(Inst::NoteRead(p)); // scale2
                     self.emit(Inst::Load(x, Base::V(p), s.c as i32));
                     self.check(Cond::Test(x, Opnd::V(x), Cc::E), f);
                     x
@@ -2452,55 +2455,94 @@ impl<'a> B<'a> {
         let mt_addr = (&raw const crate::threads::MULTI_THREADED) as i64;
         for (s, b) in cases.iter().zip(bodies) {
             self.switch_to(b);
-            let f = Fail::Block(slow);
             match s.kind {
                 kind::INSTANCE_DICT => {
-                    // other threads may access the values lock-free: locked runtime path
+                    // (scale2) single-threaded: plain stores; with threads the same under
+                    // the object's mutex (taken inline when free, else the runtime path),
+                    // the old value released after the unlock (qsbr::release_attr)
                     let mta = self.imm(mt_addr);
-                    self.check(Cond::CmpMem(Base::V(mta), 0, 0, Cc::NE), f);
-                    let w = self.values_word(p, f);
-                    let off = 8 * s.b as i32;
-                    let trans = if s.c != 0 && live_type(s.c, s.a) { crate::shape::transitions_adding(s.c as *mut PyTypeObject, name as *mut PyObject, s.b as usize) } else { Vec::new() };
-                    if trans.len() == 1 {
-                        // replace (shape = child) or add (shape = parent, room left)
-                        let (parent, child) = trans[0];
-                        let sh = self.shape_of(w);
-                        let add = self.new_block(u32::MAX);
-                        let replace = self.new_block(u32::MAX);
-                        let notc = self.new_block(u32::MAX);
-                        self.term(Term::Branch(Cond::Cmp(sh, Opnd::I(child as i64), Cc::E), replace, notc));
-                        self.switch_to(notc);
-                        self.check(Cond::Cmp(sh, Opnd::I(parent as i64), Cc::NE), f);
-                        // room left: the capacity byte (shape.rs) must exceed the index
-                        let cap = self.v(Class::G);
-                        self.emit(Inst::Load8(cap, Base::V(p), crate::shape::capacity_offset()));
-                        self.check(Cond::Cmp(cap, Opnd::I(s.b as i64), Cc::BE), f);
-                        self.term(Term::Jump(add));
-                        self.switch_to(add);
+                    let stb = self.new_block(u32::MAX);
+                    let mtb = self.new_block(u32::MAX);
+                    self.term(Term::Branch(Cond::CmpMem(Base::V(mta), 0, 0, Cc::NE), mtb, stb));
+                    for mt in [false, true] {
+                        let f = if mt {
+                            self.switch_to(mtb);
+                            let lk = self.v(Class::G);
+                            self.emit(Inst::TryLockFlag(lk, p));
+                            self.check(Cond::Test(lk, Opnd::V(lk), Cc::E), Fail::Block(slow));
+                            let ul = self.new_block(u32::MAX);
+                            let here = self.cur;
+                            self.switch_to(ul);
+                            self.emit(Inst::Unlock(p));
+                            self.term(Term::Jump(slow));
+                            self.switch_to(here);
+                            Fail::Block(ul)
+                        } else {
+                            self.switch_to(stb);
+                            Fail::Block(slow)
+                        };
+                        let w = self.values_word(p, f);
+                        let off = 8 * s.b as i32;
+                        let trans = if s.c != 0 && live_type(s.c, s.a) { crate::shape::transitions_adding(s.c as *mut PyTypeObject, name as *mut PyObject, s.b as usize) } else { Vec::new() };
+                        if trans.len() == 1 {
+                            // replace (shape = child) or add (shape = parent, room left)
+                            let (parent, child) = trans[0];
+                            let sh = self.shape_of(w);
+                            let add = self.new_block(u32::MAX);
+                            let replace = self.new_block(u32::MAX);
+                            let notc = self.new_block(u32::MAX);
+                            self.term(Term::Branch(Cond::Cmp(sh, Opnd::I(child as i64), Cc::E), replace, notc));
+                            self.switch_to(notc);
+                            self.check(Cond::Cmp(sh, Opnd::I(parent as i64), Cc::NE), f);
+                            // room left: the capacity byte (shape.rs) must exceed the index
+                            let cap = self.v(Class::G);
+                            self.emit(Inst::Load8(cap, Base::V(p), crate::shape::capacity_offset()));
+                            self.check(Cond::Cmp(cap, Opnd::I(s.b as i64), Cc::BE), f);
+                            self.term(Term::Jump(add));
+                            self.switch_to(add);
+                            let vb = self.values_base(p, w);
+                            self.emit(Inst::Store(Base::V(vb), off, val));
+                            let cv = self.imm(child as i64 | 1);
+                            self.emit(Inst::Store(Base::V(p), MANAGED_DICT, cv));
+                            if mt {
+                                self.emit(Inst::Unlock(p));
+                            }
+                            self.term(Term::Jump(cont));
+                            self.switch_to(replace);
+                        } else {
+                            self.check_shape_key(w, s.b, name, f);
+                        }
                         let vb = self.values_base(p, w);
+                        let old = self.v(Class::G);
+                        self.emit(Inst::Load(old, Base::V(vb), off));
                         self.emit(Inst::Store(Base::V(vb), off, val));
-                        let cv = self.imm(child as i64 | 1);
-                        self.emit(Inst::Store(Base::V(p), MANAGED_DICT, cv));
-                        self.term(Term::Jump(cont));
-                        self.switch_to(replace);
-                    } else {
-                        self.check_shape_key(w, s.b, name, f);
+                        if mt {
+                            self.emit(Inst::Unlock(p));
+                            self.emit(Inst::ReleaseAttr(p, old));
+                        } else {
+                            self.emit(Inst::XDecref(old));
+                            self.term(Term::Jump(cont));
+                        }
                     }
-                    let vb = self.values_base(p, w);
-                    let old = self.v(Class::G);
-                    self.emit(Inst::Load(old, Base::V(vb), off));
-                    self.emit(Inst::Store(Base::V(vb), off, val));
-                    self.emit(Inst::XDecref(old));
                 }
                 _ => {
-                    // __slots__ member: lock-free readers on other threads need the old
-                    // value released through QSBR, which the runtime path does
+                    // __slots__ member: single-threaded a plain store; (scale2) with
+                    // threads an atomic swap (slots are written without the object lock)
+                    // and qsbr::release_attr for the old value
                     let mta = self.imm(mt_addr);
-                    self.check(Cond::CmpMem(Base::V(mta), 0, 0, Cc::NE), f);
+                    let stb = self.new_block(u32::MAX);
+                    let mtb = self.new_block(u32::MAX);
+                    self.term(Term::Branch(Cond::CmpMem(Base::V(mta), 0, 0, Cc::NE), mtb, stb));
+                    self.switch_to(stb);
                     let old = self.v(Class::G);
                     self.emit(Inst::Load(old, Base::V(p), s.c as i32));
                     self.emit(Inst::Store(Base::V(p), s.c as i32, val));
                     self.emit(Inst::XDecref(old));
+                    self.term(Term::Jump(cont));
+                    self.switch_to(mtb);
+                    let old2 = self.v(Class::G);
+                    self.emit(Inst::Xchg(old2, Base::V(p), s.c as i32, val));
+                    self.emit(Inst::ReleaseAttr(p, old2));
                 }
             }
             self.term(Term::Jump(cont));

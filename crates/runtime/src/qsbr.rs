@@ -233,6 +233,69 @@ pub unsafe fn swap_field(slot: *mut *mut PyObject, new: *mut PyObject) {
     }
 }
 
+// ---------------------------------------------------------------- attribute storage (scale2)
+//
+// Values stored in an object's attribute storage (inline values of `shape.rs`,
+// `__slots__` members) are read lock-free. A value replaced there only needs the
+// deferred release if some thread other than the object's owner may be in the middle of
+// such a read. Such readers announce themselves once per object: before their first
+// lock-free read of the object's attribute storage they set the sticky `XREAD` bit in its
+// `ob_flags` (a locked RMW followed by a SeqCst fence). A writer swaps the value out with
+// a SeqCst RMW and then loads the flags (SeqCst): if it is the owner and sees the bit
+// clear, every non-owner reader's bit-setting comes after its swap in the single total
+// order, so such a reader's slot load sees the new value and the old one can be released
+// at once. Readers that are the owner thread need nothing (same thread as the writer);
+// writers that are not the owner always defer. Objects whose owner gave up ownership
+// (`ob_tid == 0`) have no owner: every access counts as a non-owner one.
+
+/// `ob_flags` bit: a thread other than the owner has read the attribute storage
+/// lock-free (bits 0-2 belong to the C API, 5-7 to `sharded.rs`, 8-15 to `shape.rs`).
+pub const XREAD: u16 = 1 << 4;
+
+/// Announce a lock-free read of `o`'s attribute storage by the calling thread (call
+/// before loading the slot).
+#[inline(always)]
+pub fn note_attr_read(o: &PyObject) {
+    if o.ob_tid.load(Relaxed) != crate::object::thread_id() && o.ob_flags.load(Relaxed) & XREAD == 0 {
+        mark_xread(o);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn mark_xread(o: &PyObject) {
+    o.ob_flags.fetch_or(XREAD, SeqCst);
+    std::sync::atomic::fence(SeqCst);
+}
+
+/// Release `old` (an owned reference or null), just swapped out of the attribute
+/// storage of `o` by a SeqCst RMW: at once when no other thread can be reading it
+/// lock-free (see above), else through QSBR. Must not be called with a leaf lock held
+/// (the release may run a deallocator).
+#[inline(always)]
+pub unsafe fn release_attr(o: *mut PyObject, old: *mut PyObject) {
+    unsafe {
+        if old.is_null() {
+            return;
+        }
+        if !multi_threaded() || ((*o).ob_tid.load(Relaxed) == crate::object::thread_id() && (*o).ob_flags.load(SeqCst) & XREAD == 0) {
+            crate::object::decref(old);
+            return;
+        }
+        decref_deferred(old);
+    }
+}
+
+/// Store `new` (an owned reference or null) into attribute storage `slot` of `o`
+/// (readers use `note_attr_read`) and release the previous value (`release_attr`).
+#[inline(always)]
+pub unsafe fn swap_attr(o: *mut PyObject, slot: *mut *mut PyObject, new: *mut PyObject) {
+    unsafe {
+        let old = std::sync::atomic::AtomicPtr::from_ptr(slot).swap(new, SeqCst);
+        release_attr(o, old);
+    }
+}
+
 /// Free raw storage `p` with `f` once no thread can still be reading it lock-free.
 pub unsafe fn free_deferred(p: *mut u8, f: unsafe fn(*mut u8)) {
     if !multi_threaded() {
@@ -475,6 +538,31 @@ fn poll(scan: bool) {
     }
     for b in orphan_ready {
         unsafe { release(b.into_iter().map(|i| i.0).collect()) };
+    }
+}
+
+/// (scale2) The calling thread is about to wait (lock acquire, sleep, join) and may not
+/// poll for a long time: close its open batch and release what has matured (with the
+/// other threads blocked too, that is everything), so that objects it retired are not
+/// kept alive for the whole wait (a weakref callback another thread waits for, a
+/// reference cycle through a frame...). Called where running deallocators is safe
+/// (the same places that run signal handlers).
+pub fn before_wait() {
+    let l = local();
+    if l.open.is_empty() && l.closed.is_empty() {
+        return;
+    }
+    if !l.open.is_empty() {
+        close_batch();
+    }
+    poll(true);
+    // Threads running Python report within microseconds (closing the batch asked them
+    // to); blocked ones already count as quiescent. Give them a moment rather than
+    // keeping the items for the whole wait.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2);
+    while !local().closed.is_empty() && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+        poll(true);
     }
 }
 

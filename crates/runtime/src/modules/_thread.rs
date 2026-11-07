@@ -571,6 +571,7 @@ fn handle_join(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRes
         raise!(PythonFinalizationError, "cannot join thread at interpreter shutdown");
     }
     let fgen = h.generation.load(Relaxed);
+    crate::threads::before_wait(); // scale2
     wait_interruptible(
         &h.state,
         &h.cv,

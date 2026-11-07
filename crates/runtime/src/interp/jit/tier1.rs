@@ -46,6 +46,7 @@ const OB_TID: i32 = offset_of!(PyObject, ob_tid) as i32;
 const OB_REF_LOCAL: i32 = offset_of!(PyObject, ob_ref_local) as i32;
 const OB_REF_SHARED: i32 = offset_of!(PyObject, ob_ref_shared) as i32;
 const OB_TYPE: i32 = offset_of!(PyObject, ob_type) as i32;
+const OB_MUTEX: i32 = offset_of!(PyObject, ob_mutex) as i32;
 const LV_TAG: i32 = offset_of!(PyLongObject, lv_tag) as i32;
 const LV_DIGIT: i32 = offset_of!(PyLongObject, ob_digit) as i32;
 const FVAL: i32 = offset_of!(PyFloatObject, ob_fval) as i32;
@@ -295,6 +296,55 @@ impl<'a> Gen<'a> {
         self.a.bind(skip);
     }
 
+    /// (scale2) Release the object's mutex taken inline (`lock cmpxchg` 0 -> 1): wake
+    /// parked waiters through the runtime when the byte is not plain 1. Clobbers rax
+    /// and r11; `obj` must not be rax or r11.
+    fn ob_unlock(&mut self, obj: R) {
+        let done = self.a.label();
+        self.a.mov_ri(Rax, 1);
+        self.a.mov_ri(R11, 0);
+        self.a.lock_cmpxchg8(M(obj, OB_MUTEX), R11);
+        self.a.jcc(Cc::E, done);
+        let rt = unlock_slow_routine().expect("tier1: unlock routine");
+        self.a.push(Rdi);
+        if obj != Rdi {
+            self.a.mov_rr(Rdi, obj);
+        }
+        self.a.mov_ri(R11, rt as i64);
+        self.a.call_r(R11);
+        self.a.pop(Rdi);
+        self.a.bind(done);
+    }
+
+    /// (scale2) Inline `qsbr::release_attr(obj, old)` after a swap of attribute storage
+    /// (the swap or the unlock that followed it was a locked instruction, i.e. a full
+    /// barrier before the flags load): `old` (may be null) is released at once when this
+    /// thread owns `obj` and no other thread read its attribute storage lock-free (XREAD
+    /// clear), else through QSBR. `obj` must be callee-saved (r14); clobbers the rest.
+    fn release_attr(&mut self, obj: R, old: R) {
+        const OB_FLAGS: i32 = offset_of!(PyObject, ob_flags) as i32;
+        let skip = self.a.label();
+        let defer = self.a.label();
+        self.a.test_rr(old, old);
+        self.a.jcc(Cc::E, skip);
+        self.a.cmp_rm(R15, M(obj, OB_TID));
+        self.a.jcc(Cc::NE, defer);
+        self.a.load8(R11, M(obj, OB_FLAGS));
+        self.a.test_ri(R11, crate::qsbr::XREAD as i32);
+        self.a.jcc(Cc::NE, defer);
+        if old != Rax {
+            self.a.mov_rr(Rax, old);
+        }
+        self.decref(Rax);
+        self.a.jmp(skip);
+        self.a.bind(defer);
+        if old != Rdi {
+            self.a.mov_rr(Rdi, old);
+        }
+        self.call(addr!(h::h_decref_deferred));
+        self.a.bind(skip);
+    }
+
     /// Eval-breaker poll (safepoints, signals, GC) at depth `depth`.
     fn poll(&mut self, pc: u32, depth: i32) {
         let slow = self.a.label();
@@ -335,9 +385,28 @@ impl<'a> Gen<'a> {
     }
     /// Record type-profile bits for the instruction at `pc` (fast paths). Clobbers r11.
     fn prof(&mut self, pc: u32, bits: u16) {
+        // (scale2) write only when a bit is new: an unconditional `or` stores to the
+        // shared profile line at every execution, and threads running the same code
+        // then fight over that cache line
         let p = self.prof_addr(pc);
+        let skip = self.a.label();
+        let set = self.a.label();
         self.a.mov_ri(R11, p);
-        self.a.or16_mi(M(R11, 0), bits);
+        for byte in 0..2 {
+            let b = (bits >> (8 * byte)) as u8;
+            for k in 0..8 {
+                if b & (1 << k) != 0 {
+                    self.a.test8_mi(M(R11, byte), 1 << k);
+                    self.a.jcc(Cc::E, set);
+                }
+            }
+        }
+        self.a.bind(skip);
+        self.stubs.push(Box::new(move |a: &mut Asm, _exit, _nlp| {
+            a.bind(set);
+            a.or16_mi(M(R11, 0), bits);
+            a.jmp(skip);
+        }));
     }
     /// Record the types of the stack operands at depths `da` and `db` (slow paths;
     /// clobbers caller-saved registers).
@@ -576,6 +645,10 @@ impl<'a> Gen<'a> {
                         let back = self.a.label();
                         let cnt = &self.cd.caches.t2_backedge as *const _ as i64;
                         self.a.mov_ri(R11, cnt);
+                        // (scale2) written only while it runs (>= 0; h_backedge parks it
+                        // at -1): threads running the same loop share this line
+                        self.a.cmp32_mi(M(R11, 0), 0);
+                        self.a.jcc(Cc::L, back);
                         // (weighted by the loop length, like the interpreter's counter)
                         self.a.sub32_mi(M(R11, 0), 1 + ((pc - arg) / 32) as i32);
                         self.a.jcc(Cc::L, stub);
@@ -1372,6 +1445,7 @@ impl<'a> Gen<'a> {
                     self.a.load(Rax, obj);
                     self.guard_tag(Rax, tag, slow);
                     let dict_path = self.a.label();
+                    emit_note_attr_read(&mut self.a, Rax); // scale2
                     self.inline_values(Rax, s.b, name, slow, dict_path);
                     self.incref(Rsi);
                     self.a.store(obj, Rsi);
@@ -1390,6 +1464,7 @@ impl<'a> Gen<'a> {
                     attr_kind = true;
                     self.a.load(Rax, obj);
                     self.guard_tag(Rax, tag, slow);
+                    emit_note_attr_read(&mut self.a, Rax); // scale2
                     self.a.load(Rsi, M(Rax, s.c as i32));
                     self.a.test_rr(Rsi, Rsi);
                     self.a.jcc(Cc::E, slow);
@@ -1608,13 +1683,12 @@ impl<'a> Gen<'a> {
                 }
                 (Op::StoreAttr, kind::SLOT) => {
                     let val = self.slot(d - 2);
+                    let mt = self.a.label();
                     self.a.load(Rax, obj);
                     self.guard_tag(Rax, tag, slow);
-                    // with threads the old value must go through QSBR (lock-free
-                    // readers): leave that to the helper
                     self.a.mov_ri(Rdi, (&raw const crate::threads::MULTI_THREADED) as i64);
                     self.a.cmp_mi(M(Rdi, 0), 0);
-                    self.a.jcc(Cc::NE, slow);
+                    self.a.jcc(Cc::NE, mt);
                     self.a.load(Rsi, val);
                     self.a.load(Rdx, M(Rax, s.c as i32));
                     self.a.store(M(Rax, s.c as i32), Rsi);
@@ -1622,10 +1696,21 @@ impl<'a> Gen<'a> {
                     self.xdecref(Rdx);
                     self.a.mov_rr(Rax, R14);
                     self.decref(Rax);
+                    self.a.jmp(done);
+                    // (scale2) with threads: swap atomically (slots are written without the
+                    // object lock), then release the old value at once or through QSBR
+                    self.a.bind(mt);
+                    self.a.load(Rsi, val);
+                    self.a.xchg_mr(M(Rax, s.c as i32), Rsi);
+                    self.a.mov_rr(R14, Rax);
+                    self.release_attr(R14, Rsi);
+                    self.a.mov_rr(Rax, R14);
+                    self.decref(Rax);
                     inline = true;
                 }
                 (Op::StoreAttr, kind::INSTANCE_DICT) if s.b < (1 << 20) => {
                     let val = self.slot(d - 2);
+                    let mt = self.a.label();
                     self.a.load(Rax, obj);
                     self.guard_tag(Rax, tag, slow);
                     // (perf5) attribute-adding store (`__init__`): with the object in the
@@ -1662,13 +1747,13 @@ impl<'a> Gen<'a> {
                         self.a.bind(not_add);
                     }
                     // inline values (jit3): replace the existing attribute in place
-                    // while single-threaded (rsi = old value, rdx = values word)
+                    // (rsi = old value, rdx = values word)
                     let dict_path = self.a.label();
-                    self.inline_values(Rax, s.b, name, slow, dict_path);
-                    // rcx = shape.voff: the slot is at rax + rcx + 8*hint (perf2 layout)
                     self.a.mov_ri(Rdi, (&raw const crate::threads::MULTI_THREADED) as i64);
                     self.a.cmp_mi(M(Rdi, 0), 0);
-                    self.a.jcc(Cc::NE, slow);
+                    self.a.jcc(Cc::NE, mt);
+                    self.inline_values(Rax, s.b, name, slow, dict_path);
+                    // rcx = shape.voff: the slot is at rax + rcx + 8*hint (perf2 layout)
                     self.a.load(Rdx, val);
                     self.a.store_idx(Rax, Rcx, 1, 8 * s.b as i32, Rdx);
                     self.a.mov_rr(R14, Rax);
@@ -1677,6 +1762,34 @@ impl<'a> Gen<'a> {
                     self.a.mov_rr(Rax, R14);
                     self.decref(Rax);
                     self.a.jmp(done);
+                    // (scale2) with threads: the same under the object's mutex (writers on
+                    // other threads may change the shape), taken inline when free; the
+                    // old value is released after the unlock (qsbr::release_attr)
+                    {
+                        let unlock_slow = self.a.label();
+                        let unlock_dict = self.a.label();
+                        self.a.bind(mt);
+                        self.a.mov_rr(R14, Rax);
+                        self.a.mov_ri(Rax, 0);
+                        self.a.mov_ri(R11, 1);
+                        self.a.lock_cmpxchg8(M(R14, OB_MUTEX), R11);
+                        self.a.jcc(Cc::NE, slow);
+                        self.inline_values(R14, s.b, name, unlock_slow, unlock_dict);
+                        self.a.load(Rdx, val);
+                        self.a.store_idx(R14, Rcx, 1, 8 * s.b as i32, Rdx);
+                        self.ob_unlock(R14);
+                        self.release_attr(R14, Rsi);
+                        self.a.mov_rr(Rax, R14);
+                        self.decref(Rax);
+                        self.a.jmp(done);
+                        self.a.bind(unlock_dict);
+                        self.ob_unlock(R14);
+                        self.a.mov_rr(Rax, R14);
+                        self.a.jmp(dict_path);
+                        self.a.bind(unlock_slow);
+                        self.ob_unlock(R14);
+                        self.a.jmp(slow);
+                    }
                     self.a.bind(dict_path);
                     self.managed_dict(Rax, slow, slow);
                     self.a.mov_rr(R14, Rax);
@@ -2270,6 +2383,13 @@ pub(crate) fn unlock_slow_routine() -> Option<usize> {
     *R.get_or_init(|| preserving_routine(h::h_ob_unlock_slow as usize))
 }
 
+/// (scale2) Same calling convention: deferred release (QSBR) of the object in rdi
+/// (tier-2 ReleaseAttr).
+pub(crate) fn decref_deferred_routine() -> Option<usize> {
+    static R: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *R.get_or_init(|| preserving_routine(h::h_decref_deferred as usize))
+}
+
 /// A routine calling `target(rdi)` that preserves every other general register and
 /// xmm0-15 and aligns the stack itself.
 fn preserving_routine(target: usize) -> Option<usize> {
@@ -2299,6 +2419,22 @@ fn preserving_routine(target: usize) -> Option<usize> {
         a.resolve().ok()?;
         crate::interp::jit::mem::install(&a.buf, |_, _| {})
     }
+}
+
+/// (scale2) Inline `qsbr::note_attr_read` for the object in `r` (not r11): a thread
+/// other than the owner sets the sticky XREAD bit before its first lock-free read of
+/// the object's attribute storage (`lock or` is a full barrier, so the slot load that
+/// follows is ordered after it). Clobbers r11 only.
+pub(crate) fn emit_note_attr_read(a: &mut Asm, r: R) {
+    const OB_FLAGS: i32 = offset_of!(PyObject, ob_flags) as i32;
+    let done = a.label();
+    a.cmp_rm(R15, M(r, OB_TID));
+    a.jcc(Cc::E, done);
+    a.load8(R11, M(r, OB_FLAGS));
+    a.test_ri(R11, crate::qsbr::XREAD as i32);
+    a.jcc(Cc::NE, done);
+    a.lock_or16_mi(M(r, OB_FLAGS), crate::qsbr::XREAD);
+    a.bind(done);
 }
 
 /// Out-of-line part of an inline incref when the object in `r` (not r11) is owned by

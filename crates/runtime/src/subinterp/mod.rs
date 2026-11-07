@@ -634,6 +634,9 @@ pub fn finalize_current() {
         crate::modules::sys_full::flush_std("stderr");
         clear_exc();
         crate::gc::collect();
+        // (scale2) deferred releases of this thread (QSBR, merge queue) happen now,
+        // while the modules their finalizers and weakref callbacks use still exist
+        crate::threads::before_wait();
         clear_exc();
         crate::modules::sys_finalize::finalize_modules();
         clear_exc();
