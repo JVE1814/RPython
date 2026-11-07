@@ -90,8 +90,17 @@ pub fn assign_type_tag(tp: *mut PyTypeObject) -> u32 {
         TYPE_VERSION.store(u32::MAX - 1, Relaxed);
         return 0;
     }
-    match tag_cell(tp).compare_exchange(0, v, AcqRel, Acquire) {
+    if TYPE_WRITERS.load(SeqCst) != 0 {
+        return 0;
+    }
+    match tag_cell(tp).compare_exchange(0, v, SeqCst, Acquire) {
         Ok(_) => {
+            // (stability3) a type attribute store that began meanwhile may already
+            // have reset the tags; caching now could pair this tag with the old value
+            if TYPE_WRITERS.load(SeqCst) != 0 {
+                let _ = tag_cell(tp).compare_exchange(v, 0, SeqCst, Relaxed);
+                return 0;
+            }
             unsafe { (*tp).tp_flags |= Py_TPFLAGS_VALID_VERSION_TAG };
             if heap {
                 unsafe { (*tp).tp_versions_used = (*tp).tp_versions_used.saturating_add(1) };
@@ -103,6 +112,12 @@ pub fn assign_type_tag(tp: *mut PyTypeObject) -> u32 {
     }
 }
 
+/// (stability3) Type attribute stores in progress (`type.__setattr__`). The store
+/// resets the version tags of the type and its subclasses *before* changing the dict
+/// and no tag is assigned while any store runs, so a cache hit can never return a
+/// value older than one a lock-free read of the type's dict already saw (CPython
+/// does both under its type lock).
+pub static TYPE_WRITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 const MAX_VERSIONS_PER_CLASS: u16 = 1000;
 
 /// (tail2) `_testinternalcapi.type_assign_specific_version_unsafe`: give `tp` the tag
@@ -365,6 +380,15 @@ pub mod kind {
     /// LoadAttr on a class object (metatype `type`): a = class tag, b = class ptr,
     /// c = value (plain, no __get__ binding needed).
     pub const TYPE_ATTR: u32 = 10;
+    /// (perf5) Like TYPE_ATTR for a class whose metatype is a subclass of `type`
+    /// with type's own attribute lookup: a = class tag | metatype tag << 32.
+    pub const TYPE_ATTR_META: u32 = 11;
+    /// (perf5) classmethod object c in the dict of class b (a as TYPE_ATTR_META, for
+    /// any such metatype including `type`): LoadMethod pushes its function with the
+    /// class as self; LoadAttr binds them.
+    pub const TYPE_CLASSMETHOD: u32 = 12;
+    /// (perf5) staticmethod object c in the dict of class b: its callable.
+    pub const TYPE_STATICMETHOD: u32 = 13;
     /// Instruction is not worth caching (megamorphic / unsupported).
     pub const UNCACHEABLE: u32 = 0xff;
 }

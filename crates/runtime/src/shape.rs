@@ -558,6 +558,39 @@ pub fn replace_hinted(o: &PyObject, name: *mut PyObject, hint: u64, val: &PyObje
     }
 }
 
+/// (perf5) Append interned `name` = `val` when the object's shape has exactly `hint`
+/// attributes, an existing transition for `name` and room for one more value (the
+/// store of an attribute-adding site such as `__init__`, without the key scan of
+/// `set_ix`). False: nothing done.
+pub fn add_hinted(o: &PyObject, name: *mut PyObject, hint: u64, val: &PyObject) -> bool {
+    let op = o.as_ptr();
+    let w = match slot_word(op) {
+        Some(w) => w,
+        None => return false,
+    };
+    unsafe {
+        let p = w.load(Acquire) as usize;
+        if p & 1 == 0 {
+            return false;
+        }
+        let sh = &*((p & !1) as *const Shape);
+        if sh.len as u64 != hint || sh.len >= capacity(op) {
+            return false;
+        }
+        // a transition adding `name` exists only if `sh` lacks it (Shape::add)
+        let Some(child) = sh.find_transition(name) else { return false };
+        let g = wlock(o);
+        if w.load(Acquire) as usize != p {
+            return false;
+        }
+        incref(val.as_ptr());
+        slot(op, sh, sh.len as usize).store(val.as_ptr(), Release);
+        w.store((child as usize | 1) as *mut PyObject, Release);
+        drop(g);
+        true
+    }
+}
+
 /// Convert the inline values of `o` into a real dict stored in the managed slot (no-op
 /// in dict mode). Returns true if the object is now in dict mode with a dict present.
 pub fn materialize(o: &PyObject) -> bool {
@@ -592,6 +625,8 @@ pub fn materialize(o: &PyObject) -> bool {
             }
         }
         dict::fill_fresh_steal(&d, &buf[..n]);
+        // (stability3) remembered for _testinternalcapi.has_split_table
+        d.ob_flags.fetch_or(dict::OBF_FROM_INSTANCE, Relaxed);
         // publish the dict first: until then readers still find the values in the
         // slots (alive: the dict holds them now)
         w.store(d.into_raw(), Release);

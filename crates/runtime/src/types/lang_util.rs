@@ -137,7 +137,8 @@ pub fn alloc(tp: *mut PyTypeObject) -> PyResult {
 #[inline]
 pub fn field(o: &PyObject, i: usize) -> Option<&PyObject> {
     unsafe {
-        let p = *((o.as_ptr() as *mut u8).add(HEADER + i * 8) as *mut *mut PyObject);
+        let p = std::sync::atomic::AtomicPtr::from_ptr((o.as_ptr() as *mut u8).add(HEADER + i * 8) as *mut *mut PyObject)
+            .load(std::sync::atomic::Ordering::Acquire);
         if p.is_null() { None } else { Some(&*p) }
     }
 }
@@ -148,8 +149,15 @@ pub fn field_ref(o: &PyObject, i: usize) -> Option<PyRef> {
 pub fn set_field(o: &PyObject, i: usize, v: Option<PyRef>) {
     unsafe {
         let s = (o.as_ptr() as *mut u8).add(HEADER + i * 8) as *mut *mut PyObject;
-        let old = std::mem::replace(&mut *s, v.map_or(std::ptr::null_mut(), |x| x.into_raw()));
-        xdecref(old);
+        let new = v.map_or(std::ptr::null_mut(), |x| x.into_raw());
+        if !crate::qsbr::multi_threaded() {
+            let old = std::mem::replace(&mut *s, new);
+            xdecref(old);
+            return;
+        }
+        // (stability3) readers (`field_ref`) load and incref without a lock (lazily
+        // computed `__parameters__`, iterator fields): the old value goes through QSBR
+        crate::qsbr::swap_field(s, new);
     }
 }
 

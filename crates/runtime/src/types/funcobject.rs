@@ -1007,16 +1007,34 @@ pub fn new_cell(v: Option<PyRef>) -> PyRef {
 #[inline]
 pub fn cell_get(c: &PyObject) -> Option<PyRef> {
     unsafe {
-        let p = (*(c.as_ptr() as *mut PyCellObject)).ob_ref;
+        let slot = &raw mut (*(c.as_ptr() as *mut PyCellObject)).ob_ref;
+        // (stability3) with threads, load and incref under the cell's lock: `cell_set`
+        // releases the old value right away (as CPython does under its critical
+        // section), so a reader must not be between the load and the incref then
+        let _g = if crate::threads::MULTI_THREADED.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            Some(crate::types::dict::ob_lock(c))
+        } else {
+            None
+        };
+        let p = *slot;
         if p.is_null() { None } else { Some(PyRef::from_borrowed(p)) }
     }
 }
+/// (stability3) The store happens under the cell's lock while threads exist (readers
+/// take it too, see `cell_get`; tier-1 code then reads through the helper), and the
+/// old value is released immediately, outside the lock: `events = []` must free the
+/// old list at once, as in CPython.
 #[inline]
 pub fn cell_set(c: &PyObject, v: Option<PyRef>) {
     unsafe {
-        let slot = &mut (*(c.as_ptr() as *mut PyCellObject)).ob_ref;
-        let old = *slot;
-        *slot = v.map_or(std::ptr::null_mut(), |v| v.into_raw());
+        let slot = &raw mut (*(c.as_ptr() as *mut PyCellObject)).ob_ref;
+        let new = v.map_or(std::ptr::null_mut(), |v| v.into_raw());
+        let old = if crate::threads::MULTI_THREADED.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            let _g = crate::types::dict::ob_lock(c);
+            std::ptr::replace(slot, new)
+        } else {
+            std::ptr::replace(slot, new)
+        };
         xdecref(old);
     }
 }

@@ -130,7 +130,7 @@ pub fn gen_send_ex(o: &PyObject, arg: Option<&PyObject>, throw: Option<PyRef>, c
     // no GIL: claiming the generator must be atomic (two threads may resume it at once)
     let gn = g(o);
     let flag = unsafe { &*(&raw mut gn.running as *const std::sync::atomic::AtomicBool) };
-    if flag.compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire).is_err() {
+    if flag.compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire).is_err() && !claim_after_readers(o) {
         let msg = if is_coroutine_exact(o) {
             "coroutine already executing"
         } else if is_asyncgen(o) {
@@ -357,17 +357,10 @@ unsafe fn jit_send_chain(ts: &crate::threads::ThreadState, o: *mut PyObject, v: 
         let mut g = o as *mut GenObject;
         // walk, claim and link the pass-through levels in one pass
         while k < room {
-            let f = (*g).frame;
-            if f.is_null() || (*f).state != FrameState::Suspended || (*f).yield_from_send < 0 || (*f).stack_top <= (*f).nlocalsplus {
-                break;
-            }
-            let recv = *(*f).slots.as_ptr().add((*f).stack_top - 1);
-            let rt = (*recv).type_ptr();
-            if rt != gt && rt != ct {
-                break;
-            }
             // claim (a plain store while single-threaded, see jit_send_one); a level
-            // that is already running ends the chain (resuming it reports that)
+            // that is already running ends the chain (resuming it reports that).
+            // (stability3) claimed before its frame is looked at: another thread may
+            // finish the generator and free the frame until then
             let flag = &*(&raw mut (*g).running as *const AtomicBool);
             if mt {
                 if flag.compare_exchange(false, true, AcqRel, Acquire).is_err() {
@@ -378,6 +371,17 @@ unsafe fn jit_send_chain(ts: &crate::threads::ThreadState, o: *mut PyObject, v: 
                     break;
                 }
                 flag.store(true, Relaxed);
+            }
+            let f = (*g).frame;
+            if f.is_null() || (*f).state != FrameState::Suspended || (*f).yield_from_send < 0 || (*f).stack_top <= (*f).nlocalsplus {
+                flag.store(false, Release);
+                break;
+            }
+            let recv = *(*f).slots.as_ptr().add((*f).stack_top - 1);
+            let rt = (*recv).type_ptr();
+            if rt != gt && rt != ct {
+                flag.store(false, Release);
+                break;
             }
             let gn = &mut *g;
             let f = &mut *f;
@@ -599,28 +603,12 @@ unsafe fn jit_send_one(ts: &crate::threads::ThreadState, o: *mut PyObject, v: *m
     use crate::interp::jit::tier1::ST_YIELD;
     unsafe {
         let gn = &mut *(o as *mut GenObject);
-        let fp = gn.frame;
-        if fp.is_null() || (*fp).resume == 0 {
-            return (JS_SLOW, std::ptr::null_mut());
-        }
-        let f = &mut *fp;
-        let none = none::none().as_ptr();
-        let push = match f.state {
-            FrameState::Suspended => true,
-            FrameState::Created if v.is_null() || v == none => false,
-            _ => return (JS_SLOW, std::ptr::null_mut()),
-        };
-        if crate::modules::sys::tracing_active() || crate::interp::pep523::forces_interpreter() || !crate::interp::jit::genfast_enabled() {
-            return (JS_SLOW, std::ptr::null_mut());
-        }
-        let depth = ts.recursion_depth.get() + 1;
-        if depth > ts.c.py_recursion_limit || crate::interp::stack_pointer() < ts.stack_soft_limit() {
-            return (JS_SLOW, std::ptr::null_mut());
-        }
         let flag = &*(&raw mut gn.running as *const std::sync::atomic::AtomicBool);
         // claim: while only one thread exists (threads set MULTI_THREADED before the
         // second one starts) nobody can race the claim, so a plain store does (a
-        // locked compare-exchange costs ~20 cycles per resumption)
+        // locked compare-exchange costs ~20 cycles per resumption).
+        // (stability3) The frame is inspected only once the generator is claimed:
+        // another thread resuming it meanwhile may finish it and free the frame.
         if crate::threads::MULTI_THREADED.load(std::sync::atomic::Ordering::Relaxed) == 0 {
             if flag.load(std::sync::atomic::Ordering::Relaxed) {
                 return (JS_SLOW, std::ptr::null_mut());
@@ -628,6 +616,28 @@ unsafe fn jit_send_one(ts: &crate::threads::ThreadState, o: *mut PyObject, v: *m
             flag.store(true, std::sync::atomic::Ordering::Relaxed);
         } else if flag.compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire).is_err() {
             return (JS_SLOW, std::ptr::null_mut());
+        }
+        let unclaim = || {
+            flag.store(false, std::sync::atomic::Ordering::Release);
+            (JS_SLOW, std::ptr::null_mut())
+        };
+        let fp = gn.frame;
+        if fp.is_null() || (*fp).resume == 0 {
+            return unclaim();
+        }
+        let f = &mut *fp;
+        let none = none::none().as_ptr();
+        let push = match f.state {
+            FrameState::Suspended => true,
+            FrameState::Created if v.is_null() || v == none => false,
+            _ => return unclaim(),
+        };
+        if crate::modules::sys::tracing_active() || crate::interp::pep523::forces_interpreter() || !crate::interp::jit::genfast_enabled() {
+            return unclaim();
+        }
+        let depth = ts.recursion_depth.get() + 1;
+        if depth > ts.c.py_recursion_limit || crate::interp::stack_pointer() < ts.stack_soft_limit() {
+            return unclaim();
         }
         if push {
             let x = if v.is_null() {
@@ -906,9 +916,100 @@ fn with_frame_on_stack<R>(o: &PyObject, f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// (stability3) Claim generator `o` for the calling thread (as resuming it does), or
+/// raise "... already executing".
+fn claim(o: &PyObject) -> PyResult<()> {
+    use std::sync::atomic::{AtomicBool, Ordering::*};
+    let flag = unsafe { &*(&raw mut g(o).running as *const AtomicBool) };
+    if flag.compare_exchange(false, true, AcqRel, Acquire).is_err() && !claim_after_readers(o) {
+        raise!(ValueError, "{} already executing", kind_name(o));
+    }
+    Ok(())
+}
+
+/// (stability3) Generators claimed for a moment by `gi_yieldfrom`/`cr_await` readers
+/// (one entry per reader). A reader needs the claim to look at the suspended frame
+/// (a resumer could pop and release the delegate, a closer free the frame), but must
+/// not make a concurrent resumption fail with "already executing", nor another reader
+/// see None: both wait for the reader instead.
+static YF_READERS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+fn readers_of(o: &PyObject) -> usize {
+    let k = o.as_ptr() as usize;
+    YF_READERS.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|&&x| x == k).count()
+}
+
+/// The claim on `o` just failed: if a reader holds it, wait for the reader and take
+/// the claim. False: a real resumption holds it.
+fn claim_after_readers(o: &PyObject) -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering::*};
+    let flag = unsafe { &*(&raw mut g(o).running as *const AtomicBool) };
+    for _ in 0..100_000 {
+        if readers_of(o) == 0 {
+            // one last try: the reader may have left between the CAS and the check
+            return flag.compare_exchange(false, true, AcqRel, Acquire).is_ok();
+        }
+        std::thread::yield_now();
+        if flag.compare_exchange(false, true, AcqRel, Acquire).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// `gi_yieldfrom` / `cr_await`: the delegate, read with the generator claimed.
+fn yieldfrom_shared(o: &PyObject) -> Option<PyRef> {
+    use std::sync::atomic::{AtomicBool, Ordering::*};
+    if !crate::threads::multi_threaded() {
+        return yieldfrom(o);
+    }
+    let k = o.as_ptr() as usize;
+    let flag = unsafe { &*(&raw mut g(o).running as *const AtomicBool) };
+    YF_READERS.lock().unwrap_or_else(|e| e.into_inner()).push(k);
+    let leave = || {
+        let mut v = YF_READERS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = v.iter().position(|&x| x == k) {
+            v.swap_remove(i);
+        }
+    };
+    let mut claimed = false;
+    for _ in 0..100_000 {
+        if flag.compare_exchange(false, true, AcqRel, Acquire).is_ok() {
+            claimed = true;
+            break;
+        }
+        // held by another reader: wait for it; by a resumption: the generator is
+        // running, so it has no suspended delegate
+        if readers_of(o) <= 1 {
+            // the reader holding it may have left between the CAS and the count
+            if flag.compare_exchange(false, true, AcqRel, Acquire).is_ok() {
+                claimed = true;
+            }
+            break;
+        }
+        std::thread::yield_now();
+    }
+    let r = if claimed { yieldfrom(o) } else { None };
+    if claimed {
+        flag.store(false, Release);
+    }
+    leave();
+    r
+}
+fn unclaim(o: &PyObject) {
+    use std::sync::atomic::{AtomicBool, Ordering::Release};
+    unsafe { (*(&raw mut g(o).running as *const AtomicBool)).store(false, Release) };
+}
+
 pub fn gen_throw_impl(o: &PyObject, typ: &PyObject, val: Option<&PyObject>, tb: Option<&PyObject>, close_on_genexit: bool) -> PyResult {
-    // delegate to sub-iterator first
-    if let Some(yf) = yieldfrom(o) {
+    // delegate to sub-iterator first; (stability3) the frame is inspected, and the
+    // delegation run, with the generator claimed (another thread may resume or close it)
+    claim(o)?;
+    let yf = yieldfrom(o);
+    if yf.is_none() {
+        unclaim(o);
+    }
+    if let Some(yf) = yf {
         // GeneratorExit (class, subclass or instance) closes the sub-iterator and
         // is then raised here
         let is_genexit = if exc::is_exception_class(typ) {
@@ -917,9 +1018,8 @@ pub fn gen_throw_impl(o: &PyObject, typ: &PyObject, val: Option<&PyObject>, tb: 
             is_subtype(typ.type_ptr(), exc::GeneratorExit())
         };
         if is_genexit && close_on_genexit {
-            g(o).running = true;
             let r = close_iter(&yf);
-            g(o).running = false;
+            unclaim(o);
             if r.is_err() {
                 let e = take_exc().unwrap();
                 return resume_with_error(o, e);
@@ -927,15 +1027,21 @@ pub fn gen_throw_impl(o: &PyObject, typ: &PyObject, val: Option<&PyObject>, tb: 
             return throw_here(o, typ, val, tb);
         }
         let r = if is_any_gen(&yf) {
-            g(o).running = true;
             let r = with_frame_on_stack(o, || gen_throw_impl(&yf, typ, val, tb, close_on_genexit));
-            g(o).running = false;
+            unclaim(o);
             r
         } else {
-            match ab::getattr_opt(&yf, name!("throw"))? {
-                None => return throw_here(o, typ, val, tb),
-                Some(m) => {
-                    g(o).running = true;
+            let m = ab::getattr_opt(&yf, name!("throw"));
+            match m {
+                Err(e) => {
+                    unclaim(o);
+                    return Err(e);
+                }
+                Ok(None) => {
+                    unclaim(o);
+                    return throw_here(o, typ, val, tb);
+                }
+                Ok(Some(m)) => {
                     let mut args: Vec<&PyObject> = vec![typ];
                     if let Some(v) = val {
                         args.push(v);
@@ -947,7 +1053,7 @@ pub fn gen_throw_impl(o: &PyObject, typ: &PyObject, val: Option<&PyObject>, tb: 
                         args.push(t);
                     }
                     let r = with_frame_on_stack(o, || ab::call(&m, &args));
-                    g(o).running = false;
+                    unclaim(o);
                     r
                 }
             }
@@ -1093,7 +1199,7 @@ fn gen_throw(o: &PyObject, args: &[&PyObject]) -> PyResult {
 /// observe the exception, so the effect is just finishing the frame. (An abandoned
 /// `any(x for x in ...)` closes its generator on every call.)
 fn close_without_throw(gn: &GenObject) -> bool {
-    if gn.running || crate::modules::sys::tracing_active() {
+    if crate::modules::sys::tracing_active() {
         return false;
     }
     let f = unsafe { &*gn.frame };
@@ -1121,14 +1227,19 @@ pub fn gen_close(o: &PyObject) -> PyResult {
     if gn.frame.is_null() {
         return Ok(none::none_ref());
     }
-    if unsafe { (*gn.frame).state == FrameState::Created } {
-        finish(gn);
+    // (stability3) finishing the frame here requires the claim: another thread may be
+    // resuming the generator (its frame must not be freed under it)
+    claim(o)?;
+    if gn.frame.is_null() {
+        unclaim(o);
         return Ok(none::none_ref());
     }
-    if close_without_throw(gn) {
+    if unsafe { (*gn.frame).state == FrameState::Created } || close_without_throw(gn) {
         finish(gn);
+        unclaim(o);
         return Ok(none::none_ref());
     }
+    unclaim(o);
     let ge = type_ref(exc::GeneratorExit());
     match gen_throw_impl(o, &ge, None, None, true) {
         Ok(_) => {
@@ -1365,7 +1476,7 @@ fn get_code(o: &PyObject) -> PyResult {
     unsafe { Ok(PyRef::from_borrowed(g(o).code)) }
 }
 fn get_yieldfrom(o: &PyObject) -> PyResult {
-    Ok(yieldfrom(o).unwrap_or_else(none::none_ref))
+    Ok(yieldfrom_shared(o).unwrap_or_else(none::none_ref))
 }
 fn gen_sizeof(_o: &PyObject) -> PyResult {
     Ok(crate::types::int::new_int(std::mem::size_of::<GenObject>() as i64))

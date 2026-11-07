@@ -306,10 +306,15 @@ pub fn instance_dict_existing(o: &PyObject) -> Option<PyRef> {
             return None;
         }
         let slot = dict_slot(o.as_ptr());
-        if slot.is_null() || (*slot).is_null() {
+        if slot.is_null() {
             return None;
         }
-        Some(PyRef::from_borrowed(*slot))
+        // (stability3) one load: another thread may assign __dict__ meanwhile
+        let d = std::sync::atomic::AtomicPtr::from_ptr(slot).load(std::sync::atomic::Ordering::Acquire);
+        if d.is_null() {
+            return None;
+        }
+        Some(PyRef::from_borrowed(d))
     }
 }
 

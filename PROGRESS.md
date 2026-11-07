@@ -1,13 +1,13 @@
 # PROGRESS
 
 ## Status 2026-11-07 (day 7, afternoon)
-Master ca5cdc8: core6, perf4, tail1, capi2, cleanroom1 (14 Lib modules rewritten clean-room), scale1 (multi-core scaling) merged today; suite run 12: 367/434 modules pass, 129 failures, 70 errors. Smoke on snap19: test_capi 40 failures (was 433 in run 11),
+Master 0a2f1fa: core6, perf4, tail1, capi2, cleanroom1+2 (20 Lib modules rewritten clean-room), scale1 (multi-core scaling), tail2 (re.DEBUG, _zoneinfo, ssl PSK, alloc-failure injection, 22 modules) merged today; suite run 13 running; suite run 12: 367/434 modules pass, 129 failures, 70 errors. Smoke on snap19: test_capi 40 failures (was 433 in run 11),
 stable_abi_ctypes/fileutils pass, cmd_line_script 1; tail1 fixed ~60 long-tail modules (inspect, codecs, time,
 path modules, math, buffer, logging, json, ...). Run 11 (pre-merges):
 294/434 modules pass, 674 failures (241 without test_capi), 616 errors. Baseline free-threaded CPython: 416/434.
 Running agents: scale2 (scaling round 2 + prompt-free regression in test_concurrent_futures), perf5 (remaining slow benchmarks), stability3 (test_free_threading races,
-flaky crashes, gc hang), tail2 (alloc-failure injection, re.DEBUG, _zoneinfo, pdb, tkinter, leftovers),
-cleanroom2 (continuing the D19 Lib audit).
+flaky crashes), tail3 (crossinterp, getpath, nturl2path, asyncio, ast, leftovers), pdb1 (clean-room pdb, remote pdb,
+profiling.sampling).
 Earlier history (2026-11-02): agents stopped when the weekly API limit was hit; resumed Nov 5.
 
 ## RESUMED (2026-11-01, 22:15 UTC) after a pause at user request
@@ -121,7 +121,31 @@ Run 1 top blockers: py_compile (230 modules; merged since), unittest.mock (57), 
 array (24), socket (17), pathlib (16), http (14), multiprocessing, decimal, datetime, ntpath.
 
 ## Benchmarks
-### Latest (perf4, 2026-11-07; wall-clock ratio ours / best CPython, pinned to one core, one run each, loaded machine, ±10%)
+### Latest (perf5, 2026-11-07; wall ratio ours / best CPython, pinned one core, one run each, load 6–7, ±10–15%)
+| benchmark | perf4 | perf5 |
+|---|---|---|
+| xml_etree | 1.55 | 1.55 |
+| deepcopy | 1.52 | 1.36 |
+| bpe_tokeniser | 1.27 | 1.30 |
+| logging | 1.34 | 1.30 |
+| python_startup | 1.33 | 1.29 |
+| comprehensions | 1.35 | 1.27 |
+| typing_runtime_protocols | 1.37 | 1.25 |
+| mdp | 1.33 | 1.24 |
+| base64 | 1.28 | 1.18 |
+| async_generators | 1.25 | 1.17 |
+| pathlib | 1.87 | 1.16 |
+| nqueens | 1.30 | 1.14 |
+| concurrent_imap | 1.00 | 1.08 |
+| pprint | 1.11 | 1.02 |
+| go | 1.03 | 0.97 |
+| gc_traversal | 1.42 | 0.70 |
+| gc_collect | 0.66 | 0.51 |
+Instructions per call: bound method 447 (CPython 502), property read 401 (441), kw call 743 (701), raise+catch 4042
+(3686). Peak memory 35.3 MB (CPython 32.4). Startup `-c pass` 55.8M instructions (40.5M). perf6 is on startup
+(CDS-style startup image), slow call paths, xml_etree's expat engine, raise/catch, memory.
+
+### Previous (perf4, 2026-11-07; wall-clock ratio ours / best CPython, pinned to one core, one run each, loaded machine, ±10%)
 About 11 of 32 benchmarks beat or match the best CPython build (json_dumps 0.83, json_loads, raytrace, richards 0.60,
 deltablue, chaos 0.65, float, hexiom, gc_collect, coroutines 0.98, unpack_sequence); fannkuch and go within a few %.
 

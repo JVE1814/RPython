@@ -322,3 +322,11 @@ test_ttk reach `requires('gui')` and regrtest reports "NO TESTS RAN", exit 4). B
 neither run executes a test. The comparison with CPython counts skipped tests, so this changes classification only.
 With a display and `-u gui` both modules pass for us (1424 tests, tail2). Errors (tests that raise) are recorded in a
 seventh column, since regrtest's "Total tests" line counts only failures.
+
+## D29 — Direct calls between our own code units (2026-11-07)
+`.cargo/config.toml` adds `-Z plt=yes -Z relax-elf-relocations=yes` (RUSTC_BOOTSTRAP is already set for D18). With the
+exports.map version script (perf4: only Py*/_Py*/PY_*/RPY_* symbols are exported), the linker relaxes GOT-indirect
+calls and data loads between our crates into direct `call`/`lea`, about 3–4% on call-heavy benchmarks (perf4/perf5
+measurements). C extensions are unaffected: the exported C-API symbols keep their dynamic binding. Verified by perf5
+with test_ctypes, a test_capi subset, the spec's test extensions and the numpy cp315t wheel. Every agent rebuilds
+fully once after merging this.

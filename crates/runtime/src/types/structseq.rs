@@ -106,7 +106,11 @@ unsafe fn alloc_instance(tp: *mut PyTypeObject, visible: usize) -> *mut PyObject
 }
 
 /// Create an instance from exactly `n_fields` values (visible ones first).
-pub fn new_instance(tp: *mut PyTypeObject, values: Vec<PyRef>) -> PyRef {
+pub fn new_instance<I: IntoIterator<Item = PyRef>>(tp: *mut PyTypeObject, values: I) -> PyRef
+where
+    I::IntoIter: ExactSizeIterator,
+{
+    let values = values.into_iter();
     let visible = (values.len()).saturating_sub(hidden_count(tp));
     unsafe {
         let op = alloc_instance(tp, visible);

@@ -164,6 +164,20 @@ fn check_not_in_timer(o: &PyObject, what: &str) -> PyResult<()> {
 // ------------------------------------------------------------------ bookkeeping
 
 fn enter(o: &PyObject, key: usize, obj: &PyObject) {
+    // (stability3) A new entry for a builtin keeps its descriptive label, not the
+    // builtin itself: a bound builtin references its `self` (a list, the profiler
+    // itself for `pr.disable()`, ...), which would keep that object alive as long as
+    // the profiler, and form a cycle through the profiler only a collection breaks.
+    let fresh = if st(o).table.lock().unwrap().entries.contains_key(&key) {
+        None
+    } else if cfunction::is_cfunction(obj) {
+        Some(label(obj).unwrap_or_else(|_| {
+            let _ = take_exc_if_any();
+            obj.to_ref()
+        }))
+    } else {
+        Some(obj.to_ref())
+    };
     let t = now(o);
     let p = st(o);
     let subcalls = p.subcalls;
@@ -174,7 +188,7 @@ fn enter(o: &PyObject, key: usize, obj: &PyObject) {
         tb.order.push(key);
         tb.entries.insert(
             key,
-            Entry { obj: obj.to_ref(), calls: 0, rec: 0, total: 0.0, inline: 0.0, level: 0, subs: HashMap::new(), sub_order: Vec::new() },
+            Entry { obj: fresh.unwrap_or_else(|| obj.to_ref()), calls: 0, rec: 0, total: 0.0, inline: 0.0, level: 0, subs: HashMap::new(), sub_order: Vec::new() },
         );
     }
     tb.entries.get_mut(&key).unwrap().level += 1;

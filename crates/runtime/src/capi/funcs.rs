@@ -718,19 +718,45 @@ fn extra_free_fn(index: usize) -> Option<unsafe extern "C" fn(*mut c_void)> {
     let f = *CODE_EXTRA.lock().unwrap().get(index)?;
     if f == 0 { None } else { Some(unsafe { std::mem::transmute::<usize, unsafe extern "C" fn(*mut c_void)>(f) }) }
 }
-unsafe fn extra_slot(co: *mut PyObject) -> *mut usize {
-    unsafe { &mut (*(co as *mut code::PyCodeObject))._reserved[6] as *mut usize }
+unsafe fn extra_slot<'a>(co: *mut PyObject) -> &'a std::sync::atomic::AtomicUsize {
+    unsafe { std::sync::atomic::AtomicUsize::from_ptr(&raw mut (*(co as *mut code::PyCodeObject))._reserved[6]) }
+}
+/// (stability3) The per-code values: one atomic cell per possible index, installed once
+/// with a CAS, so threads setting and getting extras concurrently need no lock (a
+/// growable vector was resized under readers and writers: heap corruption).
+type Extras = [std::sync::atomic::AtomicUsize; MAX_CO_EXTRA];
+const MAX_CO_EXTRA: usize = 255;
+unsafe fn extras_of<'a>(co: *mut PyObject, create: bool) -> Option<&'a Extras> {
+    use std::sync::atomic::Ordering::*;
+    unsafe {
+        let slot = extra_slot(co);
+        let p = slot.load(Acquire);
+        if p != 0 {
+            return Some(&*(p as *const Extras));
+        }
+        if !create {
+            return None;
+        }
+        let fresh = Box::into_raw(Box::new([const { std::sync::atomic::AtomicUsize::new(0) }; MAX_CO_EXTRA])) as usize;
+        match slot.compare_exchange(0, fresh, AcqRel, Acquire) {
+            Ok(_) => Some(&*(fresh as *const Extras)),
+            Err(cur) => {
+                drop(Box::from_raw(fresh as *mut Extras));
+                Some(&*(cur as *const Extras))
+            }
+        }
+    }
 }
 /// Called by the code object's deallocator.
 pub(crate) unsafe fn free_code_extras(co: *mut PyObject) {
     unsafe {
-        let slot = extra_slot(co);
-        if *slot == 0 {
+        let p = extra_slot(co).swap(0, std::sync::atomic::Ordering::AcqRel);
+        if p == 0 {
             return;
         }
-        let v = Box::from_raw(*slot as *mut Vec<usize>);
-        *slot = 0;
-        for (i, &x) in v.iter().enumerate() {
+        let v = Box::from_raw(p as *mut Extras);
+        for (i, x) in v.iter().enumerate() {
+            let x = x.load(std::sync::atomic::Ordering::Acquire);
             if x != 0 {
                 if let Some(f) = extra_free_fn(i) {
                     f(x as *mut c_void);
@@ -747,10 +773,9 @@ pub unsafe extern "C" fn PyUnstable_Code_GetExtra(co: *mut PyObject, index: Py_s
             return -1;
         }
         *extra = std::ptr::null_mut();
-        let slot = extra_slot(co);
-        if index >= 0 && *slot != 0 {
-            if let Some(&x) = (&*(*slot as *const Vec<usize>)).get(index as usize) {
-                *extra = x as *mut c_void;
+        if index >= 0 && (index as usize) < MAX_CO_EXTRA {
+            if let Some(v) = extras_of(co, false) {
+                *extra = v[index as usize].load(std::sync::atomic::Ordering::Acquire) as *mut c_void;
             }
         }
         0
@@ -763,16 +788,9 @@ pub unsafe extern "C" fn PyUnstable_Code_SetExtra(co: *mut PyObject, index: Py_s
             let _ = bad_internal();
             return -1;
         }
-        let slot = extra_slot(co);
-        if *slot == 0 {
-            *slot = Box::into_raw(Box::new(Vec::<usize>::new())) as usize;
-        }
-        let v = &mut *(*slot as *mut Vec<usize>);
         let i = index as usize;
-        if v.len() <= i {
-            v.resize(i + 1, 0);
-        }
-        let old = std::mem::replace(&mut v[i], extra as usize);
+        let v = extras_of(co, true).unwrap();
+        let old = v[i].swap(extra as usize, std::sync::atomic::Ordering::AcqRel);
         if old != 0 {
             if let Some(f) = extra_free_fn(i) {
                 f(old as *mut c_void);

@@ -585,6 +585,55 @@ pub fn quiesce_now() {
     }
 }
 
+/// (stability3) Retired items handed out by `take_for_gc`.
+pub struct Taken(Vec<Item>);
+
+/// Anything retired (by any thread, or orphaned) and not yet released?
+pub fn has_pending_for_gc() -> bool {
+    if PENDING_TOTAL.load(Relaxed) > 0 {
+        return true;
+    }
+    let locals = LOCALS.lock().unwrap_or_else(|e| e.into_inner());
+    locals.iter().any(|&lp| !unsafe { &*(lp as *const Local) }.open.is_empty())
+}
+
+/// (stability3) Take every retired item of every thread and every orphaned batch.
+/// Only call with the world stopped: no thread is then inside a lock-free read, so
+/// all of them are due. Unlike `take_all_for_gc` (whose items go back to their
+/// threads, or are released after the collection), the caller releases these itself
+/// with `release_taken_now` once the world runs again and *before* analysing the
+/// heap: a reference that a thread dropped while other threads existed (e.g. `del x`
+/// of a global) must not keep a cycle alive, and a thread blocked for a long time
+/// (one left over by an earlier test) would otherwise hold its items until it wakes.
+pub fn take_for_gc() -> Taken {
+    let mut out: Vec<Item> = Vec::new();
+    let locals = LOCALS.lock().unwrap_or_else(|e| e.into_inner());
+    for &lp in locals.iter() {
+        let l = unsafe { &mut *(lp as *mut Local) };
+        let open = std::mem::take(&mut l.open);
+        PENDING_TOTAL.fetch_add(open.len(), Relaxed);
+        out.extend(open);
+        for (_, items) in l.closed.drain(..) {
+            out.extend(items);
+        }
+        l.polls = 0;
+    }
+    drop(locals);
+    let mut o = ORPHANS.lock().unwrap_or_else(|e| e.into_inner());
+    for (_, items) in o.drain(..) {
+        out.extend(items.into_iter().map(|i| i.0));
+    }
+    ORPHAN_MIN.store(u64::MAX, Relaxed);
+    Taken(out)
+}
+
+/// Release what `take_for_gc` returned (world running).
+pub fn release_taken_now(t: Taken) {
+    if !t.0.is_empty() {
+        unsafe { release(t.0) };
+    }
+}
+
 /// Number of retired items not yet released (diagnostics/tests).
 pub fn pending() -> usize {
     PENDING_TOTAL.load(Relaxed) + local().open.len()
