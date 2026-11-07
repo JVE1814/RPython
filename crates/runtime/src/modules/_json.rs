@@ -244,11 +244,54 @@ fn push_u_escape(out: &mut StrBuilder, c: u32) {
     out.push(HEX[(c & 0xf) as usize] as u32);
 }
 
+/// Characters that are copied unchanged into JSON text by both escapers.
+#[inline]
+fn json_plain(c: u8) -> bool {
+    c >= 0x20 && c != b'"' && c != b'\\' && c < 0x7f
+}
+
 fn escape_into(out: &mut StrBuilder, s: &PyObject, ascii: bool) {
     let d = pystr::str_data(s);
+    if let StrData::L1(b) = d {
+        // ASCII/Latin-1: copy runs of plain characters in one go
+        out.push_ascii(b"\"");
+        let mut start = 0;
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i];
+            if json_plain(c) {
+                i += 1;
+                continue;
+            }
+            if c >= 0x80 && !ascii {
+                // non-ASCII Latin-1 is copied unescaped
+                i += 1;
+                continue;
+            }
+            if start < i {
+                out.push_data(StrData::L1(&b[start..i]));
+            }
+            escape_one(out, c as u32, ascii);
+            i += 1;
+            start = i;
+        }
+        if start < b.len() {
+            out.push_data(StrData::L1(&b[start..]));
+        }
+        out.push_ascii(b"\"");
+        return;
+    }
     out.push(b'"' as u32);
     for i in 0..d.len() {
-        let c = d.get(i);
+        escape_one(out, d.get(i), ascii);
+    }
+    out.push(b'"' as u32);
+}
+
+/// Append the JSON form of one character.
+#[inline]
+fn escape_one(out: &mut StrBuilder, c: u32, ascii: bool) {
+    {
         match c {
             0x22 => {
                 out.push(b'\\' as u32);
@@ -291,7 +334,6 @@ fn escape_into(out: &mut StrBuilder, s: &PyObject, ascii: bool) {
             _ => out.push(c),
         }
     }
-    out.push(b'"' as u32);
 }
 
 fn escape_str(s: &PyObject, ascii: bool) -> PyRef {
@@ -689,15 +731,22 @@ static mut ENCODE_UNICODE_FN: *mut PyObject = std::ptr::null_mut();
 unsafe extern "C" fn encoder_new(tp: *mut PyTypeObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
     unsafe {
         let r = (|| -> PyResult {
-            let (pos, kwn) = crate::args::kwdict_to_vectorcall(&*args, kw);
-            let refs: Vec<&PyObject> = pos.iter().map(|x| &**x).collect();
-            let p = crate::args::Params::new(
-                "make_encoder",
-                &["markers", "default", "encoder", "indent", "key_separator", "item_separator", "sort_keys", "skipkeys", "allow_nan"],
-                0,
-                9,
-            );
-            let a = crate::args::parse::<9>(&p, &refs, kwn.as_deref())?;
+            let a: [Option<&PyObject>; 9] = if kw.is_null() && tuple::tuple_len(&*args) == 9 {
+                std::array::from_fn(|i| Some(tuple::tuple_get(&*args, i)))
+            } else {
+                let (pos, kwn) = crate::args::kwdict_to_vectorcall(&*args, kw);
+                let refs: Vec<&PyObject> = pos.iter().map(|x| &**x).collect();
+                let p = crate::args::Params::new(
+                    "make_encoder",
+                    &["markers", "default", "encoder", "indent", "key_separator", "item_separator", "sort_keys", "skipkeys", "allow_nan"],
+                    0,
+                    9,
+                );
+                let a = crate::args::parse::<9>(&p, &refs, kwn.as_deref())?;
+                // the parsed references point into `pos`, which lives until the end of
+                // this call; the caller's tuple/dict keep the objects alive as well
+                a.map(|x| x.map(|r| &*(r as *const PyObject)))
+            };
             let markers = a[0].unwrap();
             if !markers.is(none::none()) && !dict::is_dict(markers) {
                 raise!(TypeError, "make_encoder() argument 1 must be dict or None, not {}", tname(markers));
@@ -760,6 +809,20 @@ unsafe extern "C" fn encoder_dealloc(o: *mut PyObject) {
 struct Enc<'a> {
     e: &'a EncoderObj,
     out: StrBuilder,
+    /// Circular-reference bookkeeping kept here instead of in the `markers` dict
+    /// (used when that dict is empty at the start of the call: the dict then stays
+    /// empty, exactly as it would be after a successful encoding).
+    private_markers: bool,
+    active: Vec<usize>,
+    use_set: bool,
+    active_set: std::collections::HashSet<usize>,
+}
+
+/// How a container was registered for the circular-reference check.
+enum Mark {
+    None,
+    Private,
+    Dict(PyRef),
 }
 
 fn is_frozendict(o: &PyObject) -> bool {
@@ -820,6 +883,43 @@ impl<'a> Enc<'a> {
         ab::repr(&crate::types::int_methods::exact_copy(o))
     }
 
+    /// Append the decimal text of an int (machine-word values without a str object).
+    fn push_int(&mut self, o: &PyObject) -> PyResult<()> {
+        if let Some(v) = int::as_i64(o) {
+            let mut buf = [0u8; 20];
+            let mut i = buf.len();
+            let mut m = v.unsigned_abs();
+            loop {
+                i -= 1;
+                buf[i] = b'0' + (m % 10) as u8;
+                m /= 10;
+                if m == 0 {
+                    break;
+                }
+            }
+            if v < 0 {
+                self.out.push_ascii(b"-");
+            }
+            self.out.push_ascii(&buf[i..]);
+            return Ok(());
+        }
+        let s = self.int_str(o)?;
+        self.out.push_obj(&s);
+        Ok(())
+    }
+
+    /// Append the text of a float (repr for finite values).
+    fn push_float(&mut self, o: &PyObject) -> PyResult<()> {
+        let v = float::float_value(o);
+        if v.is_finite() {
+            self.out.push_ascii(rpy_numfmt::float_repr(v).as_bytes());
+            return Ok(());
+        }
+        let s = self.float_str(o)?;
+        self.out.push_obj(&s);
+        Ok(())
+    }
+
     fn newline_indent(&mut self, level: usize) {
         self.out.push(b'\n' as u32);
         let ind = unsafe { &*self.e.indent };
@@ -834,19 +934,20 @@ impl<'a> Enc<'a> {
 
     fn encode_obj(&mut self, o: &PyObject, level: usize) -> PyResult<()> {
         if o.is(none::none()) {
-            self.out.push_str("null");
+            self.out.push_ascii(b"null");
         } else if o.is(bool_::true_obj()) {
-            self.out.push_str("true");
+            self.out.push_ascii(b"true");
         } else if o.is(bool_::false_obj()) {
-            self.out.push_str("false");
+            self.out.push_ascii(b"false");
         } else if pystr::is_str(o) {
             self.encode_str(o)?;
+        } else if int::is_int_exact(o) {
+            self.push_int(o)?;
         } else if int::is_int(o) {
             let s = self.int_str(o)?;
             self.out.push_obj(&s);
         } else if float::is_float(o) {
-            let s = self.float_str(o)?;
-            self.out.push_obj(&s);
+            self.push_float(o)?;
         } else if list::is_list(o) || tuple::is_tuple(o) {
             let t = ts();
             crate::interp::enter_recursive_call(t, " while encoding a JSON object")?;
@@ -874,21 +975,48 @@ impl<'a> Enc<'a> {
         Ok(())
     }
 
-    fn mark(&self, o: &PyObject) -> PyResult<Option<PyRef>> {
+    fn mark(&mut self, o: &PyObject) -> PyResult<Mark> {
+        if self.private_markers {
+            // containers being encoded, innermost last; a linear scan beats hashing
+            // for the usual shallow nesting, a set takes over for deep documents
+            let p = o.as_ptr() as usize;
+            if !self.use_set && self.active.len() >= 32 {
+                self.use_set = true;
+                self.active_set.extend(self.active.iter().copied());
+            }
+            let seen = if self.use_set { !self.active_set.insert(p) } else { self.active.contains(&p) };
+            if seen {
+                raise!(ValueError, "Circular reference detected");
+            }
+            self.active.push(p);
+            return Ok(Mark::Private);
+        }
         if let Some(m) = self.markers() {
             let ident = int::new_int_usize(o.as_ptr() as usize);
             if dict::contains(m, &ident)? {
                 raise!(ValueError, "Circular reference detected");
             }
             dict::set_item(m, &ident, o)?;
-            return Ok(Some(ident));
+            return Ok(Mark::Dict(ident));
         }
-        Ok(None)
+        Ok(Mark::None)
     }
 
-    fn unmark(&self, ident: Option<PyRef>) -> PyResult<()> {
-        if let (Some(m), Some(i)) = (self.markers(), ident) {
-            dict::del_item(m, &i)?;
+    fn unmark(&mut self, m: Mark) -> PyResult<()> {
+        match m {
+            Mark::None => {}
+            Mark::Private => {
+                if let Some(p) = self.active.pop() {
+                    if self.use_set {
+                        self.active_set.remove(&p);
+                    }
+                }
+            }
+            Mark::Dict(i) => {
+                if let Some(m) = self.markers() {
+                    dict::del_item(m, &i)?;
+                }
+            }
         }
         Ok(())
     }
@@ -940,90 +1068,120 @@ impl<'a> Enc<'a> {
 
     fn encode_dict(&mut self, d: &PyObject, level: usize) -> PyResult<()> {
         if ab::length(d)? == 0 {
-            self.out.push_str("{}");
+            self.out.push_ascii(b"{}");
             return Ok(());
         }
         let ident = self.mark(d)?;
-        self.out.push(b'{' as u32);
-        let items: PyRef = if dict::is_dict_exact(d) {
-            let v: Vec<PyRef> = dict::items_vec(d).into_iter().map(|(k, v)| tuple::tuple2(k, v)).collect();
-            list::new_list(v)
-        } else {
-            let it = ab::call_method(d, name!("items"), &[])?;
-            if list::is_list_exact(&it) { it } else { list::list_from_iter(&it)? }
-        };
-        if self.e.sort_keys {
-            ab::call_method(&items, name!("sort"), &[])?;
-        }
+        self.out.push_ascii(b"{");
         let indent = self.has_indent();
         let level = level + 1;
         let mut first = true;
-        let mut i = 0;
-        while let Some(item) = list::get(&items, i) {
-            i += 1;
-            if !tuple::is_tuple(&item) || tuple::tuple_len(&item) != 2 {
-                raise!(ValueError, "items must return 2-tuples");
+        if dict::is_dict_exact(d) && !self.e.sort_keys {
+            // a snapshot of the entries: no item tuples or list needed
+            for (key, value) in dict::items_vec(d) {
+                self.encode_member(d, &key, &value, &mut first, indent, level)?;
             }
-            let key = tuple::tuple_get(&item, 0).to_ref();
-            let value = tuple::tuple_get(&item, 1).to_ref();
-            let kstr: PyRef = if pystr::is_str(&key) {
-                key.clone()
-            } else if float::is_float(&key) {
-                self.float_str(&key)?
-            } else if key.is(bool_::true_obj()) {
-                pystr::new_str("true")
-            } else if key.is(bool_::false_obj()) {
-                pystr::new_str("false")
-            } else if key.is(none::none()) {
-                pystr::new_str("null")
-            } else if int::is_int(&key) {
-                self.int_str(&key)?
-            } else if self.e.skipkeys {
-                continue;
+        } else {
+            let items: PyRef = if dict::is_dict_exact(d) {
+                let v: Vec<PyRef> = dict::items_vec(d).into_iter().map(|(k, v)| tuple::tuple2(k, v)).collect();
+                list::new_list(v)
             } else {
-                raise!(TypeError, "keys must be str, int, float, bool or None, not {}", tname(&key));
+                let it = ab::call_method(d, name!("items"), &[])?;
+                if list::is_list_exact(&it) { it } else { list::list_from_iter(&it)? }
             };
-            if first {
-                first = false;
-                if indent {
-                    self.newline_indent(level);
-                }
-            } else {
-                self.out.push_obj(unsafe { &*self.e.item_separator });
-                if indent {
-                    self.newline_indent(level);
-                }
+            if self.e.sort_keys {
+                ab::call_method(&items, name!("sort"), &[])?;
             }
-            self.encode_str(&kstr)?;
-            self.out.push_obj(unsafe { &*self.e.key_separator });
-            if self.encode_obj(&value, level).is_err() {
-                let kr = ab::repr_string(&kstr).unwrap_or_default();
-                return Err(add_note(format!("when serializing {} item {}", tname(d), kr)));
+            let mut i = 0;
+            while let Some(item) = list::get(&items, i) {
+                i += 1;
+                if !tuple::is_tuple(&item) || tuple::tuple_len(&item) != 2 {
+                    raise!(ValueError, "items must return 2-tuples");
+                }
+                let key = tuple::tuple_get(&item, 0).to_ref();
+                let value = tuple::tuple_get(&item, 1).to_ref();
+                self.encode_member(d, &key, &value, &mut first, indent, level)?;
             }
         }
         if !first && indent {
             self.newline_indent(level - 1);
         }
-        self.out.push(b'}' as u32);
+        self.out.push_ascii(b"}");
         self.unmark(ident)
+    }
+
+    /// One `key: value` member of an object (a skipped key writes nothing).
+    fn encode_member(
+        &mut self,
+        d: &PyObject,
+        key: &PyObject,
+        value: &PyObject,
+        first: &mut bool,
+        indent: bool,
+        level: usize,
+    ) -> PyResult<()> {
+        let kstr: PyRef = if pystr::is_str(key) {
+            key.to_ref()
+        } else if float::is_float(key) {
+            self.float_str(key)?
+        } else if key.is(bool_::true_obj()) {
+            pystr::new_str("true")
+        } else if key.is(bool_::false_obj()) {
+            pystr::new_str("false")
+        } else if key.is(none::none()) {
+            pystr::new_str("null")
+        } else if int::is_int(key) {
+            self.int_str(key)?
+        } else if self.e.skipkeys {
+            return Ok(());
+        } else {
+            raise!(TypeError, "keys must be str, int, float, bool or None, not {}", tname(key));
+        };
+        if *first {
+            *first = false;
+        } else {
+            self.out.push_obj(unsafe { &*self.e.item_separator });
+        }
+        if indent {
+            self.newline_indent(level);
+        }
+        self.encode_str(&kstr)?;
+        self.out.push_obj(unsafe { &*self.e.key_separator });
+        if self.encode_obj(value, level).is_err() {
+            let kr = ab::repr_string(&kstr).unwrap_or_default();
+            return Err(add_note(format!("when serializing {} item {}", tname(d), kr)));
+        }
+        Ok(())
     }
 }
 
 unsafe extern "C" fn encoder_call(o: *mut PyObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
     unsafe {
         let r = (|| -> PyResult {
-            let (pos, kwn) = crate::args::kwdict_to_vectorcall(&*args, kw);
-            let refs: Vec<&PyObject> = pos.iter().map(|x| &**x).collect();
-            let p = crate::args::Params::new("_iterencode", &["obj", "_current_indent_level"], 0, 2);
-            let [obj, lvl] = crate::args::parse::<2>(&p, &refs, kwn.as_deref())?;
-            let lvl = lvl.unwrap();
-            if !int::is_int(lvl) {
-                raise!(TypeError, "'{}' object cannot be interpreted as an integer", tname(lvl));
+            let (obj, lvl): (PyRef, PyRef) = if kw.is_null() && tuple::tuple_len(&*args) == 2 {
+                (tuple::tuple_get(&*args, 0).to_ref(), tuple::tuple_get(&*args, 1).to_ref())
+            } else {
+                let (pos, kwn) = crate::args::kwdict_to_vectorcall(&*args, kw);
+                let refs: Vec<&PyObject> = pos.iter().map(|x| &**x).collect();
+                let p = crate::args::Params::new("_iterencode", &["obj", "_current_indent_level"], 0, 2);
+                let [obj, lvl] = crate::args::parse::<2>(&p, &refs, kwn.as_deref())?;
+                (obj.unwrap().to_ref(), lvl.unwrap().to_ref())
+            };
+            if !int::is_int(&lvl) {
+                raise!(TypeError, "'{}' object cannot be interpreted as an integer", tname(&lvl));
             }
-            let lvl = index_arg(lvl)?.max(0) as usize;
+            let lvl = index_arg(&lvl)?.max(0) as usize;
             let eo = &*(o as *const EncoderObj);
-            let mut enc = Enc { e: eo, out: StrBuilder::new() };
-            enc.encode_obj(obj.unwrap(), lvl)?;
+            let private_markers = opt(eo.markers).is_some_and(|m| dict::is_dict_exact(m) && dict::dict_len(m) == 0);
+            let mut enc = Enc {
+                e: eo,
+                out: StrBuilder::with_capacity(64),
+                private_markers,
+                active: Vec::new(),
+                use_set: false,
+                active_set: Default::default(),
+            };
+            enc.encode_obj(&obj, lvl)?;
             Ok(tuple::new_tuple(vec![enc.out.finish()]))
         })();
         into_c(r)

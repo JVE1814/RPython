@@ -104,6 +104,12 @@ def dumps(obj, *, skipkeys=False, ensure_ascii=True, check_circular=True,
 
     The keyword arguments are those of dump().
     """
+    # the common call with nothing customised needs no options mapping
+    if (cls is None and indent is None and separators is None
+            and default is None and not kw and skipkeys == False
+            and ensure_ascii == True and check_circular == True
+            and allow_nan == True and sort_keys == False):
+        return _shared_encoder.encode(obj)
     options = dict(skipkeys=skipkeys, ensure_ascii=ensure_ascii,
                    check_circular=check_circular, allow_nan=allow_nan,
                    indent=indent, separators=separators, default=default,
