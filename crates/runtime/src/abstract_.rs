@@ -41,6 +41,9 @@ pub fn getattr_opt(o: &PyObject, nm: &PyObject) -> PyResult<Option<PyRef>> {
     let tp = o.ty();
     let r = if tp.tp_getattro.map(|f| f as usize) == Some(object_generic_getattro as usize) {
         generic_getattr_opt(o, nm, None)
+    } else if tp.tp_getattro.is_some() && tp.tp_getattro.map(|f| f as usize) == unsafe { (*(&raw const crate::types::typeobject::PyType_Type)).tp_getattro }.map(|f| f as usize) && pystr::is_str(nm) {
+        // (perf4) classes: a missing attribute raises no AttributeError just to clear it
+        crate::types::object_type::type_getattr_impl(o, nm, true)
     } else {
         getattr(o, nm).map(Some)
     };
