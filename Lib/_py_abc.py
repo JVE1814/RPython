@@ -1,44 +1,39 @@
-"""Pure Python implementation of the ABC machinery (fallback for _abc)."""
+"""ABCMeta written in Python, used when the _abc accelerator is missing.
+
+Each ABC keeps four attributes: _abc_registry (registered virtual
+subclasses), _abc_cache (classes known to be subclasses), _abc_negative_cache
+(classes known not to be) and _abc_negative_cache_version (the global
+registration counter at the time the negative cache was filled; any
+register() call on any ABC makes all negative caches stale).
+"""
 
 from _weakrefset import WeakSet
 
 
 def get_cache_token():
-    """Returns the current ABC cache token.
-
-    The token is an opaque object (supporting equality testing) identifying the
-    current version of the ABC cache for virtual subclasses. The token changes
-    with every call to ``register()`` on any ABC.
-    """
+    """Return a value that changes (increases) whenever any ABC registers a
+    virtual subclass."""
     return ABCMeta._abc_invalidation_counter
 
 
+def _abstract_names(cls, namespace, bases):
+    names = {name for name, value in namespace.items()
+             if getattr(value, "__isabstractmethod__", False)}
+    for base in bases:
+        for name in getattr(base, "__abstractmethods__", ()):
+            if getattr(getattr(cls, name, None), "__isabstractmethod__", False):
+                names.add(name)
+    return frozenset(names)
+
+
 class ABCMeta(type):
-    """Metaclass for defining Abstract Base Classes (ABCs).
+    """Metaclass of abstract base classes (pure Python version)."""
 
-    Use this metaclass to create an ABC.  An ABC can be subclassed
-    directly, and then acts as a mix-in class.  You can also register
-    unrelated concrete classes (even built-in classes) and unrelated
-    ABCs as 'virtual subclasses' -- these and their descendants will
-    be considered subclasses of the registering ABC by the built-in
-    issubclass() function, but the registering ABC won't show up in
-    their MRO (Method Resolution Order) nor will method
-    implementations defined by the registering ABC be callable (not
-    even via super()).
-    """
-
-    # Bumped on every register() call so negative caches can be invalidated.
     _abc_invalidation_counter = 0
 
     def __new__(mcls, name, bases, namespace, /, **kwargs):
         cls = super().__new__(mcls, name, bases, namespace, **kwargs)
-        abstract = {key for key, value in namespace.items()
-                    if getattr(value, "__isabstractmethod__", False)}
-        for base in bases:
-            for key in getattr(base, "__abstractmethods__", set()):
-                if getattr(getattr(cls, key, None), "__isabstractmethod__", False):
-                    abstract.add(key)
-        cls.__abstractmethods__ = frozenset(abstract)
+        cls.__abstractmethods__ = _abstract_names(cls, namespace, bases)
         cls._abc_registry = WeakSet()
         cls._abc_cache = WeakSet()
         cls._abc_negative_cache = WeakSet()
@@ -46,14 +41,11 @@ class ABCMeta(type):
         return cls
 
     def register(cls, subclass):
-        """Register a virtual subclass of an ABC.
-
-        Returns the subclass, to allow usage as a class decorator.
-        """
+        """Make subclass a virtual subclass of cls; return subclass."""
         if not isinstance(subclass, type):
             raise TypeError("Can only register classes")
         if issubclass(subclass, cls):
-            return subclass
+            return subclass             # nothing to do
         if issubclass(cls, subclass):
             raise RuntimeError("Refusing to create an inheritance cycle")
         cls._abc_registry.add(subclass)
@@ -61,72 +53,72 @@ class ABCMeta(type):
         return subclass
 
     def _dump_registry(cls, file=None):
-        """Debug helper to print the ABC registry."""
+        """Print the registry and caches of cls (for debugging)."""
         print(f"Class: {cls.__module__}.{cls.__qualname__}", file=file)
         print(f"Inv. counter: {get_cache_token()}", file=file)
-        for name in cls.__dict__:
-            if name.startswith("_abc_"):
-                value = getattr(cls, name)
-                if isinstance(value, WeakSet):
-                    value = set(value)
-                print(f"{name}: {value!r}", file=file)
+        for attr in ('_abc_registry', '_abc_cache', '_abc_negative_cache',
+                     '_abc_negative_cache_version'):
+            value = getattr(cls, attr)
+            if isinstance(value, WeakSet):
+                value = set(value)
+            print(f"{attr}: {value!r}", file=file)
 
     def _abc_registry_clear(cls):
-        """Clear the registry (for debugging or testing)."""
+        """Forget all registered virtual subclasses (for tests)."""
         cls._abc_registry.clear()
 
     def _abc_caches_clear(cls):
-        """Clear the caches (for debugging or testing)."""
+        """Empty the positive and negative caches (for tests)."""
         cls._abc_cache.clear()
         cls._abc_negative_cache.clear()
 
     def __instancecheck__(cls, instance):
-        """Override for isinstance(instance, cls)."""
-        subtype = type(instance)
-        try:
-            subclass = instance.__class__
-        except AttributeError:
-            # no usable __class__: the type alone decides
-            subclass = subtype
-        if subclass in cls._abc_cache:
+        """isinstance(instance, cls)"""
+        real_type = type(instance)
+        # instance.__class__ may differ from type(instance) (proxies)
+        claimed = getattr(instance, '__class__', real_type)
+        if claimed in cls._abc_cache:
             return True
-        if subtype is subclass:
-            if (cls._abc_negative_cache_version ==
-                    ABCMeta._abc_invalidation_counter and
-                    subclass in cls._abc_negative_cache):
+        if claimed is real_type:
+            if (claimed in cls._abc_negative_cache
+                    and cls._abc_negative_cache_version
+                    == ABCMeta._abc_invalidation_counter):
                 return False
-            return cls.__subclasscheck__(subclass)
-        return any(cls.__subclasscheck__(c) for c in (subclass, subtype))
+            return cls.__subclasscheck__(claimed)
+        return cls.__subclasscheck__(claimed) or \
+            cls.__subclasscheck__(real_type)
 
     def __subclasscheck__(cls, subclass):
-        """Override for issubclass(subclass, cls)."""
+        """issubclass(subclass, cls)"""
         if not isinstance(subclass, type):
             raise TypeError('issubclass() arg 1 must be a class')
         if subclass in cls._abc_cache:
             return True
-        if cls._abc_negative_cache_version < ABCMeta._abc_invalidation_counter:
+        if cls._abc_negative_cache_version != ABCMeta._abc_invalidation_counter:
             cls._abc_negative_cache = WeakSet()
             cls._abc_negative_cache_version = ABCMeta._abc_invalidation_counter
         elif subclass in cls._abc_negative_cache:
             return False
-        ok = cls.__subclasshook__(subclass)
-        if ok is not NotImplemented:
-            assert isinstance(ok, bool)
-            if ok:
-                cls._abc_cache.add(subclass)
-            else:
-                cls._abc_negative_cache.add(subclass)
-            return ok
-        if cls in getattr(subclass, '__mro__', ()):
-            cls._abc_cache.add(subclass)
+
+        verdict = cls.__subclasshook__(subclass)
+        if verdict is NotImplemented:
+            verdict = _is_derived(cls, subclass)
+        else:
+            assert isinstance(verdict, bool)
+        (cls._abc_cache if verdict else cls._abc_negative_cache).add(subclass)
+        return verdict
+
+
+def _is_derived(cls, subclass):
+    # a real subclass, a subclass of a registered class, or a subclass of
+    # one of cls's own subclasses (which may have registrations of their own)
+    if cls in getattr(subclass, '__mro__', ()):
+        return True
+    for registered in cls._abc_registry:
+        if issubclass(subclass, registered):
             return True
-        for rcls in cls._abc_registry:
-            if issubclass(subclass, rcls):
-                cls._abc_cache.add(subclass)
-                return True
-        for scls in cls.__subclasses__():
-            if issubclass(subclass, scls):
-                cls._abc_cache.add(subclass)
-                return True
-        cls._abc_negative_cache.add(subclass)
-        return False
+    for child in cls.__subclasses__():
+        if issubclass(subclass, child):
+            return True
+    return False
+

@@ -1,333 +1,338 @@
-"""A lexical analyzer class for simple shell-like syntaxes."""
+"""Tokenizer for shell-like command lines.
 
-lazy import os
+``shlex.shlex`` is a small lexer for simple shell-style languages
+(configuration files, command lines); ``split`` turns a command line into an
+argument list, ``quote``/``join`` do the reverse.
+"""
+
 import sys
-lazy from collections import deque
 from io import StringIO
 
 __all__ = ["shlex", "split", "quote", "join"]
 
+_ASCII_WORD = ("abcdefghijklmnopqrstuvwxyz"
+               "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+               "0123456789_")
+# Latin-1 letters (without the multiplication and division signs) count as
+# word characters in POSIX mode.
+_LATIN1_WORD = "".join(chr(c) for c in range(0xC0, 0x100)
+                       if c not in (0xD7, 0xF7))
+_DEFAULT_PUNCTUATION = "();<>|&"
+_PUNCTUATION_WORD_EXTRA = "~-./*?="
+
+# States of the lexer, besides "inside a quote" (the state is the quote
+# character) and "after an escape" (the state is the escape character).
+_IDLE = " "
+_WORD = "a"
+_PUNCT = "c"
+
 
 class shlex:
-    "A lexical analyzer class for simple shell-like syntaxes."
+    """A lexical analyzer for simple shell-like syntaxes."""
 
     def __init__(self, instream=None, infile=None, posix=False,
                  punctuation_chars=False):
         if isinstance(instream, str):
             instream = StringIO(instream)
-        if instream is not None:
-            self.instream = instream
-            self.infile = infile
-        else:
+        if instream is None:
             self.instream = sys.stdin
             self.infile = None
-        self.posix = posix
-        if posix:
-            self.eof = None
         else:
-            self.eof = ''
+            self.instream = instream
+            self.infile = infile
+        self.posix = posix
+        self.eof = None if posix else ''
         self.commenters = '#'
-        self.wordchars = ('abcdfeghijklmnopqrstuvwxyz'
-                          'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_')
-        if self.posix:
-            self.wordchars += ('ßàáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿ'
-                               'ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞ')
+        self.wordchars = _ASCII_WORD + (_LATIN1_WORD if posix else '')
         self.whitespace = ' \t\r\n'
         self.whitespace_split = False
         self.quotes = '\'"'
         self.escape = '\\'
         self.escapedquotes = '"'
-        self.state = ' '
-        self.pushback = deque()
+        self.state = _IDLE
+        self.pushback = []          # pushed tokens, last one is read first
         self.lineno = 1
         self.debug = 0
         self.token = ''
-        self.filestack = deque()
+        self.filestack = []         # saved (infile, instream, lineno)
         self.source = None
-        if not punctuation_chars:
+        if punctuation_chars is True:
+            punctuation_chars = _DEFAULT_PUNCTUATION
+        elif not punctuation_chars:
             punctuation_chars = ''
-        elif punctuation_chars is True:
-            punctuation_chars = '();<>|&'
         self._punctuation_chars = punctuation_chars
+        self._pending_chars = []    # characters to re-read, last one first
         if punctuation_chars:
-            self._pushback_chars = deque()
-            self.wordchars += '~-./*?='
-            t = self.wordchars.maketrans(dict.fromkeys(punctuation_chars))
-            self.wordchars = self.wordchars.translate(t)
+            self.wordchars = ''.join(
+                ch for ch in self.wordchars + _PUNCTUATION_WORD_EXTRA
+                if ch not in punctuation_chars)
 
     @property
     def punctuation_chars(self):
         return self._punctuation_chars
 
+    # -- token and input stacks ---------------------------------------------
+
     def push_token(self, tok):
-        "Push a token onto the stack popped by the get_token method"
+        """Push a token back; it is returned by the next get_token()."""
         if self.debug >= 1:
-            print("shlex: pushing token " + repr(tok))
-        self.pushback.appendleft(tok)
+            print(f"shlex: pushing token {tok!r}")
+        self.pushback.append(tok)
 
     def push_source(self, newstream, newfile=None):
-        "Push an input source onto the lexer's input source stack."
+        """Read from newstream (a stream or a string) until it is exhausted."""
         if isinstance(newstream, str):
             newstream = StringIO(newstream)
-        self.filestack.appendleft((self.infile, self.instream, self.lineno))
+        self.filestack.append((self.infile, self.instream, self.lineno))
         self.infile = newfile
         self.instream = newstream
         self.lineno = 1
         if self.debug:
             if newfile is not None:
-                print('shlex: pushing to file %s' % (self.infile,))
+                print(f"shlex: pushing to file {self.infile}")
             else:
-                print('shlex: pushing to stream %s' % (self.instream,))
+                print(f"shlex: pushing to stream {self.instream}")
 
     def pop_source(self):
-        "Pop the input source stack."
+        """Close the current input and go back to the previous one."""
         self.instream.close()
-        (self.infile, self.instream, self.lineno) = self.filestack.popleft()
+        self.infile, self.instream, self.lineno = self.filestack.pop()
         if self.debug:
-            print('shlex: popping to %s, line %d'
-                  % (self.instream, self.lineno))
-        self.state = ' '
+            print(f"shlex: popping to {self.instream}, line {self.lineno}")
+        self.state = _IDLE
 
     def get_token(self):
-        "Get a token from the input stream (or from stack if it's nonempty)"
+        """Return the next token, handling pushback and source inclusion."""
         if self.pushback:
-            tok = self.pushback.popleft()
+            tok = self.pushback.pop()
             if self.debug >= 1:
-                print("shlex: popping token " + repr(tok))
+                print(f"shlex: popping token {tok!r}")
             return tok
-        raw = self.read_token()
+        tok = self.read_token()
         if self.source is not None:
-            while raw == self.source:
-                spec = self.sourcehook(self.read_token())
-                if spec:
-                    (newfile, newstream) = spec
-                    self.push_source(newstream, newfile)
-                raw = self.get_token()
-        while raw == self.eof:
+            while tok == self.source:
+                included = self.sourcehook(self.read_token())
+                if included:
+                    name, stream = included
+                    self.push_source(stream, name)
+                tok = self.get_token()
+        while tok == self.eof:
             if not self.filestack:
                 return self.eof
-            else:
-                self.pop_source()
-                raw = self.get_token()
+            self.pop_source()
+            tok = self.get_token()
         if self.debug >= 1:
-            if raw != self.eof:
-                print("shlex: token=" + repr(raw))
+            if tok != self.eof:
+                print(f"shlex: token={tok!r}")
             else:
                 print("shlex: token=EOF")
-        return raw
+        return tok
+
+    # -- the lexer proper -----------------------------------------------------
+
+    def _fail(self, message, what):
+        if self.debug >= 2:
+            print(f"shlex: I see EOF in {what} state")
+        raise ValueError(message)
 
     def read_token(self):
-        quoted = False
-        escapedstate = ' '
+        """Read one raw token from the input, ignoring pushback and sources."""
+        posix = self.posix
+        pending = self._pending_chars
+        stream = self.instream
+        tok = ''
+        quoted = False      # posix: a quote was seen, so '' is a real token
+        resume = _IDLE      # the state to return to after an escape
         while True:
-            if self.punctuation_chars and self._pushback_chars:
-                nextchar = self._pushback_chars.pop()
+            if pending:
+                ch = pending.pop()
             else:
-                nextchar = self.instream.read(1)
-            if nextchar == '\n':
-                self.lineno += 1
+                ch = stream.read(1)
+                if ch == '\n':
+                    self.lineno += 1
+            state = self.state
             if self.debug >= 3:
-                print("shlex: in state %r I see character: %r" % (self.state,
-                                                                  nextchar))
-            if self.state is None:
-                self.token = ''
+                print(f"shlex: in state {state!r} I see character: {ch!r}")
+
+            if state is None:
+                tok = ''
                 break
-            elif self.state == ' ':
-                if not nextchar:
+
+            if state == _IDLE:
+                if not ch:
                     self.state = None
                     break
-                elif nextchar in self.whitespace:
+                if ch in self.whitespace:
                     if self.debug >= 2:
                         print("shlex: I see whitespace in whitespace state")
-                    if self.token or (self.posix and quoted):
+                    if tok or (posix and quoted):
                         break
-                    else:
-                        continue
-                elif nextchar in self.commenters:
-                    self.instream.readline()
+                elif ch in self.commenters:
+                    stream.readline()
                     self.lineno += 1
-                elif self.posix and nextchar in self.escape:
-                    escapedstate = 'a'
-                    self.state = nextchar
-                elif nextchar in self.wordchars:
-                    self.token = nextchar
-                    self.state = 'a'
-                elif nextchar in self.punctuation_chars:
-                    self.token = nextchar
-                    self.state = 'c'
-                elif nextchar in self.quotes:
-                    if not self.posix:
-                        self.token = nextchar
-                    self.state = nextchar
+                elif posix and ch in self.escape:
+                    resume = _WORD
+                    self.state = ch
+                elif ch in self.wordchars:
+                    tok = ch
+                    self.state = _WORD
+                elif ch in self._punctuation_chars:
+                    tok = ch
+                    self.state = _PUNCT
+                elif ch in self.quotes:
+                    if not posix:
+                        tok = ch
+                    self.state = ch
                 elif self.whitespace_split:
-                    self.token = nextchar
-                    self.state = 'a'
+                    tok = ch
+                    self.state = _WORD
                 else:
-                    self.token = nextchar
-                    if self.token or (self.posix and quoted):
-                        break
-                    else:
-                        continue
-            elif self.state in self.quotes:
-                quoted = True
-                if not nextchar:
-                    if self.debug >= 2:
-                        print("shlex: I see EOF in quotes state")
-                    raise ValueError("No closing quotation")
-                if nextchar == self.state:
-                    if not self.posix:
-                        self.token += nextchar
-                        self.state = ' '
-                        break
-                    else:
-                        self.state = 'a'
-                elif (self.posix and nextchar in self.escape and self.state
-                      in self.escapedquotes):
-                    escapedstate = self.state
-                    self.state = nextchar
-                else:
-                    self.token += nextchar
-            elif self.state in self.escape:
-                if not nextchar:
-                    if self.debug >= 2:
-                        print("shlex: I see EOF in escape state")
-                    raise ValueError("No escaped character")
-                if (escapedstate in self.quotes and
-                        nextchar != self.state and nextchar != escapedstate):
-                    self.token += self.state
-                self.token += nextchar
-                self.state = escapedstate
-            elif self.state in ('a', 'c'):
-                if not nextchar:
+                    # any other character is a token of its own
+                    tok = ch
+                    break
+
+            elif state == _WORD:
+                if not ch:
                     self.state = None
                     break
-                elif nextchar in self.whitespace:
+                if ch in self.whitespace:
                     if self.debug >= 2:
                         print("shlex: I see whitespace in word state")
-                    self.state = ' '
-                    if self.token or (self.posix and quoted):
+                    self.state = _IDLE
+                    if tok or (posix and quoted):
                         break
-                    else:
-                        continue
-                elif nextchar in self.commenters:
-                    self.instream.readline()
+                elif ch in self.commenters:
+                    stream.readline()
                     self.lineno += 1
-                    if self.posix:
-                        self.state = ' '
-                        if self.token or (self.posix and quoted):
+                    if posix:
+                        self.state = _IDLE
+                        if tok or quoted:
                             break
-                        else:
-                            continue
-                elif self.state == 'c':
-                    if nextchar in self.punctuation_chars:
-                        self.token += nextchar
-                    else:
-                        if nextchar not in self.whitespace:
-                            self._pushback_chars.append(nextchar)
-                        self.state = ' '
-                        break
-                elif self.posix and nextchar in self.quotes:
-                    self.state = nextchar
-                elif self.posix and nextchar in self.escape:
-                    escapedstate = 'a'
-                    self.state = nextchar
-                elif (nextchar in self.wordchars or nextchar in self.quotes
-                      or (self.whitespace_split and
-                          nextchar not in self.punctuation_chars)):
-                    self.token += nextchar
+                    # outside POSIX mode the word goes on after the comment
+                elif posix and ch in self.quotes:
+                    self.state = ch
+                elif posix and ch in self.escape:
+                    resume = _WORD
+                    self.state = ch
+                elif (ch in self.wordchars or ch in self.quotes
+                      or (self.whitespace_split
+                          and ch not in self._punctuation_chars)):
+                    tok += ch
                 else:
-                    if self.punctuation_chars:
-                        self._pushback_chars.append(nextchar)
-                    else:
-                        self.pushback.appendleft(nextchar)
+                    # the character ends the word and is read again
                     if self.debug >= 2:
                         print("shlex: I see punctuation in word state")
-                    self.state = ' '
-                    if self.token or (self.posix and quoted):
+                    pending.append(ch)
+                    self.state = _IDLE
+                    if tok or (posix and quoted):
                         break
-                    else:
-                        continue
-        result = self.token
+
+            elif state == _PUNCT:
+                if ch and ch in self._punctuation_chars:
+                    tok += ch
+                else:
+                    if ch and ch not in self.whitespace:
+                        pending.append(ch)
+                    self.state = _IDLE
+                    break
+
+            elif state in self.quotes:
+                quoted = True
+                if not ch:
+                    self.token = tok
+                    self._fail("No closing quotation", "quotes")
+                if ch == state:
+                    if not posix:
+                        tok += ch
+                        self.state = _IDLE
+                        break
+                    self.state = _WORD
+                elif posix and ch in self.escape and state in self.escapedquotes:
+                    resume = state
+                    self.state = ch
+                else:
+                    tok += ch
+
+            elif state in self.escape:
+                if not ch:
+                    self.token = tok
+                    self._fail("No escaped character", "escape")
+                # inside quotes the escape only applies to the quote and to
+                # itself; otherwise it stays in the token
+                if resume in self.quotes and ch != state and ch != resume:
+                    tok += state
+                tok += ch
+                self.state = resume
+
         self.token = ''
-        if self.posix and not quoted and result == '':
-            result = None
-        if self.debug > 1:
-            if result:
-                print("shlex: raw token=" + repr(result))
+        if posix and not quoted and tok == '':
+            tok = None
+        if self.debug >= 2:
+            if tok:
+                print(f"shlex: raw token={tok!r}")
             else:
                 print("shlex: raw token=EOF")
-        return result
+        return tok
+
+    # -- helpers --------------------------------------------------------------
 
     def sourcehook(self, newfile):
-        "Hook called on a filename to be sourced."
-        if newfile[0] == '"':
+        """Open a file named by a source request; return (name, stream)."""
+        import os.path
+        if newfile[:1] == '"':
             newfile = newfile[1:-1]
+        # relative names are taken relative to the including file
         if isinstance(self.infile, str) and not os.path.isabs(newfile):
             newfile = os.path.join(os.path.dirname(self.infile), newfile)
-        return (newfile, open(newfile, "r"))
+        return newfile, open(newfile, "r")
 
     def error_leader(self, infile=None, lineno=None):
-        "Emit a C-compiler-like, Emacs-friendly error-message leader."
+        """Return a '"file", line N: ' prefix for error messages."""
         if infile is None:
             infile = self.infile
         if lineno is None:
             lineno = self.lineno
-        return "\"%s\", line %d: " % (infile, lineno)
+        return '"%s", line %d: ' % (infile, lineno)
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        token = self.get_token()
-        if token == self.eof:
+        tok = self.get_token()
+        if tok == self.eof:
             raise StopIteration
-        return token
+        return tok
 
 
 def split(s, comments=False, posix=True):
-    """Split the string *s* using shell-like syntax."""
+    """Split the string s into a list of words, like a POSIX shell would."""
     if s is None:
         raise ValueError("s argument must not be None")
-    lex = shlex(s, posix=posix)
-    lex.whitespace_split = True
+    lexer = shlex(s, posix=posix)
+    lexer.whitespace_split = True
     if not comments:
-        lex.commenters = ''
-    return list(lex)
+        lexer.commenters = ''
+    return list(lexer)
 
 
 def join(split_command):
-    """Return a shell-escaped string from *split_command*."""
-    return ' '.join(quote(arg) for arg in split_command)
+    """Join a list of words into a shell-escaped command line."""
+    return ' '.join(map(quote, split_command))
+
+
+_SHELL_SAFE = frozenset("abcdefghijklmnopqrstuvwxyz"
+                        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                        "0123456789_@%+=:,./-")
 
 
 def quote(s):
-    """Return a shell-escaped version of the string *s*."""
+    """Return a shell-escaped version of the string s."""
     if not s:
         return "''"
-
     if not isinstance(s, str):
-        raise TypeError(f"expected string object, got {type(s).__name__!r}")
-
-    # Characters that are safe unquoted in any POSIX shell.
-    safe_chars = (b'%+,-./0123456789:=@'
-                  b'ABCDEFGHIJKLMNOPQRSTUVWXYZ_'
-                  b'abcdefghijklmnopqrstuvwxyz')
-    if s.isascii() and not s.encode().translate(None, delete=safe_chars):
+        raise TypeError(f"expected string or bytes-like object, "
+                        f"got {type(s).__name__!r}")
+    if _SHELL_SAFE.issuperset(s):
         return s
-
-    # Wrap in single quotes; embedded single quotes become '"'"'.
+    # single quotes protect everything; an embedded ' becomes '"'"'
     return "'" + s.replace("'", "'\"'\"'") + "'"
-
-
-def _print_tokens(lexer):
-    while tt := lexer.get_token():
-        print("Token: " + repr(tt))
-
-
-if __name__ == '__main__':
-    if len(sys.argv) == 1:
-        _print_tokens(shlex())
-    else:
-        fn = sys.argv[1]
-        with open(fn) as f:
-            _print_tokens(shlex(f, fn))

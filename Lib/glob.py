@@ -1,4 +1,4 @@
-"""Filename globbing utility."""
+"""Find path names matching shell-style wildcard patterns (glob, iglob)."""
 
 import contextlib
 import os
