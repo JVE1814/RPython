@@ -8,6 +8,7 @@ pub mod jit;
 pub mod specialize;
 pub mod adaptive;
 pub mod borrow;
+pub mod borrow_mark;
 pub mod pep523;
 pub mod translate;
 pub mod wc;

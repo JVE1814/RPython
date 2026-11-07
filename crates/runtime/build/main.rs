@@ -20,6 +20,25 @@ mod wc;
 #[path = "../src/interp/translate.rs"]
 mod translate;
 
+// (refs1) the translator's borrowed-load step (interp/borrow_mark.rs) and the stack-effect
+// table it uses; the image keeps the marks, the runtime removes them under
+// RPYTHON_BORROW=0 (startup_image::decode_translation)
+#[allow(dead_code, unused_imports, clippy::all)]
+#[path = "../src/interp/borrow_mark.rs"]
+mod borrow_mark;
+#[allow(dead_code, unused_imports, clippy::all)]
+#[path = "../src/interp/jit/analysis.rs"]
+pub(crate) mod jit_analysis;
+mod jit {
+    pub(crate) use super::jit_analysis as analysis;
+}
+mod borrow {
+    pub use super::borrow_mark::mark;
+    pub fn enabled() -> bool {
+        true
+    }
+}
+
 #[path = "../src/startup_image/fmt.rs"]
 mod fmt;
 

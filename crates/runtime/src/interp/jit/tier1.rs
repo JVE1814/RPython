@@ -1578,13 +1578,17 @@ impl<'a> Gen<'a> {
             self.a.load32(R9, M(Rcx, E_A));
             self.a.cmp32_rm(R8, M(Rcx, E_SEQ));
             self.a.jcc(Cc::NE, slow);
-            self.a.load(Rax, obj);
+            // (refs1) a borrowed receiver: tag removed for the guard, kept for `self`
+            self.load_obj(Rax, d - 1);
             self.a.load(Rdx, M(Rax, OB_TYPE));
             self.a.cmp32_rm(R9, M(Rdx, TP_TAG));
             self.a.jcc(Cc::NE, slow);
             self.incref(Rsi);
             self.a.store(obj, Rsi);
             let m = self.slot(d);
+            if self.tagged(d - 1) {
+                self.a.or_ri(Rax, 1);
+            }
             self.a.store(m, Rax);
             inline = true;
         }

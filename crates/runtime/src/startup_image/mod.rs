@@ -225,7 +225,16 @@ pub fn decode_translation(tx: &'static [u8]) -> Translation {
     use crate::interp::translate::Extra;
     let mut r = In::new(tx, 0);
     let n = r.n();
-    let code: Vec<u32> = r.take(4 * n).chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    let mut code: Vec<u32> = r.take(4 * n).chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    if !crate::interp::borrow::enabled() {
+        // (refs1) the image was translated with borrowed loads (build script)
+        use rpy_compiler::bytecode::Op;
+        for w in code.iter_mut() {
+            if *w & 0xff == Op::LoadFastBorrow as u32 {
+                *w = (*w & !0xff) | Op::LoadFast as u32;
+            }
+        }
+    }
     let ne = r.n();
     let mut exception_table = Vec::with_capacity(ne);
     for _ in 0..ne {
