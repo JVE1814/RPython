@@ -1088,7 +1088,7 @@ pub fn set_item_hash(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) -
             crate::interp::cache::on_dict_write(d, key.as_ptr()); // jit
             drop(g);
             // perf-runtime (D6): lock-free readers may still hold `old`
-            unsafe { crate::qsbr::decref_deferred(old) };
+            unsafe { crate::qsbr::release_unpublished(old) };
         }
         Found::Missing => {
             unsafe { incref(key.as_ptr()) };
