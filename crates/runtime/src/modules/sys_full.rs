@@ -797,6 +797,10 @@ fn thread_frames_and_excs(want_exc: bool) -> PyResult {
         if !crate::threads::is_live(ts) {
             continue;
         }
+        // (interp1) only the threads of the calling interpreter
+        if !std::ptr::eq(crate::subinterp::of_ts(ts), crate::subinterp::current()) {
+            continue;
+        }
         let key = int::new_int_u128(ts.c.thread_id as u128);
         if want_exc {
             let e = crate::interp::eval::handled_exception(ts);
