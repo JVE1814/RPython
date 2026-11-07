@@ -1790,7 +1790,7 @@ fn emit_routines_body(a: &mut Asm, box_int: Label, box_float: Label, free_num: L
         let big = a.label();
         let helper = a.label();
         a.lea(Rcx, M(Rdi, 5));
-        a.cmp_ri(Rcx, 1030);
+        a.cmp_ri(Rcx, 1029); // -5..=1024 come from the small int table
         a.jcc(Cc::A, big);
         a.mov_ri(Rax, small);
         a.load_idx(Rax, Rax, Rcx, 8, 0);
