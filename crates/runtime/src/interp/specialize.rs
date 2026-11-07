@@ -487,10 +487,9 @@ pub fn store_attr(o: &PyObject, nm: &PyObject, v: &PyObject, es: &[Entry]) -> Py
                         }
                     },
                     kind::SLOT => unsafe {
+                        // readers on other threads load the slot without a lock
                         let p = (o.as_ptr() as *mut u8).add(s.c) as *mut *mut PyObject;
-                        let old = *p;
-                        *p = v.to_ref().into_raw();
-                        xdecref(old);
+                        crate::qsbr::swap_field(p, v.to_ref().into_raw());
                         return Ok(());
                     },
                     kind::DATA_DESCR => unsafe {
