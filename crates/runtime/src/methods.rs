@@ -182,7 +182,33 @@ macro_rules! mdefs {
         $crate::methods::def_static(concat!($name, "\0"), $crate::methods::fastkw($f), $crate::ffi::METH_FASTCALL | $crate::ffi::METH_KEYWORDS $(| $extra)?, $crate::mdefs!(@doc $($doc)?))
     };
     (@doc) => { "" };
-    (@doc $d:literal) => { concat!($d, "\0") };
+    (@doc $d:literal) => { $crate::doc_str!($d) };
+}
+
+/// (perf7) A docstring literal (NUL-terminated `&'static str`) stored apart from the
+/// other constants, in the `.rodata.rpydoc` section the launcher's link places after
+/// `.rodata` (crates/launcher/docs.ld). Start-up reads the method names but not their
+/// docs; interleaved, the names pulled most of the docs' pages into memory through the
+/// kernel's fault-around (about 1 MB of start-up RSS).
+#[macro_export]
+macro_rules! doc_str {
+    ($d:literal) => {{
+        const S: &str = concat!($d, "\0");
+        const N: usize = S.len();
+        #[unsafe(link_section = ".rodata.rpydoc")]
+        static D: [u8; N] = {
+            let b = S.as_bytes();
+            let mut a = [0u8; N];
+            let mut i = 0;
+            while i < N {
+                a[i] = b[i];
+                i += 1;
+            }
+            a
+        };
+        // SAFETY: a copy of the bytes of a str literal
+        unsafe { std::str::from_utf8_unchecked(&D) }
+    }};
 }
 
 pub fn method_name(ml: *const PyMethodDef) -> String {
