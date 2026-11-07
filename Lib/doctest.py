@@ -62,6 +62,7 @@ __all__ = [
 import __future__
 import difflib
 import functools
+import importlib
 import inspect
 import linecache
 import os
@@ -125,89 +126,91 @@ ELLIPSIS_MARKER = '...'
 
 # ---------------------------------------------------------------- helpers
 
-def _extract_future_flags(globs):
-    """Compiler flags of the __future__ features imported into globs."""
+def _future_flags_of(globs):
+    """Compiler flags for the __future__ features that globs has imported
+    (the feature objects themselves, not just their names)."""
     flags = 0
     for name in __future__.all_feature_names:
-        feature = globs.get(name, None)
-        if feature is getattr(__future__, name):
+        feature = getattr(__future__, name)
+        if globs.get(name) is feature:
             flags |= feature.compiler_flag
     return flags
 
 
-def _normalize_module(module, depth=2):
-    """Module object for `module` (a module, a name, or None meaning the
-    caller `depth` frames up)."""
+def _resolve_module(module, depth=2):
+    """Turn `module` into a module object: a module is returned as is, a
+    string is imported, None means the module of the code `depth` frames
+    up the stack (or __main__ when frames are not available)."""
     if inspect.ismodule(module):
         return module
     if isinstance(module, str):
-        return __import__(module, globals(), locals(), ["*"])
-    if module is None:
-        try:
-            frame = sys._getframe(depth)
-        except AttributeError:
-            frame = None
-        if frame is None:
-            return sys.modules['__main__']
-        return sys.modules[frame.f_globals['__name__']]
-    raise TypeError("Expected a module, string, or None")
+        return importlib.import_module(module)
+    if module is not None:
+        raise TypeError("Expected a module, string, or None")
+    getframe = getattr(sys, '_getframe', None)
+    caller = getframe(depth) if getframe is not None else None
+    name = caller.f_globals['__name__'] if caller is not None else '__main__'
+    return sys.modules[name]
 
 
-def _newline_convert(data):
-    # universal newlines for text that was read in binary mode
-    return IncrementalNewlineDecoder(None, True).decode(data, True)
+def _universal_newlines(text):
+    # text read through a loader comes in binary form: normalise the
+    # line endings the way text-mode files do
+    return IncrementalNewlineDecoder(None, True).decode(text, True)
 
 
-def _load_testfile(filename, package, module_relative, encoding):
+def _read_test_file(filename, package, module_relative, encoding):
+    """Return (contents, path) of a doctest file; a module-relative name is
+    looked up next to `package` and read through its loader if it has
+    one (so files inside zip archives work)."""
     if module_relative:
-        package = _normalize_module(package, 3)
-        filename = _module_relative_path(package, filename)
+        package = _resolve_module(package, 3)
+        filename = _path_beside_module(package, filename)
         loader = getattr(package, '__loader__', None)
         if loader is None:
-            spec = getattr(package, '__spec__', None)
-            loader = getattr(spec, 'loader', None) if spec else None
-        if loader is not None and hasattr(loader, 'get_data'):
+            loader = getattr(getattr(package, '__spec__', None), 'loader', None)
+        get_data = getattr(loader, 'get_data', None)
+        if get_data is not None:
             try:
-                data = loader.get_data(filename)
+                raw = get_data(filename)
             except OSError:
                 pass
             else:
-                text = data.decode(encoding)
-                return _newline_convert(text), filename
+                return _universal_newlines(raw.decode(encoding)), filename
     with open(filename, encoding=encoding) as stream:
         return stream.read(), filename
 
 
-def _indent(s, indent=4):
-    """Indent every non-empty line of `s` by `indent` spaces."""
+def _indented(s, indent=4):
+    """`s` with every non-blank line shifted right by `indent` spaces."""
     pad = ' ' * indent
-    return re.sub('(?m)^(?!$)', pad, s)
+    return '\n'.join(pad + line if line else line for line in s.split('\n'))
 
 
-def _exception_traceback(exc_info):
-    """The formatted traceback of an exc_info triple."""
-    out = StringIO()
-    exc_type, exc_value, exc_tb = exc_info
-    traceback.print_exception(exc_type, exc_value, exc_tb, file=out, colorize=False)
-    return out.getvalue()
+def _format_exc_info(exc_info):
+    """The traceback text of an (type, value, traceback) triple."""
+    buffer = StringIO()
+    kind, value, tb = exc_info
+    traceback.print_exception(kind, value, tb, file=buffer, colorize=False)
+    return buffer.getvalue()
 
 
-class _SpoofOut(StringIO):
-    """Captures example output; getvalue() makes sure non-empty output ends
-    with a newline."""
+class _CapturedOutput(StringIO):
+    """Collects what an example prints.  getvalue() adds the final newline
+    the expected-output block always has; truncate() also rewinds."""
 
     def getvalue(self):
-        text = StringIO.getvalue(self)
-        if text and not text.endswith("\n"):
-            text += "\n"
+        text = super().getvalue()
+        if text[-1:] not in ('', '\n'):
+            text += '\n'
         return text
 
     def truncate(self, size=None):
-        self.seek(size if size is not None else 0)
-        StringIO.truncate(self)
+        self.seek(0 if size is None else size)
+        super().truncate()
 
 
-def _ellipsis_match(want, got):
+def _matches_with_ellipsis(want, got):
     """True if `got` matches `want`, in which '...' matches any substring."""
     if ELLIPSIS_MARKER not in want:
         return want == got
@@ -232,13 +235,13 @@ def _ellipsis_match(want, got):
     return True
 
 
-def _comment_line(line):
+def _as_comment(line):
     """The line commented out with '# '."""
     line = line.rstrip()
     return '# ' + line if line else '#'
 
 
-def _strip_exception_details(msg):
+def _bare_exception_name(msg):
     """Reduce an exception message to the bare exception name: drop the
     module path and everything after the first colon or newline."""
     end = len(msg)
@@ -250,33 +253,28 @@ def _strip_exception_details(msg):
     return head[dot + 1:]
 
 
-class _OutputRedirectingPdb:
-    """Placeholder replaced below by a pdb.Pdb subclass when pdb is
-    importable."""
-
-
-def _module_relative_path(module, test_path):
+def _path_beside_module(module, test_path):
+    """Turn a '/'-separated path relative to `module` into a file path:
+    next to the module's file, next to the script for __main__, or in
+    the first directory of a namespace package that has it."""
     if not inspect.ismodule(module):
         raise TypeError('Expected a module: %r' % module)
     if test_path.startswith('/'):
         raise ValueError('Module-relative files may not have absolute paths')
-    test_path = os.path.join(*test_path.split('/'))
-    if hasattr(module, '__file__') and module.__file__:
-        basedir = os.path.split(module.__file__)[0]
-    elif module.__name__ == '__main__':
-        if len(sys.argv) > 0 and sys.argv[0] != '':
-            basedir = os.path.split(sys.argv[0])[0]
-        else:
-            basedir = os.curdir
-    else:
-        if hasattr(module, '__path__'):
-            for directory in module.__path__:
-                candidate = os.path.join(directory, test_path)
-                if os.path.exists(candidate):
-                    return candidate
-        raise ValueError("Can't resolve paths relative to the module "
-                         "%r (it has no __file__)" % module.__name__)
-    return os.path.join(basedir, test_path)
+    relative = os.path.join(*test_path.split('/'))
+    source = getattr(module, '__file__', None)
+    if source:
+        return os.path.join(os.path.dirname(source), relative)
+    if module.__name__ == '__main__':
+        script = sys.argv[0] if sys.argv else ''
+        return os.path.join(os.path.dirname(script) if script else os.curdir,
+                            relative)
+    for directory in getattr(module, '__path__', ()):
+        candidate = os.path.join(directory, relative)
+        if os.path.exists(candidate):
+            return candidate
+    raise ValueError("Can't resolve paths relative to the module "
+                     "%r (it has no __file__)" % module.__name__)
 
 
 # ---------------------------------------------------------------- Example / DocTest
@@ -773,7 +771,7 @@ class OutputChecker:
                 return True
 
         if optionflags & ELLIPSIS:
-            if _ellipsis_match(want, got):
+            if _matches_with_ellipsis(want, got):
                 return True
 
         return False
@@ -806,14 +804,14 @@ class OutputChecker:
                 diff = list(engine.compare(want_lines, got_lines))
                 kind = 'ndiff with -expected +actual'
             body = ''.join(line if line.endswith('\n') else line + '\n' for line in diff)
-            return f'Differences ({kind}):\n' + _indent(body)
+            return f'Differences ({kind}):\n' + _indented(body)
 
         if want and got:
-            return 'Expected:\n%sGot:\n%s' % (_indent(want), _indent(got))
+            return 'Expected:\n%sGot:\n%s' % (_indented(want), _indented(got))
         if want:
-            return 'Expected:\n%sGot nothing\n' % _indent(want)
+            return 'Expected:\n%sGot nothing\n' % _indented(want)
         if got:
-            return 'Expected nothing\nGot:\n%s' % _indent(got)
+            return 'Expected nothing\nGot:\n%s' % _indented(got)
         return 'Expected nothing\nGot nothing\n'
 
 
@@ -845,7 +843,7 @@ class DocTestRunner:
         self.failures = 0
         self.skips = 0
         self._stats = {}
-        self._fakeout = _SpoofOut()
+        self._fakeout = _CapturedOutput()
 
     # ---- reporting
 
@@ -853,10 +851,10 @@ class DocTestRunner:
         """Called before running an example (verbose mode only)."""
         if self._verbose:
             if example.want:
-                out('Trying:\n' + _indent(example.source) +
-                    'Expecting:\n' + _indent(example.want))
+                out('Trying:\n' + _indented(example.source) +
+                    'Expecting:\n' + _indented(example.want))
             else:
-                out('Trying:\n' + _indent(example.source) +
+                out('Trying:\n' + _indented(example.source) +
                     'Expecting nothing\n')
 
     def report_success(self, out, test, example, got):
@@ -872,7 +870,7 @@ class DocTestRunner:
     def report_unexpected_exception(self, out, test, example, exc_info):
         """Called when an example raised an unexpected exception."""
         out(self._failure_header(test, example) +
-            'Exception raised:\n' + _indent(_exception_traceback(exc_info)))
+            'Exception raised:\n' + _indented(_format_exc_info(exc_info)))
 
     def _failure_header(self, test, example):
         lines = [self.DIVIDER]
@@ -885,7 +883,7 @@ class DocTestRunner:
         else:
             lines.append('Line %s, in %s' % (example.lineno + 1, test.name))
         lines.append('Failed example:')
-        lines.append(_indent(example.source))
+        lines.append(_indented(example.source))
         return '\n'.join(lines)
 
     # ---- running
@@ -956,14 +954,14 @@ class DocTestRunner:
                     header = traceback.format_exception_only(exc_info[0], exc_info[1])[0]
                     exc_msg = exc_msg[exc_msg.index(header):] if header in exc_msg else exc_msg
                 if not quiet:
-                    got += _exception_traceback(exc_info)
+                    got += _format_exc_info(exc_info)
                 if example.exc_msg is None:
                     outcome = BOOM
                 elif check(example.exc_msg, exc_msg, self.optionflags):
                     outcome = SUCCESS
                 elif self.optionflags & IGNORE_EXCEPTION_DETAIL:
-                    if check(_strip_exception_details(example.exc_msg),
-                             _strip_exception_details(exc_msg),
+                    if check(_bare_exception_name(example.exc_msg),
+                             _bare_exception_name(exc_msg),
                              self.optionflags):
                         outcome = SUCCESS
 
@@ -1030,7 +1028,7 @@ class DocTestRunner:
         false."""
         self.test = test
         if compileflags is None:
-            compileflags = _extract_future_flags(test.globs)
+            compileflags = _future_flags_of(test.globs)
 
         real_stdout = sys.stdout
         if out is None:
@@ -1050,7 +1048,7 @@ class DocTestRunner:
             pdb = None
         if pdb is not None:
             saved_set_trace = pdb.set_trace
-            self.debugger = _OutputRedirectingPdb(real_stdout)
+            self.debugger = _redirecting_debugger(real_stdout)
             self.debugger.reset()
             pdb.set_trace = self.debugger.set_trace
         else:
@@ -1193,7 +1191,7 @@ def _make_redirecting_pdb():
     return _RedirectingPdb
 
 
-def _OutputRedirectingPdb(out):
+def _redirecting_debugger(out):
     cls = _make_redirecting_pdb()
     if cls is None:
         return _NoDebugger()
@@ -1301,7 +1299,7 @@ def testfile(filename, module_relative=True, name=None, package=None,
     if package and not module_relative:
         raise ValueError("Package may only be specified for module-"
                          "relative paths.")
-    text, filename = _load_testfile(filename, package, module_relative,
+    text, filename = _read_test_file(filename, package, module_relative,
                                     encoding or "utf-8")
     if name is None:
         name = os.path.basename(filename)
@@ -1337,17 +1335,17 @@ def run_docstring_examples(f, globs, verbose=False, name="NoName",
 
 # ---------------------------------------------------------------- unittest integration
 
-_unittest_reportflags = 0
+_unittest_report_flags = 0
 
 
 def set_unittest_reportflags(flags):
     """Set the reporting flags used by DocTestSuite/DocFileSuite tests that
     were created without any; returns the previous value."""
-    global _unittest_reportflags
+    global _unittest_report_flags
     if (flags & REPORTING_FLAGS) != flags:
         raise ValueError("Only reporting flags allowed", flags)
-    previous = _unittest_reportflags
-    _unittest_reportflags = flags
+    previous = _unittest_report_flags
+    _unittest_report_flags = flags
     return previous
 
 
@@ -1362,7 +1360,7 @@ class _CollectingRunner(DocTestRunner):
         self.outcomes.append(('skip', index, example, None))
 
     def _example_failed(self, test, index, example, got):
-        message = ('Failed example:\n' + _indent(example.source) +
+        message = ('Failed example:\n' + _indented(example.source) +
                    self._checker.output_difference(example, got, self.optionflags))
         self.outcomes.append(('fail', index, example, message))
 
@@ -1450,7 +1448,7 @@ class DocTestCase(unittest.TestCase):
     def _effective_flags(self):
         flags = self._dt_optionflags
         if not flags & REPORTING_FLAGS:
-            flags |= _unittest_reportflags
+            flags |= _unittest_report_flags
         return flags
 
     def runTest(self):
@@ -1544,7 +1542,7 @@ class SkipDocTestCase(DocTestCase):
     __str__ = shortDescription
 
 
-class _DocTestSuite(unittest.TestSuite):
+class _SuiteOfDocTests(unittest.TestSuite):
     def _removeTestAtIndex(self, index):
         # keep the tests: the suite may be run several times
         pass
@@ -1560,14 +1558,14 @@ def DocTestSuite(module=None, globs=None, extraglobs=None, test_finder=None,
     optionflags) are passed to DocTestCase."""
     if test_finder is None:
         test_finder = DocTestFinder()
-    module = _normalize_module(module)
+    module = _resolve_module(module)
     tests = test_finder.find(module, globs=globs, extraglobs=extraglobs)
     if not tests and sys.flags.optimize >= 2:
-        suite = _DocTestSuite()
+        suite = _SuiteOfDocTests()
         suite.addTest(SkipDocTestCase(module))
         return suite
     tests.sort()
-    suite = _DocTestSuite()
+    suite = _SuiteOfDocTests()
     for test in tests:
         if not test.examples:
             continue
@@ -1603,7 +1601,7 @@ def DocFileTest(path, module_relative=True, package=None,
     if package and not module_relative:
         raise ValueError("Package may only be specified for module-"
                          "relative paths.")
-    doc, path = _load_testfile(path, package, module_relative,
+    doc, path = _read_test_file(path, package, module_relative,
                                encoding or "utf-8")
     if "__file__" not in globs:
         globs["__file__"] = path
@@ -1617,9 +1615,9 @@ def DocFileSuite(*paths, **kw):
 
     Keyword arguments: module_relative, package, setUp, tearDown, globs,
     optionflags, parser, encoding (as for testfile() and DocTestSuite())."""
-    suite = _DocTestSuite()
+    suite = _SuiteOfDocTests()
     if kw.get('module_relative', True):
-        kw['package'] = _normalize_module(kw.get('package'))
+        kw['package'] = _resolve_module(kw.get('package'))
     for path in paths:
         suite.addTest(DocFileTest(path, **kw))
     return suite
@@ -1639,7 +1637,7 @@ def script_from_examples(s):
                 output.append('# Expected:')
                 output += ['## ' + line for line in want.split('\n')[:-1]]
         else:
-            output += [_comment_line(line) for line in piece.split('\n')[:-1]]
+            output += [_as_comment(line) for line in piece.split('\n')[:-1]]
     # drop leading and trailing comment-only lines
     while output and output[-1] == '#':
         output.pop()
@@ -1650,7 +1648,7 @@ def script_from_examples(s):
 
 def testsource(module, name):
     """The script_from_examples() of the docstring of `name` in `module`."""
-    module = _normalize_module(module)
+    module = _resolve_module(module)
     tests = DocTestFinder().find(module)
     matching = [t for t in tests if t.name == name]
     if not matching:
@@ -1679,13 +1677,13 @@ def debug_script(src, pm=False, globs=None):
 
 def debug(module, name, pm=False):
     """Debug the examples in the docstring of `name` in `module`."""
-    module = _normalize_module(module)
+    module = _resolve_module(module)
     debug_script(testsource(module, name), pm, module.__dict__)
 
 
 # ---------------------------------------------------------------- command line
 
-def _test():
+def _main():
     import argparse
 
     parser = argparse.ArgumentParser(description="doctest runner", color=True)
@@ -1727,4 +1725,4 @@ def _test():
 
 
 if __name__ == "__main__":
-    sys.exit(_test())
+    sys.exit(_main())

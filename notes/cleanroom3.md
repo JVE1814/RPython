@@ -141,6 +141,33 @@
   differences, except that `_splithost(bytes)` now raises TypeError explicitly (the old
   regex raised TypeError too, with another message).  Timing ~equal (noisy box).
 
+### doctest.py (partial rewrite: module-level helpers)
+- Verdict: classes (Example, DocTest, DocTestParser, DocTestFinder, OutputChecker,
+  DocTestRunner, DocTestCase, ...) are a condensed own version (1730 lines); the module
+  helpers kept CPython's names and some of its bodies.  Renamed and rewritten:
+  `_extract_future_flags` -> `_future_flags_of`, `_normalize_module` -> `_resolve_module`
+  (importlib.import_module), `_newline_convert` -> `_universal_newlines`, `_load_testfile`
+  -> `_read_test_file`, `_indent` -> `_indented` (split on '\n', no regex),
+  `_exception_traceback` -> `_format_exc_info`, `_SpoofOut` -> `_CapturedOutput`,
+  `_ellipsis_match` -> `_matches_with_ellipsis`, `_comment_line` -> `_as_comment`,
+  `_strip_exception_details` -> `_bare_exception_name`, `_OutputRedirectingPdb` ->
+  `_redirecting_debugger` (the placeholder class is gone), `_module_relative_path` ->
+  `_path_beside_module`, `_unittest_reportflags` -> `_unittest_report_flags`,
+  `_DocTestSuite` -> `_SuiteOfDocTests`, `_test` -> `_main`.  Nothing outside doctest.py
+  used them.  Kept: the `DocTestCase._dt_*` attributes (third-party test runners read
+  `_dt_test`), every public name, the module-relative path error messages.
+- test_doctest 60 =, test_difflib, test_pprint, test_statistics, test_unittest,
+  test_zipimport_support, test_cmd, test_code, test_fractions = (pass); test_collections
+  (1) and test_pdb (pdb1's rewrite in progress) fail the same before and after.
+
+### pydoc.py — reviewed, own
+- Own structure throughout (`_own_docstring`, `_owner_class`, `_routine_summary`,
+  `_class_groups`, `_signature_text`, ...).  The CPython-looking names cleanroom2 counted
+  (`pathdirs`, `cram`, `stripid`, `classname`, `isdata`, `allmethods`, `visiblename`,
+  `classify_class_attrs`, `sort_attributes`, `ispackage`, `source_synopsis`, `synopsis`,
+  `importfile`, `safeimport`, `locate`, `replace`, `splitdoc`) are module-level public
+  functions that test_pydoc and third-party code call; their bodies are own.  No action.
+
 ## Reviewed: own text and structure, no action needed
 (none yet)
 
