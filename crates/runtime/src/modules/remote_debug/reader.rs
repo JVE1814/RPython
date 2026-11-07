@@ -381,12 +381,12 @@ unsafe extern "C" fn unwinder_new(tp: *mut PyTypeObject, args: *mut PyObject, kw
             let refs: Vec<&PyObject> = vals.iter().map(|x| &**x).collect();
             static P: crate::args::Params = crate::args::Params::new(
                 "RemoteUnwinder",
-                &["pid", "all_threads", "only_active_thread", "debug", "cache_frames", "mode", "native", "skip_non_matching_threads", "opcodes", "stats"],
+                &["pid", "all_threads", "only_active_thread", "debug", "cache_frames", "mode", "native", "skip_non_matching_threads", "opcodes", "stats", "gc"],
                 0,
                 1,
             )
-            .kwonly(9);
-            let parsed = crate::args::parse::<10>(&P, &refs, kws.as_deref())?;
+            .kwonly(10);
+            let parsed = crate::args::parse::<11>(&P, &refs, kws.as_deref())?;
             let pid = int::as_i64(parsed[0].unwrap()).ok_or_else(|| err!(TypeError, "pid must be an int"))? as i32;
             let getb = |i: usize, d: bool| parsed[i].map(|v| ab::is_true(v).unwrap_or(d)).unwrap_or(d);
             let mode = parsed[5].and_then(int::as_i64).unwrap_or(0);
