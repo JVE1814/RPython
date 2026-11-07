@@ -89,6 +89,12 @@ pub fn bootstrap() -> Option<PyRef> {
 /// mtime and on the interpreter executable's size and mtime (a rebuilt compiler
 /// invalidates it). Any problem with the cache falls back to compiling.
 pub(crate) fn bootstrap_code(src: &[u8], file: &str, display: &str) -> PyResult {
+    bootstrap_code_with(|| Ok(std::borrow::Cow::Borrowed(src)), file, display)
+}
+
+/// `bootstrap_code` with the source produced on demand (perf4: a valid cache does
+/// not need the source file read at all).
+fn bootstrap_code_with<'a>(src: impl FnOnce() -> PyResult<std::borrow::Cow<'a, [u8]>>, file: &str, display: &str) -> PyResult {
     fn stamp(p: &std::path::Path) -> Option<(u64, u128)> {
         let m = std::fs::metadata(p).ok()?;
         let t = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
@@ -116,7 +122,8 @@ pub(crate) fn bootstrap_code(src: &[u8], file: &str, display: &str) -> PyResult 
             }
         }
     }
-    let c = crate::compile::compile_bytes(src, display, crate::compile::Mode::Exec, 0, 0)?;
+    let src = src()?;
+    let c = crate::compile::compile_bytes(&src, display, crate::compile::Mode::Exec, 0, 0)?;
     if let (Some(key), Some(cache)) = (&key, &cache) {
         if let Ok(body) = crate::modules::marshal::dumps_vec(&c.code, 5, true) {
             let mut out = key.clone().into_bytes();
@@ -137,12 +144,15 @@ pub(crate) fn bootstrap_code(src: &[u8], file: &str, display: &str) -> PyResult 
 }
 
 fn exec_bootstrap_module(name: &str, file: &str, display: &str) -> PyResult {
-    let src = match std::fs::read(file) {
-        Ok(s) => s,
-        Err(e) => {
-            return Err(crate::types::exceptions::os_error_from_errno(e.raw_os_error().unwrap_or(0), Some(&pystr::new_str(file)), None));
+    let read_src = || -> PyResult<std::borrow::Cow<'static, [u8]>> {
+        match std::fs::read(file) {
+            Ok(s) => Ok(std::borrow::Cow::Owned(s)),
+            Err(e) => Err(crate::types::exceptions::os_error_from_errno(e.raw_os_error().unwrap_or(0), Some(&pystr::new_str(file)), None)),
         }
     };
+    if !std::path::Path::new(file).is_file() {
+        read_src()?;
+    }
     let m = module::new_module(name)?;
     let d = module::module_dict(&m);
     dict::set_item_str(&d, "__builtins__", &crate::builtins::builtins_dict())?;
@@ -153,7 +163,7 @@ fn exec_bootstrap_module(name: &str, file: &str, display: &str) -> PyResult {
     }
     dict::set_item_str(&crate::modules::sys::modules_dict(), name, &m)?;
     let r = (|| -> PyResult<()> {
-        let code = bootstrap_code(&src, file, display)?;
+        let code = bootstrap_code_with(read_src, file, display)?;
         crate::interp::eval_code(&code, &d, Some(&d))?;
         Ok(())
     })();

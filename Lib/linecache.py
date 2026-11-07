@@ -425,3 +425,18 @@ def _register_code(code, string, name):
                 stack.append(const)
         key = _make_key(code)
         _interactive_cache[key] = entry
+
+
+def _take_interpreter_sources():
+    # Sources the interpreter recorded before this module was first imported
+    # (the code of `python -c`), registered now instead of at every start.
+    try:
+        from _imp import _rpy_linecache_pending
+    except ImportError:
+        return
+    for code, string, name in _rpy_linecache_pending():
+        _register_code(code, string, name)
+
+
+_take_interpreter_sources()
+del _take_interpreter_sources

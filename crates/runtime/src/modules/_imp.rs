@@ -375,6 +375,11 @@ fn imp_rpy_listdir(_m: &PyObject, p: &PyObject) -> PyResult {
     }
     Ok(list::new_list(v))
 }
+/// `_imp._rpy_linecache_pending()`: sources (`python -c`) recorded before linecache was
+/// imported, as [(code, source, name)]; linecache registers them at import.
+fn imp_rpy_linecache_pending(_m: &PyObject) -> PyResult {
+    Ok(crate::modules::pymain::take_pending_sources())
+}
 fn imp_rpy_getcwd(_m: &PyObject) -> PyResult {
     let d = std::env::current_dir().map_err(|e| os_err(e, "."))?;
     use std::os::unix::ffi::OsStrExt;
@@ -434,6 +439,7 @@ pub fn init_module() -> PyResult {
             ("_rpy_stat", O, imp_rpy_stat),
             ("_rpy_listdir", O, imp_rpy_listdir),
             ("_rpy_getcwd", NOARGS, imp_rpy_getcwd),
+            ("_rpy_linecache_pending", NOARGS, imp_rpy_linecache_pending),
             ("_rpy_read_file", O, imp_rpy_read_file),
             ("_set_lazy_attributes", FAST, imp_set_lazy_attributes),
         ],

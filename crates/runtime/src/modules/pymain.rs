@@ -387,7 +387,26 @@ fn register_interactive_source(code: &PyObject, src: &str) {
     register_source(code, src, "<stdin>")
 }
 
+/// (perf4) Sources recorded for linecache before it was imported: (owned code object,
+/// source, name). `python -c` used to import linecache at every start only to register
+/// its source; linecache takes these when it is imported (`_imp._rpy_linecache_pending`).
+static PENDING_SOURCES: std::sync::Mutex<Vec<(usize, String, &'static str)>> = std::sync::Mutex::new(Vec::new());
+
+/// Take the pending sources as a list of (code, source, name) tuples.
+pub fn take_pending_sources() -> PyRef {
+    let v = std::mem::take(&mut *PENDING_SOURCES.lock().unwrap_or_else(|e| e.into_inner()));
+    let items: Vec<PyRef> = v
+        .into_iter()
+        .map(|(c, s, n)| crate::types::tuple::new_tuple(vec![unsafe { PyRef::from_raw(c as *mut PyObject) }, pystr::new_str(&s), pystr::new_str(n)]))
+        .collect();
+    crate::types::list::new_list(items)
+}
+
 fn register_source(code: &PyObject, src: &str, name: &str) {
+    if name == "<string>" && crate::import::get_loaded_module("linecache").is_none() {
+        PENDING_SOURCES.lock().unwrap_or_else(|e| e.into_inner()).push((code.to_ref().into_raw() as usize, src.to_string(), "<string>"));
+        return;
+    }
     let r = (|| -> PyResult<()> {
         let lc = crate::import::import_absolute("linecache")?;
         let f = ab::getattr_str(&lc, "_register_code")?;
