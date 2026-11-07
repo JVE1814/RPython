@@ -152,7 +152,20 @@ pub fn binary_op_on_stack(op: BinOp, a: &PyObject, b: &PyObject) -> PyResult {
 /// dispatching on this thread.
 pub fn is_stack_temporary(p: *const PyObject) -> bool {
     let p = p as usize;
-    p != 0 && STACK_OPERANDS.with(|c| c.get().contains(&p))
+    p != 0 && (STACK_OPERANDS.with(|c| c.get().contains(&p)) || on_current_value_stack(p))
+}
+
+/// (capi3) Is `p` on the value stack of the innermost Python frame (e.g. an argument of
+/// the C function that frame is calling)? Popped slots are cleared, so only live
+/// operands match.
+fn on_current_value_stack(p: usize) -> bool {
+    let f = crate::interp::current_frame_ptr();
+    if f.is_null() {
+        return false;
+    }
+    let f = unsafe { &*f };
+    let top = f.stack_top.min(f.slots.len());
+    f.nlocalsplus < top && f.slots[f.nlocalsplus..top].iter().any(|&s| s as usize == p)
 }
 
 /// Find the exception handler for instruction `i` (first matching entry).

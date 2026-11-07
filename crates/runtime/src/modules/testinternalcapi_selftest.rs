@@ -72,8 +72,16 @@ fn check_pyobject_freed_is_freed(_m: &PyObject) -> PyResult {
     }
 }
 
+/// Take a new reference to `o` and give it back through the deferred-release queue
+/// (QSBR), which the collector drains with the world stopped.
+fn incref_decref_delayed(_m: &PyObject, o: &PyObject) -> PyResult {
+    unsafe { crate::qsbr::decref_deferred(o.to_ref().into_raw()) };
+    Ok(none::none_ref())
+}
+
 pub fn methods() -> *mut PyMethodDef {
     crate::mdefs![
+        ("incref_decref_delayed", O, incref_decref_delayed),
         ("check_pyobject_null_is_freed", NOARGS, check_pyobject_null_is_freed),
         ("check_pyobject_uninitialized_is_freed", NOARGS, check_pyobject_uninitialized_is_freed),
         ("check_pyobject_forbidden_bytes_is_freed", NOARGS, check_pyobject_forbidden_bytes_is_freed),

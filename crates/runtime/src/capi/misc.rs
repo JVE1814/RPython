@@ -586,10 +586,7 @@ pub unsafe extern "C" fn PyFile_WriteString(s: *const c_char, f: *mut PyObject) 
         })())
     }
 }
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyFile_NewStdPrinter(fd: c_int) -> *mut PyObject {
-    unsafe { PyFile_FromFd(fd, std::ptr::null(), c"w".as_ptr(), -1, c"utf-8".as_ptr(), c"backslashreplace".as_ptr(), std::ptr::null(), 0) }
-}
+// PyFile_NewStdPrinter: capi/stdprinter.rs (capi3)
 static OPEN_CODE_HOOK: Mutex<(usize, usize)> = Mutex::new((0, 0));
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyFile_SetOpenCodeHook(hook: *mut c_void, data: *mut c_void) -> c_int {
@@ -674,6 +671,10 @@ pub unsafe extern "C" fn Py_fopen(path: *mut PyObject, mode: *const c_char) -> *
             p
         };
         let mut c = bytes::bytes_data(&b).to_vec();
+        if c.contains(&0) {
+            let _ = value_error("embedded null byte"); // (capi3)
+            return std::ptr::null_mut();
+        }
         c.push(0);
         let f = libc::fopen(c.as_ptr() as *const c_char, mode);
         if f.is_null() {

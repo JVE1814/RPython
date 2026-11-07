@@ -116,11 +116,31 @@ fn write_unraisable_attr(what: &str) {
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_SetAttr(o: *mut PyObject, n: *mut PyObject, v: *mut PyObject) -> c_int {
-    unsafe { if o.is_null() || n.is_null() { null_arg(); return -1; } ret_i(ab::setattr_opt(&*o, &*n, opt(v))) }
+    unsafe {
+        if v.is_null() && delete_with_pending_error("PyObject_SetAttr") {
+            return -1;
+        }
+        if o.is_null() || n.is_null() { null_arg(); return -1; }
+        ret_i(ab::setattr_opt(&*o, &*n, opt(v)))
+    }
+}
+/// (capi3) Deleting an attribute (NULL value) while an exception is pending would
+/// lose that exception: SystemError instead, chained to the pending one. True if raised.
+fn delete_with_pending_error(func: &str) -> bool {
+    let Some(pending) = crate::errors::take_exc() else { return false };
+    let _ = system_error(&format!("{}() must not be called with NULL value and an exception set", func));
+    let cur = crate::errors::current_exc_ptr();
+    if !cur.is_null() {
+        unsafe { crate::types::exceptions::set_context_and_cause(&*cur, Some(&pending)) };
+    }
+    true
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_SetAttrString(o: *mut PyObject, n: *const c_char, v: *mut PyObject) -> c_int {
     unsafe {
+        if v.is_null() && delete_with_pending_error("PyObject_SetAttrString") {
+            return -1;
+        }
         if o.is_null() || n.is_null() {
             null_arg();
             return -1;
@@ -133,7 +153,7 @@ pub unsafe extern "C" fn PyObject_SetAttrString(o: *mut PyObject, n: *const c_ch
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_DelAttr(o: *mut PyObject, n: *mut PyObject) -> c_int {
-    unsafe { ret_i(ab::setattr_opt(&*o, &*n, None)) }
+    unsafe { PyObject_SetAttr(o, n, std::ptr::null_mut()) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_DelAttrString(o: *mut PyObject, n: *const c_char) -> c_int {
@@ -335,7 +355,8 @@ pub unsafe extern "C" fn PyObject_Bytes(o: *mut PyObject) -> *mut PyObject {
                 }
                 return Ok(r);
             }
-            ab::call(to::type_obj(bytes::bytes_type()), &[&*o])
+            // (capi3) no __bytes__: PyBytes_FromObject's conversions (buffers, iterables)
+            PyRef::from_raw_opt(super::bytes::PyBytes_FromObject(o)).ok_or(PyErr)
         })())
     }
 }
@@ -448,8 +469,12 @@ pub unsafe extern "C" fn PyObject_SelfIter(o: *mut PyObject) -> *mut PyObject {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_Print(o: *mut PyObject, fp: *mut libc::FILE, flags: c_int) -> c_int {
     unsafe {
+        libc::clearerr(fp);
         let s = if o.is_null() {
             Ok(pystr::new_str("<nil>"))
+        } else if (*o).refcnt() <= 0 {
+            // (capi3) an object being destroyed is not asked for its repr
+            Ok(pystr::new_str(&format!("<refcnt {} at {:p}>", (*o).refcnt(), o)))
         } else if flags & 1 != 0 {
             ab::str(&*o)
         } else {
@@ -459,6 +484,12 @@ pub unsafe extern "C" fn PyObject_Print(o: *mut PyObject, fp: *mut libc::FILE, f
             Ok(s) => {
                 let u = pystr::to_string_lossy(&s);
                 libc::fwrite(u.as_ptr() as *const c_void, 1, u.len(), fp);
+                if libc::ferror(fp) != 0 {
+                    // (capi3) e.g. a stream opened for reading only
+                    let _ = super::errors::PyErr_SetFromErrno(crate::types::exceptions::OSError() as *mut PyObject);
+                    libc::clearerr(fp);
+                    return -1;
+                }
                 0
             }
             Err(_) => -1,
@@ -468,8 +499,9 @@ pub unsafe extern "C" fn PyObject_Print(o: *mut PyObject, fp: *mut libc::FILE, f
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_Dump(o: *mut PyObject) {
     unsafe {
-        if o.is_null() {
-            eprintln!("<object at NULL>");
+        if super::memdebug::object_looks_freed(o) {
+            // (capi3) null, or memory the debug allocator marked as fresh/released
+            eprintln!("<object at {:p} is freed>", o);
             return;
         }
         let saved = take_exc();
@@ -529,6 +561,10 @@ pub unsafe extern "C" fn PyObject_AsFileDescriptor(o: *mut PyObject) -> c_int {
     unsafe {
         let r = (|| -> PyResult<i64> {
             let v = if crate::types::int::is_int(&*o) {
+                if crate::types::bool_::is_bool(&*o) {
+                    // (capi3) as os functions do for a bool file descriptor
+                    crate::modules::warnings::warn(crate::types::exceptions::RuntimeWarning(), "bool is used as a file descriptor", 1)?;
+                }
                 (*o).to_ref()
             } else {
                 match ab::getattr_opt(&*o, crate::name!("fileno"))? {

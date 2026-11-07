@@ -37,6 +37,7 @@ pub mod pystate;
 pub mod pythread;
 pub mod refcount;
 pub mod slots;
+pub mod stdprinter;
 pub mod typeobj;
 pub mod unicode;
 pub mod varargs;

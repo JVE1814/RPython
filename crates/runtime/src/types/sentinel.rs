@@ -213,7 +213,8 @@ pub unsafe extern "C" fn PySentinel_New(name: *const c_char, module_name: *const
             return into_c(Err(err!(SystemError, "PySentinel_New: name must not be NULL")));
         }
         let n = s(name).unwrap();
-        let m = s(module_name);
+        // (capi3) without a module name, __module__ is None
+        let m = Some(s(module_name).unwrap_or_else(crate::types::none::none_ref));
         let r = s(repr);
         into_c(new_sentinel(&n, m.as_deref(), r.as_deref()))
     }
