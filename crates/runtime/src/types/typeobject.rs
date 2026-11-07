@@ -466,6 +466,37 @@ pub unsafe extern "C" fn object_generic_setattro(o: *mut PyObject, name: *mut Py
     }
 }
 
+/// (tail2) A dict materialised from an instance's inline values that outlives the
+/// instance is "detached" when the instance dies: in CPython that copies the values
+/// out of the instance, an allocation a failure-injecting hook (`_testcapi.set_nomemory`)
+/// can refuse, and the refusal is reported as unraisable with the dict emptied. Our
+/// materialised dicts own their values already, so only the observable failure is
+/// reproduced; with no hook installed this is one flag test.
+unsafe fn detach_shared_dict_hooked(op: *mut PyObject, d: *mut PyObject) {
+    unsafe {
+        if !crate::capi::mem::hook_installed()
+            || d as usize & 1 != 0
+            || !crate::alloc::has_managed(op)
+            || (*op).ob_gc_bits.load(std::sync::atomic::Ordering::Relaxed) & crate::alloc::GC_BIT_DICT_DETACHED != 0
+            || (*d).refcnt() <= 1
+            || !dict::is_dict_exact(&*d)
+        {
+            return;
+        }
+        let n = dict::dict_len(&*d);
+        if !crate::capi::mem::hooked_alloc_refuses((n + 1) * std::mem::size_of::<usize>()) {
+            return;
+        }
+        let pending = take_exc();
+        let _ = memory_error();
+        crate::modules::sys_full::write_unraisable(None, None);
+        dict::clear(&*d);
+        if let Some(e) = pending {
+            set_exc(e);
+        }
+    }
+}
+
 // ---------------------------------------------------------------- allocation
 
 /// PyType_GenericAlloc: zeroed instance with `nitems` variable items, GC-tracked if GC.
@@ -582,6 +613,7 @@ pub unsafe extern "C" fn subtype_dealloc(op: *mut PyObject) {
         if !slot.is_null() && !(*slot).is_null() {
             let d = *slot;
             *slot = std::ptr::null_mut();
+            detach_shared_dict_hooked(op, d);
             decref(d);
         }
         // find the nearest static (non-heap) base to dealloc the remaining layout

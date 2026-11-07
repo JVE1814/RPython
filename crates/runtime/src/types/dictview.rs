@@ -405,7 +405,7 @@ fn iter_next_rs(o: &PyObject) -> PyResult<Option<PyRef>> {
                 }
                 if i >= 0 {
                     let e = t.entries()[i as usize];
-                    res = Some(unsafe { (PyRef::from_borrowed(e.key), PyRef::from_borrowed(e.value)) });
+                    res = Some(unsafe { entry_result(k, &e) });
                     it.pos = i - 1;
                 }
             }
@@ -415,7 +415,7 @@ fn iter_next_rs(o: &PyObject) -> PyResult<Option<PyRef>> {
             }
             if i < n {
                 let e = t.entries()[i as usize];
-                res = Some(unsafe { (PyRef::from_borrowed(e.key), PyRef::from_borrowed(e.value)) });
+                res = Some(unsafe { entry_result(k, &e) });
                 it.pos = i + 1;
             }
         }
@@ -426,17 +426,26 @@ fn iter_next_rs(o: &PyObject) -> PyResult<Option<PyRef>> {
             finish(it);
             Ok(None)
         }
-        Some((key, value)) => {
+        Some(r) => {
             if it.len == 0 {
                 finish(it);
                 raise!(RuntimeError, "dictionary keys changed during iteration");
             }
             it.len -= 1;
-            Ok(Some(match k {
-                Kind::Keys => key,
-                Kind::Values => value,
-                Kind::Items => tuple::tuple2(key, value),
-            }))
+            Ok(Some(r))
+        }
+    }
+}
+
+/// (perf5) What a dict iterator of kind `k` yields for entry `e` (only the references
+/// it needs are taken).
+#[inline(always)]
+unsafe fn entry_result(k: Kind, e: &dict::Entry) -> PyRef {
+    unsafe {
+        match k {
+            Kind::Keys => PyRef::from_borrowed(e.key),
+            Kind::Values => PyRef::from_borrowed(e.value),
+            Kind::Items => tuple::tuple2(PyRef::from_borrowed(e.key), PyRef::from_borrowed(e.value)),
         }
     }
 }

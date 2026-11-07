@@ -633,6 +633,17 @@ fn plain_eq_depth(a: &PyObject, b: &PyObject, depth: u32) -> Option<bool> {
             return Some(false);
         }
         for (p, q) in x.iter().zip(y.iter()) {
+            // (perf5) identical items and compact ints without the recursive call
+            if p.is(q) {
+                continue;
+            }
+            let tp = p.type_ptr();
+            if tp == q.type_ptr() && tp as *mut crate::ffi::PyTypeObject == int::int_type() && int::is_compact(p) && int::is_compact(q) {
+                if int::compact_value(p) != int::compact_value(q) {
+                    return Some(false);
+                }
+                continue;
+            }
             if !plain_eq_depth(p, q, depth + 1)? {
                 return Some(false);
             }
@@ -1306,6 +1317,22 @@ pub fn iter_next(it: &PyObject) -> PyResult<Option<PyRef>> {
     Ok(None)
 }
 
+/// (perf5) The items iterating `o` yields, taken in one pass under the container's
+/// lock, for builtin containers whose iteration runs no Python code: exact sets and
+/// frozensets, exact dicts (keys) and the exact dict views. None for anything else.
+pub fn builtin_snapshot(o: &PyObject) -> Option<Vec<PyRef>> {
+    if crate::types::set::is_anyset_exact(o) {
+        return Some(crate::types::set::set_items(o));
+    }
+    if dict::is_dict_exact(o) {
+        return Some(dict::keys_vec(o));
+    }
+    if crate::types::dictview::is_view_exact(o) {
+        return Some(crate::types::dictview::view_items(o));
+    }
+    None
+}
+
 pub fn collect_iterable(o: &PyObject) -> PyResult<Vec<PyRef>> {
     if tuple::is_tuple_exact(o) {
         return Ok(tuple::tuple_to_vec(o));
@@ -1313,8 +1340,8 @@ pub fn collect_iterable(o: &PyObject) -> PyResult<Vec<PyRef>> {
     if list::is_list_exact(o) {
         return Ok(list::list_to_vec(o));
     }
-    if crate::types::set::is_anyset_exact(o) {
-        return Ok(crate::types::set::set_items(o));
+    if let Some(v) = builtin_snapshot(o) {
+        return Ok(v);
     }
     let it = get_iter(o)?;
     let mut v = Vec::new();

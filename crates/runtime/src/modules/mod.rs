@@ -64,6 +64,7 @@ pub mod _random;
 pub mod _imp;
 pub mod _weakref;
 pub mod _queue;
+pub mod _zoneinfo; // (tail2)
 pub mod _socket;
 pub mod select;
 pub mod _posixsubprocess;

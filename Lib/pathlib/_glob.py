@@ -114,17 +114,21 @@ def _compile_segment(part, seps, case_sensitive):
     return re.compile(fr'(?s:{_translate_segment(part, re.escape(seps))})\Z', flags).match
 
 
+def _call_entry(entry, follow_symlinks):
+    return entry(follow_symlinks)
+
+
 class Globber:
     """String-based globber.
 
-    scandir(path_str) returns an iterable of (name, is_dir) pairs, where
-    is_dir(follow_symlinks) tells whether the entry is a directory; it raises
-    OSError if path_str cannot be scanned.  An empty path_str means the
-    current directory.  lexists(path_str) tells whether a path exists
-    (without following a final symlink)."""
+    scandir(path_str) returns an iterable of (name, entry) pairs, and
+    is_dir(entry, follow_symlinks) tells whether an entry is a directory;
+    scandir raises OSError if path_str cannot be scanned.  An empty path_str
+    means the current directory.  lexists(path_str) tells whether a path
+    exists (without following a final symlink)."""
 
     def __init__(self, sep, case_sensitive, scandir, lexists, recurse_symlinks,
-                 case_pedantic=False):
+                 case_pedantic=False, is_dir=None):
         self.sep = sep
         self.case_sensitive = case_sensitive
         self.scandir = scandir
@@ -133,6 +137,8 @@ class Globber:
         # True when case_sensitive differs from the file system's own rule:
         # then even literal segments must be compared with directory listings
         self.case_pedantic = case_pedantic
+        # without is_dir, the entries are callables taking follow_symlinks
+        self.is_dir = is_dir if is_dir is not None else _call_entry
 
     def _scan(self, path):
         try:
@@ -180,14 +186,14 @@ class Globber:
         if entries is None:
             return
         match = _compile_segment(part, sep, self.case_sensitive)
-        for name, is_dir in entries:
+        for name, entry in entries:
             if not match(name):
                 continue
             if last:
                 yield path + name
             else:
                 try:
-                    d = is_dir(True)
+                    d = self.is_dir(entry, True)
                 except OSError:
                     d = False
                 if d:
@@ -209,9 +215,9 @@ class Globber:
             if entries is None:
                 continue
             subdirs = []
-            for name, is_dir in entries:
+            for name, entry in entries:
                 try:
-                    d = is_dir(self.recurse_symlinks)
+                    d = self.is_dir(entry, self.recurse_symlinks)
                 except OSError:
                     d = False
                 if last:

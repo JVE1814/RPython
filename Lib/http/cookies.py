@@ -25,8 +25,8 @@ class CookieError(Exception):
 
 
 # Characters allowed in a cookie name and in an unquoted value.
-_LegalChars = string.ascii_letters + string.digits + "!#$%&'*+-.^_`|~:"
-_UnescapedChars = _LegalChars + ' ()/<=>?@[]{}'
+_TOKEN_CHARS = string.ascii_letters + string.digits + "!#$%&'*+-.^_`|~:"
+_PLAIN_IN_QUOTES = _TOKEN_CHARS + ' ()/<=>?@[]{}'
 
 _C0_CONTROLS = frozenset(chr(c) for c in range(0x20)) | {'\x7f'}
 
@@ -45,14 +45,14 @@ def _has_control_character(*values):
 def _escape_char(ch):
     if ch == '"' or ch == '\\':
         return '\\' + ch
-    if ch in _UnescapedChars:
+    if ch in _PLAIN_IN_QUOTES:
         return ch
     return '\\%03o' % ord(ch)
 
 
-def _quote(text):
+def _quote_value(text):
     """Quote *text* for use as a cookie value if it needs quoting."""
-    if text is None or all(ch in _LegalChars for ch in text):
+    if text is None or all(ch in _TOKEN_CHARS for ch in text):
         return text
     return '"' + ''.join(map(_escape_char, text)) + '"'
 
@@ -67,8 +67,8 @@ def _unescape(match):
     return other
 
 
-def _unquote(text):
-    """Undo _quote(): strip the quotes and resolve backslash escapes."""
+def _unquote_value(text):
+    """Undo _quote_value(): strip the quotes and resolve backslash escapes."""
     if text is None or len(text) < 2:
         return text
     if text[0] != '"' or text[-1] != '"':
@@ -79,18 +79,18 @@ def _unquote(text):
     return _UNQUOTE_RE.sub(_unescape, body)
 
 
-_WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-_MONTHS = [None, 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-           'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+_DAY_NAMES = 'Mon Tue Wed Thu Fri Sat Sun'.split()
+_MONTH_NAMES = 'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split()
 
 
-def _getdate(future=0, weekdayname=_WEEKDAYS, monthname=_MONTHS):
-    """An HTTP date *future* seconds from now."""
+def _http_date_from_now(seconds=0):
+    """The RFC 1123 date (as used by the expires attribute) *seconds* from
+    now."""
     from time import gmtime, time
-    tm = gmtime(time() + future)
-    return '%s, %02d %3s %4d %02d:%02d:%02d GMT' % (
-        weekdayname[tm.tm_wday], tm.tm_mday, monthname[tm.tm_mon],
-        tm.tm_year, tm.tm_hour, tm.tm_min, tm.tm_sec)
+    t = gmtime(time() + seconds)
+    return (f'{_DAY_NAMES[t.tm_wday]}, {t.tm_mday:02d} '
+            f'{_MONTH_NAMES[t.tm_mon - 1]} {t.tm_year:4d} '
+            f'{t.tm_hour:02d}:{t.tm_min:02d}:{t.tm_sec:02d} GMT')
 
 
 class Morsel(dict):
@@ -180,7 +180,7 @@ class Morsel(dict):
     def set(self, key, val, coded_val):
         if key.lower() in self._reserved:
             raise CookieError(f'Attempt to set a reserved key {key!r}')
-        if not key or not all(ch in _LegalChars for ch in key):
+        if not key or not all(ch in _TOKEN_CHARS for ch in key):
             raise CookieError(f'Illegal key {key!r}')
         if _has_control_character(key, val, coded_val):
             raise CookieError(f'Control characters are not allowed in '
@@ -246,11 +246,11 @@ class Morsel(dict):
                 continue
             name = self._reserved[key]
             if key == 'expires' and isinstance(value, int):
-                parts.append(f'{name}={_getdate(value)}')
+                parts.append(f'{name}={_http_date_from_now(value)}')
             elif key == 'max-age' and isinstance(value, int):
                 parts.append('%s=%d' % (name, value))
             elif key == 'comment' and isinstance(value, str):
-                parts.append(f'{name}={_quote(value)}')
+                parts.append(f'{name}={_quote_value(value)}')
             elif key in self._flags:
                 if value:
                     parts.append(str(name))
@@ -402,7 +402,7 @@ class BaseCookie(dict):
                         return
                     parsed.append((False, key, True))
                 else:
-                    parsed.append((False, key, _unquote(value)))
+                    parsed.append((False, key, _unquote_value(value)))
             elif value is not None:
                 parsed.append((True, key, self.value_decode(value)))
                 seen_cookie = True
@@ -422,8 +422,8 @@ class SimpleCookie(BaseCookie):
     """Cookies whose values are str, quoted as needed."""
 
     def value_decode(self, val):
-        return _unquote(val), val
+        return _unquote_value(val), val
 
     def value_encode(self, val):
         text = str(val)
-        return text, _quote(text)
+        return text, _quote_value(text)

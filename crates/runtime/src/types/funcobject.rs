@@ -1158,7 +1158,7 @@ pub fn init_types() {
 
         let t = &mut *method_type();
         t.tp_name = c"method".as_ptr();
-        t.tp_doc = c"method(function, instance, /)\n--\n\nBind a callable to an instance.".as_ptr();
+        t.tp_doc = c"method(function, instance, /)\n--\n\nCreate a bound instance method object.".as_ptr();
         t.tp_basicsize = std::mem::size_of::<PyMethodObject>() as isize;
         t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC | Py_TPFLAGS_HAVE_VECTORCALL;
         t.tp_dealloc = Some(method_dealloc);

@@ -38,10 +38,6 @@ class _Iterating:
                 container._commit_removals()
 
 
-# weakref imports the guard under this name
-_IterationGuard = _Iterating
-
-
 def _dead_ref_callback(selfref):
     # The callback of the element references.  It holds the set only
     # weakly, so a WeakSet can be collected while elements are alive.

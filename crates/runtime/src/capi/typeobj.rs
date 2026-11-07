@@ -84,8 +84,9 @@ pub unsafe extern "C" fn PyType_ClearCache() -> std::ffi::c_uint {
     0
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyUnstable_Type_AssignVersionTag(_t: *mut PyTypeObject) -> c_int {
-    1
+pub unsafe extern "C" fn PyUnstable_Type_AssignVersionTag(t: *mut PyTypeObject) -> c_int {
+    // (tail2) a real assignment (0 when the type cannot get a tag)
+    (crate::interp::cache::assign_type_tag(t) != 0) as c_int
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyType_GetDict(t: *mut PyTypeObject) -> *mut PyObject {

@@ -722,24 +722,9 @@ pub fn extend(o: &PyObject, it: &PyObject) -> PyResult<()> {
         }
         return Ok(());
     }
-    // (stability3) exact dicts, sets and dict views are copied in one snapshot taken
-    // under their lock, as free-threaded CPython does: `list(d)` never sees `d`
-    // change size half way (no "changed size during iteration" under concurrent
-    // mutation).
-    let snapshot: Option<Vec<PyRef>> = if crate::types::dict::is_dict_exact(it) {
-        Some(crate::types::dict::keys_vec(it))
-    } else if crate::types::set::is_anyset_exact(it) {
-        Some(crate::types::set::set_items(it))
-    } else if crate::types::dictview::is_view_exact(it) && crate::types::dict::is_dict_exact(crate::types::dictview::view_dict(it)) {
-        Some(crate::types::dictview::view_items(it))
-    } else {
-        None
-    };
-    if snapshot.is_some() || is_list_exact(it) || o.is(it) {
-        let items: Vec<PyRef> = match snapshot {
-            Some(v) => v,
-            None => list_to_vec(it),
-        };
+    // (perf5) exact sets, dicts and dict views: one snapshot instead of an iterator
+    let snap = if is_list_exact(it) || o.is(it) { Some(list_to_vec(it)) } else { ab::builtin_snapshot(it) };
+    if let Some(items) = snap {
         if items.is_empty() {
             return Ok(());
         }

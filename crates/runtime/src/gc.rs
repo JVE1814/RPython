@@ -555,14 +555,14 @@ const REFS_SHIFT: u32 = 3;
 #[inline(always)]
 unsafe fn graph_word<'a>(op: *mut PyObject) -> Option<&'a std::sync::atomic::AtomicUsize> {
     unsafe {
-        if op.is_null() || (*op).ob_gc_bits.load(Relaxed) & GC_BIT_TRACKED == 0 {
-            return None;
-        }
+        // (perf5) the tag alone identifies the examined objects: owner words of all
+        // other objects (tracked or not) are aligned thread pointers or 0
         let t = &(*op).ob_tid;
         if t.load(Relaxed) & GRAPH_TAG == GRAPH_TAG { Some(t) } else { None }
     }
 }
 
+/// `op` non-null.
 #[inline(always)]
 unsafe fn decref_visit(op: *mut PyObject) {
     unsafe {
@@ -572,26 +572,30 @@ unsafe fn decref_visit(op: *mut PyObject) {
     }
 }
 
+/// `op` non-null.
 #[inline(always)]
 unsafe fn mark_visit(op: *mut PyObject, stack: &mut Vec<*mut PyObject>) {
     unsafe {
-        if let Some(w) = graph_word(op) {
-            let v = w.load(Relaxed);
-            if v & REACHABLE == 0 {
-                w.store(v | REACHABLE, Relaxed);
-                stack.push(op);
-            }
+        let w = &(*op).ob_tid;
+        let v = w.load(Relaxed);
+        if v & (GRAPH_TAG | REACHABLE) == GRAPH_TAG {
+            w.store(v | REACHABLE, Relaxed);
+            stack.push(op);
         }
     }
 }
 
 unsafe extern "C" fn visit_decref(op: *mut PyObject, _arg: *mut c_void) -> c_int {
-    unsafe { decref_visit(op) };
+    if !op.is_null() {
+        unsafe { decref_visit(op) };
+    }
     0
 }
 
 unsafe extern "C" fn visit_mark(op: *mut PyObject, arg: *mut c_void) -> c_int {
-    unsafe { mark_visit(op, &mut (*(arg as *mut Graph)).stack) };
+    if !op.is_null() {
+        unsafe { mark_visit(op, &mut (*(arg as *mut Graph)).stack) };
+    }
     0
 }
 
@@ -634,6 +638,49 @@ unsafe fn traverse_inline(op: *mut PyObject, visit: visitproc, arg: *mut c_void,
     }
 }
 
+/// (perf5) Roots for `find_unreachable`: the locals (and function, globals, builtins,
+/// locals mapping) of every frame running on a registered thread. The world is
+/// stopped, so every thread is at a safepoint with a consistent frame chain. Only
+/// the locals part of the slots is read: compiled code does not keep `stack_top`
+/// current, while local slots always hold owned references or NULL.
+unsafe fn mark_from_frames(stack: &mut Vec<*mut PyObject>) {
+    unsafe {
+        // the current interpreter's sys.modules and sys (raw pointers: reference
+        // counts must not change while owner words hold collection state)
+        let it = crate::subinterp::current();
+        for p in [it.modules.load(Acquire), it.sys.load(Acquire)] {
+            if !p.is_null() {
+                mark_visit(p, stack);
+            }
+        }
+        let threads: Vec<usize> = crate::threads::ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        for t in threads {
+            let ts = &*(t as *const ThreadState);
+            if !ts.alive() {
+                continue;
+            }
+            let mut f = ts.frame.get();
+            let mut guard = 0usize;
+            while !f.is_null() && guard < 1 << 20 {
+                let fr = &*f;
+                let n = fr.nlocalsplus.min(fr.slots.len());
+                for &p in &fr.slots[..n] {
+                    if !p.is_null() {
+                        mark_visit(p, stack);
+                    }
+                }
+                for p in [fr.func, fr.globals, fr.builtins, fr.locals] {
+                    if !p.is_null() {
+                        mark_visit(p, stack);
+                    }
+                }
+                f = fr.prev;
+                guard += 1;
+            }
+        }
+    }
+}
+
 /// Compute the unreachable subset of `objs` (all tracked, no duplicates).
 unsafe fn find_unreachable(objs: Vec<*mut PyObject>) -> Vec<*mut PyObject> {
     unsafe {
@@ -647,11 +694,20 @@ unsafe fn find_unreachable(objs: Vec<*mut PyObject>) -> Vec<*mut PyObject> {
             t.store(((r.clamp(0, 1 << 56) as usize) << REFS_SHIFT) | GRAPH_TAG, Relaxed);
         }
         drop(refs);
-        let mut g = Graph { stack: Vec::new() };
+        let mut g = Graph { stack: Vec::with_capacity(objs.len()) };
         let gp = &mut g as *mut Graph as *mut c_void;
-        // subtract the references the examined objects hold among themselves
+        // (perf5) first everything reachable from the threads' running frames: those
+        // objects are alive whatever their counts say, and their references need not
+        // be subtracted (each of their edges is then visited once instead of twice)
+        mark_from_frames(&mut g.stack);
+        while let Some(op) = g.stack.pop() {
+            traverse_inline(op, Some(visit_mark), gp, |it| mark_visit(it, &mut (*(gp as *mut Graph)).stack));
+        }
+        // subtract the references the other examined objects hold among themselves
         for &op in &objs {
-            traverse_inline(op, Some(visit_decref), gp, |it| decref_visit(it));
+            if (*op).ob_tid.load(Relaxed) & REACHABLE == 0 {
+                traverse_inline(op, Some(visit_decref), gp, |it| decref_visit(it));
+            }
         }
         // anything still referenced from outside is reachable, and so is everything
         // it reaches

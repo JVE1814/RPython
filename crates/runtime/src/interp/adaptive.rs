@@ -332,6 +332,12 @@ pub fn contains(container: &PyObject) -> u16 {
     G
 }
 
+/// (tail2) CPython specialises attribute access, class calls and TO_BOOL_ALWAYS_TRUE
+/// only for types that have (or can get) a version tag.
+fn versioned(tp: *mut PyTypeObject) -> bool {
+    crate::interp::cache::assign_type_tag(tp) != 0
+}
+
 pub fn to_bool(v: &PyObject) -> u16 {
     if bool_::is_bool(v) {
         return o::TO_BOOL_BOOL;
@@ -353,7 +359,7 @@ pub fn to_bool(v: &PyObject) -> u16 {
         (m.is_null() || (*m).mp_length.is_none()) && (s.is_null() || (*s).sq_length.is_none())
     };
     let no_bool = tp.tp_as_number.is_null() || unsafe { (*tp.tp_as_number).nb_bool.is_none() };
-    if tp.tp_flags & Py_TPFLAGS_HEAPTYPE != 0 && no_bool && no_len(tp.tp_as_mapping, tp.tp_as_sequence) {
+    if tp.tp_flags & Py_TPFLAGS_HEAPTYPE != 0 && no_bool && no_len(tp.tp_as_mapping, tp.tp_as_sequence) && versioned(v.type_ptr()) {
         return o::TO_BOOL_ALWAYS_TRUE;
     }
     G
@@ -471,6 +477,9 @@ pub fn call(callable: &PyObject, self_or_null: Option<&PyObject>, nargs: usize) 
         }
         let tp = unsafe { &*t };
         if tp.tp_flags & Py_TPFLAGS_HEAPTYPE != 0 {
+            if !versioned(t) {
+                return G;
+            }
             let init = lookup(t, crate::name!("__init__"));
             let new_is_object = lookup(t, crate::name!("__new__")).is_some_and(|n| {
                 lookup(crate::types::typeobject::object_type(), crate::name!("__new__")).is_some_and(|b| b.is(&n))
@@ -577,6 +586,9 @@ pub fn load_attr(owner: &PyObject, name: &PyObject, method: bool) -> u16 {
         if method {
             return G;
         }
+        if !versioned(as_type(owner)) {
+            return G;
+        }
         let meta = owner.type_ptr();
         if lookup(meta, name).is_some() {
             return G;
@@ -584,6 +596,9 @@ pub fn load_attr(owner: &PyObject, name: &PyObject, method: bool) -> u16 {
         if lookup(as_type(owner), name).is_some() {
             return if meta == type_type() { o::LOAD_ATTR_CLASS } else { o::LOAD_ATTR_CLASS_WITH_METACLASS_CHECK };
         }
+        return G;
+    }
+    if !versioned(owner.type_ptr()) {
         return G;
     }
     let tp = owner.ty();
@@ -646,7 +661,7 @@ pub fn load_attr(owner: &PyObject, name: &PyObject, method: bool) -> u16 {
 
 pub fn store_attr(owner: &PyObject, name: &PyObject) -> u16 {
     let tp = owner.ty();
-    if tp.tp_setattro.map(|f| f as usize) != Some(object_generic_setattro as usize) || is_type(owner) {
+    if tp.tp_setattro.map(|f| f as usize) != Some(object_generic_setattro as usize) || is_type(owner) || !versioned(owner.type_ptr()) {
         return G;
     }
     if let Some(d) = lookup(owner.type_ptr(), name) {

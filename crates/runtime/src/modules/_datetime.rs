@@ -1056,3 +1056,39 @@ pub fn init_module() -> PyResult {
     keep(&MODREF, w);
     Ok(m)
 }
+
+// ============================================================ (tail2) helpers for _zoneinfo
+
+/// The native `datetime.tzinfo` type (`_zoneinfo.ZoneInfo` derives from it).
+pub fn tzinfo_type_ptr() -> *mut PyTypeObject {
+    tzinfo_type()
+}
+
+/// Is `o` a `datetime.datetime` (or subclass) instance of the native type?
+pub fn is_datetime(o: &PyObject) -> bool {
+    is_subtype(o.type_ptr(), datetime_type())
+}
+
+/// Wall-clock fields of a datetime: (year, month, day, hour, minute, second, fold).
+/// The caller checks `is_datetime` first.
+pub fn datetime_wall_fields(o: &PyObject) -> (i64, u32, u32, u32, u32, u32, u32) {
+    let t = dt(o);
+    let year = ((t.data[0] as i64) << 8) | t.data[1] as i64;
+    (year, t.data[2] as u32, t.data[3] as u32, t.data[4] as u32, t.data[5] as u32, t.data[6] as u32, t.fold as u32)
+}
+
+/// The tzinfo of a datetime (null when naive).
+pub fn datetime_tzinfo_ptr(o: &PyObject) -> *mut PyObject {
+    let t = dt(o);
+    if t.hastzinfo != 0 { t.tzinfo } else { std::ptr::null_mut() }
+}
+
+/// `timedelta(seconds=secs)`.
+pub fn timedelta_from_seconds(secs: i64) -> PyResult {
+    let days = secs.div_euclid(86400);
+    let rest = secs.rem_euclid(86400);
+    if days.abs() > 999_999_999 {
+        raise!(OverflowError, "days={}; must have magnitude <= 999999999", days);
+    }
+    unsafe { new_delta_raw(delta_type(), days as c_int, rest as c_int, 0) }
+}

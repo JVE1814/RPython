@@ -198,6 +198,8 @@ fn set_collection_flag_recursive(tp: *mut PyTypeObject, flag: std::ffi::c_ulong)
             return;
         }
         (*tp).tp_flags = ((*tp).tp_flags & !COLLECTION_FLAGS) | flag;
+        // (tail2) the flags steer pattern matching: caches keyed on the type are stale
+        crate::types::slots::type_modified(tp);
         for sub in crate::types::typeobject::subclasses(tp) {
             let sub = sub.p();
             set_collection_flag_recursive(sub, flag);

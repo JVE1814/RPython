@@ -16,7 +16,8 @@ __all__ = ["pprint", "pformat", "isreadable", "isrecursive", "saferepr",
 def pprint(object, stream=None, indent=1, width=80, depth=None, *,
            compact=False, sort_dicts=True, underscore_numbers=False,
            expand=False):
-    """Pretty-print a Python object to a stream [default is sys.stdout]."""
+    """Write the pretty-printed form of *object* and a newline to *stream*
+    (sys.stdout by default); see PrettyPrinter for the options."""
     printer = PrettyPrinter(
         stream=stream, indent=indent, width=width, depth=depth,
         compact=compact, sort_dicts=sort_dicts,
@@ -27,7 +28,8 @@ def pprint(object, stream=None, indent=1, width=80, depth=None, *,
 def pformat(object, indent=1, width=80, depth=None, *,
             compact=False, sort_dicts=True, underscore_numbers=False,
             expand=False):
-    """Format a Python object into a pretty-printed representation."""
+    """Return the pretty-printed form of *object* as a string; see
+    PrettyPrinter for the options."""
     return PrettyPrinter(indent=indent, width=width, depth=depth,
                          compact=compact, sort_dicts=sort_dicts,
                          underscore_numbers=underscore_numbers,
@@ -40,17 +42,17 @@ def pp(object, *args, sort_dicts=False, **kwargs):
 
 
 def saferepr(object):
-    """Version of repr() which can handle recursive data structures."""
+    """repr() that survives recursive containers (shown as <Recursion on ...>)."""
     return PrettyPrinter()._safe_repr(object, {}, None, 0)[0]
 
 
 def isreadable(object):
-    """Determine if saferepr(object) is readable by eval()."""
+    """True if saferepr(object) is valid input for eval()."""
     return PrettyPrinter()._safe_repr(object, {}, None, 0)[1]
 
 
 def isrecursive(object):
-    """Determine if object requires a recursive representation."""
+    """True if object contains a reference to itself."""
     return PrettyPrinter()._safe_repr(object, {}, None, 0)[2]
 
 
@@ -72,7 +74,7 @@ class _safe_key:
 
 
 def _safe_tuple(t):
-    "Helper function for comparing 2-tuples"
+    """Order key for a (key, value) pair; see _safe_key."""
     return _safe_key(t[0]), _safe_key(t[1])
 
 
@@ -80,7 +82,7 @@ class PrettyPrinter:
     def __init__(self, indent=1, width=80, depth=None, stream=None, *,
                  compact=False, sort_dicts=True, underscore_numbers=False,
                  expand=False):
-        """Handle pretty printing operations onto a stream.
+        """Configure a printer writing to *stream*.
 
         indent: number of spaces added per nesting level
         width: desired maximum line width
@@ -573,10 +575,9 @@ class PrettyPrinter:
         return repr
 
     def format(self, object, context, maxlevels, level):
-        """Format object for a specific context, returning a string
-        and flags indicating whether the representation is 'readable'
-        and whether the object represents a recursive construct.
-        """
+        """Return (text, readable, recursive) for *object*: its one-line
+        repr, whether eval() could rebuild it, and whether it refers to
+        itself.  Subclasses override this to customise the output."""
         return self._safe_repr(object, context, maxlevels, level)
 
     def _pprint_default_dict(self, object, stream, indent, allowance, context, level):

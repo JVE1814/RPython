@@ -47,9 +47,12 @@ impl PathArg {
 /// UTF-8 + surrogateescape encode of a str.
 pub fn fs_encode_str(s: &PyObject) -> PyResult<Vec<u8>> {
     if let Some(a) = pystr::ascii_str(s) {
-        return Ok(a.as_bytes().to_vec());
+        // (perf5) room for the terminator CString::new appends (no reallocation)
+        let mut v = Vec::with_capacity(a.len() + 1);
+        v.extend_from_slice(a.as_bytes());
+        return Ok(v);
     }
-    let mut out = Vec::with_capacity(pystr::str_len(s));
+    let mut out = Vec::with_capacity(pystr::str_len(s) + 1);
     for (i, c) in pystr::str_data(s).iter().enumerate() {
         match char::from_u32(c) {
             Some(ch) => {

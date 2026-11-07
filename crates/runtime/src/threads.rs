@@ -234,6 +234,10 @@ pub fn new_thread_state() -> *mut ThreadState {
             None => Box::into_raw(Box::new(st)),
         };
         (*ts).c.exc_info = &mut (*ts).c.exc_state;
+        // (tail2) C code reads `current_frame` as "a Python frame is running"; ours live
+        // on the Rust side, so the field holds a non-null stand-in (the base-frame slot)
+        // that C code may clear to simulate a call from a frameless C thread
+        (*ts).c.current_frame = (&raw mut (*ts).c.base_frame) as *mut c_void;
         {
             let mut all = ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner());
             // (jit6) the flag flipped here, not by a parent before starting the
@@ -329,6 +333,7 @@ pub fn thread_exit() {
         crate::qsbr::thread_exit();
         crate::object::thread_exit_type_counts();
         crate::interp::frame::drain_pool();
+        crate::types::asyncgen::drain_free_lists();
         crate::gc::flush_thread_counts();
         // Nobody queues objects for this owner once `alive` is false (checked under
         // the ALL_THREADS lock). Drain the queue while this thread still counts as
