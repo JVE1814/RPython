@@ -173,6 +173,13 @@ fn attach_new() -> &'static ThreadState {
 }
 
 pub fn new_thread_state() -> *mut ThreadState {
+    if let Some(path) = std::env::var_os("RPY_ATTACH_DEBUG") {
+        // debugging aid: append a backtrace of every thread-state creation to the file
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "new thread state (pid {}):\n{}", std::process::id(), std::backtrace::Backtrace::force_capture());
+        }
+    }
     unsafe {
         let mut c: CThreadState = std::mem::zeroed();
         c.py_recursion_limit = 1000;
