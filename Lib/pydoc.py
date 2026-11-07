@@ -1519,7 +1519,9 @@ def tty_pager(text, title=''):
             termios.tcsetattr(fd, termios.TCSAFLUSH, saved)
 
 
-ttypager = tty_pager
+def ttypager(text, title=''):
+    """Page through text on a text terminal (same as tty_pager)."""
+    return tty_pager(text, title)
 
 
 def get_pager():

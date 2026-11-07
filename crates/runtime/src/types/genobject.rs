@@ -909,7 +909,14 @@ fn with_frame_on_stack<R>(o: &PyObject, f: impl FnOnce() -> R) -> R {
 pub fn gen_throw_impl(o: &PyObject, typ: &PyObject, val: Option<&PyObject>, tb: Option<&PyObject>, close_on_genexit: bool) -> PyResult {
     // delegate to sub-iterator first
     if let Some(yf) = yieldfrom(o) {
-        if typ.is(type_obj(exc::GeneratorExit())) && close_on_genexit {
+        // GeneratorExit (class, subclass or instance) closes the sub-iterator and
+        // is then raised here
+        let is_genexit = if exc::is_exception_class(typ) {
+            is_subtype(as_type(typ), exc::GeneratorExit())
+        } else {
+            is_subtype(typ.type_ptr(), exc::GeneratorExit())
+        };
+        if is_genexit && close_on_genexit {
             g(o).running = true;
             let r = close_iter(&yf);
             g(o).running = false;
@@ -1039,8 +1046,24 @@ fn close_iter(yf: &PyObject) -> PyResult<()> {
         gen_close(yf)?;
         return Ok(());
     }
-    if let Some(m) = ab::getattr_opt(yf, name!("close"))? {
-        ab::call(&m, &[])?;
+    match ab::getattr_opt(yf, name!("close")) {
+        Ok(Some(m)) => {
+            ab::call(&m, &[])?;
+        }
+        Ok(None) => {}
+        // a sub-iterator whose close cannot even be looked up does not stop the
+        // closing of the delegating generator: the failure is reported
+        Err(_) => {
+            let e = take_exc();
+            let r = ab::repr_string(yf).unwrap_or_else(|_| {
+                clear_exc();
+                String::from("<generator>")
+            });
+            if let Some(e) = e {
+                set_exc(e);
+            }
+            crate::modules::sys_full::write_unraisable(Some(&format!("Exception ignored while closing generator {}", r)), None);
+        }
     }
     Ok(())
 }

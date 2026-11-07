@@ -76,6 +76,9 @@ pub fn assign_type_tag(tp: *mut PyTypeObject) -> u32 {
             return 0;
         }
     }
+    if mro_has_foreign_entry(tp) {
+        return 0;
+    }
     let v = TYPE_VERSION.fetch_add(1, Relaxed);
     if v == 0 || v >= u32::MAX - 1 {
         TYPE_VERSION.store(u32::MAX - 1, Relaxed);
@@ -88,6 +91,27 @@ pub fn assign_type_tag(tp: *mut PyTypeObject) -> u32 {
             v
         }
         Err(cur) => cur,
+    }
+}
+
+/// True when a custom mro() put a class into `tp`'s MRO that is not an ancestor
+/// through its bases: changes to that class do not reach `tp` (it is not one of
+/// its registered subclasses), so `tp` must not be cached by version tag.
+fn mro_has_foreign_entry(tp: *mut PyTypeObject) -> bool {
+    unsafe {
+        let mro = &*(*tp).tp_mro;
+        if (*tp).tp_bases.is_null() {
+            return false;
+        }
+        let bases = crate::types::tuple::tuple_items(&*(*tp).tp_bases);
+        crate::types::tuple::tuple_items(mro).iter().skip(1).any(|m| {
+            !bases.iter().any(|b| {
+                b.is(m) || (crate::types::typeobject::is_type(b) && {
+                    let bm = (*crate::types::typeobject::as_type(b)).tp_mro;
+                    !bm.is_null() && crate::types::tuple::tuple_items(&*bm).iter().any(|x| x.is(m))
+                })
+            })
+        })
     }
 }
 

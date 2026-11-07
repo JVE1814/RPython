@@ -288,6 +288,8 @@ struct PickleBufferObj {
     weakreflist: *mut PyObject,
 }
 
+// the C API's PyPickleBuffer_Type is this type
+#[unsafe(export_name = "PyPickleBuffer_Type")]
 static mut PICKLEBUFFER_TYPE: PyTypeObject = PyTypeObject::ZERO;
 fn picklebuffer_type() -> *mut PyTypeObject {
     &raw mut PICKLEBUFFER_TYPE

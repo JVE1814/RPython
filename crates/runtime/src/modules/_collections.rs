@@ -766,8 +766,9 @@ fn defdict_missing(o: &PyObject, key: &PyObject) -> PyResult {
         }
     };
     let v = ab::call(&f, &[])?;
-    ab::setitem(o, key, Some(&v))?;
-    Ok(v)
+    // the factory may itself have stored the key (re-entrant lookup): keep that value
+    let h = ab::hash(key)?;
+    dict::setdefault_hash(o, key, h, &v)
 }
 
 fn defdict_copy(o: &PyObject) -> PyResult {
@@ -875,7 +876,8 @@ unsafe extern "C" fn defdict_or(a: *mut PyObject, b: *mut PyObject) -> *mut PyOb
             } else {
                 (b, a, false)
             };
-            if !dict::is_dict(other) {
+            // a frozendict on the right merges in; on the left it keeps its own type
+            if !(dict::is_dict(other) || (left && dict::is_anydict(other))) {
                 return Ok(none::not_implemented().to_ref());
             }
             let tp = type_ref(slf.type_ptr());

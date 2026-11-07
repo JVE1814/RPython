@@ -29,6 +29,16 @@ from asyncio import base_futures as _base_futures
 from asyncio import exceptions as _exceptions
 from asyncio import format_helpers as _format_helpers
 
+
+# Submodules needed lazily are looked up in sys.modules first: code may run
+# while the package entry itself is hidden (sys.modules["asyncio"] = None).
+def _asyncio_sub(name):
+    mod = _sys.modules.get("asyncio." + name)
+    if mod is None:
+        import importlib
+        mod = importlib.import_module("asyncio." + name)
+    return mod
+
 _PENDING = 'PENDING'
 _CANCELLED = 'CANCELLED'
 _FINISHED = 'FINISHED'
@@ -73,12 +83,12 @@ def get_event_loop():
     loop = _get_running_loop()
     if loop is not None:
         return loop
-    from asyncio import events
+    events = _asyncio_sub('events')
     return events._get_event_loop_policy().get_event_loop()
 
 
 def _events():
-    from asyncio import events
+    events = _asyncio_sub('events')
     return events
 
 
@@ -507,7 +517,7 @@ class Task(Future):
     def __init__(self, coro, *, loop=None, name=None, context=None,
                  eager_start=False):
         Future.__init__(self, loop=loop)
-        from asyncio import coroutines
+        coroutines = _asyncio_sub('coroutines')
         self._task_log_destroy_pending = True
         if not coroutines.iscoroutine(coro):
             self._task_log_destroy_pending = False
@@ -556,7 +566,7 @@ class Task(Future):
     __class_getitem__ = classmethod(_GenericAlias)
 
     def __repr__(self):
-        from asyncio import base_tasks
+        base_tasks = _asyncio_sub('base_tasks')
         return base_tasks._task_repr(self)
 
     # -- attributes
@@ -612,12 +622,12 @@ class Task(Future):
 
     def get_stack(self, *, limit=None):
         """Frames of the suspended coroutine (or of the final traceback)."""
-        from asyncio import base_tasks
+        base_tasks = _asyncio_sub('base_tasks')
         return base_tasks._task_get_stack(self, limit)
 
     def print_stack(self, *, limit=None, file=None):
         """Print get_stack() in traceback format."""
-        from asyncio import base_tasks
+        base_tasks = _asyncio_sub('base_tasks')
         return base_tasks._task_print_stack(self, limit, file)
 
     def cancel(self, msg=None):
@@ -748,7 +758,7 @@ class Task(Future):
                 f'Task cannot await on itself: {self!r}'))
             return
         result._asyncio_future_blocking = False
-        from asyncio import futures
+        futures = _asyncio_sub('futures')
         futures.future_add_to_awaited_by(result, self)
         result.add_done_callback(self._task_wakeup,
                                  context=self._task_context)
@@ -758,7 +768,7 @@ class Task(Future):
                 self._task_must_cancel = False
 
     def _task_wakeup(self, fut):
-        from asyncio import futures
+        futures = _asyncio_sub('futures')
         futures.future_discard_from_awaited_by(fut, self)
         if isinstance(fut, Future):
             # read the outcome directly: raising it here would add this

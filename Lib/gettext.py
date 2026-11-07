@@ -163,11 +163,19 @@ class _PluralParser:
 
 
 def _as_int(n):
+    """n as an int for a plural formula: numbers that are not ints are
+    accepted with a DeprecationWarning, anything else is a TypeError."""
     try:
         round(n)
     except TypeError:
         raise TypeError('Plural value must be an integer, got %s' %
                         (n.__class__.__name__,)) from None
+    return _as_int_lenient(n)
+
+
+def _as_int_lenient(n):
+    """Like _as_int, but any object is accepted (with a DeprecationWarning
+    when it is not an int): used where n is only compared with 1."""
     try:
         return operator.index(n)
     except TypeError:
@@ -279,7 +287,7 @@ class NullTranslations:
     def ngettext(self, msgid1, msgid2, n):
         if self._fallback:
             return self._fallback.ngettext(msgid1, msgid2, n)
-        n = _as_int(n)
+        n = _as_int_lenient(n)
         if n == 1:
             return msgid1
         else:
@@ -293,7 +301,7 @@ class NullTranslations:
     def npgettext(self, context, msgid1, msgid2, n):
         if self._fallback:
             return self._fallback.npgettext(context, msgid1, msgid2, n)
-        n = _as_int(n)
+        n = _as_int_lenient(n)
         if n == 1:
             return msgid1
         else:
@@ -563,7 +571,7 @@ def dngettext(domain, msgid1, msgid2, n):
     try:
         t = translation(domain, _localedirs.get(domain, None))
     except OSError:
-        n = _as_int(n)
+        n = _as_int_lenient(n)
         if n == 1:
             return msgid1
         else:
@@ -583,7 +591,7 @@ def dnpgettext(domain, context, msgid1, msgid2, n):
     try:
         t = translation(domain, _localedirs.get(domain, None))
     except OSError:
-        n = _as_int(n)
+        n = _as_int_lenient(n)
         if n == 1:
             return msgid1
         else:

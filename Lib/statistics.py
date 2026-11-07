@@ -295,8 +295,9 @@ def _sqrtprod(x: float, y: float) -> float:
 
 def _sqrt_of_mss(mss, T):
     if not isinstance(mss, Fraction):
-        # NaN or infinity
-        return T(mss) if issubclass(T, Decimal) else float(mss) ** 0.5
+        # the data held a NaN or an infinity: no meaningful deviation
+        raise ValueError('standard deviation of data containing '
+                         'infinities or NaNs is undefined')
     if issubclass(T, Decimal):
         return _decimal_sqrt_of_frac(mss.numerator, mss.denominator)
     return _float_sqrt_of_frac(mss.numerator, mss.denominator)

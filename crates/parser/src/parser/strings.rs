@@ -287,7 +287,17 @@ impl<'a> Parser<'a> {
             return Ok(PyStr::Utf8(s.to_string()));
         }
         let mut inv = None;
-        let r = decode_str_escapes(s, self.opts.hooks.lookup_name, &mut inv).map_err(|e| self.err_tok(e.msg, t))?;
+        // an unpaired backslash at the end of a piece is followed by the `{` of a
+        // replacement field: `\{` is an invalid escape that keeps the backslash
+        let dangling = s.bytes().rev().take_while(|&c| c == b'\\').count() % 2 == 1;
+        let body = if dangling { &s[..s.len() - 1] } else { s };
+        let mut r = decode_str_escapes(body, self.opts.hooks.lookup_name, &mut inv).map_err(|e| self.err_tok(e.msg, t))?;
+        if dangling {
+            r.push_char('\\');
+            if inv.is_none() {
+                inv = Some(InvalidEscape { offset: s.len() - 1, text: "{".to_string(), octal: false });
+            }
+        }
         if let Some(inv) = inv {
             self.warn_invalid_escape(t, s, &inv, 0)?;
         }

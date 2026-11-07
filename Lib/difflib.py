@@ -741,7 +741,8 @@ def _mdiff(fromlines, tolines, context=None, linejunk=None,
                 return
 
 
-_file_template = """<!DOCTYPE html>
+_file_template = """
+<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="%(charset)s">

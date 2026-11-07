@@ -57,6 +57,9 @@ pub fn get_buffer(o: &PyObject, view: &mut Py_buffer, flags: c_int) -> PyResult<
         None => raise!(TypeError, "a bytes-like object is required, not '{}'", tname(o)),
         Some(f) => {
             if unsafe { f(o.as_ptr(), view, flags) } < 0 {
+                // a failing provider may leave junk in view.obj (old providers did);
+                // nothing was exported, so it must not be released later
+                view.obj = std::ptr::null_mut();
                 if !err_occurred() {
                     return Err(system_error("getbuffer returned error without setting an exception"));
                 }

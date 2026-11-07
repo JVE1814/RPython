@@ -36,7 +36,11 @@ pub unsafe extern "C" fn PyObject_GetBuffer(o: *mut PyObject, view: *mut Py_buff
         let bp = ob.ty().tp_as_buffer;
         if !bp.is_null() {
             if let Some(f) = (*bp).bf_getbuffer {
-                return f(o, view, flags);
+                let r = f(o, view, flags);
+                if r < 0 && !view.is_null() {
+                    (*view).obj = std::ptr::null_mut();
+                }
+                return r;
             }
         }
         if bytes::is_bytes(ob) {

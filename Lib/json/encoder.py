@@ -3,8 +3,8 @@
     >>> from json.encoder import JSONEncoder
     >>> JSONEncoder(sort_keys=True).encode({"b": [1, 2.0], "a": None})
     '{"a": null, "b": [1, 2.0]}'
-    >>> list(JSONEncoder().iterencode([True]))
-    ['[true]']
+    >>> ''.join(JSONEncoder().iterencode([True, None]))
+    '[true, null]'
 """
 import re
 

@@ -163,6 +163,22 @@ fn looks_like_zip(path: &str) -> bool {
     tail.windows(4).any(|w| w == b"PK\x05\x06")
 }
 
+/// A path that does not exist on disk but names a directory inside a zip archive
+/// (`archive.zip/package/sub`): zipimport can import `__main__` from there.
+fn inside_zip(path: &str) -> bool {
+    let mut p = std::path::Path::new(path);
+    while let Some(parent) = p.parent() {
+        if parent.as_os_str().is_empty() {
+            return false;
+        }
+        if let Ok(m) = std::fs::metadata(parent) {
+            return m.is_file() && looks_like_zip(&parent.to_string_lossy());
+        }
+        p = parent;
+    }
+    false
+}
+
 fn insert_path0(p: &str) {
     if let Some(path) = crate::modules::sys::get_sys_attr("path") {
         list::insert(&path, 0, pystr::new_str(p));
@@ -175,7 +191,7 @@ fn run_script(path: &str, opts: &MainOptions) -> Outcome {
     let meta = std::fs::metadata(path);
     // a directory or zip file with __main__.py: run it as a module
     let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-    let is_zip = !is_dir && looks_like_zip(path);
+    let is_zip = !is_dir && (looks_like_zip(path) || (meta.is_err() && inside_zip(path)));
     if is_dir || is_zip {
         // The directory or archive is where __main__ comes from, so it is
         // put on sys.path even in safe-path / isolated mode.
@@ -335,6 +351,19 @@ fn is_incomplete_error() -> bool {
         || msg.contains("expected an indented block") || msg.contains("unterminated triple-quoted string");
     set_exc(e);
     inc
+}
+
+/// Is the pending SyntaxError about a bracket or triple-quoted string that the
+/// input so far leaves open?
+fn still_open_error() -> bool {
+    if !exc_matches(crate::types::exceptions::SyntaxError()) {
+        return false;
+    }
+    let e = take_exc().unwrap();
+    let msg = ab::getattr_str(&e, "msg").ok().map(|m| ab::str_string(&m).unwrap_or_default()).unwrap_or_default();
+    clear_exc();
+    set_exc(e);
+    msg.contains("was never closed") || msg.contains("unterminated triple-quoted string")
 }
 
 /// Call sys.__interactivehook__ (installed by site: readline completion and history).
@@ -554,6 +583,7 @@ fn repl(quiet: bool) -> i32 {
                 continue;
             }
         }
+        let at_eof = matches!(n, Ok(0) | Err(_));
         match n {
             Ok(0) | Err(_) => {
                 if buf.is_empty() {
@@ -605,7 +635,10 @@ fn repl(quiet: bool) -> i32 {
             Err(_) => {
                 // a compound statement is complete only after a blank line (its error, too)
                 let first = src.lines().next().unwrap_or("");
-                if (is_incomplete_error() || starts_compound(first)) && !blank {
+                // inside an open bracket or triple-quoted string a blank line is just
+                // part of the statement (only the end of input stops it there)
+                let open = still_open_error();
+                if ((is_incomplete_error() || starts_compound(first)) && !blank) || (open && !at_eof) {
                     clear_exc();
                     continue;
                 }

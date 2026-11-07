@@ -274,7 +274,33 @@ fn f_set_trace_opcodes(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
 /// Snapshot of a frame's locals as a dict (fast locals + cells; or the locals mapping).
 pub fn locals_dict(f: &Frame) -> PyResult {
     if !f.locals.is_null() {
-        return Ok(unsafe { (*f.locals).to_ref() });
+        let m = unsafe { (*f.locals).to_ref() };
+        if !crate::types::frameobject_proxy::has_bound_hidden(f) {
+            return Ok(m);
+        }
+        // a comprehension inlined into a module/class body is running: a snapshot
+        // of the mapping plus its (hidden) variables
+        let d = dict::new_dict();
+        for (k, v) in crate::types::frameobject_proxy::mapping_items(&m)? {
+            dict::set_item(&d, &k, &v)?;
+        }
+        let cd = crate::types::code::code_data(f.code());
+        for i in 0..f.nlocalsplus {
+            let p = f.slots[i];
+            if cd.localspluskinds[i] & bc::fast::HIDDEN != 0 && !p.is_null() {
+                let v = unsafe { &*p };
+                let v = if v.is_type(crate::types::funcobject::cell_type()) {
+                    match crate::types::funcobject::cell_get(v) {
+                        Some(x) => x,
+                        None => continue,
+                    }
+                } else {
+                    v.to_ref()
+                };
+                dict::set_item(&d, &cd.localsplusnames[i], &v)?;
+            }
+        }
+        return Ok(d);
     }
     // jit: unboxed locals of tier-2 code
     crate::interp::jit::opt::sync_frame(f as *const Frame as *mut Frame);
@@ -312,7 +338,7 @@ pub fn locals_dict(f: &Frame) -> PyResult {
 
 fn f_locals(o: &PyObject) -> PyResult {
     let f = need(o)?;
-    if !f.locals.is_null() {
+    if !f.locals.is_null() && !crate::types::frameobject_proxy::has_bound_hidden(f) {
         return Ok(unsafe { (*f.locals).to_ref() });
     }
     crate::types::frameobject_proxy::new_proxy(o)

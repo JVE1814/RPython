@@ -137,6 +137,7 @@ pub fn builtin_compile(args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
             raise!(ValueError, "compile() mode must be 'exec', 'eval' or 'single'");
         }
     };
+    crate::modules::sys_full::audit("compile", &[src, &pystr::new_str(&fname)])?;
     let mut opts = Opts::new(&fname, mode, flags, optimize as i32);
     opts.module = module;
     if flags & cf::PYCF_ONLY_AST != 0 {

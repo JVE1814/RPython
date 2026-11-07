@@ -182,6 +182,25 @@ static LAZY_FILTER: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
 static FLAGS_TYPE: AtomicPtr<PyTypeObject> = AtomicPtr::new(std::ptr::null_mut());
 static UNRAISABLE_ARGS_TYPE: AtomicPtr<PyTypeObject> = AtomicPtr::new(std::ptr::null_mut());
 static VERSION_INFO_TYPE: AtomicPtr<PyTypeObject> = AtomicPtr::new(std::ptr::null_mut());
+static FLOAT_INFO_TYPE: AtomicPtr<PyTypeObject> = AtomicPtr::new(std::ptr::null_mut());
+static INT_INFO_TYPE: AtomicPtr<PyTypeObject> = AtomicPtr::new(std::ptr::null_mut());
+static HASH_INFO_TYPE: AtomicPtr<PyTypeObject> = AtomicPtr::new(std::ptr::null_mut());
+static THREAD_INFO_TYPE: AtomicPtr<PyTypeObject> = AtomicPtr::new(std::ptr::null_mut());
+
+/// A struct-sequence type of `sys` shared by every interpreter: created by the first
+/// `sys` module, reused by the sys modules of subinterpreters (one type object per
+/// process, like the static types of the C implementation).
+fn shared_structseq(slot: &AtomicPtr<PyTypeObject>, name: &'static str, fields: &'static [&'static str], n_seq: usize) -> PyResult<*mut PyTypeObject> {
+    let tp = slot.load(Acquire);
+    if !tp.is_null() {
+        return Ok(tp);
+    }
+    let new = ss::make_type(name, fields, n_seq, false)?;
+    match slot.compare_exchange(std::ptr::null_mut(), new, AcqRel, Acquire) {
+        Ok(_) => Ok(new),
+        Err(existing) => Ok(existing),
+    }
+}
 
 pub fn unraisable_args_type() -> *mut PyTypeObject {
     UNRAISABLE_ARGS_TYPE.load(Acquire)
@@ -813,7 +832,7 @@ fn sys_set_int_max_str_digits(_m: &PyObject, args: &[&PyObject], kw: Option<&PyO
         raise!(ValueError, "maxdigits must be >= 640 or 0 for unlimited");
     }
     let n = n.min(i32::MAX as i64);
-    crate::modules::sys::INT_MAX_STR_DIGITS.store(n as i32, Relaxed);
+    crate::modules::sys::set_int_max_str_digits(n as i32);
     Ok(none::none_ref())
 }
 
@@ -953,38 +972,6 @@ fn sys_set_coroutine_origin_tracking_depth(_m: &PyObject, args: &[&PyObject], kw
     }
     let ts = crate::threads::current_mut();
     unsafe { (*ts).c.coroutine_origin_tracking_depth = n.min(i32::MAX as i64) as i32 };
-    Ok(none::none_ref())
-}
-
-static ASYNCGEN_HOOKS_TYPE: AtomicPtr<PyTypeObject> = AtomicPtr::new(std::ptr::null_mut());
-
-fn sys_get_asyncgen_hooks(_m: &PyObject) -> PyResult {
-    let ts = crate::threads::current();
-    let g = |p: *mut PyObject| if p.is_null() { none::none_ref() } else { unsafe { PyRef::from_borrowed(p) } };
-    Ok(ss::new_instance(ASYNCGEN_HOOKS_TYPE.load(Acquire), vec![g(ts.c.async_gen_firstiter), g(ts.c.async_gen_finalizer)]))
-}
-fn sys_set_asyncgen_hooks(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
-    static P: crate::args::Params = crate::args::Params::new("set_asyncgen_hooks", &["firstiter", "finalizer"], 0, 0);
-    let [fi, fz] = crate::args::parse::<2>(&P, args, kw)?;
-    for (v, nm) in [(fz, "finalizer"), (fi, "firstiter")] {
-        if let Some(v) = v {
-            if !v.is(none::none()) && !ab::is_callable(v) {
-                raise!(TypeError, "callable {} expected, got {}", nm, crate::types::typeobject::tname(v));
-            }
-        }
-    }
-    let ts = crate::threads::current_mut();
-    unsafe {
-        let set = |slot: *mut *mut PyObject, v: Option<&PyObject>| {
-            if let Some(v) = v {
-                let nv = if v.is(none::none()) { std::ptr::null_mut() } else { v.to_ref().into_raw() };
-                let old = std::mem::replace(&mut *slot, nv);
-                xdecref(old);
-            }
-        };
-        set(&raw mut (*ts).c.async_gen_finalizer, fz);
-        set(&raw mut (*ts).c.async_gen_firstiter, fi);
-    }
     Ok(none::none_ref())
 }
 
@@ -1554,11 +1541,11 @@ pub fn populate(d: &PyObject) -> PyResult<()> {
     )?;
     set("flags", &*make_flags()?)?;
     // float_info
-    let fi = ss::make_type(
+    let fi = shared_structseq(
+        &FLOAT_INFO_TYPE,
         "sys.float_info",
         &["max", "max_exp", "max_10_exp", "min", "min_exp", "min_10_exp", "dig", "mant_dig", "epsilon", "radix", "rounds"],
         11,
-        false,
     )?;
     let fl = |v: f64| float::new_float(v);
     let i = |v: i64| int::new_int(v);
@@ -1569,18 +1556,18 @@ pub fn populate(d: &PyObject) -> PyResult<()> {
             vec![fl(f64::MAX), i(1024), i(308), fl(f64::MIN_POSITIVE), i(-1021), i(-307), i(15), i(53), fl(f64::EPSILON), i(2), i(1)],
         ),
     )?;
-    let ii = ss::make_type(
+    let ii = shared_structseq(
+        &INT_INFO_TYPE,
         "sys.int_info",
         &["bits_per_digit", "sizeof_digit", "default_max_str_digits", "str_digits_check_threshold"],
         4,
-        false,
     )?;
     set("int_info", &ss::new_instance(ii, vec![i(30), i(4), i(4300), i(640)]))?;
-    let hi = ss::make_type(
+    let hi = shared_structseq(
+        &HASH_INFO_TYPE,
         "sys.hash_info",
         &["width", "modulus", "inf", "nan", "imag", "algorithm", "hash_bits", "seed_bits", "cutoff"],
         9,
-        false,
     )?;
     set(
         "hash_info",
@@ -1589,13 +1576,10 @@ pub fn populate(d: &PyObject) -> PyResult<()> {
             vec![i(64), i((1i64 << 61) - 1), i(314159), i(0), i(1000003), s("siphash13"), i(64), i(128), i(0)],
         ),
     )?;
-    let ti = ss::make_type("sys.thread_info", &["name", "lock", "version"], 3, false)?;
+    let ti = shared_structseq(&THREAD_INFO_TYPE, "sys.thread_info", &["name", "lock", "version"], 3)?;
     set("thread_info", &ss::new_instance(ti, vec![s("pthread"), s("pymutex"), thread_lib_version()]))?;
-    let ua = ss::make_type("UnraisableHookArgs", &["exc_type", "exc_value", "exc_traceback", "err_msg", "object"], 5, false)?;
-    UNRAISABLE_ARGS_TYPE.store(ua, Release);
+    let ua = shared_structseq(&UNRAISABLE_ARGS_TYPE, "UnraisableHookArgs", &["exc_type", "exc_value", "exc_traceback", "err_msg", "object"], 5)?;
     set("UnraisableHookArgs", crate::types::typeobject::type_obj(ua))?;
-    let ah = ss::make_type("asyncgen_hooks", &["firstiter", "finalizer"], 2, false)?;
-    ASYNCGEN_HOOKS_TYPE.store(ah, Release);
     // implementation
     let impl_ns = crate::modules::sys_namespace::new_namespace(&[
         ("name", s("cpython")),
@@ -1672,8 +1656,6 @@ pub fn populate(d: &PyObject) -> PyResult<()> {
         ("_debugmallocstats", NOARGS, sys_debugmallocstats),
         ("get_coroutine_origin_tracking_depth", NOARGS, sys_get_coroutine_origin_tracking_depth),
         ("set_coroutine_origin_tracking_depth", FASTKW, sys_set_coroutine_origin_tracking_depth, "set_coroutine_origin_tracking_depth(depth)\n--\n\nRecord this many frames of creation context for new coroutines\n(0 disables the tracking)."),
-        ("get_asyncgen_hooks", NOARGS, sys_get_asyncgen_hooks),
-        ("set_asyncgen_hooks", FASTKW, sys_set_asyncgen_hooks),
         ("getdlopenflags", NOARGS, sys_getdlopenflags),
         ("setdlopenflags", O, sys_setdlopenflags),
         ("set_lazy_imports", FASTKW, sys_set_lazy_imports, "set_lazy_imports(mode)\n--\n\nChoose how lazy imports behave: \"normal\", \"all\" or \"none\"."),

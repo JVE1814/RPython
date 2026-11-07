@@ -19,6 +19,21 @@ unsafe extern "C" {
     fn ldexp(x: f64, e: i32) -> f64;
     fn frexp(x: f64, e: *mut i32) -> f64;
     fn nextafter(x: f64, y: f64) -> f64;
+    fn atanh(x: f64) -> f64;
+    fn asinh(x: f64) -> f64;
+    fn acosh(x: f64) -> f64;
+}
+
+// the C library's inverse hyperbolic functions are accurate near the poles
+// (std's formulas lose most digits for atanh close to +-1)
+fn c_atanh(x: f64) -> f64 {
+    unsafe { atanh(x) }
+}
+fn c_asinh(x: f64) -> f64 {
+    unsafe { asinh(x) }
+}
+fn c_acosh(x: f64) -> f64 {
+    unsafe { acosh(x) }
 }
 
 pub fn c_erf(x: f64) -> f64 {
@@ -124,11 +139,11 @@ macro_rules! f1 {
 }
 
 f1!(m_acos, f64::acos, false, Some("expected a number in range from -1 up to 1, got %s"));
-f1!(m_acosh, f64::acosh, false, Some("expected argument value not less than 1, got %s"));
+f1!(m_acosh, c_acosh, false, Some("expected argument value not less than 1, got %s"));
 f1!(m_asin, f64::asin, false, Some("expected a number in range from -1 up to 1, got %s"));
-f1!(m_asinh, f64::asinh, false, None);
+f1!(m_asinh, c_asinh, false, None);
 f1!(m_atan, f64::atan, false, None);
-f1!(m_atanh, f64::atanh, false, Some("expected a number between -1 and 1, got %s"));
+f1!(m_atanh, c_atanh, false, Some("expected a number between -1 and 1, got %s"));
 f1!(m_cbrt, f64::cbrt, false, None);
 f1!(m_cos, f64::cos, false, Some("expected a finite input, got %s"));
 f1!(m_cosh, f64::cosh, true, None);
@@ -376,7 +391,16 @@ fn loghelper(arg: &PyObject, f: fn(f64) -> f64) -> PyResult<f64> {
             }
         }
     }
-    let x = to_f64(arg)?;
+    let x = match to_f64(arg) {
+        Ok(x) => x,
+        // too large for a float: an integer-like object takes the exact path above
+        Err(_) if !int::is_int(arg) && exc_matches(crate::types::exceptions::OverflowError()) && ab::has_index(arg) => {
+            clear_exc();
+            let i = ab::index(arg)?;
+            return loghelper(&i, f);
+        }
+        Err(e) => return Err(e),
+    };
     let r = f(x);
     if (r.is_nan() && !x.is_nan()) || (r.is_infinite() && x.is_finite()) || (x.is_infinite() && x < 0.0) {
         return Err(domain_err(Some("expected a positive input, got %s"), x));

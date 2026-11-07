@@ -54,7 +54,9 @@ unsafe fn codec_item(enc: *const c_char, idx: usize) -> *mut PyObject {
     unsafe {
         ret((|| {
             let ci = lookup(enc)?;
-            if tuple::is_tuple(&ci) {
+            // a CodecInfo is the 4-tuple (encode, decode, streamreader, streamwriter);
+            // the incremental factories exist only as attributes
+            if idx < 2 && tuple::is_tuple(&ci) {
                 return Ok(tuple::tuple_get(&ci, idx).to_ref());
             }
             ab::getattr_str(&ci, ["encode", "decode", "incrementalencoder", "incrementaldecoder", "streamreader", "streamwriter"][idx])

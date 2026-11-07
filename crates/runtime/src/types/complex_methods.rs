@@ -255,10 +255,12 @@ fn dep_warn(which: &str, o: &PyObject) -> PyResult<()> {
     )
 }
 
-pub fn complex_new_impl(tp: *mut PyTypeObject, r: Option<&PyObject>, i: Option<&PyObject>) -> PyResult {
+/// `real_kw`: the real part was passed by keyword (a complex value there is deprecated
+/// even without an imaginary part).
+pub fn complex_new_impl(tp: *mut PyTypeObject, r: Option<&PyObject>, i: Option<&PyObject>, real_kw: bool) -> PyResult {
     let zero = int::new_int(0);
     let r = r.unwrap_or(&zero);
-    if is_complex_exact(r) && i.is_none() && tp == complex_type() {
+    if is_complex_exact(r) && i.is_none() && !real_kw && tp == complex_type() {
         return Ok(r.to_ref());
     }
     if pystr::is_str(r) {
@@ -292,7 +294,7 @@ pub fn complex_new_impl(tp: *mut PyTypeObject, r: Option<&PyObject>, i: Option<&
             }
         }
     };
-    if cr_is_complex && i.is_some() {
+    if cr_is_complex && (i.is_some() || real_kw) {
         dep_warn("real", r)?;
     }
     let (mut re, mut im);
@@ -330,7 +332,8 @@ unsafe extern "C" fn complex_new(tp: *mut PyTypeObject, args: *mut PyObject, kw:
             let (all, kwn) = crate::args::kwdict_to_vectorcall(&*args, kw);
             let refs: Vec<&PyObject> = all.iter().map(|r| &**r).collect();
             let [re, im] = crate::args::parse::<2>(&P, &refs, kwn.as_deref())?;
-            complex_new_impl(tp, re, im)
+            let real_kw = re.is_some() && crate::types::tuple::tuple_len(&*args) == 0;
+            complex_new_impl(tp, re, im, real_kw)
         })();
         into_c(r)
     }
