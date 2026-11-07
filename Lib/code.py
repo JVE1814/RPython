@@ -169,6 +169,8 @@ class InteractiveConsole(InteractiveInterpreter):
                     self.resetbuffer()
                     more = False
                 except _LocalExit:
+                    # leaving through exit()/quit() ends the prompt line first
+                    self.write("\n")
                     break
         finally:
             self._restore_exits(saved_exits)

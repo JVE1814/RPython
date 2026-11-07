@@ -6,11 +6,17 @@ set -e
 BIN="$1"; WT="$2"; DEST="$3"
 rm -rf "$DEST.tmp"; mkdir -p "$DEST.tmp/bin" "$DEST.tmp/lib"
 cp "$BIN" "$DEST.tmp/bin/python3"
+# python3.15t-config (shell variant), next to the interpreter as in an installation
+install -m 755 "$WT/tools/python-config.sh" "$DEST.tmp/bin/python3.15t-config"
 cp -r "$WT/Lib" "$DEST.tmp/lib/python3.15t"
 # the test package is part of an installed stdlib (subprocess tests run with -I/-E rely on it)
 cp -r "$WT/spec/Lib/test" "$DEST.tmp/lib/python3.15t/test"
 # cached bytecode is never copied: cp resets mtimes, which would defeat the compiler-epoch check (D25)
 find "$DEST.tmp/lib/python3.15t" -name __pycache__ -prune -exec rm -rf {} +
+# public headers + pyconfig.h, as tools/install.sh installs them (sysconfig's include paths)
+mkdir -p "$DEST.tmp/include/python3.15t"
+cp -r "$WT/spec/Include/." "$DEST.tmp/include/python3.15t/"
+cp "$WT/tools/pyconfig.h" "$DEST.tmp/include/python3.15t/pyconfig.h"
 # license() (site) reads LICENSE.txt from the stdlib directory, as in a CPython install
 cp "$WT/spec/LICENSE" "$DEST.tmp/lib/python3.15t/LICENSE.txt"
 # idlelib's own tests live inside the package in an installed stdlib

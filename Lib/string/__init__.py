@@ -1,10 +1,10 @@
-"""Common string constants and classes.
+"""String constants, capwords(), and the Template and Formatter classes.
 
-Constants: whitespace, ascii_lowercase, ascii_uppercase, ascii_letters,
-digits, hexdigits, octdigits, punctuation, printable.
+Constants (ASCII only): whitespace, ascii_lowercase, ascii_uppercase,
+ascii_letters, digits, hexdigits, octdigits, punctuation, printable.
 
-Classes: Formatter (customizable str.format) and Template ($-substitution).
-Function: capwords.
+Template performs $-substitution ($name, ${name}, $$ for a literal $);
+Formatter exposes the machinery of str.format() as overridable methods.
 """
 
 __all__ = ["ascii_letters", "ascii_lowercase", "ascii_uppercase", "capwords",
@@ -13,7 +13,6 @@ __all__ = ["ascii_letters", "ascii_lowercase", "ascii_uppercase", "capwords",
 
 import _string
 
-# Character classes (ASCII only)
 whitespace = ' \t\n\r\v\f'
 ascii_lowercase = 'abcdefghijklmnopqrstuvwxyz'
 ascii_uppercase = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
@@ -26,247 +25,225 @@ printable = digits + ascii_letters + punctuation + whitespace
 
 
 def capwords(s, sep=None):
-    """Capitalize each word of s.
-
-    s is split with s.split(sep), every word is capitalized and the words
-    are joined with sep (a single space when sep is None, which also
-    collapses runs of whitespace and strips the ends).
-    """
-    return (sep or ' ').join(map(str.capitalize, s.split(sep)))
+    """Split *s* with s.split(sep), capitalize each piece and join them with
+    *sep* (one space when sep is None, so that runs of whitespace collapse
+    and leading/trailing whitespace disappears)."""
+    return (sep or ' ').join(word.capitalize() for word in s.split(sep))
 
 
-####################################################################
-# $-substitution templates
+# --------------------------------------------------------------------------
+# Template
 
-_sentinel_dict = {}
-
-
-class _TemplatePattern:
-    """Marker for 'the default pattern, built from delimiter/idpattern on
-    first use' (so that importing string does not import re)."""
+# Default for the positional mapping argument of the substitute methods.
+_NO_MAPPING = {}
 
 
-class _MergedMapping:
-    """Look keys up in `primary` first, then in `fallback`."""
+class _KeywordsFirst:
+    """Mapping view: the keyword arguments shadow the positional mapping."""
 
-    def __init__(self, primary, fallback):
-        self.primary = primary
-        self.fallback = fallback
+    __slots__ = ('keywords', 'mapping')
+
+    def __init__(self, keywords, mapping):
+        self.keywords = keywords
+        self.mapping = mapping
 
     def __getitem__(self, key):
-        try:
-            return self.primary[key]
-        except KeyError:
-            return self.fallback[key]
+        if key in self.keywords:
+            return self.keywords[key]
+        return self.mapping[key]
+
+
+def _lookup_source(mapping, keywords):
+    if mapping is _NO_MAPPING:
+        return keywords
+    if keywords:
+        return _KeywordsFirst(keywords, mapping)
+    return mapping
+
+
+def _default_pattern_source(cls):
+    import re
+    start = re.escape(cls.delimiter)
+    plain = cls.idpattern
+    braced = cls.braceidpattern or cls.idpattern
+    # verbose regex: the four alternatives after a delimiter
+    return (f'{start} (?:\n'
+            f'    (?P<escaped>{start})\n'          # the delimiter twice
+            f'  | (?P<named>{plain})\n'            # $identifier
+            f'  | {{ (?P<braced>{braced}) }}\n'    # ${identifier}
+            f'  | (?P<invalid>)\n'                 # a delimiter alone
+            f')')
+
+
+def _compile_for(cls, source):
+    import re
+    if isinstance(source, re.Pattern):
+        return source
+    flags = re.IGNORECASE if cls.flags is None else cls.flags
+    return re.compile(source, flags | re.VERBOSE)
+
+
+class _PatternOnDemand:
+    """Template.pattern until first use: compiling it at import time would
+    mean importing re.  Subclasses get their pattern when created."""
+
+    def __get__(self, instance, owner):
+        compiled = _compile_for(owner, _default_pattern_source(owner))
+        owner.pattern = compiled
+        return compiled
 
 
 class Template:
-    """A string with $-substitution placeholders ($name, ${name}, $$)."""
+    """A string containing $-placeholders, see substitute()."""
 
     delimiter = '$'
-    # ASCII-only identifiers; the pattern is case insensitive by default.
+    # identifiers are ASCII; matching ignores case unless flags says otherwise
     idpattern = r'(?a:[_a-z][_a-z0-9]*)'
     braceidpattern = None
-    # None means re.IGNORECASE.
-    flags = None
-    pattern = _TemplatePattern
+    flags = None          # None stands for re.IGNORECASE
+    pattern = _PatternOnDemand()
 
     def __init_subclass__(cls):
         super().__init_subclass__()
-        cls._compile_pattern()
-
-    @classmethod
-    def _compile_pattern(cls):
-        import re
-        # A pattern that was generated from delimiter/idpattern belongs to the
-        # class it was generated for (``_pattern_auto`` set in its dict); a
-        # subclass inheriting it regenerates its own from its own attributes.
-        # A pattern a class spells out itself is inherited as is.
-        own = cls.__dict__.get('pattern', _TemplatePattern)
-        if own is not _TemplatePattern and not cls.__dict__.get('_pattern_auto'):
-            pattern = own
-            cls._pattern_auto = False
-        elif ('pattern' not in cls.__dict__
-                and not getattr(cls, '_pattern_auto', True)):
-            pattern = cls.pattern
+        if 'pattern' in cls.__dict__:
+            source = cls.__dict__['pattern']
         else:
-            pattern = _TemplatePattern
-            cls._pattern_auto = True
-        if pattern is not _TemplatePattern and not isinstance(pattern, str):
-            # Already a compiled pattern object.
-            cls.pattern = pattern
-            return pattern
-        if pattern is _TemplatePattern:
-            delim = re.escape(cls.delimiter)
-            ident = cls.idpattern
-            bident = cls.braceidpattern or cls.idpattern
-            pattern = (
-                f'{delim}(?:\n'
-                f'  (?P<escaped>{delim})   |  # doubled delimiter\n'
-                f'  (?P<named>{ident})      |  # delimiter + identifier\n'
-                f'  {{(?P<braced>{bident})}} |  # delimiter + {{identifier}}\n'
-                f'  (?P<invalid>)             # anything else is an error\n'
-                f')\n'
-            )
-        flags = cls.flags
-        if flags is None:
-            flags = re.IGNORECASE
-        compiled = re.compile(pattern, flags | re.VERBOSE)
-        cls.pattern = compiled
-        return compiled
-
-    @classmethod
-    def _get_pattern(cls):
-        pattern = cls.__dict__.get('pattern', _TemplatePattern)
-        if pattern is _TemplatePattern or isinstance(pattern, str):
-            pattern = cls._compile_pattern()
-        return pattern
+            source = _default_pattern_source(cls)
+        cls.pattern = _compile_for(cls, source)
 
     def __init__(self, template):
         self.template = template
 
-    def _invalid(self, mo):
-        i = mo.start('invalid')
-        lines = self.template[:i].splitlines(keepends=True)
-        if not lines:
-            colno = 1
-            lineno = 1
-        else:
-            colno = i - len(''.join(lines[:-1]))
-            lineno = len(lines)
-        raise ValueError('Invalid placeholder in string: line %d, col %d' %
-                         (lineno, colno))
+    def _placeholder_error(self, match):
+        # The 'invalid' group is empty and normally sits right after the
+        # delimiter, so the number of characters before it on its line is
+        # the delimiter's 1-based column.
+        index = match.start('invalid')
+        # The sentinel makes the last row the one holding the placeholder.
+        rows = (self.template[:index] + '#').splitlines()
+        column = max(1, len(rows[-1]) - 1)
+        raise ValueError(f'Invalid placeholder in string: '
+                         f'line {len(rows)}, col {column}')
 
-    def substitute(self, mapping=_sentinel_dict, /, **kws):
-        if mapping is _sentinel_dict:
-            mapping = kws
-        elif kws:
-            mapping = _MergedMapping(kws, mapping)
+    def _unknown_match(self):
+        return ValueError('the Template pattern matched without setting any '
+                          'of the escaped/named/braced/invalid groups',
+                          self.pattern)
 
-        def convert(mo):
-            named = mo.group('named') or mo.group('braced')
-            if named is not None:
-                return str(mapping[named])
-            if mo.group('escaped') is not None:
+    def substitute(self, mapping=_NO_MAPPING, /, **kws):
+        """Return the template with every placeholder replaced by the value
+        from *mapping* and/or the keyword arguments (keywords win).
+
+        A missing key raises KeyError, a malformed placeholder ValueError.
+        """
+        source = _lookup_source(mapping, kws)
+
+        def replace(match):
+            name = match['named'] or match['braced']
+            if name is not None:
+                return str(source[name])
+            if match['escaped'] is not None:
                 return self.delimiter
-            if mo.group('invalid') is not None:
-                self._invalid(mo)
-            raise ValueError('Unrecognized named group in pattern',
-                             self.pattern)
-        return self._get_pattern().sub(convert, self.template)
+            if match['invalid'] is not None:
+                self._placeholder_error(match)
+            raise self._unknown_match()
 
-    def safe_substitute(self, mapping=_sentinel_dict, /, **kws):
-        if mapping is _sentinel_dict:
-            mapping = kws
-        elif kws:
-            mapping = _MergedMapping(kws, mapping)
+        return self.pattern.sub(replace, self.template)
 
-        def convert(mo):
-            named = mo.group('named') or mo.group('braced')
-            if named is not None:
+    def safe_substitute(self, mapping=_NO_MAPPING, /, **kws):
+        """Like substitute(), but placeholders that cannot be filled (missing
+        key or malformed) are left in the result unchanged."""
+        source = _lookup_source(mapping, kws)
+
+        def replace(match):
+            name = match['named'] or match['braced']
+            if name is not None:
                 try:
-                    return str(mapping[named])
+                    return str(source[name])
                 except KeyError:
-                    return mo.group()
-            if mo.group('escaped') is not None:
+                    return match[0]
+            if match['escaped'] is not None:
                 return self.delimiter
-            if mo.group('invalid') is not None:
-                return mo.group()
-            raise ValueError('Unrecognized named group in pattern',
-                             self.pattern)
-        return self._get_pattern().sub(convert, self.template)
+            if match['invalid'] is not None:
+                return match[0]
+            raise self._unknown_match()
+
+        return self.pattern.sub(replace, self.template)
 
     def is_valid(self):
-        for mo in self._get_pattern().finditer(self.template):
-            if mo.group('invalid') is not None:
+        """True unless the template contains a malformed placeholder."""
+        for match in self.pattern.finditer(self.template):
+            if match['invalid'] is not None:
                 return False
-            if (mo.group('named') is None
-                    and mo.group('braced') is None
-                    and mo.group('escaped') is None):
-                # The pattern matched but none of the known groups did.
-                raise ValueError('Unrecognized named group in pattern',
-                                 self.pattern)
+            if (match['named'] is None and match['braced'] is None
+                    and match['escaped'] is None):
+                raise self._unknown_match()
         return True
 
     def get_identifiers(self):
-        ids = []
-        for mo in self._get_pattern().finditer(self.template):
-            named = mo.group('named') or mo.group('braced')
-            if named is not None and named not in ids:
-                ids.append(named)
-            elif (named is None
-                    and mo.group('invalid') is None
-                    and mo.group('escaped') is None):
-                raise ValueError('Unrecognized named group in pattern',
-                                 self.pattern)
-        return ids
+        """The placeholder names used in the template, in order of first
+        appearance, without duplicates."""
+        seen = {}
+        for match in self.pattern.finditer(self.template):
+            name = match['named'] or match['braced']
+            if name is not None:
+                seen.setdefault(name, None)
+            elif match['invalid'] is None and match['escaped'] is None:
+                raise self._unknown_match()
+        return list(seen)
 
 
-########################################################################
-# The Formatter class: str.format() as overridable methods.
+# --------------------------------------------------------------------------
+# Formatter
 
 class Formatter:
+    """str.format() split into methods that subclasses can override:
+    parse() finds the fields, get_field()/get_value() look the arguments
+    up, convert_field() applies !r/!s/!a, format_field() calls format(),
+    check_unused_args() may reject unused arguments."""
+
     def format(self, format_string, /, *args, **kwargs):
         return self.vformat(format_string, args, kwargs)
 
     def vformat(self, format_string, args, kwargs):
-        used_args = set()
-        result, _ = self._vformat(format_string, args, kwargs, used_args, 2)
-        self.check_unused_args(used_args, args, kwargs)
-        return result
+        used = set()
+        text, _ = self._vformat(format_string, args, kwargs, used, 2)
+        self.check_unused_args(used, args, kwargs)
+        return text
 
     def _vformat(self, format_string, args, kwargs, used_args, recursion_depth,
                  auto_arg_index=0):
+        # Returns (text, numbering state).  The state is the next automatic
+        # field number, or None once explicit numbers were used; the two
+        # styles must not be mixed.  Format specs are expanded recursively,
+        # at most *recursion_depth* levels deep.
         if recursion_depth < 0:
-            raise ValueError('Max string recursion exceeded')
-        result = []
-        for literal_text, field_name, format_spec, conversion in \
-                self.parse(format_string):
-
-            if literal_text:
-                result.append(literal_text)
-
-            if field_name is not None:
-                # Automatic ('{}') and manual ('{0}') numbering cannot be
-                # mixed; auto_arg_index is False once manual numbering is used.
-                # The argument part ends at the first '.' or '['; an empty one
-                # ('{}', '{.attr}', '{[key]}') takes the next automatic index.
-                head = field_name.partition('.')[0].partition('[')[0]
-                if head == '':
-                    if auto_arg_index is False:
-                        raise ValueError('cannot switch from manual field '
-                                         'specification to automatic field '
-                                         'numbering')
-                    field_name = str(auto_arg_index) + field_name
-                    auto_arg_index += 1
-                elif head.isdigit():
-                    if auto_arg_index:
-                        raise ValueError('cannot switch from automatic field '
-                                         'numbering to manual field '
-                                         'specification')
-                    auto_arg_index = False
-
-                obj, arg_used = self.get_field(field_name, args, kwargs)
-                used_args.add(arg_used)
-                obj = self.convert_field(obj, conversion)
-
-                # The format spec may itself contain replacement fields.
-                format_spec, auto_arg_index = self._vformat(
-                    format_spec, args, kwargs,
-                    used_args, recursion_depth - 1,
-                    auto_arg_index=auto_arg_index)
-
-                result.append(self.format_field(obj, format_spec))
-
-        return ''.join(result), auto_arg_index
+            raise ValueError('format specifications nest too deeply '
+                             '(recursion limit reached)')
+        pieces = []
+        for literal, field, spec, conversion in self.parse(format_string):
+            if literal:
+                pieces.append(literal)
+            if field is None:
+                continue
+            field, auto_arg_index = _number_field(field, auto_arg_index)
+            value, key = self.get_field(field, args, kwargs)
+            used_args.add(key)
+            value = self.convert_field(value, conversion)
+            spec, auto_arg_index = self._vformat(
+                spec, args, kwargs, used_args, recursion_depth - 1,
+                auto_arg_index)
+            pieces.append(self.format_field(value, spec))
+        return ''.join(pieces), auto_arg_index
 
     def get_value(self, key, args, kwargs):
+        """Positional argument *key* (an int) or keyword argument *key*."""
         if isinstance(key, int):
             return args[key]
         return kwargs[key]
 
     def check_unused_args(self, used_args, args, kwargs):
-        pass
+        """Hook called after formatting; by default it accepts anything."""
 
     def format_field(self, value, format_spec):
         return format(value, format_spec)
@@ -274,27 +251,43 @@ class Formatter:
     def convert_field(self, value, conversion):
         if conversion is None:
             return value
-        if conversion == 's':
-            return str(value)
-        if conversion == 'r':
-            return repr(value)
-        if conversion == 'a':
-            return ascii(value)
-        raise ValueError("Unknown conversion specifier {0!s}".format(conversion))
+        converter = _CONVERSIONS.get(conversion)
+        if converter is None:
+            raise ValueError(f'Unknown conversion specifier {conversion!s}')
+        return converter(value)
 
     def parse(self, format_string):
-        """Return an iterable of (literal_text, field_name, format_spec,
-        conversion) tuples; field_name is None after the last field."""
+        """Iterate over (literal_text, field_name, format_spec, conversion);
+        field_name is None for trailing text without a field."""
         return _string.formatter_parser(format_string)
 
     def get_field(self, field_name, args, kwargs):
-        """Resolve field_name (e.g. '0.attr[key]') to an object; return
-        (object, first_key) where first_key is recorded as used."""
-        first, rest = _string.formatter_field_name_split(field_name)
-        obj = self.get_value(first, args, kwargs)
-        for is_attr, i in rest:
-            if is_attr:
-                obj = getattr(obj, i)
-            else:
-                obj = obj[i]
-        return obj, first
+        """Resolve a field such as '0.attr[key]'; return (object, key of the
+        argument it started from)."""
+        first, accessors = _string.formatter_field_name_split(field_name)
+        value = self.get_value(first, args, kwargs)
+        for is_attribute, name in accessors:
+            value = getattr(value, name) if is_attribute else value[name]
+        return value, first
+
+
+_CONVERSIONS = {'s': str, 'r': repr, 'a': ascii}
+
+
+def _number_field(field, state):
+    """Give an automatically numbered field ('{}', '{.x}', '{[0]}') its
+    number; return (field, new numbering state)."""
+    argument = field
+    for stop in '.[':
+        argument = argument.partition(stop)[0]
+    if argument == '':
+        if state is None:
+            raise ValueError('cannot switch from manual field specification '
+                             'to automatic field numbering')
+        return f'{state}{field}', state + 1
+    if argument.isdigit():
+        if state:
+            raise ValueError('cannot switch from automatic field numbering '
+                             'to manual field specification')
+        return field, None
+    return field, state

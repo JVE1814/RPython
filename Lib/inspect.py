@@ -254,7 +254,7 @@ def isroutine(object):
 
 # Objects produced by functools.singledispatchmethod.__get__ act as methods.
 _DISPATCH_GETTERS = tuple(
-    getattr(functools, name) for name in ("_singledispatchmethod_get",)
+    getattr(functools, name) for name in ("_DispatchingMethod",)
     if isinstance(getattr(functools, name, None), type))
 
 def isabstract(object):

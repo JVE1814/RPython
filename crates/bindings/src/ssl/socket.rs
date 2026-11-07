@@ -144,7 +144,7 @@ pub fn new_sslsocket(
     if server_side && c.post_handshake_auth {
         let m = sl!(SSL_get_verify_mode(ssl));
         if m != SSL_VERIFY_NONE {
-            sl!(SSL_set_verify(ssl, m | SSL_VERIFY_POST_HANDSHAKE, std::ptr::null_mut()));
+            sl!(SSL_set_verify(ssl, m | SSL_VERIFY_POST_HANDSHAKE, super::context::verify_with_distrust as *mut c_void));
         }
     }
     let mut sock_weak = None;
