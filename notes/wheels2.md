@@ -92,7 +92,25 @@ the binary of a snapshot/venv; the pandas parts skip without pandas).
     (preset 6). Speed ~1.3 MB/s on text at preset 6 (was much faster, much worse).
     Dev aid: `cargo run --release -p rpy-compress --example xzsize -- FILE...`.
 
-## Left (root causes known)
-* xz presets (3 tests, io/test_compression::test_xz_compression_level_read): our LZMA encoder
-  has no price-based optimal parser, so presets 1..9 give the same size on pickled frames.
+
+## Results (pandas 3.1.0, same marker selection as the baseline)
+| run | failed | passed | errors | ours-only |
+|---|---|---|---|---|
+| baseline CPython ft | 3,344 | 182,561 | 1,362 | - |
+| stability2 list (all tests vs baseline) | | | | 2,320 (1,502 among tests the baseline ran) |
+| wheels2 run 1 (commit e8fc5d2) | 3,395 | 182,509 | 1,362 | 51 |
+| wheels2 run 2 (commit 486ec8a) | 3,347 | 182,557 | 1,362 | 3 (xz presets, fixed in c647cf2) |
+
+Run 2's failure set is the baseline's plus the 3 xz tests (no test fails only on the
+baseline); io/test_compression passes completely with c647cf2. numpy full suite after the
+changes: 3 failed / 50,577 passed / 41 errors (as before, 0 ours-only). msgspec unit
+tests: 0 failures (test_wrong_classvar fixed).
+
+## Left
 * test_capi.test_watchers: type/function/code/context watchers still do not fire (28).
+* Both full pandas runs abort *after* the summary with "memory allocation of 32 bytes
+  failed" under `ulimit -v 6000000` (memory growth over the 45-minute run; results are
+  complete). stability2 saw the same at junit-XML time.
+* Seen in the base, not from this branch (also on hang1's master snapshot):
+  test_traceback lazy-import reification (2), test_sys subinterpreter intern (3).
+* getrefcount emulation (item 14) is a stand-in for real borrowed stack references.
