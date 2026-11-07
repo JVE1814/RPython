@@ -86,9 +86,13 @@ affected workloads: the extra CPU was cache-line traffic and lock spinning, not 
    thread list is mirrored into a fixed array under a sequence lock (`note_threads` takes the
    list), each thread state publishes its sequence in `ThreadState::qsbr_seen`, scans are
    rate-limited (cached minimum, capped by the GLOBAL read before the scan), batches hold up to
-   1024 items, immortal objects are never retired, a thread re-arms its eval breaker a bounded
-   number of times, and every collection releases everything retired before its stop
-   (`take_all_for_gc`). Nothing is released inside `retire` any more (the caller may hold a
+   1024 items, immortal objects are never retired, a thread that keeps retiring comes back to
+   its handler by itself (every 64 retires and when a batch fills) instead of re-arming its eval
+   breaker at every poll (that alone was 10% of jit_calls' instructions: worker threads 469M →
+   360M instructions at 0.1 scale), an idle one re-arms a bounded number of times, and every
+   collection marks everything retired before its stop as matured, to be released by its own
+   thread at its next poll (`take_all_for_gc`; releasing it on the collector's thread made
+   those frees cross-thread). Nothing is released inside `retire` any more (the caller may hold a
    leaf lock; releasing runs deallocators — this deadlocked weakref_race once the old code's
    release-on-full-batch path became frequent). Closing a batch is not a quiescent point (an
    earlier version of this rewrite reported one there: heap corruption).
@@ -122,7 +126,12 @@ affected workloads: the extra CPU was cache-line traffic and lock spinning, not 
    so the collector's tp_clear/dealloc on other threads' cyclic garbage no longer pushes every
    object through the owners' merge queues (1.15M queue hand-offs, each taking the global
    `ALL_THREADS` lock, in alloc_cycles at 0.3 scale → 37); the weakref detach step builds its
-   hash set only when a callback needs it (8% of a cycle-heavy run).
+   hash set only when a callback needs it (8% of a cycle-heavy run). Dead sharded objects and
+   orphaned QSBR items are released after `COLLECTING` is cleared, and `gc.get_objects()` called
+   by the collecting thread itself (a `__del__` run by the collection) no longer waits for its
+   own collection — a pre-existing hang of test_gc when it runs after threaded tests (the
+   before build hangs the same way in `-m test test_free_threading test_threading test_weakref
+   test_gc`).
 
 7. **Contended object locks spun with sched_yield**: `ob_lock`'s slow path yielded up to 2000
    times before sleeping (whole cores burned on contended dicts/lists). It now spins briefly and
@@ -131,7 +140,59 @@ affected workloads: the extra CPU was cache-line traffic and lock spinning, not 
 
 ## Results
 
-RESULTS_PLACEHOLDER
+Final run (2026-11-07 ~13:55–14:20, `REPS=3 THREADS="1 2 4"`, scale 1, 828 runs, ours = commit
+3378fa4 (`/home/user/RPython/target/scale1/after`), before = the core-branch build of 09:33 (my base
+853051a plus the wheels2 merge and D27, which do not touch these paths)). **The machine was not
+quiet**: other agents used 2.3 CPUs on average during the run, only 394 of 828 runs passed the
+contention check, and for most workloads no 4-thread run did (`*`). Wall-clock speedups at 4
+threads are therefore lower bounds and noisy; the CPU-inflation column is the reliable one.
+Best runs (`STAT=min`; medians in `summary.txt` of the run show the same picture with more noise):
+
+| workload | before x4 / cpu-infl@4 | ours x4 / cpu-infl@4 | py-ft x4 / cpu-infl@4 | py-default x4 | ours/ft wall @1 / @4 |
+|---|---|---|---|---|---|
+| cpu_nbody | 0.68 / 1.48 | 1.57 / **1.08** | 2.68 / 1.07 | 1.07 | 0.47 / 0.80 |
+| cpu_oo | 0.32 / 3.23 | 1.00 / 1.55 | 1.58 / 1.07 | 0.98 | 0.93 / 1.48 |
+| cpu_float | 0.47 / 2.43 | 1.04 / **1.15** | 1.77 / 1.08 | 1.03 | 1.43 / 2.43 |
+| cpu_gen | 0.64 / 1.35 | 1.45 / **1.14** | 2.33 / 1.08 | 0.90 | 0.99 / 1.60 |
+| cpu_comp | 0.31 / 3.09 | 0.93 / **1.07** | 1.84 / 1.15 | 0.90 | 1.86 / 3.65 |
+| cpu_regex | 0.90 / 1.56 | **2.01** / 1.21 | 1.79 / 1.12 | 0.90 | 0.44 / 0.39 |
+| cpu_json | 3.16 / 1.09 | 2.25 / **1.06** | 3.29 / 1.11 | 0.90 | 0.88 / 1.29 |
+| shr_dict | 0.83 / 1.19 | **1.00** / **1.02** | 0.90 / 1.12 | 1.02 | 0.94 / 0.85 |
+| shr_list | 0.88 / 1.36 | **2.26** / **0.95** | 0.89 / 1.33 | 1.07 | 0.83 / 0.33 |
+| shr_globals | 0.96 / 1.01 | 2.25 / **0.98** | 2.69 / 1.01 | 1.12 | 0.67 / 0.80 |
+| shr_attrs | 0.65 / 2.08 | 0.83 / 1.15 | 1.65 / 1.00 | 1.09 | 1.22 / 2.44 |
+| alloc_small | 1.72 / 1.05 | 2.06 / **1.05** | 2.19 / 1.05 | 1.19 | 1.06 / 1.13 |
+| alloc_cycles | 0.46 / 2.66 | 0.98 / 1.45 | 1.32 / 0.81 | 0.98 | 0.56 / 0.75 |
+| alloc_dicts | 1.39 / 1.34 | **1.90** / 1.06 | 1.68 / 1.02 | 0.99 | 1.95 / 1.72 |
+| mut_queue | 0.57 / 1.78 | **1.13** / **1.05** | 0.81 / 1.78 | 0.93 | 2.08 / 1.50 |
+| mut_dict | 0.31 / 3.85 | 0.76 / **1.69** | 0.80 / 1.74 | 1.02 | 1.57 / 1.65 |
+| mut_lock | 1.07 / 1.03 | 0.80 / 1.40 | 0.80 / 1.30 | 1.10 | 1.46 / 1.48 |
+| mut_list | 0.31 / 3.42 | 0.10 / 1.70 | 0.96 / 1.52 | 0.98 | 1.26 / 12.2 |
+| jit_loop | 2.69 / 1.05 | 2.57 / **0.99** | 3.04 / 1.00 | 0.89 | 0.09 / 0.11 |
+| jit_calls | 0.32 / 9.16 | 1.19 / 2.60 | 3.09 / 1.03 | 1.00 | 1.08 / 2.82 |
+| misc_classes | 0.31 / 3.49 | 0.29 / 5.22 | 0.59 / 2.43 | 0.90 | 0.79 / 1.59 |
+| misc_import | 1.72 / 1.24 | **1.81** / **1.15** | 1.66 / 1.16 | 0.76 | 1.53 / 1.40 |
+| misc_cext | 1.02 / 1.42 | 1.20 / 1.08 | 1.70 / 1.05 | 0.97 | 1.43 / 2.03 |
+
+(bold: ours at least as good as py-ft.) The 2-thread columns of this run are not usable (the
+load changed between the 1-, 2- and 4-thread runs of a workload; e.g. all four interpreters show
+x2 ≈ 0.2–0.4 for shr_dict/mut_*), they are in `summary.txt` only.
+
+Reading: before this work, 4 threads cost 1.5–9x the CPU per unit of independent work and
+shared-read work (atomic refcount and lock ping-pong); now cpu-infl is at py-ft's level (≤1.15)
+for nbody, float, gen, comp, json, all four shared-read workloads, alloc_small/dicts, the JIT
+loop, queue, import and C-extension calls, and better than py-ft for shr_list, shr_dict,
+mut_queue and mut_dict. Still worse than py-ft: cpu_oo and jit_calls (attribute stores retire
+through QSBR, see below), shr_attrs (borrowed loads), alloc_cycles and misc_classes (serial
+collector), mut_list (erratic: 0.9–6 s at 4 threads; the before build takes ~8 s and 30 s of CPU
+every time — cache-line ping-pong on a shared list whose refcount and `ob_mutex` share a line).
+Absolute single-thread speed in multi-threaded mode (`ours/ft @1`) is below py-ft for several
+workloads because single-threaded JIT fast paths are still disabled once a second thread
+exists (cpu_comp, alloc_dicts, mut_*).
+
+An earlier run (12:38–12:56, a build before the last QSBR change) gave the same ranking; e.g.
+cpu-infl@4 cpu_oo 4.88 → 1.83, cpu_comp 3.51 → 1.57, jit_calls 4.48 → 2.26 before the last QSBR
+change (the re-arm policy took jit_calls' worker threads from 469M to 360M instructions).
 
 ## What is left (measured causes)
 
@@ -153,7 +214,25 @@ RESULTS_PLACEHOLDER
   LOAD_GLOBAL inline paths are disabled once a second thread exists (they now hit lock-free
   helpers, but pay a call).
 * `queue_object_for_merge` still takes the global `ALL_THREADS` lock per hand-off
-  (producer/consumer patterns).
+  (producer/consumer patterns: 366k hand-offs in mut_list at scale 1).
+* **mut_list**: one shared list appended/popped by all threads; its refcount (incref per
+  LOAD_FAST, not sharded while young) and `ob_mutex` share the header cache line. Run times at 4
+  threads vary 0.9–6 s (before: ~8 s, 30 s CPU, every run; py-ft 0.5 s).
+* **Class creation** (misc_classes, cpu-infl 5.2 vs py-ft 2.4): collections take ~30 ms each
+  (29 per run) with the other threads parked; 31k objects become sharded (strings, dicts, code
+  of the fresh classes) and the sharded tables evict often (109k evictions).
+
+### Known limitations of the new mechanisms
+
+* Sharded objects are released only by a collection (like CPython ft's deferred-refcount
+  objects); a program that stops allocating GC objects keeps them until the next collection.
+  `sys.getrefcount`/`Py_REFCNT` of a sharded object do not include other threads' pending
+  deltas; C's inline `Py_REFCNT` sees the 2^50 bias (as for heap types before).
+* The "exclusively owned" fast paths (list append/iteration without locks, immediate frees)
+  trust that a reference the caller can use is counted; C code that operates on a list or list
+  iterator through a borrowed pointer whose only counted reference belongs to another thread
+  could race the owner (no such use is known).
+* `RPY_SHARD_MASK` and `RPY_SCALESTATS` are diagnostics only.
 
 ## Correctness
 
@@ -165,6 +244,15 @@ RESULTS_PLACEHOLDER
   test_collections 3, test_capi: the same failures as the before build except tests fixed on
   core after my base (dict watchers, bz2/lzma end of stream, monitoring, frozendict pickling,
   sys.getrefcount emulation D27: test_list.test_list_overwrite_local) — none in my areas.
+* Found and fixed on the way (all would have been regressions of this work): a QSBR report at
+  batch close (heap corruption), unsharding with the collector's own pending table deltas
+  (types freed under live instances: enum_composite), the old block of a dict resize retired
+  under the new table's sharing state, `dict.update` replacing the table header under readers
+  (test_free_threading.test_dict), releases inside `retire` under a leaf lock (weakref_race
+  deadlock), dead-object releases while COLLECTING was held.
+* `-m test test_free_threading test_threading test_weakref test_gc` in one process used to hang
+  in test_gc (before build too: `gc.get_objects()` in a `__del__` during a collection once the
+  process had threads); fixed (gc.rs `COLLECTOR`).
 
 ## Files
 
