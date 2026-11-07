@@ -590,12 +590,48 @@ pub(crate) unsafe fn type_from_desc(desc: TypeDesc, token: *mut c_void) -> PyRes
         }
         // sizes
         let base_size = (*base).tp_basicsize;
+        // (hang1) PEP 697 checks: a type that extends its base (negative
+        // basicsize) needs a base whose items, if any, are at the end, and
+        // relative member offsets need such an extension and must lie in it
+        let extends = desc.extra_basicsize > 0 || desc.basicsize < 0;
+        let extra = if desc.extra_basicsize > 0 { desc.extra_basicsize } else { -desc.basicsize };
+        if desc.basicsize < 0 && (*base).tp_itemsize != 0 && (*base).tp_flags & Py_TPFLAGS_ITEMS_AT_END == 0 {
+            return Err(system_error("Cannot extend variable-size class without Py_TPFLAGS_ITEMS_AT_END"));
+        }
+        if !members.is_null() {
+            let mut p = members;
+            while !(*p).name.is_null() {
+                let nm = CStr::from_ptr((*p).name).to_bytes();
+                if matches!(nm, b"__vectorcalloffset__" | b"__dictoffset__" | b"__weaklistoffset__") {
+                    let nm = String::from_utf8_lossy(nm);
+                    if (*p).type_code != 19 {
+                        return Err(system_error(&format!("type of {} must be Py_T_PYSSIZET", nm)));
+                    }
+                    if (*p).flags & !Py_RELATIVE_OFFSET != 1 {
+                        return Err(system_error(&format!("flags for {} must be Py_READONLY or (Py_READONLY | Py_RELATIVE_OFFSET)", nm)));
+                    }
+                }
+                if (*p).flags & Py_RELATIVE_OFFSET != 0 {
+                    if !extends {
+                        return Err(system_error("With Py_RELATIVE_OFFSET, basicsize must be extended"));
+                    }
+                    if (*p).offset < 0 {
+                        return Err(system_error("Member offset must not be negative"));
+                    }
+                    if (*p).offset >= extra {
+                        return Err(system_error("Member offset out of range (0..extra_basicsize)"));
+                    }
+                }
+                p = p.add(1);
+            }
+        }
+        // the extension is rounded up to the maximum alignment, like its offset
         let (basicsize, data_off) = if desc.extra_basicsize > 0 {
             let off = align_up(base_size);
-            (off + desc.extra_basicsize, off)
+            (off + align_up(desc.extra_basicsize), off)
         } else if desc.basicsize < 0 {
             let off = align_up(base_size);
-            (off - desc.basicsize, off)
+            (off + align_up(-desc.basicsize), off)
         } else if desc.basicsize == 0 {
             (base_size, base_size)
         } else {
