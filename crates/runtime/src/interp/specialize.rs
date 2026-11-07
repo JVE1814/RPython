@@ -511,7 +511,7 @@ pub fn store_attr(o: &PyObject, nm: &PyObject, v: &PyObject, es: &[Entry]) -> Py
             if tag == s.a && s.kind != kind::EMPTY {
                 match s.kind {
                     kind::INSTANCE_DICT => unsafe {
-                        if crate::shape::replace_hinted(o, nm.as_ptr(), s.b, v) {
+                        if crate::shape::replace_hinted(o, nm.as_ptr(), s.b, v) || crate::shape::add_hinted(o, nm.as_ptr(), s.b, v) {
                             return Ok(());
                         }
                         let had_values = crate::shape::has_inline_values(o);
