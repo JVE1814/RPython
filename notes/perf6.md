@@ -125,10 +125,89 @@ not needed for parity); the per-element allocations and per-character state mach
 "base" = this worktree at the merge (ee46d9d, `core` + D29), installed snapshot; "perf6" =
 the branch head. CPython = /opt/baseline/py-default through the bench scripts.
 
-RESULTS_PLACEHOLDER
+### Start-up and memory
+| | base | perf6 | CPython default |
+|---|---|---|---|
+| `-c pass` instructions | 64.8M (58.3M with the os.py fix alone) | 39.2M | 40.5M (perf2) |
+| `-S -c pass` instructions | 28.3M | 19.7M | 27.7M (perf2) |
+| `-c pass` wall, best of 40, pinned, interleaved | 13.1 ms | 8.9 ms | 10.1 ms (ft 11.9) |
+| `-S -c pass` wall | 7.3 ms | 5.6 ms | 7.4 ms |
+| start-up RSS (anon / file) | 13.1 MB (4.1 / 9.0) | 12.0 MB (3.9 / 8.1) | 9.2 MB (3.3 / 5.9) |
+| startup_mem.sh peak_rss_kb | 37352 (36.5-38.7 across runs) | 35796 | 32336 (ft 38640, perf4) |
+
+### Instructions per operation (`percall.sh`)
+| kind | base | perf6 | CPython default |
+|---|---|---|---|
+| xmlparse fromstring (per element) | 6703 | 4365 | 4507 |
+| xmlparse iterparse | 13429 | 10810 | 9393 |
+| xmlparse tostring | 11464 | 11487 | 14622 |
+| xmlparse build (SubElement, `'%d' %`) | 6214 | 3942 | 4429 |
+| calls.py keyerror (miss + except) | 2396 | 1867 | 1841 |
+| calls.py exc (raise + catch one down) | 4210 | 4004 | 3686 |
+| calls.py counter (`stats[pair] += 1`) | 2620 | 2213 | 2360 |
+| calls.py dunder | 1962 | 1954 | 1452 |
+| calls.py kw / init / super / prop / bound | 796 / 762 / 2226 / 400 / 457 | 767 / 759 / 2215 / 401 / 454 | 701 / 1253 / 1911 / 441 / 502 |
+| calls.py map / sortkey / getattr_call / alloc / star / kwargs | 684 / 523 / 1125 / 943 / 629 / 2916 | 681 / 522 / 1151 / 937 / 605 / 2932 | 542 / 502 / 1094 / 762 / 856 / 1818 |
+| b64.py enc / dec / enc_raw / dec_raw | 2944 / 4073 / 1521 / 1774 | 2958 / 4024 / 1496 / 1780 | 2449 / 4373 / 1560 / 1481 |
+
+### Steady state per benchmark loop (callgrind, millions, `perloop.sh`)
+| bench (windows) | base | perf6 | CPython default |
+|---|---|---|---|
+| typing_runtime_protocols (300/1300) | 1.92 | 1.32 | 1.68 |
+| deepcopy (100/400) | 3.29 | 3.24 | 2.83 |
+| logging (500/1500) | 1.28 | 1.28 | 1.05 |
+| comprehensions (50/300) | 0.22 | 0.22 | 0.19 |
+| mdp (1/2) | 12561 | 12412 | - |
+| bpe_tokeniser, one loop incl. start-up | 48.66G (before the LoadMethod fix) | 46.80G | - |
+
+(The perloop windows matter: several benchmarks are not linear in the loop count for us,
+e.g. typing at 50/300 reads 0.22M; use the windows given.)
+
+### Wall clock
+s/loop through run_bench.sh, the four binaries back to back per benchmark, pinned to core 3,
+other agents running; ratio = x / best CPython. Noisy benchmarks were re-run three times
+interleaved (the ratios shown are from those runs). Single runs of the same binary vary by
+10-15% (a three-binary layout experiment showed the same spread for one binary).
+
+| bench | base ratio | perf6 ratio |
+|---|---|---|
+| python_startup (best of 40) | 1.30 | 0.88 |
+| xml_etree | 1.70 | 1.21 |
+| mdp | 1.52 | 1.32 |
+| bpe_tokeniser | 1.35 | 1.29 |
+| typing_runtime_protocols | 1.39 | 1.32 |
+| logging | 1.33 | 1.31 |
+| comprehensions | 1.30 | 1.27 |
+| nqueens | 1.28 | 1.22 |
+| deepcopy | 1.47 | 1.48 |
+| pathlib | 1.16 | 1.17 |
+| base64 | 1.17 | 1.15 |
+| async_generators | 1.12 | 1.12 |
+| pprint | 1.10 | 0.82 |
+| concurrent_imap | 0.90 | 0.97 |
+
+typing_runtime_protocols now runs fewer instructions than CPython (1.32M vs 1.68M) and is
+still 1.3x in wall time: not explained by instruction counts (cache/branch behaviour of the
+call paths; not investigated further).
 
 ## Correctness
-CORRECTNESS_PLACEHOLDER
+tools/jit_tests/run.sh (with the new t_late_methods.py) and tools/stress/run.sh pass on
+the final build (after merging `core` 91b8c20). Spec modules through tools/run_tests.sh on
+installed-layout snapshots of the starting point and of the head (frozen modules on in the
+head's snapshot): no new failure anywhere; the differences are improvements that came with
+the `core` merge (test_asyncio 10 -> 2 failures, test_free_threading 2 -> 0, test_import
+3 -> 0). Final gate: test_call test_descr test_class test_exceptions test_traceback
+test_sys_settrace test_monitoring test_generators test_coroutines test_asyncio test_logging
+test_pathlib test_xml_etree test_xml_etree_c test_pyexpat test_sax test_minidom test_copy
+test_typing test_gc test_threading test_free_threading test_pickle test_importlib
+test_import test_frozen test_cmd_line test_sys test_embed test_fractions test_dict test_str
+test_format test_inspect test_dis. Earlier rounds (identical run/failure/error counts to the
+starting point): test_site test_runpy test_zipimport test_pkgutil test_os test_posixpath
+test_abc test_code test_compile test_linecache test_warnings test_set test_tuple test_bytes
+test_collections test_hash test_dictviews test_ordered_dict test_userdict test_float
+test_long test_bool test_compare test_marshal test_frame test_funcattrs test_capi
+test_except_star test_raise test_with test_exception_group test_asyncgen test_contextlib
+test_contextlib_async test_xml_dom_minicompat test_string_literals.
 
 ## What is left (measured causes)
 * Peak memory (startup_mem.sh ~37 MB vs CPython 32.3 MB; ft CPython 38.6). The workload
