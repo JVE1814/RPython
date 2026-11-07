@@ -34,6 +34,7 @@ import builtins
 import contextlib
 import inspect
 import io
+import pkgutil  # patch() resolves targets with it, even while sys.path is replaced
 import pprint
 import sys
 import threading
@@ -2035,7 +2036,6 @@ def _resolve_dotted(path):
     """Import/look up a name like ``package.module.Class.attr`` (or
     ``package.module:Class.attr``).  The longest importable module prefix
     wins over a package attribute of the same name."""
-    import pkgutil
     return pkgutil.resolve_name(path)
 
 

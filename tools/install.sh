@@ -17,4 +17,6 @@ find "$PREFIX/lib/python3.15t.tmp" -name __pycache__ -prune -exec rm -rf {} +
 cp -r "$PREFIX/lib/python3.15t.tmp/." "$PREFIX/lib/python3.15t/"; rm -rf "$PREFIX/lib/python3.15t.tmp"
 cp -r "$ROOT/spec/Include/." "$PREFIX/include/python3.15t/"
 cp "$ROOT/tools/pyconfig.h" "$PREFIX/include/python3.15t/pyconfig.h"
+# PEP 739 build-details.json (tail4)
+"$PREFIX/bin/python3.15t" -I "$ROOT/tools/build_details.py" || echo "warning: build-details.json not written"
 echo "installed to $PREFIX"
