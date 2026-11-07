@@ -87,7 +87,13 @@ pub fn current_builtins() -> PyRef {
 }
 
 pub fn current_frame_ptr() -> *mut Frame {
-    crate::threads::current().frame.get()
+    // no attached state (e.g. PyTraceMalloc_Track called by an extension with the
+    // GIL released): no frame. Attaching a state here leaked one per call.
+    let ts = crate::threads::current_ptr();
+    if ts.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe { (*ts).frame.get() }
 }
 
 /// vectorcall entry for Python functions.
