@@ -147,7 +147,7 @@ pub fn for_each_large_gc(mut f: impl FnMut(*mut PyObject)) {
 pub unsafe fn alloc_object(tp: *mut PyTypeObject, size: usize) -> *mut PyObject {
     unsafe {
         let flags = (*tp).tp_flags;
-        if flags & Py_TPFLAGS_READY == 0 || size > crate::tlab::MAX_SMALL - MANAGED || crate::modules::_tracemalloc::TRACING.load(Relaxed) {
+        if flags & Py_TPFLAGS_READY == 0 || size > 512 - MANAGED || crate::modules::_tracemalloc::TRACING.load(Relaxed) {
             return alloc_object_slow(tp, size);
         }
         let gc = ((flags >> 14) & 1) as usize; // Py_TPFLAGS_HAVE_GC
@@ -159,7 +159,7 @@ pub unsafe fn alloc_object(tp: *mut PyTypeObject, size: usize) -> *mut PyObject 
         if raw.is_null() {
             return alloc_object_slow(tp, size);
         }
-        crate::tlab::zero_slot(raw, slot);
+        crate::tlab::zero_slot_small(raw, slot);
         let op = raw.add(pre) as *mut PyObject;
         // gc bits: PREHEADER (0x80) for GC kinds, MANAGED (0x40) with the pre-header
         let bits = ((gc << 7) | (managed << 6)) as u64;
@@ -168,10 +168,18 @@ pub unsafe fn alloc_object(tp: *mut PyTypeObject, size: usize) -> *mut PyObject 
         std::ptr::write((op as *mut u64).add(1), (bits << 24) | (1u64 << 32));
         (*op).ob_type.store(tp, Relaxed);
         if flags & Py_TPFLAGS_HEAPTYPE != 0 {
-            crate::object::incref_type(tp);
+            // (tail call: keeps the static-type path free of register saves)
+            return alloc_heap_type_ref(tp, op);
         }
         op
     }
+}
+
+/// The new instance's reference to its heap type (`alloc_object`).
+#[inline(never)]
+unsafe fn alloc_heap_type_ref(tp: *mut PyTypeObject, op: *mut PyObject) -> *mut PyObject {
+    unsafe { crate::object::incref_type(tp) };
+    op
 }
 
 #[cold]

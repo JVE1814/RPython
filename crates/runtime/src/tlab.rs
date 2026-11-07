@@ -461,6 +461,27 @@ pub unsafe fn zero_slot(p: *mut u8, slot: usize) {
     unsafe { zero_block(p, *SLOT_SIZE.get_unchecked(slot) as usize) }
 }
 
+/// `zero_slot` for blocks of at most 512 bytes (no library call: callers stay leaf
+/// functions).
+#[inline(always)]
+pub unsafe fn zero_slot_small(p: *mut u8, slot: usize) {
+    unsafe {
+        let size = *SLOT_SIZE.get_unchecked(slot) as usize;
+        let mut off = 0;
+        while off + 32 <= size {
+            store_zero::<32>(p.add(off));
+            off += 32;
+        }
+        if off + 16 <= size {
+            store_zero::<16>(p.add(off));
+            off += 16;
+        }
+        if off < size {
+            store_zero::<8>(p.add(off));
+        }
+    }
+}
+
 /// Refill path of `alloc_kind`: a zeroed block of `slot`, null on OOM.
 #[cold]
 #[inline(never)]
