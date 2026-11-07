@@ -203,6 +203,9 @@ fn f_lineno(o: &PyObject) -> PyResult {
     Ok(if l < 0 { none::none_ref() } else { int::new_int(l as i64) })
 }
 fn f_set_lineno(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
+    if v.is_none() {
+        raise!(AttributeError, "cannot delete f_lineno");
+    }
     let f = need(o)?;
     crate::interp::jump::set_lineno(f, v)
 }
@@ -247,6 +250,7 @@ fn f_set_trace_lines(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
             need(o)?.f_trace_lines = v.is(bool_::true_obj());
             Ok(())
         }
+        None => raise!(TypeError, "can't delete numeric/char attribute"),
         _ => raise!(TypeError, "attribute value type must be bool"),
     }
 }
@@ -259,6 +263,7 @@ fn f_set_trace_opcodes(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
             need(o)?.f_trace_opcodes = v.is(bool_::true_obj());
             Ok(())
         }
+        None => raise!(AttributeError, "attribute 'f_trace_opcodes' of 'frame' objects cannot be deleted"),
         _ => raise!(TypeError, "attribute value type must be bool"),
     }
 }
@@ -317,14 +322,7 @@ fn frame_clear_method(o: &PyObject) -> PyResult {
     let f = need(o)?;
     match f.state {
         FrameState::Executing => raise!(RuntimeError, "cannot clear an executing frame"),
-        FrameState::Suspended => {
-            if !f.generator.is_null() {
-                let g = unsafe { (*f.generator).to_ref() };
-                crate::types::genobject::gen_close(&g)?;
-            } else {
-                raise!(RuntimeError, "cannot clear a suspended frame");
-            }
-        }
+        FrameState::Suspended => raise!(RuntimeError, "cannot clear a suspended frame"),
         _ => {}
     }
     if let Some(f) = frame_of(o) {

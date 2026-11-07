@@ -444,7 +444,11 @@ pub unsafe extern "C" fn PyEval_GetFrameLocals() -> *mut PyObject {
         match current_frame() {
             Some(f) => {
                 let fo = crate::interp::eval::frame_object(f);
-                ret(ab::getattr_str(&*fo, "f_locals"))
+                // PEP 667: a snapshot dict for optimized (function) frames, the real
+                // namespace for module and class frames
+                ret(ab::getattr_str(&*fo, "f_locals").and_then(|l| {
+                    if crate::types::dict::is_dict(&l) { Ok(l) } else { ab::call(crate::types::typeobject::type_obj(crate::types::dict::dict_type()), &[&l]) }
+                }))
             }
             None => std::ptr::null_mut(),
         }
