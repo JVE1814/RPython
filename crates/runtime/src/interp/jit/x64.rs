@@ -387,6 +387,13 @@ impl Asm {
             self.buf.extend_from_slice(&i.to_le_bytes());
         }
     }
+    /// test byte [m], imm8 (scale2)
+    pub fn test8_mi(&mut self, m: M, i: u8) {
+        self.rex(false, 0, 0, m.0 as u8, false);
+        self.b(0xf6);
+        self.modrm_mem(0, m);
+        self.b(i);
+    }
     /// xchg qword [m], r64 (implicitly locked: a full barrier) (scale2)
     pub fn xchg_mr(&mut self, m: M, r: R) {
         self.rex(true, r as u8, 0, m.0 as u8, false);

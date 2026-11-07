@@ -589,7 +589,7 @@ pub unsafe extern "C" fn h_backedge(f: *mut crate::interp::frame::Frame, header:
         let f = &mut *f;
         let cd = crate::types::code::code_data(f.code());
         let cc = &cd.caches;
-        cc.t2_backedge.store(i32::MAX, Relaxed);
+        cc.t2_backedge.store(-1, Relaxed); // (scale2) parked: tier-1 code stops counting
         if !enabled() {
             return 0;
         }

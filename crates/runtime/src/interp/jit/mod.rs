@@ -120,8 +120,15 @@ pub fn try_run(ts: &ThreadState, f: &mut Frame, cd: &CodeData, pc: usize) -> Run
         if pc != 0 || !enabled() {
             return Run::NotRun;
         }
-        let n = cd.invocation_count.fetch_add(1, Relaxed) + 1;
-        if n < THRESHOLD.load(Relaxed) || cd.caches.tier_state.load(Relaxed) != tier::INTERP {
+        // (scale2) count only while it can still trigger tier 1 (plain update, a lost
+        // one only delays tiering): code that failed to compile is called by many
+        // threads, and an atomic add per call contends on the code object
+        if cd.caches.tier_state.load(Relaxed) != tier::INTERP {
+            return Run::NotRun;
+        }
+        let n = cd.invocation_count.load(Relaxed).wrapping_add(1);
+        cd.invocation_count.store(n, Relaxed);
+        if n < THRESHOLD.load(Relaxed) {
             return Run::NotRun;
         }
         if !compile(f, cd) {
@@ -131,9 +138,7 @@ pub fn try_run(ts: &ThreadState, f: &mut Frame, cd: &CodeData, pc: usize) -> Run
     }
     if pc == 0 {
         let cc = &cd.caches;
-        let t = cc.t2_calls.load(Relaxed);
-        cc.t2_calls.store(t.wrapping_sub(1), Relaxed);
-        if t == 1 {
+        if t2_countdown(cc) {
             opt::compile(f.code(), f.globals, f.builtins, 0);
         }
     }
@@ -344,10 +349,20 @@ fn enter_bound(ts: &ThreadState, f: &crate::types::funcobject::PyFunctionObject,
 /// tier-2 call countdown expires.
 #[inline(always)]
 fn bump_invocations(cd: &CodeData) -> bool {
-    let n = cd.invocation_count.load(Relaxed);
-    cd.invocation_count.store(n.wrapping_add(1), Relaxed);
-    let t = cd.caches.t2_calls.load(Relaxed);
-    cd.caches.t2_calls.store(t.wrapping_sub(1), Relaxed);
+    // (scale2) only compiled code gets here: the invocation count (tier-1 trigger) is
+    // no longer needed, and the tier-2 countdown is written only while it runs, so
+    // that threads calling the same function do not fight over the counters' line
+    t2_countdown(&cd.caches)
+}
+
+/// (scale2) Tier-2 call countdown: decrement while positive; true when it expires.
+#[inline(always)]
+fn t2_countdown(cc: &crate::interp::cache::CodeCaches) -> bool {
+    let t = cc.t2_calls.load(Relaxed);
+    if t <= 0 {
+        return false;
+    }
+    cc.t2_calls.store(t - 1, Relaxed);
     t == 1
 }
 
@@ -599,9 +614,9 @@ pub fn resume(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> Result<P
         return Err(None);
     }
     let pc = f.next_instr as usize;
-    if pc == 0 {
-        cd.invocation_count.fetch_add(1, Relaxed);
-    }
+    // (scale2) no invocation count here: the code is compiled already (the count only
+    // triggers tier 1), and an atomic add per generator start on the shared code object
+    // was a contended cache line for threads creating generators of the same function
     f.yield_from_send = -1;
     match run(ts, f, unsafe { &*c }, pc) {
         Run::NotRun => Err(None),

@@ -385,9 +385,28 @@ impl<'a> Gen<'a> {
     }
     /// Record type-profile bits for the instruction at `pc` (fast paths). Clobbers r11.
     fn prof(&mut self, pc: u32, bits: u16) {
+        // (scale2) write only when a bit is new: an unconditional `or` stores to the
+        // shared profile line at every execution, and threads running the same code
+        // then fight over that cache line
         let p = self.prof_addr(pc);
+        let skip = self.a.label();
+        let set = self.a.label();
         self.a.mov_ri(R11, p);
-        self.a.or16_mi(M(R11, 0), bits);
+        for byte in 0..2 {
+            let b = (bits >> (8 * byte)) as u8;
+            for k in 0..8 {
+                if b & (1 << k) != 0 {
+                    self.a.test8_mi(M(R11, byte), 1 << k);
+                    self.a.jcc(Cc::E, set);
+                }
+            }
+        }
+        self.a.bind(skip);
+        self.stubs.push(Box::new(move |a: &mut Asm, _exit, _nlp| {
+            a.bind(set);
+            a.or16_mi(M(R11, 0), bits);
+            a.jmp(skip);
+        }));
     }
     /// Record the types of the stack operands at depths `da` and `db` (slow paths;
     /// clobbers caller-saved registers).
@@ -626,6 +645,10 @@ impl<'a> Gen<'a> {
                         let back = self.a.label();
                         let cnt = &self.cd.caches.t2_backedge as *const _ as i64;
                         self.a.mov_ri(R11, cnt);
+                        // (scale2) written only while it runs (>= 0; h_backedge parks it
+                        // at -1): threads running the same loop share this line
+                        self.a.cmp32_mi(M(R11, 0), 0);
+                        self.a.jcc(Cc::L, back);
                         // (weighted by the loop length, like the interpreter's counter)
                         self.a.sub32_mi(M(R11, 0), 1 + ((pc - arg) / 32) as i32);
                         self.a.jcc(Cc::L, stub);

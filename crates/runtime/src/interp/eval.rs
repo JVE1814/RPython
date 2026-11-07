@@ -1325,7 +1325,13 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             if (arg as usize) < pc {
                                 // backedge: safepoint poll + tiering counter (weighted by the loop
                                 // length: long loop bodies get compiled after fewer iterations)
-                                cd.backedge_count.fetch_add(1 + ((pc - arg as usize) / 32) as u32, std::sync::atomic::Ordering::Relaxed);
+                                // (scale2) a plain, saturating update (a lost one only delays
+                                // tiering): an atomic add per backedge on the shared code
+                                // object was a contended line for threads in the same loop
+                                let bc = cd.backedge_count.load(std::sync::atomic::Ordering::Relaxed);
+                                if bc < 1 << 24 {
+                                    cd.backedge_count.store(bc + 1 + ((pc - arg as usize) / 32) as u32, std::sync::atomic::Ordering::Relaxed);
+                                }
                                 let eb = ts.c.eval_breaker.load(std::sync::atomic::Ordering::Relaxed);
                                 if eb != 0 && !jumps_back_to_send(&cd.code, arg as usize) {
                                     handle_eval_breaker(ts)?;
