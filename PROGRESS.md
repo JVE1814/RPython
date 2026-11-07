@@ -112,8 +112,33 @@ importlib.resources (11), datetime (11), concurrent (9), xml/email (7 each), htm
 Run 1 top blockers: py_compile (230 modules; merged since), unittest.mock (57), doctest (24),
 array (24), socket (17), pathlib (16), http (14), multiprocessing, decimal, datetime, ntpath.
 
+### Latest (perf4, 2026-11-07; wall-clock ratio ours / best CPython, pinned to one core, one run each, loaded machine, ±10%)
+About 11 of 32 benchmarks beat or match the best CPython build (json_dumps 0.83, json_loads, raytrace, richards 0.60,
+deltablue, chaos 0.65, float, hexiom, gc_collect, coroutines 0.98, unpack_sequence); fannkuch and go within a few %.
+
+| benchmark | before perf4 | perf4 |
+|---|---|---|
+| pathlib | 2.12 | 1.76 |
+| asyncio_tcp | 2.80 | 1.65 |
+| concurrent_imap | — | 1.55 |
+| deepcopy | 1.75 | 1.51 |
+| mdp | — | 1.48 |
+| gc_traversal | — | 1.46 |
+| xml_etree | — | 1.45 |
+| typing_runtime_protocols | 1.84 | 1.43 |
+| logging | 1.67 | 1.35 |
+| bpe_tokeniser | 1.65 | 1.31 |
+| base64 | 2.11 | 1.27 |
+| python_startup | 1.43 | 1.27 |
+| pprint | 1.60 | 1.22 |
+| async_generators | 1.51 | 1.20 |
+
+Startup `-c pass`: 56.6M instructions (CPython 40.5M); `-S -c pass` 29.2M (27.7M). Peak RSS (startup_mem.sh):
+34.9 MB (CPython default 32.3, free-threaded 38.6). Instructions per call shape and per loop: notes/perf4.md.
+Multi-core scaling: being measured by scale1.
+
 ## Benchmarks
-### Latest (jit6 + perf3, 2026-11-07; wall-clock ratio ours / best CPython, targeted runs at load ~4, not quiet-machine)
+### Previous (jit6 + perf3, 2026-11-07; wall-clock ratio ours / best CPython, targeted runs at load ~4, not quiet-machine)
 | bench | jit5 | now | source |
 |---|---|---|---|
 | base64 | 2.98 | 1.45 | perf3 |
