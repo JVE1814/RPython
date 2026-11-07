@@ -258,6 +258,25 @@ pub unsafe fn decref_deferred(p: *mut PyObject) {
     retire(Item::Decref(p));
 }
 
+/// (tail4) Release `p` (an owned reference), just unpublished from a structure other
+/// threads read lock-free (with a store at least Release-ordered, before this call):
+/// at once when every other thread is quiescent (see `others_quiescent`), else
+/// through QSBR. Must not be called with a leaf lock held (may run a deallocator).
+pub unsafe fn release_unpublished(p: *mut PyObject) {
+    unsafe {
+        if !multi_threaded() || (*p).is_immortal() {
+            crate::object::decref(p);
+            return;
+        }
+        std::sync::atomic::fence(SeqCst);
+        if others_quiescent() {
+            crate::object::decref(p);
+            return;
+        }
+        decref_deferred(p);
+    }
+}
+
 /// Store `new` (an owned reference or null) into an object field that other threads
 /// read without a lock (getters taking a new reference to the current value), and
 /// release the previous value once no such reader can still hold the old pointer.
@@ -658,6 +677,25 @@ pub fn before_wait(spin: bool) {
 pub fn on_eval_breaker(ts: &ThreadState) {
     ts.c.eval_breaker.fetch_and(!EVAL_QSBR, AcqRel);
     report(ts);
+    let l = local();
+    // (tail4) everything retired so far was unpublished before now: if no other
+    // thread is executing Python at this moment, none is in the middle of a
+    // lock-free read of it, so it can go at once (finalizers then run close to
+    // where CPython runs them, instead of after a batch interval)
+    if (!l.open.is_empty() || !l.closed.is_empty()) && multi_threaded() && others_quiescent() {
+        let open = std::mem::take(&mut l.open);
+        let closed: Vec<(u64, Vec<Item>)> = l.closed.drain(..).collect();
+        l.polls = 0;
+        for it in open {
+            match it {
+                Item::Decref(p) => unsafe { crate::object::decref(p) },
+                Item::Free(p, f) => unsafe { f(p) },
+            }
+        }
+        for (_, items) in closed {
+            unsafe { release(items) };
+        }
+    }
     let l = local();
     if !l.open.is_empty() {
         l.polls += 1;

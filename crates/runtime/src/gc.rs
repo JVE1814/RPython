@@ -40,6 +40,9 @@ pub static THRESHOLD: AtomicUsize = AtomicUsize::new(2000);
 static COLLECTING: AtomicBool = AtomicBool::new(false);
 /// (scale1) Thread id of the thread running `collect_gen` (0: none).
 static COLLECTOR: AtomicUsize = AtomicUsize::new(0);
+/// (tail4) Thread state of the thread running a collection (0: none); published in the
+/// remote-debugging table so a sampling profiler can show a "<GC>" frame.
+pub static GC_COLLECTOR_TS: AtomicUsize = AtomicUsize::new(0);
 pub static COLLECTIONS: AtomicUsize = AtomicUsize::new(0);
 pub static COLLECTED: AtomicUsize = AtomicUsize::new(0);
 pub static UNCOLLECTABLE: AtomicUsize = AtomicUsize::new(0);
@@ -935,22 +938,31 @@ unsafe fn find_unreachable(objs: Vec<*mut PyObject>) -> Vec<*mut PyObject> {
 }
 
 fn snapshot() -> Vec<*mut PyObject> {
-    snapshot_gen(false)
+    snapshot_gen(false, false)
 }
 
 /// Tracked objects of the young generation (young_only) or of both generations, found
 /// by walking the GC pages and the large-object registry. The world must be stopped
 /// (or the process single-threaded).
-fn snapshot_gen(young_only: bool) -> Vec<*mut PyObject> {
+fn snapshot_gen(young_only: bool, count_tuples: bool) -> Vec<*mut PyObject> {
     let mut v = Vec::with_capacity(if young_only { 1024 } else { TRACKED.load(Relaxed).max(0) as usize });
     let mask = if young_only { GC_BIT_TRACKED | GC_BIT_OLD } else { GC_BIT_TRACKED };
+    // (tail4) tuples of atomic values are never tracked here (CPython tracks them
+    // and untracks them at the next collection): a full collection counts the
+    // live ones for the long-lived total
+    let tuple_tp = crate::types::tuple::tuple_type();
+    let mut untracked_tuples = 0usize;
     let mut take = |op: *mut PyObject| unsafe {
-        if (*op).ob_gc_bits.load(Relaxed) & mask == GC_BIT_TRACKED {
+        let bits = (*op).ob_gc_bits.load(Relaxed);
+        if bits & mask == GC_BIT_TRACKED {
             v.push(op);
+        } else if count_tuples && !young_only && bits & GC_BIT_TRACKED == 0 && (*op).type_ptr() == tuple_tp {
+            untracked_tuples += 1;
         }
     };
     unsafe { crate::tlab::for_each_gc_block(&mut take) };
     crate::alloc::for_each_large_gc(&mut take);
+    crate::gc_support::UNTRACKED_TUPLES.fetch_add(untracked_tuples, Relaxed);
     v
 }
 
@@ -1019,6 +1031,7 @@ fn collect_gen(young_only: bool, explicit: bool) -> usize {
     if crate::scalestats::gc_debug() {
         eprintln!("collect {:?} young={} nthreads={} thr={} since={} tracked={} lastlive={} scale={} t={:?}", me, young_only, crate::threads::ALL_THREADS.lock().unwrap().len(), trigger_threshold(), ALLOCS_SINCE.load(Relaxed), TRACKED.load(Relaxed), LAST_LIVE.load(Relaxed), YOUNG_SCALE.load(Relaxed), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() % 100000000);
     }
+    GC_COLLECTOR_TS.store(me as usize, Release);
     let saved_exc = crate::errors::take_exc();
     let mut clock = crate::scalestats::PhaseClock::start();
     let t0 = std::time::Instant::now();
@@ -1102,6 +1115,7 @@ fn collect_gen(young_only: bool, explicit: bool) -> usize {
         crate::errors::set_exc(e);
     }
     clock.lap(6);
+    GC_COLLECTOR_TS.store(0, Release);
     n.unwrap_or(0)
 }
 
@@ -1164,7 +1178,7 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool, explicit: bool,
             let mut objs = if young_only {
                 snapshot_young()
             } else {
-                let v = snapshot_gen(false);
+                let v = snapshot_gen(false, true);
                 // everything tracked is examined (and promoted) now
                 crate::young::clear_all();
                 v

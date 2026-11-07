@@ -332,14 +332,20 @@ unsafe fn snap_task(t: &Task) {
             } else {
                 // every tracked object of these pages: it becomes old and leaves its
                 // young buffer (each block is visited by exactly one task)
+                // (live untracked tuples count for the long-lived total, as in gc.rs
+                // `snapshot_gen`)
+                let mut tuples = 0usize;
                 crate::tlab::for_each_gc_block_in(t.src as usize, t.len, t.len + PAGES_PER_TASK, |op| {
                     let b = &(*op).ob_gc_bits;
                     let bits = b.load(Relaxed);
                     if bits & crate::alloc::GC_BIT_TRACKED != 0 {
                         b.store((bits | crate::alloc::GC_BIT_OLD) & !crate::young::GC_BIT_YOUNG_BUF, Relaxed);
                         take(op);
+                    } else if (*op).type_ptr() == tt {
+                        tuples += 1;
                     }
                 });
+                crate::gc_support::UNTRACKED_TUPLES.fetch_add(tuples, Relaxed);
             }
             *t.untracked.get() = untracked;
         }

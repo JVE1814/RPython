@@ -283,33 +283,42 @@ class XMLFilterBase(xmlreader.XMLReader):
 
 
 def prepare_input_source(source, base=""):
-    """Turn a system id, path, file or InputSource into an InputSource
-    with an open stream."""
+    """An InputSource with an open stream for source: a system id (URL or
+    file name, resolved against base), a path-like object, an open file
+    (text or binary) or an InputSource."""
     if isinstance(source, os.PathLike):
         source = os.fspath(source)
     if isinstance(source, str):
         source = xmlreader.InputSource(source)
     elif hasattr(source, "read"):
-        f = source
-        source = xmlreader.InputSource()
-        if isinstance(f.read(0), str):
-            source.setCharacterStream(f)
-        else:
-            source.setByteStream(f)
-        if hasattr(f, "name") and isinstance(f.name, str):
-            source.setSystemId(f.name)
-
+        source = _input_source_for_file(source)
     if source.getCharacterStream() is None and source.getByteStream() is None:
-        sysid = source.getSystemId()
-        basehead = os.path.dirname(os.path.normpath(base))
-        sysidfilename = os.path.join(basehead, sysid)
-        if os.path.isfile(sysidfilename):
-            source.setSystemId(sysidfilename)
-            f = open(sysidfilename, "rb")
-        else:
-            import urllib.parse
-            import urllib.request
-            source.setSystemId(urllib.parse.urljoin(base, sysid))
-            f = urllib.request.urlopen(source.getSystemId())
-        source.setByteStream(f)
+        source.setByteStream(_open_system_id(source, base))
     return source
+
+
+def _input_source_for_file(f):
+    wrapped = xmlreader.InputSource()
+    # read(0) tells text files from binary ones without consuming anything
+    if isinstance(f.read(0), str):
+        wrapped.setCharacterStream(f)
+    else:
+        wrapped.setByteStream(f)
+    name = getattr(f, "name", None)
+    if isinstance(name, str):
+        wrapped.setSystemId(name)
+    return wrapped
+
+
+def _open_system_id(source, base):
+    """Open source's system id: a file next to base if there is one, else
+    the URL it makes relative to base."""
+    sysid = source.getSystemId()
+    candidate = os.path.join(os.path.dirname(os.path.normpath(base)), sysid)
+    if os.path.isfile(candidate):
+        source.setSystemId(candidate)
+        return open(candidate, "rb")
+    import urllib.parse
+    import urllib.request
+    source.setSystemId(urllib.parse.urljoin(base, sysid))
+    return urllib.request.urlopen(source.getSystemId())
