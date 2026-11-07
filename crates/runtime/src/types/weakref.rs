@@ -339,6 +339,37 @@ pub unsafe fn clear_weakrefs(o: *mut PyObject) {
     }
 }
 
+/// PyUnstable_Object_ClearWeakRefsNoCallbacks: detach every weakref to `o`; callbacks
+/// are dropped, not called.
+pub unsafe fn clear_weakrefs_no_callbacks(o: *mut PyObject) {
+    unsafe {
+        let list = weaklist_slot(o);
+        if list.is_null() {
+            return;
+        }
+        let mut cbs: Vec<*mut PyObject> = Vec::new();
+        {
+            let _g = list_lock();
+            let mut r = head(list);
+            *list = std::ptr::null_mut();
+            while !r.is_null() {
+                let next = (*r).wr_next;
+                (*r).wr_object = none::none().as_ptr();
+                (*r).wr_prev = std::ptr::null_mut();
+                (*r).wr_next = std::ptr::null_mut();
+                let cb = std::mem::replace(&mut (*r).wr_callback, std::ptr::null_mut());
+                if !cb.is_null() {
+                    cbs.push(cb);
+                }
+                r = next;
+            }
+        }
+        for cb in cbs {
+            decref(cb);
+        }
+    }
+}
+
 /// As clear_weakrefs, with an explicit list head slot.
 pub unsafe fn clear_weakrefs_at(o: *mut PyObject, list: *mut *mut PyObject) {
     unsafe {

@@ -287,7 +287,7 @@ pub unsafe extern "C" fn PyObject_ClearWeakRefs(o: *mut PyObject) {
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_Object_ClearWeakRefsNoCallbacks(o: *mut PyObject) {
-    unsafe { crate::types::weakref::clear_weakrefs(o) }
+    unsafe { crate::types::weakref::clear_weakrefs_no_callbacks(o) }
 }
 
 // ---------------------------------------------------------------- repr / str / hash / compare

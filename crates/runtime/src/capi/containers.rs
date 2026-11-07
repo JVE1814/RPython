@@ -125,6 +125,15 @@ pub unsafe extern "C" fn _PyTuple_Resize(p: *mut *mut PyObject, n: Py_ssize_t) -
             return -1;
         }
         let old_n = tuple::tuple_len(&*o);
+        // the items are moved out of `o`: only allowed for a tuple nobody else sees
+        // (moving them out of a shared tuple, e.g. a code constant, left it with NULL
+        // items); the empty tuple is shared but has nothing to move
+        if old_n != 0 && (*o).refcnt() != 1 {
+            *p = std::ptr::null_mut();
+            decref(o);
+            let _ = bad_internal();
+            return -1;
+        }
         let new = PyTuple_New(n);
         if new.is_null() {
             *p = std::ptr::null_mut();
