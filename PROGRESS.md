@@ -5,7 +5,7 @@ Master 24d1c6a: core6, perf4, tail1, capi2, cleanroom1+2 (20 Lib modules rewritt
 stable_abi_ctypes/fileutils pass, cmd_line_script 1; tail1 fixed ~60 long-tail modules (inspect, codecs, time,
 path modules, math, buffer, logging, json, ...). Run 11 (pre-merges):
 294/434 modules pass, 674 failures (241 without test_capi), 616 errors. Baseline free-threaded CPython: 416/434.
-Running agents: scale2 (scaling round 2 + prompt-free regression in test_concurrent_futures), perf5 (remaining slow benchmarks), cleanroom3 (D19 Lib audit, round 3),
+Running agents: scale2 (scaling round 2), perf6 (startup image, slow call paths, xml engine, memory), cleanroom3 (D19 Lib audit, round 3),
 tail3 (crossinterp, getpath, nturl2path, asyncio, ast, leftovers), pdb1 (clean-room pdb, remote pdb,
 profiling.sampling).
 Earlier history (2026-11-02): agents stopped when the weekly API limit was hit; resumed Nov 5.
