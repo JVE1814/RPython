@@ -278,7 +278,7 @@ fn opt(p: *mut PyObject) -> PyResult {
 /// atomic).
 fn replace(slot: &mut *mut PyObject, v: Option<&PyObject>) {
     let new = v.map_or(std::ptr::null_mut(), |x| x.to_ref().into_raw());
-    unsafe { crate::qsbr::swap_field(slot as *mut *mut PyObject, new) };
+    unsafe { crate::qsbr::swap_field_unlocked(slot as *mut *mut PyObject, new) }; // scale2: at once when no other thread runs
 }
 
 fn f_code(o: &PyObject) -> PyResult {

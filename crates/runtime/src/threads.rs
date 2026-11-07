@@ -152,6 +152,7 @@ impl Drop for AutoAttached {
         ts.mode.0.store(ThreadMode::Blocked as u8, SeqCst);
         {
             let mut all = ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+            let _q = ts.merge_queue.lock().unwrap_or_else(|e| e.into_inner()); // (scale2) see queue_object_for_merge
             ts.alive.store(false, SeqCst);
             ts.exited.store(true, SeqCst);
             all.retain(|&t| t != p as usize);
@@ -340,6 +341,9 @@ pub fn thread_exit() {
         // running for stop-the-world purposes.
         {
             let _all = ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+            // (scale2) also under the queue lock: queue_object_for_merge checks `alive` under
+            // that lock only
+            let _q = ts.merge_queue.lock().unwrap_or_else(|e| e.into_inner());
             ts.alive.store(false, SeqCst);
         }
         loop {
@@ -382,12 +386,19 @@ pub unsafe fn queue_object_for_merge(op: *mut PyObject) {
             crate::scalestats::MERGE_QUEUED.fetch_add(1, Relaxed);
         }
         let tid = (*op).ob_tid.load(Relaxed);
-        let threads = ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+        // (scale2) found without the global ALL_THREADS lock (every hand-off of a
+        // producer/consumer program took it): the candidates come from the lock-free
+        // thread list, and the owner's liveness is checked under its queue lock, under
+        // which thread exit clears `alive` before its final drain
+        let cands = crate::qsbr::find_threads(|ts| ts.owner_tid == tid);
         let mut folded: Option<bool> = None;
-        for &t in threads.iter() {
+        for t in cands.iter() {
             let ts = &*(t as *const ThreadState);
-            if ts.owner_tid == tid && ts.alive.load(SeqCst) {
+            if ts.owner_tid == tid {
                 let mut q = ts.merge_queue.lock().unwrap_or_else(|e| e.into_inner());
+                if !ts.alive.load(SeqCst) || ts.owner_tid != tid {
+                    continue;
+                }
                 // (scale2) only for owners of this thread's interpreter: the release can
                 // run finalizers and weakref callbacks that use that interpreter's
                 // modules, which its own finalization may be tearing down (a callback
@@ -405,7 +416,6 @@ pub unsafe fn queue_object_for_merge(op: *mut PyObject) {
                 return;
             }
         }
-        drop(threads);
         if let Some(dead) = folded {
             if dead {
                 crate::object::dealloc(op);
@@ -466,7 +476,7 @@ pub fn before_wait() {
     if ts.c.eval_breaker.load(Relaxed) & EVAL_MERGE_REFCOUNTS != 0 {
         process_merge_queue(ts);
     }
-    crate::qsbr::before_wait();
+    crate::qsbr::before_wait(true);
 }
 
 /// Process pending merges for the current thread.
@@ -615,7 +625,7 @@ pub fn blocking_pure<R>(drain: bool, f: impl FnOnce() -> R) -> R {
         // (scale2) also release what this thread retired through QSBR (matured
         // items; the other threads are asked to report first), instead of keeping
         // it for the whole wait
-        crate::qsbr::before_wait();
+        crate::qsbr::before_wait(false);
     }
     loop {
         let mut q = ts.merge_queue.lock().unwrap_or_else(|e| e.into_inner());

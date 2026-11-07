@@ -120,6 +120,43 @@ fn for_each_thread(mut f: impl FnMut(&ThreadState)) {
     }
 }
 
+/// (scale2) Registered thread states for which `pred` holds (a consistent snapshot of
+/// the list, without the `ALL_THREADS` lock unless there are more than CAP threads).
+/// The memory of a thread state is never freed, so the result stays dereferenceable;
+/// whether it is still the same thread must be checked by the caller.
+pub fn find_threads(mut pred: impl FnMut(&ThreadState) -> bool) -> smallvec_like::Found {
+    let mut out = smallvec_like::Found::default();
+    for_each_thread(|ts| {
+        if pred(ts) {
+            out.push(ts as *const ThreadState as usize);
+        }
+    });
+    out
+}
+
+pub mod smallvec_like {
+    /// Up to 4 matches without allocating.
+    #[derive(Default)]
+    pub struct Found {
+        n: usize,
+        inline: [usize; 4],
+        more: Vec<usize>,
+    }
+    impl Found {
+        pub fn push(&mut self, v: usize) {
+            if self.n < 4 {
+                self.inline[self.n] = v;
+            } else {
+                self.more.push(v);
+            }
+            self.n += 1;
+        }
+        pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+            self.inline[..self.n.min(4)].iter().copied().chain(self.more.iter().copied())
+        }
+    }
+}
+
 // ---------------------------------------------------------------- per-thread batches
 
 enum Item {
@@ -278,11 +315,46 @@ pub unsafe fn release_attr(o: *mut PyObject, old: *mut PyObject) {
         if old.is_null() {
             return;
         }
-        if !multi_threaded() || ((*o).ob_tid.load(Relaxed) == crate::object::thread_id() && (*o).ob_flags.load(SeqCst) & XREAD == 0) {
+        if !multi_threaded() || ((*o).ob_tid.load(Relaxed) == crate::object::thread_id() && (*o).ob_flags.load(SeqCst) & XREAD == 0) || others_quiescent() {
             crate::object::decref(old);
             return;
         }
         decref_deferred(old);
+    }
+}
+
+/// (scale2) Is every other thread quiescent right now (not executing Python: blocked in
+/// a wait, in native code, parked)? Then none of them is in the middle of a lock-free
+/// read, and a pointer the caller unpublished with a SeqCst RMW (before this call) can
+/// be released at once: a thread that enters the VM afterwards stores its mode
+/// (SeqCst) before reading anything, so it sees the new value (Dekker with
+/// `gc::enter_vm`). The common case of a writer whose helper threads are idle (an event
+/// loop next to blocked executor threads) then finalizes values promptly.
+pub fn others_quiescent() -> bool {
+    let me = me() as usize;
+    let mut quiet = true;
+    for_each_thread(|ts| {
+        if quiet && ts as *const ThreadState as usize != me && ts.alive() && ts.mode.0.load(SeqCst) == crate::threads::ThreadMode::InVm as u8 {
+            quiet = false;
+        }
+    });
+    quiet
+}
+
+/// As `swap_field`, for callers that hold no lock (the old value may be released at
+/// once, which can run a deallocator): released at once when every other thread is
+/// quiescent, else through QSBR.
+pub unsafe fn swap_field_unlocked(slot: *mut *mut PyObject, new: *mut PyObject) {
+    unsafe {
+        let old = std::sync::atomic::AtomicPtr::from_ptr(slot).swap(new, SeqCst);
+        if old.is_null() {
+            return;
+        }
+        if !multi_threaded() || others_quiescent() {
+            crate::object::decref(old);
+        } else {
+            decref_deferred(old);
+        }
     }
 }
 
@@ -546,10 +618,20 @@ fn poll(scan: bool) {
 /// other threads blocked too, that is everything), so that objects it retired are not
 /// kept alive for the whole wait (a weakref callback another thread waits for, a
 /// reference cycle through a frame...). Called where running deallocators is safe
-/// (the same places that run signal handlers).
-pub fn before_wait() {
+/// (the same places that run signal handlers). `spin`: a long wait (thread join,
+/// interpreter teardown); otherwise only matured batches are released.
+pub fn before_wait(spin: bool) {
     let l = local();
     if l.open.is_empty() && l.closed.is_empty() {
+        return;
+    }
+    if !spin {
+        // short waits (lock and queue waits of busy producer/consumer threads): only
+        // release what has matured; closing a batch here would send a handshake to
+        // every thread at each wait
+        if !l.closed.is_empty() {
+            poll(true);
+        }
         return;
     }
     if !l.open.is_empty() {

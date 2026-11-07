@@ -398,6 +398,7 @@ pub unsafe fn retire_thread_state(p: *mut ThreadState) {
         }
         {
             let _all = threads::ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+            let _q = ts.merge_queue.lock().unwrap_or_else(|e| e.into_inner()); // (scale2) see threads::queue_object_for_merge
             ts.alive.store(false, SeqCst);
         }
         loop {
