@@ -94,3 +94,17 @@
 - The no-`_types` fallback (exercised by test_types via import_fresh_module) derives every
   type from a sample object; `__all__` is `_types.__all__` (or the fallback list) plus the
   helpers.  `_GeneratorWrapper` forwards gi_*/cr_* through properties made by one helper.
+
+### string/__init__.py (rewritten)
+- test_string 55 =, test_logging 289 =, test_configparser 383 =, test_pydoc, test___all__ =.
+- Template: the base class compiles its pattern on first use through a small descriptor
+  (`import string` still does not import re); every subclass compiles its own pattern when
+  created (an explicit pattern string, a precompiled re.Pattern used as is, or the default
+  built from its delimiter/idpattern/braceidpattern).  Keyword arguments shadow the mapping
+  via `_KeywordsFirst`.  Kept (asserted): "Invalid placeholder in string: line L, col C",
+  `flags = None` meaning re.IGNORECASE (as before).  Behaviour change: the line/column of an
+  invalid placeholder right after a line break is now reported on the new line (col 1).
+- Formatter: kept `_vformat(format_string, args, kwargs, used_args, recursion_depth,
+  auto_arg_index=0)` (test_string calls it); numbering logic moved to `_number_field`; the
+  manual-numbering state is None instead of False; str.format's own error texts kept.
+- string/templatelib.py reviewed: tiny, own (`_template_unpickle` is used by the runtime).
