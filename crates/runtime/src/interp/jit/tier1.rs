@@ -236,8 +236,7 @@ impl<'a> Gen<'a> {
         self.a.bind(done);
         self.stubs.push(Box::new(move |a: &mut Asm, _exit, _nlp| {
             a.bind(slow);
-            a.lock_add_mi(M(r, OB_REF_SHARED), 1 << REF_SHARED_SHIFT);
-            a.jmp(done);
+            emit_nonowner_incref(a, r, done);
         }));
     }
     fn xincref(&mut self, r: R) {
@@ -1976,4 +1975,105 @@ pub fn compile_mode(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crat
     emit_routines(&mut g.a, rt_box_int, rt_box_float, rt_free_num);
     g.a.resolve()?;
     Ok(Output { asm: g.a, entries })
+}
+
+// ---------------------------------------------------------------- sharded increfs (scale1)
+
+/// Process-wide routine for the incref of a sharded object (crate::sharded) from JIT
+/// code. Entered by `call` with the object in rdi (the caller saves rdi); preserves
+/// every other general register and xmm0-15, whatever the stack alignment at entry.
+pub(crate) fn incref_sharded_routine() -> Option<usize> {
+    static R: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *R.get_or_init(|| {
+        let mut a = Asm::new();
+        a.push(Rbp);
+        a.mov_rr(Rbp, Rsp);
+        for r in [Rax, Rcx, Rdx, Rsi, R8, R9, R10, R11] {
+            a.push(r);
+        }
+        a.and_ri(Rsp, -16);
+        a.sub_ri(Rsp, 128);
+        for k in 0..16u8 {
+            a.movsd_store(M(Rsp, 8 * k as i32), X(k));
+        }
+        a.call_abs(h::h_incref_sharded as usize);
+        for k in 0..16u8 {
+            a.movsd_load(X(k), M(Rsp, 8 * k as i32));
+        }
+        a.mov_rr(Rsp, Rbp);
+        a.sub_ri(Rsp, 64);
+        for r in [R11, R10, R9, R8, Rsi, Rdx, Rcx, Rax] {
+            a.pop(r);
+        }
+        a.pop(Rbp);
+        a.ret();
+        a.resolve().ok()?;
+        crate::interp::jit::mem::install(&a.buf, |_, _| {})
+    })
+}
+
+/// Out-of-line part of an inline incref when the object in `r` (not r11) is owned by
+/// another thread: a sharded object's reference goes to the thread's delta table
+/// (through `incref_sharded_routine`), any other object's to its shared field.
+/// Clobbers r11 only; continues at `done`.
+pub(crate) fn emit_nonowner_incref(a: &mut Asm, r: R, done: Label) {
+    const OB_FLAGS: i32 = offset_of!(PyObject, ob_flags) as i32;
+    match incref_sharded_routine() {
+        Some(rt) => {
+            let sh = a.label();
+            let call = a.label();
+            a.load8(R11, M(r, OB_FLAGS));
+            a.test_ri(R11, crate::sharded::SHARDED as i32);
+            a.jcc(Cc::NE, sh);
+            a.lock_add_mi(M(r, OB_REF_SHARED), 1 << REF_SHARED_SHIFT);
+            a.jmp(done);
+            a.bind(sh);
+            if let Some(l) = crate::sharded::jit_layout() {
+                // inline `sharded::add(r, 1)` (r15 = thread pointer): look the object
+                // up in its bucket, else take a slot whose delta is zero, else call
+                a.cmp8_mi(M(R15, l.ready), 0);
+                a.jcc(Cc::E, call);
+                a.mov_rr(R11, r);
+                a.shr_ri(R11, 4);
+                a.imul_rri(R11, R11, l.mul);
+                a.shr_ri(R11, l.shift);
+                a.and_ri(R11, l.bucket_mask);
+                a.shl_ri(R11, l.row_shift);
+                a.lea_idx(R11, R15, R11, 1, l.keys);
+                let found: Vec<Label> = (0..l.ways).map(|_| a.label()).collect();
+                let free: Vec<Label> = (0..l.ways).map(|_| a.label()).collect();
+                for w in 0..l.ways {
+                    a.cmp_rm(r, M(R11, 8 * w as i32));
+                    a.jcc(Cc::E, found[w]);
+                }
+                for w in 0..l.ways {
+                    a.cmp_mi(M(R11, l.vals_delta + 8 * w as i32), 0);
+                    a.jcc(Cc::E, free[w]);
+                }
+                a.jmp(call);
+                for w in 0..l.ways {
+                    a.bind(found[w]);
+                    a.add_mi(M(R11, l.vals_delta + 8 * w as i32), 1);
+                    a.jmp(done);
+                    a.bind(free[w]);
+                    a.store(M(R11, 8 * w as i32), r);
+                    a.store_i(M(R11, l.vals_delta + 8 * w as i32), 1);
+                    a.jmp(done);
+                }
+            }
+            a.bind(call);
+            a.push(Rdi);
+            if r != Rdi {
+                a.mov_rr(Rdi, r);
+            }
+            a.mov_ri(R11, rt as i64);
+            a.call_r(R11);
+            a.pop(Rdi);
+            a.jmp(done);
+        }
+        None => {
+            a.lock_add_mi(M(r, OB_REF_SHARED), 1 << REF_SHARED_SHIFT);
+            a.jmp(done);
+        }
+    }
 }

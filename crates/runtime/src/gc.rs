@@ -191,6 +191,8 @@ fn request_collection() {
 
 #[cold]
 fn wait_for_release() {
+    let t0 = if crate::scalestats::on() { Some(std::time::Instant::now()) } else { None };
+    let _stats = StatGuard(t0, &crate::scalestats::PARKED_NS);
     PARKED.fetch_add(1, AcqRel);
     let mut i = 0u32;
     while !RELEASE.load(SeqCst) {
@@ -202,6 +204,16 @@ fn wait_for_release() {
         i += 1;
     }
     PARKED.fetch_sub(1, AcqRel);
+}
+
+/// Adds the time since `.0` (when counting is on) to the counter `.1` when dropped.
+struct StatGuard(Option<std::time::Instant>, &'static std::sync::atomic::AtomicU64);
+impl Drop for StatGuard {
+    fn drop(&mut self) {
+        if let Some(t) = self.0 {
+            crate::scalestats::add_ns(self.1, t);
+        }
+    }
 }
 
 /// Switch a thread's mode to `InVm` following the handshake above. `safe` is the
@@ -315,6 +327,13 @@ pub fn safepoint_poll(ts: &ThreadState) {
 /// Bring all other threads to a safepoint. Returns false if they did not arrive in
 /// time (the world is running again then).
 fn stop_the_world(me: *mut ThreadState) -> bool {
+    let t0 = if crate::scalestats::on() {
+        crate::scalestats::STW_COUNT.fetch_add(1, Relaxed);
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    let _stats = StatGuard(t0, &crate::scalestats::STW_WAIT_NS);
     STW_OWNER.store(unsafe { &(*me).mode as *const _ as usize }, SeqCst);
     RELEASE.store(false, SeqCst);
     // read the thread list only after publishing the stop: a thread registered
@@ -409,7 +428,7 @@ fn total_refcnt(o: &PyObject) -> isize {
         return isize::MAX / 2;
     }
     local as isize + (o.ob_ref_shared.load(Relaxed) >> REF_SHARED_SHIFT)
-        - if unsafe { crate::object::has_type_id(o.as_ptr()) } { crate::object::TYPE_BIAS } else { 0 }
+        - if crate::sharded::is_sharded(o) || unsafe { crate::object::has_type_id(o.as_ptr()) } { crate::object::TYPE_BIAS } else { 0 }
 }
 
 /// Multiplicative hash for object addresses (SipHash dominated collection time).
@@ -605,6 +624,8 @@ fn promote(objs: &[*mut PyObject]) {
     }
 }
 
+static DEAD_SHARDED: Mutex<Vec<PyRef>> = Mutex::new(Vec::new());
+
 /// Run a full collection; returns the number of unreachable objects found.
 pub fn collect() -> usize {
     collect_gen(false)
@@ -618,6 +639,14 @@ fn collect_gen(young_only: bool) -> usize {
     let saved_exc = crate::errors::take_exc();
     let t0 = std::time::Instant::now();
     let n = unsafe { collect_phases(me, young_only) };
+    // sharded objects found dead while the world was stopped (sharded.rs), released
+    // now that it runs again
+    let dead = std::mem::take(&mut *DEAD_SHARDED.lock().unwrap_or_else(|e| e.into_inner()));
+    drop(dead);
+    if crate::scalestats::on() {
+        crate::scalestats::GC_COUNT.fetch_add(1, Relaxed);
+        crate::scalestats::add_ns(&crate::scalestats::GC_NS, t0);
+    }
     release_mature();
     if let Some(e) = saved_exc {
         crate::errors::set_exc(e);
@@ -657,6 +686,7 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
         // every thread is at a safepoint: references deferred before now can go
         mature_deferred();
         crate::object::merge_type_counts();
+        crate::sharded::merge_all();
         // ---- phase 1 (stopped): find the unreachable objects
         let mut objs = snapshot_gen(young_only);
         crate::gc_support::untrack_atomic_tuples(&mut objs);
@@ -666,6 +696,7 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
         // cycles with legacy finalizers (tp_del) are left alone and reported
         let legacy = crate::gc_support::split_legacy_finalizers(&mut unreachable);
         if unreachable.is_empty() {
+            DEAD_SHARDED.lock().unwrap_or_else(|e| e.into_inner()).extend(crate::sharded::dead_untracked());
             start_the_world();
             if legacy.is_empty() {
                 return Some(0);
@@ -683,8 +714,13 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
         for &o in &unreachable {
             if crate::object::has_type_id(o) {
                 crate::object::release_type_id(o as *mut PyTypeObject, true);
+            } else if crate::sharded::is_sharded(&*o) {
+                crate::sharded::unshard(o);
             }
         }
+        // (after the unsharding above: the registry must not keep entries for objects
+        // that are about to be freed)
+        DEAD_SHARDED.lock().unwrap_or_else(|e| e.into_inner()).extend(crate::sharded::dead_untracked());
         let needs_finalize = garbage.iter().any(|g| {
             let op = g.as_ptr();
             (*(*op).type_ptr()).tp_finalize.is_some() && !is_finalized(op)
@@ -719,6 +755,7 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
                 // try again in a later collection (finalizers will not run twice)
                 return Some(0);
             }
+            crate::sharded::merge_all();
             let still: Vec<*mut PyObject> = garbage.iter().map(|g| g.as_ptr()).filter(|&o| is_tracked(&*o)).collect();
             // the references held in `garbage` count as external: discount them
             for &o in &still {

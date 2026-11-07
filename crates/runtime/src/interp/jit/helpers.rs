@@ -112,6 +112,10 @@ pub unsafe extern "C" fn h_decref_shared(o: *mut PyObject) {
 pub unsafe extern "C" fn h_incref_shared(o: *mut PyObject) {
     unsafe { incref(o) }
 }
+/// (scale1) Non-owner incref of a sharded object (tier1::incref_sharded_routine).
+pub unsafe extern "C" fn h_incref_sharded(o: *mut PyObject) {
+    unsafe { crate::sharded::add(o, 1) }
+}
 pub unsafe extern "C" fn h_new_int(v: i64) -> *mut PyObject {
     int::new_int(v).into_raw()
 }

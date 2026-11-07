@@ -175,8 +175,7 @@ impl<'a, 'b> Cg<'a, 'b> {
         a.bind(done);
         self.g.add_stub(Box::new(move |a: &mut Asm, _e, _n| {
             a.bind(slow);
-            a.lock_add_mi(M(r, OB_REF_SHARED), 1 << REF_SHARED_SHIFT);
-            a.jmp(done);
+            crate::interp::jit::tier1::emit_nonowner_incref(a, r, done);
         }));
     }
     /// inline decref of the object in r (r != r11); slow paths preserve registers

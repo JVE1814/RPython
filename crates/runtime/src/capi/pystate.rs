@@ -126,7 +126,7 @@ pub unsafe extern "C" fn PyThreadState_Delete(ts: *mut c_void) {
         {
             let mut all = threads::ALL_THREADS.lock().unwrap();
             all.retain(|&t| t != ts as usize);
-            crate::qsbr::note_threads(all.len());
+            crate::qsbr::note_threads(&all);
         }
         // the memory is intentionally not freed: other threads may still hold pointers
     }

@@ -101,6 +101,8 @@ pub struct ThreadState {
     pub tracing_depth: Cell<i32>,
     /// Set when the OS thread has finished (its state may linger in ALL_THREADS).
     pub exited: std::sync::atomic::AtomicBool,
+    /// Value of the QSBR sequence this state saw at its last quiescent point (qsbr.rs).
+    pub qsbr_seen: std::sync::atomic::AtomicU64,
 }
 
 unsafe impl Sync for ThreadState {}
@@ -141,13 +143,14 @@ impl Drop for AutoAttached {
         if ts.exited.load(SeqCst) {
             return; // retired properly (thread_exit)
         }
+        crate::sharded::thread_exit();
         ts.mode.0.store(ThreadMode::Blocked as u8, SeqCst);
         {
             let mut all = ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner());
             ts.alive.store(false, SeqCst);
             ts.exited.store(true, SeqCst);
             all.retain(|&t| t != p as usize);
-            crate::qsbr::note_threads(all.len());
+            crate::qsbr::note_threads(&all);
         }
         // its memory is not reused: objects may still sit in its merge queue
     }
@@ -209,6 +212,7 @@ pub fn new_thread_state() -> *mut ThreadState {
             profile_func: Cell::new(std::ptr::null_mut()),
             tracing_depth: Cell::new(0),
             exited: std::sync::atomic::AtomicBool::new(false),
+            qsbr_seen: std::sync::atomic::AtomicU64::new(crate::qsbr::initial_seen()),
         };
         // Reuse the memory of a dead thread state (pointers to thread states stay valid).
         let recycled = FREE_STATES.lock().unwrap().pop();
@@ -222,7 +226,7 @@ pub fn new_thread_state() -> *mut ThreadState {
             None => Box::into_raw(Box::new(st)),
         };
         (*ts).c.exc_info = &mut (*ts).c.exc_state;
-        let n = {
+        {
             let mut all = ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner());
             // (jit6) the flag flipped here, not by a parent before starting the
             // thread (_thread, PyThread_start_new_thread): the other threads may be
@@ -233,9 +237,11 @@ pub fn new_thread_state() -> *mut ThreadState {
                 MT_HANDSHAKE.store(true, SeqCst);
             }
             all.push(ts as usize);
-            all.len()
+            if crate::scalestats::on() {
+                crate::scalestats::MAX_THREADS.fetch_max(all.len() as u64, Relaxed);
+            }
+            crate::qsbr::note_threads(&all);
         };
-        crate::qsbr::note_threads(n);
         ts
     }
 }
@@ -333,13 +339,16 @@ pub fn thread_exit() {
             }
         }
         ts.c.eval_breaker.fetch_and(!EVAL_MERGE_REFCOUNTS, AcqRel);
+        // pending sharded-count deltas (sharded.rs) are folded in while this thread
+        // still counts as running
+        crate::sharded::thread_exit();
         // from here on this thread touches no Python object
         ts.mode.set(ThreadMode::Blocked);
         ts.exited.store(true, SeqCst);
         {
             let mut all = ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner());
             all.retain(|&t| t != p as usize);
-            crate::qsbr::note_threads(all.len());
+            crate::qsbr::note_threads(&all);
         }
         // retired here: the exit-time guard must not touch the (reusable) memory
         let _ = AUTO_ATTACHED.try_with(|g| g.0.set(std::ptr::null_mut()));
@@ -356,6 +365,9 @@ pub fn set_current(ts: *mut ThreadState) {
 /// of the owner's local count. The queue entry owns that reference.
 pub unsafe fn queue_object_for_merge(op: *mut PyObject) {
     unsafe {
+        if crate::scalestats::on() {
+            crate::scalestats::MERGE_QUEUED.fetch_add(1, Relaxed);
+        }
         let tid = (*op).ob_tid.load(Relaxed);
         let threads = ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner());
         for &t in threads.iter() {
@@ -473,8 +485,9 @@ pub fn after_fork_child() {
             }
         }
         all.retain(|&t| t == me);
-        crate::qsbr::note_threads(all.len());
+        crate::qsbr::note_threads(&all);
     }
+    crate::sharded::after_fork_child();
     crate::modules::signal::after_fork_child();
 }
 
