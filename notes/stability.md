@@ -193,6 +193,12 @@ type_refcount_drift, deque_race, weakref_race, shared_objects, join_releases).
     constant: crash later in test_tuple); now SystemError unless refcount 1 or empty.
     `PyUnstable_Object_ClearWeakRefsNoCallbacks` called the callbacks. `_BytesIOBuffer`
     getbuffer with NULL view/source (test_capi.test_misc crash).
+15. **PyGILState_Ensure from foreign threads** created a thread state that was never deleted
+    (Release only detached it; nothing retired it when the OS thread ended). Under pandas'
+    suite 100+ accumulated: multi_threaded() stayed true, one leaked state left InVm stalled
+    QSBR (4.6 GB of unreleased batches, every poll walking them: the suite crawled from 70%).
+    Ensure-created states are now deleted at the outermost Release (counter back to 0) and
+    otherwise retired when the OS thread exits (`threads::retire_at_thread_exit`).
 14. Coordinator run-7 list: (1) deque race — fixed (item 4); (2) multiprocessing manager
     heap corruption — the likely causes (unlocked file objects/deque/Condition waiters) are
     fixed, see results; (3) test_capi crash after "text[\udc80]" — it was test_tuple
