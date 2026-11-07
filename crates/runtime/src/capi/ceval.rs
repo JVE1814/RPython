@@ -128,7 +128,12 @@ pub unsafe extern "C" fn PyEval_EvalCodeEx(
     closure: *mut PyObject,
 ) -> *mut PyObject {
     unsafe {
-        if argc == 0 && kwc == 0 && defc == 0 && kwdefs.is_null() {
+        // (capi2) code that takes parameters always goes through argument binding
+        let takes_params = !co.is_null() && crate::types::code::is_code(&*co) && {
+            let c = crate::types::code::code(&*co);
+            c.obj.co_argcount != 0 || c.obj.co_kwonlyargcount != 0 || c.flags() & 0x0c != 0
+        };
+        if argc == 0 && kwc == 0 && defc == 0 && kwdefs.is_null() && !takes_params {
             if globals.is_null() || ensure_builtins(&*globals).is_err() {
                 return std::ptr::null_mut();
             }
@@ -140,12 +145,16 @@ pub unsafe extern "C" fn PyEval_EvalCodeEx(
             ensure_builtins(&*globals)?;
             let f = crate::types::funcobject::new_function(&*co, &*globals, None)?;
             let fo = crate::types::funcobject::func(&f);
+            // (capi2) through the attribute setters, which keep the call-path caches right
             if defc > 0 {
                 let d: Vec<PyRef> = (0..defc as usize).map(|i| (**defs.add(i)).to_ref()).collect();
-                fo.func_defaults = tuple::new_tuple(d).into_raw();
+                ab::setattr(&f, &pystr::new_str("__defaults__"), &tuple::new_tuple(d))?;
             }
             if !kwdefs.is_null() {
-                fo.func_kwdefaults = (*kwdefs).to_ref().into_raw();
+                if !dict::is_dict(&*kwdefs) {
+                    return Err(system_error("bad argument to internal function"));
+                }
+                ab::setattr(&f, &pystr::new_str("__kwdefaults__"), &*kwdefs)?;
             }
             if !closure.is_null() {
                 fo.func_closure = (*closure).to_ref().into_raw();

@@ -301,7 +301,11 @@ pub unsafe extern "C" fn PySys_GetObject(name: *const c_char) -> *mut PyObject {
                 drop(v); // borrowed from sys.__dict__
                 p
             }),
-            Err(_) => std::ptr::null_mut(),
+            Err(_) => {
+                // (capi2) an undecodable name is reported, not raised
+                crate::modules::sys_full::write_unraisable(Some("Exception ignored in PySys_GetObject()"), None);
+                std::ptr::null_mut()
+            }
         };
         clear_exc();
         if let Some(e) = saved {
@@ -313,10 +317,15 @@ pub unsafe extern "C" fn PySys_GetObject(name: *const c_char) -> *mut PyObject {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PySys_GetAttr(name: *mut PyObject) -> *mut PyObject {
     unsafe {
+        if name.is_null() || !pystr::is_str(&*name) {
+            let _ = type_error(&format!("expected str, got {}", if name.is_null() { "NULL".into() } else { tname(&*name) }));
+            return std::ptr::null_mut();
+        }
         match sys_get(&*name) {
             Some(v) => v.into_raw(),
             None => {
-                let _ = crate::err!(RuntimeError, "lost sys.{}", pystr::to_string_lossy(&*name));
+                let msg = pystr::concat(&pystr::new_str("lost sys."), &*name);
+                let _ = crate::errors::set_err_obj(crate::types::exceptions::RuntimeError(), msg);
                 std::ptr::null_mut()
             }
         }
@@ -334,6 +343,11 @@ pub unsafe extern "C" fn PySys_GetAttrString(name: *const c_char) -> *mut PyObje
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PySys_GetOptionalAttr(name: *mut PyObject, result: *mut *mut PyObject) -> c_int {
     unsafe {
+        if name.is_null() || !pystr::is_str(&*name) {
+            *result = std::ptr::null_mut();
+            let _ = type_error(&format!("expected str, got {}", if name.is_null() { "NULL".into() } else { tname(&*name) }));
+            return -1;
+        }
         match sys_get(&*name) {
             Some(v) => {
                 *result = v.into_raw();
@@ -374,7 +388,7 @@ pub unsafe extern "C" fn PySys_SetObject(name: *const c_char, v: *mut PyObject) 
 pub unsafe extern "C" fn PySys_GetXOptions() -> *mut PyObject {
     unsafe {
         let d = crate::modules::sys::sys_dict();
-        match dict::get_item_rs(&d, "_xoptions") {
+        match dict::get_item_rs(&d, "_xoptions").filter(|x| dict::is_dict(x)) {
             Some(x) => {
                 let p = x.as_ptr();
                 drop(x);
