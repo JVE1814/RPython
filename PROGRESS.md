@@ -76,6 +76,7 @@ Ours (tools/run_tests.sh, 434 modules):
 | 3 | d8d869f | 158 | 266 | 6 | 4 | 14,157 | 1,195 | 892 |
 | 4 | 30f8658 | 208 | 215 | 6 | 4 | 23,987 | 1,165 | 1,632 |
 | 5 | b578bf8 | 250 | 174 | 6 | 4 | 40,734 | 1,294 | 2,549 |
+| 6 | cd9478e | 259 | 158 | 13 | 4 | 39,273 | 660 | 2,377 |
 Run 3 top blockers: array (39 modules), http (21), urllib (12), multiprocessing (11),
 importlib.resources (11), datetime (11), concurrent (9), xml/email (7 each), html (6).
 Run 1 top blockers: py_compile (230 modules; merged since), unittest.mock (57), doctest (24),
