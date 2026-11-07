@@ -166,6 +166,13 @@ pub unsafe extern "C" fn h_dict_lacks(d: *mut PyObject, name: *mut PyObject) -> 
     }
 }
 
+/// (wheels3) The value (borrowed; the caller takes its reference before any quiescent
+/// point) at entry `hint` of exact dict `d` if that entry holds key `name`, read without
+/// the lock as dict::value_at_if_key does; null otherwise (take the slow path).
+pub unsafe extern "C" fn h_dict_hinted(d: *mut PyObject, hint: u64, name: *mut PyObject) -> *mut PyObject {
+    unsafe { dict::value_at_if_key(&*d, hint as usize, name).unwrap_or(std::ptr::null_mut()) }
+}
+
 /// Replace the value at entry index `ix` of exact dict `d` if its key is `name`
 /// (taking ownership of `v`): 0 done, 1 key not there (nothing consumed).
 pub unsafe extern "C" fn h_dict_replace(d: *mut PyObject, ix: u64, name: *mut PyObject, v: *mut PyObject) -> u64 {

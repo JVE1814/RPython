@@ -1546,6 +1546,13 @@ impl<'a> Gen<'a> {
         if hint >= (1 << 20) || disp + 64 > i32::MAX as i64 {
             return false;
         }
+        // (wheels3) with other threads the entry is read by the helper (sequence lock,
+        // shared_read mark, null check: dict::value_at_if_key); rax is kept in r14
+        let mt = self.a.label();
+        let done = self.a.label();
+        self.a.mov_ri(Rcx, (&raw const crate::threads::MULTI_THREADED) as i64);
+        self.a.cmp_mi(M(Rcx, 0), 0);
+        self.a.jcc(Cc::NE, mt);
         self.a.load(Rdx, M(Rdx, MA_KEYS));
         self.a.cmp_mi(M(Rdx, l.entries_len), hint as i32);
         self.a.jcc(Cc::BE, slow);
@@ -1554,6 +1561,18 @@ impl<'a> Gen<'a> {
         self.a.cmp_rm(Rsi, M(Rdx, disp as i32 + l.entry_key));
         self.a.jcc(Cc::NE, slow);
         self.a.load(Rsi, M(Rdx, disp as i32 + l.entry_value));
+        self.a.jmp(done);
+        self.a.bind(mt);
+        self.a.mov_rr(R14, Rax);
+        self.a.mov_rr(Rdi, Rdx);
+        self.a.mov_ri(Rsi, hint as i64);
+        self.a.mov_ri(Rdx, name);
+        self.call(addr!(h::h_dict_hinted));
+        self.a.mov_rr(Rsi, Rax);
+        self.a.mov_rr(Rax, R14);
+        self.a.test_rr(Rsi, Rsi);
+        self.a.jcc(Cc::E, slow);
+        self.a.bind(done);
         true
     }
 
