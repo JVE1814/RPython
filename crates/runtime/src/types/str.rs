@@ -535,6 +535,14 @@ impl StrBuilder {
     pub fn with_capacity(n: usize) -> Self {
         StrBuilder { narrow: Vec::with_capacity(n), wide: Vec::new(), is_wide: false, maxc: 0 }
     }
+    /// (capi3) Would appending `extra` characters reallocate the buffer?
+    pub fn would_grow(&self, extra: usize) -> bool {
+        if self.is_wide {
+            self.wide.len() + extra > self.wide.capacity()
+        } else {
+            self.narrow.len() + extra > self.narrow.capacity()
+        }
+    }
     #[cold]
     fn widen(&mut self, extra: usize) {
         self.wide.reserve(self.narrow.len() + extra.max(16));
@@ -717,6 +725,89 @@ pub fn intern(s: PyRef) -> PyRef {
             s
         }
     }
+}
+
+// (capi3) Interning requested by programs (sys.intern) vs. by the runtime.
+//
+// The table above is shared by all interpreters: names in code objects, attribute
+// names and every string the runtime interns go there, so shapes and caches that key
+// on interned pointers agree in every interpreter. A string that `sys.intern()` in the
+// main interpreter made canonical (a string created at run time, not a code constant
+// or runtime name) is remembered as "dynamic": like CPython's dynamically allocated
+// interned strings it is not handed to other interpreters. `sys.intern()` in a
+// subinterpreter returns shared entries that are not dynamic, and otherwise keeps its
+// own canonical strings in a per-interpreter table (not marked interned in the object,
+// so runtime-internal lookups still canonicalise through the shared table).
+
+static MAIN_DYNAMIC: std::sync::LazyLock<Mutex<std::collections::HashSet<usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+/// Canonical strings `sys.intern()` chose in one subinterpreter: hash -> owned objects.
+struct OwnInterned(Mutex<std::collections::HashMap<isize, Vec<usize>>>);
+impl Drop for OwnInterned {
+    fn drop(&mut self) {
+        let m = self.0.get_mut().unwrap_or_else(|e| e.into_inner());
+        for v in m.values() {
+            for &p in v {
+                unsafe { decref(p as *mut PyObject) };
+            }
+        }
+    }
+}
+static OWN_INTERNED: crate::subinterp::PerInterp<OwnInterned> =
+    crate::subinterp::PerInterp::new(|| OwnInterned(Mutex::new(std::collections::HashMap::new())));
+
+fn is_main_dynamic(p: *mut PyObject) -> bool {
+    MAIN_DYNAMIC.lock().unwrap_or_else(|e| e.into_inner()).contains(&(p as usize))
+}
+
+/// `sys.intern(s)` for exact str `s` (see above).
+pub fn intern_requested(s: PyRef) -> PyRef {
+    if crate::subinterp::current().is_main() {
+        if is_interned(&s) {
+            return s;
+        }
+        let r = intern(s.clone());
+        if r.is(&s) && str_len(&s) > 1 {
+            MAIN_DYNAMIC.lock().unwrap_or_else(|e| e.into_inner()).insert(s.as_ptr() as usize);
+        }
+        return r;
+    }
+    if is_interned(&s) && !is_main_dynamic(s.as_ptr()) {
+        return s;
+    }
+    if let Some(p) = lookup_interned(&s) {
+        if !is_main_dynamic(p) {
+            return unsafe { PyRef::from_borrowed(p) };
+        }
+    }
+    let h = str_hash(&s);
+    let own = OWN_INTERNED.get();
+    let mut m = own.0.lock().unwrap_or_else(|e| e.into_inner());
+    let bucket = m.entry(h).or_default();
+    for &p in bucket.iter() {
+        if str_eq(unsafe { &*(p as *mut PyObject) }, &s) {
+            return unsafe { PyRef::from_borrowed(p as *mut PyObject) };
+        }
+    }
+    bucket.push(s.clone().into_raw() as usize);
+    s
+}
+
+/// `sys._is_interned(s)` in the current interpreter.
+pub fn is_interned_here(o: &PyObject) -> bool {
+    if crate::subinterp::current().is_main() {
+        return is_interned(o);
+    }
+    if is_interned(o) && !is_main_dynamic(o.as_ptr()) {
+        return true;
+    }
+    if !is_str_exact(o) {
+        return false;
+    }
+    let own = OWN_INTERNED.get();
+    let m = own.0.lock().unwrap_or_else(|e| e.into_inner());
+    m.get(&str_hash(o)).is_some_and(|v| v.contains(&(o.as_ptr() as usize)))
 }
 
 /// Interned str with the given Latin-1 content (marshal, names in code objects): an

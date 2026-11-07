@@ -392,13 +392,13 @@ fn sys_intern(_m: &PyObject, s: &PyObject) -> PyResult {
     if !pystr::is_str_exact(s) {
         raise!(TypeError, "intern() argument must be str, not {}", crate::types::typeobject::tname(s));
     }
-    Ok(pystr::intern(s.to_ref()))
+    Ok(pystr::intern_requested(s.to_ref())) // (capi3)
 }
 fn sys_is_interned(_m: &PyObject, s: &PyObject) -> PyResult {
     if !pystr::is_str(s) {
         raise!(TypeError, "_is_interned() argument must be str, not {}", crate::types::typeobject::tname(s));
     }
-    Ok(bool_::new_bool(pystr::is_interned(s)))
+    Ok(bool_::new_bool(pystr::is_interned_here(s)))
 }
 fn sys_is_immortal(_m: &PyObject, o: &PyObject) -> PyResult {
     Ok(bool_::new_bool(o.is_immortal()))
@@ -420,8 +420,25 @@ fn sys_getrefcount(_m: &PyObject, o: &PyObject) -> PyResult {
         if n > 1 && parent_call_operand(o) {
             n -= 1;
         }
+    } else if n > 1 && !o.is_immortal() && crate::types::typeobject::is_type(o) && crate::types::typeobject::is_heap_type(o.as_ptr() as *mut crate::ffi::PyTypeObject) && caller_stack_holds(o) {
+        // (capi3) free-threaded CPython counts heap types lazily (deferred reference
+        // counting): the operand loaded from a global or attribute adds no reference.
+        // Ours does; leave that stack copy out.
+        n -= 1;
     }
     Ok(int::new_int(n))
+}
+
+/// (capi3) The calling frame's value stack holds `o` (the argument just pushed).
+fn caller_stack_holds(o: &PyObject) -> bool {
+    let f = crate::interp::current_frame_ptr();
+    if f.is_null() {
+        return false;
+    }
+    let f = unsafe { &*f };
+    let lo = f.nlocalsplus.min(f.slots.len());
+    let hi = f.stack_top.min(f.slots.len());
+    lo < hi && f.slots[lo..hi].iter().any(|&q| q == o.as_ptr())
 }
 
 fn parent_call_operand(o: &PyObject) -> bool {

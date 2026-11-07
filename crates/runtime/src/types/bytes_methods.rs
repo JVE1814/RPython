@@ -1667,9 +1667,15 @@ pub fn percent_format(fmt: &[u8], args: &PyObject) -> PyResult<Vec<u8>> {
 // ====================================================================== repr
 
 pub fn bytes_repr_string(b: &[u8], prefix: &str, suffix: &str) -> String {
+    bytes_repr_quoted(b, prefix, suffix, true)
+}
+
+/// (capi3) `smart`: use double quotes when the data holds single but no double quotes
+/// (repr()); otherwise always single quotes (PyBytes_Repr with smartquotes=0).
+pub fn bytes_repr_quoted(b: &[u8], prefix: &str, suffix: &str, smart: bool) -> String {
     let has_sq = b.contains(&b'\'');
     let has_dq = b.contains(&b'"');
-    let q = if has_sq && !has_dq { b'"' } else { b'\'' };
+    let q = if smart && has_sq && !has_dq { b'"' } else { b'\'' };
     let mut out = String::with_capacity(b.len() + prefix.len() + suffix.len() + 3);
     out.push_str(prefix);
     out.push(q as char);
