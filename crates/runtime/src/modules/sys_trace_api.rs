@@ -173,7 +173,7 @@ fn mon_register_callback(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     let ev = event_arg(args[1])?;
     crate::modules::sys_full::audit("sys.monitoring.register_callback", &[args[2]])?;
     let mut m = MON.lock().unwrap();
-    check_in_use(&m, tool)?;
+    // registering (or clearing) a callback does not require the tool to be in use
     let nv = if args[2].is(none::none()) { 0 } else { args[2].to_ref().into_raw() as usize };
     let evs: Vec<usize> = if ev == 18 { vec![8, 9] } else { vec![ev] };
     let mut old = 0usize;
