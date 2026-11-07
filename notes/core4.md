@@ -18,7 +18,7 @@ Lib/importlib/_bootstrap*.py, Lib/traceback.py, Lib/threading.py.
 * Lib/threading.py: `serialize_iterator`, `synchronized_iterator`, `concurrent_tee` (own design: a shared linked
   list of produced values, one lock; tee objects expose `.lock`). Now 3 failures (subinterpreters only).
 
-### settrace / monitoring (test_sys_settrace 86 -> 17, test_monitoring 52 -> 11)
+### settrace / monitoring (test_sys_settrace 86 -> 1, test_monitoring 52 -> 5)
 * Start event ('call', PY_START) is reported at the RESUME instruction (functions with COPY_FREE_VARS/MAKE_CELL
   before RESUME reported line None).
 * Line events use the public location table (`code::frame_line`), not the internal per-word locations (which have
@@ -71,6 +71,56 @@ Lib/importlib/_bootstrap*.py, Lib/traceback.py, Lib/threading.py.
   dropped before os.fork() returns in the child (test_warnings test_fork_other_thread_holds_lock; test_warnings
   passes). Remaining test_io failures are a BufferedWriter write race and BytesIO MemoryError (osio area).
 
+### Later rounds
+* settrace jumps: every unbound local gets None on an f_lineno jump (with the RuntimeWarning; bcvm's must-analysis
+  was too narrow for the listcomp/with/for tests); among compatible targets the deepest stack wins (jumps inside the
+  exceptional copy of a `finally`). A C-level trace function (PyEval_SetTrace) also sees line events of frames that
+  were already running. The class-body prologue of a decorated class is on the first decorator's line.
+* monitoring: LINE at jump targets on a different line and at exception handlers (also when a generator resumes
+  into one through throw/close); LOAD_SUPER_ATTR reports the super() call (CALL/C_RETURN/C_RAISE).
+* frames/generators: frame.clear() raises for suspended frames, finalizes never-started coroutines (never-awaited
+  warning), is a no-op for released frames; f_lineno/f_trace_lines/f_trace_opcodes deletion errors; exhausted
+  generator frames have no f_back; the delegating generator's frame is on the stack while a custom sub-iterator's
+  throw() runs; PyEval_GetFrameLocals returns a snapshot dict for function frames; unawaited coroutines warn through
+  `warnings._warn_unawaited_coroutine` (origin tracking); coroutine method docstrings; invalid `__anext__` result ->
+  TypeError caused by the original error.
+* traceback: the native printer folds repeated entries ("[Previous line repeated N more times]") and reads source
+  only while io.open exists; PyTraceBack_Print prints banner + entries without carets; Lib/traceback.py works without
+  _colorize during shutdown; the wrapper group of a naked exception gets its traceback entry at CHECK_EG_MATCH;
+  `_suggestions._generate_suggestions` requires an exact list.
+* compiler positions: comprehension GET_ITER at the iterable, loop back edge at the element (dict: key..value),
+  MAP_ADD at key..value, assert builds AssertionError at the statement and raises at the test, DELETE_ATTR at the
+  attribute name, PUSH_NULL of a call at the callee, async genexpr implicit return at the expression, of two
+  same-line NOPs across blocks the later goes, co_positions() of an empty location table is empty.
+* compile(..., module=...) warnings are filtered by exactly that module name (not the path-derived names that
+  warnings filter matching otherwise also tries).
+
+## Results (installed-layout snapshot of this branch, dev build, after merging master 16a79e7)
+test_sys_settrace 448/1 (test_jump_from_yield), test_monitoring 100/5, test_traceback pass, test_frame pass,
+test_coroutines pass, test_asyncgen pass, test_dis 145 pass, test_code pass, test_peepholer pass, test_warnings
+pass, test_generators 59/3, test_compile 188/2 ("evil undecodable": tokenizer must say "source code cannot contain
+null bytes"), test_exceptions 115/4 (_testcapi no-memory tests, test_file_source caret width), test_importlib
+1236/25, test_import 128/6, test_threading 247/4 (3 subinterpreters + test_no_refcycle_through_target),
+test_cmd_line 82/24, test_listcomps/setcomps/dictcomps: only listcomps' test_frame_locals errors (module/class
+scope) remain, test_descr 168/13 (+10 errors), test_opcache 83/3 (+5 errors).
+
+## Open / for others
+* test_no_refcycle_through_target: rarely (~1 in 400) a joined thread's references are released *later* (the
+  objects are freed after another thread runs), with and without the JIT. Looks like deferred reclamation (QSBR:
+  storage freed late together with the references it holds) — stability/perf-runtime.
+* test_monitoring: test_async_for/test_match (BRANCH events of async for / match), test_disable_legal_events,
+  TestLoadSuperAttr (the line event of `super().method` must come after the super() CALL event).
+* test_sys_settrace test_jump_from_yield (f_lineno assignment on the 'return' event of a yield).
+* test_descr: variable-size bases with __slots__ (tuple/int/bytes), __bases__ assignment layout check, vicious
+  descriptor/MRO tests — type-system work.
+* test_opcache: TestInstanceDict needs `_testinternalcapi.get_object_dict_values` (shape.rs API),
+  STORE_ATTR_WITH_HINT race test, test_call_list_append_memory_error.
+* test_cmd_line remaining 24 (PYTHONMALLOC/mimalloc names, -X importtime, help texts, ...); test_lazy_import not
+  looked at.
+* rule 9: Lib/threading.py and Lib/importlib/util.py still look recalled; not rewritten in this round.
+* jit4: the tier-1/2 call paths should poll the eval breaker after calls into C as the interpreter now does.
+
 ## Testing notes
 * Use an installed-layout snapshot for suite modules that spawn `-I` subprocesses (tools/snapshot.sh); the dev
   binary cannot see spec/Lib there.
+* The scratchpad directory is shared with other agents (jit5 overwrote generic script names); use prefixed names.
