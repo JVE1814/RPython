@@ -307,11 +307,23 @@ pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
     let new_line = line >= 0
         && !is_resume
         && ((start && (line != f.trace_line || (jumped && lasti <= prev))) || (jumped && (line != f.trace_line || lasti <= prev)));
-    if new_line {
-        f.trace_line = line;
-        if MON_ANY.load(Relaxed) & (1 << LINE) != 0 && start {
+    if MON_ANY.load(Relaxed) & (1 << LINE) != 0 && line >= 0 && !is_resume {
+        // sys.monitoring LINE: at line starts, at jump targets on another line than the
+        // jump, and at exception handlers entered with a line number
+        let cd = crate::types::code::code_data(f.code());
+        let mon_line = if !jumped {
+            new_line && start
+        } else {
+            let from = crate::types::code::frame_line(f.code(), prev as usize).map(|l| l as i32);
+            cd.exception_table.iter().any(|e| e.target == lasti)
+                || (new_line && (start || from != Some(line)))
+        };
+        if mon_line {
             fire(ts, f, LINE, line as u32, &[])?;
         }
+    }
+    if new_line {
+        f.trace_line = line;
     }
     // one INSTRUCTION / opcode event per public instruction (an instruction may be
     // implemented by several internal words)
