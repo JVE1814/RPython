@@ -307,8 +307,25 @@ pub fn load_attr(o: &PyObject, nm: &PyObject, es: &[Entry]) -> PyResult<PyRef> {
     load_attr_miss(o, nm, es)
 }
 
+/// Cache misses also refresh the adaptive view (`dis(adaptive=True)`, recorded by
+/// tier 0 on every execution) for the running instruction: compiled code reaches the
+/// generic path only here, so its view would otherwise stay at what tier 0 last saw.
+#[inline]
+pub(crate) fn adaptive_note(k: impl FnOnce() -> u16) {
+    let fp = crate::interp::current_frame_ptr();
+    if fp.is_null() {
+        return;
+    }
+    let f = unsafe { &*fp };
+    let cd = crate::types::code::code_data(f.code());
+    if super::adaptive::active(cd) {
+        super::adaptive::note(cd, f.lasti as usize, k());
+    }
+}
+
 #[cold]
 fn load_attr_miss(o: &PyObject, nm: &PyObject, es: &[Entry]) -> PyResult<PyRef> {
+    adaptive_note(|| super::adaptive::load_attr(o, nm, false));
     if es[0].note_miss() {
         if let Some(f) = fill_load_attr(o, nm, false) {
             store_fill(es, f);
@@ -429,6 +446,7 @@ pub fn load_method(o: &PyObject, nm: &PyObject, es: &[Entry]) -> PyResult<(PyRef
 
 #[cold]
 fn load_method_miss(o: &PyObject, nm: &PyObject, es: &[Entry]) -> PyResult<(PyRef, Option<PyRef>)> {
+    adaptive_note(|| super::adaptive::load_attr(o, nm, true));
     if es[0].note_miss() {
         if let Some(f) = fill_load_attr(o, nm, true) {
             store_fill(es, f);
@@ -493,6 +511,11 @@ pub fn store_attr(o: &PyObject, nm: &PyObject, v: &PyObject, es: &[Entry]) -> Py
 #[cold]
 fn store_attr_miss(o: &PyObject, nm: &PyObject, v: &PyObject, es: &[Entry]) -> PyResult<()> {
     let r = ab::setattr(o, nm, v);
+    // the form later executions take (the store may just have moved the object's
+    // attributes into a dict): compiled code reaches here only on fills/misses
+    if r.is_ok() {
+        adaptive_note(|| super::adaptive::store_attr(o, nm));
+    }
     if r.is_ok() && es[0].note_miss() {
         if let Some(f) = fill_store_attr(o, nm) {
             store_fill(es, f);

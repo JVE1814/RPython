@@ -1030,3 +1030,57 @@ pub unsafe extern "C" fn h_load_super_attr(sp: *mut *mut PyObject, arg: u64, nam
         })
     }
 }
+
+// ------------------------------------------------------------------ shared instructions
+
+/// GetAwaitable: [o] -> [awaitable]. A coroutine that is not suspended in an await
+/// is its own awaitable (the common `await coro()` case needs no further work).
+pub unsafe extern "C" fn h_get_awaitable(sp: *mut *mut PyObject, arg: u64) -> u64 {
+    unsafe {
+        let o = &**sp.sub(1);
+        if crate::types::genobject::is_coroutine_exact(o) && !crate::types::genobject::coro_is_running_await(o) {
+            return OK;
+        }
+        let o = take(sp.sub(1));
+        match eval::get_awaitable(&o, arg as u32) {
+            Ok(r) => {
+                put(sp.sub(1), r);
+                OK
+            }
+            Err(_) => ERR,
+        }
+    }
+}
+
+/// Instructions implemented once in `eval::exec_misc` (exception handlers, with,
+/// async iteration, imports, pattern matching, ...). `oparg` = op | arg << 8; the
+/// value stack ends at `sp`. On error the stack is cut back to `err_top` (absolute
+/// slot index: the depth tier-1 code reports to the unwinder), releasing whatever the
+/// instruction left above it.
+pub unsafe extern "C" fn h_misc(ts: *const ThreadState, f: *mut Frame, sp: *mut *mut PyObject, oparg: u64, err_top: u64) -> u64 {
+    unsafe {
+        let f = &mut *f;
+        // compiled code does not maintain stack_top: it is accurate only while the
+        // instruction runs, and restored afterwards (slots above the static depth
+        // that compiled code later pops are not cleared, so a stale stack_top would
+        // expose freed objects to frame traversal)
+        let saved = f.stack_top;
+        f.stack_top = sp.offset_from(f.slots.as_ptr()) as usize;
+        let op = bc::Op::from_u8((oparg & 0xff) as u8);
+        let cd = &*(crate::types::code::code_data(f.code()) as *const crate::types::code::CodeData);
+        match eval::exec_misc(&*ts, f, cd, op, (oparg >> 8) as u32) {
+            Ok(()) => {
+                f.stack_top = saved;
+                OK
+            }
+            Err(_) => {
+                let e = err_top as usize;
+                while f.stack_top > e {
+                    f.stack_top -= 1;
+                    xdecref(std::mem::replace(&mut f.slots[f.stack_top], std::ptr::null_mut()));
+                }
+                ERR
+            }
+        }
+    }
+}
