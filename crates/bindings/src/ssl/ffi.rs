@@ -108,6 +108,13 @@ crate::dyn_lib!(LibCrypto, ["libcrypto.so.3", "libcrypto.so"], {
     fn X509_get_signature_nid(x: P) -> c_int;
     fn OBJ_find_sigid_algs(sig: c_int, md: *mut c_int, pk: *mut c_int) -> c_int;
     fn EVP_MD_get_size(md: P) -> c_int;
+    // (tail2) distrusted-key check in the verify callback
+    fn X509_STORE_CTX_get_current_cert(c: P) -> P;
+    fn X509_STORE_CTX_set_error(c: P, e: c_int);
+    fn X509_get_X509_PUBKEY(x: P) -> P;
+    fn i2d_X509_PUBKEY(k: P, out: *mut *mut c_uchar) -> c_int;
+    fn EVP_Digest(d: *const c_void, n: usize, md: *mut c_uchar, len: *mut c_uint, t: P, e: P) -> c_int;
+    fn EVP_sha256() -> P;
 });
 
 crate::dyn_lib!(LibSsl, ["libssl.so.3", "libssl.so"], {

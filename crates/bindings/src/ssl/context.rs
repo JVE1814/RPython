@@ -139,6 +139,51 @@ fn ctx_new_impl(tp: *mut PyTypeObject, a: &fc::VcArgs) -> PyResult {
     Ok(obj)
 }
 
+// ------------------------------------------------------------------ distrusted keys (tail2)
+
+/// SHA-256 of the DER SubjectPublicKeyInfo of CA keys that must never be trusted,
+/// whatever the trust store says: keys whose private half is known to be compromised.
+const DISTRUSTED_SPKI_SHA256: &[[u8; 32]] = &[
+    // eMudhra "EM OV TLS CA - G3C" (issued by emSign Root TLS CA - G3)
+    [
+        0x63, 0xec, 0xef, 0xee, 0x43, 0x1d, 0x49, 0x52, 0x3b, 0xc1, 0x13, 0x6c, 0x4e, 0x72, 0xd0, 0x20,
+        0x6a, 0x47, 0x70, 0x86, 0xca, 0xf6, 0x06, 0xcd, 0x5c, 0xf0, 0x25, 0x68, 0x6c, 0x10, 0x9c, 0xf8,
+    ],
+];
+
+const X509_V_ERR_CERT_REJECTED: c_int = 28;
+
+fn spki_is_distrusted(cert: *mut c_void) -> bool {
+    if cert.is_null() {
+        return false;
+    }
+    let key = cr!(X509_get_X509_PUBKEY(cert));
+    if key.is_null() {
+        return false;
+    }
+    let mut der: *mut u8 = std::ptr::null_mut();
+    let n = cr!(i2d_X509_PUBKEY(key, &mut der));
+    if n <= 0 || der.is_null() {
+        return false;
+    }
+    let mut md = [0u8; 32];
+    let mut len: c_uint = 0;
+    let ok = cr!(EVP_Digest(der as *const c_void, n as usize, md.as_mut_ptr(), &mut len, cr!(EVP_sha256()), std::ptr::null_mut()));
+    cr!(CRYPTO_free(der as *mut c_void, c"tail2".as_ptr(), 0));
+    ok == 1 && len == 32 && DISTRUSTED_SPKI_SHA256.contains(&md)
+}
+
+/// Verify callback of every context: OpenSSL's verdict, except that a certificate
+/// whose key is on the distrusted list is rejected (X509_V_ERR_CERT_REJECTED).
+pub(crate) unsafe extern "C" fn verify_with_distrust(preverify_ok: c_int, store_ctx: *mut c_void) -> c_int {
+    let cert = cr!(X509_STORE_CTX_get_current_cert(store_ctx));
+    if spki_is_distrusted(cert) {
+        cr!(X509_STORE_CTX_set_error(store_ctx, X509_V_ERR_CERT_REJECTED));
+        return 0;
+    }
+    preverify_ok
+}
+
 // ------------------------------------------------------------------ verify mode / options
 
 fn set_verify_mode_raw(o: &PyObject, n: i64) -> PyResult<()> {
@@ -152,7 +197,7 @@ fn set_verify_mode_raw(o: &PyObject, n: i64) -> PyResult<()> {
     if c.post_handshake_auth && n != 0 && c.protocol != 0x10 {
         mode |= SSL_VERIFY_POST_HANDSHAKE;
     }
-    sl!(SSL_CTX_set_verify(c.ctx, mode, std::ptr::null_mut()));
+    sl!(SSL_CTX_set_verify(c.ctx, mode, verify_with_distrust as *mut c_void));
     Ok(())
 }
 
