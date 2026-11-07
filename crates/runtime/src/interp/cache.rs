@@ -267,6 +267,12 @@ pub fn mc_store(tag: u32, name: &PyObject, value: Option<&PyObject>) {
 // ------------------------------------------------------------------ cache entries
 
 /// Kinds of cache entries (`Entry::kind`).
+/// (jit5) Bumped whenever a type is modified (version tags reset) or an object's
+/// __class__ is reassigned: compiled code that called into arbitrary code (generic
+/// attribute paths) compares it before/after and deoptimises when its type facts
+/// may have become stale.
+pub static TYPE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
 pub mod kind {
     pub const EMPTY: u32 = 0;
     /// LoadGlobal (jit5): a = globals keys_version, b = builtins keys_version (names

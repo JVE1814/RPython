@@ -2204,15 +2204,57 @@ impl<'a> B<'a> {
             // (cache misses refresh the adaptive view of the running instruction)
             self.emit(Inst::SetLasti(self.u.an.instrs[i].pc));
         }
+        let e0 = if self.inl.is_none() { Some(self.epoch_load()) } else { None };
         self.emit(Inst::Call { addr: h2_load_attr as usize, args: vec![Opnd::V(p), Opnd::I(name as i64), Opnd::I(ea)], fargs: vec![], ret: Some(r), fret: None });
         self.emit(Inst::Guard(Cond::Test(r, Opnd::V(r), Cc::E), esnap));
+        if let Some(e0) = e0 {
+            self.epoch_check(i, e0, false, Some(r));
+        }
         self.emit(Inst::Mov(res, r));
         self.term(Term::Jump(cont));
         self.switch_to(cont);
+        if self.inl.is_some() {
+            self.forget_tags(); // (no resumable snapshot inside an inlined callee)
+        }
         let k = self.st.stack.len() - 1;
         let a = self.pop();
         self.discard(a, k);
         self.push(AV::Obj(res, Own::Owned, Ty::Unknown));
+    }
+
+    /// Current value of the type epoch (cache::TYPE_EPOCH).
+    fn epoch_load(&mut self) -> V {
+        let a = self.imm(&crate::interp::cache::TYPE_EPOCH as *const _ as i64);
+        let v = self.v(Class::G);
+        self.emit(Inst::Load(v, Base::V(a), 0));
+        v
+    }
+
+    /// After a generic attribute call (which may run arbitrary code: __getattr__,
+    /// properties, descriptors): if a type was modified or an object's class reassigned
+    /// meanwhile (epoch differs from `e0`), the type facts of this unit may be stale, so
+    /// deoptimise, resuming after instruction i with the operands popped (the receiver
+    /// released; for a store the value below it was consumed) and `result` pushed.
+    fn epoch_check(&mut self, i: usize, e0: V, store: bool, result: Option<V>) {
+        let e1 = self.epoch_load();
+        let chg = self.new_block(u32::MAX);
+        let ok = self.new_block(u32::MAX);
+        self.term(Term::Branch(Cond::Cmp(e1, Opnd::V(e0), Cc::NE), chg, ok));
+        self.switch_to(chg);
+        let saved = self.st.clone();
+        let k = self.st.stack.len() - 1;
+        let a = self.pop();
+        self.discard(a, k);
+        if store {
+            self.pop();
+        }
+        if let Some(r) = result {
+            self.push(AV::Obj(r, Own::Owned, Ty::Unknown));
+        }
+        let s = self.snap_next(i);
+        self.term(Term::Deopt(s));
+        self.st = saved;
+        self.switch_to(ok);
     }
 
     /// Value of attribute `name` of a module object folded into the code, with a
@@ -2439,9 +2481,16 @@ impl<'a> B<'a> {
             // (cache misses refresh the adaptive view of the running instruction)
             self.emit(Inst::SetLasti(self.u.an.instrs[i].pc));
         }
+        let e0 = if self.inl.is_none() { Some(self.epoch_load()) } else { None };
         self.emit(Inst::CallChecked { addr: h2_store_attr as usize, args: vec![Opnd::V(p), Opnd::I(name as i64), Opnd::V(val), Opnd::I(ea)], err: esnap });
+        if let Some(e0) = e0 {
+            self.epoch_check(i, e0, true, None);
+        }
         self.term(Term::Jump(cont));
         self.switch_to(cont);
+        if self.inl.is_some() {
+            self.forget_tags();
+        }
         // value moved into the object / released by the runtime
         let k = self.st.stack.len() - 1;
         let a = self.pop();
