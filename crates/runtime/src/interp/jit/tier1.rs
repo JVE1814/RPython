@@ -868,6 +868,27 @@ impl<'a> Gen<'a> {
                 self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
                 let is_func = self.a.label();
                 self.a.jcc(Cc::E, is_func);
+                if arg == 1 {
+                    // (perf5) type(x): the argument's type
+                    let not_type = self.a.label();
+                    self.a.mov_ri(Rcx, crate::types::typeobject::type_type() as i64);
+                    self.a.cmp_rr(Rax, Rcx);
+                    self.a.jcc(Cc::NE, not_type);
+                    let sm = self.slot(base + 1);
+                    self.a.cmp_mi(sm, 0);
+                    self.a.jcc(Cc::NE, not_type);
+                    let am = self.slot(base + 2);
+                    self.a.load(Rcx, am);
+                    self.a.load(Rdx, M(Rcx, OB_TYPE));
+                    self.incref(Rdx);
+                    self.a.store(m, Rdx);
+                    self.a.mov_rr(Rax, Rcx);
+                    self.decref(Rax);
+                    self.a.mov_ri(Rax, crate::types::typeobject::type_type() as i64);
+                    self.decref(Rax);
+                    self.a.jmp(done);
+                    self.a.bind(not_type);
+                }
                 // (perf5) bound method with a free self slot: unpack it in the stack and
                 // retry with its function (CPython's bound-method call specialisation)
                 self.a.mov_ri(Rcx, crate::types::funcobject::method_type() as i64);
@@ -1520,6 +1541,61 @@ impl<'a> Gen<'a> {
                     self.a.load(Rax, obj);
                     self.a.store(obj, Rsi);
                     self.decref(Rax);
+                    inline = true;
+                }
+                (Op::LoadAttr | Op::LoadMethod, kind::DATA_DESCR)
+                    if crate::modules::_collections::tuplegetter_index(s.c as *mut PyObject).is_some_and(|i| (0..1 << 20).contains(&i)) =>
+                {
+                    // (perf5) namedtuple field (`_tuplegetter`): the item itself
+                    attr_kind = true;
+                    let idx = crate::modules::_collections::tuplegetter_index(s.c as *mut PyObject).unwrap() as i32;
+                    self.a.load(Rax, obj);
+                    self.guard_tag(Rax, tag, slow);
+                    self.a.load(Rcx, M(Rax, OB_TYPE));
+                    self.a.load(Rdx, M(Rcx, offset_of!(PyTypeObject, tp_flags) as i32));
+                    self.a.test_ri(Rdx, crate::ffi::Py_TPFLAGS_TUPLE_SUBCLASS as i32);
+                    self.a.jcc(Cc::E, slow);
+                    self.a.cmp_mi(M(Rax, LIST_SIZE), idx);
+                    self.a.jcc(Cc::LE, slow);
+                    self.a.load(Rsi, M(Rax, TUPLE_ITEMS + 8 * idx));
+                    self.a.test_rr(Rsi, Rsi);
+                    self.a.jcc(Cc::E, slow);
+                    self.incref(Rsi);
+                    self.a.store(obj, Rsi);
+                    self.decref(Rax);
+                    inline = true;
+                }
+                (Op::LoadAttr | Op::LoadMethod, kind::TYPE_ATTR_META)
+                | (Op::LoadAttr | Op::LoadMethod, kind::TYPE_STATICMETHOD)
+                | (Op::LoadMethod, kind::TYPE_CLASSMETHOD) => {
+                    // (perf5) attribute of class b under a type-derived metatype:
+                    // identity and both version tags
+                    self.a.load(Rax, obj);
+                    self.a.mov_ri(Rcx, s.b as i64);
+                    self.a.cmp_rr(Rax, Rcx);
+                    self.a.jcc(Cc::NE, slow);
+                    self.a.cmp32_mi(M(Rax, TP_TAG), (s.a & 0xffff_ffff) as u32 as i32);
+                    self.a.jcc(Cc::NE, slow);
+                    self.a.load(Rcx, M(Rax, OB_TYPE));
+                    self.a.cmp32_mi(M(Rcx, TP_TAG), (s.a >> 32) as u32 as i32);
+                    self.a.jcc(Cc::NE, slow);
+                    self.a.mov_ri(Rsi, s.c as i64);
+                    if s.kind != kind::TYPE_ATTR_META {
+                        let off = std::mem::offset_of!(crate::types::funcobject::StaticOrClassMethod, callable) as i32;
+                        self.a.load(Rsi, M(Rsi, off));
+                        self.a.test_rr(Rsi, Rsi);
+                        self.a.jcc(Cc::E, slow);
+                    }
+                    self.incref(Rsi);
+                    self.a.store(obj, Rsi);
+                    if s.kind == kind::TYPE_CLASSMETHOD {
+                        // the class moves into the self slot
+                        let m = self.slot(d);
+                        self.a.store(m, Rax);
+                    } else {
+                        attr_kind = true;
+                        self.decref(Rax);
+                    }
                     inline = true;
                 }
                 (Op::StoreAttr, kind::SLOT) => {

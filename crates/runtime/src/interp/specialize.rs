@@ -299,6 +299,26 @@ fn load_attr_hit(o: &PyObject, nm: &PyObject, e: &Entry) -> Option<PyResult<PyRe
             }
             Some(Ok(unsafe { PyRef::from_borrowed(s.c as *mut PyObject) }))
         }
+        kind::TYPE_ATTR_META => {
+            if !type_meta_guard(o, &s) {
+                return None;
+            }
+            Some(Ok(unsafe { PyRef::from_borrowed(s.c as *mut PyObject) }))
+        }
+        kind::TYPE_CLASSMETHOD => {
+            if !type_meta_guard(o, &s) {
+                return None;
+            }
+            let f = funcobject::sm_callable(unsafe { &*(s.c as *mut PyObject) })?;
+            Some(Ok(funcobject::new_method(f, o)))
+        }
+        kind::TYPE_STATICMETHOD => {
+            if !type_meta_guard(o, &s) {
+                return None;
+            }
+            let f = funcobject::sm_callable(unsafe { &*(s.c as *mut PyObject) })?;
+            Some(Ok(f.to_ref()))
+        }
         _ => None,
     }
 }
@@ -424,22 +444,27 @@ fn fill_load_attr(o: &PyObject, nm: &PyObject, method: bool) -> Option<Fill> {
             .filter(|v| !crate::types::lazyimport::is_lazy(v))
             .map(|v| (kind::MODULE, dict::version(dd), d as u64, v.as_ptr() as usize));
     }
-    if o.is_type(type_type()) {
-        // class attribute through a plain `type` metaclass. A data descriptor of
-        // `type` itself (__name__, __dict__, ...) wins over the class's own entries;
-        // non-data attributes of `type` (__new__, __init__, mro, ...) only matter when
-        // the class lacks the name, which the lookup below decides (perf3: was any
+    let meta = o.type_ptr();
+    let plain_meta = meta == type_type();
+    // (perf5) also metatypes derived from `type` that keep its attribute lookup
+    if plain_meta || (is_type(o) && unsafe { (*meta).tp_getattro.map(|f| f as usize) == (*type_type()).tp_getattro.map(|f| f as usize) }) {
+        // class attribute through the metatype's standard lookup. A data descriptor
+        // of the metatype (__name__, __dict__, ...) wins over the class's own entries;
+        // its non-data attributes (__new__, __init__, mro, ...) only matter when the
+        // class lacks the name, which the lookup below decides (perf3: was any
         // attribute of `type`, so `object.__new__`/`cls.__init__` never cached).
-        if let Some(meta) = lookup(type_type(), nm) {
-            if meta.ty().tp_descr_set.is_some() || lookup(as_type(o), nm).is_none() {
+        if let Some(m) = lookup(meta, nm) {
+            if m.ty().tp_descr_set.is_some() || lookup(as_type(o), nm).is_none() {
                 return None;
             }
         }
         let cls = as_type(o);
         let tag = cache::assign_type_tag(cls);
-        if tag == 0 {
+        let mtag = cache::assign_type_tag(meta);
+        if tag == 0 || mtag == 0 {
             return None;
         }
+        let both = tag as u64 | (mtag as u64) << 32;
         if let Some(v) = lookup(cls, nm) {
             // (perf3) method and slot-wrapper descriptors read through their class are
             // themselves as well
@@ -448,11 +473,29 @@ fn fill_load_attr(o: &PyObject, nm: &PyObject, method: bool) -> Option<Fill> {
                 || v.is_type(crate::types::descr::method_descr_type())
                 || v.is_type(crate::types::descr::wrapper_descr_type());
             if plain {
-                return Some((kind::TYPE_ATTR, tag as u64, o.as_ptr() as u64, v.as_ptr() as usize));
+                if plain_meta {
+                    return Some((kind::TYPE_ATTR, tag as u64, o.as_ptr() as u64, v.as_ptr() as usize));
+                }
+                return Some((kind::TYPE_ATTR_META, both, o.as_ptr() as u64, v.as_ptr() as usize));
+            }
+            if v.is_type(funcobject::classmethod_type()) && funcobject::sm_callable(&v).is_some() {
+                return Some((kind::TYPE_CLASSMETHOD, both, o.as_ptr() as u64, v.as_ptr() as usize));
+            }
+            if v.is_type(funcobject::staticmethod_type()) && funcobject::sm_callable(&v).is_some() {
+                return Some((kind::TYPE_STATICMETHOD, both, o.as_ptr() as u64, v.as_ptr() as usize));
             }
         }
     }
     None
+}
+
+/// (perf5) Guard of the TYPE_ATTR_META / TYPE_CLASSMETHOD / TYPE_STATICMETHOD
+/// entries: `o` is class `b` and neither it nor its metatype changed.
+#[inline(always)]
+fn type_meta_guard(o: &PyObject, s: &cache::Snapshot) -> bool {
+    o.as_ptr() as u64 == s.b
+        && cache::type_tag(o.as_ptr() as *mut PyTypeObject) as u64 == s.a & 0xffff_ffff
+        && cache::type_tag(o.type_ptr()) as u64 == s.a >> 32
 }
 
 /// LoadMethod through the cache: (callable, Some(self)) for unbound method calls,
@@ -476,6 +519,14 @@ pub fn load_method(o: &PyObject, nm: &PyObject, es: &[Entry]) -> PyResult<(PyRef
                             return Ok((unsafe { PyRef::from_borrowed(v) }, None));
                         }
                         return Ok((keep, Some(o.to_ref())));
+                    }
+                }
+                kind::TYPE_CLASSMETHOD => {
+                    // (perf5) no bound method: the function with the class as self
+                    if type_meta_guard(o, &s) {
+                        if let Some(f) = funcobject::sm_callable(unsafe { &*(s.c as *mut PyObject) }) {
+                            return Ok((f.to_ref(), Some(o.to_ref())));
+                        }
                     }
                 }
                 kind::EMPTY => {}
