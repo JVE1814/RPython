@@ -1296,11 +1296,14 @@ impl<'a> Compiler<'a> {
         };
         self.emit(build, 0);
         self.emit(O::SWAP, 2);
+        // iter() failing is reported at the iterable expression
+        let iter_loc = self.set_loc(outermost.iter.loc);
         if outermost.is_async != 0 {
             self.emit(O::GET_AITER, 0);
         } else {
             self.emit(O::GET_ITER, 0);
         }
+        self.u().loc = iter_loc;
         let r = self.comprehension_generator(e, generators, 0, 0, elt, value, kind);
         self.u().comps.pop();
         r?;
@@ -1434,7 +1437,8 @@ impl<'a> Compiler<'a> {
         }
         self.use_label(if_cleanup);
         if single.is_none() {
-            self.u().loc = NO_LOC;
+            // the loop's back edge belongs to the element expression
+            self.set_loc(comp_element_loc(elt, value));
             self.emit_jump(O::JUMP, start);
             self.use_label(anchor);
             self.set_loc(g.iter.loc);
@@ -1490,7 +1494,7 @@ impl<'a> Compiler<'a> {
             self.comprehension_element(e, depth, elt, value, kind)?;
         }
         self.use_label(if_cleanup);
-        self.u().loc = NO_LOC;
+        self.set_loc(comp_element_loc(elt, value));
         self.emit_jump(O::JUMP, start);
         self.u().fblocks.pop();
         self.use_label(except);
@@ -1611,4 +1615,12 @@ pub(crate) fn attr_loc(mut loc: Loc, attr_expr: &Expr, attr: &str) -> Loc {
         }
     }
     loc
+}
+
+/// Location of a comprehension element: the element itself, or `key: value` for dicts.
+fn comp_element_loc(elt: &Expr, value: Option<&Expr>) -> ast::Loc {
+    match value {
+        Some(v) => ast::Loc::new(elt.loc.lineno, elt.loc.col_offset, v.loc.end_lineno, v.loc.end_col_offset),
+        None => elt.loc,
+    }
 }
