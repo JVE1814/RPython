@@ -199,6 +199,15 @@ type_refcount_drift, deque_race, weakref_race, shared_objects, join_releases).
     QSBR (4.6 GB of unreleased batches, every poll walking them: the suite crawled from 70%).
     Ensure-created states are now deleted at the outermost Release (counter back to 0) and
     otherwise retired when the OS thread exits (`threads::retire_at_thread_exit`).
+16. **The real pandas thread-state leak:** `interp::current_frame_ptr()` used
+    `threads::current()`; numpy calls `PyTraceMalloc_Track` with the GIL released while
+    tracemalloc is on (pandas io.parser tests), so every call attached a fresh state for
+    the detached main thread: 102 states left InVm, QSBR stalled, memory grew to many GB
+    (the suite crawled at 70%; one run took the container down). Now no frame without an
+    attached state. Rule for runtime code reachable from C with the GIL released: use
+    `threads::current_ptr()`, never `current()`. Debug aid: `RPY_ATTACH_DEBUG=<file>`
+    appends a backtrace of every thread-state creation; `RPY_QSBR_DEBUG=1` prints the
+    QSBR state at joins.
 14. Coordinator run-7 list: (1) deque race — fixed (item 4); (2) multiprocessing manager
     heap corruption — the likely causes (unlocked file objects/deque/Condition waiters) are
     fixed, see results; (3) test_capi crash after "text[\udc80]" — it was test_tuple
