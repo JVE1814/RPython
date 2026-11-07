@@ -520,7 +520,9 @@ fn config_lookup(name: &str) -> PyResult {
         "write_bytecode" => Ok(bool_::new_bool(!ab::is_true(&*(flag("dont_write_bytecode")?))?)),
         "site_import" => Ok(bool_::new_bool(!ab::is_true(&*(flag("no_site")?))?)),
         "user_site_directory" => Ok(bool_::new_bool(!ab::is_true(&*(flag("no_user_site")?))?)),
-        "parse_argv" | "install_signal_handlers" | "import_time" | "configure_c_stdio" | "buffered_stdio" | "pathconfig_warnings" => {
+        // (tail2) -u / PYTHONUNBUFFERED
+        "buffered_stdio" => Ok(bool_::new_bool(!crate::modules::sys_full::config().unbuffered)),
+        "parse_argv" | "install_signal_handlers" | "import_time" | "configure_c_stdio" | "pathconfig_warnings" => {
             Ok(bool_::new_bool(true))
         }
         "filesystem_encoding" => Ok(pystr::new_str("utf-8")),

@@ -85,4 +85,8 @@ done
 if [ -f "$OUT/_testimportmultiple$SUFFIX" ]; then
   for sub in foo bar; do ln -sf "_testimportmultiple$SUFFIX" "$OUT/_testimportmultiple_$sub$SUFFIX"; done
 fi
+# test_ctypes' helper library (our own source, tools/ctypes_test), part of a full build
+if [ "$MODS" = "$ALL" ]; then
+  bash "$ROOT/tools/ctypes_test/build.sh" "$OUT" || { echo "FAILED to build _ctypes_test"; status=1; }
+fi
 exit $status
