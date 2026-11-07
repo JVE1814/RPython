@@ -1,0 +1,12 @@
+/* perf4: symbols the executable exports to extension modules (C API, data objects,
+   helper type objects); everything else stays local (smaller dynamic symbol table,
+   faster symbol lookups at load time) */
+{
+  global:
+    Py*;
+    _Py*;
+    PY_*;
+    RPY_*;
+  local:
+    *;
+};

@@ -20,5 +20,13 @@ fn main() {
         // relative relocations; the compact RELR encoding (glibc >= 2.36) shrinks
         // .rela.dyn from ~370 KB, which the loader reads at every start, to a few KB.
         println!("cargo:rustc-link-arg-bins=-Wl,-z,pack-relative-relocs");
+        // (perf4) export only the C API (and the helper objects extensions use);
+        // --export-dynamic alone also exported ~3700 internal Rust symbols
+        let map = format!("{}/exports.map", dir);
+        println!("cargo:rerun-if-changed=exports.map");
+        if std::path::Path::new(&map).exists() && std::env::var_os("RPY_EXPORT_ALL").is_none() {
+            println!("cargo:rustc-link-arg-bins=-Wl,--version-script={}", map);
+        }
+        println!("cargo:rerun-if-env-changed=RPY_EXPORT_ALL");
     }
 }

@@ -794,6 +794,20 @@ pub fn insert_unique(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) {
     drop(g);
 }
 
+/// (perf4) Fill a fresh dict (no other reference yet) with entries whose keys are
+/// distinct and absent (borrowed key, its hash, owned value: the value reference is
+/// taken over). One lock and one size update for all of them.
+pub fn fill_fresh_steal(d: &PyObject, items: &[(*mut PyObject, isize, *mut PyObject)]) {
+    let g = ob_lock(d);
+    let t = table(d);
+    for &(k, h, v) in items {
+        unsafe { incref(k) };
+        t.insert_new(h, k, v);
+    }
+    set_used(d, t.used, std::ptr::null_mut());
+    drop(g);
+}
+
 pub fn set_item_str(d: &PyObject, key: &str, value: &PyObject) -> PyResult<()> {
     let k = crate::types::str::intern_str(key);
     set_item(d, &k, value)

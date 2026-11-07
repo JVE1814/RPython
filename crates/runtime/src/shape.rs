@@ -579,20 +579,24 @@ pub fn materialize(o: &PyObject) -> bool {
             return true; // someone else materialised
         }
         let sh = (p & !1) as *const Shape;
+        // (perf4) the slots' references move into the dict (one bulk fill instead of
+        // an insert, an incref and a deferred decref per attribute). A lock-free reader
+        // that loaded a slot just before keeps a valid object: the dict now owns it.
+        let mut buf: [(*mut PyObject, isize, *mut PyObject); MAX_INLINE as usize] = [(std::ptr::null_mut(), 0, std::ptr::null_mut()); MAX_INLINE as usize];
+        let mut n = 0;
         for (i, &k) in (*sh).keys().iter().enumerate() {
             let val = slot(op, sh, i).load(Acquire);
             if !val.is_null() {
-                dict::insert_unique(&d, &*k, pystr::str_hash(&*k), &*val);
+                buf[n] = (k, pystr::str_hash(&*k), val);
+                n += 1;
             }
         }
+        dict::fill_fresh_steal(&d, &buf[..n]);
+        // publish the dict first: until then readers still find the values in the
+        // slots (alive: the dict holds them now)
         w.store(d.into_raw(), Release);
-        // the dict took its own references; drop the slots' ones (deferred: lock-free
-        // readers may still be looking at the slots)
         for i in 0..(*sh).len as usize {
-            let val = slot(op, sh, i).swap(std::ptr::null_mut(), AcqRel);
-            if !val.is_null() {
-                crate::qsbr::decref_deferred(val);
-            }
+            slot(op, sh, i).store(std::ptr::null_mut(), Release);
         }
     }
     true
