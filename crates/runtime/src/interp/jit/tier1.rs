@@ -74,6 +74,7 @@ const CD_FAST_ENTRY: i32 = (offset_of!(CodeData, caches) + offset_of!(crate::int
 
 const LIST_SIZE: i32 =offset_of!(PyVarObject, ob_size) as i32;
 const LIST_ITEMS: i32 = offset_of!(PyListObject, ob_item) as i32;
+const LIST_ALLOCATED: i32 = offset_of!(PyListObject, allocated) as i32;
 const TUPLE_ITEMS: i32 = offset_of!(PyTupleObject, ob_item) as i32;
 
 /// The range/list/tuple iterator structs are private to their modules; the inline
@@ -764,7 +765,34 @@ impl<'a> Gen<'a> {
             Op::BuildSet => self.helper_sp(&ins, d, addr!(h::h_build_set), Some(arg as i64), None, d - arg as i32),
             Op::BuildMap => self.helper_sp(&ins, d, addr!(h::h_build_map), Some(arg as i64), None, d - 2 * arg as i32),
             Op::BuildString => self.helper_sp(&ins, d, addr!(h::h_build_string), Some(arg as i64), None, d - arg as i32),
-            Op::ListAppend | Op::SetAdd | Op::ListExtend | Op::SetUpdate | Op::DictUpdate | Op::DictMerge => {
+            Op::ListAppend => {
+                // (jit6) inline append to the comprehension's exact list while it has
+                // room (single-threaded, as the other lock-free list paths)
+                let generic = self.a.label();
+                let done = self.a.label();
+                let lm = self.slot(d - 1 - arg as i32);
+                let vm = self.slot(d - 1);
+                self.a.mov_ri(Rdx, (&raw const crate::threads::MULTI_THREADED) as i64);
+                self.a.cmp_mi(M(Rdx, 0), 0);
+                self.a.jcc(Cc::NE, generic);
+                self.a.load(Rax, lm);
+                self.a.mov_ri(Rcx, crate::types::list::list_type() as i64);
+                self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
+                self.a.jcc(Cc::NE, generic);
+                self.a.load(Rcx, M(Rax, LIST_SIZE));
+                self.a.cmp_rm(Rcx, M(Rax, LIST_ALLOCATED));
+                self.a.jcc(Cc::GE, generic);
+                self.a.load(Rdx, M(Rax, LIST_ITEMS));
+                self.a.load(Rsi, vm);
+                self.a.store_idx(Rdx, Rcx, 8, 0, Rsi);
+                self.a.add_ri(Rcx, 1);
+                self.a.store(M(Rax, LIST_SIZE), Rcx);
+                self.a.jmp(done);
+                self.a.bind(generic);
+                self.helper_sp(&ins, d, addr!(h::h_container_op), Some(0), Some(arg as i64), d - 1);
+                self.a.bind(done);
+            }
+            Op::SetAdd | Op::ListExtend | Op::SetUpdate | Op::DictUpdate | Op::DictMerge => {
                 let which = match ins.op {
                     Op::ListAppend => 0,
                     Op::SetAdd => 1,
