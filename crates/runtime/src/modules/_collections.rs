@@ -74,9 +74,14 @@ fn dq(o: &PyObject) -> &mut Deque {
 /// asyncio's ready queue, executor work lists). `f` must not run Python code and must
 /// not drop references: removed items are returned and released after the lock is
 /// gone, since a finalizer may use the same deque.
+/// The lock is the object lock of objlock.rs (recursive): searches (index, count,
+/// `in`, remove) hold it across their comparisons, as CPython's critical section
+/// does, so that other threads' appends wait instead of making the search fail with
+/// "mutated during iteration"; a comparison that mutates the deque itself (same
+/// thread) is still detected through `state`.
 #[inline]
 fn with_dq<R>(o: &PyObject, f: impl FnOnce(&mut Deque) -> R) -> R {
-    let _g = dict::ob_lock(o);
+    let _g = crate::objlock::lock(o);
     f(dq(o))
 }
 
@@ -299,6 +304,7 @@ fn scan(o: &PyObject, v: &PyObject, start: usize, stop: usize, mut f: impl FnMut
 }
 
 fn deque_count(o: &PyObject, v: &PyObject) -> PyResult {
+    let _whole = crate::objlock::lock(o); // held across the comparisons (see with_dq)
     let mut n = 0i64;
     let len = deque_length(o);
     scan(o, v, 0, len, |_| {
@@ -309,6 +315,7 @@ fn deque_count(o: &PyObject, v: &PyObject) -> PyResult {
 }
 
 fn deque_index(o: &PyObject, a: &[&PyObject]) -> PyResult {
+    let _whole = crate::objlock::lock(o); // held across the comparisons (see with_dq)
     crate::args::check_pos("index", a, 1, 3)?;
     let len = deque_length(o) as isize;
     let norm = |x: &PyObject| -> PyResult<isize> {
@@ -337,6 +344,7 @@ fn deque_index(o: &PyObject, a: &[&PyObject]) -> PyResult {
 }
 
 fn deque_contains_impl(o: &PyObject, v: &PyObject) -> PyResult<bool> {
+    let _whole = crate::objlock::lock(o); // held across the comparisons (see with_dq)
     let mut found = false;
     let len = deque_length(o);
     scan(o, v, 0, len, |_| {
@@ -356,6 +364,7 @@ unsafe extern "C" fn deque_contains(o: *mut PyObject, v: *mut PyObject) -> c_int
 }
 
 fn deque_remove(o: &PyObject, v: &PyObject) -> PyResult {
+    let _whole = crate::objlock::lock(o); // held across the comparisons (see with_dq)
     let state = deque_state(o);
     let len = deque_length(o);
     for i in 0..len {

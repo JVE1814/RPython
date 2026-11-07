@@ -93,6 +93,20 @@ pub fn lock(o: &PyObject) -> ObjGuard {
     }
 }
 
+/// Define `extern "C" fn $name(self, args...)` that calls slot function `$f` with
+/// `self` locked: `crate::locked_slot!(l_len, my_len, () -> isize);`
+#[macro_export]
+macro_rules! locked_slot {
+    ($name:ident, $f:path, ($($arg:ident: $t:ty),*) -> $ret:ty) => {
+        unsafe extern "C" fn $name(o: *mut $crate::ffi::PyObject $(, $arg: $t)*) -> $ret {
+            unsafe {
+                let _g = $crate::objlock::lock(&*o);
+                $f(o $(, $arg)*)
+            }
+        }
+    };
+}
+
 /// Run `f` with `o` locked.
 #[inline]
 pub fn with<R>(o: &PyObject, f: impl FnOnce() -> R) -> R {

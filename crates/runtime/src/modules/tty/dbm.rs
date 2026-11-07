@@ -565,6 +565,13 @@ fn m_exit(o: &PyObject, _args: &[&PyObject]) -> PyResult {
     Ok(none::none_ref())
 }
 
+// The database handle is not thread-safe: every slot and method runs with the object lock.
+crate::locked_slot!(l_db_len, db_len, () -> Py_ssize_t);
+crate::locked_slot!(l_db_bool, db_bool, () -> c_int);
+crate::locked_slot!(l_db_subscript, db_subscript, (k: *mut PyObject) -> *mut PyObject);
+crate::locked_slot!(l_db_ass_subscript, db_ass_subscript, (k: *mut PyObject, v: *mut PyObject) -> c_int);
+crate::locked_slot!(l_db_contains, db_contains, (k: *mut PyObject) -> c_int);
+
 fn init_db_type(t: *mut PyTypeObject, name: &'static CStr, gnu: bool) -> PyResult<()> {
     unsafe {
         if (*t).tp_flags & Py_TPFLAGS_READY != 0 {
@@ -572,15 +579,15 @@ fn init_db_type(t: *mut PyTypeObject, name: &'static CStr, gnu: bool) -> PyResul
         }
         fc::init_robj_type::<Db>(t, name, Py_TPFLAGS_DISALLOW_INSTANTIATION);
         let mut sq: PySequenceMethods = std::mem::zeroed();
-        sq.sq_contains = Some(db_contains);
+        sq.sq_contains = Some(l_db_contains);
         (*t).tp_as_sequence = Box::into_raw(Box::new(sq));
         let mut mp: PyMappingMethods = std::mem::zeroed();
-        mp.mp_length = Some(db_len);
-        mp.mp_subscript = Some(db_subscript);
-        mp.mp_ass_subscript = Some(db_ass_subscript);
+        mp.mp_length = Some(l_db_len);
+        mp.mp_subscript = Some(l_db_subscript);
+        mp.mp_ass_subscript = Some(l_db_ass_subscript);
         (*t).tp_as_mapping = Box::into_raw(Box::new(mp));
         let mut nb: PyNumberMethods = std::mem::zeroed();
-        nb.nb_bool = Some(db_bool);
+        nb.nb_bool = Some(l_db_bool);
         (*t).tp_as_number = Box::into_raw(Box::new(nb));
         (*t).tp_methods = if gnu {
             mdefs![
@@ -607,6 +614,7 @@ fn init_db_type(t: *mut PyTypeObject, name: &'static CStr, gnu: bool) -> PyResul
                 ("__exit__", FAST, m_exit),
             ]
         };
+        crate::methods::lock_self_methods(t);
         typeobject::type_ready(t)?;
     }
     Ok(())

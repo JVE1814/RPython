@@ -275,6 +275,23 @@ pub fn thread_exit() {
     }
 }
 
+/// The caller is at a quiescent point and wants deferred releases done as far as
+/// possible right now (thread join: references the joined thread dropped while other
+/// threads existed sit in batches it handed over at exit; `Thread.join()` followed by
+/// a weakref check must see them released). With no other attached thread, every
+/// pending item of this thread and every orphaned batch is released immediately.
+pub fn quiesce_now() {
+    if crate::threads::current_ptr().is_null() {
+        return;
+    }
+    let r = my_rec();
+    r.seen.store(GLOBAL.load(SeqCst), Release);
+    if !multi_threaded() {
+        close_batch();
+    }
+    poll();
+}
+
 /// Number of retired items not yet released (diagnostics/tests).
 pub fn pending() -> usize {
     PENDING_TOTAL.load(Relaxed) + local().open.len()

@@ -529,6 +529,14 @@ unsafe extern "C" fn handle_repr(op: *mut PyObject) -> *mut PyObject {
 fn handle_ident(o: &PyObject) -> PyResult {
     Ok(int::new_int_u128(hinner(o).ident.load(Relaxed) as u128))
 }
+/// After a successful join, the joined thread's last reference drops must be visible:
+/// merge what it queued for this thread and release what it retired through QSBR
+/// (deferred because another thread existed at the time; usually none does now).
+fn after_join() {
+    crate::threads::process_merge_queue(crate::threads::current());
+    crate::qsbr::quiesce_now();
+}
+
 fn handle_join(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
     static P: crate::args::Params = crate::args::Params::new("join", &["timeout"], 0, 0);
     let [t] = crate::args::parse::<1>(&P, args, kw)?;
@@ -543,7 +551,10 @@ fn handle_join(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRes
     let h = handle_arc(o);
     match h.effective_state() {
         HState::NotStarted => raise!(RuntimeError, "thread not started"),
-        HState::Done => return Ok(none::none_ref()),
+        HState::Done => {
+            after_join();
+            return Ok(none::none_ref());
+        }
         _ => {}
     }
     if h.ident.load(Relaxed) == my_ident() {
@@ -560,6 +571,9 @@ fn handle_join(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRes
         |s| *s == HState::Done || h.lost_by_fork(fgen),
         timeout,
     )?;
+    if h.effective_state() == HState::Done {
+        after_join();
+    }
     Ok(none::none_ref())
 }
 fn handle_is_done(o: &PyObject) -> PyResult {
