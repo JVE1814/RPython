@@ -521,7 +521,7 @@ pub unsafe extern "C" fn h_binary_subscr(sp: *mut *mut PyObject) -> u64 {
 pub unsafe extern "C" fn h_store_subscr(sp: *mut *mut PyObject) -> u64 {
     unsafe {
         let k = take_sr(sp.sub(1));
-        let c = take_sr(sp.sub(2));
+        let c = take_sr(sp.sub(2)).owned_for_setitem();
         let v = take_sr(sp.sub(3));
         let r = if dict::is_dict_exact(&c) { dict::set_item(&c, &k, &v) } else { ab::setitem(&c, &k, Some(&v)) };
         if r.is_ok() { OK } else { ERR }

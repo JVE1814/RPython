@@ -1196,7 +1196,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                         Op::StoreSubscr => {
                             adapt!(super::adaptive::store_subscr(unsafe { &*peek!(f, 2) }, unsafe { &*peek!(f, 1) }));
                             let k = popsr!(f);
-                            let c = popsr!(f);
+                            let c = popsr!(f).owned_for_setitem();
                             let v = popsr!(f);
                             if dict::is_dict_exact(&c) {
                                 dict::set_item(&c, &k, &v)?;
