@@ -647,35 +647,11 @@ pub unsafe extern "C" fn PyUnstable_SetImmortal(o: *mut PyObject) -> c_int {
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_TryIncRef(o: *mut PyObject) -> c_int {
-    unsafe {
-        let ob = &*o;
-        if ob.is_immortal() {
-            return 1;
-        }
-        if ob.ob_tid.load(std::sync::atomic::Ordering::Relaxed) == thread_id() {
-            if ob.ob_ref_local.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-                return 0;
-            }
-            incref(o);
-            return 1;
-        }
-        let mut cur = ob.ob_ref_shared.load(std::sync::atomic::Ordering::Relaxed);
-        loop {
-            if cur == 0 || cur == REF_MERGED {
-                return 0;
-            }
-            match ob.ob_ref_shared.compare_exchange_weak(cur, cur + (1 << REF_SHARED_SHIFT), std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed) {
-                Ok(_) => return 1,
-                Err(x) => cur = x,
-            }
-        }
-    }
+    unsafe { crate::object::try_incref(o) as c_int }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_EnableTryIncRef(o: *mut PyObject) {
-    unsafe {
-        let _ = (*o).ob_ref_shared.compare_exchange(0, REF_MAYBE_WEAKREF, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed);
-    }
+    unsafe { crate::object::enable_try_incref(o) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_Object_EnableDeferredRefcount(_o: *mut PyObject) -> c_int {

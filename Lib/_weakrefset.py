@@ -56,10 +56,16 @@ class WeakSet:
             self.update(data)
 
     def _commit_removals(self):
-        pending = self._pending_removals
+        # Other threads may drain the same list concurrently: pop until it is
+        # empty instead of testing first and popping afterwards.
+        take = self._pending_removals.pop
         discard = self.data.discard
-        while pending:
-            discard(pending.pop())
+        while True:
+            try:
+                ref_ = take()
+            except IndexError:
+                return
+            discard(ref_)
 
     def __iter__(self):
         with _IterationGuard(self):

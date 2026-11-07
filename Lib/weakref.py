@@ -105,10 +105,15 @@ class WeakValueDictionary(_DeferredRemovals, _collections_abc.MutableMapping):
         self.update(other, **kw)
 
     def _commit_removals(self, drop=_remove_dead_weakref):
-        queue = self._pending_removals
+        # pop until empty (another thread may drain the queue at the same time)
+        take = self._pending_removals.pop
         data = self.data
-        while queue:
-            drop(data, queue.pop())
+        while True:
+            try:
+                key = take()
+            except IndexError:
+                return
+            drop(data, key)
 
     def __getitem__(self, key):
         self._flush()
@@ -304,10 +309,14 @@ class WeakKeyDictionary(_DeferredRemovals, _collections_abc.MutableMapping):
     def _commit_removals(self):
         # Dead references never compare equal to live ones, so queued
         # removals cannot hit a live entry; some may already be gone.
-        queue = self._pending_removals
+        take = self._pending_removals.pop
         data = self.data
-        while queue:
-            data.pop(queue.pop(), None)
+        while True:
+            try:
+                wr = take()
+            except IndexError:
+                return
+            data.pop(wr, None)
 
     def _scrub_removals(self):
         data = self.data

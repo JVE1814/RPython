@@ -70,6 +70,27 @@ fn dq(o: &PyObject) -> &mut Deque {
     rs::<Deque>(o)
 }
 
+/// Run `f` on the deque's state under the deque's object lock (threads share deques:
+/// asyncio's ready queue, executor work lists). `f` must not run Python code and must
+/// not drop references: removed items are returned and released after the lock is
+/// gone, since a finalizer may use the same deque.
+#[inline]
+fn with_dq<R>(o: &PyObject, f: impl FnOnce(&mut Deque) -> R) -> R {
+    let _g = dict::ob_lock(o);
+    f(dq(o))
+}
+
+unsafe extern "C" fn deque_tp_clear(o: *mut PyObject) -> c_int {
+    unsafe {
+        let old = with_dq(&*o, |d| {
+            d.state += 1;
+            std::mem::take(&mut d.items)
+        });
+        drop(old);
+        0
+    }
+}
+
 unsafe extern "C" fn deque_new(tp: *mut PyTypeObject, _a: *mut PyObject, _k: *mut PyObject) -> *mut PyObject {
     into_c(fc::robj_new(tp, Deque { items: VecDeque::new(), maxlen: -1, state: 0 }))
 }
@@ -88,13 +109,12 @@ fn deque_init_impl(o: &PyObject, args: *mut PyObject, kw: *mut PyObject) -> PyRe
         }
         _ => -1,
     };
-    let d = dq(o);
-    d.maxlen = ml;
-    if !d.items.is_empty() {
-        let old: Vec<PyRef> = d.items.drain(..).collect();
+    let old = with_dq(o, |d| {
+        d.maxlen = ml;
         d.state += 1;
-        drop(old);
-    }
+        std::mem::take(&mut d.items)
+    });
+    drop(old);
     if let Some(it) = iterable {
         deque_extend(o, &it)?;
     }
@@ -105,30 +125,34 @@ unsafe extern "C" fn deque_init(o: *mut PyObject, args: *mut PyObject, kw: *mut 
     unsafe { int_into_c(deque_init_impl(&*o, args, kw)) }
 }
 
+/// Append `v`; returns what has to be released by the caller (the item pushed out
+/// at the other end of a full bounded deque, or `v` itself when maxlen is 0).
 fn push_right(o: &PyObject, v: PyRef) -> Option<PyRef> {
-    let d = dq(o);
-    d.state += 1;
-    if d.maxlen == 0 {
-        return Some(v);
-    }
-    d.items.push_back(v);
-    if d.maxlen >= 0 && d.items.len() as isize > d.maxlen {
-        return d.items.pop_front();
-    }
-    None
+    with_dq(o, |d| {
+        d.state += 1;
+        if d.maxlen == 0 {
+            return Some(v);
+        }
+        d.items.push_back(v);
+        if d.maxlen >= 0 && d.items.len() as isize > d.maxlen {
+            return d.items.pop_front();
+        }
+        None
+    })
 }
 
 fn push_left(o: &PyObject, v: PyRef) -> Option<PyRef> {
-    let d = dq(o);
-    d.state += 1;
-    if d.maxlen == 0 {
-        return Some(v);
-    }
-    d.items.push_front(v);
-    if d.maxlen >= 0 && d.items.len() as isize > d.maxlen {
-        return d.items.pop_back();
-    }
-    None
+    with_dq(o, |d| {
+        d.state += 1;
+        if d.maxlen == 0 {
+            return Some(v);
+        }
+        d.items.push_front(v);
+        if d.maxlen >= 0 && d.items.len() as isize > d.maxlen {
+            return d.items.pop_back();
+        }
+        None
+    })
 }
 
 fn deque_append(o: &PyObject, v: &PyObject) -> PyResult {
@@ -142,14 +166,14 @@ fn deque_appendleft(o: &PyObject, v: &PyObject) -> PyResult {
 
 fn extend_impl(o: &PyObject, iterable: &PyObject, left: bool) -> PyResult<()> {
     if iterable.is(o) {
-        let snapshot: Vec<PyRef> = dq(o).items.iter().cloned().collect();
+        let snapshot: Vec<PyRef> = with_dq(o, |d| d.items.iter().cloned().collect());
         for v in snapshot {
             drop(if left { push_left(o, v) } else { push_right(o, v) });
         }
         return Ok(());
     }
     let it = ab::get_iter(iterable)?;
-    if dq(o).maxlen == 0 {
+    if with_dq(o, |d| d.maxlen) == 0 {
         // consume the iterator
         while ab::iter_next(&it)?.is_some() {}
         return Ok(());
@@ -170,30 +194,37 @@ fn deque_extendleft(o: &PyObject, iterable: &PyObject) -> PyResult {
 }
 
 fn deque_pop(o: &PyObject) -> PyResult {
-    let d = dq(o);
-    match d.items.pop_back() {
-        Some(v) => {
+    let r = with_dq(o, |d| {
+        let v = d.items.pop_back();
+        if v.is_some() {
             d.state += 1;
-            Ok(v)
         }
+        v
+    });
+    match r {
+        Some(v) => Ok(v),
         None => raise!(IndexError, "pop from an empty deque"),
     }
 }
 fn deque_popleft(o: &PyObject) -> PyResult {
-    let d = dq(o);
-    match d.items.pop_front() {
-        Some(v) => {
+    let r = with_dq(o, |d| {
+        let v = d.items.pop_front();
+        if v.is_some() {
             d.state += 1;
-            Ok(v)
         }
+        v
+    });
+    match r {
+        Some(v) => Ok(v),
         None => raise!(IndexError, "pop from an empty deque"),
     }
 }
 
 fn deque_clear_impl(o: &PyObject) {
-    let d = dq(o);
-    let old: Vec<PyRef> = d.items.drain(..).collect();
-    d.state += 1;
+    let old = with_dq(o, |d| {
+        d.state += 1;
+        std::mem::take(&mut d.items)
+    });
     drop(old);
 }
 fn deque_clear(o: &PyObject) -> PyResult {
@@ -202,17 +233,18 @@ fn deque_clear(o: &PyObject) -> PyResult {
 }
 
 fn rotate_impl(o: &PyObject, n: isize) {
-    let d = dq(o);
-    let len = d.items.len();
-    if len <= 1 {
-        return;
-    }
-    let n = n.rem_euclid(len as isize) as usize;
-    if n == 0 {
-        return;
-    }
-    d.items.rotate_right(n);
-    d.state += 1;
+    with_dq(o, |d| {
+        let len = d.items.len();
+        if len <= 1 {
+            return;
+        }
+        let n = n.rem_euclid(len as isize) as usize;
+        if n == 0 {
+            return;
+        }
+        d.items.rotate_right(n);
+        d.state += 1;
+    })
 }
 
 fn deque_rotate(o: &PyObject, a: &[&PyObject]) -> PyResult {
@@ -230,24 +262,32 @@ fn deque_rotate(o: &PyObject, a: &[&PyObject]) -> PyResult {
 }
 
 fn deque_reverse(o: &PyObject) -> PyResult {
-    let d = dq(o);
-    d.items.make_contiguous().reverse();
-    d.state += 1;
+    with_dq(o, |d| {
+        d.items.make_contiguous().reverse();
+        d.state += 1;
+    });
     Ok(fc::none())
+}
+
+fn deque_length(o: &PyObject) -> usize {
+    with_dq(o, |d| d.items.len())
+}
+
+fn deque_state(o: &PyObject) -> u64 {
+    with_dq(o, |d| d.state)
 }
 
 /// Iterate over items comparing with `v`; detects mutation.
 fn scan(o: &PyObject, v: &PyObject, start: usize, stop: usize, mut f: impl FnMut(usize) -> bool) -> PyResult<()> {
-    let state = dq(o).state;
+    let state = deque_state(o);
     let mut i = start;
     while i < stop {
-        let d = dq(o);
-        if i >= d.items.len() {
-            break;
-        }
-        let item = d.items[i].clone();
+        let item = match with_dq(o, |d| d.items.get(i).cloned()) {
+            Some(x) => x,
+            None => break,
+        };
         let eq = item.is(v) || ab::rich_eq(&item, v)?;
-        if dq(o).state != state {
+        if deque_state(o) != state {
             raise!(RuntimeError, "deque mutated during iteration");
         }
         if eq && !f(i) {
@@ -260,7 +300,7 @@ fn scan(o: &PyObject, v: &PyObject, start: usize, stop: usize, mut f: impl FnMut
 
 fn deque_count(o: &PyObject, v: &PyObject) -> PyResult {
     let mut n = 0i64;
-    let len = dq(o).items.len();
+    let len = deque_length(o);
     scan(o, v, 0, len, |_| {
         n += 1;
         true
@@ -270,7 +310,7 @@ fn deque_count(o: &PyObject, v: &PyObject) -> PyResult {
 
 fn deque_index(o: &PyObject, a: &[&PyObject]) -> PyResult {
     crate::args::check_pos("index", a, 1, 3)?;
-    let len = dq(o).items.len() as isize;
+    let len = deque_length(o) as isize;
     let norm = |x: &PyObject| -> PyResult<isize> {
         let mut i = ab::index_as_ssize(x, None)?;
         if i < 0 {
@@ -298,7 +338,7 @@ fn deque_index(o: &PyObject, a: &[&PyObject]) -> PyResult {
 
 fn deque_contains_impl(o: &PyObject, v: &PyObject) -> PyResult<bool> {
     let mut found = false;
-    let len = dq(o).items.len();
+    let len = deque_length(o);
     scan(o, v, 0, len, |_| {
         found = true;
         false
@@ -316,23 +356,32 @@ unsafe extern "C" fn deque_contains(o: *mut PyObject, v: *mut PyObject) -> c_int
 }
 
 fn deque_remove(o: &PyObject, v: &PyObject) -> PyResult {
-    let state = dq(o).state;
-    let len = dq(o).items.len();
+    let state = deque_state(o);
+    let len = deque_length(o);
     for i in 0..len {
-        let item = match dq(o).items.get(i) {
-            Some(x) => x.clone(),
+        let item = match with_dq(o, |d| d.items.get(i).cloned()) {
+            Some(x) => x,
             None => break,
         };
         let eq = item.is(v) || ab::rich_eq(&item, v)?;
-        if dq(o).state != state {
-            raise!(IndexError, "deque mutated during remove().");
-        }
-        if eq {
-            let d = dq(o);
-            let r = d.items.remove(i);
+        // re-check and remove under one lock hold
+        let removed = with_dq(o, |d| {
+            if d.state != state {
+                return Err(());
+            }
+            if !eq {
+                return Ok(None);
+            }
             d.state += 1;
-            drop(r);
-            return Ok(fc::none());
+            Ok(d.items.remove(i))
+        });
+        match removed {
+            Err(()) => raise!(IndexError, "deque mutated during remove()."),
+            Ok(Some(r)) => {
+                drop(r);
+                return Ok(fc::none());
+            }
+            Ok(None) => {}
         }
     }
     raise!(ValueError, "{} is not in deque", ab::repr_string(v)?);
@@ -340,71 +389,89 @@ fn deque_remove(o: &PyObject, v: &PyObject) -> PyResult {
 
 fn deque_insert(o: &PyObject, a: &[&PyObject]) -> PyResult {
     crate::args::check_pos("insert", a, 2, 2)?;
-    let mut i = fc::ssize_arg(a[0])?;
-    let d = dq(o);
-    let n = d.items.len() as isize;
-    if d.maxlen >= 0 && n >= d.maxlen {
+    let i = fc::ssize_arg(a[0])?;
+    let v = a[1].to_ref();
+    let full = with_dq(o, |d| {
+        let n = d.items.len() as isize;
+        if d.maxlen >= 0 && n >= d.maxlen {
+            return Some(v);
+        }
+        let mut i = i;
+        if i < 0 {
+            i += n;
+            if i < 0 {
+                i = 0;
+            }
+        }
+        if i > n {
+            i = n;
+        }
+        d.items.insert(i as usize, v);
+        d.state += 1;
+        None
+    });
+    if full.is_some() {
+        drop(full);
         raise!(IndexError, "deque already at its maximum size");
     }
-    if i < 0 {
-        i += n;
-        if i < 0 {
-            i = 0;
-        }
-    }
-    if i > n {
-        i = n;
-    }
-    d.items.insert(i as usize, a[1].to_ref());
-    d.state += 1;
     Ok(fc::none())
 }
 
 unsafe extern "C" fn deque_len(o: *mut PyObject) -> Py_ssize_t {
-    unsafe { dq(&*o).items.len() as Py_ssize_t }
+    unsafe { deque_length(&*o) as Py_ssize_t }
 }
 
 unsafe extern "C" fn deque_item(o: *mut PyObject, i: Py_ssize_t) -> *mut PyObject {
     unsafe {
-        let d = dq(&*o);
-        if i < 0 || i as usize >= d.items.len() {
-            return into_c(Err(err!(IndexError, "deque index out of range")));
+        let r = with_dq(&*o, |d| if i < 0 { None } else { d.items.get(i as usize).cloned() });
+        match r {
+            Some(v) => v.into_raw(),
+            None => into_c(Err(err!(IndexError, "deque index out of range"))),
         }
-        d.items[i as usize].clone().into_raw()
     }
 }
 
 unsafe extern "C" fn deque_ass_item(o: *mut PyObject, i: Py_ssize_t, v: *mut PyObject) -> c_int {
     unsafe {
-        let d = dq(&*o);
-        if i < 0 || i as usize >= d.items.len() {
-            let _ = err!(IndexError, "deque index out of range");
-            return -1;
+        let new = if v.is_null() { None } else { Some((*v).to_ref()) };
+        let r = with_dq(&*o, |d| {
+            if i < 0 || i as usize >= d.items.len() {
+                return Err(new);
+            }
+            Ok(match new {
+                None => {
+                    d.state += 1;
+                    d.items.remove(i as usize)
+                }
+                Some(n) => Some(std::mem::replace(&mut d.items[i as usize], n)),
+            })
+        });
+        match r {
+            Ok(old) => {
+                drop(old);
+                0
+            }
+            Err(new) => {
+                drop(new);
+                let _ = err!(IndexError, "deque index out of range");
+                -1
+            }
         }
-        if v.is_null() {
-            let r = d.items.remove(i as usize);
-            d.state += 1;
-            drop(r);
-        } else {
-            let old = std::mem::replace(&mut d.items[i as usize], (*v).to_ref());
-            drop(old);
-        }
-        0
     }
 }
 
 /// Make a copy with the same type and maxlen.
 fn deque_copy(o: &PyObject) -> PyResult {
-    let d = dq(o);
+    let maxlen = with_dq(o, |d| d.maxlen);
     if o.is_type(deque_type()) {
-        let items = d.items.clone();
-        return fc::robj_new(deque_type(), Deque { items, maxlen: d.maxlen, state: 0 });
+        let (items, maxlen) = with_dq(o, |d| (d.items.clone(), d.maxlen));
+        return fc::robj_new(deque_type(), Deque { items, maxlen, state: 0 });
     }
     let tp = type_ref(o.type_ptr());
-    let r = if d.maxlen < 0 {
+    let r = if maxlen < 0 {
         ab::call(&tp, &[o])?
     } else {
-        let ml = int::new_int(d.maxlen as i64);
+        let ml = int::new_int(maxlen as i64);
         let names = tuple::new_tuple(vec![pystr::new_str("maxlen")]);
         ab::call_kw(&tp, &[o, &ml], Some(&names))?
     };
@@ -438,27 +505,27 @@ unsafe extern "C" fn deque_inplace_concat(a: *mut PyObject, b: *mut PyObject) ->
 }
 
 fn repeat_inplace(o: &PyObject, n: isize) {
-    let d = dq(o);
-    if n <= 0 || d.items.is_empty() {
-        let old: Vec<PyRef> = d.items.drain(..).collect();
-        d.state += 1;
-        drop(old);
-        return;
-    }
     if n == 1 {
         return;
     }
-    let base: Vec<PyRef> = d.items.iter().cloned().collect();
-    let total = base.len().saturating_mul(n as usize);
-    let keep = if d.maxlen >= 0 { total.min(d.maxlen as usize) } else { total };
-    // only the last `keep` items survive
-    let mut out = VecDeque::with_capacity(keep);
-    let start = total - keep;
-    for k in start..total {
-        out.push_back(base[k % base.len()].clone());
-    }
-    let old = std::mem::replace(&mut d.items, out);
-    d.state += 1;
+    // building the result only increfs, so all of it happens under the lock
+    let old = with_dq(o, |d| {
+        if n <= 0 || d.items.is_empty() {
+            d.state += 1;
+            return std::mem::take(&mut d.items);
+        }
+        let len = d.items.len();
+        let total = len.saturating_mul(n as usize);
+        let keep = if d.maxlen >= 0 { total.min(d.maxlen as usize) } else { total };
+        // only the last `keep` items survive
+        let mut out = VecDeque::with_capacity(keep);
+        let start = total - keep;
+        for k in start..total {
+            out.push_back(d.items[k % len].clone());
+        }
+        d.state += 1;
+        std::mem::replace(&mut d.items, out)
+    });
     drop(old);
 }
 
@@ -504,7 +571,7 @@ unsafe extern "C" fn deque_repr(o: *mut PyObject) -> *mut PyObject {
             let l = ab::sequence_list(o)?;
             let lr = ab::repr_string(&l)?;
             let name = fc::repr_type_name(o);
-            let ml = dq(o).maxlen;
+            let ml = with_dq(o, |d| d.maxlen);
             if ml >= 0 {
                 Ok(pystr::new_str(&format!("{}({}, maxlen={})", name, lr, ml)))
             } else {
@@ -516,7 +583,7 @@ unsafe extern "C" fn deque_repr(o: *mut PyObject) -> *mut PyObject {
 
 fn deque_reduce(o: &PyObject) -> PyResult {
     let tp = type_ref(o.type_ptr());
-    let ml = dq(o).maxlen;
+    let ml = with_dq(o, |d| d.maxlen);
     let args = if ml < 0 {
         tuple::empty_tuple()
     } else {
@@ -528,14 +595,14 @@ fn deque_reduce(o: &PyObject) -> PyResult {
 }
 
 fn deque_get_maxlen(o: &PyObject) -> PyResult {
-    let ml = dq(o).maxlen;
+    let ml = with_dq(o, |d| d.maxlen);
     Ok(if ml < 0 { fc::none() } else { int::new_int(ml as i64) })
 }
 
 fn deque_sizeof(o: &PyObject) -> PyResult {
-    let d = dq(o);
+    let cap = with_dq(o, |d| d.items.capacity());
     let base = std::mem::size_of::<fc::RObj<Deque>>();
-    Ok(int::new_int((base + d.items.capacity() * 8) as i64))
+    Ok(int::new_int((base + cap * 8) as i64))
 }
 
 // ------------------------------------------------------------------ deque iterators
@@ -553,11 +620,10 @@ impl Trav for DequeIter {
 }
 
 fn new_deque_iter(tp: *mut PyTypeObject, d: &PyObject, reverse: bool, skip: usize) -> PyResult {
-    let dd = dq(d);
-    let len = dd.items.len();
+    let (len, state) = with_dq(d, |dd| (dd.items.len(), dd.state));
     let it = fc::robj_new(
         tp,
-        DequeIter { deque: Some(d.to_ref()), index: if reverse { len.wrapping_sub(1) } else { 0 }, state: dd.state, counter: len },
+        DequeIter { deque: Some(d.to_ref()), index: if reverse { len.wrapping_sub(1) } else { 0 }, state, counter: len },
     )?;
     for _ in 0..skip {
         let s = rs::<DequeIter>(&it);
@@ -582,26 +648,38 @@ fn deque_reversed(o: &PyObject) -> PyResult {
 }
 
 fn dequeiter_next_impl(o: &PyObject, reverse: bool) -> PyResult<Option<PyRef>> {
-    let s = rs::<DequeIter>(o);
-    let d = match &s.deque {
-        Some(d) => d.clone(),
-        None => return Ok(None),
+    // iterator lock, then deque lock (never the other way round); no Python code
+    // runs while either is held
+    let r = {
+        let _it = dict::ob_lock(o);
+        let s = rs::<DequeIter>(o);
+        let d = match &s.deque {
+            Some(d) => d.as_ptr(),
+            None => return Ok(None),
+        };
+        let d = unsafe { &*d };
+        with_dq(d, |dd| {
+            if dd.state != s.state {
+                s.counter = 0;
+                return Err(());
+            }
+            if s.counter == 0 {
+                return Ok(None);
+            }
+            let v = dd.items.get(s.index).cloned();
+            s.counter -= 1;
+            if reverse {
+                s.index = s.index.wrapping_sub(1);
+            } else {
+                s.index += 1;
+            }
+            Ok(v)
+        })
     };
-    if dq(&d).state != s.state {
-        s.counter = 0;
-        raise!(RuntimeError, "deque mutated during iteration");
+    match r {
+        Ok(v) => Ok(v),
+        Err(()) => raise!(RuntimeError, "deque mutated during iteration"),
     }
-    if s.counter == 0 {
-        return Ok(None);
-    }
-    let v = dq(&d).items.get(s.index).cloned();
-    s.counter -= 1;
-    if reverse {
-        s.index = s.index.wrapping_sub(1);
-    } else {
-        s.index += 1;
-    }
-    Ok(v)
 }
 
 unsafe extern "C" fn dequeiter_next(o: *mut PyObject) -> *mut PyObject {
@@ -645,7 +723,7 @@ fn dequeiter_length_hint(o: &PyObject) -> PyResult {
 fn dequeiter_reduce(o: &PyObject) -> PyResult {
     let s = rs::<DequeIter>(o);
     let d = s.deque.clone().unwrap();
-    let len = dq(&d).items.len();
+    let len = deque_length(&d);
     let consumed = len.saturating_sub(s.counter);
     Ok(tuple::tuple2(type_ref(o.type_ptr()), tuple::tuple2(d, int::new_int(consumed as i64))))
 }
@@ -935,6 +1013,7 @@ fn init_types() -> PyResult<()> {
         }
         fc::init_robj_type::<Deque>(t, c"collections.deque", Py_TPFLAGS_BASETYPE | Py_TPFLAGS_SEQUENCE);
         (*t).tp_new = Some(deque_new);
+        (*t).tp_clear = Some(deque_tp_clear);
         (*t).tp_init = Some(deque_init);
         (*t).tp_iter = Some(deque_iter);
         (*t).tp_repr = Some(deque_repr);

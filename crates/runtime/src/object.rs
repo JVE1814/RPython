@@ -187,6 +187,52 @@ pub unsafe fn decref_shared(op: *mut PyObject) {
     }
 }
 
+/// Take a new reference to `op` unless it is already being deallocated, for callers
+/// that reach the object through a pointer that does not own a reference (weakref
+/// lists, caches). The object's memory must stay valid during the call (the caller
+/// holds the lock its deallocator must take first). Races with the owner's final
+/// decref are decided by the CAS on the shared field: the owner gives up an object
+/// with references from other threads through a CAS too (merge), and frees directly
+/// only when the shared field is exactly 0, which this function never increments.
+/// So the shared field must be non-zero for other threads to succeed while the owner
+/// holds only local references: `enable_try_incref` sets the MAYBE_WEAKREF flag.
+pub unsafe fn try_incref(op: *mut PyObject) -> bool {
+    unsafe {
+        let o = &*op;
+        if o.is_immortal() {
+            return true;
+        }
+        if o.ob_tid.load(Relaxed) == thread_id() {
+            let local = o.ob_ref_local.load(Relaxed);
+            if local == 0 {
+                return false; // the owner (this thread) is deallocating it
+            }
+            o.ob_ref_local.store(local + 1, Relaxed);
+            return true;
+        }
+        let mut cur = o.ob_ref_shared.load(Relaxed);
+        loop {
+            if cur == 0 || ((cur & REF_SHARED_FLAG_MASK) == REF_MERGED && (cur >> REF_SHARED_SHIFT) <= 0) {
+                return false;
+            }
+            match o.ob_ref_shared.compare_exchange_weak(cur, cur + (1 << REF_SHARED_SHIFT), AcqRel, Relaxed) {
+                Ok(_) => return true,
+                Err(x) => cur = x,
+            }
+        }
+    }
+}
+
+/// Allow `try_incref` from other threads while `op`'s shared field would be 0.
+pub unsafe fn enable_try_incref(op: *mut PyObject) {
+    unsafe {
+        let o = &*op;
+        if !o.is_immortal() {
+            let _ = o.ob_ref_shared.compare_exchange(0, REF_MAYBE_WEAKREF, Relaxed, Relaxed);
+        }
+    }
+}
+
 /// Merge an object's local count into the shared count (owner thread only,
 /// or any thread at a safepoint when the owner has exited).
 pub unsafe fn explicit_merge(op: *mut PyObject) {

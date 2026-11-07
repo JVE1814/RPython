@@ -61,6 +61,7 @@ pip_install() { # venv-python
 # run_suite NAME VENV-PYTHON
 run_suite() {
     local name="$1" py="$2" dir="$OUT/$1"
+    shift 2
     mkdir -p "$dir"
     echo "== $name: pytest --pyargs $TESTPKG"
     local start=$SECONDS

@@ -172,10 +172,10 @@ fn referent(o: &PyObject) -> Option<PyRef> {
         return None;
     }
     unsafe {
-        if (*p).refcnt() <= 0 {
+        if !crate::object::try_incref(p) {
             return None;
         }
-        Some(PyRef::from_borrowed(p))
+        Some(PyRef::from_raw(p))
     }
 }
 pub fn get_object(o: &PyObject) -> Option<PyRef> {
@@ -223,8 +223,8 @@ pub fn weakrefs_of(o: &PyObject) -> Vec<PyRef> {
         }
         let mut r = head(slot);
         while !r.is_null() {
-            if (*(r as *mut PyObject)).refcnt() > 0 {
-                v.push(PyRef::from_borrowed(r as *mut PyObject));
+            if crate::object::try_incref(r as *mut PyObject) {
+                v.push(PyRef::from_raw(r as *mut PyObject));
             }
             r = (*r).wr_next;
         }
@@ -260,8 +260,8 @@ pub fn new_ref(tp: *mut PyTypeObject, ob: &PyObject, callback: Option<&PyObject>
     if tp == ref_type() && callback.is_none() {
         let _g = list_lock();
         let (basic, _) = unsafe { get_basic_refs(slot) };
-        if !basic.is_null() && unsafe { (*(basic as *mut PyObject)).refcnt() } > 0 {
-            return Ok(unsafe { PyRef::from_borrowed(basic as *mut PyObject) });
+        if !basic.is_null() && unsafe { crate::object::try_incref(basic as *mut PyObject) } {
+            return Ok(unsafe { PyRef::from_raw(basic as *mut PyObject) });
         }
     }
     let op = unsafe {
@@ -276,6 +276,8 @@ pub fn new_ref(tp: *mut PyTypeObject, ob: &PyObject, callback: Option<&PyObject>
     unsafe {
         init_ref(r, ob.as_ptr(), callback);
         let _g = list_lock();
+        crate::object::enable_try_incref(ob.as_ptr());
+        crate::object::enable_try_incref(op);
         let (basic_ref, basic_proxy) = get_basic_refs(slot);
         if callback.is_none() && tp == ref_type() {
             insert_head(r, slot);
@@ -293,8 +295,8 @@ pub fn new_proxy(ob: &PyObject, callback: Option<&PyObject>) -> PyResult {
     if callback.is_none() {
         let _g = list_lock();
         let (_, basic) = unsafe { get_basic_refs(slot) };
-        if !basic.is_null() && unsafe { (*(basic as *mut PyObject)).refcnt() } > 0 {
-            return Ok(unsafe { PyRef::from_borrowed(basic as *mut PyObject) });
+        if !basic.is_null() && unsafe { crate::object::try_incref(basic as *mut PyObject) } {
+            return Ok(unsafe { PyRef::from_raw(basic as *mut PyObject) });
         }
     }
     let tp = if ab::is_callable(ob) { callable_proxy_type() } else { proxy_type() };
@@ -304,6 +306,8 @@ pub fn new_proxy(ob: &PyObject, callback: Option<&PyObject>) -> PyResult {
         init_ref(r, ob.as_ptr(), callback);
         crate::gc::track(op);
         let _g = list_lock();
+        crate::object::enable_try_incref(ob.as_ptr());
+        crate::object::enable_try_incref(op);
         let (basic_ref, basic_proxy) = get_basic_refs(slot);
         if callback.is_none() {
             if basic_ref.is_null() { insert_head(r, slot) } else { insert_after(r, basic_ref) }
@@ -349,8 +353,8 @@ pub unsafe fn clear_weakrefs_at(o: *mut PyObject, list: *mut *mut PyObject) {
                 let cb = std::mem::replace(&mut (*r).wr_callback, std::ptr::null_mut());
                 if !cb.is_null() {
                     let ro = r as *mut PyObject;
-                    if (*ro).refcnt() > 0 {
-                        pending.push((PyRef::from_borrowed(ro), PyRef::from_raw(cb)));
+                    if crate::object::try_incref(ro) {
+                        pending.push((PyRef::from_raw(ro), PyRef::from_raw(cb)));
                     } else {
                         // the weakref itself is dying: just drop the callback
                         dead_cbs.push(PyRef::from_raw(cb));
