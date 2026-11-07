@@ -656,15 +656,47 @@ with core4 merged later).
   object; `lst[a:b] = other_list` of equal length replaced in place (both list locks in
   address order); extended list slices without an intermediate vector
   (`list::new_list_strided`). fannkuch 5725 -> 3789.
+* Generator claim in `jit_send` is a plain store while the process is single-threaded
+  (`_thread` and `PyThread_start_new_thread` now set `MULTI_THREADED` before the second
+  thread starts; foreign threads attaching via PyGILState_Ensure still set it from the
+  new thread). generators wall 0.0317 -> 0.0283 s (CPython 0.0205).
 * `new_function` remembers its two globals lookups (`__builtins__`, `__name__`) per
   thread while the globals dict's version is unchanged (genexpr/closure creation).
 
 ### Measurements
 Steady-state instructions per loop (callgrind, `tools/bench/perloop.sh`, same windows as
 jit3/jit4: -a 2 -b 5; deltablue/hexiom 5/15; fannkuch 1/3; unpack_sequence 2000/6000;
-comprehensions 1000/3000). See the report table (PROGRESS/final report) for the full
-list; wall-clock: tools/bench/run_bench.sh pinned to one core, all benchmarks, ours vs
-both baselines.
+comprehensions 1000/3000); binary at da4b72a (before the last two commits). CPython
+columns from the jit3 table (same harness). ratio = ours / best CPython.
+
+| bench | CPython default | CPython ft | jit4 | jit5 | ratio |
+|---|---|---|---|---|---|
+| richards | 461.1 | 565.8 | 314.3 | 282.8-322.6 | 0.61-0.70 |
+| nbody | 1107.5 | 1401.5 | 359.8 | 359.8 | 0.32 |
+| spectral_norm | 1207.8 | 1403.9 | 636.0 | 643.5 | 0.53 |
+| float | 778.4 | 870.1 | 702.2 | 702.9 | 0.90 |
+| richards_super | 530.4 | 639.0 | 484.4 | 454.0 | 0.86 |
+| chaos | 610.7 | 682.6 | 486.3 | 408.0 | 0.67 |
+| raytrace | 2757.1 | 3200.8 | 2776.3 | 2704.8 | 0.98 |
+| go | 1138.4 | 1259.6 | 1511-2167 | 1173-1244 | 1.03-1.09 |
+| generators | 337.1 | 372.4 | 477.9 | 351.8 | 1.04 |
+| coroutines | 294.4 | 299.9 | 289.7 | 281.6 | 0.96 |
+| nqueens | 841.8 | 942.5 | 1860.1 | 1043.7 | 1.24 |
+| deltablue | 29.1 | 42.4 | 36.9 | 23.1-34.4 | 0.79-1.18 |
+| hexiom | 58.1 | 65.7 | 82.7 | 53.8 | 0.93 |
+| fannkuch | 4392.7 | 4962.9 | 5779.9 | 3849.2 | 0.88 |
+| unpack_sequence | 0.25 | 0.15 | 0.11 | 0.11 | 0.73 |
+| comprehensions | 0.19 | 0.24 | 0.39 | 0.18-0.24 | 0.95-1.26 |
+
+Wall-clock: see the full-suite table in the jit5 report (tools/bench/run_bench.sh, each
+benchmark run back to back on ours / py-default / py-ft, pinned to one core). Wall time
+is far more sensitive to machine load than for CPython (a first full run with callgrind
+jobs on the other three cores gave go 0.142 s vs 0.093 s on a quiet machine). cachegrind
+(cache + branch simulation) on generators shows our D1 misses equal to CPython's and
+fewer mispredictions, yet wall time is 1.4x: the remaining gap is outside what valgrind
+models; locked instructions are one measured cause (the generator claim CAS alone was
+11% of generators' wall time; making `dict::ob_lock` non-atomic while single-threaded
+gave no measurable change, so it was not kept).
 
 Note on variance: some small benchmarks are bimodal between runs of the same binary
 (deltablue 23.5 or 34.4, richards 283 or 323): whether tier-2 discards/recompiles (e.g.
