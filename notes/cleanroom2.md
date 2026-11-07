@@ -118,3 +118,8 @@
   called too many times" and the negative-timeout ValueError.  put()/get() have an inline fast
   path and share one waiting helper (`_wait_until`) for the blocking cases; shutdown
   semantics as documented.  Timing (put+get, uncontended, ns): ~equal (noise > difference).
+- http/cookies.py — audited: body is own code (own `_has_control_character`, `_escape_char`,
+  regex-based unquoting), but kept CPython's helper names and `_getdate`'s signature.
+  Renamed `_LegalChars/_UnescapedChars/_quote/_unquote/_getdate` to own names and rewrote the
+  date helper.  Kept `Morsel._reserved` (asserted by test_http_cookies).
+  test_http_cookies 35 =, test_http_cookiejar 81 =.
