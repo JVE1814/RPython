@@ -733,13 +733,13 @@ class Task(Future):
             else:
                 Future.set_result(self, stop.value)
         except _exceptions.CancelledError as cancelled:
-            self._fut_cancelled_exc = cancelled
+            self._fut_cancelled_exc = _without_step_entry(cancelled)
             Future.cancel(self)
         except (KeyboardInterrupt, SystemExit) as fatal:
-            Future.set_exception(self, fatal)
+            Future.set_exception(self, _without_step_entry(fatal))
             raise
         except BaseException as failure:
-            Future.set_exception(self, failure)
+            Future.set_exception(self, _without_step_entry(failure))
         else:
             self._task_handle_yield(result)
         finally:
@@ -843,6 +843,20 @@ for _name in ('_get_running_loop', '_set_running_loop', 'get_running_loop',
               '_swap_current_task', 'current_task', 'all_tasks'):
     globals()[_name] = _builtin_function(globals()[_name])
 del _name
+_STEP_CODE = Task._task_step_run_and_handle.__code__
+
+
+def _without_step_entry(exc):
+    # A native task step adds no traceback entry where it catches what the
+    # coroutine raised; this Python step does.  Drop that entry: tracebacks
+    # then look like CPython's, and the step's frame (whose f_back chain
+    # reaches the task and its creator) is not kept alive by the exception.
+    tb = exc.__traceback__
+    if tb is not None and tb.tb_frame.f_code is _STEP_CODE:
+        exc.__traceback__ = tb.tb_next
+    return exc
+
+
 Future.__module__ = Task.__module__ = '_asyncio'
 "#;
 
