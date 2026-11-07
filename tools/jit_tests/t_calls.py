@@ -136,3 +136,24 @@ def ns():
     return out
 
 print(ns())
+
+# jit5: direct calls that fill trailing parameters from __defaults__
+def dflt(a, b=10, c=[1]):
+    return a + b + len(c)
+
+def call_dflt(n):
+    t = 0
+    for i in range(n):
+        t += dflt(i) + dflt(i, 2) + dflt(i, 2, [])
+        if i == 150:
+            dflt.__defaults__ = (100, [1, 2, 3])
+        if i == 250:
+            dflt.__defaults__ = (7, 8, 1000, [])  # more defaults than parameters
+    return t
+
+print(call_dflt(400))
+try:
+    dflt.__defaults__ = None
+    dflt(1)
+except TypeError as e:
+    print('TypeError', e)

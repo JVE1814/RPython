@@ -391,8 +391,20 @@ pub unsafe extern "C" fn h_call_py(base: *mut *mut PyObject, n: u64) -> u64 {
         let target = cc.fast_entry.load(Acquire);
         let ts = crate::threads::current();
         let depth = ts.recursion_depth.get() + 1;
+        let argc = cc.fast_argc.load(Relaxed) as usize;
+        // (jit5) trailing parameters with defaults: filled from __defaults__ below
+        let ndef = if argc == nargs {
+            0
+        } else {
+            let dt = (*f).func_defaults;
+            if nargs > argc || dt.is_null() || crate::types::tuple::tuple_len(&*dt) < argc - nargs {
+                usize::MAX
+            } else {
+                argc - nargs
+            }
+        };
         if target == 0
-            || cc.fast_argc.load(Relaxed) as usize != nargs
+            || ndef == usize::MAX
             || crate::modules::sys::tracing_active()
             || depth > ts.c.py_recursion_limit
             || crate::interp::stack_pointer() < ts.stack_soft_limit()
@@ -409,6 +421,16 @@ pub unsafe extern "C" fn h_call_py(base: *mut *mut PyObject, n: u64) -> u64 {
         for i in 0..nargs {
             *s.add(i) = *argp.add(i);
             *argp.add(i) = std::ptr::null_mut();
+        }
+        if ndef != 0 {
+            let dt = &*(*f).func_defaults;
+            let items = crate::types::tuple::tuple_items(dt);
+            let first = items.len() - ndef;
+            for k in 0..ndef {
+                let v = items[first + k].as_ptr();
+                incref(v);
+                *s.add(nargs + k) = v;
+            }
         }
         let mut target = target;
         if bump_invocations(cd) {
