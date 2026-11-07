@@ -14,15 +14,55 @@ pub struct PyCapsule {
     pub name: *const c_char,
     pub context: *mut c_void,
     pub destructor: PyCapsule_Destructor,
-    /// (capi3) unused; the size of CPython's capsule object (sys.getsizeof)
-    _reserved: [usize; 2],
+    /// (tail4) traverse/clear functions of a capsule made GC-visible with
+    /// `_PyCapsule_SetTraverse` (the two words also give CPython's object size)
+    pub traverse_func: Option<unsafe extern "C" fn(*mut PyObject, visitproc, *mut c_void) -> c_int>,
+    pub clear_func: Option<unsafe extern "C" fn(*mut PyObject) -> c_int>,
 }
 
 #[unsafe(no_mangle)]
 pub static mut PyCapsule_Type: PyTypeObject = PyTypeObject::ZERO;
 
+unsafe extern "C" fn capsule_traverse(o: *mut PyObject, visit: visitproc, arg: *mut c_void) -> c_int {
+    unsafe {
+        match (*(o as *mut PyCapsule)).traverse_func {
+            Some(f) => f(o, visit, arg),
+            None => 0,
+        }
+    }
+}
+
+unsafe extern "C" fn capsule_clear(o: *mut PyObject) -> c_int {
+    unsafe {
+        match (*(o as *mut PyCapsule)).clear_func {
+            Some(f) => f(o),
+            None => 0,
+        }
+    }
+}
+
+/// (tail4) Make capsule `op` visible to the cycle collector with the given traverse
+/// and clear functions (as CPython's private helper of the same name).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _PyCapsule_SetTraverse(
+    op: *mut PyObject,
+    traverse: Option<unsafe extern "C" fn(*mut PyObject, visitproc, *mut c_void) -> c_int>,
+    clear: Option<unsafe extern "C" fn(*mut PyObject) -> c_int>,
+) -> c_int {
+    unsafe {
+        let Some(c) = legal(op, "_PyCapsule_SetTraverse") else { return -1 };
+        c.traverse_func = traverse;
+        c.clear_func = clear;
+        if traverse.is_some() {
+            crate::gc::track(op);
+        }
+        0
+    }
+}
+
 unsafe extern "C" fn capsule_dealloc(o: *mut PyObject) {
     unsafe {
+        crate::gc::untrack(o);
         let c = &mut *(o as *mut PyCapsule);
         if let Some(d) = c.destructor {
             d(o);
@@ -48,7 +88,9 @@ pub fn init_type() {
         let t = &mut *(&raw mut PyCapsule_Type);
         t.tp_name = c"PyCapsule".as_ptr();
         t.tp_basicsize = std::mem::size_of::<PyCapsule>() as isize;
-        t.tp_flags = Py_TPFLAGS_DEFAULT;
+        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC;
+        t.tp_traverse = Some(capsule_traverse);
+        t.tp_clear = Some(capsule_clear);
         t.tp_dealloc = Some(capsule_dealloc);
         t.tp_repr = Some(capsule_repr);
         t.tp_doc = c"Capsule objects let you wrap a C \"void *\" pointer in a Python\nobject.".as_ptr();
@@ -91,6 +133,8 @@ pub unsafe extern "C" fn PyCapsule_New(pointer: *mut c_void, name: *const c_char
         c.name = name;
         c.context = std::ptr::null_mut();
         c.destructor = destructor;
+        c.traverse_func = None;
+        c.clear_func = None;
         op
     }
 }
