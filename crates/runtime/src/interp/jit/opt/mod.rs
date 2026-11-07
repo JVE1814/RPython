@@ -492,6 +492,7 @@ fn compile_locked(code: &PyObject, cd: &CodeData, globals: *mut PyObject, builti
         invalid_flag: &*invalid as *const AtomicU8 as usize,
         flags,
         fold_globals: cc.t2_invalidations.load(Relaxed) < 3,
+        cautious: cc.t2_invalidations.load(Relaxed) > 0,
     };
     let mut built = match build::build(&unit) {
         Ok(b) => b,

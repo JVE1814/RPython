@@ -135,6 +135,10 @@ pub struct Unit<'a> {
     pub flags: u32,
     /// fold global/builtin values into constants (off after repeated invalidation)
     pub fold_globals: bool,
+    /// (jit5) earlier code of this unit was discarded: monomorphic attribute sites
+    /// get a generic slow path instead of a deoptimising guard (no deopt churn when
+    /// a site turns polymorphic after compilation)
+    pub cautious: bool,
 }
 
 struct BcBlock {
@@ -2135,7 +2139,7 @@ impl<'a> B<'a> {
             return;
         }
         let snap = self.snap(i, SnapKind::Deopt);
-        if es.len() == 1 && cases[0].kind != kind::INSTANCE_DICT {
+        if es.len() == 1 && cases[0].kind != kind::INSTANCE_DICT && !self.u.cautious {
             // monomorphic slot / class attribute: no slow path needed
             let s = cases[0];
             let p = self.guard_tag(1, s.a as u32, snap);
@@ -2161,7 +2165,7 @@ impl<'a> B<'a> {
         let cont = self.new_block(u32::MAX);
         let slow = self.new_block(u32::MAX);
         let p;
-        let bodies = if es.len() == 1 {
+        let bodies = if es.len() == 1 && !self.u.cautious {
             p = self.guard_tag(1, cases[0].a as u32, snap);
             vec![self.cur]
         } else {
@@ -2872,6 +2876,7 @@ impl<'a> B<'a> {
             invalid_flag: self.u.invalid_flag,
             flags: co.co_flags as u32,
             fold_globals: self.u.fold_globals,
+            cautious: self.u.cautious,
         });
         self.inl_units.push(unit);
         let up: &'a Unit<'a> = unsafe { &*(&**self.inl_units.last().unwrap() as *const Unit<'static> as *const Unit<'a>) };
