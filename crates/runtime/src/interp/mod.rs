@@ -298,10 +298,29 @@ fn run_generator_prologue(mut frame: Box<Frame>) -> PyResult<Box<Frame>> {
     }
 }
 
+/// Is the activation's self-reference the only reference to frame object `fo`?
+/// (Owned by this thread with a local count of 1 and no shared references.)
+fn frame_obj_unshared(fo: *mut PyObject) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let o = unsafe { &*fo };
+    o.ob_tid.load(Relaxed) == crate::object::thread_id() && o.ob_ref_local.load(Relaxed) == 1 && o.ob_ref_shared.load(Relaxed) == 0
+}
+
 /// Called when a frame completes: hand it to its frame object if one exists.
 pub fn frame_finished(mut frame: Box<Frame>) {
     frame.state = frame::FrameState::Completed;
     frame.clear_stack();
+    if !frame.frame_obj.is_null() && frame_obj_unshared(frame.frame_obj) {
+        // (jit5) nothing but the activation's own self-reference keeps the frame
+        // object: it dies with the activation. (Handing the frame over would
+        // materialise the caller's frame object as f_back, which then repeats for
+        // every caller up the stack, one allocation per finished call.)
+        unsafe {
+            let fo = std::mem::replace(&mut frame.frame_obj, std::ptr::null_mut());
+            (*(fo as *mut crate::types::frameobject::PyFrameObject)).frame = std::ptr::null_mut();
+            decref(fo);
+        }
+    }
     if !frame.frame_obj.is_null() {
         // the frame object outlives the activation: it keeps its caller as f_back
         let caller = crate::threads::current().frame.get();
