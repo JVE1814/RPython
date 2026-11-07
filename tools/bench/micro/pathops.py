@@ -55,6 +55,16 @@ def run(n, kind):
         f = _attr
         for i in range(n):
             f(o)
+    elif kind == 'newinit':     # class with __new__(cls, *a, **k) and __init__(self, *a)
+        for i in range(n):
+            NI('x')
+    elif kind == 'withseg':     # type(self)(*segments) from a method with *segments
+        o = NI('a')
+        for i in range(n):
+            o.with_segments('x')
+    elif kind == 'superinit':   # super().__init__(x) into a base __init__
+        for i in range(n):
+            SubInit('p', i)
     elif kind == 'fspath':      # os.fspath(path) (cached string)
         p = base / 'x'
         str(p)
@@ -62,6 +72,37 @@ def run(n, kind):
             os.fspath(p)
     else:
         raise SystemExit('unknown kind ' + kind)
+
+
+class NI:
+    __slots__ = ('_raw',)
+
+    def __new__(cls, *args, **kwargs):
+        return object.__new__(cls)
+
+    def __init__(self, *args):
+        raw = []
+        for a in args:
+            raw.append(a)
+        self._raw = raw
+
+    def with_segments(self, *segs):
+        return type(self)(*segs)
+
+
+class BaseInit:
+    __slots__ = ('_p',)
+
+    def __init__(self, p):
+        self._p = p
+
+
+class SubInit(BaseInit):
+    __slots__ = ('_e',)
+
+    def __init__(self, p, e):
+        super().__init__(p)
+        self._e = e
 
 
 def _attr(o):
