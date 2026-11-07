@@ -177,3 +177,36 @@
   file run first: new 0.96/1.03/0.84/1.12 s vs old 1.01/1.01/1.14/0.96 s; the order bias of
   this box is larger than any difference).
 - Behaviour changes: none intended.
+
+## Reviewed: verdicts without a rewrite
+- asyncio/tasks.py: own decomposition of the pure-Python Task (`__resume`, `__on_yield`,
+  `__reschedule`, own register/enter/leave helpers, `_AsCompletedIterator`); `gather()` keeps
+  CPython's shape (count/finished, `child_done`, `_GatheringFuture`) with own text.  Low
+  priority.  (The C-accelerated Future/Task are Python source embedded in
+  crates/runtime/src/modules/_asyncio.rs, not reviewed: Rust is out of scope.)
+- asyncio/futures.py: own (`_ensure_finished`, `_unretrieved` property, `_chain_future`
+  with `copy_into`/`on_destination_done`/`on_source_done`).  Clean.
+- asyncio/selector_events.py: own structure (`_wait_readable(attempt)`/write counterparts
+  instead of per-method callbacks; one event dispatch table in `_process_events`).  Clean.
+- asyncio/locks.py: own (`_describe`, `Condition._reacquire`).  Clean.
+- email package: own text and structure (smaller than CPython's) except the grammar
+  functions of `_header_value_parser.py` (`get_bare_quoted_string` & co.), which keep
+  CPython's control flow almost line for line (the refolder was already rewritten as
+  `_Refolder`).  Candidate for a dedicated rewrite; test__header_value_parser pins token
+  classes and defects in detail.
+- multiprocessing: recalled.  `pool.worker`, `managers.Server.serve_client`,
+  `connection.deliver_challenge/answer_challenge` follow CPython nearly verbatim (debug
+  strings included).  ~7,250 lines; needs a dedicated session (tests: test_multiprocessing_*
+  are slow; run them with -j and the fork/forkserver/spawn variants).
+- xml.dom.minidom: recalled (`_write_data`, `_get_elements_by_tagName_helper`, `writexml`
+  bodies are CPython's).  xml.dom.expatbuilder not sampled; likely the same origin (same
+  commit).  xml.sax.saxutils: XMLGenerator restructured, `prepare_input_source` CPython-shaped.
+  xml.sax.handler/xmlreader: API classes, not sampled in detail.
+
+## Still to do (priority order)
+1. multiprocessing (pool, managers, connection first), xml.dom (minidom, expatbuilder,
+   pulldom, xmlbuilder), email/_header_value_parser grammar functions.
+2. _asyncio.rs's embedded Future: clear `self`/locals before raising from `result()` /
+   `__await__` so a failed waiter does not keep its traceback (and the transports in it)
+   alive in a cycle — fixes test_sslproto `*_failed_certificate_no_cycles` (Rust file).
+3. xml.sax (saxutils.prepare_input_source, expatreader), asyncio/tasks.gather (cosmetic).
