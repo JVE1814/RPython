@@ -517,8 +517,10 @@ class SSLProtocol(protocols.BufferedProtocol):
 
     def _on_shutdown_complete(self, shutdown_exc):
         transport = self._transport
-        pending = (not shutdown_exc and transport is not None
-                   and transport.get_write_buffer_size() > 0)
+        pending = False
+        if not shutdown_exc and self._eof_received and transport is not None:
+            size = transport.get_write_buffer_size()
+            pending = isinstance(size, int) and size > 0
         if pending:
             # (hang1) the peer still has to take what is queued (it may have
             # sent EOF and stopped reading): ssl_shutdown_timeout bounds that
