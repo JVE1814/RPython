@@ -272,6 +272,9 @@ pub fn tuple_hash(t: &PyObject) -> PyResult<isize> {
             crate::types::str::str_hash(it)
         } else if tp == crate::types::int::int_type() {
             crate::types::int::int_hash(it)
+        } else if tp == crate::types::bytes::bytes_type() {
+            // (perf6) cached in the object, no Python code
+            crate::types::bytes::bytes_hash(it)
         } else {
             break;
         };

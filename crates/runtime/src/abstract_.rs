@@ -516,6 +516,11 @@ pub fn hash(o: &PyObject) -> PyResult<isize> {
     if pystr::is_str_exact(o) {
         return Ok(pystr::str_hash(o));
     }
+    // (perf6) a one-digit int hashes to its value (-1 is reserved for errors)
+    if int::is_int_exact(o) && int::is_compact(o) {
+        let v = int::compact_value(o) as isize;
+        return Ok(if v == -1 { -2 } else { v });
+    }
     match o.ty().tp_hash {
         Some(f) => {
             let h = unsafe { f(o.as_ptr()) };
@@ -657,6 +662,10 @@ fn plain_eq_depth(a: &PyObject, b: &PyObject, depth: u32) -> Option<bool> {
     }
     if ta == crate::types::float::float_type() {
         return Some(crate::types::float::float_value(a) == crate::types::float::float_value(b));
+    }
+    // (perf6) exact bytes (pairs of bytes are bpe_tokeniser's dict keys)
+    if ta == crate::types::bytes::bytes_type() {
+        return Some(crate::types::bytes::bytes_data(a) == crate::types::bytes::bytes_data(b));
     }
     // tuples and tuple subclasses that keep tuple equality (namedtuples)
     if depth < 16 && (ta == tuple::tuple_type() || unsafe { (*ta).tp_richcompare == (*tuple::tuple_type()).tp_richcompare && (*ta).tp_flags & crate::ffi::Py_TPFLAGS_TUPLE_SUBCLASS != 0 }) {

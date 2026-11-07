@@ -1073,6 +1073,9 @@ pub struct PathConfig {
     pub zip_path: String,
     /// `<base_exec_prefix>/lib/python3.15t/lib-dynload`
     pub platstdlib_dir: String,
+    /// (perf6) The standard library is the source tree's Lib/ (no installation found):
+    /// frozen modules default to off there, as in a CPython build directory.
+    pub source_tree: bool,
 }
 
 static PATHS: OnceLock<PathConfig> = OnceLock::new();
@@ -1234,6 +1237,7 @@ fn compute_paths() -> PathConfig {
         None => (base_prefix.clone(), base_exec_prefix.clone()),
     };
 
+    let mut source_tree = false;
     let stdlib_dir = if let Some(d) = &c.stdlib_dir {
         d.clone()
     } else if let Ok(d) = std::env::var("RPYTHON_STDLIB") {
@@ -1244,6 +1248,7 @@ fn compute_paths() -> PathConfig {
             // (an explicit PYTHONHOME is taken at its word, even when nothing is there)
             p
         } else {
+            source_tree = true;
             let dev = concat!(env!("CARGO_MANIFEST_DIR"), "/../../Lib");
             std::fs::canonicalize(dev).map(|p| path_str(&p)).unwrap_or_else(|_| dev.to_string())
         }
@@ -1251,6 +1256,7 @@ fn compute_paths() -> PathConfig {
     PathConfig {
         zip_path: format!("{}/lib/python315t.zip", base_prefix),
         platstdlib_dir: format!("{}/lib/python3.15t/lib-dynload", base_exec_prefix),
+        source_tree,
         executable,
         base_executable,
         prefix,
