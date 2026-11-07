@@ -2304,6 +2304,9 @@ class Pdb(bdb.Bdb, cmd.Cmd):
             return
         ns = {**self.curframe.f_globals, **self.curframe.f_locals}
         console = _PdbInteractiveConsole(ns, message=self.message)
+        if self.pyrepl_input is not None and self.use_rawinput:
+            reader = self.pyrepl_input
+            console.raw_input = lambda prompt='': reader.python_readline(prompt, ns)
         had_ps1 = hasattr(sys, 'ps1')
         saved_ps = getattr(sys, 'ps1', None), getattr(sys, 'ps2', None)
         try:
@@ -2511,13 +2514,45 @@ class Pdb(bdb.Bdb, cmd.Cmd):
             return commands
         return self._complete_expression(text, line, begidx, endidx)
 
-    @staticmethod
-    def _readline_line_before_cursor():
+    _line_editor = None   # the readline-like module input comes from
+
+    def _editor(self):
+        if self._line_editor is not None:
+            return self._line_editor
+        import readline
+        return readline
+
+    def _readline_line_before_cursor(self):
         try:
-            import readline
-            return readline.get_line_buffer()[:readline.get_endidx()]
+            editor = self._editor()
+            return editor.get_line_buffer()[:editor.get_endidx()]
         except Exception:
             return ''
+
+    def complete(self, text, state):
+        """Completer for readline (or _pyrepl): the state-th candidate."""
+        if state == 0:
+            editor = self._editor()
+            buffer = editor.get_line_buffer()
+            line = buffer.lstrip()
+            stripped = len(buffer) - len(line)
+            begidx = editor.get_begidx() - stripped
+            endidx = editor.get_endidx() - stripped
+            if begidx > 0:
+                command = self.parseline(line)[0]
+                func = getattr(self, 'complete_' + command, None) if command else None
+                if func is None:
+                    func = self.completedefault
+            else:
+                func = self.completenames
+            try:
+                self.completion_matches = func(text, line, begidx, endidx)
+            except Exception:
+                self.completion_matches = []
+        try:
+            return self.completion_matches[state]
+        except IndexError:
+            return None
 
     def _completion_namespace(self):
         if self.curframe is None:
@@ -2694,13 +2729,59 @@ class PdbPyReplInput:
                     first[len(word.group()):len(word.group()) + 1] in ('', ' ', '\t'):
                 return False
             try:
-                return codeop.compile_command(text.lstrip('!') + '\n', '<stdin>',
-                                              'single') is None
+                # one line is complete when it compiles; a block needs an
+                # empty line after it
+                source = text.lstrip('!')
+                lines = source.split('\n')
+                if len(lines) > 1 and not lines[-1].strip():
+                    return False
+                if len(lines) == 1:
+                    source += '\n'
+                return codeop.compile_command(source, '<stdin>', 'single') is None
             except (SyntaxError, ValueError, OverflowError):
                 return False
 
+        from _pyrepl import readline as editor
         continuation = '...'.ljust(len(prompt))
-        return multiline_input(more_lines, prompt, continuation)
+        previous = editor.get_completer()
+        previous_delims = editor.get_completer_delims()
+        editor.set_completer(self.pdb.complete)
+        editor.set_completer_delims(' \t\n`@#%^&*()=+[{]}\\|;:\'",<>?')
+        self.pdb._line_editor = editor
+        try:
+            return multiline_input(more_lines, prompt, continuation)
+        finally:
+            self.pdb._line_editor = None
+            editor.set_completer(previous)
+            editor.set_completer_delims(previous_delims)
+
+    def python_readline(self, prompt, namespace):
+        """Input for the 'interact' console: Python only, completed from
+        `namespace` (the terminal belongs to _pyrepl, so plain input()
+        would miss what it has already read)."""
+        from _pyrepl import readline as editor
+        import rlcompleter
+
+        def more_lines(text):
+            try:
+                lines = text.split('\n')
+                if len(lines) > 1 and not lines[-1].strip():
+                    return False
+                source = text if len(lines) > 1 else text + '\n'
+                return codeop.compile_command(source, '<console>', 'single') is None
+            except (SyntaxError, ValueError, OverflowError):
+                return False
+
+        previous = editor.get_completer()
+        editor.set_completer(rlcompleter.Completer(namespace).complete)
+        try:
+            text = editor.multiline_input(more_lines, prompt, '... ')
+        finally:
+            editor.set_completer(previous)
+        if '\n' in text:
+            # a block: the console runs it once it ends with an empty line
+            text = text.rstrip() + '\n'
+        return text
 
     def __repr__(self):
         return '<PdbPyReplInput>'
