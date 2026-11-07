@@ -468,6 +468,7 @@ pub fn store_attr(o: &PyObject, nm: &PyObject, v: &PyObject, es: &[Entry]) -> Py
                         if crate::shape::replace_hinted(o, nm.as_ptr(), s.b, v) {
                             return Ok(());
                         }
+                        let had_values = crate::shape::has_inline_values(o);
                         match crate::shape::set_ix(o, nm, Some(v)) {
                             (crate::shape::Set::Done, i) => {
                                 if i as u64 != s.b {
@@ -483,7 +484,14 @@ pub fn store_attr(o: &PyObject, nm: &PyObject, v: &PyObject, es: &[Entry]) -> Py
                             if (*slot).is_null() {
                                 *slot = dict::new_dict().into_raw();
                             }
-                            return dict::set_item(&**slot, nm, v);
+                            let r = dict::set_item(&**slot, nm, v);
+                            if had_values && r.is_ok() {
+                                // the object's attributes just moved into a dict: later
+                                // stores (compiled hits, which record nothing) see the
+                                // dict, so the adaptive view records that form
+                                adaptive_note(|| super::adaptive::store_attr(o, nm));
+                            }
+                            return r;
                         }
                     },
                     kind::SLOT => unsafe {
