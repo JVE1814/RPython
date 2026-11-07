@@ -17,6 +17,8 @@ case "$SCRIPT" in /*) ;; *) SCRIPT="$HERE/$SCRIPT";; esac
 cg() {
   valgrind --tool=callgrind --callgrind-out-file=/dev/null "$PY" "$SCRIPT" "$1" "$2" 2>&1 >/dev/null | awk '/Collected/{print $4}'
 }
+# warm-up run (bytecode caches written outside the measurement)
+"$PY" "$SCRIPT" 10 "$1" >/dev/null 2>&1
 for k in "$@"; do
   a=$(cg "$N1" "$k"); c=$(cg "$N2" "$k")
   if [ -z "$a" ] || [ -z "$c" ]; then printf "%s\tERROR\n" "$k"; continue; fi

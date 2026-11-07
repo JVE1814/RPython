@@ -75,6 +75,12 @@ pub fn cell_type() -> *mut PyTypeObject {
 pub fn is_function(o: &PyObject) -> bool {
     o.is_type(function_type())
 }
+/// (perf4) An exact function whose vectorcall slot is the interpreter's (not replaced
+/// through the C API): callers may use `interp::call_function` directly.
+#[inline]
+pub fn is_plain_function(o: &PyObject) -> bool {
+    is_function(o) && func(o).vectorcall.map(|p| p as usize) == Some(crate::interp::function_vectorcall as usize)
+}
 #[inline]
 pub fn is_method(o: &PyObject) -> bool {
     o.is_type(method_type())
@@ -565,6 +571,15 @@ unsafe extern "C" fn method_vectorcall(
             let r = ab::vectorcall_raw(f, slot, nargs + 1, kwnames);
             *slot = saved;
             return r;
+        }
+        if total <= 8 {
+            // (perf4) stack buffer for the usual few arguments
+            let mut buf: [*mut PyObject; 10] = [std::ptr::null_mut(); 10];
+            buf[1] = s.as_ptr();
+            if total > 0 {
+                std::ptr::copy_nonoverlapping(args, buf.as_mut_ptr().add(2), total);
+            }
+            return ab::vectorcall_raw(f, buf.as_ptr().add(1), (nargs + 1) | PY_VECTORCALL_ARGUMENTS_OFFSET, kwnames);
         }
         let mut v: Vec<*mut PyObject> = Vec::with_capacity(total + 2);
         v.push(std::ptr::null_mut());

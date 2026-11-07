@@ -123,6 +123,17 @@ pub unsafe fn vectorcall_raw(
     kwnames: *mut PyObject,
 ) -> *mut PyObject {
     unsafe {
+        // (perf4) Python functions directly (no indirect call, no result check: the
+        // function call path always sets an exception on failure)
+        if crate::types::funcobject::is_function(callable)
+            && crate::types::funcobject::func(callable).vectorcall.map(|p| p as usize) == Some(crate::interp::function_vectorcall as usize)
+        {
+            let nargs = nargsf & !PY_VECTORCALL_ARGUMENTS_OFFSET;
+            let kwn = if kwnames.is_null() { None } else { Some(&*kwnames) };
+            let nkw = kwn.map_or(0, |k| tuple::tuple_len(k));
+            let all: &[*mut PyObject] = if nargs + nkw == 0 { &[] } else { std::slice::from_raw_parts(args, nargs + nkw) };
+            return into_c(crate::interp::call_function(callable, all, nargs, kwn));
+        }
         if let Some(f) = vectorcall_func(callable) {
             return check_result(callable, f(callable.as_ptr(), args, nargsf, kwnames));
         }

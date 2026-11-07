@@ -996,8 +996,25 @@ pub unsafe extern "C" fn h_call(sp: *mut *mut PyObject, n: u64, kw: u64) -> u64 
         let n = n as usize;
         let (top, kwnames) = if kw != 0 { (sp.sub(1), take_opt(sp.sub(1))) } else { (sp, None) };
         let base = top.sub(n + 2);
-        let callable = *base;
-        let self_or_null = *base.add(1);
+        let mut callable = *base;
+        let mut self_or_null = *base.add(1);
+        if self_or_null.is_null() && funcobject::is_method(&*callable) {
+            // (perf4) bound method of a Python function: unpack it into the stack (self
+            // into the free slot, the function in place of the method; both owned and
+            // released with the rest of the call's stack)
+            let (mf, ms) = funcobject::method_parts(&*callable);
+            if funcobject::is_function(mf) {
+                let (mf, ms) = (mf.as_ptr(), ms.as_ptr());
+                incref(mf);
+                incref(ms);
+                let old = callable;
+                *base = mf;
+                *base.add(1) = ms;
+                decref(old);
+                callable = mf;
+                self_or_null = ms;
+            }
+        }
         let nkw = kwnames.as_ref().map_or(0, |k| tuple::tuple_len(k));
         let kwp = kwnames.as_ref().map_or(std::ptr::null_mut(), |k| k.as_ptr());
         let r = if self_or_null.is_null() {
