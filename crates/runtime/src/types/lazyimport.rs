@@ -367,7 +367,9 @@ fn b_lazy_import(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> Py
             raise!(TypeError, "globals must be a dict");
         }
     }
-    let frame_globals = if globals.is_none() { crate::interp::current_globals() } else { None };
+    // (tail2) a C caller that cleared the thread state's current_frame has no frame
+    let frameless = crate::threads::current().c.current_frame.is_null();
+    let frame_globals = if globals.is_none() && !frameless { crate::interp::current_globals() } else { None };
     if globals.is_none() && frame_globals.is_none() {
         raise!(TypeError, "__lazy_import__() missing globals when called without a frame");
     }

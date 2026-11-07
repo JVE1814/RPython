@@ -197,10 +197,21 @@ pub fn on_dict_write(d: &PyObject, key: *mut PyObject) {
     let tag = unsafe { (*(d.as_ptr() as *const PyDictObject))._ma_watcher_tag };
     if tag != 0 {
         if tag == crate::interp::jit::opt::WATCH_TAG {
+            builtins_written(d);
             crate::interp::jit::opt::dict_written(d, key);
         } else {
             type_dict_written(tag as *mut PyTypeObject, key);
         }
+    }
+}
+
+/// (tail2) Writes to the builtins dict (tagged at creation, see builtins::init) are
+/// counted as the "builtin_dict" rare event.
+#[cold]
+fn builtins_written(d: &PyObject) {
+    let b = crate::subinterp::current().builtins.load(std::sync::atomic::Ordering::Acquire);
+    if !b.is_null() && crate::types::module::module_dict(unsafe { &*b }).as_ptr() == d.as_ptr() {
+        crate::modules::testinternalcapi::rare_event(crate::modules::testinternalcapi::RareEvent::BuiltinDict);
     }
 }
 
