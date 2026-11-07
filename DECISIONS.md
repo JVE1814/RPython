@@ -233,3 +233,69 @@ VM if CPython finds it; bugs in our stack-depth/exception-table computation woul
 ## Done
 
 Adopted by the coordinator 2026-11-07 (proposed by core5). snapshot.sh and install.sh now remove copied `__pycache__` directories.
+
+## D26 — Interpreters are isolation domains over one shared VM
+
+Like several applications/class-loader domains in one JVM: one heap, one collector, one set of
+threads and one JIT; Python-level state is per interpreter.
+
+**Finding the interpreter.** Every thread state points to its interpreter
+(`PyThreadState.interp`, which the ABI already has; null means the main interpreter).
+`subinterp::current()` is the only lookup: while no subinterpreter was ever created
+(`subinterp::USED == false`, a relaxed load and a predicted branch) it returns the static
+main `Interp` without touching TLS; afterwards it reads the current thread state's
+pointer. Threads started from an interpreter inherit it (`_thread` copies the parent's
+pointer into the new thread state before any Python code runs).
+
+**Per interpreter** (`subinterp::Interp`): `sys` and `sys.modules`, `builtins` and its
+`__import__` (identity check of IMPORT_NAME), the importlib bootstrap module and the
+"importlib installed" flag, builtin-module objects (`import.rs` table), `__main__`,
+`PyInterpreterState_GetDict`, `PyUnstable_AtExit` callbacks, config (PyInterpreterConfig),
+whence, id, running/active state, `_imp._override_multi_interp_extensions_check`,
+the reported GIL state, the main-thread ident, pending-call queues.
+Module-level statics that hold Python state use `subinterp::PerInterp<T>` (main value
+inside the static, others created on first use and dropped when the interpreter is
+destroyed): atexit callbacks, warnings filters/onceregistry/defaultaction, the codec
+registry, queue/channel end types, pending calls. `subinterp::InterpPtr` is a drop-in
+replacement for `static X: AtomicPtr<PyObject>` holding module heap objects (exception
+classes etc.): done for binascii, _struct, _csv, _locale, termios, _queue, _io
+(UnsupportedOperation), _socket (herror/gaierror).
+
+**Shared**: the heap, allocator, GC (stop-the-world covers every interpreter's threads;
+an interpreter's roots are Rust-owned references so trial deletion keeps them alive),
+static and immortal objects (static types, small ints, interned strings, None/True/False),
+the exception classes of `_interpreters`/`_interpqueues`/`_interpchannels` (created once,
+in the main interpreter), process-wide config (`sys.flags`, paths), signal handling (main
+interpreter only), audit hooks, gc callbacks, faulthandler, `_datetime`'s types (not yet
+converted: its C-API capsule is a process-wide struct).
+
+**Code and JIT.** Code objects are never shared: every value that crosses goes through the
+cross-interpreter data layer (`subinterp/xidata.rs`), which copies (marshal) or pickles,
+so code is compiled per interpreter. Inline caches and JIT-compiled code key on the actual
+dict/type objects and versions they guard, and those objects belong to one interpreter
+(or are static and shared, which is safe because they are immutable or internally
+synchronised). Hence caches and compiled code need no interpreter key. The two
+interpreter-dependent globals the interpreter loop uses (builtins of a frame-less call,
+`__import__` identity) are resolved through `current()` at the slow path only.
+
+**Running code in another interpreter** on the same OS thread (`_interpreters.exec/call`,
+`PyThreadState_Swap`): the caller's thread state is detached (`InNative`, safe for
+stop-the-world), a fresh thread state of the target is attached, and the caller's is
+re-attached afterwards (`subinterp::enter/leave`). The temporary state is retired without
+the per-OS-thread teardown of `thread_exit` (QSBR, frame pool, allocator caches stay with
+the OS thread); its biased-refcount merge queue is drained before reuse. Exceptions cross
+as text snapshots (`xidata::Captured`), optionally with a pickle of the exception.
+
+**Extensions.** Single-phase extension modules are refused in every subinterpreter
+(free-threaded build: `check_multi_interp_extensions` cannot be turned off, configs with it
+off fail to create, as CPython ft does). Multi-phase modules follow
+`Py_mod_multiple_interpreters`. In a subinterpreter an extension's PyInit runs with the main
+interpreter attached; a failure is reported there as unraisable and an ImportError is
+raised in the subinterpreter. A module without `Py_mod_gil = Py_MOD_GIL_NOT_USED` makes a
+*subinterpreter* report `sys._is_gil_enabled() == True` (with the RuntimeWarning); there is
+no GIL, and the main interpreter keeps reporting False (unchanged behaviour).
+
+**Cost.** `-c pass`: 66.50M -> 66.62M instructions (+0.17%, callgrind, same stdlib). An
+import-in-a-loop microbenchmark (200k `import os` + builtin calls): +0.7%.
+
+Adopted by the coordinator 2026-11-07 (proposed by interp1).
