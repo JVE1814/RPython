@@ -71,24 +71,35 @@ and rejects non-str keys.
   `concurrent.interpreters.Queue.__del__`/`Interpreter._decref` bind what they use (test_types,
   test_import unraisable warnings).
 
+### Exceptions and QSBR (test_httpservers hang, run 13)
+With a second thread alive every caught exception kept its traceback (and so its frames and locals)
+for a QSBR grace period: unwinding replaced `exc.__traceback__` via `qsbr::swap_field`, and the
+exception's dealloc/tp_clear released its fields the same way. A thread that then blocks never sees
+the grace period end (a discarded `HTTPResponse` kept the keep-alive socket open, the server thread
+waited in `readinto`, shutdown waited for it). Now: extending the chain (new tb's `tb_next` is the
+old value, which stays reachable) and clearing a dying/collected exception drop the reference at
+once (`exceptions::set_exc_traceback`, `base_clear`). The general point remains for other
+`swap_field` users (slot/member stores, e.g. asyncio `Handle._args`): CPython decrefs at once and
+only defers *freeing memory*; we defer the decref itself, so finalization can lag behind CPython
+whenever another thread exists.
+
+### concurrent.futures
+A forced shutdown (`_force_shutting_down`) that fails the pending work because no worker is left
+also sets `_shutdown_thread`, so the manager thread winds the pool down (test_process_pool
+test_force_shutdown_during_max_tasks_worker_exit).
+
 ## Left (root causes)
 * test_asyncio (3): test_open_connection_happy_eyeball_refcycles and the two sslproto
-  `*_failed_certificate_no_cycles` tests. After the fixes above the remaining holder is a Future
-  (and an ExceptionGroup's args) with one reference that no GC-visible object accounts for
-  (`gc.get_referrers` shows nothing, `gc.collect()` does not free it). Looks like a reference held
-  natively or a deferred decref; not tracked down.
+  `*_failed_certificate_no_cycles` tests. The remaining holder is the args tuple of an
+  `events.Handle` (a `__slots__` class): `Handle._args = None` goes through the member descriptor's
+  `qsbr::swap_field`, so the old tuple (and the Future in it) is released only after a grace period,
+  while getaddrinfo's executor threads exist. Needs QSBR to defer freeing rather than the decref
+  (stability/scale owners).
 * test_sys (2): `test_subinterp_intern_dynamically_allocated` needs per-interpreter interning of
   dynamically created strings (ours is one table; shapes key on interned pointers).
   `SizeofTest.test_objecttypes`: 25 size mismatches against CPython's struct layouts (dict
   iterators, enumerate, frame, generator, module, capsule, range, set, type, str, list/dict GC
   accounting ...) — a list in scratch; each needs a type-size decision like the deque one.
-* test_httpservers hang (regression in core, not tail3): reproducible on /home/user/snap25 (core
-  24d1c6a) and absent at 68fdc83. A discarded `http.client.HTTPResponse` stays alive, so the
-  keep-alive socket is never closed and the server thread blocks in `readinto`. Its referrers are
-  finished frame objects (begin/getresponse) chained through `f_back` to server-thread frames;
-  independent of the JIT (RPYTHON_JIT=0 too). Suspect the stability3/perf5 merge (frames/exception
-  unwinding/generator claiming changes). Repro: scratch `resp.py` = HTTPServer thread +
-  HTTPConnection.request/getresponse; check a weakref to the response.
 
 ## Tooling notes
 * Bash heredocs and some compound commands are refused in this sandbox; scripts went into the
