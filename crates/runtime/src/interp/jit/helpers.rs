@@ -358,6 +358,11 @@ pub unsafe extern "C" fn h_binary_op(sp: *mut *mut PyObject, op: u64) -> u64 {
         let b = take(sp.sub(1));
         let a = take(sp.sub(2));
         let op: BinOp = std::mem::transmute(op as u8);
+        // (tail4) compiled code reaches the generic operator only here: record what
+        // this thread sees in its specialisation view (as tier 0 does)
+        if let Some(nb) = eval::BINOPS.iter().position(|&x| x == op) {
+            specialize::adaptive_note(|| crate::interp::adaptive::binary(nb as u32, &a, &b));
+        }
         match eval::binary_op_on_stack(op, &a, &b) {
             Ok(r) => {
                 put(sp.sub(2), r);

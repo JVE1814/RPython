@@ -84,7 +84,7 @@ fn binop_slot(op: BinOp) -> (ab::NbSlot, bool) {
     }
 }
 
-const BINOPS: [BinOp; 26] = [
+pub(crate) const BINOPS: [BinOp; 26] = [
     BinOp::Add,
     BinOp::And,
     BinOp::FloorDivide,
