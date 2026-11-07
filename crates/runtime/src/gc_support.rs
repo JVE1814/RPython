@@ -31,7 +31,7 @@ pub fn trigger_threshold(threshold: usize, last_live: usize) -> usize {
 /// in CPython's layout. Returns the garbage objects that count as "collected" (the
 /// instance dicts owned by other garbage are left out).
 pub fn countable(garbage: &[PyRef]) -> Vec<*mut PyObject> {
-    let owned: HashSet<usize> = garbage
+    let owned: crate::gc::PtrSet = garbage
         .iter()
         .filter_map(|g| unsafe {
             let op = g.as_ptr();
@@ -101,8 +101,8 @@ pub unsafe fn split_legacy_finalizers(unreachable: &mut Vec<*mut PyObject>) -> V
     if !unreachable.iter().any(|&o| has_del(o)) {
         return Vec::new();
     }
-    let set: HashSet<usize> = unreachable.iter().map(|&o| o as usize).collect();
-    let mut keep: HashSet<usize> = HashSet::new();
+    let set: crate::gc::PtrSet = unreachable.iter().map(|&o| o as usize).collect();
+    let mut keep: crate::gc::PtrSet = Default::default();
     let mut stack: Vec<usize> = unreachable.iter().copied().filter(|&o| has_del(o)).map(|o| o as usize).collect();
     let mut buf: Vec<usize> = Vec::new();
     while let Some(o) = stack.pop() {
@@ -163,7 +163,7 @@ unsafe extern "C" fn collect_referent(op: *mut PyObject, arg: *mut std::ffi::c_v
 pub fn finalization_order(garbage: &[PyRef]) -> Vec<usize> {
     use std::collections::HashMap;
     let n = garbage.len();
-    let index: HashMap<usize, usize> = garbage.iter().enumerate().map(|(i, g)| (g.as_ptr() as usize, i)).collect();
+    let index: crate::gc::PtrMap<usize> = garbage.iter().enumerate().map(|(i, g)| (g.as_ptr() as usize, i)).collect();
     // adjacency lists restricted to the garbage set
     let mut edges: Vec<Vec<usize>> = Vec::with_capacity(n);
     let mut buf: Vec<usize> = Vec::new();

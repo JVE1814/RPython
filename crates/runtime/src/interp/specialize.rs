@@ -425,9 +425,15 @@ fn fill_load_attr(o: &PyObject, nm: &PyObject, method: bool) -> Option<Fill> {
             .map(|v| (kind::MODULE, dict::version(dd), d as u64, v.as_ptr() as usize));
     }
     if o.is_type(type_type()) {
-        // class attribute through a plain `type` metaclass
-        if lookup(type_type(), nm).is_some() {
-            return None;
+        // class attribute through a plain `type` metaclass. A data descriptor of
+        // `type` itself (__name__, __dict__, ...) wins over the class's own entries;
+        // non-data attributes of `type` (__new__, __init__, mro, ...) only matter when
+        // the class lacks the name, which the lookup below decides (perf3: was any
+        // attribute of `type`, so `object.__new__`/`cls.__init__` never cached).
+        if let Some(meta) = lookup(type_type(), nm) {
+            if meta.ty().tp_descr_set.is_some() || lookup(as_type(o), nm).is_none() {
+                return None;
+            }
         }
         let cls = as_type(o);
         let tag = cache::assign_type_tag(cls);
@@ -435,7 +441,12 @@ fn fill_load_attr(o: &PyObject, nm: &PyObject, method: bool) -> Option<Fill> {
             return None;
         }
         if let Some(v) = lookup(cls, nm) {
-            let plain = v.ty().tp_descr_get.is_none() || funcobject::is_function(&v);
+            // (perf3) method and slot-wrapper descriptors read through their class are
+            // themselves as well
+            let plain = v.ty().tp_descr_get.is_none()
+                || funcobject::is_function(&v)
+                || v.is_type(crate::types::descr::method_descr_type())
+                || v.is_type(crate::types::descr::wrapper_descr_type());
             if plain {
                 return Some((kind::TYPE_ATTR, tag as u64, o.as_ptr() as u64, v.as_ptr() as usize));
             }

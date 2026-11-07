@@ -707,12 +707,9 @@ pub unsafe extern "C" fn h_container_op(sp: *mut *mut PyObject, which: u64, arg:
                 3 => {
                     let it = take(sp.sub(1));
                     let l = *sp.sub(1 + arg);
-                    match ab::collect_iterable(&it) {
-                        Ok(v) => {
-                            for x in v {
-                                list::append(&*l, x);
-                            }
-                        }
+                    // perf3: list::extend copies tuples/lists without a temporary vector
+                    match list::extend(&*l, &it) {
+                        Ok(()) => {}
                         Err(_) => {
                             if exc_matches(crate::types::exceptions::TypeError())
                                 && it.ty().tp_iter.is_none()
@@ -1054,11 +1051,6 @@ pub unsafe extern "C" fn h_call_ex(sp: *mut *mut PyObject) -> u64 {
                     }
                 }
             };
-            let mut v: Vec<&PyObject> = Vec::with_capacity(tuple::tuple_len(&args) + 1);
-            if let Some(s) = &self_or_null {
-                v.push(s);
-            }
-            v.extend(tuple::tuple_items(&args).iter().copied());
             let kwd = match &kw {
                 Some(k) if !dict::is_dict(k) => {
                     let d = dict::new_dict();
@@ -1071,7 +1063,8 @@ pub unsafe extern "C" fn h_call_ex(sp: *mut *mut PyObject) -> u64 {
             if let Some(d) = &kwd {
                 st(eval::check_kwargs_keys(d))?;
             }
-            let r = st(ab::call_with_kwargs_dict(&callable, &v, kwd.as_deref()))?;
+            // perf3: tuple passed through to tp_call callables, no heap vector
+            let r = st(ab::call_ex_tuple(&callable, self_or_null.as_deref(), &args, kwd.as_deref()))?;
             put(sp.sub(4), r);
             Ok(OK)
         })
