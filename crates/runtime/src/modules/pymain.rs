@@ -77,10 +77,35 @@ fn run_code_in_main(src: &[u8], filename: &str) -> Outcome {
     let r = (|| -> PyResult<()> {
         let m = main_module()?;
         let d = module::module_dict(&m);
+        // (capi2) a script file may not contain NUL bytes (reported at the line holding the
+        // first one, its text cut at the NUL)
+        if filename != "<string>" {
+            if let Some(pos) = src.iter().position(|&b| b == 0) {
+                let start = src[..pos].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+                let lineno = src[..pos].iter().filter(|&&b| b == b'\n').count() + 1;
+                let text = String::from_utf8_lossy(&src[start..pos]).into_owned();
+                return Err(crate::compile::raise_syntax_error(
+                    crate::types::exceptions::SyntaxError(),
+                    "source code cannot contain null bytes",
+                    filename,
+                    lineno as i32,
+                    -1,
+                    Some(&text),
+                    None,
+                    None,
+                ));
+            }
+        }
         // `-c` code is text already: a coding cookie in it is not obeyed
         let code = match std::str::from_utf8(src) {
             Ok(text) if filename == "<string>" => crate::compile::compile_str(text, filename, crate::compile::Mode::Exec, 0, -1)?,
-            _ => crate::compile::compile_bytes(src, filename, crate::compile::Mode::Exec, 0, -1)?,
+            _ => {
+                // (capi2) compile-time warnings of the main script belong to module __main__
+                let main_name = pystr::new_str("__main__");
+                let mut o = crate::compile::Opts::new(filename, crate::compile::Mode::Exec, 0, -1);
+                o.module = Some(&main_name);
+                crate::compile::compile_source(crate::compile::Source::Bytes(src), &o)?
+            }
         };
         if filename == "<string>" {
             // `-c` code: tracebacks show its lines like those of a file
