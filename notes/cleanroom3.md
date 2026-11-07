@@ -194,6 +194,57 @@
   gaps read as NUL.  Old vs new on 400 random sparse layouts x random read/seek sequences:
   identical.  test_tarfile 1008 run =, test_shutil =.
 
+### mailbox.py (partial: the CPython-shaped helpers)
+- The file-locking and file-creation helpers were CPython's nearly line by line; rewritten
+  and renamed: `_lock_file` -> `_acquire_locks` (tracks which locks it holds and releases
+  exactly those on failure), `_unlock_file` -> `_release_locks`, `_create_carefully` ->
+  `_create_new`, `_create_temporary` -> `_create_unique`, `_sync_flush/_sync_close` ->
+  `_flush_to_disk/_close_to_disk`; classes `_singlefileMailbox` -> `_SingleFileMailbox`,
+  `_mboxMMDF` -> `_FromLineMailbox`.  Kept (pinned by test_mailbox): `_mboxMMDFMessage`,
+  `_ProxyFile`, `_PartialFile`; lock messages unchanged.
+- The mailbox classes themselves (Maildir, mbox, MH, Babyl, MMDF, the message classes)
+  still follow CPython's method layout (largely public API); bodies not re-audited.
+- test_mailbox 386 =.
+
+## Audit of not-yet-audited bodies (grep of characteristic CPython internal names)
+Hits = CPython-internal helper names present; "(pinned)" = used by spec tests.
+- http/client.py: 10 (`_MAXLINE`(pinned) `_MAXHEADERS`(pinned) `_is_legal_header_name`
+  `_is_illegal_header_value` `_encode` `_read_headers` `_parse_header_lines` `_UNKNOWN`
+  `_CS_IDLE` `_get_content_length`) -> recalled structure, candidate for rewrite.
+- urllib/request.py: 12 (`_opener`(pinned) `_parse_proxy`(pinned)
+  `_proxy_bypass_macosx_sysconf`(pinned) `_cut_port_re` `_safe_gethostbyname` `_have_ssl`
+  `_thishost` `_localhost` `_randombytes` `parse_keqv_list` `parse_http_list` (public)
+  `_splittype`) -> recalled structure.
+- pickle.py: 13 (`_Pickler`/`_Unpickler`/`_dumps`/`_loads` pinned; `_Framer` `_Unframer`
+  `_getattribute` `_tuplesize2code` + public `whichmodule encode_long decode_long`) ->
+  recalled structure (cleanroom1 listed it as "check").
+- xml/etree/ElementTree.py: 9 (`_namespace_map` pinned; `_escape_attrib` `_serialize_xml`
+  `_serialize_html` `_raise_serialization_error` `_escape_cdata` `_get_writer`
+  `_ListDataStream` `_IterParseIterator`) -> recalled structure.
+- asyncio/base_events.py: 8 (`_ipaddr_info` `_interleave_addrinfos`
+  `_MIN_SCHEDULED_TIMER_HANDLES` pinned; `_run_until_complete_cb` `_format_handle`
+  `_set_reuseport` `_SendfileFallbackProtocol` `_check_ssl_socket`) -> recalled structure.
+- _pyio.py: 3 (`_setmode` `_BufferedIOMixin` `_CHECK_ERRORS`); http/server.py: 2
+  (`_get_best_family` `_control_char_table`) -> mostly own, small renames would do.
+- typing.py: CPython's class layout throughout (`_Final`, `_NotIterable`, `_SpecialForm`,
+  `_BaseGenericAlias`, `_GenericAlias`, `_SpecialGenericAlias`, `_CallableType`,
+  `_TupleType`, `_ProtocolMeta`, `_proto_hook`, `_AnnotatedAlias`, `NamedTupleMeta`,
+  `_prohibited`, `_special`, `_tp_cache`, `_type_convert`, `_collect_type_parameters`,
+  ...).  Pinned: tests use `_UnionGenericAlias _overload_registry _get_protocol_attrs
+  _cleanups _type_check _type_repr _eval_type _collect_parameters _GenericAlias
+  _ConstEvaluator _ASSERT_NEVER_REPR_MAX_LENGTH _deprecation_warning_for_no_type_params_passed`;
+  the Rust runtime calls `_type_check _typevar_subst _paramspec_subst
+  _paramspec_prepare_subst _typevartuple_prepare_subst _GenericAlias`
+  (crates/runtime/src/types/{typevar,union}.rs); annotationlib and dataclasses use
+  `_deprecation_warning_for_no_type_params_passed` and `_GenericAlias`.  Third-party code
+  (typing_extensions, pydantic) relies on `_GenericAlias`, `_SpecialForm`, `_type_check`,
+  `_eval_type`.  Needs a dedicated session (2600 lines, hot path, test_typing is huge).
+- _pydatetime.py: not touched — the native `_datetime` executes this file
+  (crates/runtime/src/modules/_datetime.rs, include_str!) and reads `_IsoCalendarDate`,
+  `_timedelta_fields`, `_date_new_args`, `_time_new_args`, `_datetime_new_args`,
+  `_timezone_new_args`, `UTC` and the `_dt_*`/`_year`... attributes from it, so every edit
+  needs a rebuild; plan a session for it.
+
 ## Reviewed: own text and structure, no action needed
 (none yet)
 
