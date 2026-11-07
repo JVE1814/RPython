@@ -95,7 +95,9 @@ pub fn parse<'b, const N: usize>(p: &Params, args: &[&'b PyObject], kwnames: Opt
                 &owned
             }
         };
-        match p.names.iter().position(|n| *n == ks) {
+        // (perf6) length and first byte before the full compare (a memcmp call per name)
+        let kb = ks.as_bytes();
+        match p.names.iter().position(|n| n.len() == kb.len() && n.as_bytes().first() == kb.first() && n.as_bytes() == kb) {
             Some(i) if i >= p.posonly => {
                 if out[i].is_some() {
                     raise!(TypeError, "argument for {}() given by name ('{}') and position ({})", p.fname, ks, i + 1);

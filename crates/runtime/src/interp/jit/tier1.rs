@@ -1358,6 +1358,34 @@ impl<'a> Gen<'a> {
         let snap = e.read();
         let mut inline = false;
         let mut attr_kind = false;
+        if snap.is_none() && ins.op == Op::LoadMethod && std::ptr::eq(e, &es[0]) {
+            // (perf6) a LoadMethod site that had not run when the function was compiled
+            // (code after the loop that triggered compilation): read the first cache
+            // entry at run time and take a METHOD hit inline, instead of calling the
+            // helper on every execution. Seqlock: kind, method and type tag are one
+            // consistent snapshot; the tag guard keeps the borrowed method valid.
+            let obj = self.slot(d - 1);
+            self.a.mov_ri(Rcx, e as *const _ as i64);
+            self.a.load32(R8, M(Rcx, E_SEQ));
+            self.a.mov_rr(R9, R8);
+            self.a.and_ri(R9, 1);
+            self.a.jcc(Cc::NE, slow);
+            self.a.cmp32_mi(M(Rcx, E_KIND), kind::METHOD as i32);
+            self.a.jcc(Cc::NE, slow);
+            self.a.load(Rsi, M(Rcx, E_C));
+            self.a.load32(R9, M(Rcx, E_A));
+            self.a.cmp32_rm(R8, M(Rcx, E_SEQ));
+            self.a.jcc(Cc::NE, slow);
+            self.a.load(Rax, obj);
+            self.a.load(Rdx, M(Rax, OB_TYPE));
+            self.a.cmp32_rm(R9, M(Rdx, TP_TAG));
+            self.a.jcc(Cc::NE, slow);
+            self.incref(Rsi);
+            self.a.store(obj, Rsi);
+            let m = self.slot(d);
+            self.a.store(m, Rax);
+            inline = true;
+        }
         if let Some(s) = snap {
             let tag = s.a as u32;
             let obj = self.slot(d - 1);

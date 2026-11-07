@@ -30,6 +30,9 @@ struct Index {
     objs: Box<[AtomicPtr<PyObject>]>,
     /// (path below Lib/, offset of the code record)
     modules: Vec<(&'static str, usize)>,
+    /// start of the translation areas and the length of area 0
+    tx_base: usize,
+    tx_a_len: usize,
 }
 
 fn index() -> &'static Index {
@@ -57,7 +60,10 @@ fn index() -> &'static Index {
             let path = std::str::from_utf8(&IMAGE[at as usize..(at + len) as usize]).unwrap_or("");
             modules.push((path, off));
         }
-        Index { strings, objs, modules }
+        let t = r.take(16);
+        let tx_base = u64::from_le_bytes(t[0..8].try_into().unwrap()) as usize;
+        let tx_a_len = u64::from_le_bytes(t[8..16].try_into().unwrap()) as usize;
+        Index { strings, objs, modules, tx_base, tx_a_len }
     })
 }
 
@@ -164,7 +170,14 @@ fn code(ix: &Index, r: &mut In<'static>, filename: &PyRef) -> PyResult {
     let qualname = string(ix, r.n());
     let linetable = blob_obj(r.blob());
     let exceptiontable = blob_obj(r.blob());
-    let tx = r.blob();
+    let tx_ref = r.n();
+    let tx_len = r.n();
+    let tx: &'static [u8] = if tx_len == 0 {
+        &[]
+    } else {
+        let start = ix.tx_base + if tx_ref & 1 != 0 { ix.tx_a_len } else { 0 } + (tx_ref >> 1);
+        &IMAGE[start..start + tx_len]
+    };
     let parts = crate::types::code::PublicParts {
         argcount,
         posonlyargcount: posonly,

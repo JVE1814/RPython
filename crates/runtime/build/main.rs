@@ -96,7 +96,25 @@ struct Image {
     strings: Vec<StrKey>,
     ids: HashMap<StrKey, u64>,
     code: Out,
+    /// translated forms, by area (see `translation`)
+    tx: [Out; 2],
 }
+
+/// Modules every start imports, in import order: their records come first, so a start
+/// touches a compact part of the image.
+const STARTUP_FIRST: &[&str] = &[
+    "importlib/_bootstrap.py",
+    "importlib/_bootstrap_external.py",
+    "zipimport.py",
+    "abc.py",
+    "stat.py",
+    "_collections_abc.py",
+    "genericpath.py",
+    "posixpath.py",
+    "os.py",
+    "_sitebuiltins.py",
+    "site.py",
+];
 
 impl Image {
     fn sid(&mut self, k: StrKey) -> u64 {
@@ -222,10 +240,14 @@ impl Image {
             nnames: co.names.len(),
             stacksize: co.stacksize,
         };
-        // a blob, so that the loader can skip it in one step (it is decoded on first
-        // execution); empty = the translator failed, the runtime translates it itself
+        // stored out of line (decoded on first execution only): the record holds
+        // (offset << 1 | area) and the length; length 0 = the translator failed, the runtime
+        // translates it itself. Area 0 holds the code that runs when its module is
+        // imported (module and class bodies), area 1 the functions, so the pages a start
+        // touches stay together.
         let Ok(out) = translate::translate(&inp) else {
-            self.code.blob(&[]);
+            self.code.u(0);
+            self.code.u(0);
             return;
         };
         let mut tx = Out::default();
@@ -261,7 +283,12 @@ impl Image {
         o.u(out.gen_start as u64);
         let lines = out.pub_of_internal.iter().map(|&u| positions.get(u as usize).and_then(|p| p.lineno).map_or(-1, |l| l as i64));
         put_deltas(o, lines);
-        self.code.blob(&tx.buf);
+        // CO_OPTIMIZED marks functions (module and class bodies run at import time)
+        let area = (co.flags & 1 != 0) as usize;
+        let at = self.tx[area].buf.len() as u64;
+        self.tx[area].raw(&tx.buf);
+        self.code.u(at << 1 | area as u64);
+        self.code.u(tx.buf.len() as u64);
     }
 }
 
@@ -302,7 +329,9 @@ fn main() {
     let frozen_rs = std::fs::read_to_string(&frozen_rs_path).expect("src/frozen.rs");
     let mut img = Image::default();
     let mut modules: Vec<(u64, u64)> = Vec::new();
-    for p in frozen_sources(&frozen_rs) {
+    let mut sources = frozen_sources(&frozen_rs);
+    sources.sort_by_key(|p| STARTUP_FIRST.iter().position(|s| s == p).unwrap_or(STARTUP_FIRST.len()));
+    for p in sources {
         let file = lib.join(&p);
         println!("cargo:rerun-if-changed={}", file.display());
         let Ok(src) = std::fs::read(&file) else { continue };
@@ -340,13 +369,21 @@ fn main() {
     for _ in &modules {
         head.raw(&[0; 12]);
     }
+    // then the start of the translation areas and the length of area 0 (u64 LE)
+    let tx_at = head.buf.len();
+    head.raw(&[0; 16]);
     let base = head.buf.len() as u64;
     for (k, (id, off)) in modules.iter().enumerate() {
         let at = table_at + 12 * k;
         head.buf[at..at + 4].copy_from_slice(&(*id as u32).to_le_bytes());
         head.buf[at + 4..at + 12].copy_from_slice(&(base + off).to_le_bytes());
     }
+    let tx_base = base + img.code.buf.len() as u64;
+    head.buf[tx_at..tx_at + 8].copy_from_slice(&tx_base.to_le_bytes());
+    head.buf[tx_at + 8..tx_at + 16].copy_from_slice(&(img.tx[0].buf.len() as u64).to_le_bytes());
     head.raw(&img.code.buf);
+    head.raw(&img.tx[0].buf);
+    head.raw(&img.tx[1].buf);
     let out = Path::new(&std::env::var("OUT_DIR").unwrap()).join("startup_image.bin");
     std::fs::write(out, &head.buf).expect("write startup image");
 }

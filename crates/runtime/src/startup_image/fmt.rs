@@ -3,25 +3,28 @@
 //!
 //! Layout (all integers are LEB128-style unsigned varints unless noted):
 //! ```text
-//! magic  "RPYIMG02"
-//! nstr   then per string: kind byte (0 = UTF-8, 1 = code points as u32 LE), varint length
-//!        (bytes resp. code points), the data
-//! nmod   then per module: string id of its path below Lib/, varint offset of its code record
-//!        (relative to the start of the image)
-//! code records (nested code objects are inline constants of their parent)
+//! magic  "RPYIMG03"
+//! nstr   then per string: kind byte (S_*), varint length (bytes resp. code points), the data
+//! nmod   then per module: string id of its path below Lib/ (u32 LE) and the offset of its
+//!        code record (u64 LE, relative to the start of the image)
+//! u64 LE start of the translation areas, u64 LE length of area 0
+//! code records (nested code objects are inline constants of their parent), modules that
+//!        every start imports first
+//! translation area 0 (module and class bodies), translation area 1 (functions)
 //! ```
 //! A code record: argcount, posonlyargcount, kwonlyargcount, stacksize, flags, firstlineno;
 //! co_code (blob); consts (count + tagged constants); names (count + string ids);
 //! localsplusnames (count + string ids); localspluskinds (blob); name, qualname (string ids);
-//! linetable, exceptiontable (blobs); then the translated form as one blob (empty = the
-//! translator failed at build time: the runtime translates it itself) holding the internal words
-//! (count + u32 LE each), the exception entries (count + start, end, target, depth, lasti),
-//! the extra constants (count + tagged), pub_of_internal (delta varints, one per word),
-//! internal_of_pub (count + delta varints), eager_prologue byte, gen_start, and the line of
-//! each internal word (zigzag delta varints; -1 = none).
+//! linetable, exceptiontable (blobs); then where its translated form is: (offset << 1 | area)
+//! and length (0 = the translator failed at build time: the runtime translates it itself).
+//! A translated form holds the internal words (count + u32 LE each), the exception entries
+//! (count + start, end, target, depth, lasti), the extra constants (count + tagged),
+//! pub_of_internal (`put_deltas`, one per word), internal_of_pub (count + `put_deltas`),
+//! eager_prologue byte, gen_start, and the line of each internal word (`put_deltas`; -1 =
+//! none).
 #![allow(dead_code)]
 
-pub const MAGIC: &[u8; 8] = b"RPYIMG02";
+pub const MAGIC: &[u8; 8] = b"RPYIMG03";
 
 // constant tags
 pub const C_NONE: u8 = b'N';
