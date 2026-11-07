@@ -41,6 +41,9 @@ pub fn getattr_opt(o: &PyObject, nm: &PyObject) -> PyResult<Option<PyRef>> {
     let tp = o.ty();
     let r = if tp.tp_getattro.map(|f| f as usize) == Some(object_generic_getattro as usize) {
         generic_getattr_opt(o, nm, None)
+    } else if tp.tp_getattro.is_some() && tp.tp_getattro.map(|f| f as usize) == unsafe { (*(&raw const crate::types::typeobject::PyType_Type)).tp_getattro }.map(|f| f as usize) && pystr::is_str(nm) {
+        // (perf4) classes: a missing attribute raises no AttributeError just to clear it
+        crate::types::object_type::type_getattr_impl(o, nm, true)
     } else {
         getattr(o, nm).map(Some)
     };
@@ -123,6 +126,17 @@ pub unsafe fn vectorcall_raw(
     kwnames: *mut PyObject,
 ) -> *mut PyObject {
     unsafe {
+        // (perf4) Python functions directly (no indirect call, no result check: the
+        // function call path always sets an exception on failure)
+        if crate::types::funcobject::is_function(callable)
+            && crate::types::funcobject::func(callable).vectorcall.map(|p| p as usize) == Some(crate::interp::function_vectorcall as usize)
+        {
+            let nargs = nargsf & !PY_VECTORCALL_ARGUMENTS_OFFSET;
+            let kwn = if kwnames.is_null() { None } else { Some(&*kwnames) };
+            let nkw = kwn.map_or(0, |k| tuple::tuple_len(k));
+            let all: &[*mut PyObject] = if nargs + nkw == 0 { &[] } else { std::slice::from_raw_parts(args, nargs + nkw) };
+            return into_c(crate::interp::call_function(callable, all, nargs, kwn));
+        }
         if let Some(f) = vectorcall_func(callable) {
             return check_result(callable, f(callable.as_ptr(), args, nargsf, kwnames));
         }
@@ -130,6 +144,12 @@ pub unsafe fn vectorcall_raw(
         let nargs = nargsf & !PY_VECTORCALL_ARGUMENTS_OFFSET;
         let nkw = if kwnames.is_null() { 0 } else { tuple::tuple_len(&*kwnames) };
         let all = if nargs + nkw == 0 { &[][..] } else { std::slice::from_raw_parts(args, nargs + nkw) };
+        if nkw == 0 {
+            // (perf4) slot wrappers without an argument tuple
+            if let Some(r) = crate::types::descr::call_wrapper_fast(callable, all) {
+                return check_result(callable, r);
+            }
+        }
         let t = tuple::new_tuple_from_ptrs(&all[..nargs]);
         let kw = if nkw > 0 {
             let d = dict::new_dict();
@@ -289,6 +309,21 @@ pub fn call_with_kwargs_dict(callable: &PyObject, args: &[&PyObject], kw: Option
 /// (perf3): callables without vectorcall get that tuple as is (no vector, no second
 /// tuple); others get a stack vector.
 pub fn call_ex_tuple(callable: &PyObject, self_or_null: Option<&PyObject>, args: &PyObject, kw: Option<&PyObject>) -> PyResult {
+    // (perf4) Python functions (also bound to an instance) bind from the tuple and the
+    // dict directly
+    let plain_func = |c: &PyObject| {
+        crate::types::funcobject::is_function(c)
+            && crate::types::funcobject::func(c).vectorcall.map(|p| p as usize) == Some(crate::interp::function_vectorcall as usize)
+    };
+    if plain_func(callable) {
+        return crate::interp::call_function_ex(callable, self_or_null, args, kw.filter(|k| dict::dict_len(k) > 0));
+    }
+    if self_or_null.is_none() && crate::types::funcobject::is_method(callable) {
+        let (mf, ms) = crate::types::funcobject::method_parts(callable);
+        if plain_func(mf) {
+            return crate::interp::call_function_ex(mf, Some(ms), args, kw.filter(|k| dict::dict_len(k) > 0));
+        }
+    }
     // a callable without vectorcall gets the tuple and the keyword dict exactly as built (core6)
     if self_or_null.is_none() && vectorcall_func(callable).is_none() && callable.ty().tp_call.is_some() {
         return call_tp_call(callable, args, kw);

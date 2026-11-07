@@ -72,6 +72,13 @@ pub fn list_items(o: &PyObject) -> &[&PyObject] {
 }
 
 /// Owned snapshot of the items.
+/// (perf4) Shallow copy of a list (list.copy(), list(l)) without an intermediate
+/// vector: the items are copied under the list's lock.
+pub fn list_copy(o: &PyObject) -> PyRef {
+    let _g = ob_lock(o);
+    new_list_from_slice(list_items(o))
+}
+
 pub fn list_to_vec(o: &PyObject) -> Vec<PyRef> {
     let _g = ob_lock(o);
     list_items(o).iter().map(|x| x.to_ref()).collect()
@@ -186,6 +193,24 @@ pub fn new_list(items: Vec<PyRef>) -> PyRef {
         (*l).ob_base.ob_size = n as isize;
         crate::gc::track(op);
         PyRef::from_raw(op)
+    }
+}
+
+/// (perf4) New list taking over `n` owned references at `items` (no vector).
+#[inline]
+pub unsafe fn new_list_steal(items: *const *mut PyObject, n: usize) -> *mut PyObject {
+    unsafe {
+        let op = alloc::alloc_object(list_type(), std::mem::size_of::<PyListObject>());
+        let l = op as *mut PyListObject;
+        if n > 0 {
+            let arr = alloc_items(n);
+            std::ptr::copy_nonoverlapping(items, arr, n);
+            (*l).ob_item = arr;
+            (*l).allocated = n as isize;
+        }
+        (*l).ob_base.ob_size = n as isize;
+        crate::gc::track(op);
+        op
     }
 }
 
@@ -613,6 +638,11 @@ pub unsafe extern "C" fn list_dealloc(op: *mut PyObject) {
         (*l).ob_base.ob_size = 0;
         release_array(arr, n, false);
         let tp = (*op).type_ptr();
+        if tp == list_type() {
+            // (perf4) exact list: static type with the generic free
+            crate::alloc::free_object(op);
+            return;
+        }
         crate::types::typeobject::generic_free_and_type_decref(op, tp);
     }
 }

@@ -103,6 +103,29 @@ pub unsafe fn new_tuple_from_ptrs(items: &[*mut PyObject]) -> PyRef {
     }
 }
 
+/// (perf4) Create a tuple taking over `n` owned references at `items` (the slots are
+/// not cleared). No intermediate vector.
+#[inline]
+pub unsafe fn new_tuple_steal(items: *const *mut PyObject, n: usize) -> *mut PyObject {
+    unsafe {
+        if n == 0 {
+            return empty_tuple().into_raw();
+        }
+        let op = alloc_tuple_of(tuple_type(), n);
+        let base = item_ptr(op);
+        let mut tracked = false;
+        for i in 0..n {
+            let it = *items.add(i);
+            tracked |= crate::gc::is_tracked(&*it);
+            *base.add(i) = it;
+        }
+        if tracked {
+            crate::gc::track(op);
+        }
+        op
+    }
+}
+
 /// GC-track a freshly filled exact tuple only if one of its items may be part of
 /// a cycle (a tracked GC object); tuples of atomic values are never tracked.
 pub unsafe fn track_if_needed(op: *mut PyObject) {
@@ -147,6 +170,22 @@ pub fn tuple_refill(t: &PyObject, items: Vec<PyRef>) {
     }
 }
 
+/// (perf4) `tuple_refill` taking over `items.len()` owned references (old items are
+/// swapped into `items`, then released).
+pub unsafe fn tuple_refill_ptrs(t: &PyObject, items: &mut [*mut PyObject]) {
+    unsafe {
+        let base = item_ptr(t.as_ptr());
+        for (i, it) in items.iter_mut().enumerate() {
+            std::mem::swap(&mut *base.add(i), it);
+        }
+        (*(t.as_ptr() as *mut PyTupleObject)).ob_hash = -1;
+        track_if_needed(t.as_ptr());
+        for p in items.iter() {
+            xdecref(*p);
+        }
+    }
+}
+
 pub fn tuple2(a: PyRef, b: PyRef) -> PyRef {
     new_tuple(vec![a, b])
 }
@@ -185,6 +224,11 @@ pub unsafe extern "C" fn tuple_dealloc(op: *mut PyObject) {
             xdecref(*base.add(i));
         }
         let tp = (*op).type_ptr();
+        if tp == tuple_type() {
+            // (perf4) exact tuple: static type with the generic free
+            crate::alloc::free_object(op);
+            return;
+        }
         crate::types::typeobject::generic_free_and_type_decref(op, tp);
     }
 }

@@ -620,8 +620,13 @@ unsafe fn take_n(sp: *mut *mut PyObject, n: usize) -> Vec<PyRef> {
 pub unsafe extern "C" fn h_build_tuple(sp: *mut *mut PyObject, n: u64) -> u64 {
     unsafe {
         let n = n as usize;
-        let items = take_n(sp, n);
-        put(sp.sub(n), tuple::new_tuple(items));
+        // (perf4) items moved straight from the stack, no vector
+        let base = sp.sub(n);
+        let t = tuple::new_tuple_steal(base, n);
+        for i in 1..n {
+            *base.add(i) = std::ptr::null_mut();
+        }
+        *base = t;
         OK
     }
 }
@@ -629,8 +634,12 @@ pub unsafe extern "C" fn h_build_tuple(sp: *mut *mut PyObject, n: u64) -> u64 {
 pub unsafe extern "C" fn h_build_list(sp: *mut *mut PyObject, n: u64) -> u64 {
     unsafe {
         let n = n as usize;
-        let items = take_n(sp, n);
-        put(sp.sub(n), list::new_list(items));
+        let base = sp.sub(n);
+        let l = list::new_list_steal(base, n);
+        for i in 1..n {
+            *base.add(i) = std::ptr::null_mut();
+        }
+        *base = l;
         OK
     }
 }
@@ -981,17 +990,73 @@ pub unsafe extern "C" fn h_get_yield_from_iter(sp: *mut *mut PyObject, code_flag
 
 // ------------------------------------------------------------------ calls
 
+/// (perf4) `h_call` of a builtin function (exact `builtin_function_or_method`) or of
+/// a method descriptor found by LoadMethod (`[descr, self, args..]`), positional
+/// arguments only. None: not such a call (or a convention `call_methoddef_fast`
+/// leaves to the general path).
+#[inline]
+unsafe fn call_builtin_fast(callable: *mut PyObject, self_or_null: *mut PyObject, base: *mut *mut PyObject, n: usize) -> Option<*mut PyObject> {
+    unsafe {
+        let c = &*callable;
+        let r = if c.is_type(&raw mut crate::types::cfunction::PyCFunction_Type) {
+            let f = callable as *mut PyCFunctionObject;
+            let ml = (*f).m_ml;
+            if (*ml).ml_flags & METH_STATIC != 0 {
+                return None;
+            }
+            let (argp, nargs) = if self_or_null.is_null() { (base.add(2), n) } else { (base.add(1), n + 1) };
+            crate::methods::call_methoddef_fast(ml, (*f).m_self, std::slice::from_raw_parts(argp, nargs))?
+        } else if c.is_type(&raw mut crate::types::descr::PyMethodDescr_Type) && !self_or_null.is_null() {
+            let d = callable as *mut PyMethodDescrObject;
+            let owner = (*d).d_common.d_type;
+            let st = (*self_or_null).type_ptr();
+            if st != owner && !crate::types::typeobject::is_subtype(st, owner) {
+                return None;
+            }
+            crate::methods::call_methoddef_fast((*d).d_method, self_or_null, std::slice::from_raw_parts(base.add(2), n))?
+        } else {
+            return None;
+        };
+        if r.is_null() && !err_occurred() {
+            let _ = err!(SystemError, "{} returned NULL without setting an exception", crate::types::typeobject::type_name(c.ty()));
+        }
+        Some(r)
+    }
+}
+
 /// Call / CallKw: [callable, self_or_null, args..(, kwnames)] -> [result]
 pub unsafe extern "C" fn h_call(sp: *mut *mut PyObject, n: u64, kw: u64) -> u64 {
     unsafe {
         let n = n as usize;
         let (top, kwnames) = if kw != 0 { (sp.sub(1), take_opt(sp.sub(1))) } else { (sp, None) };
         let base = top.sub(n + 2);
-        let callable = *base;
-        let self_or_null = *base.add(1);
+        let mut callable = *base;
+        let mut self_or_null = *base.add(1);
+        if self_or_null.is_null() && funcobject::is_method(&*callable) {
+            // (perf4) bound method of a Python function: unpack it into the stack (self
+            // into the free slot, the function in place of the method; both owned and
+            // released with the rest of the call's stack)
+            let (mf, ms) = funcobject::method_parts(&*callable);
+            if funcobject::is_function(mf) {
+                let (mf, ms) = (mf.as_ptr(), ms.as_ptr());
+                incref(mf);
+                incref(ms);
+                let old = callable;
+                *base = mf;
+                *base.add(1) = ms;
+                decref(old);
+                callable = mf;
+                self_or_null = ms;
+            }
+        }
         let nkw = kwnames.as_ref().map_or(0, |k| tuple::tuple_len(k));
         let kwp = kwnames.as_ref().map_or(std::ptr::null_mut(), |k| k.as_ptr());
-        let r = if self_or_null.is_null() {
+        // (perf4) builtin functions and method descriptors with the common calling
+        // conventions: their C function directly
+        let fast = if nkw == 0 { call_builtin_fast(callable, self_or_null, base, n) } else { None };
+        let r = if let Some(r) = fast {
+            r
+        } else if self_or_null.is_null() {
             let args = base.add(2) as *const *mut PyObject;
             if funcobject::is_function(&*callable) {
                 let all = std::slice::from_raw_parts(args, n);
@@ -1181,7 +1246,21 @@ pub unsafe extern "C" fn h_load_super_attr(sp: *mut *mut PyObject, arg: u64, nam
         let cls = take(sp.sub(2));
         let gsuper = take(sp.sub(3));
         helper!({
-            let sup = if gsuper.is(type_obj(crate::types::super_::super_type())) {
+            let is_super = gsuper.is(type_obj(crate::types::super_::super_type()));
+            if is_super {
+                // (perf4) no super object, and no bound method for super().m(...)
+                if let Some(r) = crate::types::super_::lookup_fast(&cls, &slf, &*name, arg & 1 != 0) {
+                    let (v, unbound) = st(r)?;
+                    put(sp.sub(3), v);
+                    if unbound {
+                        put(sp.sub(2), slf);
+                    } else if arg & 1 != 0 {
+                        *sp.sub(2) = std::ptr::null_mut();
+                    }
+                    return Ok(OK);
+                }
+            }
+            let sup = if is_super {
                 st(crate::types::super_::new_super(&cls, &slf))?
             } else if arg & 2 != 0 {
                 st(ab::call(&gsuper, &[&cls, &slf]))?

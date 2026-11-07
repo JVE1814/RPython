@@ -43,6 +43,54 @@ fn parse_strict(kw: *mut PyObject, fname: &str) -> PyResult<bool> {
     Ok(strict)
 }
 
+/// Iterators a stack buffer serves in `next_items_buf`.
+const BUF_ITERS: usize = 8;
+
+/// (perf4) `next_items` into `out` (owned references; `out.len()` = number of
+/// iterators <= BUF_ITERS): Ok(true) when every iterator produced an item. On
+/// exhaustion or error nothing is left in `out`. No vectors.
+fn next_items_buf(iters: &PyObject, strict: bool, fname: &str, out: &mut [*mut PyObject]) -> PyResult<bool> {
+    let its = tuple::tuple_items(iters);
+    for i in 0..its.len() {
+        let step = match ab::iter_next(its[i]) {
+            Ok(Some(x)) => {
+                out[i] = x.into_raw();
+                continue;
+            }
+            Ok(None) => None,
+            Err(e) => Some(e),
+        };
+        for p in out[..i].iter_mut() {
+            unsafe { decref(std::mem::replace(p, std::ptr::null_mut())) };
+        }
+        if let Some(e) = step {
+            return Err(e);
+        }
+        if !strict {
+            return Ok(false);
+        }
+        // strict: let the general version report (the first `i` iterators advanced)
+        return strict_mismatch(its, i, fname).map(|_| false);
+    }
+    Ok(true)
+}
+
+/// strict= check after iterator `i` was exhausted first (items of the iterators
+/// before it were consumed).
+fn strict_mismatch(its: &[&PyObject], i: usize, fname: &str) -> PyResult<()> {
+    if i > 0 {
+        let plural = if i == 1 { " ".to_string() } else { "s 1-".to_string() };
+        raise!(ValueError, "{}() argument {} is shorter than argument{}{}", fname, i + 1, plural, i);
+    }
+    for (j, other) in its.iter().enumerate().skip(1) {
+        if ab::iter_next(other)?.is_some() {
+            let plural = if j == 1 { " ".to_string() } else { "s 1-".to_string() };
+            raise!(ValueError, "{}() argument {} is longer than argument{}{}", fname, j + 1, plural, j);
+        }
+    }
+    Ok(())
+}
+
 /// Shared "next tuple of items" logic for zip and map (strict handling).
 fn next_items(iters: &PyObject, strict: bool, fname: &str) -> PyResult<Option<Vec<PyRef>>> {
     let its = tuple::tuple_items(iters);
@@ -111,8 +159,23 @@ unsafe extern "C" fn zip_next(o: *mut PyObject) -> *mut PyObject {
     unsafe {
         let z = zo(&*o);
         let iters = &*z.iters;
-        if tuple::tuple_len(iters) == 0 {
+        let n = tuple::tuple_len(iters);
+        if n == 0 {
             return std::ptr::null_mut();
+        }
+        if n <= BUF_ITERS {
+            // (perf4) items in a stack buffer, no vector
+            let mut buf: [*mut PyObject; BUF_ITERS] = [std::ptr::null_mut(); BUF_ITERS];
+            return match next_items_buf(iters, z.strict != 0, "zip", &mut buf[..n]) {
+                Ok(true) => {
+                    if !z.result.is_null() && tuple::tuple_reusable(&*z.result) {
+                        tuple::tuple_refill_ptrs(&*z.result, &mut buf[..n]);
+                        return (*z.result).to_ref().into_raw();
+                    }
+                    tuple::new_tuple_steal(buf.as_ptr(), n)
+                }
+                _ => std::ptr::null_mut(),
+            };
         }
         match next_items(iters, z.strict != 0, "zip") {
             Ok(Some(items)) => {
@@ -198,6 +261,21 @@ unsafe extern "C" fn map_new(tp: *mut PyTypeObject, args: *mut PyObject, kw: *mu
 unsafe extern "C" fn map_next(o: *mut PyObject) -> *mut PyObject {
     unsafe {
         let m = mo(&*o);
+        let n = tuple::tuple_len(&*m.iters);
+        if n <= BUF_ITERS {
+            // (perf4) items in a stack buffer, called without vectors
+            let mut buf: [*mut PyObject; BUF_ITERS] = [std::ptr::null_mut(); BUF_ITERS];
+            return match next_items_buf(&*m.iters, m.strict != 0, "map", &mut buf[..n]) {
+                Ok(true) => {
+                    let r = ab::vectorcall_raw(&*m.func, buf.as_ptr(), n, std::ptr::null_mut());
+                    for p in &buf[..n] {
+                        decref(*p);
+                    }
+                    r
+                }
+                _ => std::ptr::null_mut(),
+            };
+        }
         match next_items(&*m.iters, m.strict != 0, "map") {
             Ok(Some(items)) => {
                 let refs: Vec<&PyObject> = items.iter().map(|x| &**x).collect();

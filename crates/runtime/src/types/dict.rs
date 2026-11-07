@@ -297,7 +297,8 @@ impl DictTable {
     #[inline]
     fn insert_new(&mut self, h: isize, key: *mut PyObject, value: *mut PyObject) {
         if self.nentries >= self.cap || self.fill >= self.cap {
-            self.resize(self.used * 3);
+            // (perf4) like CPython: the new index size is at least 3 * used (usable = 2/3 of it)
+            self.resize(self.used * 2);
         }
         let slot = self.find_empty_slot(h);
         if self.indices()[slot] == EMPTY {
@@ -814,6 +815,20 @@ pub fn insert_unique(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) {
     }
     t.insert_new(h, key.as_ptr(), value.as_ptr());
     set_used(d, t.used, key.as_ptr());
+    drop(g);
+}
+
+/// (perf4) Fill a fresh dict (no other reference yet) with entries whose keys are
+/// distinct and absent (borrowed key, its hash, owned value: the value reference is
+/// taken over). One lock and one size update for all of them.
+pub fn fill_fresh_steal(d: &PyObject, items: &[(*mut PyObject, isize, *mut PyObject)]) {
+    let g = ob_lock(d);
+    let t = table(d);
+    for &(k, h, v) in items {
+        unsafe { incref(k) };
+        t.insert_new(h, k, v);
+    }
+    set_used(d, t.used, std::ptr::null_mut());
     drop(g);
 }
 

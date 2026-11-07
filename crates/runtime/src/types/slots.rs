@@ -1236,11 +1236,19 @@ unsafe extern "C" fn slot_tp_setattro(s: *mut PyObject, nm: *mut PyObject, v: *m
         if r.is_ok() { 0 } else { -1 }
     }
 }
-const RICHCMP_NAMES: [&str; 6] = ["__lt__", "__le__", "__eq__", "__ne__", "__gt__", "__ge__"];
 unsafe extern "C" fn slot_tp_richcompare(s: *mut PyObject, o: *mut PyObject, op: c_int) -> *mut PyObject {
     unsafe {
         let s = &*s;
-        let nm = pystr::intern_str(RICHCMP_NAMES[op as usize]);
+        // (perf4) cached interned names (intern_str hashed the name on every call)
+        let nm = match op {
+            0 => name!("__lt__"),
+            1 => name!("__le__"),
+            2 => name!("__eq__"),
+            3 => name!("__ne__"),
+            4 => name!("__gt__"),
+            _ => name!("__ge__"),
+        }
+        .to_ref();
         // a descriptor whose __get__ fails makes the comparison NotImplemented
         if let Some(f) = lookup(s.type_ptr(), &nm) {
             if !crate::types::funcobject::is_function(&f) {

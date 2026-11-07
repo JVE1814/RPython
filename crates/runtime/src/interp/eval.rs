@@ -1012,6 +1012,19 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             let nm = &cd.names[(arg >> 2) as usize];
                             let is_method = arg & 1 != 0;
                             let two = arg & 2 != 0;
+                            if gsuper.is(type_obj(crate::types::super_::super_type())) && !crate::modules::sys::tracing_active() {
+                                // (perf4) no super object / bound method in the common case
+                                if let Some(r) = crate::types::super_::lookup_fast(&cls, &slf, nm, is_method) {
+                                    let (v, unbound) = r?;
+                                    push!(f, v.into_raw());
+                                    if unbound {
+                                        push!(f, slf.into_raw());
+                                    } else if is_method {
+                                        push!(f, std::ptr::null_mut());
+                                    }
+                                    continue;
+                                }
+                            }
                             // monitoring sees the super() call as in the unoptimised form
                             let call_info = if crate::modules::sys::tracing_active() {
                                 crate::modules::sys_trace::before_call(ts, f, &gsuper, None, if two { Some(&*cls) } else { None }, false)?
@@ -1171,28 +1184,25 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             let s = crate::types::slice::new_slice(&start, &stop, step.as_deref().unwrap_or(none::none()));
                             push!(f, s.into_raw());
                         }
-                        Op::BuildTuple => {
+                        Op::BuildTuple | Op::BuildList => {
+                            // (perf4) items moved from the stack without a vector
                             let n = arg as usize;
                             let base = f.stack_top - n;
-                            let items: Vec<PyRef> = (0..n)
-                                .map(|i| unsafe { PyRef::from_raw(std::mem::replace(&mut f.slots[base + i], std::ptr::null_mut())) })
-                                .collect();
-                            f.stack_top = base;
-                            push!(f, tuple::new_tuple(items).into_raw());
-                        }
-                        Op::BuildList => {
-                            let n = arg as usize;
-                            let base = f.stack_top - n;
-                            let items: Vec<PyRef> = (0..n)
-                                .map(|i| unsafe { PyRef::from_raw(std::mem::replace(&mut f.slots[base + i], std::ptr::null_mut())) })
-                                .collect();
-                            f.stack_top = base;
                             // (a failure-injecting allocator hook refuses the list too)
-                            if crate::capi::mem::hooked_alloc_refuses(std::mem::size_of::<PyListObject>()) {
-                                drop(items);
+                            if op == Op::BuildList && crate::capi::mem::hooked_alloc_refuses(std::mem::size_of::<PyListObject>()) {
+                                for i in 0..n {
+                                    drop(unsafe { PyRef::from_raw(std::mem::replace(&mut f.slots[base + i], std::ptr::null_mut())) });
+                                }
+                                f.stack_top = base;
                                 return Err(crate::errors::memory_error());
                             }
-                            push!(f, list::new_list(items).into_raw());
+                            let p = unsafe { f.slots.as_ptr().add(base) };
+                            let r = unsafe { if op == Op::BuildTuple { tuple::new_tuple_steal(p, n) } else { list::new_list_steal(p, n) } };
+                            for i in 0..n {
+                                f.slots[base + i] = std::ptr::null_mut();
+                            }
+                            f.stack_top = base;
+                            push!(f, r);
                         }
                         Op::BuildSet => {
                             let n = arg as usize;
@@ -1783,6 +1793,34 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
             }
         }
     }
+}
+
+/// (perf4) An exception raised in compiled code at `f.lasti` that no handler of the
+/// frame covers: do what `eval_inner`'s unwinding would (context chaining, traceback
+/// entry, propagation mark) without entering the interpreter. False (nothing done)
+/// when a handler exists, the raise is a bare re-raise, or tracing is active.
+pub(crate) fn unwind_compiled_error(ts: &ThreadState, f: &mut Frame) -> bool {
+    if crate::modules::sys::tracing_active() || ts.reraise_flag.get() || f.unwind_pc >= 0 {
+        return false;
+    }
+    if find_handler(f.code(), f.lasti).is_some() {
+        return false;
+    }
+    let Some(e) = take_exc() else { return false };
+    let prev = ts.frame.get();
+    f.prev = prev;
+    ts.frame.set(f as *mut Frame);
+    let propagated = ts.propagated_exc.replace((0, 0)) == exc_identity(&e);
+    if !propagated {
+        chain_context(ts, &e);
+    }
+    add_traceback(f, &e);
+    f.clear_stack();
+    ts.propagated_exc.set(exc_identity(&e));
+    set_exc(e);
+    ts.frame.set(prev);
+    f.prev = std::ptr::null_mut();
+    true
 }
 
 /// Identity of an exception in flight: its address and its traceback's.

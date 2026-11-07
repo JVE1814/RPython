@@ -59,7 +59,13 @@ unsafe extern "C" fn prop_descr_get(o: *mut PyObject, obj: *mut PyObject, _tp: *
         }
         match opt(po(o).fget) {
             None => into_c(Err(property_error(o, "has no getter", &*obj))),
-            Some(f) => into_c(ab::call(f, &[&*obj])),
+            Some(f) => {
+                if crate::types::funcobject::is_plain_function(f) {
+                    // (perf4) plain getter function: straight to the call path
+                    return into_c(crate::interp::call_function(f, &[obj], 1, None));
+                }
+                into_c(ab::call(f, &[&*obj]))
+            }
         }
     }
 }

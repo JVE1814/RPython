@@ -191,6 +191,8 @@ pub fn new_thread_state() -> *mut ThreadState {
         let limit = RECURSION_LIMIT.load(Relaxed) as i32;
         c.py_recursion_limit = limit;
         c.py_recursion_remaining = limit;
+        // (perf4) one pthread_getattr_np (it reads /proc/self/maps for the main thread)
+        let stack_low = compute_stack_low();
         let st = ThreadState {
             c,
             mode: ModeCell(std::sync::atomic::AtomicU8::new(ThreadMode::Blocked as u8)),
@@ -201,8 +203,8 @@ pub fn new_thread_state() -> *mut ThreadState {
             reraise_flag: Cell::new(false),
             propagated_exc: Cell::new((0, 0)),
             headroom: Cell::new(false),
-            stack_low: Cell::new(compute_stack_low()),
-            stack_margin: Cell::new(compute_stack_margin()),
+            stack_low: Cell::new(stack_low),
+            stack_margin: Cell::new(stack_margin_for(stack_low)),
             alive: std::sync::atomic::AtomicBool::new(true),
             async_exc: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             trace_func: Cell::new(std::ptr::null_mut()),
@@ -412,7 +414,11 @@ impl ThreadState {
 /// Native stack reserved below the RecursionError limit: 256 KiB on ordinary
 /// stacks, a quarter of the stack for small thread stacks (threading.stack_size()).
 pub fn compute_stack_margin() -> usize {
-    let low = compute_stack_low();
+    stack_margin_for(compute_stack_low())
+}
+
+/// `compute_stack_margin` for a known stack low address.
+pub fn stack_margin_for(low: usize) -> usize {
     let x = 0u8;
     let here = &x as *const u8 as usize;
     let size = here.saturating_sub(low);

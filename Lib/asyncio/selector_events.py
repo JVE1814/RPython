@@ -862,6 +862,8 @@ class _SelectorSocketTransport(_SelectorTransport):
             self._log_lost_write()
             return
 
+        # bytes cannot change under us: queued without a private copy
+        immutable = type(data) is bytes
         if not self._buffer:
             # try a direct send first
             try:
@@ -880,7 +882,10 @@ class _SelectorSocketTransport(_SelectorTransport):
                                   context=self._context)
 
         # keep a private copy: the caller may reuse its buffer
-        self._buffer.append(memoryview(bytes(data)))
+        if immutable:
+            self._buffer.append(memoryview(data))
+        else:
+            self._buffer.append(memoryview(bytes(data)))
         self._maybe_pause_protocol()
 
     def _get_sendmsg_buffer(self):

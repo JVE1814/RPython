@@ -138,8 +138,53 @@ pub fn for_each_large_gc(mut f: impl FnMut(*mut PyObject)) {
 }
 
 /// Allocate `size` zeroed bytes for an object of type `tp` and initialise its header.
+///
+/// (perf4) Fast path: a ready type, no tracemalloc, a block from this thread's free
+/// list. The allocation kind, pre-header size and initial GC bits follow from two
+/// flag bits without branches; the header's flags/mutex/gc-bits/local-refcount words
+/// are written with one store. Everything else goes to `alloc_object_slow`.
 #[inline]
 pub unsafe fn alloc_object(tp: *mut PyTypeObject, size: usize) -> *mut PyObject {
+    unsafe {
+        let flags = (*tp).tp_flags;
+        if flags & Py_TPFLAGS_READY == 0 || size > 512 - MANAGED || crate::modules::_tracemalloc::TRACING.load(Relaxed) {
+            return alloc_object_slow(tp, size);
+        }
+        let gc = ((flags >> 14) & 1) as usize; // Py_TPFLAGS_HAVE_GC
+        let managed = gc & (flags & Py_TPFLAGS_PREHEADER != 0) as usize;
+        let kind = gc + managed;
+        let pre = managed * MANAGED;
+        let slot = *crate::tlab::SLOT_OF.get_unchecked(kind).get_unchecked((size + pre + 7) >> 3) as usize;
+        let raw = crate::tlab::pop_slot(slot);
+        if raw.is_null() {
+            return alloc_object_slow(tp, size);
+        }
+        crate::tlab::zero_slot_small(raw, slot);
+        let op = raw.add(pre) as *mut PyObject;
+        // gc bits: PREHEADER (0x80) for GC kinds, MANAGED (0x40) with the pre-header
+        let bits = ((gc << 7) | (managed << 6)) as u64;
+        (*op).ob_tid.store(crate::object::thread_id(), Relaxed);
+        // ob_flags (u16) | ob_mutex (u8) << 16 | ob_gc_bits (u8) << 24 | ob_ref_local (u32) << 32
+        std::ptr::write((op as *mut u64).add(1), (bits << 24) | (1u64 << 32));
+        (*op).ob_type.store(tp, Relaxed);
+        if flags & Py_TPFLAGS_HEAPTYPE != 0 {
+            // (tail call: keeps the static-type path free of register saves)
+            return alloc_heap_type_ref(tp, op);
+        }
+        op
+    }
+}
+
+/// The new instance's reference to its heap type (`alloc_object`).
+#[inline(never)]
+unsafe fn alloc_heap_type_ref(tp: *mut PyTypeObject, op: *mut PyObject) -> *mut PyObject {
+    unsafe { crate::object::incref_type(tp) };
+    op
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn alloc_object_slow(tp: *mut PyTypeObject, size: usize) -> *mut PyObject {
     unsafe {
         if (*tp).tp_flags & crate::ffi::Py_TPFLAGS_READY == 0 {
             ready_lazily(tp);
@@ -206,6 +251,26 @@ pub unsafe fn alloc_start(op: *mut PyObject) -> *mut u8 {
 
 #[inline]
 pub unsafe fn free_object(op: *mut PyObject) {
+    unsafe {
+        let bits = (*op).ob_gc_bits.load(Relaxed);
+        // (perf4) fast path: a tlab block, no tracemalloc
+        if bits & GC_BIT_LARGE == 0 && !crate::modules::_tracemalloc::TRACING.load(Relaxed) {
+            if bits & GC_BIT_TRACKED != 0 {
+                crate::gc::note_untracked();
+            }
+            let start = (op as *mut u8).sub(((bits & GC_BIT_MANAGED) as usize) >> 2);
+            // a free block on a GC page must not look tracked to heap walks
+            (*op).ob_gc_bits.store(0, Relaxed);
+            crate::tlab::free_small(start);
+            return;
+        }
+        free_object_slow(op)
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn free_object_slow(op: *mut PyObject) {
     unsafe {
         let bits = (*op).ob_gc_bits.load(Relaxed);
         if bits & GC_BIT_TRACKED != 0 {
