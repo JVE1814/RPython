@@ -236,6 +236,10 @@ pub fn new_str(s: &str) -> PyRef {
         maxc = maxc.max(c as u32);
         n += 1;
     }
+    // (tail2) one Latin-1 character: the shared singleton, as for ASCII
+    if n == 1 && maxc < 256 {
+        return latin1_char(maxc as u8);
+    }
     let r = alloc_str(n, maxc);
     let p = str_data_ptr(&r);
     unsafe {
