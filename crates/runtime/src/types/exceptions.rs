@@ -349,8 +349,13 @@ pub unsafe extern "C" fn base_dealloc(op: *mut PyObject) {
 unsafe extern "C" fn base_clear(op: *mut PyObject) -> c_int {
     unsafe {
         let e = exc(&*op);
+        // (tail3) released at once, not through QSBR: this runs while the exception is
+        // being deallocated or cleared by the stop-the-world collector, so no other
+        // thread can be reading the fields (deferred, a dead exception kept its
+        // traceback, and every frame and local in it, alive for a grace period)
         for slot in [&mut e.dict, &mut e.args, &mut e.notes, &mut e.traceback, &mut e.context, &mut e.cause] {
-            set_field(slot, None);
+            let old = std::mem::replace(slot, std::ptr::null_mut());
+            xdecref(old);
         }
         // subclass extra object fields
         let layout = layout_of((*op).type_ptr());
@@ -1414,7 +1419,26 @@ pub fn exc_traceback(e: &PyObject) -> Option<PyRef> {
     if p.is_null() { None } else { Some(unsafe { PyRef::from_borrowed(p) }) }
 }
 pub fn set_exc_traceback(e: &PyObject, tb: Option<&PyObject>) {
-    set_field(&mut exc(e).traceback, tb);
+    // (tail3) Unwinding prepends an entry per frame: the new traceback's tb_next is the
+    // current one, which therefore stays alive (and readable) through the new value.
+    // Its field reference is dropped at once instead of through QSBR: deferred, it kept
+    // every older entry, and the frames and locals they hold, alive until the next
+    // grace period, which a thread that then blocks never reaches (e.g. a discarded
+    // HTTP response keeping its socket open while the program waits for the peer).
+    let slot = &mut exc(e).traceback;
+    let old = *slot;
+    if let Some(t) = tb {
+        if !old.is_null() && crate::types::traceback::is_traceback(t) {
+            let next = unsafe { (*(t.as_ptr() as *const crate::types::traceback::PyTracebackObject)).tb_next };
+            if next == old {
+                let a = unsafe { &*(slot as *mut *mut PyObject as *const std::sync::atomic::AtomicPtr<PyObject>) };
+                let prev = a.swap(t.to_ref().into_raw(), std::sync::atomic::Ordering::AcqRel);
+                unsafe { xdecref(prev) };
+                return;
+            }
+        }
+    }
+    set_field(slot, tb);
 }
 pub fn exc_context(e: &PyObject) -> Option<PyRef> {
     let p = exc(e).context;
