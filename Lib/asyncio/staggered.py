@@ -38,7 +38,7 @@ async def staggered_race(coro_fns, delay, *, loop=None):
         if not running and all_done is not None and not all_done.done():
             all_done.set_result(None)
 
-    async def attempt(index, fn):
+    async def run_one_coro(index, fn):
         try:
             value = await fn()
         except (SystemExit, KeyboardInterrupt):
@@ -67,7 +67,7 @@ async def staggered_race(coro_fns, delay, *, loop=None):
                 break
             errors.append(None)
             wake = loop.create_future()
-            task = loop.create_task(attempt(index, fn))
+            task = loop.create_task(run_one_coro(index, fn))
             futures.future_add_to_awaited_by(task, parent)
             if task.done():
                 attempt_finished(task)
