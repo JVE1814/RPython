@@ -45,6 +45,24 @@ fn alloc_bytes_unhooked(n: usize) -> PyResult<PyRef> {
     }
 }
 
+/// Allocate an exact bytes object of size `n` whose contents the caller writes in
+/// full (large payloads are not cleared first); the trailing NUL is set.
+pub fn try_alloc_bytes_uninit(n: usize) -> PyResult<PyRef> {
+    if n > MAX_SIZE || crate::capi::mem::hooked_alloc_refuses(HEADER + n + 1) {
+        return Err(memory_error());
+    }
+    unsafe {
+        let op = alloc::alloc_object_payload_uninit(bytes_type(), HEADER + n + 1);
+        if op.is_null() {
+            return Err(memory_error());
+        }
+        set_var_size(op, n as isize);
+        (*(op as *mut PyBytesObject)).ob_shash = -1;
+        *(op as *mut u8).add(HEADER + n) = 0;
+        Ok(PyRef::from_raw(op))
+    }
+}
+
 /// Allocate a zeroed exact bytes object of size `n` (aborts on allocation failure).
 pub fn alloc_bytes(n: usize) -> PyRef {
     match alloc_bytes_unhooked(n) {
@@ -98,7 +116,10 @@ pub fn new_bytes(b: &[u8]) -> PyRef {
     if b.len() <= 1 {
         return if b.is_empty() { empty_bytes() } else { single_byte(b[0]) };
     }
-    let r = alloc_bytes(b.len());
+    let r = try_alloc_bytes_uninit(b.len()).unwrap_or_else(|_| {
+        clear_exc();
+        alloc_bytes(b.len())
+    });
     unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), bytes_ptr(&r), b.len()) };
     r
 }
@@ -129,7 +150,7 @@ pub fn try_new_bytes(b: &[u8]) -> PyResult<PyRef> {
     if b.len() <= 1 {
         return Ok(if b.is_empty() { empty_bytes() } else { single_byte(b[0]) });
     }
-    let r = try_alloc_bytes(b.len())?;
+    let r = try_alloc_bytes_uninit(b.len())?;
     unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), bytes_ptr(&r), b.len()) };
     Ok(r)
 }

@@ -77,6 +77,21 @@ pub fn list_to_vec(o: &PyObject) -> Vec<PyRef> {
     list_items(o).iter().map(|x| x.to_ref()).collect()
 }
 
+/// Raw item array and size (for the collector, which runs with the world stopped).
+#[inline(always)]
+pub unsafe fn raw_items(op: *mut PyObject) -> (*mut *mut PyObject, usize) {
+    unsafe {
+        let l = op as *mut PyListObject;
+        ((*l).ob_item, (*l).ob_base.ob_size as usize)
+    }
+}
+
+/// tuple(list) without an intermediate vector.
+pub fn list_to_tuple(o: &PyObject) -> PyRef {
+    let _g = ob_lock(o);
+    tuple::new_tuple_from_refs(list_items(o))
+}
+
 unsafe fn alloc_items(n: usize) -> *mut *mut PyObject {
     unsafe { alloc::buf_calloc(n * 8) as *mut *mut PyObject }
 }
@@ -612,7 +627,29 @@ pub fn list_from_iter(it: &PyObject) -> PyResult<PyRef> {
 
 /// list.extend(iterable) semantics.
 pub fn extend(o: &PyObject, it: &PyObject) -> PyResult<()> {
-    if is_list_exact(it) || tuple::is_tuple_exact(it) || o.is(it) {
+    if tuple::is_tuple_exact(it) {
+        // immutable source: copy the item pointers straight in
+        let src = tuple::tuple_items(it);
+        if src.is_empty() {
+            return Ok(());
+        }
+        let _g = ob_lock(o);
+        unsafe {
+            let l = lp(o);
+            let n = (*l).ob_base.ob_size as usize;
+            let k = src.len();
+            if !reserve_locked(l, n + k) {
+                return Err(memory_error());
+            }
+            let arr = (*l).ob_item;
+            for (i, x) in src.iter().enumerate() {
+                *arr.add(n + i) = x.to_ref().into_raw();
+            }
+            publish_size(l, n + k);
+        }
+        return Ok(());
+    }
+    if is_list_exact(it) || o.is(it) {
         let items: Vec<PyRef> = if tuple::is_tuple_exact(it) { tuple::tuple_to_vec(it) } else { list_to_vec(it) };
         if items.is_empty() {
             return Ok(());

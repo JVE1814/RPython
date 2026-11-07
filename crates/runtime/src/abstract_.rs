@@ -285,6 +285,34 @@ pub fn call_with_kwargs_dict(callable: &PyObject, args: &[&PyObject], kw: Option
     }
 }
 
+/// CALL_FUNCTION_EX with the positional arguments already in an exact tuple
+/// (perf3): callables without vectorcall get that tuple as is (no vector, no second
+/// tuple); others get a stack vector.
+pub fn call_ex_tuple(callable: &PyObject, self_or_null: Option<&PyObject>, args: &PyObject, kw: Option<&PyObject>) -> PyResult {
+    let kw = kw.filter(|k| dict::dict_len(k) > 0);
+    let items = tuple::tuple_items(args);
+    if self_or_null.is_none() && vectorcall_func(callable).is_none() && callable.ty().tp_call.is_some() {
+        return call_tp_call(callable, args, kw);
+    }
+    let n = items.len() + self_or_null.is_some() as usize;
+    if n <= 8 {
+        let mut buf: [&PyObject; 8] = [callable; 8];
+        let mut i = 0;
+        if let Some(s) = self_or_null {
+            buf[0] = s;
+            i = 1;
+        }
+        buf[i..n].copy_from_slice(items);
+        return call_with_kwargs_dict(callable, &buf[..n], kw);
+    }
+    let mut v: Vec<&PyObject> = Vec::with_capacity(n);
+    if let Some(s) = self_or_null {
+        v.push(s);
+    }
+    v.extend_from_slice(items);
+    call_with_kwargs_dict(callable, &v, kw)
+}
+
 /// Call `f` (found on the type) with `self_` prepended, avoiding a bound method
 /// for plain functions and method descriptors.
 pub fn call_unbound(f: &PyObject, self_: &PyObject, args: &[&PyObject]) -> PyResult {
@@ -536,10 +564,55 @@ pub fn rich_compare_bool(a: &PyObject, b: &PyObject, op: c_int) -> PyResult<bool
     is_true(&r)
 }
 
+/// Equality of two objects when it can be decided without running Python code
+/// (perf3): identical objects, exact str/int/float pairs, and exact tuples of such
+/// (compared item by item, nested tuples to a bounded depth). None when the answer
+/// needs an `__eq__` call (or the nesting is deeper than the bound).
+pub fn plain_eq(a: &PyObject, b: &PyObject) -> Option<bool> {
+    plain_eq_depth(a, b, 0)
+}
+
+fn plain_eq_depth(a: &PyObject, b: &PyObject, depth: u32) -> Option<bool> {
+    if a.is(b) {
+        return Some(true);
+    }
+    let ta = a.type_ptr();
+    if ta != b.type_ptr() {
+        return None;
+    }
+    let ta = ta as *mut crate::ffi::PyTypeObject;
+    if ta == pystr::str_type() {
+        return Some(pystr::str_eq(a, b));
+    }
+    if ta == int::int_type() {
+        return Some(int::sign(a) == int::sign(b) && int::digits(a) == int::digits(b));
+    }
+    if ta == crate::types::float::float_type() {
+        return Some(crate::types::float::float_value(a) == crate::types::float::float_value(b));
+    }
+    // tuples and tuple subclasses that keep tuple equality (namedtuples)
+    if depth < 16 && (ta == tuple::tuple_type() || unsafe { (*ta).tp_richcompare == (*tuple::tuple_type()).tp_richcompare && (*ta).tp_flags & crate::ffi::Py_TPFLAGS_TUPLE_SUBCLASS != 0 }) {
+        let (x, y) = (tuple::tuple_items(a), tuple::tuple_items(b));
+        if x.len() != y.len() {
+            return Some(false);
+        }
+        for (p, q) in x.iter().zip(y.iter()) {
+            if !plain_eq_depth(p, q, depth + 1)? {
+                return Some(false);
+            }
+        }
+        return Some(true);
+    }
+    None
+}
+
 #[inline]
 pub fn rich_eq(a: &PyObject, b: &PyObject) -> PyResult<bool> {
     if a.is(b) {
         return Ok(true);
+    }
+    if let Some(r) = plain_eq(a, b) {
+        return Ok(r);
     }
     if pystr::is_str_exact(a) && pystr::is_str_exact(b) {
         return Ok(pystr::str_eq(a, b));
@@ -1203,6 +1276,9 @@ pub fn collect_iterable(o: &PyObject) -> PyResult<Vec<PyRef>> {
     if list::is_list_exact(o) {
         return Ok(list::list_to_vec(o));
     }
+    if crate::types::set::is_anyset_exact(o) {
+        return Ok(crate::types::set::set_items(o));
+    }
     let it = get_iter(o)?;
     let mut v = Vec::new();
     if let Ok(n) = length_hint(o, 0) {
@@ -1252,6 +1328,9 @@ pub fn length_hint(o: &PyObject, default: usize) -> PyResult<usize> {
 pub fn sequence_tuple(o: &PyObject) -> PyResult {
     if tuple::is_tuple_exact(o) {
         return Ok(o.to_ref());
+    }
+    if list::is_list_exact(o) {
+        return Ok(list::list_to_tuple(o));
     }
     Ok(tuple::new_tuple(collect_iterable(o)?))
 }

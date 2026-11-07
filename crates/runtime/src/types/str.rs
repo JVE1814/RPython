@@ -509,43 +509,117 @@ pub fn write_into(dst: &PyObject, at: usize, src: StrData, dkind: u32) {
     }
 }
 
-/// Builder for strings of unknown final width.
+/// Builder for strings of unknown final width. Text is collected one byte per
+/// character while every character is below U+0100 (the common case: ASCII
+/// output of repr/json/format) and switches to 32-bit units on the first wider one.
 pub struct StrBuilder {
-    pub buf: Vec<u32>,
-    pub maxc: u32,
+    narrow: Vec<u8>,
+    wide: Vec<u32>,
+    is_wide: bool,
+    /// upper bound of the characters pushed (exact below 0x100)
+    maxc: u32,
+}
+impl Default for StrBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 impl StrBuilder {
     pub fn new() -> Self {
-        StrBuilder { buf: Vec::new(), maxc: 0 }
+        StrBuilder { narrow: Vec::new(), wide: Vec::new(), is_wide: false, maxc: 0 }
     }
     pub fn with_capacity(n: usize) -> Self {
-        StrBuilder { buf: Vec::with_capacity(n), maxc: 0 }
+        StrBuilder { narrow: Vec::with_capacity(n), wide: Vec::new(), is_wide: false, maxc: 0 }
+    }
+    #[cold]
+    fn widen(&mut self, extra: usize) {
+        self.wide.reserve(self.narrow.len() + extra.max(16));
+        self.wide.extend(self.narrow.iter().map(|&b| b as u32));
+        self.narrow = Vec::new();
+        self.is_wide = true;
     }
     #[inline]
     pub fn push(&mut self, c: u32) {
         self.maxc = self.maxc.max(c);
-        self.buf.push(c);
+        if !self.is_wide {
+            if c < 0x100 {
+                self.narrow.push(c as u8);
+                return;
+            }
+            self.widen(1);
+        }
+        self.wide.push(c);
+    }
+    /// Append ASCII bytes (no check that they are ASCII beyond a debug assertion).
+    #[inline]
+    pub fn push_ascii(&mut self, s: &[u8]) {
+        debug_assert!(s.is_ascii());
+        if !self.is_wide {
+            self.narrow.extend_from_slice(s);
+        } else {
+            self.wide.extend(s.iter().map(|&b| b as u32));
+        }
+        // ASCII never raises `maxc` past the ASCII/Latin-1 boundary that matters
     }
     pub fn push_str(&mut self, s: &str) {
+        if s.is_ascii() {
+            self.push_ascii(s.as_bytes());
+            return;
+        }
         for c in s.chars() {
             self.push(c as u32);
         }
     }
     pub fn push_data(&mut self, d: StrData) {
-        for c in d.iter() {
-            self.push(c);
+        match d {
+            StrData::L1(b) if !self.is_wide => {
+                self.narrow.extend_from_slice(b);
+                if let Some(m) = b.iter().copied().max() {
+                    self.maxc = self.maxc.max(m as u32);
+                }
+            }
+            _ => {
+                for c in d.iter() {
+                    self.push(c);
+                }
+            }
         }
     }
     pub fn push_obj(&mut self, o: &PyObject) {
-        self.maxc = self.maxc.max(max_char(o).min(0x10ffff));
-        self.buf.extend(str_data(o).iter());
+        let m = max_char(o).min(0x10ffff);
+        let d = str_data(o);
+        if !self.is_wide {
+            if let StrData::L1(b) = d {
+                self.narrow.extend_from_slice(b);
+                self.maxc = self.maxc.max(m);
+                return;
+            }
+            self.widen(d.len());
+        }
+        self.maxc = self.maxc.max(m);
+        match d {
+            StrData::U4(u) => self.wide.extend_from_slice(u),
+            _ => self.wide.extend(d.iter()),
+        }
     }
     pub fn len(&self) -> usize {
-        self.buf.len()
+        if self.is_wide { self.wide.len() } else { self.narrow.len() }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
     pub fn finish(self) -> PyRef {
-        let real_max = if self.maxc >= 0x80 { self.buf.iter().copied().max().unwrap_or(0) } else { self.maxc };
-        from_codepoints_max(&self.buf, real_max)
+        if !self.is_wide {
+            let b = &self.narrow;
+            if b.len() <= 1 {
+                return if b.is_empty() { empty_str() } else { latin1_char(b[0]) };
+            }
+            let r = alloc_str(b.len(), if self.maxc < 0x80 { 0x7f } else { 0xff });
+            unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), str_data_ptr(&r), b.len()) };
+            return r;
+        }
+        let real_max = self.wide.iter().copied().max().unwrap_or(0);
+        from_codepoints_max(&self.wide, real_max)
     }
 }
 
