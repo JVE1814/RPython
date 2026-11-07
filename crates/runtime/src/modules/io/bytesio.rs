@@ -400,6 +400,7 @@ fn b_sizeof(o: &PyObject) -> PyResult {
 unsafe extern "C" fn b_iternext(op: *mut PyObject) -> *mut PyObject {
     unsafe {
         let o = &*op;
+        let _lk = crate::objlock::lock(o);
         if !o.is_type(bytesio_type()) {
             // subclass may override readline
             let r = call0(o, "readline");
@@ -540,6 +541,7 @@ pub fn init_types() -> PyResult<()> {
             ("__sizeof__", NOARGS, b_sizeof),
         ];
         t.tp_getset = crate::getset_table![("closed", b_closed)];
+        crate::methods::lock_self_methods(bytesio_type());
         crate::types::typeobject::type_ready(bytesio_type())?;
 
         let t = &mut *(&raw mut BYTESIOBUF_TYPE);

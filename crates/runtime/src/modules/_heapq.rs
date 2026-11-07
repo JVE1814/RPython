@@ -104,7 +104,12 @@ fn pop_impl(heap: &PyObject, max: bool) -> PyResult {
     if n == 0 {
         raise!(IndexError, "index out of range");
     }
-    let last = list::pop(heap, n - 1);
+    // pop the current last item atomically (another thread may have shrunk the list
+    // since `n` was read; list::pop would then hand back None)
+    let last = match list::pop_index(heap, -1) {
+        Ok(v) => v,
+        Err(_) => raise!(IndexError, "index out of range"),
+    };
     if n == 1 {
         return Ok(last);
     }

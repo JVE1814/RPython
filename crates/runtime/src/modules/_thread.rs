@@ -979,18 +979,19 @@ unsafe extern "C" fn local_dealloc(op: *mut PyObject) {
         for d in dicts {
             decref(d as *mut PyObject);
         }
-        std::ptr::drop_in_place(&raw mut (*l).dicts);
-        xdecref((*l).args);
-        xdecref((*l).kw);
+        xdecref(std::mem::replace(&mut (*l).args, std::ptr::null_mut()));
+        xdecref(std::mem::replace(&mut (*l).kw, std::ptr::null_mut()));
         let tp = (*op).type_ptr();
         if crate::types::typeobject::is_heap_type(tp) {
-            // clear subclass slots / managed dict
+            // clear subclass slots / managed dict (a subclass's tp_clear ends in
+            // local_clear, so the dict map must still be valid here)
             if let Some(clear) = (*tp).tp_clear {
                 if clear as usize != local_clear as usize {
                     clear(op);
                 }
             }
         }
+        std::ptr::drop_in_place(&raw mut (*l).dicts);
         crate::types::typeobject::generic_free_and_type_decref(op, tp);
     }
 }

@@ -489,6 +489,7 @@ fn s_detach(_o: &PyObject) -> PyResult {
 unsafe extern "C" fn s_iternext(op: *mut PyObject) -> *mut PyObject {
     unsafe {
         let o = &*op;
+        let _lk = crate::objlock::lock(o);
         let r = if o.is_type(stringio_type()) {
             readline_impl(o, -1)
         } else {
@@ -565,6 +566,7 @@ pub fn init_types() -> PyResult<()> {
             ("__setstate__", O, s_setstate),
         ];
         t.tp_getset = crate::getset_table![("closed", s_closed), ("line_buffering", s_line_buffering), ("newlines", s_newlines)];
+        crate::methods::lock_self_methods(stringio_type());
         crate::types::typeobject::type_ready(stringio_type())?;
     }
     Ok(())

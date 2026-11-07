@@ -525,6 +525,8 @@ pub const METH_STATIC: c_int = 0x0020;
 pub const METH_COEXIST: c_int = 0x0040;
 pub const METH_FASTCALL: c_int = 0x0080;
 pub const METH_METHOD: c_int = 0x0200;
+/// Private (runtime-only) flag: the call holds `objlock::lock(self)` (see objlock.rs).
+pub const METH_LOCKSELF: c_int = 0x0100_0000;
 
 pub const Py_T_SHORT: c_int = 0;
 pub const Py_T_INT: c_int = 1;

@@ -30,6 +30,7 @@ pub mod qsbr;
 pub mod shape;
 pub mod threads;
 pub mod fork;
+pub mod objlock;
 pub mod tlab;
 pub mod types;
 
