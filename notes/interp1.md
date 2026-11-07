@@ -99,4 +99,8 @@ import-in-a-loop microbenchmark (200k `import os` + builtin calls): +0.7%.
   `functools.Placeholder`, tty modules still keep module objects in process-wide statics.
 - Destroying an interpreter while daemon threads of it still run keeps its roots (they are
   cleared, not freed) to avoid use-after-free in those threads.
+- Interned strings are one process-wide table (test_sys `test_subinterp_intern_dynamically_allocated`
+  wants per-interpreter interning of dynamically created strings); a 1-char latin-1 str made by
+  decoding is not the cached singleton (`test_subinterp_intern_singleton`).
+- `_testcapi.set_nomemory` fault injection is not honoured (test_atexit low-memory test).
 - Blocking `Queue.put/get` poll (5 ms) in Python; channel `send(blocking=True)` waits in Rust.
