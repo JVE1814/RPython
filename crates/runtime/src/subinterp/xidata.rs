@@ -474,6 +474,9 @@ const OP_DELETE_GLOBAL: u8 = 62;
 const OP_DELETE_NAME: u8 = 63;
 const OP_EXTENDED_ARG: u8 = 67;
 const OP_LOAD_CONST: u8 = 81;
+const OP_LOAD_COMMON_CONSTANT: u8 = 80;
+/// LOAD_COMMON_CONSTANT operand for None
+const COMMON_CONST_NONE: u32 = 7;
 const OP_LOAD_FROM_DICT_OR_GLOBALS: u8 = 90;
 const OP_LOAD_GLOBAL: u8 = 91;
 const OP_LOAD_NAME: u8 = 92;
@@ -567,7 +570,8 @@ pub fn check_script_code(code: &PyObject, what: &str) -> PyResult<()> {
     let mut prev: Option<(u8, u32)> = None;
     for (op, arg) in instructions(code)? {
         if op == OP_RETURN_VALUE {
-            let ok = matches!(prev, Some((OP_LOAD_CONST, k)) if consts.get(k as usize).is_some_and(|c| c.is(none::none())));
+            let ok = matches!(prev, Some((OP_LOAD_CONST, k)) if consts.get(k as usize).is_some_and(|c| c.is(none::none())))
+                || matches!(prev, Some((OP_LOAD_COMMON_CONSTANT, COMMON_CONST_NONE)));
             if !ok {
                 raise!(ValueError, "{} must not return a value", what);
             }

@@ -33,6 +33,8 @@ pub fn finalize() -> bool {
     // the callback registry is per interpreter, not per atexit module object
     super::atexit::run_exitfuncs();
     crate::capi::lifecycle::run_interp_atexit();
+    // (interp1) subinterpreters that are still around are finalized first
+    crate::subinterp::destroy_all();
     // threads started by atexit callbacks are waited for as well (threading's
     // own bookkeeping already shut down: join the handles directly)
     if super::_thread::thread_shutdown(crate::types::none::none()).is_err() {

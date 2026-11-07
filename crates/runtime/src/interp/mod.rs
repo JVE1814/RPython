@@ -68,7 +68,9 @@ pub fn current_globals() -> Option<PyRef> {
     let ts = crate::threads::current();
     let f = ts.frame.get();
     if f.is_null() {
-        return None;
+        // (interp1) no Python frame, but the interpreter is running code for
+        // `_interpreters`: that code's globals are __main__'s
+        return crate::subinterp::running_main_globals();
     }
     unsafe { Some(PyRef::from_borrowed((*f).globals)) }
 }

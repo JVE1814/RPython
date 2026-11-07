@@ -586,6 +586,10 @@ pub fn finalize_current() {
         crate::modules::sys_finalize::wait_for_thread_shutdown();
         crate::modules::atexit::run_exitfuncs();
         run_c_atexit(i);
+        // threads started by atexit callbacks are joined too
+        if crate::modules::_thread::thread_shutdown(none::none()).is_err() {
+            crate::modules::sys_full::write_unraisable(Some("Exception ignored on threading shutdown"), None);
+        }
         crate::modules::sys_full::flush_std("stdout");
         crate::modules::sys_full::flush_std("stderr");
         clear_exc();
@@ -715,7 +719,7 @@ pub fn destroy_all() {
 
 /// Mark `i` as running main code on the calling thread; fails if it is already.
 pub fn claim_running(i: &'static Interp) -> PyResult<()> {
-    let me = threads::current_ptr() as usize | 1;
+    let me = crate::object::thread_id() | 1;
     if i.running.compare_exchange(0, me, AcqRel, Acquire).is_err() {
         return Err(new_err(module::interpreter_error_type(), "interpreter already running"));
     }
@@ -739,6 +743,18 @@ pub fn main_module() -> PyResult {
     dict::set_item_str(&d, "__builtins__", &crate::builtins::builtins_module())?;
     dict::set_item_str(&md, "__main__", &m)?;
     Ok(m)
+}
+
+/// `__main__.__dict__` of the current interpreter while `_interpreters` runs
+/// code in it on this thread (the globals of frame-less calls).
+pub fn running_main_globals() -> Option<PyRef> {
+    let i = current();
+    let r = i.running.load(Acquire);
+    if r == 0 || r != (crate::object::thread_id() | 1) {
+        return None;
+    }
+    let m = crate::import::get_loaded_module("__main__")?;
+    Some(pymodule::module_dict(&m))
 }
 
 /// The interpreter's per-interpreter config flags checked by os/threading.

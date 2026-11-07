@@ -316,7 +316,8 @@ fn b_globals(_m: &PyObject) -> PyResult {
 fn b_locals(_m: &PyObject) -> PyResult {
     let f = crate::interp::current_frame_ptr();
     if f.is_null() {
-        return Ok(dict::new_dict());
+        // (interp1) module-level code of a running __main__: locals are globals
+        return Ok(crate::subinterp::running_main_globals().unwrap_or_else(dict::new_dict));
     }
     crate::types::frameobject::locals_dict(unsafe { &*f })
 }

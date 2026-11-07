@@ -414,6 +414,10 @@ fn exec_common(fname: &str, args: &[&PyObject], kw: Option<&PyObject>, names: &'
     let [id, code, shared, restrict] = args::parse::<4>(&p, args, kw)?;
     let shared = check_dict_arg(fname, "shared", shared)?;
     let i = lookup_arg(id.unwrap(), truth(restrict)?)?;
+    let shared_xi = match &shared {
+        Some(d) => xidata::shared_dict(d)?,
+        None => Vec::new(),
+    };
     let code = code.unwrap();
     let data = match fname {
         "run_string" => {
@@ -434,10 +438,6 @@ fn exec_common(fname: &str, args: &[&PyObject], kw: Option<&PyObject>, names: &'
             }
             xidata::script_code(code, "code")?
         }
-    };
-    let shared_xi = match &shared {
-        Some(d) => xidata::shared_dict(d)?,
-        None => Vec::new(),
     };
     match run_in(i, || exec_code_data(&data, &shared_xi))? {
         Outcome::Ok(()) => Ok(none::none_ref()),

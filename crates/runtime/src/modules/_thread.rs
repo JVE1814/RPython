@@ -443,6 +443,8 @@ pub struct HandleInner {
     ident: AtomicU64,
     generation: AtomicU64,
     daemon: AtomicBool,
+    /// (interp1) interpreter the thread runs in (0: main)
+    interp: std::sync::atomic::AtomicUsize,
 }
 
 impl HandleInner {
@@ -453,6 +455,7 @@ impl HandleInner {
             ident: AtomicU64::new(0),
             generation: AtomicU64::new(FORK_GENERATION.load(Relaxed)),
             daemon: AtomicBool::new(true),
+            interp: std::sync::atomic::AtomicUsize::new(0),
         })
     }
     fn effective_state(&self) -> HState {
@@ -603,6 +606,7 @@ fn spawn_thread(func: PyRef, args: PyRef, kwargs: Option<PyRef>, handle: Arc<Han
     // (interp1) the new thread runs in the interpreter of the thread starting it
     let cur_ts = crate::threads::current_ptr();
     let parent_interp = SendPtr(if cur_ts.is_null() { std::ptr::null_mut() } else { unsafe { (*cur_ts).c.interp as *mut PyObject } });
+    handle.interp.store(interp_key(parent_interp.0 as usize), Relaxed);
     let f = SendPtr(func.into_raw());
     let a = SendPtr(args.into_raw());
     let k = SendPtr(kwargs.map_or(std::ptr::null_mut(), |k| k.into_raw()));
@@ -778,7 +782,14 @@ fn start_joinable_thread(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject
     }
 }
 
+/// (interp1) 0 for the main interpreter, else the address of its state.
+fn interp_key(p: usize) -> usize {
+    if p == 0 || p == crate::subinterp::main().as_ptr() as usize { 0 } else { p }
+}
+
 pub fn thread_shutdown(_m: &PyObject) -> PyResult {
+    // only the threads of the calling interpreter are waited for
+    let mine = interp_key(crate::subinterp::current().as_ptr() as usize);
     loop {
         let next: Option<Arc<HandleInner>> = {
             let nd = NON_DAEMON.lock().unwrap();
@@ -788,7 +799,7 @@ pub fn thread_shutdown(_m: &PyObject) -> PyResult {
                     Arc::increment_strong_count(p as *const HandleInner);
                     Arc::from_raw(p as *const HandleInner)
                 })
-                .find(|h| h.ident.load(Relaxed) != me && h.effective_state() != HState::Done)
+                .find(|h| h.ident.load(Relaxed) != me && h.effective_state() != HState::Done && h.interp.load(Relaxed) == mine)
         };
         match next {
             Some(h) => {
