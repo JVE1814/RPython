@@ -51,3 +51,17 @@
 - Speed (s, old vs new, 3 interleaved rounds): async_tree none 1.01/1.07/0.97 vs
   1.15/1.00/0.95, eager 0.35/0.45/0.33 vs 0.36/0.33/0.33, memoization 1.33/1.42/1.26 vs
   1.37/1.13/1.06, asyncio_tcp 0.81/0.97/0.69 vs 1.04/0.67/0.68 (equal within noise).
+
+### asyncio/staggered.py
+- Tests: test_staggered 8, test_eager_task_factory, test_base_events, test_streams (incl.
+  test_open_connection_happy_eyeball_refcycles), test_external_inspection 67
+  (test_async_staggered_race_remote_stack_trace) = (pass); full test_asyncio unchanged.
+- Kept because pinned: the local coroutine name `run_one_coro` (its qualname
+  `staggered_race.<locals>.run_one_coro` appears in test_external_inspection's expected stacks)
+  and the awaited-by registration of each attempt task with the calling task; the
+  `(result, index, exceptions)` return shape.
+- New structure: one event-driven loop in the race coroutine (flags `launch_now`/`cancelled`,
+  a `wake` future poked by attempt completions and the delay timer, `launch()` starting the
+  next attempt and re-arming the timer).
+- Behaviour: as before; base_events now empties the race's exception list after use (the
+  attempt frames, reachable from a raised exception's traceback, reach it through the closure).

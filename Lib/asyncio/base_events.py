@@ -1273,6 +1273,10 @@ class BaseEventLoop(events.AbstractEventLoop):
                 outcome = await staggered.staggered_race(
                     attempts, happy_eyeballs_delay, loop=self)
                 sock = outcome[0]
+                # The race's own per-attempt exception list duplicates
+                # `errors`; empty it for the same reason as below.
+                if isinstance(outcome[-1], list):
+                    outcome[-1].clear()
             if sock is not None:
                 return sock
             failure = _connect_failure(_flatten(errors), all_errors)
