@@ -428,7 +428,7 @@ pub fn repr(o: &PyObject) -> PyResult {
     crate::interp::leave_recursive_call(ts);
     let r = r?;
     if !pystr::is_str(&r) {
-        raise!(TypeError, "__repr__ returned non-string (type {})", tname(&r));
+        raise!(TypeError, "{}.__repr__() must return a str, not {}", type_fqname(o.type_ptr()), tname(&r));
     }
     Ok(r)
 }
@@ -447,7 +447,7 @@ pub fn str(o: &PyObject) -> PyResult {
     crate::interp::leave_recursive_call(ts);
     let r = r?;
     if !pystr::is_str(&r) {
-        raise!(TypeError, "__str__ returned non-string (type {})", tname(&r));
+        raise!(TypeError, "{}.__str__() must return a str, not {}", type_fqname(o.type_ptr()), tname(&r));
     }
     Ok(r)
 }
@@ -1191,7 +1191,8 @@ pub fn getitem(o: &PyObject, key: &PyObject) -> PyResult {
             return crate::types::genericalias::new_generic_alias(o, key);
         }
         // __class_getitem__
-        if let Some(m) = getattr_opt(o, name!("__class_getitem__"))? {
+        // (set to None it means "not subscriptable", like a missing method)
+        if let Some(m) = getattr_opt(o, name!("__class_getitem__"))?.filter(|m| !m.is(crate::types::none::none())) {
             return call(&m, &[key]);
         }
         raise!(TypeError, "type '{}' is not subscriptable", type_name(unsafe { &*as_type(o) }));

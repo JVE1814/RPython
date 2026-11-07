@@ -830,10 +830,12 @@ pub fn sort_list(l: &PyObject, key: Option<&PyObject>, reverse: bool) -> PyResul
     if reverse {
         items.reverse();
     }
-    let modified = list::list_len(l) != 0 || unsafe { (*(l.as_ptr() as *const PyListObject)).allocated } != -1;
     let saved_exc = if failed { take_exc() } else { None };
-    let extra = list::restore_items(l, items);
+    // the keys go first, while the list is still detached: their finalizers may
+    // mutate it, which counts as a modification during the sort
     drop(keys_owned);
+    let modified = list::list_len(l) != 0 || unsafe { (*(l.as_ptr() as *const PyListObject)).allocated } != -1;
+    let extra = list::restore_items(l, items);
     list::release_items(extra);
     if let Some(e) = saved_exc {
         set_exc(e);

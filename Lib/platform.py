@@ -39,16 +39,49 @@ def _comparable_version(version):
     return result
 
 
-_libc_search = re.compile(b'(__libc_init)'
-                          b'|'
-                          b'(GLIBC_([0-9.]+))'
-                          b'|'
-                          br'(libc(_\w+)?\.so(?:\.(\d[0-9.]*))?)', re.ASCII)
+# Markers of the C library left in a linked executable, tried in this order at
+# each position: musl's loader / shared object names, musl's source path,
+# glibc symbol versions, a static libc's init symbol, a generic libc.so name.
+_LIBC_MARKERS = re.compile(
+    br'(?P<muslso>(?:ld|libc)[.-]musl(?:-\w+)?\.so(?:\.(?P<muslsover>\d[\d.]*))?)'
+    br'|musl-(?P<muslver>\d+(?:\.\d+)+)'
+    br'|GLIBC_(?P<glibc>\d[\d.]*)'
+    br'|(?P<init>__libc_init)'
+    br'|libc(?P<threads>_\w+)?\.so(?:\.(?P<sover>\d[\d.]*))?',
+    re.ASCII)
+
+
+def _iter_libc_markers(executable, chunksize):
+    """Yield the marker matches of a file, reading it in chunks; the end of
+    each chunk is kept so that a marker split by a boundary is still seen."""
+    overlap = 256
+    with open(executable, 'rb') as f:
+        buf = b''
+        offset = 0          # file position of buf[0]
+        seen_until = 0      # file position up to which matches were reported
+        while True:
+            chunk = f.read(chunksize)
+            buf += chunk
+            last = not chunk
+            for m in _LIBC_MARKERS.finditer(buf):
+                start = offset + m.start()
+                # a match touching the end of the buffer may continue in the
+                # next chunk: leave it for the next round
+                if not last and m.end() >= len(buf):
+                    break
+                if start >= seen_until:
+                    seen_until = offset + m.end()
+                    yield m
+            if last:
+                return
+            keep = min(len(buf), overlap)
+            offset += len(buf) - keep
+            buf = buf[len(buf) - keep:]
 
 
 def libc_ver(executable=None, lib='', version='', chunksize=16384):
     """Return (lib, version) of the C library the executable is linked
-    against (best effort; empty strings when unknown)."""
+    against (best effort; the given defaults when nothing is recognised)."""
     if not executable:
         try:
             ver = os.confstr('CS_GNU_LIBC_VERSION')
@@ -61,45 +94,41 @@ def libc_ver(executable=None, lib='', version='', chunksize=16384):
         if not executable:
             return lib, version
 
-    V = _comparable_version
-    executable = os.path.realpath(executable)
-    ver = None
-    with open(executable, 'rb') as f:
-        binary = f.read(chunksize)
-        pos = 0
-        while pos < len(binary):
-            if b'libc' in binary or b'GLIBC' in binary:
-                m = _libc_search.search(binary, pos)
-            else:
-                m = None
-            if not m or m.end() == len(binary):
-                chunk = f.read(chunksize)
-                if chunk:
-                    binary = binary[max(pos, len(binary) - 1000):] + chunk
-                    pos = 0
-                    continue
-                if not m:
-                    break
-            libcinit, glibc, glibcversion, so, threads, soversion = [
-                s.decode('latin1') if s is not None else s
-                for s in m.groups()]
-            if libcinit and not lib:
-                lib = 'libc'
-            elif glibc:
-                if lib != 'glibc':
-                    lib = 'glibc'
-                    ver = glibcversion
-                elif V(glibcversion) > V(ver):
-                    ver = glibcversion
-            elif so:
-                if lib != 'glibc':
-                    lib = 'libc'
-                    if soversion and (not ver or V(soversion) > V(ver)):
-                        ver = soversion
-                    if threads and ver[-len(threads):] != threads:
-                        ver = ver + threads
-            pos = m.end()
-    return lib, version if ver is None else ver
+    newer = lambda a, b: b is None or _comparable_version(a) > _comparable_version(b)
+    found_lib = None
+    found_ver = None
+    for m in _iter_libc_markers(os.path.realpath(executable), chunksize):
+        groups = {k: (v.decode('latin1').rstrip('.') if v is not None else None)
+                  for k, v in m.groupdict().items()}
+        if groups['glibc'] is not None:
+            if found_lib != 'glibc':
+                found_lib, found_ver = 'glibc', groups['glibc']
+            elif newer(groups['glibc'], found_ver):
+                found_ver = groups['glibc']
+        elif found_lib == 'glibc':
+            continue        # glibc symbol versions are the best evidence
+        elif groups['muslso'] is not None or groups['muslver'] is not None:
+            ver = groups['muslsover'] or groups['muslver']
+            if found_lib != 'musl':
+                found_lib, found_ver = 'musl', ver
+            elif ver and newer(ver, found_ver):
+                found_ver = ver
+        elif found_lib == 'musl':
+            continue
+        elif groups['init'] is not None:
+            if found_lib is None:
+                found_lib = 'libc'
+        else:
+            found_lib = 'libc'
+            ver = groups['sover']
+            if ver and newer(ver, found_ver):
+                found_ver = ver
+            threads = groups['threads']
+            if threads and found_ver and not found_ver.endswith(threads):
+                found_ver += threads
+    if found_lib is None:
+        return lib, version
+    return found_lib, version if found_ver is None else found_ver
 
 
 def _norm_version(version, build=''):

@@ -279,9 +279,8 @@ fn union_instancecheck(o: &PyObject, inst: &PyObject) -> PyResult {
     Ok(bool_::new_bool(false))
 }
 fn union_subclasscheck(o: &PyObject, sub: &PyObject) -> PyResult {
-    if !is_type(sub) {
-        raise!(TypeError, "issubclass() arg 1 must be a class");
-    }
+    // No class check on `sub` here: each member decides (typing aliases accept
+    // other aliases), and plain types reject a non-class themselves.
     let args = union_args(o);
     for a in tuple::tuple_items(&args) {
         if ab::issubclass(sub, a)? {

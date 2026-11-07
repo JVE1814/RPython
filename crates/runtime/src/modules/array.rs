@@ -1108,7 +1108,7 @@ unsafe extern "C" fn array_getbuffer(o: *mut PyObject, view: *mut Py_buffer, fla
         let c = code_of(a);
         let d = data(a);
         let v = &mut *view;
-        v.buf = if d.is_empty() { EMPTY.as_ptr() as *mut c_void } else { d.as_mut_ptr() as *mut c_void };
+        v.buf = if d.is_empty() { EMPTY.0.as_ptr() as *mut c_void } else { d.as_mut_ptr() as *mut c_void };
         v.obj = a.to_ref().into_raw();
         v.len = d.len() as isize;
         v.readonly = 0;
@@ -1133,7 +1133,10 @@ unsafe extern "C" fn array_getbuffer(o: *mut PyObject, view: *mut Py_buffer, fla
     }
 }
 
-static EMPTY: [u8; 8] = [0; 8];
+// buffer of an empty array: aligned for the widest item type (16 for complex)
+#[repr(C, align(16))]
+struct AlignedEmpty([u8; 16]);
+static EMPTY: AlignedEmpty = AlignedEmpty([0; 16]);
 
 unsafe extern "C" fn array_releasebuffer(o: *mut PyObject, _view: *mut Py_buffer) {
     unsafe {

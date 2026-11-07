@@ -446,10 +446,14 @@ pub(super) fn unpack_sequence(seq: &PyObject, n: usize, out: &mut Vec<PyRef>) ->
         }
     }
     if ab::iter_next(&it)?.is_some() {
-        if let Ok(len) = ab::length(seq) {
-            raise!(ValueError, "too many values to unpack (expected {}, got {})", n, len);
+        // the count is only shown for builtin containers whose size is known; a
+        // user-defined __len__ is never called for the message
+        if dict::is_dict_exact(seq) || crate::types::set::is_anyset_exact(seq) {
+            if let Ok(len) = ab::length(seq) {
+                raise!(ValueError, "too many values to unpack (expected {}, got {})", n, len);
+            }
+            clear_exc();
         }
-        clear_exc();
         raise!(ValueError, "too many values to unpack (expected {})", n);
     }
     Ok(())
@@ -1401,7 +1405,21 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             adapt_once!(super::adaptive::for_iter(unsafe { &*peek!(f, 1) }));
                             let it = unsafe { &*top!(f) };
                             let gen_iter = crate::modules::sys::tracing_active() && crate::types::genobject::is_generator_exact(it);
-                            match ab::iter_next(it)? {
+                            // under tracing a generator is resumed directly, so that its return
+                            // value (reported as a StopIteration) is known
+                            let mut returned: Option<PyRef> = None;
+                            let next = if gen_iter {
+                                match crate::types::genobject::send_to(it, none::none())? {
+                                    crate::types::genobject::SendResult::Yield(v) => Some(v),
+                                    crate::types::genobject::SendResult::Return(r) => {
+                                        returned = Some(r);
+                                        None
+                                    }
+                                }
+                            } else {
+                                ab::iter_next(it)?
+                            };
+                            match next {
                                 Some(v) => push!(f, v.into_raw()),
                                 None => {
                                     unsafe { decref(pop!(f)) };
@@ -1409,7 +1427,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                                 }
                             }
                             if crate::modules::sys::tracing_active() {
-                                for_iter_event(ts, f, pc == arg as usize, gen_iter, pc)?;
+                                for_iter_event(ts, f, pc == arg as usize, gen_iter, returned.as_deref(), pc)?;
                             }
                         }
                         Op::GetYieldFromIter => {
@@ -2072,11 +2090,20 @@ fn branch_event(ts: &ThreadState, f: &mut Frame, taken: bool, dest: usize) -> Py
 /// FOR_ITER: continuing the loop is the left branch, leaving it the right one; an
 /// exhausted generator reports STOP_ITERATION (no exception is raised for it).
 #[cold]
-fn for_iter_event(ts: &ThreadState, f: &mut Frame, exhausted: bool, gen_iter: bool, dest: usize) -> PyResult<()> {
+/// `returned`: the return value of an exhausted generator (when known).
+fn for_iter_event(ts: &ThreadState, f: &mut Frame, exhausted: bool, gen_iter: bool, returned: Option<&PyObject>, dest: usize) -> PyResult<()> {
     use crate::modules::sys_trace as st;
     if exhausted && gen_iter && st::wants(st::STOP_ITERATION) {
         let si = ab::call(type_obj(exc::StopIteration()), &[])?;
         st::fire_exc_event(ts, f, st::STOP_ITERATION, &si)?;
+    }
+    // a legacy trace function sees an 'exception' event only when the generator
+    // returned a value (a bare return ends the loop silently)
+    if let Some(r) = returned.filter(|r| !r.is(none::none())) {
+        if exhausted && st::wants_legacy_exception(ts, f) {
+            let si = ab::call(type_obj(exc::StopIteration()), &[r])?;
+            st::legacy_exception_event(ts, f, &si)?;
+        }
     }
     st::fire_branch(ts, f, if exhausted { st::BRANCH_RIGHT } else { st::BRANCH_LEFT }, dest)
 }

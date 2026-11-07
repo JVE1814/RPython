@@ -164,11 +164,11 @@ impl State {
 /// Raw view of the current thread's Python stack: (filename, lineno) of up
 /// to `limit` frames, most recent first, and the total number of frames.
 /// Frames that have not started executing yet are skipped.
-fn capture(limit: usize) -> (Vec<(&'static str, i32)>, u32) {
+fn capture(limit: usize, start: *mut crate::interp::frame::Frame) -> (Vec<(&'static str, i32)>, u32) {
     use crate::interp::frame::FrameState;
     let mut frames = Vec::new();
     let mut total = 0u32;
-    let mut f = crate::interp::current_frame_ptr();
+    let mut f = start;
     while !f.is_null() {
         let fr = unsafe { &*f };
         f = fr.prev;
@@ -217,8 +217,12 @@ fn in_prologue(fr: &crate::interp::frame::Frame) -> bool {
 }
 
 fn record(domain: u32, ptr: usize, size: usize) {
+    record_from(domain, ptr, size, crate::interp::current_frame_ptr());
+}
+
+fn record_from(domain: u32, ptr: usize, size: usize, start: *mut crate::interp::frame::Frame) {
     let limit = state().max_nframe;
-    let (raw, total) = capture(limit);
+    let (raw, total) = capture(limit, start);
     let mut st = state();
     let frames = raw.iter().map(|(name, line)| (st.intern_filename(name), *line)).collect();
     let tb = st.intern_traceback(Traceback { frames, total_nframe: total });
@@ -312,7 +316,13 @@ pub unsafe extern "C" fn PyTraceMalloc_Track(domain: std::ffi::c_uint, ptr: usiz
     if !TRACING.load(SeqCst) {
         return -2;
     }
-    guarded(|| record(domain, ptr, size));
+    // an extension may call this with its thread state detached: the traceback is
+    // still that of the calling thread
+    let mut start = crate::interp::current_frame_ptr();
+    if start.is_null() {
+        start = crate::capi::pystate::detached_own_frame();
+    }
+    guarded(|| record_from(domain, ptr, size, start));
     0
 }
 

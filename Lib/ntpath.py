@@ -349,18 +349,7 @@ else:
             return _emulated_abspath(path)
 
 ALLOW_MISSING = genericpath.ALLOW_MISSING
-
-
-class _AllButLastMarker:
-    """Value for realpath(strict=...): every component but the last must exist."""
-    def __repr__(self):
-        return "os.path.ALL_BUT_LAST"
-
-    def __reduce__(self):
-        return "ALL_BUT_LAST"
-
-
-ALL_BUT_LAST = _AllButLastMarker()
+ALL_BUT_LAST = genericpath.ALL_BUT_LAST
 
 
 def realpath(path, /, *, strict=False):

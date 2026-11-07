@@ -206,7 +206,6 @@ pub fn new_from_sequence(tp: *mut PyTypeObject, seq: &PyObject, d: Option<&PyObj
         ab::collect_iterable(seq)?
     };
     let d = match d {
-        Some(x) if x.is(none::none()) => None,
         Some(x) if dict::is_dict(x) => Some(x),
         Some(_) => raise!(TypeError, "{}() takes a dict as second arg, if any", full),
         None => None,
@@ -349,6 +348,9 @@ fn structseq_replace(o: &PyObject, args: &[&PyObject], kwnames: Option<&PyObject
 pub fn new_type(desc: &Desc) -> PyResult<*mut PyTypeObject> {
     let tp = Box::leak(Box::new(PyTypeObject::ZERO)) as *mut PyTypeObject;
     init_type(tp, desc)?;
+    // module-level struct sequences (time.struct_time, os.stat_result, ...) are
+    // created at run time like heap types: their attributes can be set
+    unsafe { (*tp).tp_flags &= !Py_TPFLAGS_IMMUTABLETYPE };
     Ok(tp)
 }
 

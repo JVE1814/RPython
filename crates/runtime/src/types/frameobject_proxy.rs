@@ -65,12 +65,35 @@ pub fn extra_locals_of(frame_obj: *mut PyObject) -> Option<PyRef> {
     }
 }
 
+/// Whether fast slot i is part of the frame's visible locals.  Hidden slots
+/// (variables of a comprehension inlined into a module or class body) are
+/// visible while they are bound, i.e. while that comprehension runs.
+fn slot_visible(f: &Frame, i: usize) -> bool {
+    let cd = crate::types::code::code_data(f.code());
+    cd.localspluskinds[i] & bc::fast::HIDDEN == 0 || (!f.locals.is_null() && !f.slots[i].is_null())
+}
+
+/// True when a module/class frame currently has bound hidden slots: its
+/// locals are then the mapping plus those slots, seen through a proxy.
+pub fn has_bound_hidden(f: &Frame) -> bool {
+    if f.locals.is_null() {
+        return false;
+    }
+    let cd = crate::types::code::code_data(f.code());
+    (0..f.nlocalsplus).any(|i| cd.localspluskinds[i] & bc::fast::HIDDEN != 0 && !f.slots[i].is_null())
+}
+
+/// The locals mapping of a module/class frame.
+fn mapping(f: &Frame) -> Option<PyRef> {
+    if f.locals.is_null() { None } else { Some(unsafe { (*f.locals).to_ref() }) }
+}
+
 /// Index of the fast local named by `key` (hash/eq semantics), if any.
 fn find_local(f: &Frame, key: &PyObject) -> PyResult<Option<usize>> {
     let h = ab::hash(key)?;
     let cd = crate::types::code::code_data(f.code());
     for i in 0..f.nlocalsplus {
-        if cd.localspluskinds[i] & bc::fast::HIDDEN != 0 {
+        if !slot_visible(f, i) {
             continue;
         }
         let nm = &cd.localsplusnames[i];
@@ -118,7 +141,7 @@ pub fn items(p: &PyObject) -> PyResult<Vec<(PyRef, PyRef)>> {
     let cd = crate::types::code::code_data(f.code());
     let mut v = Vec::new();
     for i in 0..f.nlocalsplus {
-        if cd.localspluskinds[i] & bc::fast::HIDDEN != 0 {
+        if !slot_visible(f, i) {
             continue;
         }
         if let Some(val) = slot_value(f, i) {
@@ -128,7 +151,29 @@ pub fn items(p: &PyObject) -> PyResult<Vec<(PyRef, PyRef)>> {
     if let Some(e) = extra(p, false) {
         v.extend(dict::items_vec(&e));
     }
+    if let Some(m) = mapping(f) {
+        let shadowed: Vec<PyRef> = v.iter().map(|(k, _)| k.clone()).collect();
+        for (k, val) in mapping_items(&m)? {
+            if !shadowed.iter().any(|s| s.is(&k)) {
+                v.push((k, val));
+            }
+        }
+    }
     Ok(v)
+}
+
+/// (key, value) pairs of any mapping (a dict or an object with keys()).
+pub fn mapping_items(m: &PyObject) -> PyResult<Vec<(PyRef, PyRef)>> {
+    if dict::is_dict(m) {
+        return Ok(dict::items_vec(m));
+    }
+    let keys = ab::call_method_str(m, "keys", &[])?;
+    let mut out = Vec::new();
+    for k in ab::collect_iterable(&keys)? {
+        let val = ab::getitem(m, &k)?;
+        out.push((k, val));
+    }
+    Ok(out)
 }
 
 pub fn new_proxy(frame_obj: &PyObject) -> PyResult {
@@ -136,7 +181,7 @@ pub fn new_proxy(frame_obj: &PyObject) -> PyResult {
         Some(f) => f,
         None => raise!(RuntimeError, "frame has been cleared"),
     };
-    if !f.locals.is_null() {
+    if !f.locals.is_null() && !has_bound_hidden(f) {
         return Ok(unsafe { (*f.locals).to_ref() });
     }
     unsafe {
@@ -159,6 +204,9 @@ fn getitem(p: &PyObject, key: &PyObject) -> PyResult {
             return Ok(v);
         }
     }
+    if let Some(m) = mapping(f) {
+        return ab::getitem(&m, key);
+    }
     crate::types::dict_methods::raise_key_error(key);
     Err(PyErr)
 }
@@ -168,6 +216,9 @@ fn setitem(p: &PyObject, key: &PyObject, v: &PyObject) -> PyResult<()> {
     if let Some(i) = find_local(f, key)? {
         set_slot(f, i, v.to_ref());
         return Ok(());
+    }
+    if let Some(m) = mapping(f) {
+        return ab::setitem(&m, key, Some(v));
     }
     let e = extra(p, true).unwrap();
     dict::set_item(&e, key, v)
@@ -179,6 +230,9 @@ fn delitem(p: &PyObject, key: &PyObject) -> PyResult<()> {
         if slot_value(f, i).is_some() {
             raise!(ValueError, "cannot remove local variables from FrameLocalsProxy");
         }
+    }
+    if let Some(m) = mapping(f) {
+        return ab::setitem(&m, key, None);
     }
     if let Some(e) = extra(p, false) {
         if dict::del_item(&e, key)? {
@@ -196,8 +250,13 @@ fn contains(p: &PyObject, key: &PyObject) -> PyResult<bool> {
             return Ok(true);
         }
     }
-    match extra(p, false) {
-        Some(e) => dict::contains(&e, key),
+    if let Some(e) = extra(p, false) {
+        if dict::contains(&e, key)? {
+            return Ok(true);
+        }
+    }
+    match mapping(f) {
+        Some(m) => ab::contains(&m, key),
         None => Ok(false),
     }
 }

@@ -155,9 +155,6 @@ pub fn init() -> PyResult {
         ("UF_TRACKED", 0x00000040),
         ("UF_DATAVAULT", 0x00000080),
         ("UF_HIDDEN", 0x00008000),
-        ("SF_SETTABLE", 0x3fff0000),
-        ("SF_SUPPORTED", 0x009f0000),
-        ("SF_SYNTHETIC", 0xc0000000),
         ("SF_ARCHIVED", 0x00010000),
         ("SF_IMMUTABLE", 0x00020000),
         ("SF_APPEND", 0x00040000),
@@ -195,6 +192,16 @@ pub fn init() -> PyResult {
         ("FILE_ATTRIBUTE_VIRTUAL", 65536),
     ];
     for (n, v) in consts {
+        dict::set_item_str(&d, n, &int::new_int(*v))?;
+    }
+    // the super-user flag masks are platform specific (macOS reserves the top two
+    // bits for flags the kernel synthesises)
+    let sf: &[(&str, i64)] = if cfg!(target_os = "macos") {
+        &[("SF_SETTABLE", 0x3fff0000), ("SF_SUPPORTED", 0x009f0000), ("SF_SYNTHETIC", 0xc0000000)]
+    } else {
+        &[("SF_SETTABLE", 0xffff0000)]
+    };
+    for (n, v) in sf {
         dict::set_item_str(&d, n, &int::new_int(*v))?;
     }
     Ok(m)

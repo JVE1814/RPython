@@ -667,6 +667,8 @@ fn exec_or_eval(args: &[&PyObject], kw: Option<&PyObject>, is_eval: bool) -> PyR
     } else {
         let b = source_arg(src, fname)?;
         let mut b = b;
+        // implicit compilation of source text is audited like compile()
+        crate::modules::sys_full::audit("compile", &[src, &pystr::new_str("<string>")])?;
         if is_eval {
             // eval strips leading spaces and tabs
             let i = b.iter().position(|c| *c != b' ' && *c != b'\t').unwrap_or(b.len());

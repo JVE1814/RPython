@@ -479,12 +479,12 @@ fn pack_one(code: &Code, out: &mut [u8], v: &PyObject, big: bool) -> PyResult<()
             let val: u64 = if int::sign(&i) < 0 {
                 match int::as_i64(&i) {
                     Some(x) => x as u64,
-                    None => raise!(OverflowError, "Python int too large to convert to C long"),
+                    None => sraise!("int too large to convert"),
                 }
             } else {
                 match rpy_bigint::conv::to_u64(int_methods::iref(&i)) {
                     Some(x) => x,
-                    None => raise!(OverflowError, "Python int too large to convert to C unsigned long"),
+                    None => sraise!("int too large to convert"),
                 }
             };
             put_int(out, val, 8, big);

@@ -136,6 +136,8 @@ def _check_size(typ, typecode=None):
 class py_object(_SimpleCData):
     _type_ = "O"
 
+    __class_getitem__ = classmethod(type(list[int]))
+
     def __repr__(self):
         try:
             return super().__repr__()
