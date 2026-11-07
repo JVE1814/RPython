@@ -523,10 +523,17 @@ def _stop_process(process):
 def _handle_run(args):
     if args.module:
         import importlib.util
+        # the target runs with the current directory first on its path
+        sys.path.insert(0, os.getcwd())
         try:
             spec = importlib.util.find_spec(args.target)
         except (ImportError, ValueError):
             spec = None
+        finally:
+            try:
+                sys.path.remove(os.getcwd())
+            except ValueError:
+                pass
         if spec is None:
             raise SamplingModuleNotFoundError(args.target)
         cmd = (sys.executable, "-m", args.target, *args.args)

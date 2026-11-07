@@ -343,6 +343,10 @@ struct CodeCache {
     firstlineno: u32,
     pub_of_internal: Vec<u32>,
     co_code: Vec<u8>,
+    /// (tail4) pointers the entry was built from: (filename, qualname, linetable,
+    /// code data); a code object freed and another allocated at the same address
+    /// is recognised by a change of these.
+    stamp: (u64, u64, u64, u64),
 }
 
 #[derive(Default)]
@@ -494,17 +498,23 @@ pub(crate) fn read_frame_pub(st: &UnwinderState, frame_addr: u64) -> PyResult<Op
 // --- the code object
 
 fn code_cache_get<'a>(st: &'a UnwinderState, code: u64) -> PyResult<()> {
-    if st.code_cache.borrow().contains_key(&code) {
-        return Ok(());
-    }
     let t = &st.table;
-    let filename = st.read_str(st.ptr(code + t.c_filename)?, MAX_NAME)?;
-    let funcname = st.read_str(st.ptr(code + t.c_qualname)?, MAX_NAME)?;
-    let firstlineno = st.u32(code + t.c_firstlineno)?;
+    let fn_obj = st.ptr(code + t.c_filename)?;
+    let qn_obj = st.ptr(code + t.c_qualname)?;
     let lt_obj = st.ptr(code + t.c_linetable)?;
+    let data = st.ptr(code + t.c_data)?;
+    let stamp = (fn_obj, qn_obj, lt_obj, data);
+    if let Some(c) = st.code_cache.borrow().get(&code) {
+        // still the same code object (and its translation has not appeared since)
+        if c.stamp == stamp {
+            return Ok(());
+        }
+    }
+    let filename = st.read_str(fn_obj, MAX_NAME)?;
+    let funcname = st.read_str(qn_obj, MAX_NAME)?;
+    let firstlineno = st.u32(code + t.c_firstlineno)?;
     let linetable = st.read_bytes(lt_obj, MAX_LINETABLE)?;
     // pub_of_internal from CodeData (may be absent if the code never ran)
-    let data = st.ptr(code + t.c_data)?;
     let mut pub_of_internal = Vec::new();
     if data != 0 {
         let vp = st.ptr(data + t.c_pub_of_internal + t.vec_ptr)?;
@@ -529,6 +539,7 @@ fn code_cache_get<'a>(st: &'a UnwinderState, code: u64) -> PyResult<()> {
         firstlineno,
         pub_of_internal,
         co_code,
+        stamp,
     });
     Ok(())
 }
@@ -584,7 +595,7 @@ fn read_frame(st: &UnwinderState, frame_addr: u64) -> PyResult<Option<PyRef>> {
 /// relies on this identity); the innermost frame is always re-read so its line number is
 /// current. A cached entry whose code/lasti no longer match (a frame-pool address reused
 /// by a different call) is rebuilt.
-fn walk_frames(st: &UnwinderState, native_id: u64, top: u64) -> PyResult<Vec<PyRef>> {
+fn walk_frames(st: &UnwinderState, native_id: u64, top: u64) -> PyResult<Option<Vec<PyRef>>> {
     let t = &st.table;
     let mut out = Vec::new();
     let mut addr = top;
@@ -594,36 +605,58 @@ fn walk_frames(st: &UnwinderState, native_id: u64, top: u64) -> PyResult<Vec<PyR
         if depth > MAX_FRAME_CHAIN {
             raise!(RuntimeError, "Too many stack frames while unwinding");
         }
+        // (tail4) the target keeps running while its frames are read: a frame that
+        // was released meanwhile (no code object any more) or a generator frame that
+        // lost its caller link (the generator suspended) means a torn read, which
+        // the caller retries
         let code = st.ptr(addr + t.f_code)?;
-        let lasti = if code != 0 { st.u32(addr + t.f_lasti)? } else { 0 };
-        let cacheable = st.cache_frames && depth > 1 && code != 0;
+        if code == 0 || st.type_of(code)? != t.code_type {
+            return Ok(None);
+        }
+        let generator = st.ptr(addr + t.f_generator)?;
+        let lasti = st.u32(addr + t.f_lasti)?;
+        let cacheable = st.cache_frames && depth > 1;
+        let mut cached = None;
         if cacheable {
             if let Some((c, l, fi)) = st.frame_cache.borrow().get(&(native_id, addr)) {
                 if *c == code && *l == lasti {
-                    if st.stats_on {
-                        st.stats.borrow_mut().frames_from_cache += 1;
-                        st.stats.borrow_mut().cache_hits += 1;
-                    }
-                    out.push(fi.clone());
-                    addr = st.ptr(addr + t.f_prev)?;
-                    continue;
+                    cached = Some(fi.clone());
                 }
             }
         }
-        if let Some(fi) = read_frame(st, addr)? {
-            if st.stats_on {
-                let mut s = st.stats.borrow_mut();
-                s.frames_from_memory += 1;
-                s.cache_misses += 1;
+        match cached {
+            Some(fi) => {
+                if st.stats_on {
+                    let mut s = st.stats.borrow_mut();
+                    s.frames_from_cache += 1;
+                    s.cache_hits += 1;
+                }
+                out.push(fi);
             }
-            if cacheable {
-                st.frame_cache.borrow_mut().insert((native_id, addr), (code, lasti, fi.clone()));
+            None => {
+                let Some(fi) = read_frame(st, addr)? else { return Ok(None) };
+                if st.stats_on {
+                    let mut s = st.stats.borrow_mut();
+                    s.frames_from_memory += 1;
+                    s.cache_misses += 1;
+                }
+                if cacheable {
+                    st.frame_cache.borrow_mut().insert((native_id, addr), (code, lasti, fi.clone()));
+                }
+                out.push(fi);
             }
-            out.push(fi);
         }
-        addr = st.ptr(addr + t.f_prev)?;
+        let prev = st.ptr(addr + t.f_prev)?;
+        if prev == 0 {
+            // the outermost frame: never a generator's (generators always have a
+            // caller), and still the same live frame
+            if generator != 0 || st.ptr(addr + t.f_generator)? != 0 || st.ptr(addr + t.f_code)? != code {
+                return Ok(None);
+            }
+        }
+        addr = prev;
     }
-    Ok(out)
+    Ok(Some(out))
 }
 
 // --- threads
@@ -744,7 +777,20 @@ fn get_stack_trace(o: &PyObject) -> PyResult {
         if !mode_keeps(st, rec.status) {
             continue;
         }
-        let frames = walk_frames(st, rec.native_id, rec.frame)?;
+        // (tail4) a generator frame whose caller link vanished while it was read
+        // (the generator suspended mid-walk) gives a truncated stack: read again
+        let mut frames = None;
+        let mut top = rec.frame;
+        for _ in 0..16 {
+            if let Some(f) = walk_frames(st, rec.native_id, top)? {
+                frames = Some(f);
+                break;
+            }
+            top = st.ptr(ts + st.table.t_frame)?;
+        }
+        let Some(frames) = frames else {
+            raise!(RuntimeError, "could not read a consistent stack of thread {}", rec.native_id);
+        };
         let ti = ss(thread_info_type(), vec![int::new_int(rec.native_id as i64), int::new_int(rec.status), list::new_list(frames)]);
         match by_interp.iter_mut().find(|(id, _)| *id == rec.interp_id) {
             Some((_, v)) => v.push(ti),

@@ -189,11 +189,11 @@ class PstatsCollector(Collector):
 
         def section(title, scored, describe):
             scored = [item for item in scored if item[0] > 0]
-            if not scored:
-                return
             scored.sort(key=lambda item: item[0], reverse=True)
             print()
             print(f"{colors.BOLD}{title}{colors.RESET}")
+            if not scored:
+                print("  (none)")
             for score, key, entry in scored[:5]:
                 print(f"  {describe(score, entry)}  {label(key)}")
 
@@ -202,17 +202,17 @@ class PstatsCollector(Collector):
         section(
             "Functions with Highest Direct/Cumulative Ratio (Hot Spots):",
             [((e[2] / e[3]) if e[3] else 0.0, k, e) for k, e in rows],
-            lambda s, e: f"{s:6.3f} direct/cumulative ratio, "
+            lambda s, e: f"{s:.3f} direct/cumulative ratio, "
                          f"{e[2] * scale:.3f}{unit} direct",
         )
         section(
             "Functions with Highest Call Frequency (Indirect Calls):",
             [(e[1] - e[0], k, e) for k, e in rows],
-            lambda s, e: f"{s:8d} indirect samples, {e[1]} on stack",
+            lambda s, e: f"{s} indirect samples, {e[1]} on stack",
         )
         section(
             "Functions with Highest Call Magnification (Cumulative/Direct):",
             [((e[3] / e[2]) if e[2] else 0.0, k, e) for k, e in rows],
-            lambda s, e: f"{s:8.1f}x magnification, "
+            lambda s, e: f"{s:.1f}x magnification, "
                          f"{e[3] * scale:.3f}{unit} cumulative",
         )

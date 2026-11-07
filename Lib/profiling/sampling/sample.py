@@ -106,6 +106,8 @@ class SampleProfiler:
 
     def sample(self, collector, duration_sec=10, *, async_aware=None):
         interval = self.sample_interval_usec / 1_000_000
+        if duration_sec is None:
+            duration_sec = float("inf")     # until the target ends
         aggregating = bool(getattr(collector, "aggregating", False))
         pending = None          # the snapshot being accumulated
         pending_times = []
