@@ -42,6 +42,7 @@ build_time_vars = {
     'PY_CORE_CFLAGS': '-O2 -Wall -DPy_BUILD_CORE',
     'PY_CPPFLAGS': '-I. -I./Include',
     'PY_ENABLE_SHARED': 0,
+    'PY_BUILTIN_HASHLIB_HASHES': 'md5,sha1,sha2,sha3,blake2',
     'PY_HAVE_PERF_TRAMPOLINE': 0,
     'PY_LDFLAGS': '',
     'PY_STDMODULE_CFLAGS': '-O2 -Wall',

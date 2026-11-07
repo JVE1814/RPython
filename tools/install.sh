@@ -11,6 +11,7 @@ else (cd "$ROOT" && cargo build -p python); BIN="$TARGET/debug/python3"; fi
 mkdir -p "$PREFIX/bin" "$PREFIX/lib/python3.15t/site-packages" "$PREFIX/lib/python3.15t/lib-dynload" "$PREFIX/include/python3.15t"
 install -m 755 "$BIN" "$PREFIX/bin/python3.15t"
 ln -sf python3.15t "$PREFIX/bin/python3.15"; ln -sf python3.15t "$PREFIX/bin/python3"; ln -sf python3.15t "$PREFIX/bin/python"
+install -m 755 "$ROOT/tools/python-config.sh" "$PREFIX/bin/python3.15t-config"; ln -sf python3.15t-config "$PREFIX/bin/python3-config"
 rm -rf "$PREFIX/lib/python3.15t.tmp"; cp -r "$ROOT/Lib" "$PREFIX/lib/python3.15t.tmp"
 find "$PREFIX/lib/python3.15t.tmp" -name __pycache__ -prune -exec rm -rf {} +
 cp -r "$PREFIX/lib/python3.15t.tmp/." "$PREFIX/lib/python3.15t/"; rm -rf "$PREFIX/lib/python3.15t.tmp"
