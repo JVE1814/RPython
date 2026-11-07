@@ -123,7 +123,69 @@ call with an *owned* operand of the object, one counted reference is that slot.
 
 ## Results
 
-(see the final report / below)
+Before = core ad289e5 built from the same toolchain (`target/refs1/coretarget`), after =
+this branch (3199042). Callgrind instructions; micro: `(I(60k) - I(20k)) / 40k` per loop
+iteration of `tools/bench/micro/<name>.py` (PYTHONDONTWRITEBYTECODE=1: pyc rewrites by
+another binary distort single runs); perloop: `tools/bench/perloop.sh` (M per loop).
+
+| micro (per iteration) | interp before | after | tier 1 before | after | default before | after |
+|---|---|---|---|---|---|---|
+| attr | 2558 | 2468 (-3.5%) | 475.5 | 417.1 (-12.3%) | 313.4 | 311.0 |
+| method | 3734 | 3686 (-1.3%) | 636.4 | 613.5 (-3.6%) | 284.1 | 285.1 |
+| listdict | 3244 | 3141 (-3.2%) | 1120.2 | 1077.1 (-3.8%) | 995.7 | 975.4 (-2.0%) |
+| loop | 1702 | 1630 (-4.2%) | 389.1 | 330.3 (-15.1%) | 45.8 | 47.5 |
+| globals_ | 3969 | 4002 (+0.8%) | 1090.7 | 1074.8 (-1.5%) | 161.3 | 159.6 |
+| calls:posmany | 2160 | 2148 | 481.2 | 488.3 (+1.5%) | 110.0 | 112.2 |
+| calls:bound | 1863 | 1868 | 423.5 | 441.0 (+4.1%) | 451.5 | 461.3 (+2.2%) |
+| calls:builtin | 4089 | 4143 (+1.3%) | 1628.8 | 1687.8 (+3.6%) | 1332.9 | 1374.5 (+3.1%) |
+| calls:prop | 2041 | 2011 (-1.5%) | 372.3 | 366.6 (-1.5%) | 397.1 | 405.6 (+2.1%) |
+| calls:kw | 1988 | 2023 (+1.8%) | 767.9 | 793.7 (+3.4%) | 759.7 | 793.4 (+4.4%) |
+| calls:init | 3195 | 3194 | 1449.5 | 1471.9 (+1.5%) | 756.8 | 758.8 |
+
+perloop (M instructions per loop, default tiers): richards 268.45 → 269.28, nbody 367.59 →
+366.82, float 566.78 → 572.24 (+1.0%), chaos 355.33 → 358.19 (+0.8%), raytrace 2380.35 →
+2394.57 (+0.6%), deltablue 40.44 → 40.39, go 1070.40 → 1065.37, spectral_norm 679.97 →
+680.39. Tier 2 already kept locals borrowed inside its units, so single-thread tier-2 code
+gains little; the remaining C-call costs (`h_call_t` copies the argument block, ~25
+instructions more than `h_call` for 3-4 entries, against ~12 saved per borrowed argument)
+show up in call-heavy code.
+
+Start-up (`-c pass`): 57.88M → 59.27M (+2.4%; RPYTHON_BORROW=0: 58.13M): the marking pass
+costs ~1.3M (234 code objects, ~80 instructions per word: about 25% of the translator's
+own cost). Frozen modules come pre-marked from the start-up image.
+
+Multi-core (`tools/bench/scaling/run.sh`, `THREADS="1 4" REPS=3`, best runs, machine load
+4-6; 4-thread runs did not pass the contention filter, so cpu-infl is the meaningful
+column):
+
+| workload | cpu-infl@4 before | after | wall@1 before | after |
+|---|---|---|---|---|
+| shr_dict | 1.48 | **1.02** | 0.333 s | 0.256 s |
+| shr_attrs | 1.78 | **1.11** | 0.086 s | 0.087 s |
+| mut_list | 2.38 | **1.25** | 0.146 s | 0.111 s |
+| mut_dict | 1.11 | 1.12 | 0.405 s | 0.266 s |
+| cpu_comp | 1.33 | **1.07** | 0.251 s | 0.255 s |
+| cpu_oo | 1.09 | 1.02 | 0.135 s | 0.138 s |
+| jit_calls | 1.04 | 1.02 | 0.129 s | 0.132 s |
+
+Non-owner refcount operations on runtime paths (`RPY_SCALESTATS=1`, 4 threads, scale
+0.3; JIT-inline operations are not counted): shr_dict decrefs 22.8M → 8.4M (the shared
+dict: 8.4M → 0), mut_list 4.43M → 2.22M (the shared list: 2.16M → 0), mut_dict 12.35M →
+0.05M (the shared dict: 12.29M → 0); shr_attrs 6.35M and cpu_comp unchanged (attribute
+values loaded from the shared instance, owned `self` of Python callees).
+
+Correctness: tools/jit_tests/run.sh (all 31 scripts, incl. the new t_borrow.py) and
+tools/stress/run.sh (repeatedly) pass; the suite gate (test_sys test_capi test_gc
+test_weakref test_finalization test_generators test_coroutines test_asyncgen
+test_sys_settrace test_monitoring test_frame test_exceptions test_traceback
+test_threading test_free_threading test_descr test_class test_call test_dict test_list
+test_pdb test_inspect test_scope test_with test_contextlib) on installed-layout snapshots
+fails exactly what the base snapshot fails (test_descr 2, test_gc 2, test_sys_settrace
+1). test_threading's test_reinit_tls_after_fork hung once in some runs (2 of ~40 runs on
+this branch, 0 of 22 on base builds): the forked child deadlocks in
+`modules/_thread.rs` `handle_set_done` on a handle's `std::sync::Mutex` that another
+thread held at fork time (backtrace taken from the hung child) — a pre-existing
+fork-safety bug outside this branch's paths, made more or less likely by timing.
 
 ## What is left
 * Tier 2 keeps owned references for folded constants (`len`, method descriptors) passed
@@ -133,3 +195,13 @@ call with an *owned* operand of the object, one counted reference is that slot.
   a register (pre-existing; no longer a use-after-free thanks to `keep_alive`).
 * Callee-side borrowing (arguments of Python calls stay borrowed in the callee frame)
   would need tagged locals.
+* C calls with borrowed arguments copy the argument block (`h_call_t`, the interpreter's
+  call): 2-4% more instructions on C-call micro benchmarks in tier 1/2. A template could
+  build the untagged block in the native frame with statically known entries, or pass a
+  borrowed-entry mask so the block can be untagged in place (the frame/generator
+  traversal would then need that mask during the call).
+* Start-up: marking lazily (when a code object runs a second time) instead of at
+  translation would remove the ~1.3M instructions of `-c pass`; it needs the code words
+  rewritten while other threads may run them (each word stays valid on its own).
+* Tier-2 deopt snapshots and joins still materialise borrowed values with a reference
+  (they would need the translator's proof per entry).
