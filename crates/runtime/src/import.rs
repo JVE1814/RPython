@@ -98,7 +98,7 @@ pub(crate) fn bootstrap_code(src: &[u8], file: &str, display: &str) -> PyResult 
     let key = (|| {
         let (sl, st) = stamp(path)?;
         let (el, et) = stamp(&std::env::current_exe().ok()?)?;
-        Some(format!("rpython-boot v1{} {} {} {} {} {}\n", if crate::types::code::public_mode() { "w" } else { "" }, sl, st, el, et, display))
+        Some(format!("rpython-boot v1w {} {} {} {} {}\n", sl, st, el, et, display))
     })();
     let cache = path.parent().map(|dir| {
         let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -529,6 +529,17 @@ fn resolve_name(nm: &str, globals: Option<&PyObject>, level: i64) -> PyResult<St
             if !pystr::is_str(&p) {
                 raise!(TypeError, "package must be a string");
             }
+            if let Some(s) = spec.as_ref().filter(|s| !s.is(none::none())) {
+                let parent = ab::getattr(s, name!("parent"))?;
+                if !ab::rich_eq(&p, &parent)? {
+                    let msg = format!(
+                        "__package__ != __spec__.parent ({} != {})",
+                        ab::repr_string(&p)?,
+                        ab::repr_string(&parent)?
+                    );
+                    crate::modules::warnings::warn(crate::types::exceptions::DeprecationWarning(), &msg, 1)?;
+                }
+            }
             pystr::to_string_lossy(&p)
         }
         _ => match spec.filter(|s| !s.is(none::none())) {
@@ -609,9 +620,13 @@ pub fn import_module_level(nm: &PyObject, globals: Option<&PyObject>, fromlist: 
             // relative: return the module corresponding to the first component of `n`
             let cut = abs.len() - n.len() + n.split('.').next().unwrap().len();
             let top = &abs[..cut];
-            return match get_loaded_module(top) {
+            let modules = crate::modules::sys::modules_dict();
+            return match dict::get_item_rs(&modules, top) {
                 Some(m) => Ok(m),
-                None => import_absolute(top),
+                None => Err(crate::errors::set_err_obj(
+                    crate::types::exceptions::KeyError(),
+                    pystr::new_str(&format!("'{}' not in sys.modules as expected", top)),
+                )),
             };
         }
         return Ok(m);

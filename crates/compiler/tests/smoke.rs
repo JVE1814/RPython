@@ -30,7 +30,7 @@ fn smoke_many() {
     ];
     for s in srcs {
         let c = comp(s);
-        let d = rpy_compiler::dis::disassemble(&c);
+        let d = rpy_compiler::wordcode::dis::disassemble(&c);
         assert!(!d.is_empty());
     }
 }

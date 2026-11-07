@@ -560,6 +560,12 @@ fn handle_join(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRes
         |s| *s == HState::Done || h.lost_by_fork(fgen),
         timeout,
     )?;
+    // references the finished thread dropped on objects this thread owns were queued for
+    // a refcount merge: apply them now, so the caller sees the objects freed
+    let ts = crate::threads::current();
+    if ts.c.eval_breaker.load(Relaxed) & crate::threads::EVAL_MERGE_REFCOUNTS != 0 {
+        crate::threads::process_merge_queue(ts);
+    }
     Ok(none::none_ref())
 }
 fn handle_is_done(o: &PyObject) -> PyResult {
@@ -1353,4 +1359,28 @@ pub fn init_module() -> PyResult {
     set("_NAME_MAXLEN", &int::new_int(NAME_MAXLEN as i64))?;
     let _ = (&MAIN_HANDLE, AtomicI64::new(0), type_ref(&raw mut LOCK_TYPE));
     Ok(m)
+}
+
+/// In a forked child: drop the thread-local values of every thread except `keep` (those
+/// threads do not exist in the child; their values' finalizers run now).
+pub fn clear_foreign_thread_locals(keep: u64) {
+    let mut drop_list: Vec<usize> = Vec::new();
+    {
+        let g = LIVE_LOCALS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = g.as_ref() {
+            for &lp in m.values() {
+                let l = unsafe { &*(lp as *const LocalObject) };
+                let mut dicts = l.dicts.lock().unwrap_or_else(|e| e.into_inner());
+                let gone: Vec<u64> = dicts.keys().copied().filter(|&k| k != keep).collect();
+                for k in gone {
+                    if let Some(d) = dicts.remove(&k) {
+                        drop_list.push(d);
+                    }
+                }
+            }
+        }
+    }
+    for d in drop_list {
+        unsafe { decref(d as *mut PyObject) };
+    }
 }

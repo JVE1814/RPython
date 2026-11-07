@@ -710,53 +710,7 @@ clockfn!(PyTime_PerfCounterRaw, libc::CLOCK_MONOTONIC);
 clockfn!(PyTime_Time, libc::CLOCK_REALTIME);
 clockfn!(PyTime_TimeRaw, libc::CLOCK_REALTIME);
 
-// ---------------------------------------------------------------- monitoring (PEP 669 C API)
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyMonitoring_EnterScope(state: *mut u8, version: *mut u64, _types: *const u8, length: Py_ssize_t) -> c_int {
-    unsafe {
-        // no tools are ever active for C-level events in this runtime
-        for i in 0..length.max(0) as usize {
-            *state.add(2 * i) = 0;
-        }
-        *version = 1;
-        0
-    }
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyMonitoring_ExitScope() -> c_int {
-    0
-}
-macro_rules! monitor_noop {
-    ($($name:ident),*) => {
-        $(
-            #[unsafe(no_mangle)]
-            pub unsafe extern "C" fn $name(_state: *mut c_void, _codelike: *mut PyObject, _offset: i32, _a: *mut PyObject, _b: *mut PyObject) -> c_int {
-                0
-            }
-        )*
-    };
-}
-monitor_noop!(
-    _PyMonitoring_FirePyStartEvent,
-    _PyMonitoring_FirePyResumeEvent,
-    _PyMonitoring_FirePyReturnEvent,
-    _PyMonitoring_FirePyYieldEvent,
-    _PyMonitoring_FireCallEvent,
-    _PyMonitoring_FireLineEvent,
-    _PyMonitoring_FireJumpEvent,
-    _PyMonitoring_FireBranchEvent,
-    _PyMonitoring_FireBranchLeftEvent,
-    _PyMonitoring_FireBranchRightEvent,
-    _PyMonitoring_FireCReturnEvent,
-    _PyMonitoring_FirePyThrowEvent,
-    _PyMonitoring_FireRaiseEvent,
-    _PyMonitoring_FireReraiseEvent,
-    _PyMonitoring_FireExceptionHandledEvent,
-    _PyMonitoring_FireCRaiseEvent,
-    _PyMonitoring_FirePyUnwindEvent,
-    _PyMonitoring_FireStopIterationEvent
-);
+// monitoring (PEP 669 C API): see modules/sys_trace_api.rs
 
 // ---------------------------------------------------------------- perf maps / tracebacks
 

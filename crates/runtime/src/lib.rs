@@ -39,6 +39,9 @@ use object::PyRef;
 #[derive(Default)]
 pub struct Config {
     pub argv: Vec<String>,
+    /// The exact bytes of `argv` (non-UTF-8 arguments); when non-empty, sys.argv is decoded
+    /// from these with the filesystem encoding and surrogateescape.
+    pub argv_bytes: Vec<Vec<u8>>,
     pub hash_seed: Option<u32>,
     pub optimize: i32,
     /// Full interpreter configuration (sys.flags, -X/-W options, ...).
@@ -65,6 +68,10 @@ pub fn initialize(cfg: &Config) -> PyResult<()> {
     modules::sys::init_bootstrap_types();
     let _b = builtins::init()?;
     let sys = modules::sys::create_sys_module(&cfg.argv)?;
+    if !cfg.argv_bytes.is_empty() {
+        let items = cfg.argv_bytes.iter().map(|b| modules::posix::path::fs_decode(b)).collect::<PyResult<Vec<_>>>()?;
+        types::dict::set_item_str(&types::module::module_dict(&sys), "argv", &types::list::new_list(items))?;
+    }
     let md = modules::sys::modules_dict();
     types::dict::set_item_str(&md, "builtins", &builtins::builtins_module())?;
     let _ = sys;

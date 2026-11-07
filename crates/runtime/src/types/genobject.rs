@@ -533,6 +533,24 @@ pub fn yieldfrom(o: &PyObject) -> Option<PyRef> {
     None
 }
 
+/// Run `f` with the delegating generator's frame on the thread's frame stack (it is the
+/// caller of whatever its `yield from` delegates to).
+fn with_frame_on_stack<R>(o: &PyObject, f: impl FnOnce() -> R) -> R {
+    let ts = crate::threads::current();
+    let gf = g(o).frame;
+    let saved = ts.frame.get();
+    if !gf.is_null() {
+        unsafe { (*gf).prev = saved };
+        ts.frame.set(gf);
+    }
+    let r = f();
+    ts.frame.set(saved);
+    if !gf.is_null() {
+        unsafe { (*gf).prev = std::ptr::null_mut() };
+    }
+    r
+}
+
 pub fn gen_throw_impl(o: &PyObject, typ: &PyObject, val: Option<&PyObject>, tb: Option<&PyObject>, close_on_genexit: bool) -> PyResult {
     // delegate to sub-iterator first
     if let Some(yf) = yieldfrom(o) {
@@ -548,19 +566,7 @@ pub fn gen_throw_impl(o: &PyObject, typ: &PyObject, val: Option<&PyObject>, tb: 
         }
         let r = if is_any_gen(&yf) {
             g(o).running = true;
-            // the delegating generator's frame is the caller of the sub-generator
-            let ts = crate::threads::current();
-            let gf = g(o).frame;
-            let saved = ts.frame.get();
-            if !gf.is_null() {
-                unsafe { (*gf).prev = saved };
-                ts.frame.set(gf);
-            }
-            let r = gen_throw_impl(&yf, typ, val, tb, close_on_genexit);
-            ts.frame.set(saved);
-            if !gf.is_null() {
-                unsafe { (*gf).prev = std::ptr::null_mut() };
-            }
+            let r = with_frame_on_stack(o, || gen_throw_impl(&yf, typ, val, tb, close_on_genexit));
             g(o).running = false;
             r
         } else {
@@ -578,7 +584,7 @@ pub fn gen_throw_impl(o: &PyObject, typ: &PyObject, val: Option<&PyObject>, tb: 
                         }
                         args.push(t);
                     }
-                    let r = ab::call(&m, &args);
+                    let r = with_frame_on_stack(o, || ab::call(&m, &args));
                     g(o).running = false;
                     r
                 }
@@ -744,9 +750,32 @@ unsafe extern "C" fn gen_finalize(o: *mut PyObject) {
         if gn.frame.is_null() || (*gn.frame).state == FrameState::Created {
             if is_coroutine_exact(oo) && !gn.frame.is_null() {
                 let saved = take_exc();
-                let msg = format!("coroutine '{}' was never awaited", pystr::to_string_lossy(&*gn.qualname));
-                if crate::modules::warnings::warn_with_source(exc::RuntimeWarning(), &msg, 1, Some(oo)).is_err() {
-                    crate::modules::sys::write_unraisable_with_obj("Exception ignored while finalizing coroutine", Some(oo));
+                // the warnings module words the warning (with the creation origin when
+                // tracked); failures are reported as unraisable
+                let r = (|| -> PyResult<()> {
+                    let w = crate::import::import_absolute("warnings")?;
+                    match ab::getattr_opt(&w, &pystr::new_str("_warn_unawaited_coroutine"))? {
+                        Some(f) => {
+                            ab::call(&f, &[oo])?;
+                        }
+                        None => {
+                            let msg = format!("coroutine '{}' was never awaited", pystr::to_string_lossy(&*gn.qualname));
+                            crate::modules::warnings::warn_with_source(exc::RuntimeWarning(), &msg, 1, Some(oo))?;
+                        }
+                    }
+                    Ok(())
+                })();
+                if r.is_err() {
+                    let what = ab::repr_string(oo).unwrap_or_else(|_| {
+                        clear_exc();
+                        "<coroutine>".into()
+                    });
+                    crate::modules::sys_full::write_unraisable(Some(&format!("Exception ignored while finalizing coroutine {}", what)), None);
+                    // still warn, in the plain wording
+                    let msg = format!("coroutine '{}' was never awaited", pystr::to_string_lossy(&*gn.qualname));
+                    if crate::modules::warnings::warn_with_source(exc::RuntimeWarning(), &msg, 1, Some(oo)).is_err() {
+                        clear_exc();
+                    }
                 }
                 if let Some(s) = saved {
                     set_exc(s);
@@ -1020,16 +1049,17 @@ pub fn get_anext_awaitable(aiter: &PyObject) -> PyResult {
     };
     match get_awaitable_iter(&next) {
         Ok(r) => Ok(r),
-        Err(e) => {
-            if exc_matches(exc::TypeError()) {
-                clear_exc();
-                raise!(
-                    TypeError,
-                    "'async for' received an invalid object from __anext__: {}",
-                    tname(&next)
-                );
+        Err(_) => {
+            // reported as a TypeError caused by the original error
+            let cause = take_exc().unwrap_or_else(none::none_ref);
+            let msg = format!("'async for' received an invalid object from __anext__: {}", tname(&next));
+            let te = crate::types::exceptions::make_exception(exc::TypeError(), &[pystr::new_str(&msg)])?;
+            if !cause.is(none::none()) {
+                ab::setattr(&te, &pystr::new_str("__context__"), &cause)?;
+                ab::setattr(&te, &pystr::new_str("__cause__"), &cause)?;
             }
-            Err(e)
+            set_exc(te);
+            Err(PyErr)
         }
     }
 }
@@ -1071,9 +1101,15 @@ pub fn init_types() {
         (*(&raw mut CORO_ASYNC)).am_await = Some(coro_await);
         let t = &mut *coro_type();
         t.tp_as_async = &raw mut CORO_ASYNC;
+        t.tp_methods = crate::mdefs![
+            ("send", O, gen_send, "send($self, value, /)\n--\n\nSend a value into coroutine, resuming it; the value becomes the result of the\nawait it is suspended at."),
+            ("throw", FAST, gen_throw, "throw(value)\nthrow(type[,value[,traceback]])\n\nRaise an exception in coroutine at the point where it is suspended."),
+            ("close", NOARGS, gen_close_m, "close($self, /)\n--\n\nRaise GeneratorExit inside coroutine to make it finish."),
+            ("__sizeof__", NOARGS, gen_sizeof),
+        ];
         t.tp_getset = crate::getset_table![
-            ("__name__", get_name, set_name),
-            ("__qualname__", get_qualname, set_qualname),
+            ("__name__", get_name, set_name; "Name of the coroutine."),
+            ("__qualname__", get_qualname, set_qualname; "Qualified name of the coroutine."),
             ("cr_frame", get_frame),
             ("cr_running", get_running),
             ("cr_suspended", get_suspended),
@@ -1118,4 +1154,14 @@ pub fn gen_throw_pub(o: &PyObject, args: &[&PyObject]) -> PyResult {
 }
 pub fn gen_throw_exc(o: &PyObject, e: PyRef) -> PyResult<SendResult> {
     gen_send_ex(o, None, Some(e), false)
+}
+
+/// Finalize a generator whose frame never started (frame.clear() on it): an unawaited
+/// coroutine reports its RuntimeWarning now.
+pub fn finalize_unstarted(o: &PyObject) {
+    unsafe { gen_finalize(o.as_ptr()) }
+    let gn = g(o);
+    if !gn.frame.is_null() && unsafe { (*gn.frame).state == FrameState::Created } {
+        finish(gn);
+    }
 }

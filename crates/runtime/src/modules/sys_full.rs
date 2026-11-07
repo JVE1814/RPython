@@ -48,6 +48,9 @@ pub struct RtConfig {
     pub xoptions: Vec<String>,
     pub pycache_prefix: Option<String>,
     pub orig_argv: Vec<String>,
+    /// The exact command-line bytes behind `orig_argv` (sys.orig_argv decodes them with the
+    /// filesystem encoding and surrogateescape); empty when not supplied.
+    pub orig_argv_bytes: Vec<Vec<u8>>,
     pub faulthandler: bool,
     pub tracemalloc: i32,
     pub check_hash_based_pycs: String,
@@ -84,6 +87,7 @@ impl Default for RtConfig {
             xoptions: Vec::new(),
             pycache_prefix: None,
             orig_argv: Vec::new(),
+            orig_argv_bytes: Vec::new(),
             faulthandler: false,
             tracemalloc: 0,
             check_hash_based_pycs: "default".into(),
@@ -1411,7 +1415,10 @@ pub fn populate(d: &PyObject) -> PyResult<()> {
         }
     }
     set("_xoptions", &xo)?;
-    if !c.orig_argv.is_empty() {
+    if !c.orig_argv_bytes.is_empty() {
+        let items = c.orig_argv_bytes.iter().map(|b| crate::modules::posix::path::fs_decode(b)).collect::<PyResult<Vec<_>>>()?;
+        set("orig_argv", &crate::types::list::new_list(items))?;
+    } else if !c.orig_argv.is_empty() {
         set("orig_argv", &strlist(&c.orig_argv))?;
     }
     set("copyright", &s("Copyright (c) 2001 Python Software Foundation.\nAll Rights Reserved.\n\nCopyright (c) 2000 BeOpen.com.\nAll Rights Reserved.\n\nCopyright (c) 1995-2001 Corporation for National Research Initiatives.\nAll Rights Reserved.\n\nCopyright (c) 1991-1995 Stichting Mathematisch Centrum, Amsterdam.\nAll Rights Reserved."))?;

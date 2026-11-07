@@ -1004,12 +1004,24 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             let gsuper = popref!(f);
                             let nm = &cd.names[(arg >> 2) as usize];
                             let is_method = arg & 1 != 0;
-                            let sup = if gsuper.is(type_obj(crate::types::super_::super_type())) {
-                                crate::types::super_::new_super(&cls, &slf)?
+                            let two = arg & 2 != 0;
+                            // monitoring sees the super() call as in the unoptimised form
+                            let call_info = if crate::modules::sys::tracing_active() {
+                                crate::modules::sys_trace::before_call(ts, f, &gsuper, None, if two { Some(&*cls) } else { None }, false)?
                             } else {
-                                let two = arg & 2 != 0;
-                                if two { ab::call(&gsuper, &[&cls, &slf])? } else { ab::call(&gsuper, &[])? }
+                                None
                             };
+                            let sup = if gsuper.is(type_obj(crate::types::super_::super_type())) {
+                                crate::types::super_::new_super(&cls, &slf)
+                            } else if two {
+                                ab::call(&gsuper, &[&cls, &slf])
+                            } else {
+                                ab::call(&gsuper, &[])
+                            };
+                            if let Some(info) = call_info {
+                                crate::modules::sys_trace::after_call(ts, f, info, sup.is_ok())?;
+                            }
+                            let sup = sup?;
                             if is_method {
                                 let v = ab::getattr(&sup, nm)?;
                                 push!(f, v.into_raw());
@@ -1366,6 +1378,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                         Op::ForIter => {
                             adapt_once!(super::adaptive::for_iter(unsafe { &*peek!(f, 1) }));
                             let it = unsafe { &*top!(f) };
+                            let gen_iter = crate::modules::sys::tracing_active() && crate::types::genobject::is_generator_exact(it);
                             match ab::iter_next(it)? {
                                 Some(v) => push!(f, v.into_raw()),
                                 None => {
@@ -1374,7 +1387,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                                 }
                             }
                             if crate::modules::sys::tracing_active() {
-                                for_iter_event(ts, f, pc == arg as usize, pc)?;
+                                for_iter_event(ts, f, pc == arg as usize, gen_iter, pc)?;
                             }
                         }
                         Op::GetYieldFromIter => {
@@ -1396,9 +1409,14 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             adapt!(super::adaptive::send(unsafe { &*peek!(f, 2) }));
                             let v = popref!(f);
                             let recv = unsafe { &*top!(f) };
+                            let gen_recv = crate::modules::sys::tracing_active()
+                                && (crate::types::genobject::is_coroutine_exact(recv) || recv.is_type(crate::types::genobject::gen_type()) || is_subtype(recv.type_ptr(), crate::types::genobject::gen_type()));
                             match crate::types::genobject::send_to(recv, &v)? {
                                 crate::types::genobject::SendResult::Yield(r) => push!(f, r.into_raw()),
                                 crate::types::genobject::SendResult::Return(r) => {
+                                    if gen_recv {
+                                        crate::modules::sys_trace::stop_iteration_event(ts, f, &r, arg as usize)?;
+                                    }
                                     unsafe { decref(pop!(f)) };
                                     push!(f, r.into_raw());
                                     pc = arg as usize;
@@ -1483,6 +1501,12 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                                 return Err(PyErr);
                             }
                             push!(f, r);
+                            // periodic check after a call (as CPython does after calls into C):
+                            // e.g. references other threads queued for this owner while it
+                            // waited in a join() are merged before the next statement runs
+                            if ts.c.eval_breaker.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+                                handle_eval_breaker(ts)?;
+                            }
                         }
                         Op::CallFunctionEx => {
                             adapt!(super::adaptive::call_ex(unsafe { &*peek!(f, 4) }));
@@ -1982,9 +2006,9 @@ fn branch_event(ts: &ThreadState, f: &mut Frame, taken: bool, dest: usize) -> Py
 /// FOR_ITER: continuing the loop is the left branch, leaving it the right one; an
 /// exhausted generator reports STOP_ITERATION (no exception is raised for it).
 #[cold]
-fn for_iter_event(ts: &ThreadState, f: &mut Frame, exhausted: bool, dest: usize) -> PyResult<()> {
+fn for_iter_event(ts: &ThreadState, f: &mut Frame, exhausted: bool, gen_iter: bool, dest: usize) -> PyResult<()> {
     use crate::modules::sys_trace as st;
-    if exhausted && st::wants(st::STOP_ITERATION) {
+    if exhausted && gen_iter && st::wants(st::STOP_ITERATION) {
         let si = ab::call(type_obj(exc::StopIteration()), &[])?;
         st::fire_exc_event(ts, f, st::STOP_ITERATION, &si)?;
     }
@@ -2144,6 +2168,11 @@ pub(crate) fn exec_misc(ts: &ThreadState, f: &mut Frame, cd: &crate::types::code
             let e = popref!(f);
             check_exc_match_type(&t, true)?;
             let (rest, matched) = crate::types::exceptiongroup::eg_match(&e, &t)?;
+            if !matched.is(none::none()) && !crate::types::exceptiongroup::is_exception_group(&e) {
+                // the wrapper of a naked exception starts its traceback at this except*
+                // clause
+                add_traceback(f, &matched);
+            }
             if !matched.is(none::none()) {
                 // the matched group becomes the handled exception
                 let prev = set_handled_exception(ts, matched.clone().into_raw());

@@ -998,10 +998,12 @@ pub unsafe extern "C" fn PyTraceBack_Print(tb: *mut PyObject, f: *mut PyObject) 
             return 0;
         }
         ret_i((|| -> PyResult<()> {
-            let m = crate::import::import_absolute("traceback")?;
-            let pt = ab::getattr_str(&m, "print_tb")?;
-            let kwn = tuple::new_tuple(vec![pystr::new_str("file")]);
-            ab::call_kw(&pt, &[&*tb, &*f], Some(&kwn))?;
+            // the interpreter's own layout: banner and entries, no caret lines
+            let text = format!(
+                "Traceback (most recent call last):\n{}",
+                crate::modules::traceback_print::format_tb(Some(PyRef::from_borrowed(tb)))
+            );
+            ab::call_method_str(&*f, "write", &[&pystr::new_str(&text)])?;
             Ok(())
         })())
     }

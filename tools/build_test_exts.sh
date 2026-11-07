@@ -10,7 +10,7 @@
 # Parts that test genuinely internal behaviour are excluded and replaced by stub init functions:
 #   (_testcapi/bytes.c builds against tools/capi_shim/pycore_bytesobject.h)
 #   _testcapi/immortal.c   (pycore_long.h immortality bits)
-#   _testcapi/monitoring.c (pycore_instruments.h)
+#   (_testcapi/monitoring.c builds against tools/capi_shim/internal/pycore_instruments.h)
 # _testmultiphase uses tools/capi_shim/clinic/_testmultiphase.c.h (hand-written wrappers).
 # Not buildable at all: _testinternalcapi (internal headers; a Rust builtin instead), _testclinic,
 # _testclinic_limited (their generated Modules/clinic/*.c.h files are not in the spec).
@@ -23,7 +23,7 @@ cp "$ROOT/tools/pyconfig.h" "$INC/pyconfig.h"
 CFLAGS="-fPIC -g -O1 -fno-strict-aliasing -fwrapv -Wno-unused-result -std=c11 -D_GNU_SOURCE"
 CFLAGS="$CFLAGS -I$INC -I$ROOT/spec/Include -I$ROOT/tools/capi_shim ${EXTRA_CFLAGS:-}"
 M="$ROOT/spec/Modules"
-EXCLUDED="immortal monitoring"
+EXCLUDED="immortal"
 
 sources() { # module name -> list of sources
   case "$1" in

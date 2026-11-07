@@ -207,11 +207,25 @@ pub fn module_names_of_path(filename: &str) -> Vec<String> {
 
 /// A filter's module pattern matches the module name, or (for a warning
 /// located in a file) one of the dotted names the file path stands for.
+thread_local! {
+    /// Set while a warning with a caller-chosen module name (compile(..., module=...)) is
+    /// filtered: only that name is matched, not the names derived from the file path.
+    static EXACT_MODULE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// warn_explicit() for a warning whose module name the caller chose explicitly.
+pub fn warn_explicit_exact_module(category: *mut PyTypeObject, msg: &PyObject, filename: &PyObject, lineno: i64, module: &PyObject) -> PyResult<()> {
+    let prev = EXACT_MODULE.with(|c| c.replace(true));
+    let r = warn_explicit(category, msg, filename, lineno, Some(module), None);
+    EXACT_MODULE.with(|c| c.set(prev));
+    r
+}
+
 fn module_matches(pattern: &PyObject, module: &PyObject, filename: &PyObject) -> PyResult<bool> {
     if check_matched(pattern, module)? {
         return Ok(true);
     }
-    if pattern.is(none::none()) || !pystr::is_str(filename) {
+    if pattern.is(none::none()) || !pystr::is_str(filename) || EXACT_MODULE.with(|c| c.get()) {
         return Ok(false);
     }
     for cand in module_names_of_path(&pystr::to_string_lossy(filename)) {
@@ -727,4 +741,20 @@ pub fn warn_ex(category: *mut PyTypeObject, msg: &PyObject, stacklevel: i64, sou
 pub fn warn_explicit(category: *mut PyTypeObject, msg: &PyObject, filename: &PyObject, lineno: i64, module: Option<&PyObject>, registry: Option<&PyObject>) -> PyResult<()> {
     let cat = crate::types::typeobject::type_ref(category);
     warn_explicit_impl(Some(&cat), msg, filename, lineno, module, registry, None, None)
+}
+
+/// In a forked child only the forking thread survives: a warnings lock held by any other
+/// thread at fork time is released (its owner no longer exists).
+pub fn after_fork_child() {
+    let me = crate::object::thread_id();
+    let mut g = match LOCK.state.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        // the inner mutex is only held for a few instructions; a fork inside that window
+        // leaves the lock as it is
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    if g.1 != 0 && g.0 != me {
+        *g = (0, 0);
+    }
 }

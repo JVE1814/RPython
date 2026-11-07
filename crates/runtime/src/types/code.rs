@@ -18,7 +18,7 @@ use crate::object::*;
 use crate::raise;
 use crate::types::typeobject::*;
 use crate::types::{bytes, int, none, str as pystr, tuple};
-use rpy_compiler::bytecode::{self as bc, CodeUnit, Constant, ExceptionEntry, Location};
+use rpy_compiler::bytecode::{self as bc, ExceptionEntry, Location};
 use std::ffi::c_int;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
@@ -316,76 +316,6 @@ fn build_exec(c: &PyCodeObject, m: &CodeMeta) -> CodeData {
             d
         }
     }
-}
-
-/// The compiler emits public CPython 3.15 wordcode (D24; the default since the switch-over).
-/// `RPYTHON_WORDCODE=0` selects the legacy pipeline (comparison only, until it is deleted).
-pub fn public_mode() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var_os("RPYTHON_WORDCODE").is_none_or(|v| v != "0"))
-}
-
-/// Convert a compiler constant into an object.
-pub fn const_to_obj(c: &Constant, filename: &PyRef) -> PyResult {
-    Ok(match c {
-        Constant::None => none::none_ref(),
-        Constant::Bool(b) => crate::types::bool_::new_bool(*b),
-        Constant::Ellipsis => none::ellipsis().to_ref(),
-        Constant::Int(i) => int::new_int(*i),
-        Constant::BigInt { neg, decimal } => crate::types::int_methods::from_decimal_str(*neg, decimal)?,
-        Constant::Float(f) => crate::types::float::new_float(*f),
-        Constant::Complex { real, imag } => crate::types::complex::new_complex(*real, *imag),
-        Constant::Str(cps) => pystr::intern(pystr::from_codepoints(cps)),
-        Constant::Bytes(b) => bytes::new_bytes(b),
-        Constant::Tuple(items) => {
-            let mut v = Vec::with_capacity(items.len());
-            for it in items {
-                v.push(const_to_obj(it, filename)?);
-            }
-            tuple::new_tuple(v)
-        }
-        Constant::FrozenSet(items) => {
-            let mut v = Vec::with_capacity(items.len());
-            for it in items {
-                v.push(const_to_obj(it, filename)?);
-            }
-            crate::types::set::new_frozenset_from_vec(v)?
-        }
-        Constant::Code(cu) => new_code_from_unit(cu, Some(filename))?,
-    })
-}
-
-/// Build a code object from a compiled unit (legacy internal form).
-pub fn new_code_from_unit(cu: &CodeUnit, filename: Option<&PyRef>) -> PyResult {
-    let filename = match filename {
-        Some(f) => f.clone(),
-        None => pystr::intern_str(&cu.filename),
-    };
-    let mut consts = Vec::with_capacity(cu.consts.len());
-    for c in &cu.consts {
-        consts.push(const_to_obj(c, &filename)?);
-    }
-    let names: Vec<PyRef> = cu.names.iter().map(|n| pystr::intern_str(n)).collect();
-    let lpn: Vec<PyRef> = cu.localsplusnames.iter().map(|n| pystr::intern_str(n)).collect();
-    let parts = CodeParts {
-        argcount: cu.argcount,
-        posonlyargcount: cu.posonlyargcount,
-        kwonlyargcount: cu.kwonlyargcount,
-        flags: cu.flags,
-        stacksize: cu.stacksize,
-        firstlineno: cu.firstlineno,
-        code: cu.code.clone(),
-        locations: cu.locations.clone(),
-        exception_table: cu.exception_table.clone(),
-        kinds: cu.localspluskinds.clone(),
-        filename,
-        consts,
-        names,
-        localsplusnames: lpn,
-        name: pystr::intern_str(&cu.name),
-        qualname: pystr::intern_str(&cu.qualname),
-    };
-    new_code_from_parts(parts)
 }
 
 /// Constant tuples made only of simple immutable constants are shared between all code
@@ -903,9 +833,6 @@ pub fn addr2line(co: &PyObject, addr: i64) -> i32 {
     if addr < 0 {
         return get(co).co_firstlineno;
     }
-    if !code_meta(co).public {
-        return line_for_instr(co, (addr / 4) as usize).map_or(-1, |l| l as i32);
-    }
     let cu = (addr / 2) as usize;
     positions(co).get(cu).and_then(|p| p.lineno).map_or(-1, |l| l as i32)
 }
@@ -915,18 +842,6 @@ pub fn addr2location(co: &PyObject, addr: i64) -> (i32, i32, i32, i32) {
     if addr < 0 {
         let l = get(co).co_firstlineno;
         return (l, -1, l, -1);
-    }
-    if !code_meta(co).public {
-        let d = code_data(co);
-        return match d.locations.get((addr / 4) as usize) {
-            Some(l) if l.lineno != 0 => (
-                l.lineno as i32,
-                if l.col == u32::MAX { -1 } else { l.col as i32 },
-                l.end_lineno as i32,
-                if l.end_col == u32::MAX { -1 } else { l.end_col as i32 },
-            ),
-            _ => (-1, -1, -1, -1),
-        };
     }
     let o = |x: Option<u32>| x.map_or(-1, |v| v as i32);
     match positions(co).get((addr / 2) as usize) {
@@ -1210,7 +1125,8 @@ fn co_positions(o: &PyObject) -> PyResult {
     } else {
         let c = get(o);
         let lt = bytes::bytes_data(unsafe { &*c.co_linetable });
-        let ncu = ncodeunits(o);
+        // no location table at all: no positions (dis then reports None everywhere)
+        let ncu = if lt.is_empty() { 0 } else { ncodeunits(o) };
         let mut n = 0usize;
         for e in wc::decode_linetable_entries(lt, c.co_firstlineno.max(0) as u32) {
             let p = e.pos;

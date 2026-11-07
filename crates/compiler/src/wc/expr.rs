@@ -811,7 +811,7 @@ impl<'a> Compiler<'a> {
             return Ok(());
         }
         self.compile_expr(func)?;
-        self.set_loc(e.loc);
+        self.set_loc(func.loc);
         self.emit(O::PUSH_NULL, 0);
         self.compile_call_args(e, e.loc, 0, args, keywords)
     }
@@ -1219,9 +1219,14 @@ impl<'a> Compiler<'a> {
         }
         // (a synchronous genexpr's prologue already pushed [iterator, NULL])
         self.comprehension_generator(e, generators, 0, 0, elt, value, kind)?;
-        if kind == CompKind::Gen {
+        if kind == CompKind::Gen && !async_outer {
             // the implicit return keeps the location of the loop exit
             self.u().loc = NO_LOC;
+            self.load_none();
+        } else if kind == CompKind::Gen {
+            // an async loop ends in its exception handler: the return belongs to the
+            // whole expression
+            self.set_loc(e.loc);
             self.load_none();
         } else {
             self.set_loc(e.loc);
@@ -1296,11 +1301,14 @@ impl<'a> Compiler<'a> {
         };
         self.emit(build, 0);
         self.emit(O::SWAP, 2);
+        // iter() failing is reported at the iterable expression
+        let iter_loc = self.set_loc(outermost.iter.loc);
         if outermost.is_async != 0 {
             self.emit(O::GET_AITER, 0);
         } else {
             self.emit(O::GET_ITER, 0);
         }
+        self.u().loc = iter_loc;
         let r = self.comprehension_generator(e, generators, 0, 0, elt, value, kind);
         self.u().comps.pop();
         r?;
@@ -1434,7 +1442,8 @@ impl<'a> Compiler<'a> {
         }
         self.use_label(if_cleanup);
         if single.is_none() {
-            self.u().loc = NO_LOC;
+            // the loop's back edge belongs to the element expression
+            self.set_loc(comp_element_loc(elt, value));
             self.emit_jump(O::JUMP, start);
             self.use_label(anchor);
             self.set_loc(g.iter.loc);
@@ -1490,7 +1499,7 @@ impl<'a> Compiler<'a> {
             self.comprehension_element(e, depth, elt, value, kind)?;
         }
         self.use_label(if_cleanup);
-        self.u().loc = NO_LOC;
+        self.set_loc(comp_element_loc(elt, value));
         self.emit_jump(O::JUMP, start);
         self.u().fblocks.pop();
         self.use_label(except);
@@ -1559,7 +1568,7 @@ impl<'a> Compiler<'a> {
                 Some(v) => {
                     self.compile_expr(elt)?;
                     self.compile_expr(v)?;
-                    self.set_loc(e.loc);
+                    self.set_loc(comp_element_loc(elt, Some(v)));
                     self.emit(O::MAP_ADD, depth + 1);
                 }
                 None => {
@@ -1611,4 +1620,12 @@ pub(crate) fn attr_loc(mut loc: Loc, attr_expr: &Expr, attr: &str) -> Loc {
         }
     }
     loc
+}
+
+/// Location of a comprehension element: the element itself, or `key: value` for dicts.
+fn comp_element_loc(elt: &Expr, value: Option<&Expr>) -> ast::Loc {
+    match value {
+        Some(v) => ast::Loc::new(elt.loc.lineno, elt.loc.col_offset, v.loc.end_lineno, v.loc.end_col_offset),
+        None => elt.loc,
+    }
 }

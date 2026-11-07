@@ -21,9 +21,20 @@ __all__ = ['extract_stack', 'extract_tb', 'format_exception',
            'walk_stack', 'walk_tb', 'print_list']
 
 
+class _PlainTheme:
+    """Theme without colours (every style is the empty string)."""
+
+    def __getattr__(self, name):
+        return ''
+
+
 def _theme(colorize):
     # _colorize is only imported when something is actually formatted
-    import _colorize
+    try:
+        import _colorize
+    except ImportError:
+        # e.g. printing from __del__ while the interpreter shuts down
+        return _PlainTheme()
     if colorize:
         return _colorize.get_theme(force_color=True).traceback
     return _colorize.get_theme(force_no_color=True).traceback

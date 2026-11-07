@@ -35,9 +35,23 @@ impl Ctx {
 }
 
 fn format_stack(e: &PyObject) -> String {
+    format_tb(exc::exc_traceback(e))
+}
+
+/// The entries of a traceback chain (no banner, no carets). Runs of more than three
+/// identical entries are folded into a "[Previous line repeated N more times]" line.
+pub fn format_tb(tb: Option<PyRef>) -> String {
     let mut out = String::new();
-    let mut cur: Option<PyRef> = exc::exc_traceback(e);
+    let mut cur: Option<PyRef> = tb;
     let mut visited: Vec<usize> = Vec::new();
+    let mut last: Option<(String, i32, String)> = None;
+    let mut repeats = 0usize;
+    fn fold(out: &mut String, repeats: usize) {
+        if repeats > 3 {
+            let n = repeats - 3;
+            out.push_str(&format!("  [Previous line repeated {} more time{}]\n", n, if n == 1 { "" } else { "s" }));
+        }
+    }
     while let Some(t) = cur {
         if visited.contains(&(t.as_ptr() as usize)) {
             break;
@@ -45,20 +59,37 @@ fn format_stack(e: &PyObject) -> String {
         visited.push(t.as_ptr() as usize);
         let tbo = unsafe { &*(t.as_ptr() as *const crate::types::traceback::PyTracebackObject) };
         let fo = unsafe { &*tbo.tb_frame };
+        let next = if tbo.tb_next.is_null() { None } else { Some(unsafe { PyRef::from_borrowed(tbo.tb_next) }) };
         if let Some(f) = crate::types::frameobject::frame_of(fo) {
             let cd = crate::types::code::code_data(f.code());
             let fname = pystr::to_string_lossy(&cd.filename);
             let name = pystr::to_string_lossy(&cd.co_name);
+            let key = (fname.clone(), tbo.tb_lineno as i32, name.clone());
+            if last.as_ref() == Some(&key) {
+                repeats += 1;
+            } else {
+                fold(&mut out, repeats);
+                last = Some(key);
+                repeats = 1;
+            }
+            if repeats > 3 {
+                cur = next;
+                continue;
+            }
             out.push_str(&format!("  File \"{}\", line {}, in {}\n", fname, tbo.tb_lineno, name));
-            if let Some(line) = crate::modules::sys_full::source_line(&fname, tbo.tb_lineno) {
+            // source lines are read with io.open, as the reference printer does: no
+            // source when it is gone
+            let source = if io_open_available() { crate::modules::sys_full::source_line(&fname, tbo.tb_lineno) } else { None };
+            if let Some(line) = source {
                 let l = line.trim();
                 if !l.is_empty() {
                     out.push_str(&format!("    {}\n", l));
                 }
             }
         }
-        cur = if tbo.tb_next.is_null() { None } else { Some(unsafe { PyRef::from_borrowed(tbo.tb_next) }) };
+        cur = next;
     }
+    fold(&mut out, repeats);
     out
 }
 
@@ -276,4 +307,12 @@ fn print_with_traceback_module_inner(e: &PyObject) -> bool {
         crate::errors::set_exc(s);
     }
     r
+}
+
+/// Is `io.open` usable (the io module not imported yet counts as usable)?
+fn io_open_available() -> bool {
+    match crate::import::get_loaded_module("io") {
+        None => true,
+        Some(io) => matches!(ab::getattr_opt(&io, &pystr::new_str("open")), Ok(Some(_))),
+    }
 }

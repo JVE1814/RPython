@@ -29,7 +29,8 @@ __all__ = ['get_ident', 'active_count', 'Condition', 'current_thread',
            'Barrier', 'BrokenBarrierError', 'Timer', 'ThreadError',
            'ExceptHookArgs', 'setprofile', 'settrace', 'local', 'stack_size',
            'excepthook', 'getprofile', 'gettrace',
-           'setprofile_all_threads', 'settrace_all_threads']
+           'setprofile_all_threads', 'settrace_all_threads',
+           'serialize_iterator', 'synchronized_iterator', 'concurrent_tee']
 
 _start_joinable_thread = _thread.start_joinable_thread
 _daemon_threads_allowed = _thread.daemon_threads_allowed
@@ -582,6 +583,112 @@ class Barrier:
 
 class BrokenBarrierError(RuntimeError):
     pass
+
+
+# Iterator helpers for sharing one iterator between threads.
+
+class serialize_iterator:
+    """Wrap an iterator so that only one thread at a time advances it.
+
+    next(), send(), throw() and close() all run while holding the wrapper's
+    lock; the last three are only available if the wrapped iterator has them.
+    """
+
+    def __init__(self, iterable):
+        self._iterator = iter(iterable)
+        self._lock = Lock()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        with self._lock:
+            return next(self._iterator)
+
+    def _forward(self, method_name, args):
+        target = self._iterator
+        with self._lock:
+            method = getattr(target, method_name)
+            return method(*args)
+
+    def send(self, value, /):
+        return self._forward('send', (value,))
+
+    def throw(self, *args):
+        return self._forward('throw', args)
+
+    def close(self):
+        return self._forward('close', ())
+
+
+def synchronized_iterator(func):
+    """Decorator: calls of *func* return its iterator wrapped in serialize_iterator."""
+    from functools import wraps
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        return serialize_iterator(func(*args, **kwargs))
+
+    return wrapper
+
+
+class _TeeCell:
+    # One produced value; ``following`` is filled in when the next value is produced.
+    __slots__ = ('value', 'following')
+
+    def __init__(self, value):
+        self.value = value
+        self.following = None
+
+
+class _TeeSource:
+    __slots__ = ('iterator', 'lock')
+
+    def __init__(self, iterator, lock):
+        self.iterator = iterator
+        self.lock = lock
+
+
+class _ConcurrentTee:
+    """One of the independent iterators returned by concurrent_tee()."""
+
+    __slots__ = ('_source', '_cell', '__weakref__')
+
+    def __init__(self, source, cell):
+        self._source = source
+        self._cell = cell
+
+    @property
+    def lock(self):
+        return self._source.lock
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        source = self._source
+        with source.lock:
+            cell = self._cell
+            following = cell.following
+            if following is None:
+                following = _TeeCell(next(source.iterator))
+                cell.following = following
+            self._cell = following
+        return following.value
+
+
+def concurrent_tee(iterable, n=2):
+    """Return n independent iterators over *iterable* that may be consumed
+    from different threads; the underlying iterator is advanced under one
+    shared lock and every value is delivered to every iterator."""
+    if n < 0:
+        raise ValueError('n must be >= 0')
+    if n == 0:
+        return ()
+    source = _TeeSource(iter(iterable), Lock())
+    # Every iterator starts at the same empty head cell; the values hang off it.
+    head = _TeeCell(None)
+    return tuple(_ConcurrentTee(source, head) for _ in range(n))
 
 
 _counter = _count(1).__next__
