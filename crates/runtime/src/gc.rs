@@ -233,20 +233,59 @@ pub fn enter_vm(cell: &crate::threads::ModeCell, safe: crate::threads::ThreadMod
     use crate::threads::ThreadMode;
     let safe = if safe == ThreadMode::InVm { ThreadMode::Blocked } else { safe };
     let me = cell as *const _ as usize;
+    // (stability3) set once this thread had to wait: it is then counted in ENTERING
+    // until it gets in, which makes the next stop wait for it (no starvation)
+    let mut waited = false;
     loop {
         cell.0.store(ThreadMode::InVm as u8, SeqCst);
         if STW_OWNER.load(SeqCst) == me {
-            return;
+            break;
         }
         if RELEASE.load(SeqCst) {
             if !PARK_ALL.load(SeqCst) || FINALIZER.load(SeqCst) == me {
-                return;
+                break;
             }
             cell.0.store(safe as u8, SeqCst);
+            if waited {
+                ENTERING.fetch_sub(1, SeqCst);
+            }
             park_forever();
         }
         cell.0.store(safe as u8, SeqCst);
+        if !waited {
+            waited = true;
+            ENTERING.fetch_add(1, SeqCst);
+        }
         wait_for_release();
+    }
+    if waited {
+        ENTERING.fetch_sub(1, SeqCst);
+    }
+}
+
+/// (stability3) Threads that found the world stopped while entering the VM and have
+/// not got in yet. A new stop first gives them a moment to enter, so a thread that
+/// stops the world in a tight loop cannot keep the others out forever (each of them
+/// makes progress between two pauses).
+static ENTERING: AtomicUsize = AtomicUsize::new(0);
+
+/// Wait (briefly) until the threads queued in ENTERING have entered the VM.
+fn let_waiters_in() {
+    if ENTERING.load(SeqCst) == 0 {
+        return;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+    let mut i = 0u32;
+    while ENTERING.load(SeqCst) != 0 {
+        if i < 32 {
+            std::thread::yield_now();
+        } else {
+            if std::time::Instant::now() > deadline {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(20));
+        }
+        i += 1;
     }
 }
 
@@ -331,13 +370,30 @@ pub fn safepoint_poll(ts: &ThreadState) {
         return; // already counts as stopped
     }
     ts.mode.0.store(crate::threads::ThreadMode::Blocked as u8, SeqCst);
-    wait_for_release();
+    // enter_vm waits for the restart (and queues this thread in ENTERING meanwhile)
     enter_vm(&ts.mode, crate::threads::ThreadMode::Blocked);
+}
+
+/// `_testinternalcapi.test_stop_the_world()`: stop every other thread and restart
+/// them at once (stability3).
+pub fn test_stop_the_world() {
+    while COLLECTING.compare_exchange(false, true, AcqRel, Acquire).is_err() {
+        crate::threads::blocking(|| std::thread::sleep(std::time::Duration::from_micros(100)));
+    }
+    let me = crate::threads::current_mut();
+    for _ in 0..40 {
+        if stop_the_world(me) {
+            start_the_world();
+            break;
+        }
+    }
+    COLLECTING.store(false, Release);
 }
 
 /// Bring all other threads to a safepoint. Returns false if they did not arrive in
 /// time (the world is running again then).
 fn stop_the_world(me: *mut ThreadState) -> bool {
+    let_waiters_in();
     STW_OWNER.store(unsafe { &(*me).mode as *const _ as usize }, SeqCst);
     RELEASE.store(false, SeqCst);
     // read the thread list only after publishing the stop: a thread registered
@@ -918,6 +974,7 @@ pub fn fork_parent(stopped: bool) {
 /// Reset the collector state in the child: the other threads are gone.
 pub fn fork_child() {
     PARKED.store(0, Release);
+    ENTERING.store(0, SeqCst);
     STW_OWNER.store(0, SeqCst);
     RELEASE.store(true, Release);
     COLLECTING.store(false, Release);

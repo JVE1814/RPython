@@ -1261,7 +1261,7 @@ pub unsafe extern "C" fn h_load_super_attr(sp: *mut *mut PyObject, arg: u64, nam
                 }
             }
             let sup = if is_super {
-                st(crate::types::super_::new_super(&cls, &slf))?
+                if arg & 2 != 0 { st(crate::types::super_::new_super(&cls, &slf))? } else { st(crate::types::super_::new_super_zero_arg(&cls, &slf))? }
             } else if arg & 2 != 0 {
                 st(ab::call(&gsuper, &[&cls, &slf]))?
             } else {

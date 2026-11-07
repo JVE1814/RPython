@@ -1032,7 +1032,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                                 None
                             };
                             let sup = if gsuper.is(type_obj(crate::types::super_::super_type())) {
-                                crate::types::super_::new_super(&cls, &slf)
+                                if two { crate::types::super_::new_super(&cls, &slf) } else { crate::types::super_::new_super_zero_arg(&cls, &slf) }
                             } else if two {
                                 ab::call(&gsuper, &[&cls, &slf])
                             } else {

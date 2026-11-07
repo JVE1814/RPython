@@ -592,6 +592,8 @@ pub fn materialize(o: &PyObject) -> bool {
             }
         }
         dict::fill_fresh_steal(&d, &buf[..n]);
+        // (stability3) remembered for _testinternalcapi.has_split_table
+        d.ob_flags.fetch_or(dict::OBF_FROM_INSTANCE, Relaxed);
         // publish the dict first: until then readers still find the values in the
         // slots (alive: the dict holds them now)
         w.store(d.into_raw(), Release);
