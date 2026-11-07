@@ -864,6 +864,7 @@ pub fn init_module() -> PyResult {
     dict::set_item_str(&d, "CoroInfo", &crate::types::typeobject::type_ref(coro_info_type()))?;
     dict::set_item_str(&d, "TaskInfo", &crate::types::typeobject::type_ref(task_info_type()))?;
     dict::set_item_str(&d, "AwaitedInfo", &crate::types::typeobject::type_ref(awaited_info_type()))?;
+    super::binfmt::init(&d)?; // tail4
     dict::set_item_str(&d, "PROCESS_VM_READV_SUPPORTED", &bool_::new_bool(true))?;
     for (k, v) in [
         ("THREAD_STATUS_HAS_GIL", super::THREAD_STATUS_HAS_GIL),
