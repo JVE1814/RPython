@@ -543,7 +543,9 @@ pub fn trampoline() -> usize {
         a.mov_rr(R13, Rdx);
         a.load_fs0(R15);
         a.jmp_r(Rcx);
-        mem::install(&a.buf, |_, _| {}).expect("jit: cannot install the entry trampoline")
+        let t = mem::install(&a.buf, |_, _| {}).expect("jit: cannot install the entry trampoline");
+        TRAMP_ADDR.store(t, Relaxed);
+        t
     })
 }
 
@@ -578,6 +580,17 @@ pub fn enter(ts: &ThreadState, f: &mut Frame, target: usize, out: &mut *mut PyOb
     let entry: EntryFn = unsafe { std::mem::transmute(trampoline()) };
     unsafe { entry(f, f.slots.as_mut_ptr(), ts, target, out) }
 }
+
+/// `enter` for callers running inside compiled code (jit5: generator resumption from
+/// Send/ForIter): the thread's allocator is registered and the trampoline exists.
+#[inline(always)]
+pub fn enter_registered(ts: &ThreadState, f: &mut Frame, target: usize, out: &mut *mut PyObject) -> u32 {
+    let t = TRAMP_ADDR.load(Relaxed);
+    let t = if t != 0 { t } else { trampoline() };
+    let entry: EntryFn = unsafe { std::mem::transmute(t) };
+    unsafe { entry(f, f.slots.as_mut_ptr(), ts, target, out) }
+}
+static TRAMP_ADDR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Compiled code entered by `enter` ended with a deopt or an error (status `st`): the
 /// interpreter finishes this activation (or runs it to the next yield).

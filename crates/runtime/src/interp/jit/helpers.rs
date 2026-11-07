@@ -743,12 +743,12 @@ pub unsafe extern "C" fn h_get_iter(sp: *mut *mut PyObject) -> u64 {
 }
 
 /// 0: value pushed; 1: exhausted (iterator popped); 2: error (iterator still on the stack)
-pub unsafe extern "C" fn h_for_iter(sp: *mut *mut PyObject) -> u64 {
+pub unsafe extern "C" fn h_for_iter(sp: *mut *mut PyObject, ts: *const ThreadState) -> u64 {
     unsafe {
         let it = &**sp.sub(1);
         if it.is_type(crate::types::genobject::gen_type()) {
             use crate::types::genobject as gm;
-            let (st, v) = gm::jit_send(it.as_ptr(), std::ptr::null_mut());
+            let (st, v) = gm::jit_send(&*ts, it.as_ptr(), std::ptr::null_mut());
             match st {
                 gm::JS_YIELD => {
                     *sp = v;
@@ -795,13 +795,13 @@ pub unsafe extern "C" fn h_for_iter(sp: *mut *mut PyObject) -> u64 {
 }
 
 /// Send: [recv, v] -> [recv, yielded] (0) | [result] (1, jump) | error (2, [recv])
-pub unsafe extern "C" fn h_send(sp: *mut *mut PyObject) -> u64 {
+pub unsafe extern "C" fn h_send(sp: *mut *mut PyObject, ts: *const ThreadState) -> u64 {
     unsafe {
         let recvp = *sp.sub(2);
         let rt = (*recvp).type_ptr();
         if rt == crate::types::genobject::gen_type() || rt == crate::types::genobject::coro_type() {
             use crate::types::genobject as gm;
-            let (st, r) = gm::jit_send(recvp, *sp.sub(1));
+            let (st, r) = gm::jit_send(&*ts, recvp, *sp.sub(1));
             match st {
                 gm::JS_YIELD => {
                     *sp.sub(1) = r;

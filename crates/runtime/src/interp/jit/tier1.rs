@@ -475,6 +475,7 @@ impl<'a> Gen<'a> {
                 let t = self.ilabel[self.an.index_of[arg as usize] as usize];
                 self.set_lasti(pc);
                 self.lea_sp(Rdi, d);
+                self.a.mov_rr(Rsi, R13);
                 self.call(addr!(h::h_send));
                 let err = self.error_label(pc, d - 1);
                 self.a.cmp_ri(Rax, 1);
@@ -1004,6 +1005,7 @@ impl<'a> Gen<'a> {
         self.a.bind(noprof);
         self.set_lasti(ins.pc);
         self.lea_sp(Rdi, d);
+        self.a.mov_rr(Rsi, R13);
         self.call(addr!(h::h_for_iter));
         let err = self.error_label(ins.pc, d);
         self.a.cmp_ri(Rax, 1);

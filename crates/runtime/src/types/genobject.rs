@@ -252,7 +252,7 @@ pub const JS_SLOW: u32 = 3;
 /// return value (the generator is finished), JS_ERROR with the exception set (also
 /// finished). Anything else returns JS_SLOW without consuming `v`.
 #[inline(always)]
-pub unsafe fn jit_send(o: *mut PyObject, v: *mut PyObject) -> (u32, *mut PyObject) {
+pub unsafe fn jit_send(ts: &crate::threads::ThreadState, o: *mut PyObject, v: *mut PyObject) -> (u32, *mut PyObject) {
     use crate::interp::jit::tier1::ST_YIELD;
     unsafe {
         let gn = &mut *(o as *mut GenObject);
@@ -270,7 +270,6 @@ pub unsafe fn jit_send(o: *mut PyObject, v: *mut PyObject) -> (u32, *mut PyObjec
         if crate::modules::sys::tracing_active() || !crate::interp::jit::genfast_enabled() {
             return (JS_SLOW, std::ptr::null_mut());
         }
-        let ts = crate::threads::current();
         let depth = ts.recursion_depth.get() + 1;
         if depth > ts.c.py_recursion_limit || crate::interp::stack_pointer() < ts.stack_soft_limit() {
             return (JS_SLOW, std::ptr::null_mut());
@@ -302,7 +301,7 @@ pub unsafe fn jit_send(o: *mut PyObject, v: *mut PyObject) -> (u32, *mut PyObjec
         let target = f.resume;
         f.resume = 0;
         let mut out: *mut PyObject = std::ptr::null_mut();
-        let st = crate::interp::jit::enter(ts, f, target, &mut out);
+        let st = crate::interp::jit::enter_registered(ts, f, target, &mut out);
         if st == ST_YIELD {
             ts.frame.set(prev);
             f.prev = std::ptr::null_mut();
