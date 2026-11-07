@@ -84,10 +84,59 @@ pub fn assign_type_tag(tp: *mut PyTypeObject) -> u32 {
     match tag_cell(tp).compare_exchange(0, v, AcqRel, Acquire) {
         Ok(_) => {
             unsafe { (*tp).tp_flags |= Py_TPFLAGS_VALID_VERSION_TAG };
+            register_tag(tp, v);
             v
         }
         Err(cur) => cur,
     }
+}
+
+/// Tags handed out to types that are still alive: (tag -> type, type -> its tags).
+/// Inline-cache entries keep raw type pointers next to the tag they were filled
+/// under; the optimising tier may only dereference such a pointer if the pair is
+/// still registered (`type_alive_with_tag`), since the type may have been freed.
+type TagMaps = (std::collections::HashMap<u32, usize>, std::collections::HashMap<usize, Vec<u32>>);
+static TAGS: std::sync::Mutex<Option<TagMaps>> = std::sync::Mutex::new(None);
+
+fn register_tag(tp: *mut PyTypeObject, tag: u32) {
+    let mut g = TAGS.lock().unwrap_or_else(|e| e.into_inner());
+    let (by_tag, by_type) = g.get_or_insert_with(Default::default);
+    by_tag.insert(tag, tp as usize);
+    by_type.entry(tp as usize).or_default().push(tag);
+}
+
+/// A type object is being freed: forget every tag it had.
+pub fn forget_type(tp: *mut PyTypeObject) {
+    let mut g = TAGS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((by_tag, by_type)) = g.as_mut() {
+        if let Some(tags) = by_type.remove(&(tp as usize)) {
+            for t in tags {
+                by_tag.remove(&t);
+            }
+        }
+    }
+}
+
+/// Was `tag` handed out to a type that is still alive?
+pub fn tag_alive(tag: u64) -> bool {
+    if tag == 0 || tag > u32::MAX as u64 {
+        return false;
+    }
+    let g = TAGS.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref().is_some_and(|(by_tag, _)| by_tag.contains_key(&(tag as u32)))
+}
+
+/// Is `tp` (possibly a dangling pointer from a cache entry) a live type whose
+/// current version tag is `tag`? Never dereferences a freed type.
+pub fn type_alive_with_tag(tp: usize, tag: u32) -> bool {
+    if tag == 0 {
+        return false;
+    }
+    let registered = {
+        let g = TAGS.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().is_some_and(|(by_tag, _)| by_tag.get(&tag) == Some(&tp))
+    };
+    registered && type_tag(tp as *mut PyTypeObject) == tag
 }
 
 // ------------------------------------------------------------------ type dict watching
@@ -106,7 +155,9 @@ pub fn watch_type_dict(tp: *mut PyTypeObject) {
 }
 
 /// The type owning dict `d` is going away.
+/// (Called by type_dealloc: also forgets the type's version tags.)
 pub fn unwatch_type_dict(tp: *mut PyTypeObject) {
+    forget_type(tp);
     unsafe {
         let d = (*tp).tp_dict;
         if !d.is_null() && (*(d as *mut PyDictObject))._ma_watcher_tag == tp as u64 {
@@ -124,14 +175,32 @@ pub fn on_dict_write(d: &PyObject, key: *mut PyObject) {
         if tag == crate::interp::jit::opt::WATCH_TAG {
             crate::interp::jit::opt::dict_written(d, key);
         } else {
-            type_dict_written(tag as *mut PyTypeObject);
+            type_dict_written(tag as *mut PyTypeObject, key);
         }
     }
 }
 
 #[cold]
-fn type_dict_written(tp: *mut PyTypeObject) {
+fn type_dict_written(tp: *mut PyTypeObject, key: *mut PyObject) {
     crate::types::slots::type_modified(tp);
+    // A class that gains or loses __get__/__set__/__delete__ changes how instances
+    // of it behave as attributes of *other* classes, whose version tags would not
+    // change: cached lookups there (instance attributes shadowing it, class
+    // attributes, constants folded by tier 2) must all be redone. Rare: invalidate
+    // the tags of every class.
+    // (bulk updates of a type dict, key NULL, are left out: they happen as classes are
+    // set up and would invalidate every compiled unit each time)
+    let descr_key = !key.is_null()
+        && unsafe {
+            let k = &*key;
+            crate::types::str::is_str(k)
+                && (crate::types::str::str_eq(k, crate::name!("__get__"))
+                    || crate::types::str::str_eq(k, crate::name!("__set__"))
+                    || crate::types::str::str_eq(k, crate::name!("__delete__")))
+        };
+    if descr_key {
+        crate::types::slots::type_modified(crate::types::typeobject::object_type());
+    }
 }
 
 // ------------------------------------------------------------------ global method cache

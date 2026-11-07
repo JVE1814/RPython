@@ -109,3 +109,20 @@ def mixed(vals):
 for _ in range(120):
     r = mixed([0, 1, -7, 3.5, 0.0, -0.0, float('nan'), float('inf'), 2 ** 31, 2 ** 70, True, 1 << 29])
 print(r)
+
+# unpacking sites that see tuples and lists (and then other sequences, wrong sizes)
+def unpack_mixed(seqs):
+    t = 0
+    for s in seqs:
+        a, b, c = s
+        t += a * 100 + b * 10 + c
+    return t
+
+for _ in range(120):
+    r = unpack_mixed([(1, 2, 3), [4, 5, 6], (7, 8, 9)])
+print(r, unpack_mixed([(1, 2, 3), [4, 5, 6], range(3), "123" and (0, 0, 1)]))
+for bad in ([1, 2], (1, 2, 3, 4), "ab"):
+    try:
+        unpack_mixed([bad])
+    except (ValueError, TypeError) as e:
+        print(type(e).__name__, e)

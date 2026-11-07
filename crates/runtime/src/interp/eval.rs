@@ -643,7 +643,7 @@ pub(super) fn call_intrinsic2(f: &mut Frame, which: u32, a: PyRef, b: PyRef) -> 
     }
 }
 
-fn get_awaitable(o: &PyObject, where_: u32) -> PyResult {
+pub(crate) fn get_awaitable(o: &PyObject, where_: u32) -> PyResult {
     match crate::types::genobject::get_awaitable_iter(o) {
         Ok(r) => {
             if crate::types::genobject::is_coroutine_exact(&r) && crate::types::genobject::coro_is_running_await(&r) {
@@ -731,7 +731,7 @@ pub fn eval_frame(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyRe
     r
 }
 
-fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult<Exit> {
+pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult<Exit> {
     let code_obj: PyRef = f.code().to_ref();
     let cd = crate::types::code::code_data(&code_obj);
     let code: &[u32] = &cd.code;
@@ -902,27 +902,8 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             let cell = f.slots[arg as usize];
                             funcobject::cell_set(unsafe { &*cell }, Some(v));
                         }
-                        Op::DeleteDeref => {
-                            let cell = f.slots[arg as usize];
-                            if funcobject::cell_get(unsafe { &*cell }).is_none() {
-                                return Err(unbound_local(f, arg as usize));
-                            }
-                            funcobject::cell_set(unsafe { &*cell }, None);
-                        }
-                        Op::LoadFromDictOrDeref => {
-                            let mapping = popref!(f);
-                            let nm = &cd.localsplusnames[arg as usize];
-                            match mapping_get(&mapping, nm)? {
-                                Some(v) => push!(f, v.into_raw()),
-                                None => {
-                                    let cell = f.slots[arg as usize];
-                                    match funcobject::cell_get(unsafe { &*cell }) {
-                                        Some(v) => push!(f, v.into_raw()),
-                                        None => return Err(unbound_local(f, arg as usize)),
-                                    }
-                                }
-                            }
-                        }
+                        // shared with tier-1 code (jit::helpers::h_misc)
+                        Op::DeleteDeref | Op::LoadFromDictOrDeref | Op::DeleteGlobal | Op::LoadFromDictOrGlobals | Op::GetAiter | Op::GetAnext | Op::EndAsyncFor | Op::GetAwaitable | Op::CleanupThrow | Op::LoadBuildClass | Op::PushExcInfo | Op::PopExcept | Op::CheckExcMatch | Op::CheckEgMatch | Op::WithExceptStart | Op::BeforeWith | Op::BeforeAsyncWith | Op::ImportName | Op::ImportFrom | Op::BuildTemplate | Op::BuildInterpolation | Op::MatchClass | Op::MatchMapping | Op::MatchSequence | Op::MatchKeys | Op::GetLen | Op::LoadCommonConstant | Op::LoadSpecial => exec_misc(ts, f, cd, op, arg)?,
                         Op::LoadLocals => {
                             if f.locals.is_null() {
                                 raise!(SystemError, "no locals found");
@@ -992,21 +973,6 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                         Op::StoreGlobal => {
                             let v = popref!(f);
                             dict::set_item(f.globals(), &cd.names[arg as usize], &v)?;
-                        }
-                        Op::DeleteGlobal => {
-                            let nm = &cd.names[arg as usize];
-                            if !dict::del_item(f.globals(), nm)? {
-                                return Err(name_error(f, nm));
-                            }
-                        }
-                        Op::LoadFromDictOrGlobals => {
-                            let mapping = popref!(f);
-                            let nm = &cd.names[arg as usize];
-                            let v = match mapping_get(&mapping, nm)? {
-                                Some(v) => lazy_check(&mapping, nm, v)?,
-                                None => load_global(f, nm)?,
-                            };
-                            push!(f, v.into_raw());
                         }
                         Op::LoadAttr => {
                             let o = popref!(f);
@@ -1424,31 +1390,6 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                                 for_iter_event(ts, f, pc == arg as usize, gen_iter, pc)?;
                             }
                         }
-                        Op::GetAiter => {
-                            let o = popref!(f);
-                            let r = crate::types::genobject::get_aiter(&o)?;
-                            push!(f, r.into_raw());
-                        }
-                        Op::GetAnext => {
-                            let aiter = unsafe { &*top!(f) };
-                            let r = crate::types::genobject::get_anext_awaitable(aiter)?;
-                            push!(f, r.into_raw());
-                        }
-                        Op::EndAsyncFor => {
-                            let e = popref!(f);
-                            let aiter = popref!(f);
-                            drop(aiter);
-                            if is_subtype(e.type_ptr(), exc::StopAsyncIteration()) {
-                                // done
-                            } else {
-                                set_exc(e);
-                                return Err(PyErr);
-                            }
-                        }
-                        Op::GetAwaitable => {
-                            let o = popref!(f);
-                            push!(f, get_awaitable(&o, arg)?.into_raw());
-                        }
                         Op::GetYieldFromIter => {
                             let o = popref!(f);
                             let r = if crate::types::genobject::is_coroutine_exact(&o) {
@@ -1493,19 +1434,6 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                                 }
                             }
                             return Ok(Some(Exit::Yield(v)));
-                        }
-                        Op::CleanupThrow => {
-                            let e = popref!(f);
-                            let _last = popopt!(f);
-                            let _sub = popopt!(f);
-                            if is_subtype(e.type_ptr(), exc::StopIteration()) {
-                                let val = exc::stop_iteration_value(&e);
-                                push!(f, none::none_ref().into_raw());
-                                push!(f, val.into_raw());
-                            } else {
-                                set_exc(e);
-                                return Err(PyErr);
-                            }
                         }
                         Op::ReturnValue => {
                             let v = popref!(f);
@@ -1665,14 +1593,6 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             unsafe { xdecref(old) };
                             push!(f, func.into_raw());
                         }
-                        Op::LoadBuildClass => {
-                            let b = f.builtins();
-                            let bc_ = if dict::is_dict(b) { dict::get_item_str(b, name!("__build_class__")) } else { ab::getitem(b, name!("__build_class__")).ok() };
-                            match bc_ {
-                                Some(v) => push!(f, v.into_raw()),
-                                None => raise!(NameError, "__build_class__ not found"),
-                            }
-                        }
                         Op::RaiseVarargs => {
                             let (e, cause) = match arg {
                                 0 => (None, None),
@@ -1715,133 +1635,10 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             set_exc(e);
                             return Err(ReraiseMarker::mark(ts));
                         }
-                        Op::PushExcInfo => {
-                            let e = pop!(f);
-                            unsafe { incref(e) };
-                            let prev = set_handled_exception(ts, e);
-                            push!(f, if prev.is_null() { none::none_ref().into_raw() } else { prev });
-                            push!(f, e);
-                        }
-                        Op::PopExcept => {
-                            let prev = pop!(f);
-                            let prevv = if !prev.is_null() && unsafe { (*prev).is(none::none()) } {
-                                unsafe { decref(prev) };
-                                std::ptr::null_mut()
-                            } else {
-                                prev
-                            };
-                            let old = set_handled_exception(ts, prevv);
-                            unsafe { xdecref(old) };
-                        }
-                        Op::CheckExcMatch => {
-                            let t = popref!(f);
-                            let e = unsafe { &*top!(f) };
-                            check_exc_match_type(&t, false)?;
-                            let r = exception_matches(e, &t)?;
-                            push!(f, bool_::new_bool(r).into_raw());
-                        }
-                        Op::CheckEgMatch => {
-                            let t = popref!(f);
-                            let e = popref!(f);
-                            check_exc_match_type(&t, true)?;
-                            let (rest, matched) = crate::types::exceptiongroup::eg_match(&e, &t)?;
-                            if !matched.is(none::none()) && !crate::types::exceptiongroup::is_exception_group(&e) {
-                                // the wrapper of a naked exception starts its traceback at
-                                // this except* clause
-                                add_traceback(f, &matched);
-                            }
-                            if !matched.is(none::none()) {
-                                // the matched group becomes the handled exception
-                                let prev = set_handled_exception(ts, matched.clone().into_raw());
-                                unsafe { xdecref(prev) };
-                            }
-                            push!(f, rest.into_raw());
-                            push!(f, matched.into_raw());
-                        }
-                        Op::WithExceptStart => {
-                            let val = peek!(f, 1);
-                            let exit_self = peek!(f, 4);
-                            let exit_func = peek!(f, 5);
-                            let v = unsafe { &*val };
-                            let tp = type_ref(v.type_ptr());
-                            let tb = exc::exc_traceback(v).unwrap_or_else(none::none_ref);
-                            let r = if exit_self.is_null() {
-                                ab::call(unsafe { &*exit_func }, &[&tp, v, &tb])?
-                            } else {
-                                ab::call(unsafe { &*exit_func }, &[unsafe { &*exit_self }, &tp, v, &tb])?
-                            };
-                            push!(f, r.into_raw());
-                        }
-                        Op::LoadSpecial => {
-                            let o = popref!(f);
-                            let (m, s) = load_special(&o, arg)?;
-                            push!(f, m.into_raw());
-                            push!(f, s.map_or(std::ptr::null_mut(), |s| s.into_raw()));
-                        }
                         Op::ReturnGenerator => {
                             // end of the eager generator prologue (see interp::call_function)
                             f.next_instr = pc as u32;
                             return Ok(Some(Exit::Yield(none::none_ref())));
-                        }
-                        Op::BeforeWith | Op::BeforeAsyncWith => {
-                            let mgr = popref!(f);
-                            let (enter_n, exit_n) = if op == Op::BeforeWith {
-                                (name!("__enter__"), name!("__exit__"))
-                            } else {
-                                (name!("__aenter__"), name!("__aexit__"))
-                            };
-                            let enter = lookup(mgr.type_ptr(), enter_n);
-                            let exit = lookup(mgr.type_ptr(), exit_n);
-                            let (enter, exit) = match (enter, exit) {
-                                (Some(a), Some(b)) => (a, b),
-                                (en, ex) => {
-                                    let sync = op == Op::BeforeWith;
-                                    let kind = if sync { "" } else { "asynchronous " };
-                                    // a missing exit method is reported before a missing enter
-                                    let missing = if ex.is_none() {
-                                        if sync { "__exit__" } else { "__aexit__" }
-                                    } else if sync {
-                                        "__enter__"
-                                    } else {
-                                        "__aenter__"
-                                    };
-                                    let _ = en;
-                                    // suggest the other protocol when the object implements it
-                                    let (oe, ox, hint) = if sync {
-                                        (name!("__aenter__"), name!("__aexit__"), " but it supports the asynchronous context manager protocol. Did you mean to use 'async with'?")
-                                    } else {
-                                        (name!("__enter__"), name!("__exit__"), " but it supports the context manager protocol. Did you mean to use 'with'?")
-                                    };
-                                    let other = lookup(mgr.type_ptr(), oe).is_some() && lookup(mgr.type_ptr(), ox).is_some();
-                                    raise!(
-                                        TypeError,
-                                        "'{}' object does not support the {}context manager protocol (missed {} method){}",
-                                        tname(&mgr),
-                                        kind,
-                                        missing,
-                                        if other { hint } else { "" }
-                                    );
-                                }
-                            };
-                            // push exit as (func, self) pair
-                            if exit.ty().tp_flags & Py_TPFLAGS_METHOD_DESCRIPTOR != 0 {
-                                push!(f, exit.into_raw());
-                                push!(f, mgr.clone().into_raw());
-                            } else {
-                                let bound = match exit.ty().tp_descr_get {
-                                    Some(g) => unsafe { from_c(g(exit.as_ptr(), mgr.as_ptr(), mgr.type_ptr() as *mut PyObject))? },
-                                    None => exit,
-                                };
-                                push!(f, bound.into_raw());
-                                push!(f, std::ptr::null_mut());
-                            }
-                            let r = ab::call_unbound(&enter, &mgr, &[])?;
-                            if op == Op::BeforeAsyncWith {
-                                let aw = get_awaitable(&r, 1)?;
-                                push!(f, aw.into_raw());
-                            } else {
-                                push!(f, r.into_raw());
-                            }
                         }
                         Op::SetupAnnotations => {
                             if f.locals.is_null() {
@@ -1852,42 +1649,6 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                                 let d = dict::new_dict();
                                 ab::setitem(l, name!("__annotations__"), Some(&d))?;
                             }
-                        }
-                        Op::ImportName => {
-                            let fromlist = popref!(f);
-                            let level = popref!(f);
-                            let nm = &cd.names[(arg & 0x7fffff) as usize];
-                            let locals = if f.locals.is_null() { none::none_ref() } else { unsafe { (*f.locals).to_ref() } };
-                            let m = if arg >> 23 != 0 {
-                                let module_level = !f.locals.is_null() && f.locals == f.globals;
-                                if arg & (1 << 23) != 0 && !locals.is(f.globals()) {
-                                    // `lazy import` compiled by exec() inside a function or class body
-                                    raise!(SyntaxError, "lazy import is only allowed at module level");
-                                }
-                                crate::types::lazyimport::import_name(
-                                    f.globals(),
-                                    &locals,
-                                    nm,
-                                    &fromlist,
-                                    &level,
-                                    f.builtins(),
-                                    (arg >> 23) & 1 != 0,
-                                    (arg >> 24) & 1 != 0,
-                                    module_level,
-                                )?
-                            } else {
-                                crate::import::import_name_from_frame(f.globals(), &locals, nm, &fromlist, &level, f.builtins())?
-                            };
-                            push!(f, m.into_raw());
-                        }
-                        Op::ImportFrom => {
-                            let m = unsafe { &*top!(f) };
-                            let v = if crate::types::lazyimport::is_lazy(m) {
-                                crate::types::lazyimport::import_from(m, &cd.names[arg as usize])?
-                            } else {
-                                import_from(m, &cd.names[arg as usize])?
-                            };
-                            push!(f, v.into_raw());
                         }
                         Op::FormatSimple => {
                             let v = popref!(f);
@@ -1907,73 +1668,6 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                                 _ => raise!(SystemError, "bad conversion"),
                             };
                             push!(f, r.into_raw());
-                        }
-                        Op::BuildTemplate => {
-                            let interps = popref!(f);
-                            let strings = popref!(f);
-                            let t = crate::types::templatelib::new_template(&strings, &interps)?;
-                            push!(f, t.into_raw());
-                        }
-                        Op::BuildInterpolation => {
-                            let spec = if arg & 1 != 0 { Some(popref!(f)) } else { None };
-                            let s = popref!(f);
-                            let v = popref!(f);
-                            let conv = arg >> 2;
-                            let r = crate::types::templatelib::new_interpolation(&v, &s, conv, spec.as_deref())?;
-                            push!(f, r.into_raw());
-                        }
-                        Op::MatchClass => {
-                            let names = popref!(f);
-                            let cls = popref!(f);
-                            let subject = popref!(f);
-                            let r = crate::interp::eval::match_class(&subject, &cls, arg as usize, &names)?;
-                            push!(f, r.into_raw());
-                        }
-                        Op::MatchMapping => {
-                            let s = unsafe { &*top!(f) };
-                            let r = s.ty().tp_flags & Py_TPFLAGS_MAPPING != 0;
-                            push!(f, bool_::new_bool(r).into_raw());
-                        }
-                        Op::MatchSequence => {
-                            let s = unsafe { &*top!(f) };
-                            let r = s.ty().tp_flags & Py_TPFLAGS_SEQUENCE != 0;
-                            push!(f, bool_::new_bool(r).into_raw());
-                        }
-                        Op::MatchKeys => {
-                            let keys = unsafe { &*top!(f) };
-                            let subject = unsafe { &*peek!(f, 2) };
-                            let r = match_keys(subject, keys)?;
-                            push!(f, r.into_raw());
-                        }
-                        Op::GetLen => {
-                            let o = unsafe { &*top!(f) };
-                            let n = ab::length(o)?;
-                            push!(f, int::new_int(n as i64).into_raw());
-                        }
-                        Op::LoadCommonConstant => {
-                            let v = match arg {
-                                0 => type_ref(exc::AssertionError()),
-                                1 => type_ref(exc::NotImplementedError()),
-                                2 => type_ref(tuple::tuple_type()),
-                                3 | 4 => {
-                                    // the original builtins.all / builtins.any (identity is what the
-                                    // `all(genexpr)` fast path tests), captured on first use
-                                    static ORIG: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
-                                    let (a, b) = *ORIG.get_or_init(|| {
-                                        let a = crate::builtins::builtin("all").map(|v| v.into_raw() as usize).unwrap_or(0);
-                                        let b = crate::builtins::builtin("any").map(|v| v.into_raw() as usize).unwrap_or(0);
-                                        (a, b)
-                                    });
-                                    let p = if arg == 3 { a } else { b };
-                                    if p == 0 {
-                                        raise!(SystemError, "builtins.all/any unavailable");
-                                    }
-                                    unsafe { PyRef::from_borrowed(p as *mut PyObject) }
-                                }
-                                5 => type_ref(list::list_type()),
-                                _ => type_ref(crate::types::set::set_type()),
-                            };
-                            push!(f, v.into_raw());
                         }
                         Op::ExtendedArg => unreachable!(),
                         Op::Unused1 | Op::Unused2 | Op::Unused3 => match &cd.invalid {
@@ -2319,4 +2013,358 @@ fn for_iter_event(ts: &ThreadState, f: &mut Frame, exhausted: bool, gen_iter: bo
         st::fire_exc_event(ts, f, st::STOP_ITERATION, &si)?;
     }
     st::fire_branch(ts, f, if exhausted { st::BRANCH_RIGHT } else { st::BRANCH_LEFT }, dest)
+}
+
+/// Instructions without control flow whose implementation tiers 0 and 1 share: the
+/// interpreter dispatches them here, tier-1 code calls them through
+/// `jit::helpers::h_misc` with `f.stack_top` set to the stack depth of the instruction.
+#[inline]
+pub(crate) fn is_misc(op: Op) -> bool {
+    matches!(
+        op,
+        Op::DeleteDeref
+            | Op::LoadFromDictOrDeref
+            | Op::DeleteGlobal
+            | Op::LoadFromDictOrGlobals
+            | Op::GetAiter
+            | Op::GetAnext
+            | Op::EndAsyncFor
+            | Op::GetAwaitable
+            | Op::CleanupThrow
+            | Op::LoadBuildClass
+            | Op::PushExcInfo
+            | Op::PopExcept
+            | Op::CheckExcMatch
+            | Op::CheckEgMatch
+            | Op::WithExceptStart
+            | Op::BeforeWith
+            | Op::BeforeAsyncWith
+            | Op::ImportName
+            | Op::ImportFrom
+            | Op::BuildTemplate
+            | Op::BuildInterpolation
+            | Op::MatchClass
+            | Op::MatchMapping
+            | Op::MatchSequence
+            | Op::MatchKeys
+            | Op::GetLen
+            | Op::LoadCommonConstant
+            | Op::LoadSpecial
+    )
+}
+
+/// Execute one `is_misc` instruction on the value stack of the frame (`f.stack_top`).
+pub(crate) fn exec_misc(ts: &ThreadState, f: &mut Frame, cd: &crate::types::code::CodeData, op: Op, arg: u32) -> PyResult<()> {
+    match op {
+        Op::DeleteDeref => {
+            let cell = f.slots[arg as usize];
+            if funcobject::cell_get(unsafe { &*cell }).is_none() {
+                return Err(unbound_local(f, arg as usize));
+            }
+            funcobject::cell_set(unsafe { &*cell }, None);
+        }
+        Op::LoadFromDictOrDeref => {
+            let mapping = popref!(f);
+            let nm = &cd.localsplusnames[arg as usize];
+            match mapping_get(&mapping, nm)? {
+                Some(v) => push!(f, v.into_raw()),
+                None => {
+                    let cell = f.slots[arg as usize];
+                    match funcobject::cell_get(unsafe { &*cell }) {
+                        Some(v) => push!(f, v.into_raw()),
+                        None => return Err(unbound_local(f, arg as usize)),
+                    }
+                }
+            }
+        }
+        Op::DeleteGlobal => {
+            let nm = &cd.names[arg as usize];
+            if !dict::del_item(f.globals(), nm)? {
+                return Err(name_error(f, nm));
+            }
+        }
+        Op::LoadFromDictOrGlobals => {
+            let mapping = popref!(f);
+            let nm = &cd.names[arg as usize];
+            let v = match mapping_get(&mapping, nm)? {
+                Some(v) => lazy_check(&mapping, nm, v)?,
+                None => load_global(f, nm)?,
+            };
+            push!(f, v.into_raw());
+        }
+        Op::GetAiter => {
+            let o = popref!(f);
+            let r = crate::types::genobject::get_aiter(&o)?;
+            push!(f, r.into_raw());
+        }
+        Op::GetAnext => {
+            let aiter = unsafe { &*top!(f) };
+            let r = crate::types::genobject::get_anext_awaitable(aiter)?;
+            push!(f, r.into_raw());
+        }
+        Op::EndAsyncFor => {
+            let e = popref!(f);
+            let aiter = popref!(f);
+            drop(aiter);
+            if is_subtype(e.type_ptr(), exc::StopAsyncIteration()) {
+                // done
+            } else {
+                set_exc(e);
+                return Err(PyErr);
+            }
+        }
+        Op::GetAwaitable => {
+            let o = popref!(f);
+            push!(f, get_awaitable(&o, arg)?.into_raw());
+        }
+        Op::CleanupThrow => {
+            let e = popref!(f);
+            let _last = popopt!(f);
+            let _sub = popopt!(f);
+            if is_subtype(e.type_ptr(), exc::StopIteration()) {
+                let val = exc::stop_iteration_value(&e);
+                push!(f, none::none_ref().into_raw());
+                push!(f, val.into_raw());
+            } else {
+                set_exc(e);
+                return Err(PyErr);
+            }
+        }
+        Op::LoadBuildClass => {
+            let b = f.builtins();
+            let bc_ = if dict::is_dict(b) { dict::get_item_str(b, name!("__build_class__")) } else { ab::getitem(b, name!("__build_class__")).ok() };
+            match bc_ {
+                Some(v) => push!(f, v.into_raw()),
+                None => raise!(NameError, "__build_class__ not found"),
+            }
+        }
+        Op::PushExcInfo => {
+            let e = pop!(f);
+            unsafe { incref(e) };
+            let prev = set_handled_exception(ts, e);
+            push!(f, if prev.is_null() { none::none_ref().into_raw() } else { prev });
+            push!(f, e);
+        }
+        Op::PopExcept => {
+            let prev = pop!(f);
+            let prevv = if !prev.is_null() && unsafe { (*prev).is(none::none()) } {
+                unsafe { decref(prev) };
+                std::ptr::null_mut()
+            } else {
+                prev
+            };
+            let old = set_handled_exception(ts, prevv);
+            unsafe { xdecref(old) };
+        }
+        Op::CheckExcMatch => {
+            let t = popref!(f);
+            let e = unsafe { &*top!(f) };
+            check_exc_match_type(&t, false)?;
+            let r = exception_matches(e, &t)?;
+            push!(f, bool_::new_bool(r).into_raw());
+        }
+        Op::CheckEgMatch => {
+            let t = popref!(f);
+            let e = popref!(f);
+            check_exc_match_type(&t, true)?;
+            let (rest, matched) = crate::types::exceptiongroup::eg_match(&e, &t)?;
+            if !matched.is(none::none()) && !crate::types::exceptiongroup::is_exception_group(&e) {
+                // the wrapper of a naked exception starts its traceback at this except*
+                // clause
+                add_traceback(f, &matched);
+            }
+            if !matched.is(none::none()) {
+                // the matched group becomes the handled exception
+                let prev = set_handled_exception(ts, matched.clone().into_raw());
+                unsafe { xdecref(prev) };
+            }
+            push!(f, rest.into_raw());
+            push!(f, matched.into_raw());
+        }
+        Op::WithExceptStart => {
+            let val = peek!(f, 1);
+            let exit_self = peek!(f, 4);
+            let exit_func = peek!(f, 5);
+            let v = unsafe { &*val };
+            let tp = type_ref(v.type_ptr());
+            let tb = exc::exc_traceback(v).unwrap_or_else(none::none_ref);
+            let r = if exit_self.is_null() {
+                ab::call(unsafe { &*exit_func }, &[&tp, v, &tb])?
+            } else {
+                ab::call(unsafe { &*exit_func }, &[unsafe { &*exit_self }, &tp, v, &tb])?
+            };
+            push!(f, r.into_raw());
+        }
+        Op::BeforeWith | Op::BeforeAsyncWith => {
+            let mgr = popref!(f);
+            let (enter_n, exit_n) = if op == Op::BeforeWith {
+                (name!("__enter__"), name!("__exit__"))
+            } else {
+                (name!("__aenter__"), name!("__aexit__"))
+            };
+            let enter = lookup(mgr.type_ptr(), enter_n);
+            let exit = lookup(mgr.type_ptr(), exit_n);
+            let (enter, exit) = match (enter, exit) {
+                (Some(a), Some(b)) => (a, b),
+                (en, ex) => {
+                    let sync = op == Op::BeforeWith;
+                    let kind = if sync { "" } else { "asynchronous " };
+                    // a missing exit method is reported before a missing enter
+                    let missing = if ex.is_none() {
+                        if sync { "__exit__" } else { "__aexit__" }
+                    } else if sync {
+                        "__enter__"
+                    } else {
+                        "__aenter__"
+                    };
+                    let _ = en;
+                    // suggest the other protocol when the object implements it
+                    let (oe, ox, hint) = if sync {
+                        (name!("__aenter__"), name!("__aexit__"), " but it supports the asynchronous context manager protocol. Did you mean to use 'async with'?")
+                    } else {
+                        (name!("__enter__"), name!("__exit__"), " but it supports the context manager protocol. Did you mean to use 'with'?")
+                    };
+                    let other = lookup(mgr.type_ptr(), oe).is_some() && lookup(mgr.type_ptr(), ox).is_some();
+                    raise!(
+                        TypeError,
+                        "'{}' object does not support the {}context manager protocol (missed {} method){}",
+                        tname(&mgr),
+                        kind,
+                        missing,
+                        if other { hint } else { "" }
+                    );
+                }
+            };
+            // push exit as (func, self) pair
+            if exit.ty().tp_flags & Py_TPFLAGS_METHOD_DESCRIPTOR != 0 {
+                push!(f, exit.into_raw());
+                push!(f, mgr.clone().into_raw());
+            } else {
+                let bound = match exit.ty().tp_descr_get {
+                    Some(g) => unsafe { from_c(g(exit.as_ptr(), mgr.as_ptr(), mgr.type_ptr() as *mut PyObject))? },
+                    None => exit,
+                };
+                push!(f, bound.into_raw());
+                push!(f, std::ptr::null_mut());
+            }
+            let r = ab::call_unbound(&enter, &mgr, &[])?;
+            if op == Op::BeforeAsyncWith {
+                let aw = get_awaitable(&r, 1)?;
+                push!(f, aw.into_raw());
+            } else {
+                push!(f, r.into_raw());
+            }
+        }
+        Op::ImportName => {
+            let fromlist = popref!(f);
+            let level = popref!(f);
+            let nm = &cd.names[(arg & 0x7fffff) as usize];
+            let locals = if f.locals.is_null() { none::none_ref() } else { unsafe { (*f.locals).to_ref() } };
+            let m = if arg >> 23 != 0 {
+                let module_level = !f.locals.is_null() && f.locals == f.globals;
+                if arg & (1 << 23) != 0 && !locals.is(f.globals()) {
+                    // `lazy import` compiled by exec() inside a function or class body
+                    raise!(SyntaxError, "lazy import is only allowed at module level");
+                }
+                crate::types::lazyimport::import_name(
+                    f.globals(),
+                    &locals,
+                    nm,
+                    &fromlist,
+                    &level,
+                    f.builtins(),
+                    (arg >> 23) & 1 != 0,
+                    (arg >> 24) & 1 != 0,
+                    module_level,
+                )?
+            } else {
+                crate::import::import_name_from_frame(f.globals(), &locals, nm, &fromlist, &level, f.builtins())?
+            };
+            push!(f, m.into_raw());
+        }
+        Op::ImportFrom => {
+            let m = unsafe { &*top!(f) };
+            let v = if crate::types::lazyimport::is_lazy(m) {
+                crate::types::lazyimport::import_from(m, &cd.names[arg as usize])?
+            } else {
+                import_from(m, &cd.names[arg as usize])?
+            };
+            push!(f, v.into_raw());
+        }
+        Op::BuildTemplate => {
+            let interps = popref!(f);
+            let strings = popref!(f);
+            let t = crate::types::templatelib::new_template(&strings, &interps)?;
+            push!(f, t.into_raw());
+        }
+        Op::BuildInterpolation => {
+            let spec = if arg & 1 != 0 { Some(popref!(f)) } else { None };
+            let s = popref!(f);
+            let v = popref!(f);
+            let conv = arg >> 2;
+            let r = crate::types::templatelib::new_interpolation(&v, &s, conv, spec.as_deref())?;
+            push!(f, r.into_raw());
+        }
+        Op::MatchClass => {
+            let names = popref!(f);
+            let cls = popref!(f);
+            let subject = popref!(f);
+            let r = crate::interp::eval::match_class(&subject, &cls, arg as usize, &names)?;
+            push!(f, r.into_raw());
+        }
+        Op::MatchMapping => {
+            let s = unsafe { &*top!(f) };
+            let r = s.ty().tp_flags & Py_TPFLAGS_MAPPING != 0;
+            push!(f, bool_::new_bool(r).into_raw());
+        }
+        Op::MatchSequence => {
+            let s = unsafe { &*top!(f) };
+            let r = s.ty().tp_flags & Py_TPFLAGS_SEQUENCE != 0;
+            push!(f, bool_::new_bool(r).into_raw());
+        }
+        Op::MatchKeys => {
+            let keys = unsafe { &*top!(f) };
+            let subject = unsafe { &*peek!(f, 2) };
+            let r = match_keys(subject, keys)?;
+            push!(f, r.into_raw());
+        }
+        Op::GetLen => {
+            let o = unsafe { &*top!(f) };
+            let n = ab::length(o)?;
+            push!(f, int::new_int(n as i64).into_raw());
+        }
+        Op::LoadCommonConstant => {
+            let v = match arg {
+                0 => type_ref(exc::AssertionError()),
+                1 => type_ref(exc::NotImplementedError()),
+                2 => type_ref(tuple::tuple_type()),
+                3 | 4 => {
+                    // the original builtins.all / builtins.any (identity is what the
+                    // `all(genexpr)` fast path tests), captured on first use
+                    static ORIG: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+                    let (a, b) = *ORIG.get_or_init(|| {
+                        let a = crate::builtins::builtin("all").map(|v| v.into_raw() as usize).unwrap_or(0);
+                        let b = crate::builtins::builtin("any").map(|v| v.into_raw() as usize).unwrap_or(0);
+                        (a, b)
+                    });
+                    let p = if arg == 3 { a } else { b };
+                    if p == 0 {
+                        raise!(SystemError, "builtins.all/any unavailable");
+                    }
+                    unsafe { PyRef::from_borrowed(p as *mut PyObject) }
+                }
+                5 => type_ref(list::list_type()),
+                _ => type_ref(crate::types::set::set_type()),
+            };
+            push!(f, v.into_raw());
+        }
+        Op::LoadSpecial => {
+            let o = popref!(f);
+            let (m, s) = load_special(&o, arg)?;
+            push!(f, m.into_raw());
+            push!(f, s.map_or(std::ptr::null_mut(), |s| s.into_raw()));
+        }
+        _ => unreachable!("exec_misc: {:?}", op),
+    }
+    Ok(())
 }

@@ -118,3 +118,216 @@ print(r, divs(10))
 def who():
     return sys._getframe().f_code.co_name
 print(who())
+
+# callees with branches (paths duplicated, results meet in one value)
+def sign(x):
+    if x > 0:
+        return 1
+    elif x < 0:
+        return -1
+    return 0
+
+def pick(o, a, b):
+    if o is None:
+        return a
+    if o:
+        return b
+    return a + b
+
+class Dir:
+    def __init__(self, fwd, v1, v2):
+        self.fwd = fwd
+        self.v1 = v1
+        self.v2 = v2
+
+    def out(self):
+        if self.fwd:
+            return self.v2
+        else:
+            return self.v1
+
+    def scaled(self, k):
+        if k == 0:
+            return None
+        r = self.v1 * k
+        if r > 100:
+            r = 100
+        return r
+
+def branchy(n):
+    t = 0
+    ds = [Dir(i % 2 == 0, i, -i) for i in range(5)]
+    for i in range(n):
+        t += sign(i - n // 2)
+        t += pick(None if i % 3 == 0 else i % 2 == 0, i, 2)
+        d = ds[i % 5]
+        t += d.out()
+        s = d.scaled(i % 4)
+        if s is not None:
+            t += s
+    return t
+
+for k in range(60):
+    r = branchy(50)
+print(r, branchy(51))
+Dir.out = lambda self: 1000
+print(branchy(50))
+
+# type change inside one path of an inlined branchy callee (deopt), then exceptions
+def half(x, big):
+    if big:
+        return x / 2
+    return x // 2
+
+def use_half(vals):
+    t = 0
+    for i, v in enumerate(vals):
+        t += half(v, i % 2 == 0)
+    return t
+
+class Vec2:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+    def check(self):
+        return self
+
+    def dot(self, o):
+        o.check()
+        return self.x * o.x + self.y * o.y
+
+    def norm2(self):
+        return self.dot(self)
+
+def nested(vs):
+    t = 0
+    for v in vs:
+        t += v.norm2() + sign(v.dot(vs[0]))
+    return t
+
+vs = [Vec2(i, -i) for i in range(8)]
+for k in range(60):
+    r = nested(vs)
+print(r)
+vs[3].y = 2.5  # float inside a doubly inlined callee
+print(nested(vs))
+Vec2.check = lambda self: 1 / 0
+try:
+    nested(vs)
+except ZeroDivisionError as e:
+    print("ZeroDivisionError", [f.name for f in traceback.extract_tb(e.__traceback__)])
+
+# the result of a branchy callee is tested right away (the continuation block starts
+# with a call while the result is still needed after it)
+def _single_bit(num):
+    return num > 0 and (num & (num - 1)) == 0
+
+class Mem:
+    def __init__(self, v):
+        self._value_ = v
+
+def flag_masks(holder, members):
+    singles = 0
+    everything = 0
+    for found in members.values():
+        value = found._value_
+        if isinstance(value, int) and value > 0:
+            everything |= value
+            if _single_bit(value):
+                singles |= value
+    type.__setattr__(holder, 'singles', singles)
+    type.__setattr__(holder, 'all_bits', (1 << everything.bit_length()) - 1)
+
+class Holder:
+    pass
+
+for k in range(60):
+    flag_masks(Holder, {i: Mem(1 << (i % 5) if i % 3 else "x") for i in range(k % 9)})
+print(Holder.singles, Holder.all_bits)
+
+# a finalizer run by a decref in compiled code changes the class the code is
+# specialised on: later accesses must see the change
+class K:
+    def val(self):
+        return 1
+    scale = 10
+
+class Trap:
+    def __del__(self):
+        K.val = lambda self: 2
+        K.scale = 1000
+
+def del_trap(n):
+    k = K()
+    t = 0
+    trap = None
+    for i in range(n):
+        t += k.val() * K.scale
+        if i == n - 2:
+            trap = Trap()
+        if i == n - 1:
+            trap = None   # decref -> __del__ mutates K
+        t += k.val() * K.scale
+    return t
+
+for _ in range(60):
+    K.val = lambda self: 1
+    K.scale = 10
+    r = del_trap(20)
+print(r)
+
+# inlined constructors: object.__new__ + inlined __init__
+class P:
+    alive = 0
+    def __init__(self, x, y):
+        if x < 0:
+            raise ValueError("negative %d" % x)
+        self.x = x
+        self.y = y
+        P.alive += 1
+
+    def __del__(self):
+        P.alive -= 1
+
+    def plus(self, o):
+        return P(self.x + o.x, self.y + o.y)
+
+def build(n):
+    acc = P(0, 0)
+    for i in range(n):
+        acc = acc.plus(P(i, 1))
+    return acc.x, acc.y
+
+for k in range(60):
+    r = build(30)
+print(r, P.alive)
+def bad(n):
+    out = []
+    for i in range(n):
+        try:
+            out.append(P(i - 3, 0).x)
+        except ValueError as e:
+            out.append(str(e))
+    return out
+for k in range(60):
+    r = bad(6)
+print(r, P.alive)
+P.__init__ = lambda self, x, y: 5
+try:
+    build(3)
+except TypeError as e:
+    print("TypeError", e)
+def init2(self, x, y):
+    self.x = x * 10
+    self.y = y
+P.__init__ = init2
+print(build(5), P.alive)
+
+for k in range(60):
+    r = use_half(list(range(20)))
+print(r, use_half([1.5, 2, 3.25, 4, 5]))
+try:
+    print(use_half([1, 2, None]))
+except TypeError as e:
+    print("TypeError", [f.name for f in traceback.extract_tb(e.__traceback__)])

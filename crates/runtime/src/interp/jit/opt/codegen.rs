@@ -1491,12 +1491,18 @@ pub fn codegen(u: &Unit, built: &Built, al: &Alloc, deopt_counter: usize) -> Res
     }
     // ---- entries
     let mut entries = Vec::new();
+    // (code unit pc, label of its entry stub): generator suspensions record the
+    // address of the entry they resume at
+    let mut entry_labels: Vec<(u32, crate::interp::jit::x64::Label)> = Vec::new();
     for &(pc, b) in &f.entries {
         let pos = cg.a().pos() as u32;
         entries.push((pc, pos));
+        let el = cg.a().label();
+        cg.a().bind(el);
+        entry_labels.push((pc, el));
         // invalidated code is never entered: resume in the interpreter instead
         {
-            let depth = u.an.depth[u.entry].max(0);
+            let depth = u.an.depth[u.an.index_of[pc as usize] as usize].max(0);
             let nlp = cg.nlp;
             let ok = cg.a().label();
             let a = cg.a();
@@ -1569,6 +1575,32 @@ pub fn codegen(u: &Unit, built: &Built, al: &Alloc, deopt_counter: usize) -> Res
                 a.store(M(R10, 0), Rax);
                 a.store_i(M(Rbx, STACK_TOP), nlp + *depth as i32);
                 a.mov_ri(Rax, tier1::ST_RETURN as i64);
+                let e = cg.exit;
+                cg.a().jmp(e);
+            }
+            Term::Yield(v, depth, s, yfs) => {
+                // result first (the local syncs clobber registers), then the frame
+                let r = cg.gr(*v, Rax);
+                {
+                    let a = cg.a();
+                    if r != Rax {
+                        a.mov_rr(Rax, r);
+                    }
+                    a.load(R10, M(Rsp, frame));
+                    a.store(M(R10, 0), Rax);
+                }
+                let snap = f.snaps[*s as usize].clone();
+                cg.sync_snapshot_locals(&snap);
+                let cont = entry_labels.iter().find(|e| e.0 == snap.resume).map(|e| e.1).ok_or("tier2: yield without resume entry")?;
+                let nlp = cg.nlp;
+                let a = cg.a();
+                a.store32_i(M(Rbx, LASTI), snap.lasti as i32);
+                a.store32_i(M(Rbx, NEXT_INSTR), snap.resume as i32);
+                a.store32_i(M(Rbx, YIELD_FROM_SEND), *yfs);
+                a.store_i(M(Rbx, STACK_TOP), nlp + *depth as i32);
+                a.mov_r_label_addr(Rcx, cont);
+                a.store(M(Rbx, RESUME), Rcx);
+                a.mov_ri(Rax, tier1::ST_YIELD as i64);
                 let e = cg.exit;
                 cg.a().jmp(e);
             }

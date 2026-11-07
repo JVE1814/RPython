@@ -107,12 +107,33 @@ pub unsafe extern "C" fn function_vectorcall(
 
 /// Call a Python function with vectorcall-style arguments.
 pub fn call_function(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwnames: Option<&PyObject>) -> PyResult {
-    if let Some(r) = jit::call_fast(func, args, nargs, kwnames) {
+    let f: &PyFunctionObject = funcobject::func(func);
+    if f.func_code.is_null() {
+        return Err(system_error("function object without code"));
+    }
+    let co = unsafe { &*f.func_code };
+    let cobj = code::code(co).obj;
+    let flags = cobj.co_flags as u32;
+    if flags & (bc::co::GENERATOR | bc::co::COROUTINE | bc::co::ASYNC_GENERATOR) != 0 {
+        // jit4: exact positional call of a generator function: arguments copied
+        // straight into the generator's frame
+        if kwnames.is_none()
+            && nargs == cobj.co_argcount as usize
+            && flags & (bc::co::VARARGS | bc::co::VARKEYWORDS) == 0
+            && cobj.co_kwonlyargcount == 0
+            && !code::code_data(co).eager_prologue
+        {
+            let mut frame = Frame::new_call(co, func, unsafe { &*f.func_globals }, unsafe { &*f.func_builtins });
+            for (i, &a) in args[..nargs].iter().enumerate() {
+                unsafe { incref(a) };
+                frame.slots[i] = a;
+            }
+            frame.make_owned();
+            return crate::types::genobject::new_generator_for(frame, func, flags);
+        }
+    } else if let Some(r) = jit::call_fast(func, args, nargs, kwnames) {
         return r; // jit workstream: compiled callee, direct entry
     }
-    let f: &PyFunctionObject = funcobject::func(func);
-    let co = unsafe { &*f.func_code };
-    let flags = code::code(co).flags();
     // plain calls borrow code/func from the caller (perf-runtime, frame.rs `owns_fc`)
     let mut frame = Frame::new_call(co, func, unsafe { &*f.func_globals }, unsafe { &*f.func_builtins });
     if flags & bc::co::OPTIMIZED == 0 && frame.locals.is_null() {
@@ -329,7 +350,7 @@ pub fn bind_arguments(func: &PyObject, frame: &mut Frame, args: &[*mut PyObject]
         let kwonly_given = (argcount..total_named).filter(|&i| !slots[i].is_null()).count();
         let plural = |n: usize| if n == 1 { "" } else { "s" };
         let takes = if defcount > 0 {
-            format!("from {} to {} positional arguments", argcount - defcount, argcount)
+            format!("from {} to {} positional arguments", argcount - defcount.min(argcount), argcount)
         } else {
             format!("{} positional argument{}", argcount, plural(argcount))
         };

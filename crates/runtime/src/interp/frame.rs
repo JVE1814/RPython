@@ -59,6 +59,10 @@ pub struct Frame {
     pub t2_site: usize,
     /// Tier 2: rsp of the running compiled code (base of its spill slots).
     pub t2_sp: usize,
+    /// Generator frames: machine-code address at which the next resumption continues
+    /// (set by compiled `YieldValue`, or to the code's entry for a created frame), 0
+    /// when the interpreter must resume it (genobject.rs `gen_send_fast`).
+    pub resume: usize,
 }
 
 fn borrows_globals(func: Option<&PyObject>, globals: &PyObject, builtins: &PyObject) -> bool {
@@ -160,6 +164,7 @@ impl Frame {
             jump_to: -1,
             t2_site: 0,
             t2_sp: 0,
+            resume: 0,
         })
     }
 
@@ -212,6 +217,7 @@ impl Frame {
             f.trace_event = 0;
             f.jump_to = -1;
             f.t2_site = 0;
+            f.resume = 0;
             return f;
         }
         let slots = vec![std::ptr::null_mut::<PyObject>(); total];
@@ -244,6 +250,7 @@ impl Frame {
             jump_to: -1,
             t2_site: 0,
             t2_sp: 0,
+            resume: 0,
         })
     }
 
@@ -353,6 +360,7 @@ impl Frame {
         self.trace_event = 0;
         self.jump_to = -1;
         self.t2_site = 0;
+        self.resume = 0;
     }
 }
 
