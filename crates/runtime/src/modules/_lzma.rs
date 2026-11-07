@@ -418,7 +418,7 @@ pub fn init_module() -> PyResult {
             ("flush", NOARGS, c_flush, "flush($self, /)\n--\n\nEnd the stream and return the remaining output."),
             ("__reduce__", NOARGS, cc::no_pickle),
         ];
-        crate::methods::lock_self_methods(ctype());
+        crate::methods::lock_self_methods_held(ctype());
         res = type_ready(ctype());
         if res.is_err() {
             return;
@@ -437,7 +437,7 @@ pub fn init_module() -> PyResult {
             ("unused_data", d_unused; "Bytes that followed the end of the stream."),
             ("needs_input", d_needs_input; "Whether decompress() must be given more input to make progress."),
         ];
-        crate::methods::lock_self_methods(dtype());
+        crate::methods::lock_self_methods_held(dtype());
         res = type_ready(dtype());
     });
     res?;

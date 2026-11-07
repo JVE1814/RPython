@@ -51,7 +51,7 @@ macro_rules! iternext {
         unsafe extern "C" fn $name(o: *mut PyObject) -> *mut PyObject {
             unsafe {
                 // the iterator's Rust state is not safe to step from two threads
-                let _lk = crate::objlock::lock(&*o);
+                let _lk = crate::objlock::lock_held(&*o);
                 match $imp(&*o) {
                     Ok(Some(v)) => v.into_raw(),
                     Ok(None) => std::ptr::null_mut(),
@@ -1388,7 +1388,7 @@ tpnew!(teedata_new, teedata_new_impl);
 
 fn teedata_jumplink(d: &PyObject) -> PyResult {
     // shared by every tee of the group, which may run on different threads
-    let _lk = crate::objlock::lock(d);
+    let _lk = crate::objlock::lock_held(d);
     let s = rs::<TeeData>(d);
     if let Some(n) = &s.next {
         return Ok(n.clone());
@@ -1404,7 +1404,7 @@ fn teedata_getitem(d: &PyObject, i: usize) -> PyResult<Option<PyRef>> {
     // (it may block, waiting for another thread that uses this tee): the `running`
     // flag makes a concurrent step fail with "cannot re-enter" instead of waiting.
     let it = {
-        let _lk = crate::objlock::lock(d);
+        let _lk = crate::objlock::lock_held(d);
         let s = rs::<TeeData>(d);
         if i < s.values.len() {
             return Ok(Some(s.values[i].clone()));
@@ -1420,7 +1420,7 @@ fn teedata_getitem(d: &PyObject, i: usize) -> PyResult<Option<PyRef>> {
         it
     };
     let r = ab::iter_next(&it);
-    let _lk = crate::objlock::lock(d);
+    let _lk = crate::objlock::lock_held(d);
     let s = rs::<TeeData>(d);
     s.running = false;
     match r? {

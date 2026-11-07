@@ -237,6 +237,11 @@ unsafe extern "C" fn reversed_traverse(o: *mut PyObject, visit: visitproc, arg: 
         if s.is_null() { 0 } else { visit.unwrap()(s, arg) }
     }
 }
+// enumerate and reversed objects shared between threads (test_free_threading.test_reversed):
+// their counters and sequence reference change under the object lock
+crate::locked_slot!(l_enum_next, enum_next, () -> *mut PyObject);
+crate::locked_slot!(l_reversed_next, reversed_next, () -> *mut PyObject);
+
 unsafe extern "C" fn reversed_next(o: *mut PyObject) -> *mut PyObject {
     unsafe {
         let r = rv(&*o);
@@ -309,7 +314,7 @@ pub fn init_types() {
         t.tp_dealloc = Some(enum_dealloc);
         t.tp_traverse = Some(enum_traverse);
         t.tp_iter = Some(crate::types::list::self_iter);
-        t.tp_iternext = Some(enum_next);
+        t.tp_iternext = Some(l_enum_next);
         t.tp_new = Some(enum_new);
         t.tp_alloc = Some(generic_alloc);
         t.tp_free = Some(generic_free);
@@ -327,7 +332,7 @@ pub fn init_types() {
         t.tp_dealloc = Some(reversed_dealloc);
         t.tp_traverse = Some(reversed_traverse);
         t.tp_iter = Some(crate::types::list::self_iter);
-        t.tp_iternext = Some(reversed_next);
+        t.tp_iternext = Some(l_reversed_next);
         t.tp_new = Some(reversed_new);
         t.tp_alloc = Some(generic_alloc);
         t.tp_free = Some(generic_free);
@@ -342,6 +347,8 @@ pub fn init_types() {
 }
 
 pub fn ready() -> PyResult<()> {
+    unsafe { crate::methods::lock_self_methods_held(&raw mut PyEnum_Type) };
+    unsafe { crate::methods::lock_self_methods_held(&raw mut PyReversed_Type) };
     type_ready(&raw mut PyEnum_Type)?;
     type_ready(&raw mut PyReversed_Type)
 }

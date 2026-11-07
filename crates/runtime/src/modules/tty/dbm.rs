@@ -614,7 +614,7 @@ fn init_db_type(t: *mut PyTypeObject, name: &'static CStr, gnu: bool) -> PyResul
                 ("__exit__", FAST, m_exit),
             ]
         };
-        crate::methods::lock_self_methods(t);
+        crate::methods::lock_self_methods_held(t);
         typeobject::type_ready(t)?;
     }
     Ok(())

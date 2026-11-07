@@ -848,7 +848,7 @@ fn init_types() -> PyResult<()> {
             ("__sizeof__", NOARGS, m_sizeof),
         ];
         (*t).tp_getset = crate::getset_table![("closed", m_closed)];
-        crate::methods::lock_self_methods(t);
+        crate::methods::lock_self_methods_held(t);
         typeobject::type_ready(t)?;
     }
     Ok(())

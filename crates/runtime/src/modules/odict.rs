@@ -343,7 +343,7 @@ unsafe extern "C" fn od_ass_sub(o: *mut PyObject, k: *mut PyObject, v: *mut PyOb
     unsafe {
         let o = &*o;
         // the node list and side array are not safe to change from two threads
-        let _lk = crate::objlock::lock(o);
+        let _lk = crate::objlock::lock_held(o);
         let r = if v.is_null() { delitem(o, &*k) } else { setitem(o, &*k, &*v) };
         int_into_c(r)
     }
@@ -417,7 +417,7 @@ unsafe extern "C" fn od_init(o: *mut PyObject, args: *mut PyObject, kw: *mut PyO
 
 unsafe extern "C" fn od_iter(o: *mut PyObject) -> *mut PyObject {
     unsafe {
-        let _lk = crate::objlock::lock(&*o);
+        let _lk = crate::objlock::lock_held(&*o);
         into_c(new_iter(&*o, KIND_KEYS, false))
     }
 }
@@ -870,11 +870,11 @@ fn iter_next_key(i: &mut ODIter) -> PyResult<Option<PyRef>> {
 unsafe extern "C" fn iter_next(op: *mut PyObject) -> *mut PyObject {
     unsafe {
         // iterator, then the OrderedDict (whose node list it walks)
-        let _li = crate::objlock::lock(&*op);
+        let _li = crate::objlock::lock_held(&*op);
         let i = it(&*op);
         // (no extra reference: when the dict dies is observable through __del__; the
         // lock is keyed by address and stays valid even if the dict goes meanwhile)
-        let _lo = if i.odict.is_null() { None } else { Some(crate::objlock::lock(&*i.odict)) };
+        let _lo = if i.odict.is_null() { None } else { Some(crate::objlock::lock_held(&*i.odict)) };
         let r = (|| -> PyResult<Option<PyRef>> {
             let key = match iter_next_key(i)? {
                 Some(k) => k,
@@ -1056,7 +1056,7 @@ pub fn init_types() -> PyResult<()> {
             ("__length_hint__", NOARGS, iter_length_hint, "Private method returning an estimate of len(list(it))."),
         ];
         crate::types::typeobject::type_ready(t)?;
-        crate::methods::lock_self_methods(odict_type());
+        crate::methods::lock_self_methods_held(odict_type());
         crate::types::typeobject::type_ready(odict_type())?;
     }
     Ok(())
