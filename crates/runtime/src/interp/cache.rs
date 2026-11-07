@@ -546,6 +546,9 @@ pub struct CodeCaches {
     /// (jit6) tier-1 "drain mode" code of a generator expression (YieldValue hands the
     /// value to its consumer directly, jit/helpers.rs `h_drain`); 1 = cannot be built
     pub drain: AtomicPtr<crate::interp::jit::Compiled>,
+    /// (jit6) tier-2 deoptimisations per resume pc ((pc, count)); recompilations use
+    /// generic paths instead of deoptimising guards at pcs that trapped
+    pub traps: std::sync::Mutex<Vec<(u32, u32)>>,
 }
 
 impl CodeCaches {
@@ -571,6 +574,7 @@ impl CodeCaches {
             t2_retired: std::sync::Mutex::new(Vec::new()),
             genexpr: AtomicU32::new(0),
             drain: AtomicPtr::new(std::ptr::null_mut()),
+            traps: std::sync::Mutex::new(Vec::new()),
         }
     }
 

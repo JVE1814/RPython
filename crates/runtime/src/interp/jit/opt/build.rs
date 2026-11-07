@@ -141,6 +141,19 @@ pub struct Unit<'a> {
     pub cautious: bool,
 }
 
+impl Unit<'_> {
+    /// (jit6) generic path instead of a deoptimising guard at this instruction: it
+    /// trapped repeatedly in earlier code (CodeCaches::traps), or, when no trap was
+    /// recorded, earlier code of the unit was discarded
+    fn cautious_at(&self, ins: crate::interp::jit::analysis::Instr) -> bool {
+        let t = self.cd.caches.traps.lock().unwrap_or_else(|e| e.into_inner());
+        if t.iter().any(|&(p, n)| n >= 2 && (p == ins.start || p == ins.pc)) {
+            return true;
+        }
+        self.cautious && t.is_empty()
+    }
+}
+
 struct BcBlock {
     first: usize,
     last: usize,
@@ -2141,7 +2154,7 @@ impl<'a> B<'a> {
             return;
         }
         let snap = self.snap(i, SnapKind::Deopt);
-        if es.len() == 1 && cases[0].kind != kind::INSTANCE_DICT && !self.u.cautious {
+        if es.len() == 1 && cases[0].kind != kind::INSTANCE_DICT && !self.u.cautious_at(self.u.an.instrs[i]) {
             // monomorphic slot / class attribute: no slow path needed
             let s = cases[0];
             let p = self.guard_tag(1, s.a as u32, snap);
@@ -2167,7 +2180,7 @@ impl<'a> B<'a> {
         let cont = self.new_block(u32::MAX);
         let slow = self.new_block(u32::MAX);
         let p;
-        let bodies = if es.len() == 1 && !self.u.cautious {
+        let bodies = if es.len() == 1 && !self.u.cautious_at(self.u.an.instrs[i]) {
             p = self.guard_tag(1, cases[0].a as u32, snap);
             vec![self.cur]
         } else {
