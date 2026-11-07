@@ -81,30 +81,30 @@ MAX_EXTRACT_VERSION = 63
 structEndArchive = b"<4s4H2LH"
 stringEndArchive = b"PK\005\006"
 sizeEndCentDir = struct.calcsize(structEndArchive)
-_ECD_SIGNATURE, _ECD_DISK_NUMBER, _ECD_DISK_START, _ECD_ENTRIES_THIS_DISK, \
-    _ECD_ENTRIES_TOTAL, _ECD_SIZE, _ECD_OFFSET, _ECD_COMMENT_SIZE = range(8)
-_ECD_COMMENT = 8
-_ECD_LOCATION = 9
+_END_SIGNATURE, _END_DISK_NUMBER, _END_DISK_START, _END_ENTRIES_THIS_DISK, \
+    _END_ENTRIES_TOTAL, _END_SIZE, _END_OFFSET, _END_COMMENT_SIZE = range(8)
+_END_COMMENT = 8
+_END_LOCATION = 9
 
 # central directory file header
 structCentralDir = "<4s4B4HL2L5H2L"
 stringCentralDir = b"PK\001\002"
 sizeCentralDir = struct.calcsize(structCentralDir)
-(_CD_SIGNATURE, _CD_CREATE_VERSION, _CD_CREATE_SYSTEM, _CD_EXTRACT_VERSION,
- _CD_EXTRACT_SYSTEM, _CD_FLAG_BITS, _CD_COMPRESS_TYPE, _CD_TIME, _CD_DATE,
- _CD_CRC, _CD_COMPRESSED_SIZE, _CD_UNCOMPRESSED_SIZE, _CD_FILENAME_LENGTH,
- _CD_EXTRA_FIELD_LENGTH, _CD_COMMENT_LENGTH, _CD_DISK_NUMBER_START,
- _CD_INTERNAL_FILE_ATTRIBUTES, _CD_EXTERNAL_FILE_ATTRIBUTES,
- _CD_LOCAL_HEADER_OFFSET) = range(19)
+(_CEN_SIGNATURE, _CEN_CREATE_VERSION, _CEN_CREATE_SYSTEM, _CEN_EXTRACT_VERSION,
+ _CEN_EXTRACT_SYSTEM, _CEN_FLAG_BITS, _CEN_COMPRESS_TYPE, _CEN_TIME, _CEN_DATE,
+ _CEN_CRC, _CEN_COMPRESSED_SIZE, _CEN_UNCOMPRESSED_SIZE, _CEN_FILENAME_LENGTH,
+ _CEN_EXTRA_FIELD_LENGTH, _CEN_COMMENT_LENGTH, _CEN_DISK_NUMBER_START,
+ _CEN_INTERNAL_FILE_ATTRIBUTES, _CEN_EXTERNAL_FILE_ATTRIBUTES,
+ _CEN_LOCAL_HEADER_OFFSET) = range(19)
 
 # local file header
 structFileHeader = "<4s2B4HL2L2H"
 stringFileHeader = b"PK\003\004"
 sizeFileHeader = struct.calcsize(structFileHeader)
-(_FH_SIGNATURE, _FH_EXTRACT_VERSION, _FH_EXTRACT_SYSTEM,
- _FH_GENERAL_PURPOSE_FLAG_BITS, _FH_COMPRESSION_METHOD, _FH_LAST_MOD_TIME,
- _FH_LAST_MOD_DATE, _FH_CRC, _FH_COMPRESSED_SIZE, _FH_UNCOMPRESSED_SIZE,
- _FH_FILENAME_LENGTH, _FH_EXTRA_FIELD_LENGTH) = range(12)
+(_LOC_SIGNATURE, _LOC_EXTRACT_VERSION, _LOC_EXTRACT_SYSTEM,
+ _LOC_GENERAL_PURPOSE_FLAG_BITS, _LOC_COMPRESSION_METHOD, _LOC_LAST_MOD_TIME,
+ _LOC_LAST_MOD_DATE, _LOC_CRC, _LOC_COMPRESSED_SIZE, _LOC_UNCOMPRESSED_SIZE,
+ _LOC_FILENAME_LENGTH, _LOC_EXTRA_FIELD_LENGTH) = range(12)
 
 # ZIP64 end of central directory locator and record
 structEndArchive64Locator = "<4sLQL"
@@ -114,10 +114,10 @@ sizeEndCentDir64Locator = struct.calcsize(structEndArchive64Locator)
 structEndArchive64 = "<4sQ2H2L4Q"
 stringEndArchive64 = b"PK\x06\x06"
 sizeEndCentDir64 = struct.calcsize(structEndArchive64)
-(_CD64_SIGNATURE, _CD64_DIRECTORY_RECSIZE, _CD64_CREATE_VERSION,
- _CD64_EXTRACT_VERSION, _CD64_DISK_NUMBER, _CD64_DISK_NUMBER_START,
- _CD64_NUMBER_ENTRIES_THIS_DISK, _CD64_NUMBER_ENTRIES_TOTAL,
- _CD64_DIRECTORY_SIZE, _CD64_OFFSET_START_CENTDIR) = range(10)
+(_END64_SIGNATURE, _END64_DIRECTORY_RECSIZE, _END64_CREATE_VERSION,
+ _END64_EXTRACT_VERSION, _END64_DISK_NUMBER, _END64_DISK_NUMBER_START,
+ _END64_NUMBER_ENTRIES_THIS_DISK, _END64_NUMBER_ENTRIES_TOTAL,
+ _END64_DIRECTORY_SIZE, _END64_OFFSET_START_CENTDIR) = range(10)
 
 _DD_SIGNATURE = 0x08074b50
 
@@ -164,26 +164,31 @@ class _Extra(bytes):
         return b''.join(f for f in cls.split(data) if f.id not in xids)
 
 
-def _strip_extra(extra, xids):
+def _without_extra_ids(extra, xids):
     return _Extra.strip(extra, xids)
 
 
-def _check_zipfile(fp):
+def _looks_like_zip(fp):
+    """True if fp ends with a plausible end-of-central-directory record:
+    one describing an empty archive, or one whose central directory
+    starts with the central directory signature."""
     try:
-        endrec = _EndRecData(fp)
-        if endrec:
-            if endrec[_ECD_ENTRIES_TOTAL] == 0 and endrec[_ECD_SIZE] == 0 \
-                    and endrec[_ECD_OFFSET] == 0:
-                return True    # an empty archive
-            # The central directory ends where the end record starts.
-            start = endrec[_ECD_LOCATION] - endrec[_ECD_SIZE]
-            if endrec[_ECD_SIZE] and start >= 0:
-                fp.seek(start)
-                if fp.read(4) == stringCentralDir:
-                    return True
+        end = _find_end_record(fp)
     except (OSError, BadZipFile):
-        pass
-    return False
+        return False
+    if not end:
+        return False
+    size, offset = end[_END_SIZE], end[_END_OFFSET]
+    if end[_END_ENTRIES_TOTAL] == 0 and size == 0 and offset == 0:
+        return True
+    directory = end[_END_LOCATION] - size
+    if not size or directory < 0:
+        return False
+    try:
+        fp.seek(directory)
+        return fp.read(4) == stringCentralDir
+    except OSError:
+        return False
 
 
 def is_zipfile(filename):
@@ -195,16 +200,16 @@ def is_zipfile(filename):
         if hasattr(filename, "read"):
             pos = filename.tell()
             try:
-                return _check_zipfile(fp=filename)
+                return _looks_like_zip(fp=filename)
             finally:
                 filename.seek(pos)
         with open(filename, "rb") as fp:
-            return _check_zipfile(fp)
+            return _looks_like_zip(fp)
     except OSError:
         return False
 
 
-def _EndRecData64(fpin, offset, endrec):
+def _merge_zip64_end(fpin, offset, endrec):
     """Merge the ZIP64 end-of-central-directory data into *endrec*.
 
     *offset* is the position of the regular end record relative to the end
@@ -252,18 +257,18 @@ def _EndRecData64(fpin, offset, endrec):
     if diskno != 0 or disk_dir != 0 or dircount != dircount2:
         raise BadZipFile("zipfiles that span multiple disks are not supported")
 
-    endrec[_ECD_SIGNATURE] = sig
-    endrec[_ECD_DISK_NUMBER] = disk_num
-    endrec[_ECD_DISK_START] = disk_dir
-    endrec[_ECD_ENTRIES_THIS_DISK] = dircount
-    endrec[_ECD_ENTRIES_TOTAL] = dircount2
-    endrec[_ECD_SIZE] = dirsize
-    endrec[_ECD_OFFSET] = diroffset
-    endrec[_ECD_LOCATION] = record_pos
+    endrec[_END_SIGNATURE] = sig
+    endrec[_END_DISK_NUMBER] = disk_num
+    endrec[_END_DISK_START] = disk_dir
+    endrec[_END_ENTRIES_THIS_DISK] = dircount
+    endrec[_END_ENTRIES_TOTAL] = dircount2
+    endrec[_END_SIZE] = dirsize
+    endrec[_END_OFFSET] = diroffset
+    endrec[_END_LOCATION] = record_pos
     return endrec
 
 
-def _EndRecData(fpin):
+def _find_end_record(fpin):
     """Locate the end-of-central-directory record.
 
     Returns a list [signature, disk, disk_cd, entries_disk, entries, cd_size,
@@ -276,7 +281,7 @@ def _EndRecData(fpin):
         endrec = list(struct.unpack(structEndArchive, data))
         endrec.append(comment)
         endrec.append(pos)
-        return _EndRecData64(fpin, pos - filesize, endrec)
+        return _merge_zip64_end(fpin, pos - filesize, endrec)
 
     # Fast path: no archive comment.
     try:
@@ -297,13 +302,13 @@ def _EndRecData(fpin):
         rec = tail[i:i + sizeEndCentDir]
         if len(rec) != sizeEndCentDir:
             return None
-        comment_len = struct.unpack(structEndArchive, rec)[_ECD_COMMENT_SIZE]
+        comment_len = struct.unpack(structEndArchive, rec)[_END_COMMENT_SIZE]
         comment = tail[i + sizeEndCentDir:i + sizeEndCentDir + comment_len]
         return finish(rec, start + i, comment)
     return None
 
 
-def _sanitize_filename(filename):
+def _clean_member_name(filename):
     """Terminate at NUL and use '/' as the separator."""
     nul = filename.find(chr(0))
     if nul >= 0:
@@ -328,7 +333,7 @@ class ZipInfo:
 
     def __init__(self, filename="NoName", date_time=(1980, 1, 1, 0, 0, 0)):
         self.orig_filename = filename
-        filename = _sanitize_filename(filename)
+        filename = _clean_member_name(filename)
         self.filename = filename
         self.date_time = date_time
         if date_time[0] < 1980:
@@ -467,7 +472,7 @@ class ZipInfo:
                     if up_version == 1 and up_name_crc == filename_crc:
                         up_unicode_name = data[5:].decode('utf-8')
                         if up_unicode_name:
-                            self.filename = _sanitize_filename(up_unicode_name)
+                            self.filename = _clean_member_name(up_unicode_name)
                         else:
                             import warnings
                             warnings.warn("Empty unicode path extra field "
@@ -534,47 +539,61 @@ class ZipInfo:
 
 # ---------------------------------------------------------------- ZipCrypto
 
-_crctable = None
+def _reflected_crc_table():
+    # CRC-32 lookup table (reflected polynomial 0xEDB88320), one entry per
+    # byte value
+    table = []
+    for value in range(256):
+        for _ in range(8):
+            value = (value >> 1) ^ (0xEDB88320 if value & 1 else 0)
+        table.append(value)
+    return table
 
 
-def _gen_crc(crc):
-    for _ in range(8):
-        if crc & 1:
-            crc = (crc >> 1) ^ 0xEDB88320
-        else:
-            crc >>= 1
-    return crc
+_CRC_TABLE = None
 
 
-def _ZipDecrypter(pwd):
-    """Return a function decrypting bytes with the traditional PKWARE
-    stream cipher keyed by *pwd*."""
-    global _crctable
-    if _crctable is None:
-        _crctable = list(map(_gen_crc, range(256)))
-    table = _crctable
-    k0, k1, k2 = 305419896, 591751049, 878082192
+class _ZipCryptoDecoder:
+    """The traditional PKWARE stream cipher ("ZipCrypto").
 
-    def step(c):
-        nonlocal k0, k1, k2
-        k0 = (k0 >> 8) ^ table[(k0 ^ c) & 0xFF]
-        k1 = (k1 + (k0 & 0xFF)) & 0xFFFFFFFF
-        k1 = (k1 * 134775813 + 1) & 0xFFFFFFFF
-        k2 = (k2 >> 8) ^ table[(k2 ^ (k1 >> 24)) & 0xFF]
+    Three 32-bit keys start from fixed values and are updated with every
+    plaintext byte, the password first.  Calling the object decrypts a
+    chunk of data and keeps the state for the next chunk.
+    """
 
-    for c in pwd:
-        step(c)
+    __slots__ = ('_keys', '_table')
 
-    def decrypter(data):
-        out = bytearray()
-        for c in data:
-            t = k2 | 2
-            c ^= ((t * (t ^ 1)) >> 8) & 0xFF
-            step(c)
-            out.append(c)
-        return bytes(out)
+    def __init__(self, password):
+        global _CRC_TABLE
+        if _CRC_TABLE is None:
+            _CRC_TABLE = _reflected_crc_table()
+        self._table = _CRC_TABLE
+        self._keys = [0x12345678, 0x23456789, 0x34567890]
+        for byte in password:
+            self._mix(byte)
 
-    return decrypter
+    def _mix(self, byte):
+        table = self._table
+        keys = self._keys
+        first = (keys[0] >> 8) ^ table[(keys[0] ^ byte) & 0xFF]
+        second = ((keys[1] + (first & 0xFF)) * 134775813 + 1) & 0xFFFFFFFF
+        third = (keys[2] >> 8) ^ table[(keys[2] ^ (second >> 24)) & 0xFF]
+        keys[0], keys[1], keys[2] = first, second, third
+
+    def __call__(self, data):
+        plain = bytearray()
+        keep = plain.append
+        table = self._table
+        k0, k1, k2 = self._keys
+        for byte in data:
+            stream = k2 | 2
+            byte ^= ((stream * (stream ^ 1)) >> 8) & 0xFF
+            keep(byte)
+            k0 = (k0 >> 8) ^ table[(k0 ^ byte) & 0xFF]
+            k1 = ((k1 + (k0 & 0xFF)) * 134775813 + 1) & 0xFFFFFFFF
+            k2 = (k2 >> 8) ^ table[(k2 ^ (k1 >> 24)) & 0xFF]
+        self._keys[:] = (k0, k1, k2)
+        return bytes(plain)
 
 
 # ---------------------------------------------------------------- codecs
@@ -685,7 +704,7 @@ def _get_decompressor(compress_type):
     raise NotImplementedError("compression type %d" % (compress_type,))
 
 
-class _SharedFile:
+class _ArchiveView:
     """View of the archive file used by one open member; keeps its own
     position and serialises access through the archive lock."""
 
@@ -731,17 +750,18 @@ class _SharedFile:
             self._close(fileobj)
 
 
-class _Tellable:
-    """Wrap an unseekable output stream so tell() still works."""
+class _CountingWriter:
+    """Output stream wrapper for unseekable targets: counts the bytes
+    written so that tell() can report the position."""
 
     def __init__(self, fp):
         self.fp = fp
         self.offset = 0
 
     def write(self, data):
-        n = self.fp.write(data)
-        self.offset += n
-        return n
+        written = self.fp.write(data)
+        self.offset += written
+        return written
 
     def tell(self):
         return self.offset
@@ -804,7 +824,7 @@ class ZipExtFile(io.BufferedIOBase):
                 raise RuntimeError("Bad password for file %r" % zipinfo.orig_filename)
 
     def _init_decrypter(self):
-        self._decrypter = _ZipDecrypter(self._pwd)
+        self._decrypter = _ZipCryptoDecoder(self._pwd)
         header = self._fileobj.read(12)
         self._compress_left -= 12
         return self._decrypter(header)[11]
@@ -1028,7 +1048,7 @@ class ZipExtFile(io.BufferedIOBase):
                 + self._offset)
 
 
-class _ZipWriteFile(io.BufferedIOBase):
+class _MemberWriter(io.BufferedIOBase):
     """Writable file object for a new member (from ZipFile.open(..., 'w'))."""
 
     def __init__(self, zf, zinfo, zip64):
@@ -1188,7 +1208,7 @@ class ZipFile:
                     self.start_dir = self.fp.tell()
                     self._start_disk = self.start_dir
                 except (AttributeError, OSError):
-                    self.fp = _Tellable(self.fp)
+                    self.fp = _CountingWriter(self.fp)
                     self.start_dir = 0
                     self._seekable = False
                 else:
@@ -1236,21 +1256,21 @@ class ZipFile:
         """Read the central directory."""
         fp = self.fp
         try:
-            endrec = _EndRecData(fp)
+            endrec = _find_end_record(fp)
         except OSError:
             raise BadZipFile("File is not a zip file")
         if not endrec:
             raise BadZipFile("File is not a zip file")
         if self.debug > 1:
             print(endrec)
-        self._comment = endrec[_ECD_COMMENT]
-        size_cd = endrec[_ECD_SIZE]
-        offset_cd = endrec[_ECD_OFFSET]
+        self._comment = endrec[_END_COMMENT]
+        size_cd = endrec[_END_SIZE]
+        offset_cd = endrec[_END_OFFSET]
 
         # Bytes prepended to the archive (e.g. a launcher stub): the
         # directory physically ends where the end record (or ZIP64 record)
         # starts, while the stored offsets count from the archive start.
-        concat = endrec[_ECD_LOCATION] - size_cd - offset_cd
+        concat = endrec[_END_LOCATION] - size_cd - offset_cd
         if concat < 0:
             raise BadZipFile("Bad offset for central directory")
 
@@ -1269,13 +1289,13 @@ class ZipFile:
             if len(centdir) != sizeCentralDir:
                 raise BadZipFile("Truncated central directory")
             centdir = struct.unpack(structCentralDir, centdir)
-            if centdir[_CD_SIGNATURE] != stringCentralDir:
+            if centdir[_CEN_SIGNATURE] != stringCentralDir:
                 raise BadZipFile("Bad magic number for central directory")
             if self.debug > 2:
                 print(centdir)
-            filename = fp.read(centdir[_CD_FILENAME_LENGTH])
+            filename = fp.read(centdir[_CEN_FILENAME_LENGTH])
             orig_filename_crc = crc32(filename)
-            flags = centdir[_CD_FLAG_BITS]
+            flags = centdir[_CEN_FLAG_BITS]
             raw_name = filename
             if flags & _MASK_UTF_FILENAME:
                 filename = filename.decode('utf-8')
@@ -1284,9 +1304,9 @@ class ZipFile:
             x = ZipInfo(filename)
             if not flags & _MASK_UTF_FILENAME:
                 x._stored_name = (raw_name, x.filename)
-            x.extra = fp.read(centdir[_CD_EXTRA_FIELD_LENGTH])
-            x.comment = fp.read(centdir[_CD_COMMENT_LENGTH])
-            x.header_offset = centdir[_CD_LOCAL_HEADER_OFFSET]
+            x.extra = fp.read(centdir[_CEN_EXTRA_FIELD_LENGTH])
+            x.comment = fp.read(centdir[_CEN_COMMENT_LENGTH])
+            x.header_offset = centdir[_CEN_LOCAL_HEADER_OFFSET]
             (x.create_version, x.create_system, x.extract_version, x.reserved,
              x.flag_bits, x.compress_type, t, d,
              x.CRC, x.compress_size, x.file_size) = centdir[1:12]
@@ -1301,9 +1321,9 @@ class ZipFile:
             x.header_offset = x.header_offset + concat
             self.filelist.append(x)
             self.NameToInfo[x.filename] = x
-            total = (total + sizeCentralDir + centdir[_CD_FILENAME_LENGTH]
-                     + centdir[_CD_EXTRA_FIELD_LENGTH]
-                     + centdir[_CD_COMMENT_LENGTH])
+            total = (total + sizeCentralDir + centdir[_CEN_FILENAME_LENGTH]
+                     + centdir[_CEN_EXTRA_FIELD_LENGTH]
+                     + centdir[_CEN_COMMENT_LENGTH])
             if self.debug > 2:
                 print("total", total)
 
@@ -1424,26 +1444,26 @@ class ZipFile:
                              "trying to read." % (name,))
 
         self._fileRefCnt += 1
-        zef_file = _SharedFile(self.fp, zinfo.header_offset,
+        zef_file = _ArchiveView(self.fp, zinfo.header_offset,
                                self._fpclose, self._lock, lambda: self._writing)
         try:
             fheader = zef_file.read(sizeFileHeader)
             if len(fheader) != sizeFileHeader:
                 raise BadZipFile("Truncated file header")
             fheader = struct.unpack(structFileHeader, fheader)
-            if fheader[_FH_SIGNATURE] != stringFileHeader:
+            if fheader[_LOC_SIGNATURE] != stringFileHeader:
                 raise BadZipFile("Bad magic number for file header")
 
-            fname = zef_file.read(fheader[_FH_FILENAME_LENGTH])
-            if fheader[_FH_EXTRA_FIELD_LENGTH]:
-                zef_file.seek(fheader[_FH_EXTRA_FIELD_LENGTH], whence=1)
+            fname = zef_file.read(fheader[_LOC_FILENAME_LENGTH])
+            if fheader[_LOC_EXTRA_FIELD_LENGTH]:
+                zef_file.seek(fheader[_LOC_EXTRA_FIELD_LENGTH], whence=1)
 
             if zinfo.flag_bits & _MASK_COMPRESSED_PATCH:
                 raise NotImplementedError("compressed patched data (flag bit 5)")
             if zinfo.flag_bits & _MASK_STRONG_ENCRYPTION:
                 raise NotImplementedError("strong encryption (flag bit 6)")
 
-            if fheader[_FH_GENERAL_PURPOSE_FLAG_BITS] & _MASK_UTF_FILENAME:
+            if fheader[_LOC_GENERAL_PURPOSE_FLAG_BITS] & _MASK_UTF_FILENAME:
                 fname_str = fname.decode("utf-8")
             else:
                 fname_str = fname.decode(self.metadata_encoding or "cp437")
@@ -1516,7 +1536,7 @@ class ZipFile:
         self.fp.write(zinfo.FileHeader(zip64))
 
         self._writing = True
-        return _ZipWriteFile(self, zinfo, zip64)
+        return _MemberWriter(self, zinfo, zip64)
 
     def extract(self, member, path=None, pwd=None):
         """Extract one member to *path* (default: current directory).

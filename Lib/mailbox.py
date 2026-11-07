@@ -281,7 +281,7 @@ class Maildir(Mailbox):
             tmp_file.close()
             os.remove(tmp_file.name)
             raise
-        _sync_close(tmp_file)
+        _close_to_disk(tmp_file)
         if isinstance(message, MaildirMessage):
             subdir = message.get_subdir()
             suffix = self.colon + message.get_info()
@@ -506,7 +506,7 @@ class Maildir(Mailbox):
         except FileNotFoundError:
             Maildir._count += 1
             try:
-                return _create_carefully(path)
+                return _create_new(path)
             except FileExistsError:
                 pass
         raise ExternalClashError('Name clash prevented file creation: %s'
@@ -564,7 +564,7 @@ class Maildir(Mailbox):
                 continue
 
 
-class _singlefileMailbox(Mailbox):
+class _SingleFileMailbox(Mailbox):
     """A mailbox stored in one file; the table of contents maps keys to
     (start, stop) byte offsets."""
 
@@ -620,12 +620,12 @@ class _singlefileMailbox(Mailbox):
 
     def lock(self):
         if not self._locked:
-            _lock_file(self._file)
+            _acquire_locks(self._file)
             self._locked = True
 
     def unlock(self):
         if self._locked:
-            _unlock_file(self._file)
+            _release_locks(self._file)
             self._locked = False
 
     def flush(self):
@@ -633,7 +633,7 @@ class _singlefileMailbox(Mailbox):
         when messages were removed or replaced."""
         if not self._pending:
             if self._pending_sync:
-                _sync_flush(self._file)
+                _flush_to_disk(self._file)
                 self._pending_sync = False
             return
 
@@ -645,7 +645,7 @@ class _singlefileMailbox(Mailbox):
                                      '(expected %i, found %i)' %
                                      (self._file_length, length))
 
-        new_file = _create_temporary(self._path)
+        new_file = _create_unique(self._path)
         try:
             new_toc = {}
             self._pre_mailbox_hook(new_file)
@@ -667,7 +667,7 @@ class _singlefileMailbox(Mailbox):
             new_file.close()
             os.remove(new_file.name)
             raise
-        _sync_close(new_file)
+        _close_to_disk(new_file)
         self._file.close()
         st = os.stat(self._path)
         os.chmod(new_file.name, st.st_mode)
@@ -686,7 +686,7 @@ class _singlefileMailbox(Mailbox):
         self._pending = False
         self._pending_sync = False
         if self._locked:
-            _lock_file(self._file, dotlock=False)
+            _acquire_locks(self._file, dotlock=False)
 
     def __enter__(self):
         self.lock()
@@ -738,7 +738,7 @@ class _singlefileMailbox(Mailbox):
         return offsets
 
 
-class _mboxMMDF(_singlefileMailbox):
+class _FromLineMailbox(_SingleFileMailbox):
     """Shared code of mbox and MMDF: each message starts with a
     'From ' line."""
 
@@ -799,7 +799,7 @@ class _mboxMMDF(_singlefileMailbox):
         return (start, stop)
 
 
-class mbox(_mboxMMDF):
+class mbox(_FromLineMailbox):
     """The classic Unix mailbox: messages separated by 'From ' lines."""
 
     _mangle_from_ = True
@@ -807,7 +807,7 @@ class mbox(_mboxMMDF):
 
     def __init__(self, path, factory=None, create=True):
         self._message_factory = mboxMessage
-        _mboxMMDF.__init__(self, path, factory, create)
+        _FromLineMailbox.__init__(self, path, factory, create)
 
     def _post_message_hook(self, f):
         f.write(linesep)
@@ -840,12 +840,12 @@ class mbox(_mboxMMDF):
 _MMDF_SEP = b'\001\001\001\001'
 
 
-class MMDF(_mboxMMDF):
+class MMDF(_FromLineMailbox):
     """MMDF: messages framed by lines of four ^A characters."""
 
     def __init__(self, path, factory=None, create=True):
         self._message_factory = MMDFMessage
-        _mboxMMDF.__init__(self, path, factory, create)
+        _FromLineMailbox.__init__(self, path, factory, create)
 
     def _pre_message_hook(self, f):
         f.write(_MMDF_SEP + linesep)
@@ -908,18 +908,18 @@ class MH(Mailbox):
         keys = self.keys()
         new_key = max(keys) + 1 if keys else 1
         new_path = self._msg_path(new_key)
-        f = _create_carefully(new_path)
+        f = _create_new(new_path)
         closed = False
         try:
             if self._locked:
-                _lock_file(f)
+                _acquire_locks(f)
             try:
                 try:
                     self._dump_message(message, f)
                 except BaseException:
                     if self._locked:
-                        _unlock_file(f)
-                    _sync_close(f)
+                        _release_locks(f)
+                    _close_to_disk(f)
                     closed = True
                     os.remove(new_path)
                     raise
@@ -927,10 +927,10 @@ class MH(Mailbox):
                     self._dump_sequences(message, new_key)
             finally:
                 if self._locked:
-                    _unlock_file(f)
+                    _release_locks(f)
         finally:
             if not closed:
-                _sync_close(f)
+                _close_to_disk(f)
         return new_key
 
     def remove(self, key):
@@ -942,7 +942,7 @@ class MH(Mailbox):
         f = self._open_existing(key, 'rb+')
         try:
             if self._locked:
-                _lock_file(f)
+                _acquire_locks(f)
             try:
                 os.close(os.open(self._msg_path(key),
                                  os.O_WRONLY | os.O_TRUNC))
@@ -951,20 +951,20 @@ class MH(Mailbox):
                     self._dump_sequences(message, key)
             finally:
                 if self._locked:
-                    _unlock_file(f)
+                    _release_locks(f)
         finally:
-            _sync_close(f)
+            _close_to_disk(f)
 
     def get_message(self, key):
         f = self._open_existing(key, 'rb+' if self._locked else 'rb')
         with f:
             if self._locked:
-                _lock_file(f)
+                _acquire_locks(f)
             try:
                 msg = MHMessage(f)
             finally:
                 if self._locked:
-                    _unlock_file(f)
+                    _release_locks(f)
         for name, key_list in self.get_sequences().items():
             if key in key_list:
                 msg.add_sequence(name)
@@ -974,12 +974,12 @@ class MH(Mailbox):
         f = self._open_existing(key, 'rb+' if self._locked else 'rb')
         with f:
             if self._locked:
-                _lock_file(f)
+                _acquire_locks(f)
             try:
                 return _from_disk(f.read())
             finally:
                 if self._locked:
-                    _unlock_file(f)
+                    _release_locks(f)
 
     def get_file(self, key):
         return _ProxyFile(self._open_existing(key, 'rb'))
@@ -1003,13 +1003,13 @@ class MH(Mailbox):
             if not os.path.exists(path):
                 os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
             self._file = open(path, 'rb+')
-            _lock_file(self._file)
+            _acquire_locks(self._file)
             self._locked = True
 
     def unlock(self):
         if self._locked:
-            _unlock_file(self._file)
-            _sync_close(self._file)
+            _release_locks(self._file)
+            _close_to_disk(self._file)
             del self._file
             self._locked = False
 
@@ -1075,7 +1075,7 @@ class MH(Mailbox):
                     continue
                 f.write(name + ':' + _format_ranges(sorted(set(keys))) + '\n')
         finally:
-            _sync_close(f)
+            _close_to_disk(f)
 
     def pack(self):
         """Renumber the messages 1..n without gaps."""
@@ -1136,28 +1136,28 @@ def _format_ranges(keys):
 _BABYL_EOOH = b'*** EOOH ***'
 
 
-class Babyl(_singlefileMailbox):
+class Babyl(_SingleFileMailbox):
     """Emacs RMAIL (Babyl) files."""
 
     _special_labels = frozenset({'unseen', 'deleted', 'filed', 'answered',
                                  'forwarded', 'edited', 'resent'})
 
     def __init__(self, path, factory=None, create=True):
-        _singlefileMailbox.__init__(self, path, factory, create)
+        _SingleFileMailbox.__init__(self, path, factory, create)
         self._labels = {}
 
     def add(self, message):
-        key = _singlefileMailbox.add(self, message)
+        key = _SingleFileMailbox.add(self, message)
         if isinstance(message, BabylMessage):
             self._labels[key] = message.get_labels()
         return key
 
     def remove(self, key):
-        _singlefileMailbox.remove(self, key)
+        _SingleFileMailbox.remove(self, key)
         self._labels.pop(key, None)
 
     def __setitem__(self, key, message):
-        _singlefileMailbox.__setitem__(self, key, message)
+        _SingleFileMailbox.__setitem__(self, key, message)
         if isinstance(message, BabylMessage):
             self._labels[key] = message.get_labels()
 
@@ -1811,77 +1811,92 @@ class _PartialFile(_ProxyFile):
             del self._file
 
 
-def _lock_file(f, dotlock=True):
-    """Lock *f* with lockf() and, optionally, a <name>.lock dot file."""
-    dotlock_done = False
+def _acquire_locks(f, dotlock=True):
+    """Lock the open mailbox file f: an exclusive, non-blocking lockf()
+    lock and, if dotlock, a "<name>.lock" file put in place atomically
+    (hard link, or rename where links are not possible).
+
+    ExternalClashError means another process holds one of the locks; on
+    any failure the locks taken so far are released again.  A read-only
+    directory silently means no dot lock.
+    """
+    lock_path = f.name + '.lock'
+    have_lockf = have_dotlock = False
     try:
         if fcntl:
             try:
                 fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError as e:
-                if e.errno in (errno.EAGAIN, errno.EACCES, errno.EROFS):
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EACCES, errno.EROFS):
                     raise ExternalClashError('lockf: lock unavailable: %s'
                                              % f.name)
                 raise
-        if dotlock:
+            have_lockf = True
+        if not dotlock:
+            return
+        try:
+            scratch = _create_unique(lock_path)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EROFS):
+                return
+            raise
+        scratch.close()
+        try:
             try:
-                pre_lock = _create_temporary(f.name + '.lock')
-                pre_lock.close()
-            except OSError as e:
-                if e.errno in (errno.EACCES, errno.EROFS):
-                    return  # read-only directory: no dot lock possible
-                raise
-            try:
-                try:
-                    os.link(pre_lock.name, f.name + '.lock')
-                    dotlock_done = True
-                except (AttributeError, PermissionError):
-                    os.rename(pre_lock.name, f.name + '.lock')
-                    dotlock_done = True
-                else:
-                    os.unlink(pre_lock.name)
-            except FileExistsError:
-                os.remove(pre_lock.name)
-                raise ExternalClashError('dot lock unavailable: %s' % f.name)
-    except:
-        if fcntl:
+                os.link(scratch.name, lock_path)
+            except (AttributeError, PermissionError):
+                os.rename(scratch.name, lock_path)
+                have_dotlock = True
+            else:
+                have_dotlock = True
+                os.unlink(scratch.name)
+        except FileExistsError:
+            os.remove(scratch.name)
+            raise ExternalClashError('dot lock unavailable: %s' % f.name)
+    except BaseException:
+        if have_lockf:
             fcntl.lockf(f, fcntl.LOCK_UN)
-        if dotlock_done:
-            os.remove(f.name + '.lock')
+        if have_dotlock:
+            os.remove(lock_path)
         raise
 
 
-def _unlock_file(f):
+def _release_locks(f):
+    """Undo _acquire_locks()."""
     if fcntl:
         fcntl.lockf(f, fcntl.LOCK_UN)
-    if os.path.exists(f.name + '.lock'):
+    try:
         os.remove(f.name + '.lock')
+    except FileNotFoundError:
+        pass
 
 
-def _create_carefully(path):
-    """Create *path* exclusively and return it opened 'rb+'."""
-    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o666)
+def _create_new(path):
+    """Create path, failing if it already exists, and return it opened
+    for reading and writing in binary mode."""
+    descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o666)
     try:
         return open(path, 'rb+')
     finally:
-        os.close(fd)
+        os.close(descriptor)
 
 
-def _create_temporary(path):
-    """A new file named after *path* with time, host and pid appended."""
-    return _create_carefully('%s.%s.%s.%s' % (path, int(time.time()),
-                                              socket.gethostname(),
-                                              os.getpid()))
+def _create_unique(path):
+    """_create_new() on path plus time, host name and process id."""
+    suffix = '%d.%s.%d' % (time.time(), socket.gethostname(), os.getpid())
+    return _create_new(f'{path}.{suffix}')
 
 
-def _sync_flush(f):
+def _flush_to_disk(f):
+    """Flush f's buffers and ask the OS to write the data out."""
     f.flush()
-    if hasattr(os, 'fsync'):
-        os.fsync(f.fileno())
+    fsync = getattr(os, 'fsync', None)
+    if fsync is not None:
+        fsync(f.fileno())
 
 
-def _sync_close(f):
-    _sync_flush(f)
+def _close_to_disk(f):
+    _flush_to_disk(f)
     f.close()
 
 
