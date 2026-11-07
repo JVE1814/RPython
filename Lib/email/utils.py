@@ -239,14 +239,16 @@ def parsedate_to_datetime(data):
     if parsed is None:
         raise ValueError('Invalid date value or format "%s"' % str(data))
     *fields, offset = parsed
-    if offset is None:
-        return datetime.datetime(*fields[:6])
+    # a year or offset too large for datetime is an invalid date, whichever
+    # of ValueError/OverflowError the constructor reports
     try:
-        delta = datetime.timedelta(seconds=offset)
+        if offset is None:
+            return datetime.datetime(*fields[:6])
+        zone = datetime.timezone(datetime.timedelta(seconds=offset))
+        return datetime.datetime(*fields[:6], tzinfo=zone)
     except OverflowError:
         raise ValueError('Invalid date value or format "%s"'
                          % str(data)) from None
-    return datetime.datetime(*fields[:6], tzinfo=datetime.timezone(delta))
 
 
 def localtime(dt=None, isdst=None):
