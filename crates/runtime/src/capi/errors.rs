@@ -45,11 +45,12 @@ pub(crate) fn chain_context(e: &PyObject) {
 /// Create an exception instance of `tp` from `value` with PyErr_SetObject rules.
 pub(crate) fn instantiate(tp: &PyObject, value: Option<&PyObject>) -> PyResult {
     if let Some(v) = value {
-        if exc::is_exception_instance(v) && typeobject::is_subtype(v.type_ptr(), typeobject::as_type(tp)) {
+        // an instance of the class (or a subclass, as the class's metaclass decides) is used as is
+        if exc::is_exception_instance(v) && ab::issubclass(typeobject::type_obj(v.type_ptr()), tp)? {
             return Ok(v.to_ref());
         }
     }
-    match value {
+    let r = match value {
         None => ab::call(tp, &[]),
         Some(v) if none::is_none(v) => ab::call(tp, &[]),
         Some(v) if tuple::is_tuple(v) => {
@@ -57,7 +58,33 @@ pub(crate) fn instantiate(tp: &PyObject, value: Option<&PyObject>) -> PyResult {
             ab::call(tp, items)
         }
         Some(v) => ab::call(tp, &[v]),
+    };
+    // a failed instantiation raises the error it caused, noting what was attempted
+    if r.is_err() {
+        if let Some(e) = take_exc() {
+            let args = match value {
+                None => "None".to_string(),
+                Some(v) => match ab::repr_string(v) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        clear_exc();
+                        "<unknown>".to_string()
+                    }
+                },
+            };
+            let name = unsafe { std::ffi::CStr::from_ptr((*typeobject::as_type(tp)).tp_name) }.to_string_lossy().into_owned();
+            let short = name.rsplit('.').next().unwrap_or(&name).to_string();
+            if let Ok(f) = ab::getattr_str(&e, "add_note") {
+                if ab::call(&f, &[&crate::types::str::new_str(&format!("Normalization failed: type={} args={}", short, args))]).is_err() {
+                    clear_exc();
+                }
+            } else {
+                clear_exc();
+            }
+            set_exc(e);
+        }
     }
+    r
 }
 
 /// PyErr_SetObject in Rust form.

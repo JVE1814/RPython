@@ -803,8 +803,13 @@ fn update_one_slot(tp: *mut PyTypeObject, slot: Slot) {
 pub fn type_modified(tp: *mut PyTypeObject) {
     unsafe {
         crate::interp::cache::TYPE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // (capi2) watchers hear of a modification once per version tag (lookups assign a new one)
+        let notify = crate::capi::watchers::type_watched(tp) && (*tp).tp_version_tag != 0;
         (*tp).tp_version_tag = 0;
         (*tp).tp_flags &= !Py_TPFLAGS_VALID_VERSION_TAG;
+        if notify {
+            crate::capi::watchers::type_event(tp);
+        }
         for s in subclasses(tp) {
             let s = s.p();
             type_modified(s);

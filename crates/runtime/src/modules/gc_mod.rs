@@ -115,7 +115,10 @@ fn gc_collect(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRes
     if !(0..=2).contains(&generation) {
         raise!(ValueError, "invalid generation");
     }
-    Ok(int::new_int(collect_with_callbacks(generation) as i64))
+    let n = collect_with_callbacks(generation);
+    // (capi2) type watchers queued while the collector cleared types
+    crate::capi::watchers::flush_type_events();
+    Ok(int::new_int(n as i64))
 }
 
 fn gc_get_count(_m: &PyObject) -> PyResult {

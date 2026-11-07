@@ -301,7 +301,11 @@ pub unsafe extern "C" fn PySys_GetObject(name: *const c_char) -> *mut PyObject {
                 drop(v); // borrowed from sys.__dict__
                 p
             }),
-            Err(_) => std::ptr::null_mut(),
+            Err(_) => {
+                // (capi2) an undecodable name is reported, not raised
+                crate::modules::sys_full::write_unraisable(Some("Exception ignored in PySys_GetObject()"), None);
+                std::ptr::null_mut()
+            }
         };
         clear_exc();
         if let Some(e) = saved {
@@ -313,10 +317,15 @@ pub unsafe extern "C" fn PySys_GetObject(name: *const c_char) -> *mut PyObject {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PySys_GetAttr(name: *mut PyObject) -> *mut PyObject {
     unsafe {
+        if name.is_null() || !pystr::is_str(&*name) {
+            let _ = type_error(&format!("expected str, got {}", if name.is_null() { "NULL".into() } else { tname(&*name) }));
+            return std::ptr::null_mut();
+        }
         match sys_get(&*name) {
             Some(v) => v.into_raw(),
             None => {
-                let _ = crate::err!(RuntimeError, "lost sys.{}", pystr::to_string_lossy(&*name));
+                let msg = pystr::concat(&pystr::new_str("lost sys."), &*name);
+                let _ = crate::errors::set_err_obj(crate::types::exceptions::RuntimeError(), msg);
                 std::ptr::null_mut()
             }
         }
@@ -334,6 +343,11 @@ pub unsafe extern "C" fn PySys_GetAttrString(name: *const c_char) -> *mut PyObje
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PySys_GetOptionalAttr(name: *mut PyObject, result: *mut *mut PyObject) -> c_int {
     unsafe {
+        if name.is_null() || !pystr::is_str(&*name) {
+            *result = std::ptr::null_mut();
+            let _ = type_error(&format!("expected str, got {}", if name.is_null() { "NULL".into() } else { tname(&*name) }));
+            return -1;
+        }
         match sys_get(&*name) {
             Some(v) => {
                 *result = v.into_raw();
@@ -374,7 +388,7 @@ pub unsafe extern "C" fn PySys_SetObject(name: *const c_char, v: *mut PyObject) 
 pub unsafe extern "C" fn PySys_GetXOptions() -> *mut PyObject {
     unsafe {
         let d = crate::modules::sys::sys_dict();
-        match dict::get_item_rs(&d, "_xoptions") {
+        match dict::get_item_rs(&d, "_xoptions").filter(|x| dict::is_dict(x)) {
             Some(x) => {
                 let p = x.as_ptr();
                 drop(x);
@@ -751,20 +765,24 @@ pub unsafe extern "C" fn PyUnstable_DumpTracebackThreads(fd: c_int, _interp: *mu
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnstable_Exc_PrepReraiseStar(orig: *mut PyObject, excs: *mut PyObject) -> *mut PyObject {
     unsafe {
-        // keep the raised exceptions that are not the original's leaves
-        let items = crate::types::list::list_to_vec(&*excs);
-        let raised: Vec<PyRef> = items.into_iter().filter(|e| !none::is_none(e)).collect();
-        if raised.is_empty() {
-            return none::none_ref().into_raw();
-        }
-        if raised.len() == 1 {
-            return raised[0].clone().into_raw();
-        }
-        let _ = orig;
         ret((|| -> PyResult {
-            let b = crate::builtins::builtins_module();
-            let eg = ab::getattr_str(&b, "ExceptionGroup")?;
-            ab::call(&eg, &[&pystr::new_str(""), &crate::types::list::new_list(raised)])
+            let is_exc = |o: &PyObject| crate::types::typeobject::is_subtype(o.type_ptr(), crate::types::exceptions::BaseException());
+            if orig.is_null() || !is_exc(&*orig) {
+                return Err(type_error(&format!("orig must be an exception, not {}", if orig.is_null() { "NULL".into() } else { tname(&*orig) })));
+            }
+            if excs.is_null() || !crate::types::list::is_list(&*excs) {
+                return Err(type_error(&format!("excs must be a list, not {}", if excs.is_null() { "NULL".into() } else { tname(&*excs) })));
+            }
+            for (i, e) in crate::types::list::list_to_vec(&*excs).iter().enumerate() {
+                if !none::is_none(e) && !is_exc(e) {
+                    return Err(type_error(&format!("item {} of excs is not an exception", i)));
+                }
+            }
+            // the original must have been raised (it carries a traceback)
+            if none::is_none(&*ab::getattr_str(&*orig, "__traceback__")?) {
+                return Err(value_error("orig must be a raised exception"));
+            }
+            crate::types::exceptiongroup::prep_reraise_star(&*orig, &*excs)
         })())
     }
 }

@@ -35,6 +35,26 @@ unsafe fn ustr<'a>(o: *mut PyObject) -> PyResult<&'a PyObject> {
     }
 }
 
+/// Like `ustr`, but NULL is a SystemError (bad internal call). (capi2)
+unsafe fn ustr_nn<'a>(o: *mut PyObject) -> PyResult<&'a PyObject> {
+    unsafe {
+        if o.is_null() {
+            return Err(bad_internal());
+        }
+        ustr(o)
+    }
+}
+
+/// A str argument the function modifies or reads raw: anything else is a SystemError. (capi2)
+unsafe fn ustr_sys<'a>(o: *mut PyObject) -> PyResult<&'a PyObject> {
+    unsafe {
+        if o.is_null() || !pystr::is_str(&*o) {
+            return Err(bad_internal());
+        }
+        Ok(&*o)
+    }
+}
+
 unsafe fn opt_cstr(p: *const c_char) -> Option<String> {
     if p.is_null() { None } else { Some(unsafe { cs(p).into_owned() }) }
 }
@@ -77,12 +97,13 @@ pub unsafe extern "C" fn PyUnicode_New(size: Py_ssize_t, maxchar: Py_UCS4) -> *m
         let _ = system_error("Negative size passed to PyUnicode_New");
         return std::ptr::null_mut();
     }
+    // the empty string is shared whatever maximum character is requested
+    if size == 0 {
+        return pystr::new_str("").into_raw();
+    }
     if maxchar > 0x10ffff {
         let _ = system_error("invalid maximum character passed to PyUnicode_New");
         return std::ptr::null_mut();
-    }
-    if size == 0 {
-        return pystr::new_str("").into_raw();
     }
     match pystr::try_alloc_str(size as usize, maxchar) {
         Some(s) => s.into_raw(),
@@ -133,7 +154,7 @@ pub unsafe extern "C" fn PyUnicode_FromKindAndData(kind: c_int, buffer: *const s
             4 => {
                 let s = std::slice::from_raw_parts(buffer as *const u32, n);
                 if let Some(&bad) = s.iter().find(|&&c| c > 0x10ffff) {
-                    let _ = value_error(&format!("character U+{:x} is not in range [U+0000; U+10ffff]", bad));
+                    let _ = system_error(&format!("character U+{:x} is not in range [U+0000; U+10ffff]", bad));
                     return std::ptr::null_mut();
                 }
                 pystr::from_codepoints(s).into_raw()
@@ -296,7 +317,7 @@ pub unsafe extern "C" fn PyUnicode_WriteChar(o: *mut PyObject, i: Py_ssize_t, c:
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnicode_Fill(o: *mut PyObject, start: Py_ssize_t, length: Py_ssize_t, c: Py_UCS4) -> Py_ssize_t {
     unsafe {
-        let Ok(s) = ustr(o) else { return -1 };
+        let Ok(s) = ustr_sys(o) else { return -1 };
         if start < 0 {
             let _ = crate::err!(IndexError, "string index out of range");
             return -1;
@@ -326,7 +347,7 @@ pub unsafe extern "C" fn PyUnicode_CopyCharacters(
     how_many: Py_ssize_t,
 ) -> Py_ssize_t {
     unsafe {
-        let (Ok(t), Ok(f)) = (ustr(to), ustr(from)) else {
+        let (Ok(t), Ok(f)) = (ustr_sys(to), ustr_sys(from)) else {
             return -1;
         };
         let (tl, fl) = (pystr::str_len(t) as isize, pystr::str_len(f) as isize);
@@ -338,7 +359,11 @@ pub unsafe extern "C" fn PyUnicode_CopyCharacters(
             let _ = system_error("how_many cannot be negative");
             return -1;
         }
-        let n = how_many.min(fl - from_start).min(tl - to_start);
+        let n = how_many.min(fl - from_start);
+        if n > tl - to_start {
+            let _ = system_error(&format!("cannot copy {} characters into a string of {} characters at index {}", n, tl, to_start));
+            return -1;
+        }
         if n == 0 {
             return 0;
         }
@@ -372,12 +397,29 @@ pub unsafe extern "C" fn PyUnicode_Resize(p: *mut *mut PyObject, length: Py_ssiz
         let old = &**p;
         let d = pystr::str_data(old);
         let n = length as usize;
-        let mut v: Vec<u32> = (0..n.min(d.len())).map(|i| d.get(i)).collect();
-        v.resize(n, 0);
+        if n == d.len() {
+            return 0; // same length: the object is kept
+        }
         // keep the kind (callers may write wider characters afterwards via WriteChar)
-        let new = if n == 0 { pystr::new_str("") } else { pystr::alloc_str(n, kind_max(old)) };
-        for (i, c) in v.into_iter().enumerate() {
-            write_raw(&new, i, c);
+        let new = if n == 0 {
+            pystr::new_str("")
+        } else {
+            match pystr::try_alloc_str(n, kind_max(old)) {
+                Some(s) => s,
+                None => {
+                    let _ = memory_error();
+                    return -1;
+                }
+            }
+        };
+        if n > 0 {
+            let keep = n.min(d.len());
+            for i in 0..keep {
+                write_raw(&new, i, d.get(i));
+            }
+            for i in keep..n {
+                write_raw(&new, i, 0);
+            }
         }
         let newp = new.into_raw();
         decref(*p);
@@ -437,12 +479,8 @@ pub unsafe extern "C" fn PyUnicode_AsUTF8AndSize(o: *mut PyObject, size: *mut Py
 pub unsafe extern "C" fn PyUnicode_AsUTF8(o: *mut PyObject) -> *const c_char {
     unsafe {
         let mut n: Py_ssize_t = 0;
-        let p = PyUnicode_AsUTF8AndSize(o, &mut n);
-        if !p.is_null() && libc::strlen(p) != n as usize {
-            let _ = value_error("embedded null character");
-            return std::ptr::null();
-        }
-        p
+        // (embedded NUL characters are allowed: the buffer is NUL-terminated after them)
+        PyUnicode_AsUTF8AndSize(o, &mut n)
     }
 }
 #[unsafe(no_mangle)]
@@ -487,7 +525,7 @@ pub unsafe extern "C" fn PyUnicode_AsUCS4Copy(o: *mut PyObject) -> *mut Py_UCS4 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnicode_AsWideChar(o: *mut PyObject, w: *mut libc::wchar_t, size: Py_ssize_t) -> Py_ssize_t {
     unsafe {
-        let Ok(s) = ustr(o) else { return -1 };
+        let Ok(s) = ustr_nn(o) else { return -1 };
         let d = pystr::str_data(s);
         if w.is_null() {
             return d.len() as Py_ssize_t + 1;
@@ -502,7 +540,7 @@ pub unsafe extern "C" fn PyUnicode_AsWideChar(o: *mut PyObject, w: *mut libc::wc
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnicode_AsWideCharString(o: *mut PyObject, size: *mut Py_ssize_t) -> *mut libc::wchar_t {
     unsafe {
-        let Ok(s) = ustr(o) else { return std::ptr::null_mut() };
+        let Ok(s) = ustr_nn(o) else { return std::ptr::null_mut() };
         let d = pystr::str_data(s);
         if size.is_null() && d.iter().any(|c| c == 0) {
             let _ = value_error("embedded null character");
@@ -647,7 +685,21 @@ pub unsafe extern "C" fn PyUnicode_DecodeUTF7(s: *const c_char, size: Py_ssize_t
 unsafe fn decode_utf_16_32(name: &str, s: *const c_char, size: Py_ssize_t, errors: *const c_char, byteorder: *mut c_int, consumed: *mut Py_ssize_t) -> *mut PyObject {
     unsafe {
         let bo = if byteorder.is_null() { 0 } else { *byteorder };
-        let r = decode_stateful_via_codecs(&format!("{}_ex_decode", name), raw(s, size), errors, &[int::new_int(bo as i64)], consumed);
+        let data = raw(s, size);
+        let r = decode_stateful_via_codecs(&format!("{}_ex_decode", name), data, errors, &[int::new_int(bo as i64)], consumed);
+        // with native order requested, a byte order mark tells the caller which order it was
+        if !r.is_null() && !byteorder.is_null() && bo == 0 {
+            let found = if name == "utf_16" {
+                if data.starts_with(b"\xff\xfe") { -1 } else if data.starts_with(b"\xfe\xff") { 1 } else { 0 }
+            } else if data.starts_with(b"\xff\xfe\0\0") {
+                -1
+            } else if data.starts_with(b"\0\0\xfe\xff") {
+                1
+            } else {
+                0
+            };
+            *byteorder = found;
+        }
         r
     }
 }
@@ -688,7 +740,9 @@ pub unsafe extern "C" fn PyUnicode_AsCharmapString(o: *mut PyObject, mapping: *m
     unsafe {
         let Ok(s) = ustr(o) else { return std::ptr::null_mut() };
         if mapping.is_null() {
-            return encode_impl(s, "latin-1", std::ptr::null());
+            let _ = s;
+            let _ = type_error("bad argument type for built-in operation");
+            return std::ptr::null_mut();
         }
         ret((|| -> PyResult {
             let codecs = crate::import::import_absolute("_codecs")?;
@@ -950,14 +1004,93 @@ pub unsafe extern "C" fn PyUnicode_Replace(s: *mut PyObject, old: *mut PyObject,
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnicode_Translate(s: *mut PyObject, table: *mut PyObject, errors: *const c_char) -> *mut PyObject {
     unsafe {
-        let _ = errors;
-        ret(call_m(s, "translate", &[&*table]))
+        let Ok(src) = ustr(s) else { return std::ptr::null_mut() };
+        if table.is_null() {
+            let _ = type_error("translate table must not be NULL");
+            return std::ptr::null_mut();
+        }
+        let errors = opt_cstr(errors).unwrap_or_else(|| "strict".into());
+        ret(translate_with_errors(src, &*table, &errors))
     }
+}
+
+/// str translation where a character mapped to None is an error handed to the
+/// `errors` handler (characters the table does not know are copied unchanged). (capi2)
+fn translate_with_errors(src: &PyObject, table: &PyObject, errors: &str) -> PyResult {
+    let data = chars(src);
+    let lookup = |c: u32| -> PyResult<Option<PyRef>> {
+        match ab::getitem(table, &int::new_int(c as i64)) {
+            Ok(v) => Ok(Some(v)),
+            Err(_) => {
+                let e = take_exc().ok_or(PyErr)?;
+                if crate::types::typeobject::is_subtype(e.type_ptr(), crate::types::exceptions::LookupError()) {
+                    Ok(None)
+                } else {
+                    set_exc(e);
+                    Err(PyErr)
+                }
+            }
+        }
+    };
+    let mut out: Vec<u32> = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        let c = data[i];
+        match lookup(c)? {
+            None => {
+                out.push(c);
+                i += 1;
+            }
+            Some(v) if int::is_int(&v) => {
+                match int::as_i64(&v).filter(|x| (0..=0x10ffff).contains(x)) {
+                    Some(cp) => out.push(cp as u32),
+                    None => return Err(value_error("character mapping must be in range(0x110000)")),
+                }
+                i += 1;
+            }
+            Some(v) if pystr::is_str(&v) => {
+                out.extend(chars(&v));
+                i += 1;
+            }
+            Some(v) if none::is_none(&v) => {
+                // a run of undefined characters goes to the error handler at once
+                let mut end = i + 1;
+                while end < data.len() && lookup(data[end])?.is_some_and(|x| none::is_none(&x)) {
+                    end += 1;
+                }
+                let exc = ab::call(
+                    crate::types::typeobject::type_obj(crate::types::exceptions::UnicodeTranslateError()),
+                    &[src, &int::new_int(i as i64), &int::new_int(end as i64), &pystr::new_str("character maps to <undefined>")],
+                )?;
+                if errors == "strict" {
+                    set_exc(exc);
+                    return Err(PyErr);
+                }
+                let handler = crate::modules::_codecs::lookup_error(errors)?;
+                let r = ab::call(&handler, &[&exc])?;
+                let items: Vec<PyRef> = if crate::types::tuple::is_tuple(&r) { crate::types::tuple::tuple_items(&r).iter().map(|x| x.to_ref()).collect() } else { Vec::new() };
+                if items.len() != 2 || !pystr::is_str(&items[0]) || !int::is_int(&items[1]) {
+                    return Err(type_error("translating error handler must return (str, int) tuple"));
+                }
+                out.extend(chars(&items[0]));
+                let mut np = int::as_i64(&items[1]).unwrap_or(end as i64);
+                if np < 0 {
+                    np += data.len() as i64;
+                }
+                if np < 0 || np as usize > data.len() {
+                    return Err(crate::errors::new_err(crate::types::exceptions::IndexError(), &format!("position {} from error handler out of bounds", np)));
+                }
+                i = np as usize;
+            }
+            Some(_) => return Err(type_error("character mapping must return integer, None or str")),
+        }
+    }
+    Ok(pystr::from_codepoints(&out))
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnicode_Format(format: *mut PyObject, args: *mut PyObject) -> *mut PyObject {
     unsafe {
-        let Ok(f) = ustr(format) else { return std::ptr::null_mut() };
+        let Ok(f) = ustr_nn(format) else { return std::ptr::null_mut() };
         if args.is_null() {
             return null_arg();
         }
@@ -1280,6 +1413,8 @@ pub unsafe extern "C" fn PyUnicodeWriter_WriteASCII(wr: *mut Writer, s: *const c
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnicodeWriter_WriteWideChar(wr: *mut Writer, s: *const libc::wchar_t, size: Py_ssize_t) -> c_int {
     unsafe {
+        // a negative size means a NUL-terminated string
+        let size = if size < 0 && !s.is_null() { libc::wcslen(s) as Py_ssize_t } else { size.max(0) };
         let o = PyUnicode_FromWideChar(s, size);
         if o.is_null() {
             return -1;
@@ -1369,8 +1504,13 @@ pub unsafe extern "C" fn PyUnicodeWriter_DecodeUTF8Stateful(
     consumed: *mut Py_ssize_t,
 ) -> c_int {
     unsafe {
+        // a negative size means a NUL-terminated string
+        let size = if size < 0 && !s.is_null() { libc::strlen(s) as Py_ssize_t } else { size.max(0) };
         let o = PyUnicode_DecodeUTF8Stateful(s, size, errors, consumed);
         if o.is_null() {
+            if !consumed.is_null() {
+                *consumed = 0;
+            }
             return -1;
         }
         let o = PyRef::from_raw(o);

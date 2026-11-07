@@ -91,7 +91,8 @@ pub unsafe fn digits_mut(op: *mut PyObject, n: usize) -> &'static mut [u32] {
 }
 
 const SMALL_MIN: i64 = -5;
-const SMALL_MAX: i64 = 1025;
+// the cached small ints are -5..=1024 (_PY_NSMALLPOSINTS = 1025 values from 0) (capi2)
+const SMALL_MAX: i64 = 1024;
 static SMALL: [std::sync::atomic::AtomicPtr<PyObject>; (SMALL_MAX - SMALL_MIN + 1) as usize] =
     [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; (SMALL_MAX - SMALL_MIN + 1) as usize];
 

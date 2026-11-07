@@ -133,7 +133,11 @@ fn update_current(f: impl FnOnce(&PyObject) -> PyResult<()>) -> PyResult<()> {
 }
 
 pub fn context_enter(c: &PyObject) -> PyResult<()> {
-    let prev = current_context()?;
+    // (capi2) a thread without a current context gets none back on exit
+    let prev: Option<PyRef> = unsafe {
+        let p = (*crate::threads::current_mut()).c.context;
+        if p.is_null() { None } else { Some((*p).to_ref()) }
+    };
     // check-and-set under the lock: two threads running the same context race here
     let ok = {
         let _g = dict::ob_lock(c);
@@ -141,7 +145,7 @@ pub fn context_enter(c: &PyObject) -> PyResult<()> {
         if s.entered {
             false
         } else {
-            s.prev = Some(prev);
+            s.prev = prev;
             s.entered = true;
             true
         }
@@ -150,6 +154,9 @@ pub fn context_enter(c: &PyObject) -> PyResult<()> {
         raise!(RuntimeError, "cannot enter context: {} is already entered", ab::repr_string(c)?);
     }
     set_current(Some(c.to_ref()));
+    if crate::capi::watchers::contexts_watched() {
+        crate::capi::watchers::context_switched(c);
+    }
     Ok(())
 }
 
@@ -165,7 +172,13 @@ pub fn context_exit(c: &PyObject) -> PyResult<()> {
         }
     };
     match prev {
-        Some(prev) => set_current(prev),
+        Some(prev) => {
+            let now = prev.clone();
+            set_current(prev);
+            if crate::capi::watchers::contexts_watched() {
+                crate::capi::watchers::context_switched(now.as_deref().unwrap_or(crate::types::none::none()));
+            }
+        }
         None => raise!(RuntimeError, "cannot exit context: {} has not been entered", ab::repr_string(c)?),
     }
     Ok(())

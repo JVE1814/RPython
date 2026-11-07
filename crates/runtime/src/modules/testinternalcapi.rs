@@ -315,40 +315,19 @@ fn identify_type_slot_wrappers(_m: &PyObject) -> PyResult {
 
 // ---- PEP 523 frame-evaluation hook (test form) and rare-event counters
 
-/// While set, the list every evaluated Python frame's code name is appended to
-/// (`set_eval_frame_record`); compiled code is bypassed so that every frame is seen.
-pub static EVAL_RECORD: std::sync::atomic::AtomicPtr<PyObject> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-static EVAL_ALLOWS_SPECIALIZATION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// (capi2) the hook itself lives in interp/pep523.rs
 
-#[inline(always)]
-pub fn eval_hook_active() -> bool {
-    !EVAL_RECORD.load(std::sync::atomic::Ordering::Relaxed).is_null()
+fn is_specialization_enabled(_m: &PyObject) -> PyResult {
+    Ok(bool_::new_bool(crate::interp::pep523::specialization_enabled()))
 }
 
-/// Called by the interpreter when it starts or resumes a frame while the hook is set.
-#[cold]
-pub fn record_frame(code: &PyObject) {
-    let l = EVAL_RECORD.load(std::sync::atomic::Ordering::Acquire);
-    if !l.is_null() {
-        list::append(unsafe { &*l }, crate::types::code::code_name(code));
-    }
-}
-
-fn set_eval_hook(l: Option<&PyObject>, allow_specialization: bool) {
-    let new = l.map_or(std::ptr::null_mut(), |l| l.to_ref().into_raw());
-    EVAL_ALLOWS_SPECIALIZATION.store(allow_specialization, std::sync::atomic::Ordering::Relaxed);
-    let old = EVAL_RECORD.swap(new, std::sync::atomic::Ordering::AcqRel);
-    crate::modules::sys_trace::recompute_tracing();
-    if !old.is_null() {
-        unsafe { decref(old) };
-    }
-}
-
+/// set_eval_frame_record(list) / set_eval_frame_interp(list) / set_eval_frame_default():
+/// PEP 523 frame-evaluation hooks recording code names (interp/pep523.rs). (capi2)
 fn set_eval_frame_record(_m: &PyObject, l: &PyObject) -> PyResult {
     if !list::is_list(l) {
         raise!(TypeError, "argument must be a list");
     }
-    set_eval_hook(Some(l), false);
+    crate::interp::pep523::install(crate::interp::pep523::ALL, Some(l));
     rare_event(RareEvent::SetEvalFrameFunc);
     Ok(none::none_ref())
 }
@@ -356,20 +335,16 @@ fn set_eval_frame_interp(_m: &PyObject, l: &PyObject) -> PyResult {
     if !list::is_list(l) {
         raise!(TypeError, "argument must be a list");
     }
-    set_eval_hook(Some(l), true);
+    crate::interp::pep523::install(crate::interp::pep523::OUTER, Some(l));
     rare_event(RareEvent::SetEvalFrameFunc);
     Ok(none::none_ref())
 }
 fn set_eval_frame_default(_m: &PyObject) -> PyResult {
-    if eval_hook_active() {
+    if crate::interp::pep523::installed() {
         rare_event(RareEvent::SetEvalFrameFunc);
     }
-    set_eval_hook(None, false);
+    crate::interp::pep523::install(crate::interp::pep523::NONE, None);
     Ok(none::none_ref())
-}
-
-fn is_specialization_enabled(_m: &PyObject) -> PyResult {
-    Ok(bool_::new_bool(!eval_hook_active() || EVAL_ALLOWS_SPECIALIZATION.load(std::sync::atomic::Ordering::Relaxed)))
 }
 
 /// Events that invalidate optimistic assumptions of the specializer/JIT, counted as
@@ -506,6 +481,222 @@ fn tuple_from_pair(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     Ok(tuple::new_tuple_from_refs(&[args[0], args[1]]))
 }
 
+/// module_get_gc_hooks(module): addresses of the module state's traverse, clear and free
+/// functions (0 when absent). (capi2)
+fn module_get_gc_hooks(_m: &PyObject, o: &PyObject) -> PyResult {
+    if !crate::types::module::is_module(o) {
+        raise!(TypeError, "expected a module, got {}", crate::types::typeobject::tname(o));
+    }
+    let def = crate::types::module::m(o).md_def;
+    let (t, c, f) = if def.is_null() {
+        (0, 0, 0)
+    } else {
+        unsafe { ((*def).m_traverse.map_or(0, |p| p as usize), (*def).m_clear.map_or(0, |p| p as usize), (*def).m_free.map_or(0, |p| p as usize)) }
+    };
+    Ok(tuple::new_tuple(vec![int::new_int_usize(t), int::new_int_usize(c), int::new_int_usize(f)]))
+}
+
+/// get_configs(): {"global_config": {legacy global variable: value}}. (capi2)
+fn get_configs(_m: &PyObject) -> PyResult {
+    let g = dict::new_dict();
+    for (k, v) in crate::capi::config::legacy_globals() {
+        dict::set_item_str(&g, k, &int::new_int(v as i64))?;
+    }
+    let out = dict::new_dict();
+    dict::set_item_str(&out, "global_config", &g)?;
+    Ok(out)
+}
+
+/// _pyerr_setkeyerror(arg): raise KeyError(arg) (one argument, never unpacked), replacing a
+/// pending exception. (capi2)
+fn pyerr_setkeyerror(_m: &PyObject, arg: &PyObject) -> PyResult {
+    let _ = memory_error();
+    clear_exc();
+    let e = ab::call(crate::types::typeobject::type_obj(crate::types::exceptions::KeyError()), &[arg])?;
+    set_exc(e);
+    Err(PyErr)
+}
+
+// ---- mixed complex/real arithmetic helpers (_py_cr_* / _py_rc_*). (capi2)
+// The real operand only combines with the real part (or scales both parts), so signed
+// zeros and infinities of the other component survive unchanged.
+
+fn cplx_arg(o: &PyObject) -> PyResult<(f64, f64)> {
+    let c = unsafe { crate::capi::long::PyComplex_AsCComplex(o.as_ptr()) };
+    if c.real == -1.0 && err_occurred() {
+        return Err(PyErr);
+    }
+    Ok((c.real, c.imag))
+}
+
+fn real_arg(o: &PyObject) -> PyResult<f64> {
+    let v = unsafe { crate::capi::long::PyFloat_AsDouble(o.as_ptr()) };
+    if v == -1.0 && err_occurred() {
+        return Err(PyErr);
+    }
+    Ok(v)
+}
+
+fn cplx_result(re: f64, im: f64, errno: i64) -> PyResult {
+    Ok(tuple::new_tuple(vec![crate::types::complex::new_complex(re, im), int::new_int(errno)]))
+}
+
+fn two_args<'a>(args: &'a [&'a PyObject], name: &str) -> PyResult<(&'a PyObject, &'a PyObject)> {
+    if args.len() != 2 {
+        raise!(TypeError, "{} expected 2 arguments, got {}", name, args.len());
+    }
+    Ok((args[0], args[1]))
+}
+
+fn py_cr_sum(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    let (a, b) = two_args(args, "_py_cr_sum")?;
+    let ((re, im), r) = (cplx_arg(a)?, real_arg(b)?);
+    cplx_result(re + r, im, 0)
+}
+
+fn py_cr_diff(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    let (a, b) = two_args(args, "_py_cr_diff")?;
+    let ((re, im), r) = (cplx_arg(a)?, real_arg(b)?);
+    cplx_result(re - r, im, 0)
+}
+
+fn py_rc_diff(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    let (a, b) = two_args(args, "_py_rc_diff")?;
+    let (r, (re, im)) = (real_arg(a)?, cplx_arg(b)?);
+    cplx_result(r - re, -im, 0)
+}
+
+fn py_cr_prod(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    let (a, b) = two_args(args, "_py_cr_prod")?;
+    let ((re, im), r) = (cplx_arg(a)?, real_arg(b)?);
+    cplx_result(re * r, im * r, 0)
+}
+
+fn py_cr_quot(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    let (a, b) = two_args(args, "_py_cr_quot")?;
+    let ((re, im), r) = (cplx_arg(a)?, real_arg(b)?);
+    if r == 0.0 {
+        return cplx_result(0.0, 0.0, libc::EDOM as i64);
+    }
+    cplx_result(re / r, im / r, 0)
+}
+
+fn py_rc_quot(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    let (a, b) = two_args(args, "_py_rc_quot")?;
+    let (x, (c, d)) = (real_arg(a)?, cplx_arg(b)?);
+    // x / (c + di), scaled by the larger divisor component to avoid overflow
+    if c.abs() >= d.abs() {
+        if c == 0.0 && d == 0.0 {
+            return cplx_result(0.0, 0.0, libc::EDOM as i64);
+        }
+        let t = d / c;
+        let den = c + d * t;
+        cplx_result(x / den, -x * t / den, 0)
+    } else if d.abs() >= c.abs() {
+        let t = c / d;
+        let den = c * t + d;
+        cplx_result(x * t / den, -x / den, 0)
+    } else if x.is_finite() && (c.is_infinite() || d.is_infinite()) {
+        // a finite value over an infinite divisor is zero (the NaN part only lends its sign)
+        cplx_result(0.0f64.copysign(x) * 1.0f64.copysign(c), 0.0f64.copysign(-x) * 1.0f64.copysign(d), 0)
+    } else {
+        cplx_result(f64::NAN, f64::NAN, 0)
+    }
+}
+
+/// gh_119213_getargs(spam=None): keyword parsing from a subinterpreter. (capi2)
+fn gh_119213_getargs(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
+    static P: crate::args::Params = crate::args::Params::new("gh_119213_getargs", &["spam"], 0, 0);
+    let [spam] = crate::args::parse::<1>(&P, args, kw)?;
+    Ok(spam.map(|s| s.to_ref()).unwrap_or_else(none::none_ref))
+}
+
+/// _PyUnicode_TransformDecimalAndSpaceToASCII(s): decimal digits become ASCII digits,
+/// whitespace a space; the first other non-ASCII character becomes '?' and ends the
+/// result. (capi2)
+fn transform_decimal_and_space(_m: &PyObject, s: &PyObject) -> PyResult {
+    if !pystr::is_str(s) {
+        return Err(crate::errors::system_error("bad argument to internal function"));
+    }
+    let mut out = String::new();
+    for c in pystr::str_data(s).iter() {
+        if rpy_unicode::is_space(c) {
+            out.push(' ');
+        } else if let Some(d) = rpy_unicode::to_decimal(c) {
+            out.push(char::from(b'0' + d as u8));
+        } else if c < 128 {
+            out.push(char::from(c as u8));
+        } else {
+            out.push('?');
+            break;
+        }
+    }
+    Ok(pystr::new_str(&out))
+}
+
+/// normalize_path(path): lexical normalisation of a path (dot segments, repeated
+/// separators; a leading "//" but not "///" is kept). (capi2)
+fn normalize_path(_m: &PyObject, p: &PyObject) -> PyResult {
+    let s: Vec<u32> = if pystr::is_str(p) { pystr::str_data(p).iter().collect() } else { raise!(TypeError, "normalize_path() argument must be str") };
+    let slash = '/' as u32;
+    let lead = if s.len() >= 2 && s[0] == slash && s[1] == slash && s.get(2) != Some(&slash) { 2 } else if s.first() == Some(&slash) { 1 } else { 0 };
+    let mut parts: Vec<&[u32]> = Vec::new();
+    for comp in s[lead..].split(|&c| c == slash) {
+        if comp.is_empty() || comp == ['.' as u32] {
+            continue;
+        }
+        if comp == ['.' as u32, '.' as u32] {
+            if parts.last().is_some_and(|l| *l != ['.' as u32, '.' as u32]) {
+                parts.pop();
+                continue;
+            }
+            if lead > 0 {
+                continue;
+            }
+        }
+        parts.push(comp);
+    }
+    let mut out: Vec<u32> = vec![slash; lead];
+    for (i, comp) in parts.iter().enumerate() {
+        if i > 0 {
+            out.push(slash);
+        }
+        out.extend_from_slice(comp);
+    }
+    if out.is_empty() {
+        out.push('.' as u32);
+    }
+    Ok(pystr::from_codepoints(&out))
+}
+
+/// set_update(set, iterable) -> 0: in-place update of a (mutable) set. (capi2)
+fn set_update_fn(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    if args.len() != 2 {
+        raise!(TypeError, "set_update expected 2 arguments, got {}", args.len());
+    }
+    if !crate::types::set::is_set(args[0]) {
+        return Err(crate::errors::system_error("bad argument to internal function"));
+    }
+    crate::types::set::set_update(args[0], args[1])?;
+    Ok(int::new_int(0))
+}
+
+/// set_next_entry(set, pos) -> (1, next_pos, hash, item) or None at the end. (capi2)
+fn set_next_entry(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    if args.len() != 2 {
+        raise!(TypeError, "set_next_entry expected 2 arguments, got {}", args.len());
+    }
+    if !crate::types::set::is_anyset(args[0]) {
+        return Err(crate::errors::system_error("bad argument to internal function"));
+    }
+    let pos = ab::as_i64(args[1])?.max(0) as usize;
+    let items = crate::types::set::items_with_hash(args[0]);
+    match items.get(pos) {
+        Some((k, h)) => Ok(tuple::new_tuple(vec![int::new_int(1), int::new_int(pos as i64 + 1), int::new_int(*h as i64), k.clone()])),
+        None => Ok(none::none_ref()),
+    }
+}
+
 pub fn init() -> PyResult {
     let m = crate::types::module::new_module("_testinternalcapi")?;
     let d = crate::types::module::module_dict(&m);
@@ -513,6 +704,23 @@ pub fn init() -> PyResult {
         &d,
         crate::mdefs![
             ("has_inline_values", O, has_inline_values),
+            ("module_get_gc_hooks", O, module_get_gc_hooks),
+            ("get_configs", NOARGS, get_configs),
+            ("_pyerr_setkeyerror", O, pyerr_setkeyerror),
+            ("set_update", FAST, set_update_fn),
+            ("set_next_entry", FAST, set_next_entry),
+            ("normalize_path", O, normalize_path),
+            ("set_eval_frame_record", O, set_eval_frame_record),
+            ("set_eval_frame_interp", O, set_eval_frame_interp),
+            ("set_eval_frame_default", NOARGS, set_eval_frame_default),
+            ("_PyUnicode_TransformDecimalAndSpaceToASCII", O, transform_decimal_and_space),
+            ("gh_119213_getargs", FASTKW, gh_119213_getargs),
+            ("_py_cr_sum", FAST, py_cr_sum),
+            ("_py_cr_diff", FAST, py_cr_diff),
+            ("_py_rc_diff", FAST, py_rc_diff),
+            ("_py_cr_prod", FAST, py_cr_prod),
+            ("_py_cr_quot", FAST, py_cr_quot),
+            ("_py_rc_quot", FAST, py_rc_quot),
             ("pending_threadfunc", FASTKW, pending_threadfunc),
             ("tuple_from_pair", FAST, tuple_from_pair),
             ("tuple_from_pair_steal", FAST, tuple_from_pair),
@@ -550,9 +758,6 @@ pub fn init() -> PyResult {
             ("_PyTime_ObjectToTimespec", FAST, object_to_timespec),
             ("DecodeLocaleEx", FAST, decode_locale_ex),
             ("is_specialization_enabled", NOARGS, is_specialization_enabled),
-            ("set_eval_frame_record", O, set_eval_frame_record),
-            ("set_eval_frame_interp", O, set_eval_frame_interp),
-            ("set_eval_frame_default", NOARGS, set_eval_frame_default),
             ("get_rare_event_counters", NOARGS, get_rare_event_counters),
             ("reset_rare_event_counters", NOARGS, reset_rare_event_counters),
             ("get_co_localskinds", O, crate::types::code_introspect::get_co_localskinds),

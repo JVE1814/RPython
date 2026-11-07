@@ -91,7 +91,7 @@ fn unit_len(f: &[u8], i: usize) -> Option<usize> {
             _ => 2,
         },
         b'O' => match next {
-            Some(b'!') | Some(b'&') => 2,
+            Some(b'!') | Some(b'&') | Some(b'#') | Some(b'*') => 2,
             _ => 1,
         },
         b's' | b'z' | b'y' | b'w' | b'u' | b'Z' => match next {
@@ -129,21 +129,51 @@ unsafe fn no_buffer_raised(arg: &PyObject) -> bool {
     }
 }
 
-unsafe fn get_buffer(arg: &PyObject, view: *mut Py_buffer, writable: bool) -> Result<(), ()> {
+/// Err(true): the object exports a buffer, but not a C-contiguous one.
+unsafe fn get_buffer(arg: &PyObject, view: *mut Py_buffer, writable: bool) -> Result<(), bool> {
     unsafe {
         let flags = if writable { PYBUF_WRITABLE } else { 0 };
         if super::buffer::PyObject_CheckBuffer(arg.as_ptr()) == 0 {
-            return Err(());
+            return Err(false);
         }
         if PyObject_GetBuffer(arg.as_ptr(), view, flags) < 0 {
             clear_exc();
-            return Err(());
+            // a strided export means the buffer exists but is not contiguous
+            const PYBUF_FULL_RO: c_int = 0x0100 | 0x0010 | 0x0008 | 0x0004;
+            if PyObject_GetBuffer(arg.as_ptr(), view, PYBUF_FULL_RO | flags) == 0 {
+                PyBuffer_Release(view);
+                return Err(true);
+            }
+            clear_exc();
+            return Err(false);
         }
         if super::buffer::PyBuffer_IsContiguous(view, b'C' as c_char) == 0 {
             PyBuffer_Release(view);
-            return Err(());
+            return Err(true);
         }
         Ok(())
+    }
+}
+
+/// The low `bits` bits of the int `i` for an unsigned format unit. Values from the
+/// signed minimum to the unsigned maximum of that width convert silently; anything
+/// else still wraps but is deprecated (3.15).
+unsafe fn unsigned_wrap(i: &PyObject, bits: u32) -> Result<u64, ConvErr> {
+    unsafe {
+        let lo = -(1i128 << (bits - 1));
+        let hi = (1i128 << bits) - 1;
+        let in_range = int::as_i128(i).is_some_and(|v| v >= lo && v <= hi);
+        if !in_range {
+            let msg = format!("integer is out of range for an unsigned {}-bit C type; the value is truncated", bits);
+            if crate::modules::warnings::warn(crate::types::exceptions::DeprecationWarning(), &msg, 1).is_err() {
+                return Err(ConvErr::Raised);
+            }
+        }
+        let v = super::long::PyLong_AsUnsignedLongLongMask(i.as_ptr());
+        if v == u64::MAX && err_occurred() {
+            return Err(ConvErr::Raised);
+        }
+        Ok(if bits == 64 { v } else { v & ((1u64 << bits) - 1) })
     }
 }
 
@@ -188,16 +218,21 @@ unsafe fn convert_simple(ctx: &mut Ctx, u: &[u8], arg: &PyObject) -> CResult {
             b'h' => int_conv!(c_short, i16::MIN as c_long, i16::MAX as c_long, "signed short integer is less than minimum", "signed short integer is greater than maximum"),
             b'i' => int_conv!(c_int, i32::MIN as c_long, i32::MAX as c_long, "signed integer is less than minimum", "signed integer is greater than maximum"),
             b'B' | b'H' | b'I' => {
+                let p: *mut c_void = ctx.ptr();
                 if float::is_float(arg) {
                     let _ = type_error("'float' object cannot be interpreted as an integer");
-                    let _: *mut c_void = ctx.ptr();
                     return Err(ConvErr::Raised);
                 }
-                let p: *mut c_void = ctx.ptr();
-                let v = super::long::PyLong_AsUnsignedLongMask(arg.as_ptr());
-                if v == c_ulong::MAX && err_occurred() {
-                    return Err(ConvErr::Raised);
-                }
+                let i = match ab::index(arg) {
+                    Ok(i) => i,
+                    Err(_) => return Err(ConvErr::Raised),
+                };
+                let bits = match c {
+                    b'B' => 8,
+                    b'H' => 16,
+                    _ => 32,
+                };
+                let v = unsigned_wrap(&i, bits)?;
                 match c {
                     b'B' => *(p as *mut u8) = v as u8,
                     b'H' => *(p as *mut c_ushort) = v as c_ushort,
@@ -239,24 +274,15 @@ unsafe fn convert_simple(ctx: &mut Ctx, u: &[u8], arg: &PyObject) -> CResult {
             }
             b'k' | b'K' => {
                 let p: *mut c_void = ctx.ptr();
-                if !int::is_int(arg) {
-                    if ab::has_index(arg) {
-                        // ints only, but accept __index__ through a converted int (3.14+)
-                        let i = match ab::index(arg) {
-                            Ok(i) => i,
-                            Err(_) => return Err(ConvErr::Raised),
-                        };
-                        let v = super::long::PyLong_AsUnsignedLongLongMask(i.as_ptr());
-                        if c == b'k' {
-                            *(p as *mut c_ulong) = v as c_ulong;
-                        } else {
-                            *(p as *mut c_ulonglong) = v;
-                        }
-                        return Ok(());
-                    }
+                if !int::is_int(arg) && !ab::has_index(arg) {
                     return Err(must_be("int", arg));
                 }
-                let v = super::long::PyLong_AsUnsignedLongLongMask(arg.as_ptr());
+                // ints, and (3.14+) objects with __index__ through the int they convert to
+                let i = match ab::index(arg) {
+                    Ok(i) => i,
+                    Err(_) => return Err(ConvErr::Raised),
+                };
+                let v = unsigned_wrap(&i, 64)?;
                 if c == b'k' {
                     *(p as *mut c_ulong) = v as c_ulong;
                 } else {
@@ -392,7 +418,11 @@ unsafe fn convert_simple(ctx: &mut Ctx, u: &[u8], arg: &PyObject) -> CResult {
                         if no_buffer_raised(arg) {
                             return Err(ConvErr::Raised);
                         }
-                        if get_buffer(arg, view, false).is_err() {
+                        if let Err(noncontig) = get_buffer(arg, view, false) {
+                            if noncontig {
+                                let _ = crate::errors::new_err(crate::types::exceptions::BufferError(), "argument is not a C-contiguous buffer");
+                                return Err(ConvErr::Raised);
+                            }
                             return Err(must_be(
                                 match c {
                                     b's' => "str or bytes-like object",
@@ -618,7 +648,10 @@ unsafe fn convert_item(ctx: &mut Ctx, u: &[u8], arg: &PyObject) -> CResult {
         if !is_seq {
             return Err(ConvErr::Msg(format!("must be {}-item tuple, not {}", n, if none::is_none(arg) { "None".into() } else { tname(arg) })));
         }
-        if !tuple::is_tuple(arg) && inner.iter().any(|c| b"OSUY".contains(c)) {
+        // units that keep borrowed references need a tuple: another sequence is
+        // (deprecatedly) copied into one, and reported as such
+        let as_tuple = tuple::is_tuple(arg) || inner.iter().any(|c| b"OSUY".contains(c));
+        if !tuple::is_tuple(arg) && as_tuple {
             if crate::modules::warnings::warn(
                 crate::types::exceptions::DeprecationWarning(),
                 &format!("argument must be {}-item tuple, not {}", n, tname(arg)),
@@ -636,7 +669,7 @@ unsafe fn convert_item(ctx: &mut Ctx, u: &[u8], arg: &PyObject) -> CResult {
         if len != n {
             return Err(ConvErr::Msg(format!(
                 "must be {} of length {}, not {}",
-                if tuple::is_tuple(arg) { "tuple" } else { "sequence" },
+                if as_tuple { "tuple" } else { "sequence" },
                 n,
                 len
             )));
@@ -935,9 +968,32 @@ unsafe fn parse_keywords(args: &[*mut PyObject], kw: Kw, fmt: *const c_char, kwl
         let mut conflict: Vec<Option<(usize, String)>> = vec![None; nkw];
         for i in pos..len {
             let Some(name) = names[i].as_ref() else { continue };
-            let Ok(namestr) = std::str::from_utf8(name) else { continue };
+            let namestr = match std::str::from_utf8(name) {
+                Ok(s) => s,
+                Err(e) => {
+                    // a name that must be looked up among the keywords has to decode
+                    if i >= nargs && nkw > 0 {
+                        let start = e.valid_up_to();
+                        let end = start + e.error_len().unwrap_or(name.len() - start);
+                        let _ = crate::types::exceptions::unicode_decode_error("utf-8", name, start, end, "invalid continuation byte");
+                        return 0;
+                    }
+                    continue;
+                }
+            };
             for (j, (key, val)) in pairs.iter().enumerate() {
-                if pystr::str_eq_ascii(key, namestr) || pystr::to_string_strict(key).as_deref() == Some(namestr) {
+                // keywords match like dict lookups: an exact str by content, a str subclass
+                // by hash and its own __eq__
+                let hit = if pystr::is_str_exact(key) {
+                    pystr::str_eq_ascii(key, namestr) || pystr::to_string_strict(key).as_deref() == Some(namestr)
+                } else {
+                    let n = pystr::new_str(namestr);
+                    let same_hash = matches!((ab::hash(key), ab::hash(&n)), (Ok(a), Ok(b)) if a == b);
+                    let r = same_hash && ab::rich_eq(key, &n).unwrap_or(false);
+                    clear_exc();
+                    r
+                };
+                if hit {
                     if used[j] {
                         continue;
                     }
@@ -961,11 +1017,9 @@ unsafe fn parse_keywords(args: &[*mut PyObject], kw: Kw, fmt: *const c_char, kwl
         }
         if let Some(j) = used.iter().position(|u| !u) {
             let key = &pairs[j].0;
-            // a str subclass whose __eq__ matches a keyword name is reported differently
-            let bad_sub = !pystr::is_str_exact(key)
-                && names.iter().flatten().filter_map(|n| std::str::from_utf8(n).ok()).any(|n| {
-                    ab::rich_eq(key, &pystr::new_str(n)).unwrap_or(false) || pystr::to_string_lossy(key) == n
-                });
+            // a leftover key that spells a parameter name (a str subclass that failed the
+            // lookup) is reported differently from an unknown name
+            let bad_sub = names.iter().flatten().filter(|n| !n.is_empty()).filter_map(|n| std::str::from_utf8(n).ok()).any(|n| pystr::to_string_strict(key).as_deref() == Some(n));
             clear_exc();
             if bad_sub {
                 let _ = type_error(&format!("invalid keyword argument for {}{}", if f.fname.is_none() { "this function" } else { &fnm }, fsuf));
@@ -979,15 +1033,14 @@ unsafe fn parse_keywords(args: &[*mut PyObject], kw: Kw, fmt: *const c_char, kwl
                 }
                 let rep = super::unicode::PyUnicode_FromObject(key.as_ptr());
                 let k2 = if rep.is_null() { clear_exc(); key.clone() } else { PyRef::from_raw(rep) };
-                let _ = crate::errors::new_err(
-                    crate::types::exceptions::TypeError(),
-                    &format!(
-                        "{}{} got an unexpected keyword argument '{}'",
-                        if f.fname.is_none() { "this function".to_string() } else { fnm.clone() },
-                        fsuf,
-                        pystr::to_string_lossy(&k2)
-                    ),
-                );
+                // the message embeds the key itself (it may hold lone surrogates)
+                let head = pystr::new_str(&format!(
+                    "{}{} got an unexpected keyword argument '",
+                    if f.fname.is_none() { "this function".to_string() } else { fnm.clone() },
+                    fsuf
+                ));
+                let msg = pystr::concat(&pystr::concat(&head, &k2), &pystr::new_str("'"));
+                let _ = crate::errors::set_err_obj(crate::types::exceptions::TypeError(), msg);
             }
             return 0;
         }
@@ -1060,6 +1113,28 @@ pub unsafe extern "C" fn _PyArg_ParseTuple_SizeT(args: *mut PyObject, fmt: *cons
         let Some(a) = tuple_args(args) else { return 0 };
         parse_positional(a, fmt, &mut ap, None)
     }
+}
+// stable-ABI-only "_SizeT" variants (Py_ssize_t lengths are the only kind now) (capi2)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _PyArg_VaParse_SizeT(args: *mut PyObject, fmt: *const c_char, mut ap: VaList) -> c_int {
+    unsafe {
+        let Some(a) = tuple_args(args) else { return 0 };
+        parse_positional(a, fmt, &mut ap, None)
+    }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _PyArg_Parse_SizeT(arg: *mut PyObject, fmt: *const c_char, mut ap: ...) -> c_int {
+    unsafe {
+        if arg.is_null() {
+            let _ = bad_internal();
+            return 0;
+        }
+        parse_positional(&[arg], fmt, &mut ap, Some(&*arg))
+    }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _PyArg_VaParseTupleAndKeywords_SizeT(args: *mut PyObject, kw: *mut PyObject, fmt: *const c_char, kwlist: *const *const c_char, ap: VaList) -> c_int {
+    unsafe { PyArg_VaParseTupleAndKeywords(args, kw, fmt, kwlist, ap) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyArg_VaParse(args: *mut PyObject, fmt: *const c_char, mut ap: VaList) -> c_int {

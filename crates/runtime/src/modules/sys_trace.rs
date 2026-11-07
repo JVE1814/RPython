@@ -76,9 +76,8 @@ pub static MON_ANY: AtomicU32 = AtomicU32::new(0);
 pub static TRACERS: AtomicUsize = AtomicUsize::new(0);
 
 pub fn recompute_tracing() {
-    // (core6) the PEP 523 test hook must see every frame: like tracing, it keeps
-    // execution out of compiled code
-    let any = MON_ANY.load(Acquire) != 0 || TRACERS.load(Acquire) > 0 || crate::modules::testinternalcapi::eval_hook_active();
+    // (capi2) an observe-every-frame PEP 523 hook needs the same "no compiled code" mode
+    let any = MON_ANY.load(Acquire) != 0 || TRACERS.load(Acquire) > 0 || crate::interp::pep523::forces_interpreter();
     crate::modules::sys::TRACING.store(any, Release);
 }
 

@@ -100,6 +100,10 @@ pub unsafe extern "C" fn PyImport_ImportModule(name: *const c_char) -> *mut PyOb
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyImport_Import(name: *mut PyObject) -> *mut PyObject {
     unsafe {
+        if name.is_null() {
+            let _ = bad_internal();
+            return std::ptr::null_mut();
+        }
         ret((|| -> PyResult {
             let n = &*name;
             let b = crate::builtins::builtins_module();
@@ -126,6 +130,10 @@ pub unsafe extern "C" fn PyImport_ImportModuleLevelObject(
     unsafe {
         if name.is_null() {
             let _ = value_error("Empty module name");
+            return std::ptr::null_mut();
+        }
+        if !globals.is_null() && !dict::is_dict(&*globals) {
+            let _ = type_error("globals must be a dict");
             return std::ptr::null_mut();
         }
         let fl = opt(fromlist).unwrap_or(none::none());
@@ -213,7 +221,20 @@ pub unsafe extern "C" fn PyImport_GetMagicTag() -> *const c_char {
 }
 
 pub(crate) unsafe fn exec_code_module(name: &PyObject, code: &PyObject, pathname: Option<&PyObject>) -> PyResult {
+    unsafe { exec_code_module_paths(name, code, pathname, None) }
+}
+
+/// Run `code` in module `name` (created in sys.modules if needed). The module gets a
+/// spec, loader and `__file__` for the source path: `pathname`, else the source of the
+/// cached file `cpathname`, else the code's filename. (capi2)
+pub(crate) unsafe fn exec_code_module_paths(name: &PyObject, code: &PyObject, pathname: Option<&PyObject>, cpathname: Option<&PyObject>) -> PyResult {
     let d = crate::modules::sys::modules_dict();
+    // the import machinery treats the name as a dotted str (an unhashable name already
+    // fails the sys.modules lookup with TypeError)
+    if !pystr::is_str(name) {
+        ab::hash(name)?;
+        return Err(crate::err!(AttributeError, "'{}' object has no attribute 'rpartition'", tname(name)));
+    }
     let m = match dict::get_item(&d, name)? {
         Some(m) => m,
         None => {
@@ -226,8 +247,23 @@ pub(crate) unsafe fn exec_code_module(name: &PyObject, code: &PyObject, pathname
     if dict::get_item_rs(&md, "__builtins__").is_none() {
         dict::set_item_str(&md, "__builtins__", &crate::builtins::builtins_module())?;
     }
-    if let Some(p) = pathname {
-        dict::set_item_str(&md, "__file__", p)?;
+    let ext = crate::import::import_absolute("importlib._bootstrap_external")?;
+    let path: PyRef = match (pathname, cpathname) {
+        (Some(p), _) => p.to_ref(),
+        (None, Some(c)) => match ab::call(&*ab::getattr_str(&ext, "source_from_cache")?, &[c]) {
+            Ok(p) => p,
+            Err(_) => {
+                clear_exc();
+                c.to_ref()
+            }
+        },
+        (None, None) => ab::getattr_str(code, "co_filename")?,
+    };
+    let cp = cpathname.map(|c| c.to_ref()).unwrap_or_else(none::none_ref);
+    let fix_up = ab::getattr_str(&ext, "_fix_up_module")?;
+    if let Err(e) = ab::call(&fix_up, &[&md, name, &path, &cp]) {
+        let _ = dict::del_item(&d, name);
+        return Err(e);
     }
     if let Err(e) = crate::interp::eval_code(code, &md, Some(&md)) {
         let _ = dict::del_item(&d, name);
@@ -238,16 +274,23 @@ pub(crate) unsafe fn exec_code_module(name: &PyObject, code: &PyObject, pathname
         None => Err(crate::err!(ImportError, "Loaded module {} not found in sys.modules", pystr::to_string_lossy(name))),
     }
 }
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyImport_ExecCodeModuleObject(name: *mut PyObject, co: *mut PyObject, pathname: *mut PyObject, _cpathname: *mut PyObject) -> *mut PyObject {
-    unsafe { ret(exec_code_module(&*name, &*co, opt(pathname))) }
+/// A path argument of the char* ExecCodeModule variants (filesystem encoding).
+unsafe fn fs_path_arg(p: *const c_char) -> PyResult<Option<PyRef>> {
+    unsafe { if p.is_null() { Ok(None) } else { super::unicode::decode_fs(CStr::from_ptr(p).to_bytes()).map(Some) } }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyImport_ExecCodeModuleWithPathnames(name: *const c_char, co: *mut PyObject, pathname: *const c_char, _cpathname: *const c_char) -> *mut PyObject {
+pub unsafe extern "C" fn PyImport_ExecCodeModuleObject(name: *mut PyObject, co: *mut PyObject, pathname: *mut PyObject, cpathname: *mut PyObject) -> *mut PyObject {
+    unsafe { ret(exec_code_module_paths(&*name, &*co, opt(pathname), opt(cpathname))) }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyImport_ExecCodeModuleWithPathnames(name: *const c_char, co: *mut PyObject, pathname: *const c_char, cpathname: *const c_char) -> *mut PyObject {
     unsafe {
-        let Ok(n) = cstr_obj(name) else { return std::ptr::null_mut() };
-        let p = if pathname.is_null() { None } else { cstr_obj(pathname).ok() };
-        ret(exec_code_module(&n, &*co, p.as_deref()))
+        ret((|| -> PyResult {
+            let n = cstr_obj(name)?;
+            let p = fs_path_arg(pathname)?;
+            let c = fs_path_arg(cpathname)?;
+            exec_code_module_paths(&n, &*co, p.as_deref(), c.as_deref())
+        })())
     }
 }
 #[unsafe(no_mangle)]
@@ -309,12 +352,41 @@ pub unsafe extern "C" fn PyImport_ExtendInittab(newtab: *mut InittabEntry) -> c_
     }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyImport_ImportFrozenModuleObject(_name: *mut PyObject) -> c_int {
-    0 // no frozen modules
+pub unsafe extern "C" fn PyImport_ImportFrozenModuleObject(name: *mut PyObject) -> c_int {
+    unsafe {
+        // 1: found and executed, 0: not a frozen module, -1: error (capi2)
+        if name.is_null() || !pystr::is_str(&*name) {
+            return 0;
+        }
+        let n = pystr::to_string_lossy(&*name);
+        let Some(e) = crate::frozen::lookup(&n, true) else { return 0 };
+        let r = (|| -> PyResult<()> {
+            let code = crate::modules::_imp::frozen_code(e)?;
+            let m = from_c(add_module(&*name))?;
+            let md = tmod::module_dict(&m);
+            if dict::get_item_rs(&md, "__builtins__").is_none() {
+                dict::set_item_str(&md, "__builtins__", &crate::builtins::builtins_module())?;
+            }
+            if e.is_package {
+                dict::set_item_str(&md, "__path__", &crate::types::list::new_list(vec![]))?;
+            }
+            crate::interp::eval_code(&code, &md, Some(&md))?;
+            Ok(())
+        })();
+        match r {
+            Ok(()) => 1,
+            Err(_) => -1,
+        }
+    }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyImport_ImportFrozenModule(_name: *const c_char) -> c_int {
-    0
+pub unsafe extern "C" fn PyImport_ImportFrozenModule(name: *const c_char) -> c_int {
+    unsafe {
+        match cstr_obj(name) {
+            Ok(n) => PyImport_ImportFrozenModuleObject(n.as_ptr()),
+            Err(_) => -1,
+        }
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyImport_CreateModuleFromInitfunc(spec: *mut PyObject, initfunc: Option<unsafe extern "C" fn() -> *mut PyObject>) -> *mut PyObject {

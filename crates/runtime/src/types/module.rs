@@ -18,6 +18,8 @@ pub struct PyModuleObject {
     pub md_weaklist: *mut PyObject,
     pub md_name: *mut PyObject,
     pub md_token: *mut c_void,
+    /// created by PyModule_FromSlotsAndSpec: md_def is a private synthesized def
+    pub md_from_slots: bool,
 }
 
 #[unsafe(no_mangle)]

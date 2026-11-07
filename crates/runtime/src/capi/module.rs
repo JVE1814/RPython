@@ -14,10 +14,6 @@ pub const MOD_EXEC: c_int = 85;
 pub const MOD_MULTIPLE_INTERPRETERS: c_int = 86;
 pub const MOD_GIL: c_int = 87;
 
-#[inline]
-fn norm_mod_slot(id: c_int) -> c_int {
-    if (1..=4).contains(&id) { id + 83 } else { id }
-}
 
 unsafe fn md<'a>(m: *mut PyObject) -> &'a mut PyModuleObject {
     unsafe { &mut *(m as *mut PyModuleObject) }
@@ -25,7 +21,7 @@ unsafe fn md<'a>(m: *mut PyObject) -> &'a mut PyModuleObject {
 
 pub(crate) unsafe fn module_token(m: *mut PyModuleObject) -> *mut c_void {
     unsafe {
-        if !(*m).md_token.is_null() {
+        if !(*m).md_token.is_null() || (*m).md_from_slots {
             return (*m).md_token;
         }
         (*m).md_def as *mut c_void
@@ -134,7 +130,10 @@ pub unsafe extern "C" fn PyModule_GetFilename(m: *mut PyObject) -> *const c_char
 pub unsafe extern "C" fn PyModule_GetDef(m: *mut PyObject) -> *mut PyModuleDef {
     unsafe {
         if m.is_null() || !tmod::is_module(&*m) {
-            let _ = bad_internal();
+            let _ = chk_module(m);
+            return std::ptr::null_mut();
+        }
+        if md(m).md_from_slots {
             return std::ptr::null_mut();
         }
         md(m).md_def
@@ -161,7 +160,13 @@ pub unsafe extern "C" fn PyModule_GetStateSize(m: *mut PyObject, result: *mut Py
         let Ok(_) = chk_module(m) else { return -1 };
         let d = md(m).md_def;
         if !d.is_null() {
-            *result = (*d).m_size.max(0);
+            *result = (*d).m_size.max(-1);
+        } else if let Some(n) = dict::get_item_rs(&tmod::module_dict(&*m), "__name__").filter(|n| pystr::is_str(n)) {
+            // modules built into the runtime behave like single-phase modules
+            let n = pystr::to_string_lossy(&n);
+            if crate::import::builtin_module_names().contains(&n.as_str()) && (n == "sys" || n == "builtins" || crate::import::is_builtin_module_object(&*m, &n)) {
+                *result = -1;
+            }
         }
         0
     }
@@ -178,6 +183,11 @@ pub unsafe extern "C" fn PyModule_GetToken(m: *mut PyObject, result: *mut *mut c
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyModule_GetToken_DuringGC(m: *mut PyObject, result: *mut *mut c_void) -> c_int {
     unsafe {
+        // no exception can be raised during GC: a non-module only gives -1
+        if m.is_null() || !tmod::is_module(&*m) {
+            *result = std::ptr::null_mut();
+            return -1;
+        }
         *result = module_token(m as *mut PyModuleObject);
         0
     }
@@ -284,30 +294,12 @@ pub unsafe extern "C" fn PyModule_FromDefAndSpec2(def: *mut PyModuleDef, spec: *
         ret((|| -> PyResult {
             let name = ab::getattr_str(&*spec, "name")?;
             let mut create: Option<unsafe extern "C" fn(*mut PyObject, *mut PyModuleDef) -> *mut PyObject> = None;
-            let mut seen_gil = false;
-            let mut seen_mi = false;
-            let mut s = (*def).m_slots;
-            while !s.is_null() && (*s).slot != 0 {
-                match norm_mod_slot((*s).slot) {
-                    MOD_CREATE => {
-                        if create.is_some() {
-                            return Err(system_error(&format!("module {} has multiple create slots", pystr::to_string_lossy(&name))));
-                        }
-                        create = Some(std::mem::transmute((*s).value));
-                    }
-                    MOD_EXEC => {}
-                    MOD_MULTIPLE_INTERPRETERS => {
-                        if seen_mi {
-                            return Err(system_error(&format!("module {} has more than one 'multiple interpreters' slots", pystr::to_string_lossy(&name))));
-                        }
-                        seen_mi = true;
-                    }
-                    MOD_GIL => {
-                        if seen_gil {
-                            return Err(system_error(&format!("module {} has more than one 'gil' slot", pystr::to_string_lossy(&name))));
-                        }
-                        seen_gil = true;
-                    }
+            let mut walker = super::slots::Walker::new(super::slots::Kind::Module, super::slots::Api::Def, format!("module {}", pystr::to_string_lossy(&name)));
+            walker.walk_mod_slots((*def).m_slots, 0)?;
+            for e in &walker.out {
+                let value = e.value;
+                match e.id as c_int {
+                    MOD_CREATE => create = Some(std::mem::transmute(value)),
                     // slots that restate a PyModuleDef field must agree with it
                     id @ (100..=106 | 110) => {
                         let d = &*def;
@@ -321,7 +313,7 @@ pub unsafe extern "C" fn PyModule_FromDefAndSpec2(def: *mut PyModuleDef, spec: *
                             106 => (d.m_free.map_or(0, |f| f as usize), "Py_mod_state_free"),
                             _ => (def as usize, "Py_mod_token"),
                         };
-                        if (*s).value as usize != field {
+                        if value as usize != field {
                             return Err(system_error(&format!(
                                 "module {}: {} slot contradicts the PyModuleDef field",
                                 pystr::to_string_lossy(&name),
@@ -329,12 +321,8 @@ pub unsafe extern "C" fn PyModule_FromDefAndSpec2(def: *mut PyModuleDef, spec: *
                             )));
                         }
                     }
-                    other if other >= 0 && other <= 110 => {}
-                    other => {
-                        return Err(system_error(&format!("module {} uses unknown slot ID {}", pystr::to_string_lossy(&name), other)));
-                    }
+                    _ => {}
                 }
-                s = s.add(1);
             }
             let m = match create {
                 Some(c) => {
@@ -400,10 +388,11 @@ pub unsafe extern "C" fn PyModule_ExecDef(m: *mut PyObject, def: *mut PyModuleDe
             if tmod::is_module(&*m) {
                 alloc_state(&*m, (*def).m_size)?;
             }
-            let mut s = (*def).m_slots;
-            while !s.is_null() && (*s).slot != 0 {
-                if norm_mod_slot((*s).slot) == MOD_EXEC {
-                    let f: unsafe extern "C" fn(*mut PyObject) -> c_int = std::mem::transmute((*s).value);
+            let mut walker = super::slots::Walker::new(super::slots::Kind::Module, super::slots::Api::Def, "module".into());
+            walker.walk_mod_slots((*def).m_slots, 0)?;
+            for e in &walker.out {
+                if e.id as c_int == MOD_EXEC {
+                    let f: unsafe extern "C" fn(*mut PyObject) -> c_int = std::mem::transmute(e.value);
                     let rc = f(m);
                     if rc != 0 {
                         if !err_occurred() {
@@ -425,7 +414,6 @@ pub unsafe extern "C" fn PyModule_ExecDef(m: *mut PyObject, def: *mut PyModuleDe
                         return Err(PyErr);
                     }
                 }
-                s = s.add(1);
             }
             Ok(())
         })();
@@ -447,50 +435,33 @@ pub unsafe extern "C" fn PyModule_Exec(m: *mut PyObject) -> c_int {
         PyModule_ExecDef(m, def)
     }
 }
-
 /// PEP 793: create a module from a PySlot array.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyModule_FromSlotsAndSpec(slots: *const super::typeobj::PySlot, spec: *mut PyObject) -> *mut PyObject {
     unsafe {
-        let mut flat = Vec::new();
-        super::typeobj::flatten_slots(slots, &mut flat);
-        // synthesise a (leaked) PyModuleDef so the module object's dealloc/traverse work
+        // the spec's name is looked up first (a spec without one is an AttributeError)
+        let name = match ab::getattr_str(&*spec, "name") {
+            Ok(n) => n,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let mut walker = super::slots::Walker::new(super::slots::Kind::Module, super::slots::Api::Slots, format!("module {}", pystr::to_string_lossy(&name)));
+        if walker.walk_slots(slots, 0).is_err() {
+            return std::ptr::null_mut();
+        }
+        if walker.out.is_empty() {
+            let _ = system_error(&format!("module {}: empty slot array", pystr::to_string_lossy(&name)));
+            return std::ptr::null_mut();
+        }
+        // synthesise a (leaked) PyModuleDef so the module object's dealloc/traverse work;
+        // the module does not expose it (PyModule_GetDef gives NULL)
         let def: *mut PyModuleDef = Box::into_raw(Box::new(std::mem::zeroed::<PyModuleDef>()));
         let mut mslots: Vec<PyModuleDef_Slot> = Vec::new();
         let mut token: *mut c_void = std::ptr::null_mut();
-        // the slots standing for PyModuleDef fields (and exec) may appear once, and only the
-        // state size may be NULL/0
-        let slot_name = |id: u16| -> Option<&'static str> {
-            Some(match id {
-                85 => "Py_mod_exec",
-                100 => "Py_mod_name",
-                101 => "Py_mod_doc",
-                102 => "Py_mod_state_size",
-                103 => "Py_mod_methods",
-                104 => "Py_mod_state_traverse",
-                105 => "Py_mod_state_clear",
-                106 => "Py_mod_state_free",
-                110 => "Py_mod_token",
-                _ => return None,
-            })
-        };
-        let mut seen: Vec<u16> = Vec::new();
-        for &(id, _, p) in &flat {
-            if let Some(n) = slot_name(id as u16) {
-                if seen.contains(&(id as u16)) {
-                    let _ = system_error(&format!("module has multiple {} slots", n));
-                    return std::ptr::null_mut();
-                }
-                seen.push(id as u16);
-                if p.is_null() && id != 102 {
-                    let _ = system_error(&format!("module slot {} must not be NULL", n));
-                    return std::ptr::null_mut();
-                }
-            }
-        }
-        for (id, flags, p) in flat {
-            match id {
-                84..=87 => mslots.push(PyModuleDef_Slot { slot: id as c_int, value: p }),
+        let mut abi: Vec<*mut c_void> = Vec::new();
+        for e in &walker.out {
+            let p = e.value;
+            match e.id {
+                84..=87 => mslots.push(PyModuleDef_Slot { slot: e.id as c_int, value: p }),
                 100 => (*def).m_name = p as *const c_char,
                 101 => (*def).m_doc = p as *const c_char,
                 102 => (*def).m_size = p as Py_ssize_t,
@@ -498,18 +469,14 @@ pub unsafe extern "C" fn PyModule_FromSlotsAndSpec(slots: *const super::typeobj:
                 104 => (*def).m_traverse = std::mem::transmute(p),
                 105 => (*def).m_clear = std::mem::transmute(p),
                 106 => (*def).m_free = std::mem::transmute(p),
-                109 => {
-                    if super::modsupport::PyABIInfo_Check(p as *mut super::modsupport::PyABIInfo, (*def).m_name) < 0 {
-                        return std::ptr::null_mut();
-                    }
-                }
+                109 => abi.push(p),
                 110 => token = p,
-                _ => {
-                    if flags & 1 == 0 {
-                        let _ = system_error(&format!("invalid slot ID {} for a module", id));
-                        return std::ptr::null_mut();
-                    }
-                }
+                _ => {}
+            }
+        }
+        for p in abi {
+            if super::modsupport::PyABIInfo_Check(p as *mut super::modsupport::PyABIInfo, (*def).m_name) < 0 {
+                return std::ptr::null_mut();
             }
         }
         mslots.push(PyModuleDef_Slot { slot: 0, value: std::ptr::null_mut() });
@@ -517,8 +484,9 @@ pub unsafe extern "C" fn PyModule_FromSlotsAndSpec(slots: *const super::typeobj:
         FROM_SLOTS.with(|c| c.set(true));
         let m = PyModule_FromDefAndSpec2(def, spec, 1013);
         FROM_SLOTS.with(|c| c.set(false));
-        if !m.is_null() && tmod::is_module(&*m) {
+        if !m.is_null() && tmod::is_module(&*m) && md(m).md_def == def {
             md(m).md_token = token;
+            md(m).md_from_slots = true;
         }
         m
     }

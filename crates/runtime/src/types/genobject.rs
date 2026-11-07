@@ -249,7 +249,7 @@ pub fn gen_send_fast(o: &PyObject, arg: *mut PyObject) -> PyResult<SendResult> {
     let mut r = None;
     if !fp.is_null() {
         let f = unsafe { &mut *fp };
-        if f.resume != 0 && !crate::modules::sys::tracing_active() && crate::interp::jit::genfast_enabled() {
+        if f.resume != 0 && !crate::modules::sys::tracing_active() && !crate::interp::pep523::forces_interpreter() && crate::interp::jit::genfast_enabled() {
             let ok = match f.state {
                 FrameState::Suspended => true,
                 FrameState::Created => arg.is_null() || arg == none::none().as_ptr(),
@@ -336,7 +336,7 @@ fn chain_enabled() -> bool {
 unsafe fn jit_send_chain(ts: &crate::threads::ThreadState, o: *mut PyObject, v: *mut PyObject) -> Option<(u32, *mut PyObject)> {
     use std::sync::atomic::{AtomicBool, Ordering::*};
     unsafe {
-        if crate::modules::sys::tracing_active() || !chain_enabled() || !crate::interp::jit::genfast_enabled() {
+        if crate::modules::sys::tracing_active() || crate::interp::pep523::forces_interpreter() || !chain_enabled() || !crate::interp::jit::genfast_enabled() {
             return None;
         }
         let depth0 = ts.recursion_depth.get();
@@ -632,7 +632,7 @@ unsafe fn jit_send_one(ts: &crate::threads::ThreadState, o: *mut PyObject, v: *m
             FrameState::Created if v.is_null() || v == none => false,
             _ => return unclaim(),
         };
-        if crate::modules::sys::tracing_active() || !crate::interp::jit::genfast_enabled() {
+        if crate::modules::sys::tracing_active() || crate::interp::pep523::forces_interpreter() || !crate::interp::jit::genfast_enabled() {
             return unclaim();
         }
         let depth = ts.recursion_depth.get() + 1;

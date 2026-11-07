@@ -112,6 +112,9 @@ fn compilable(f: &Frame, cd: &CodeData) -> bool {
 /// Called by the interpreter when it (re)starts dispatching at `pc`.
 #[inline]
 pub fn try_run(ts: &ThreadState, f: &mut Frame, cd: &CodeData, pc: usize) -> Run {
+    if crate::interp::pep523::forces_interpreter() {
+        return Run::NotRun; // (capi2) every frame entry must reach eval_frame
+    }
     let c = cd.caches.jit.load(Acquire);
     if c.is_null() {
         if pc != 0 || !enabled() {
@@ -141,6 +144,9 @@ pub fn try_run(ts: &ThreadState, f: &mut Frame, cd: &CodeData, pc: usize) -> Run
 /// `try_run` (compiled code with an entry at the loop header exists).
 #[inline]
 pub fn osr_check(f: &mut Frame, cd: &CodeData, target: usize) -> bool {
+    if crate::interp::pep523::forces_interpreter() {
+        return false;
+    }
     let c = cd.caches.jit.load(Acquire);
     if !c.is_null() {
         let c = unsafe { &*c };
@@ -234,6 +240,7 @@ pub fn call_fast(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwnames:
         || co.co_flags as u32 & rpy_compiler::bytecode::co::OPTIMIZED == 0
         || co.co_kwonlyargcount != 0
         || crate::modules::sys::tracing_active()
+        || crate::interp::pep523::forces_interpreter()
     {
         return None;
     }
@@ -476,6 +483,7 @@ pub unsafe extern "C" fn h_call_py(base: *mut *mut PyObject, n: u64) -> u64 {
         if target == 0
             || ndef == usize::MAX
             || crate::modules::sys::tracing_active()
+        || crate::interp::pep523::forces_interpreter()
             || depth > ts.c.py_recursion_limit
             || crate::interp::stack_pointer() < ts.stack_soft_limit()
         {
@@ -533,7 +541,7 @@ pub fn resume(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> Result<P
     }
     let cd = crate::types::code::code_data(f.code());
     let c = cd.caches.jit.load(Acquire);
-    if c.is_null() || crate::modules::sys::tracing_active() {
+    if c.is_null() || crate::modules::sys::tracing_active() || crate::interp::pep523::forces_interpreter() {
         return Err(None);
     }
     let pc = f.next_instr as usize;
@@ -626,7 +634,7 @@ pub fn trampoline() -> usize {
 pub fn generator_entry(f: &Frame) -> usize {
     let cd = crate::types::code::code_data(f.code());
     let c = cd.caches.jit.load(Acquire);
-    if c.is_null() || crate::modules::sys::tracing_active() {
+    if c.is_null() || crate::modules::sys::tracing_active() || crate::interp::pep523::forces_interpreter() {
         return 0;
     }
     if bump_invocations(cd) {

@@ -49,6 +49,30 @@ fn seq_items(o: &PyObject, what: &str) -> PyResult<Vec<PyRef>> {
     }
 }
 
+/// The items of a sequence of paths by the sequence protocol (len + indexing), as a C
+/// argv array would be built. (capi2)
+fn path_sequence(o: &PyObject) -> PyResult<Vec<CString>> {
+    let n = ab::length(o)?;
+    if n > (isize::MAX as usize) / std::mem::size_of::<*const libc::c_char>() - 1 {
+        return Err(memory_error());
+    }
+    let mut v = Vec::new();
+    for i in 0..n {
+        let it = match ab::getitem(o, &int::new_int(i as i64)) {
+            Ok(x) => x,
+            Err(e) => {
+                if exc_matches(crate::types::exceptions::TypeError()) {
+                    clear_exc();
+                    raise!(TypeError, "'{}' object does not support indexing", tname(o));
+                }
+                return Err(e);
+            }
+        };
+        v.push(fs_convert(&it)?);
+    }
+    Ok(v)
+}
+
 fn int_of(o: &PyObject) -> PyResult<i64> {
     let v = ab::index(o)?;
     match int::as_i64(&v) {
@@ -279,6 +303,8 @@ fn f_fork_exec(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     if args.len() != 22 && args.len() != 23 {
         raise!(TypeError, "fork_exec expected 22 arguments, got {}", args.len());
     }
+    // the executable list is converted first (a bad one is reported before anything else)
+    let exec_list = path_sequence(args[1])?;
     let argv: Vec<CString> = if none::is_none(args[0]) {
         Vec::new()
     } else {
@@ -291,10 +317,6 @@ fn f_fork_exec(_m: &PyObject, args: &[&PyObject]) -> PyResult {
         }
         v
     };
-    let mut exec_list = Vec::new();
-    for it in seq_items(args[1], "executable_list must be a sequence")? {
-        exec_list.push(fs_convert(&it)?);
-    }
     let close_fds = ab::is_true(args[2])?;
     if !tuple::is_tuple(args[3]) {
         raise!(TypeError, "fork_exec() argument 4 must be tuple, not {}", tname(args[3]));
