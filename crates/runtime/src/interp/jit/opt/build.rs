@@ -2154,6 +2154,13 @@ impl<'a> B<'a> {
             kind::INSTANCE_DICT => s.b < (1 << 20),
             kind::SLOT => true,
             kind::CLASS_ATTR => unsafe { (*(s.c as *mut PyObject)).ty().tp_descr_get.is_none() },
+            // (scale2) a class attribute (no descriptor) that instances with inline
+            // values could shadow (`self.LIMIT`): the shape must lack the name. Lets
+            // methods reading class constants through self be inlined.
+            kind::CLASS_ATTR_SHADOWABLE => unsafe {
+                (*(s.c as *mut PyObject)).ty().tp_descr_get.is_none()
+                    && crate::interp::cache::type_for_tag(s.a).is_some_and(|tp| (*(tp as *mut PyTypeObject)).tp_flags & crate::ffi::Py_TPFLAGS_INLINE_VALUES != 0)
+            },
             _ => false,
         };
         let cases: Vec<_> = es.iter().copied().filter(|s| ok(s)).collect();
@@ -2166,6 +2173,9 @@ impl<'a> B<'a> {
             // monomorphic slot / class attribute: no slow path needed
             let s = cases[0];
             let p = self.guard_tag(1, s.a as u32, snap);
+            if s.kind == kind::CLASS_ATTR_SHADOWABLE {
+                self.check_not_shadowed(p, name, Fail::Deopt(snap), snap);
+            }
             let k = self.st.stack.len() - 1;
             if s.kind == kind::SLOT {
                 let x = self.v(Class::G);
@@ -2219,6 +2229,10 @@ impl<'a> B<'a> {
                     self.emit(Inst::Load(x, Base::V(p), s.c as i32));
                     self.check(Cond::Test(x, Opnd::V(x), Cc::E), f);
                     x
+                }
+                kind::CLASS_ATTR_SHADOWABLE => {
+                    self.check_not_shadowed(p, name, f, snap);
+                    self.imm(s.c as i64)
                 }
                 _ => self.imm(s.c as i64),
             };
