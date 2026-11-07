@@ -116,20 +116,27 @@ unsafe extern "C" fn cfunction_vectorcall(
         // __qualname__ and pickling) but are called without a self.
         let slf = if (*(*ff).m_ml).ml_flags & METH_STATIC != 0 && !(*ff).m_self.is_null() && is_type(&*(*ff).m_self) { std::ptr::null_mut() } else { (*ff).m_self };
         if nkw != 0 && (*(*ff).m_ml).ml_flags & METH_KEYWORDS == 0 {
-            // named like other call errors: `module.name()` for functions outside builtins
-            let mut n = cfunction_qualname(fo);
-            if self_is_meaningful(fo).is_none() {
-                if let Some(m) = (!(*ff).m_module.is_null()).then(|| &*(*ff).m_module).filter(|m| crate::types::str::is_str(m)) {
-                    let m = crate::types::str::to_string_lossy(m);
-                    if m != "builtins" {
-                        n = format!("{}.{}", m, n);
-                    }
-                }
-            }
-            return into_c(Err(crate::err!(TypeError, "{}() takes no keyword arguments", n)));
+            return into_c(Err(crate::err!(TypeError, "{}() takes no keyword arguments", cfunction_func_str(fo))));
         }
-        into_c(crate::methods::call_methoddef((*ff).m_ml, slf, cls, all, kwnames, &|| cfunction_qualname(fo)))
+        into_c(crate::methods::call_methoddef((*ff).m_ml, slf, cls, all, kwnames, &|| cfunction_func_str(fo)))
     }
+}
+
+/// The function's name in call errors: `module.qualname` when its `__module__` is a str
+/// other than "builtins" (also with a meaningful self: cffi's `lib` functions read
+/// `_mod.Lib.foo0() takes no arguments`), else the qualified name.
+fn cfunction_func_str(fo: &PyObject) -> String {
+    let n = cfunction_qualname(fo);
+    unsafe {
+        let m = (*fptr(fo)).m_module;
+        if !m.is_null() && crate::types::str::is_str(&*m) {
+            let m = crate::types::str::to_string_lossy(&*m);
+            if m != "builtins" {
+                return format!("{}.{}", m, n);
+            }
+        }
+    }
+    n
 }
 
 unsafe extern "C" fn cfunction_dealloc(op: *mut PyObject) {
@@ -170,7 +177,7 @@ unsafe extern "C" fn cfunction_repr(op: *mut PyObject) -> *mut PyObject {
             Some(slf) => format!(
                 "<built-in method {} of {} object at {:p}>",
                 cfunction_name(o),
-                type_name(slf.ty()),
+                tp_name_of(slf),
                 slf.as_ptr()
             ),
         };
