@@ -1017,7 +1017,16 @@ pub fn cell_get(c: &PyObject) -> Option<PyRef> {
 #[inline]
 pub fn cell_set(c: &PyObject, v: Option<PyRef>) {
     unsafe {
-        crate::qsbr::swap_field(&raw mut (*(c.as_ptr() as *mut PyCellObject)).ob_ref, v.map_or(std::ptr::null_mut(), |v| v.into_raw()));
+        let slot = &raw mut (*(c.as_ptr() as *mut PyCellObject)).ob_ref;
+        let new = v.map_or(std::ptr::null_mut(), |v| v.into_raw());
+        if !crate::qsbr::multi_threaded() {
+            // no other reader can exist: a plain store (an atomic swap costs ~15% in a
+            // STORE_DEREF loop)
+            let old = std::ptr::replace(slot, new);
+            xdecref(old);
+            return;
+        }
+        crate::qsbr::swap_field(slot, new);
     }
 }
 unsafe extern "C" fn cell_dealloc(op: *mut PyObject) {
