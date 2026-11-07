@@ -518,6 +518,21 @@ pub unsafe fn free_storage(op: *mut PyObject) {
 
 pub unsafe extern "C" fn dict_dealloc(op: *mut PyObject) {
     unsafe {
+        let wm = crate::capi::dict::watched_mask(op);
+        if wm != 0 {
+            // the callbacks see a live dict: resurrect it for their duration
+            // (same protocol as gc::call_finalizer_from_dealloc)
+            let o = &*op;
+            o.ob_ref_local.store(1, std::sync::atomic::Ordering::Relaxed);
+            o.ob_tid.store(crate::object::thread_id(), std::sync::atomic::Ordering::Relaxed);
+            crate::capi::dict::notify(op, wm, crate::capi::dict::EV_DEALLOCATED, std::ptr::null_mut(), std::ptr::null_mut());
+            crate::capi::dict::forget_watched(op);
+            let local = o.ob_ref_local.load(std::sync::atomic::Ordering::Relaxed) - 1;
+            o.ob_ref_local.store(local, std::sync::atomic::Ordering::Relaxed);
+            if local != 0 || (o.ob_ref_shared.load(std::sync::atomic::Ordering::Relaxed) >> 2) != 0 {
+                return; // a callback kept it alive
+            }
+        }
         crate::gc::untrack(op);
         free_storage(op);
         let tp = (*op).type_ptr();
@@ -757,6 +772,11 @@ pub fn set_item(d: &PyObject, key: &PyObject, value: &PyObject) -> PyResult<()> 
 }
 
 pub fn set_item_hash(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) -> PyResult<()> {
+    let wm = crate::capi::dict::watched_mask(d.as_ptr());
+    if wm != 0 {
+        let ev = if contains_hash(d, key, h)? { crate::capi::dict::EV_MODIFIED } else { crate::capi::dict::EV_ADDED };
+        crate::capi::dict::notify(d.as_ptr(), wm, ev, key.as_ptr(), value.as_ptr());
+    }
     let (g, f) = find(d, key, h)?;
     let t = table(d);
     unsafe { incref(value.as_ptr()) };
@@ -782,6 +802,10 @@ pub fn set_item_hash(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) -
 
 /// Insert a key known not to be present (fresh dict build, e.g. copy). Steals nothing.
 pub fn insert_unique(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) {
+    let wm = crate::capi::dict::watched_mask(d.as_ptr());
+    if wm != 0 {
+        crate::capi::dict::notify(d.as_ptr(), wm, crate::capi::dict::EV_ADDED, key.as_ptr(), value.as_ptr());
+    }
     let g = ob_lock(d);
     let t = table(d);
     unsafe {
@@ -800,6 +824,10 @@ pub fn set_item_str(d: &PyObject, key: &str, value: &PyObject) -> PyResult<()> {
 
 /// d.setdefault(key, default) → the value now stored for key.
 pub fn setdefault_hash(d: &PyObject, key: &PyObject, h: isize, default: &PyObject) -> PyResult<PyRef> {
+    let wm = crate::capi::dict::watched_mask(d.as_ptr());
+    if wm != 0 && !contains_hash(d, key, h)? {
+        crate::capi::dict::notify(d.as_ptr(), wm, crate::capi::dict::EV_ADDED, key.as_ptr(), default.as_ptr());
+    }
     let (g, f) = find(d, key, h)?;
     let t = table(d);
     let r = match f {
@@ -832,6 +860,10 @@ pub fn del_item_hash(d: &PyObject, key: &PyObject, h: isize) -> PyResult<bool> {
 pub fn pop_item_hash(d: &PyObject, key: &PyObject, h: isize) -> PyResult<Option<PyRef>> {
     if dict_len(d) == 0 {
         return Ok(None);
+    }
+    let wm = crate::capi::dict::watched_mask(d.as_ptr());
+    if wm != 0 && contains_hash(d, key, h)? {
+        crate::capi::dict::notify(d.as_ptr(), wm, crate::capi::dict::EV_DELETED, key.as_ptr(), std::ptr::null_mut());
     }
     let (g, f) = find(d, key, h)?;
     match f {
@@ -868,6 +900,10 @@ pub fn remove_at(d: &PyObject, ix: usize, _h: isize) -> (*mut PyObject, *mut PyO
 }
 
 pub fn clear(d: &PyObject) {
+    let wm = crate::capi::dict::watched_mask(d.as_ptr());
+    if wm != 0 && dict_len(d) != 0 {
+        crate::capi::dict::notify(d.as_ptr(), wm, crate::capi::dict::EV_CLEARED, std::ptr::null_mut(), std::ptr::null_mut());
+    }
     let g = ob_lock(d);
     if unsafe { is_shared_empty(d) } {
         return;
@@ -1001,6 +1037,10 @@ pub fn merge_dict(d: &PyObject, other: &PyObject, overwrite: bool) -> PyResult<(
     }
     // Fast path: empty target, exact source → bulk copy (no lookups needed).
     if dict_len(d) == 0 && nentries(d) == 0 {
+        let wm = crate::capi::dict::watched_mask(d.as_ptr());
+        if wm != 0 {
+            crate::capi::dict::notify(d.as_ptr(), wm, crate::capi::dict::EV_CLONED, other.as_ptr(), std::ptr::null_mut());
+        }
         let items = items_hash_vec(other);
         let g = ob_lock(d);
         let t = table(d);
@@ -1054,6 +1094,13 @@ pub fn version(d: &PyObject) -> u64 {
 
 /// Pop the last item (LIFO), for popitem. Trims the entry array like CPython.
 pub fn pop_last(d: &PyObject) -> Option<(PyRef, PyRef)> {
+    let wm = crate::capi::dict::watched_mask(d.as_ptr());
+    if wm != 0 {
+        let last = { let _g = ob_lock(d); let t = table(d); t.entries()[..t.nentries].iter().rev().find(|e| !e.key.is_null()).map(|e| unsafe { PyRef::from_borrowed(e.key) }) };
+        if let Some(k) = last {
+            crate::capi::dict::notify(d.as_ptr(), wm, crate::capi::dict::EV_DELETED, k.as_ptr(), std::ptr::null_mut());
+        }
+    }
     let g = ob_lock(d);
     let t = table(d);
     let mut ix = t.nentries;

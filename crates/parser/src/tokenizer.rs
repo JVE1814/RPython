@@ -2193,6 +2193,16 @@ impl<'a> Iterator for TokenIter<'a> {
                 if t.ty == TokenType::ENDMARKER && self.extra {
                     pt.start = (t.lineno, 0);
                     pt.end = (t.lineno, 0);
+                } else if t.ty == TokenType::ENDMARKER {
+                    // (wheels2) without extra tokens the end marker sits on the last
+                    // source line, column -1, like the DEDENTs before it
+                    let src = self.lexer.src;
+                    let nl = src.matches('\n').count() as u32;
+                    let nlines = if src.is_empty() || src.ends_with('\n') { nl } else { nl + 1 };
+                    let ln = t.lineno.min(nlines.max(1));
+                    pt.start = (ln, -1);
+                    pt.end = (ln, -1);
+                    pt.line = raw_line_text(src, ln).to_string();
                 }
                 Some(Ok(pt))
             }

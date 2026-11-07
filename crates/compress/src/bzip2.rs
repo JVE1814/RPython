@@ -124,12 +124,17 @@ impl Encoder {
         self.run_len = 0;
     }
 
-    pub fn compress(&mut self, data: &[u8]) {
+    /// The stream header goes out with the first block (or at finish), so that
+    /// compress() returns nothing until a block is complete, like libbz2 (wheels2).
+    fn ensure_header(&mut self) {
         if !self.header_done {
             self.header_done = true;
             self.out.extend_from_slice(b"BZh");
             self.out.push(b'0' + self.level as u8);
         }
+    }
+
+    pub fn compress(&mut self, data: &[u8]) {
         for &b in data {
             if self.run_byte == b as i32 && self.run_len < 255 {
                 self.run_len += 1;
@@ -150,9 +155,7 @@ impl Encoder {
 
     /// Finish the stream; returns everything produced since the last take.
     pub fn finish(&mut self) {
-        if !self.header_done {
-            self.compress(&[]);
-        }
+        self.ensure_header();
         self.flush_run();
         if !self.block.is_empty() {
             self.write_block();
@@ -169,6 +172,7 @@ impl Encoder {
     }
 
     fn write_block(&mut self) {
+        self.ensure_header();
         let block = std::mem::take(&mut self.block);
         let crc = !self.block_crc;
         self.block_crc = 0xffff_ffff;
@@ -558,6 +562,15 @@ impl Decoder {
                 if self.out_pos == self.out.len() {
                     self.out.clear();
                     self.out_pos = 0;
+                }
+            }
+            if res.len() >= max && !self.has_output() && matches!(self.st, St::BlockStart) {
+                // (wheels2) all output handed out and the stream trailer is next:
+                // it needs no output space, so take it now (libbz2 reports the end
+                // of the stream in the call that returns the last bytes)
+                let mut b = Bits { d: &self.input, pos: self.bitpos };
+                if b.get48() == Some(END_MAGIC) {
+                    self.step()?;
                 }
             }
             if res.len() >= max || self.is_done() {

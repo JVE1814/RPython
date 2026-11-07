@@ -111,6 +111,24 @@ fn bad_format() -> ConvErr {
     ConvErr::Raised
 }
 
+/// For the read-only buffer formats (s*, y#, ...) an argument without any buffer
+/// interface fails with the TypeError of PyObject_GetBuffer itself ("a bytes-like
+/// object is required, not 'NoneType'"), which CPython leaves in place of the
+/// generic "must be ..." message (pandas' ujson tests check it).  (wheels2)
+unsafe fn no_buffer_raised(arg: &PyObject) -> bool {
+    unsafe {
+        if super::buffer::PyObject_CheckBuffer(arg.as_ptr()) != 0 {
+            return false;
+        }
+        let mut view: Py_buffer = std::mem::zeroed();
+        if PyObject_GetBuffer(arg.as_ptr(), &mut view, 0) == 0 {
+            PyBuffer_Release(&mut view);
+            return false;
+        }
+        true
+    }
+}
+
 unsafe fn get_buffer(arg: &PyObject, view: *mut Py_buffer, writable: bool) -> Result<(), ()> {
     unsafe {
         let flags = if writable { PYBUF_WRITABLE } else { 0 };
@@ -371,6 +389,9 @@ unsafe fn convert_simple(ctx: &mut Ctx, u: &[u8], arg: &PyObject) -> CResult {
                             ctx.cleanups.push(Cleanup::Buffer(view));
                             return Ok(());
                         }
+                        if no_buffer_raised(arg) {
+                            return Err(ConvErr::Raised);
+                        }
                         if get_buffer(arg, view, false).is_err() {
                             return Err(must_be(
                                 match c {
@@ -401,6 +422,9 @@ unsafe fn convert_simple(ctx: &mut Ctx, u: &[u8], arg: &PyObject) -> CResult {
                             return Ok(());
                         }
                         // read-only bytes-like objects only (no release needed: bytes)
+                        if no_buffer_raised(arg) {
+                            return Err(ConvErr::Raised);
+                        }
                         let bp = arg.ty().tp_as_buffer;
                         let releases = !bp.is_null() && (*bp).bf_releasebuffer.is_some();
                         let mut view: Py_buffer = std::mem::zeroed();

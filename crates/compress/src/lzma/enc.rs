@@ -75,6 +75,8 @@ struct MatchFinder {
     buf: Vec<u8>,
     base: u64,
     head3: Vec<u32>,
+    /// Last position (+1) of each 2-byte prefix (short matches for the price-based parser).
+    head2: Vec<u32>,
     head4: Vec<u32>,
     /// Previous position (+1) with the same 4-byte hash, per buffer index.
     chain: Vec<u32>,
@@ -100,6 +102,7 @@ impl MatchFinder {
             buf: Vec::new(),
             base: 0,
             head3: vec![0; 1 << H3_BITS],
+            head2: if o.mode >= 2 { vec![0; 1 << 16] } else { Vec::new() },
             head4: vec![0; 1 << bits4],
             chain: Vec::new(),
             bits4,
@@ -133,6 +136,10 @@ impl MatchFinder {
             self.chain[i] = self.head4[b];
             self.head4[b] = i as u32 + 1;
             self.head3[a] = i as u32 + 1;
+            if !self.head2.is_empty() {
+                let k = (self.buf[i] as usize) << 8 | self.buf[i + 1] as usize;
+                self.head2[k] = i as u32 + 1;
+            }
             self.inserted += 1;
         }
     }
@@ -164,7 +171,9 @@ impl MatchFinder {
         let mut best = 0usize;
         let mut dist = 0u32;
         let c = self.head3[self.h3(p)] as usize;
-        if c > 0 {
+        // (positions after `p` may already be inserted when a planned run of symbols
+        // was cut short: they are skipped)
+        if c > 0 && c - 1 < p {
             let c = c - 1;
             let d = p - c - 1;
             if d < self.dict_size && d < (1 << 16) {
@@ -182,6 +191,10 @@ impl MatchFinder {
         let mut depth = self.depth;
         while v > 0 && depth > 0 {
             let c = v - 1;
+            if c >= p {
+                v = self.chain[c] as usize;
+                continue;
+            }
             let d = p - c - 1;
             if d >= self.dict_size {
                 break;
@@ -202,6 +215,72 @@ impl MatchFinder {
         if best < 3 { (0, 0) } else { (best, dist) }
     }
 
+    /// Every match at `p` that is longer than all nearer ones, nearest first:
+    /// (len, dist) with growing lengths (for the price-based parser).
+    fn find_all(&self, p: usize, avail: usize, out: &mut Vec<(usize, u32)>) {
+        out.clear();
+        if avail < 4 || p + 4 > self.buf.len() {
+            return;
+        }
+        let mut best = 1usize;
+        if !self.head2.is_empty() {
+            // a 2-byte match only pays off close by
+            let c = self.head2[(self.buf[p] as usize) << 8 | self.buf[p + 1] as usize] as usize;
+            if c > 0 && c - 1 < p {
+                let c = c - 1;
+                let d = p - c - 1;
+                if d < self.dict_size && d < 128 {
+                    let l = self.match_len(c, p, avail);
+                    if l >= 2 {
+                        best = l;
+                        out.push((l, d as u32));
+                    }
+                }
+            }
+        }
+        let c = self.head3[self.h3(p)] as usize;
+        if c > 0 && c - 1 < p {
+            let c = c - 1;
+            let d = p - c - 1;
+            if d < self.dict_size && d < (1 << 16) {
+                let l = self.match_len(c, p, avail);
+                if l >= 3 && l > best {
+                    best = l;
+                    out.push((l, d as u32));
+                }
+            }
+        }
+        best = best.max(2);
+        if best >= self.nice {
+            return;
+        }
+        let mut v = self.head4[self.h4(p)] as usize;
+        let mut depth = self.depth;
+        while v > 0 && depth > 0 {
+            let c = v - 1;
+            if c >= p {
+                v = self.chain[c] as usize;
+                continue;
+            }
+            let d = p - c - 1;
+            if d >= self.dict_size {
+                break;
+            }
+            if best < avail && self.buf[c + best] == self.buf[p + best] {
+                let l = self.match_len(c, p, avail);
+                if l > best {
+                    best = l;
+                    out.push((l, d as u32));
+                    if l >= self.nice || l >= avail {
+                        break;
+                    }
+                }
+            }
+            v = self.chain[c] as usize;
+            depth -= 1;
+        }
+    }
+
     /// Forget history older than the dictionary once enough has accumulated before `p`.
     /// Returns the number of bytes dropped from the front.
     fn slide(&mut self, p: usize) -> usize {
@@ -213,6 +292,7 @@ impl MatchFinder {
         let cut32 = cut as u32;
         let fix = |v: &mut u32| *v = if *v > cut32 { *v - cut32 } else { 0 };
         self.head3.iter_mut().for_each(fix);
+        self.head2.iter_mut().for_each(fix);
         self.head4.iter_mut().for_each(fix);
         self.chain.drain(..cut.min(self.chain.len()));
         self.chain.iter_mut().for_each(fix);
@@ -224,6 +304,88 @@ impl MatchFinder {
 }
 
 // ------------------------------------------------------------------ symbol coder
+
+// ------------------------------------------------------------------ prices
+
+/// Prices are in 1/16 bit.
+const PRICE_SHIFT: u32 = 4;
+/// Positions planned at once by the price-based parser.
+const PLAN_WINDOW: usize = 4096;
+
+/// Cost of coding bit 0 with a probability (of a zero bit) of `(i << 4) + 8` / 2048.
+static BIT_PRICES: std::sync::OnceLock<[u32; 128]> = std::sync::OnceLock::new();
+
+#[inline]
+fn bit_price(prob: u16, bit: u32) -> u32 {
+    let t = BIT_PRICES.get_or_init(|| {
+        let mut t = [0u32; 128];
+        for (i, v) in t.iter_mut().enumerate() {
+            let p = ((i << 4) + 8) as f64 / PROB_ONE as f64;
+            *v = (-p.log2() * (1 << PRICE_SHIFT) as f64).round() as u32;
+        }
+        t
+    });
+    let p = if bit == 0 { prob as u32 } else { PROB_ONE - prob as u32 };
+    t[((p >> 4) as usize).min(127)]
+}
+
+fn tree_price(probs: &[u16], n: u32, sym: u32) -> u32 {
+    let mut m = 1usize;
+    let mut price = 0;
+    for i in (0..n).rev() {
+        let b = (sym >> i) & 1;
+        price += bit_price(probs[m], b);
+        m = (m << 1) | b as usize;
+    }
+    price
+}
+
+fn rev_tree_price(probs: &[u16], n: u32, sym: u32) -> u32 {
+    let mut m = 1usize;
+    let mut price = 0;
+    for i in 0..n {
+        let b = (sym >> i) & 1;
+        price += bit_price(probs[m], b);
+        m = (m << 1) | b as usize;
+    }
+    price
+}
+
+fn len_price(lm: &LenModel, len: usize, ps: usize) -> u32 {
+    let l = (len - LEN_MIN) as u32;
+    if l < 8 {
+        bit_price(lm.choice, 0) + tree_price(&lm.low[ps], 3, l)
+    } else if l < 16 {
+        bit_price(lm.choice, 1) + bit_price(lm.choice2, 0) + tree_price(&lm.mid[ps], 3, l - 8)
+    } else {
+        bit_price(lm.choice, 1) + bit_price(lm.choice2, 1) + tree_price(&lm.high, 8, l - 16)
+    }
+}
+
+/// One planned symbol.
+#[derive(Clone, Copy)]
+enum Plan {
+    Literal,
+    ShortRep,
+    /// (index of the recent distance, length)
+    Rep(u8, u16),
+    /// (length, distance)
+    Match(u16, u32),
+}
+
+/// Cheapest known way to reach a position of the planning window.
+#[derive(Clone, Copy)]
+struct Node {
+    price: u32,
+    from: u32,
+    step: Plan,
+    state: u8,
+    reps: [u32; 4],
+}
+
+impl Node {
+    const UNREACHED: Node = Node { price: u32::MAX, from: 0, step: Plan::Literal, state: 0, reps: [0; 4] };
+}
 
 /// LZMA symbol encoder working on the match finder's buffer.
 pub struct LzEncoder {
@@ -416,6 +578,226 @@ impl LzEncoder {
         r
     }
 
+    // ------------------------------------------------------------ price-based parsing
+    //
+    // Normal mode (presets 4..9, mode 2) chooses the symbols of a window of up to
+    // PLAN_WINDOW bytes by their cost: a shortest-path search over the positions of
+    // the window, where every position can be left by a literal, a short rep, a rep
+    // match of any length or the longest match of any length, priced with the
+    // model's current probabilities.  Each path node carries the coder state and the
+    // recent distances its path leads to, so literals and reps are priced in their
+    // real context.  (wheels2: the greedy/lazy parser compressed no better than the
+    // fast presets.)
+
+    fn lit_price(&self, q: usize, s: usize, rep0: u32) -> u32 {
+        let pos = self.mf.base + q as u64;
+        let m = &self.model;
+        let ps = (pos & m.pos_mask()) as usize;
+        let mut price = bit_price(m.is_match[(s << 4) + ps], 0);
+        let prev = if pos > 0 { self.mf.buf[q - 1] } else { 0 };
+        let base = m.literal_base(pos, prev);
+        let probs = &m.literal[base..base + 0x300];
+        let byte = self.mf.buf[q] as u32;
+        if is_literal_state(s) {
+            price += tree_price(probs, 8, byte);
+        } else {
+            let mb = self.mf.buf[q - rep0 as usize - 1] as u32;
+            let mut matched = true;
+            let mut sym = 1usize;
+            for i in (0..8).rev() {
+                let b = (byte >> i) & 1;
+                if matched {
+                    let mbit = (mb >> i) & 1;
+                    price += bit_price(probs[0x100 + ((mbit as usize) << 8) + sym], b);
+                    matched = b == mbit;
+                } else {
+                    price += bit_price(probs[sym], b);
+                }
+                sym = (sym << 1) | b as usize;
+            }
+        }
+        price
+    }
+
+    /// Price of a rep match without its length.
+    fn rep_head_price(&self, idx: usize, s: usize, ps: usize) -> u32 {
+        let m = &self.model;
+        let mut price = bit_price(m.is_match[(s << 4) + ps], 1) + bit_price(m.is_rep[s], 1);
+        if idx == 0 {
+            price += bit_price(m.is_rep_g0[s], 0) + bit_price(m.is_rep0_long[(s << 4) + ps], 1);
+        } else {
+            price += bit_price(m.is_rep_g0[s], 1);
+            if idx == 1 {
+                price += bit_price(m.is_rep_g1[s], 0);
+            } else {
+                price += bit_price(m.is_rep_g1[s], 1) + bit_price(m.is_rep_g2[s], (idx - 2) as u32);
+            }
+        }
+        price
+    }
+
+    fn short_rep_price(&self, s: usize, ps: usize) -> u32 {
+        let m = &self.model;
+        bit_price(m.is_match[(s << 4) + ps], 1)
+            + bit_price(m.is_rep[s], 1)
+            + bit_price(m.is_rep_g0[s], 0)
+            + bit_price(m.is_rep0_long[(s << 4) + ps], 0)
+    }
+
+    /// Price of a match's distance for each of the four length classes.
+    fn dist_prices(&self, dist: u32) -> [u32; DIST_STATES] {
+        let m = &self.model;
+        let slot = dist_slot(dist);
+        let mut price = 0;
+        if slot >= 4 {
+            let nb = (slot >> 1) - 1;
+            let base = (2 | (slot & 1)) << nb;
+            let red = dist - base;
+            if slot < END_POS_MODEL {
+                price += rev_tree_price(&m.dist_special[(base - slot) as usize..], nb, red);
+            } else {
+                price += (nb - ALIGN_BITS) << PRICE_SHIFT;
+                price += rev_tree_price(&m.align, ALIGN_BITS, red & ((1 << ALIGN_BITS) - 1));
+            }
+        }
+        std::array::from_fn(|ls| price + tree_price(&m.dist_slot[ls], 6, slot))
+    }
+
+    /// Length prices of a length coder: `[pos_state][len]`.
+    fn len_prices(&self, lm: &LenModel) -> Vec<[u32; LEN_MAX + 1]> {
+        let nps = 1usize << self.model.props.pb;
+        (0..nps)
+            .map(|ps| {
+                let mut t = [0u32; LEN_MAX + 1];
+                for (l, v) in t.iter_mut().enumerate().skip(LEN_MIN) {
+                    *v = len_price(lm, l, ps);
+                }
+                t
+            })
+            .collect()
+    }
+
+    /// Choose the symbols for `[p, wend)`; returns them in order.
+    fn plan(&mut self, p: usize, wend: usize) -> Vec<Plan> {
+        let end = self.mf.buf.len();
+        let mut w = (wend - p).min(PLAN_WINDOW);
+        let nice = self.mf.nice;
+        let mut nodes: Vec<Node> = vec![Node::UNREACHED; w + 1];
+        nodes[0] = Node { price: 0, from: 0, step: Plan::Literal, state: self.model.state as u8, reps: self.model.reps };
+        let mut found: Vec<(usize, u32)> = Vec::new();
+        self.cached = None;
+        let lp_len = self.len_prices(&self.model.len);
+        let lp_rep = self.len_prices(&self.model.rep_len);
+        let mut i = 0;
+        while i < w {
+            let n = nodes[i];
+            if n.price == u32::MAX {
+                i += 1;
+                continue;
+            }
+            let q = p + i;
+            let avail = (end - q).min(LEN_MAX);
+            let room = w - i;
+            let s = n.state as usize;
+            let ps = self.pos_state(q);
+            let mut relax = |nodes: &mut Vec<Node>, to: usize, price: u32, step: Plan, state: usize, reps: [u32; 4]| {
+                if price < nodes[to].price {
+                    nodes[to] = Node { price, from: i as u32, step, state: state as u8, reps };
+                }
+            };
+            // literal
+            let lp = n.price + self.lit_price(q, s, n.reps[0]);
+            relax(&mut nodes, i + 1, lp, Plan::Literal, after_literal(s), n.reps);
+            // short rep
+            let r0 = n.reps[0] as usize;
+            if r0 < q && r0 < self.mf.dict_size && self.mf.buf[q - r0 - 1] == self.mf.buf[q] {
+                let sp = n.price + self.short_rep_price(s, ps);
+                relax(&mut nodes, i + 1, sp, Plan::ShortRep, after_shortrep(s), n.reps);
+            }
+            let mut longest = 0;
+            let mut long = false;
+            // rep matches
+            if avail >= 2 {
+                for idx in 0..4 {
+                    let d = n.reps[idx] as usize;
+                    if d + 1 > q || d >= self.mf.dict_size {
+                        continue;
+                    }
+                    let c = q - d - 1;
+                    if self.mf.buf[c] != self.mf.buf[q] || self.mf.buf[c + 1] != self.mf.buf[q + 1] {
+                        continue;
+                    }
+                    let full = self.mf.match_len(c, q, avail);
+                    let mut reps = n.reps;
+                    if idx > 0 {
+                        let dd = reps[idx];
+                        for k in (1..=idx).rev() {
+                            reps[k] = reps[k - 1];
+                        }
+                        reps[0] = dd;
+                    }
+                    let head = n.price + self.rep_head_price(idx, s, ps);
+                    if full >= nice && full <= room {
+                        // a long repeat is taken whole: the window ends with it
+                        let rp = head + lp_rep[ps][full];
+                        relax(&mut nodes, i + full, rp, Plan::Rep(idx as u8, full as u16), after_rep(s), reps);
+                        w = i + full;
+                        long = true;
+                        break;
+                    }
+                    let len = full.min(w - i);
+                    longest = longest.max(len);
+                    for l in 2..=len {
+                        let rp = head + lp_rep[ps][l];
+                        relax(&mut nodes, i + l, rp, Plan::Rep(idx as u8, l as u16), after_rep(s), reps);
+                    }
+                }
+            }
+            if long {
+                break;
+            }
+            // matches: each length at the nearest distance that reaches it
+            if avail >= 4 {
+                self.mf.insert_upto(q);
+                self.mf.find_all(q, avail, &mut found);
+                let m = &self.model;
+                let head = n.price + bit_price(m.is_match[(s << 4) + ps], 1) + bit_price(m.is_rep[s], 0);
+                if let Some(&(ml, md)) = found.last() {
+                    if ml >= nice && ml <= room && ml > longest {
+                        // a long match is taken whole: the window ends with it
+                        let reps = [md, n.reps[0], n.reps[1], n.reps[2]];
+                        let mp = head + lp_len[ps][ml] + self.dist_prices(md)[len_to_dist_state(ml)];
+                        relax(&mut nodes, i + ml, mp, Plan::Match(ml as u16, md), after_match(s), reps);
+                        w = i + ml;
+                        break;
+                    }
+                }
+                let mut from_len = 2;
+                for &(ml, md) in found.iter() {
+                    let len = ml.min(w - i);
+                    let reps = [md, n.reps[0], n.reps[1], n.reps[2]];
+                    let dp = self.dist_prices(md);
+                    for l in from_len..=len {
+                        let mp = head + lp_len[ps][l] + dp[len_to_dist_state(l)];
+                        relax(&mut nodes, i + l, mp, Plan::Match(l as u16, md), after_match(s), reps);
+                    }
+                    from_len = from_len.max(len + 1);
+                }
+            }
+            i += 1;
+        }
+        // walk back from the end of the window
+        let mut out = Vec::new();
+        let mut at = w;
+        while at > 0 {
+            let n = nodes[at];
+            out.push(n.step);
+            at = n.from as usize;
+        }
+        out.reverse();
+        out
+    }
+
     /// Encode symbols.  Without `finish`, `LEN_MAX + 1` bytes of lookahead are kept back.
     /// `limit(uncompressed_bytes_from_start_mark, rc_pending)` returning true stops before
     /// the next symbol.
@@ -426,6 +808,11 @@ impl LzEncoder {
             if self.pos + keep >= end || self.pos >= end {
                 return Stop::Input;
             }
+            // a plan always sees a full window plus lookahead (or the end of the
+            // data), so the output does not depend on how the input was fed
+            if self.opts.mode >= 2 && !finish && self.pos + keep + PLAN_WINDOW > end {
+                return Stop::Input;
+            }
             if limit(self.mf.base + self.pos as u64, self.rc.pending()) {
                 return Stop::Limit;
             }
@@ -434,6 +821,35 @@ impl LzEncoder {
             if avail < 2 {
                 self.lit(p);
                 self.pos += 1;
+                continue;
+            }
+            if self.opts.mode >= 2 {
+                let wend = if finish { end } else { end - keep };
+                let steps = self.plan(p, wend);
+                for (k, st) in steps.into_iter().enumerate() {
+                    if k > 0 && limit(self.mf.base + self.pos as u64, self.rc.pending()) {
+                        return Stop::Limit;
+                    }
+                    let q = self.pos;
+                    match st {
+                        Plan::Literal => {
+                            self.lit(q);
+                            self.pos += 1;
+                        }
+                        Plan::ShortRep => {
+                            self.short_rep(q);
+                            self.pos += 1;
+                        }
+                        Plan::Rep(idx, l) => {
+                            self.rep(q, idx as usize, l as usize);
+                            self.advance(l as usize);
+                        }
+                        Plan::Match(l, d) => {
+                            self.mtch(q, l as usize, d);
+                            self.advance(l as usize);
+                        }
+                    }
+                }
                 continue;
             }
             let nice = self.mf.nice;

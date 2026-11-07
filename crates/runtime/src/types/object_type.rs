@@ -1265,6 +1265,13 @@ fn is_identifier(s: &PyObject) -> bool {
 }
 
 unsafe extern "C" fn type_new_slot(meta: *mut PyTypeObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
+    // (wheels2) an extension that calls PyType_Type.tp_new with an exception still
+    // set (msgspec after a failed annotation lookup) gets that exception back:
+    // CPython's type_new runs into it at its first optional namespace lookup
+    // (__classcell__, __doc__, ...) and fails with it.
+    if crate::errors::err_occurred() {
+        return std::ptr::null_mut();
+    }
     unsafe { into_c(type_new(meta, &*args, if kw.is_null() { None } else { Some(&*kw) })) }
 }
 
