@@ -1125,7 +1125,8 @@ fn co_positions(o: &PyObject) -> PyResult {
     } else {
         let c = get(o);
         let lt = bytes::bytes_data(unsafe { &*c.co_linetable });
-        let ncu = ncodeunits(o);
+        // no location table at all: no positions (dis then reports None everywhere)
+        let ncu = if lt.is_empty() { 0 } else { ncodeunits(o) };
         let mut n = 0usize;
         for e in wc::decode_linetable_entries(lt, c.co_firstlineno.max(0) as u32) {
             let p = e.pos;
