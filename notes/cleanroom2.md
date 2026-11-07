@@ -51,8 +51,8 @@
   the exit hook sorts the atexit-enabled finalizers by creation serial and re-sorts whenever a
   registration happened meanwhile (a finalizer created by a finalizer runs next); the cyclic
   GC is paused during that pass; finalizers triggered after it do nothing.
-- `_collections_abc.MutableSet.register(WeakSet)` now lives in weakref.py (it was in the old
-  file; _weakrefset is imported too early to do it).
+- `_collections_abc.MutableSet.register(WeakSet)` is done in weakref.py (test_weakset needs it;
+  _weakrefset is imported too early to do it).
 - Timing (old -> new, ns/op, interleaved minima): WeakKeyDictionary set/get/contains equal,
   iteration ~equal (57-84 vs 47-81, noisy), WeakValueDictionary items 155 -> 129,
   finalize create+call 170 -> 159, WeakMethod 89 -> 82.
@@ -184,3 +184,14 @@
    is pinned by test_urlparse (deprecated aliases).
 6. Not audited at all (bodies): mailbox, http/client, http/server, urllib/request,
    email/*, xml/*, asyncio/*, multiprocessing/*, tkinter/*, idlelib/*, _pyio, pickle.
+
+## Cross-check
+- test_concurrent_futures.test_process_pool: 135 run / 8 failures (test_free_reference,
+  test_no_stale_references, test_force_shutdown_during_max_tasks_worker_exit for
+  fork/forkserver/spawn) both with the session-start versions of queue/weakref/_weakrefset/
+  functools/types and with the rewrites: pre-existing.
+- Final pass on the finished branch: test_functools, test_weakref, test_glob, test_types,
+  test_string, test_queue, test_pickletools, test_http_cookies, test_inspect, test_typing,
+  test_enum, test_dataclasses, test_pydoc, test___all__, test_pathlib, test_logging,
+  test_unittest, test_argparse, test_copy all pass; test_collections 110 run / 1 failure
+  (test_illegal_patma_flags in _collections_abc, the same failure cleanroom1 recorded).
