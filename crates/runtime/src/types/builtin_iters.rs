@@ -261,7 +261,9 @@ fn fo(o: &PyObject) -> &mut FilterObject {
 unsafe extern "C" fn filter_new(tp: *mut PyTypeObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
     unsafe {
         let r = (|| -> PyResult {
-            if tp == &raw mut PyFilter_Type && !kw.is_null() && dict::dict_len(&*kw) > 0 {
+            // a subclass that does not define __init__ cannot take keywords either
+            let plain = tp == &raw mut PyFilter_Type || (*tp).tp_init == PyFilter_Type.tp_init;
+            if plain && !kw.is_null() && dict::dict_len(&*kw) > 0 {
                 raise!(TypeError, "filter() takes no keyword arguments");
             }
             let a = tuple::tuple_items(&*args);
