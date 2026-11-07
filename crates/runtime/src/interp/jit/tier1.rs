@@ -498,6 +498,14 @@ impl<'a> Gen<'a> {
         self.incref(Rax);
         self.a.bind(skip);
     }
+    /// `emit_own_slot` for an entry known to be borrowed (pushed by LoadFastBorrow).
+    fn emit_own_slot_exact(&mut self, k: i32) {
+        let m = self.slot(k);
+        self.a.load(Rax, m);
+        self.a.and_ri(Rax, -2);
+        self.a.store(m, Rax);
+        self.incref(Rax);
+    }
     /// `own_slot` for every borrowed entry (before a template that expects owned ones).
     fn own_all(&mut self) {
         let mut m = self.tagm;
@@ -1094,8 +1102,9 @@ impl<'a> Gen<'a> {
                 // (inline, statically known entries) rather than in the call routine
                 for k in base + 1..d {
                     if self.tagged(k) {
-                        // (rcx, the callee's code data, survives: incref clobbers r11)
-                        self.emit_own_slot(k);
+                        // (rcx, the callee's code data, survives: incref clobbers r11;
+                        // only `self` can be NULL or an unpacked owned self)
+                        if k == base + 1 { self.emit_own_slot(k) } else { self.emit_own_slot_exact(k) }
                     }
                 }
                 self.set_lasti(pc);
@@ -2557,9 +2566,7 @@ fn tag_masks(an: &Analysis, borrow: bool, own: &[bool]) -> Vec<u64> {
             Op::Copy | Op::LoadConst | Op::LoadFast | Op::LoadFastCheck | Op::LoadGlobal | Op::PushNull | Op::LoadDeref
             | Op::Nop | Op::Resume => m,
             op => {
-                let (fall, _) = super::analysis::effect(op, ins.arg);
                 let pops = crate::interp::borrow::pops(op, ins.arg).unwrap_or(d as u32) as i32;
-                let _ = fall;
                 m & low(d - pops)
             }
         };
@@ -2585,6 +2592,11 @@ pub(crate) fn py_call_site(cd: &CodeData, pc: u32) -> bool {
 fn owned_loads(an: &Analysis, cd: &CodeData) -> Vec<bool> {
     let n = an.instrs.len();
     let mut own = vec![false; n];
+    // (RPYTHON_BORROW_PYARGS=1: keep them borrowed, for measurements)
+    static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *KEEP.get_or_init(|| matches!(std::env::var("RPYTHON_BORROW_PYARGS").as_deref(), Ok("1"))) {
+        return own;
+    }
     if cd.spec.is_empty() {
         return own;
     }

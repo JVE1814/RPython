@@ -1557,7 +1557,8 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             let mut tmp = std::mem::MaybeUninit::<[*mut PyObject; 16]>::uninit();
                             let mut argv: *const *mut PyObject = unsafe { f.slots.as_ptr().add(base) };
                             let nall = f.stack_top - base;
-                            if unsafe { super::borrow::any_borrowed(argv, nall) } {
+                            // (up to 8 entries are copied without looking: cheaper than the test)
+                            if nall <= 8 || unsafe { super::borrow::any_borrowed(argv, nall) } {
                                 if nall <= 16 {
                                     let dst = tmp.as_mut_ptr() as *mut *mut PyObject;
                                     unsafe { super::borrow::copy_untagged(dst, argv, nall) };

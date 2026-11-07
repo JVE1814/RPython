@@ -7,7 +7,21 @@ LOAD_FAST_BORROW). Measured cause (scale1/scale2): every LOAD_FAST incref'd and 
 consumer decref'd, ~10% of single-thread instructions, and with threads every core
 wrote the refcount line of shared objects (shr_dict, shr_attrs, mut_list, mut_dict).
 
-## Design (proposed as D30)
+## Decision proposal (for DECISIONS.md, coordinator; the brief said D30, which is taken)
+
+**D35 — Borrowed value-stack references.** A frame's value-stack slot may hold a
+borrowed reference to a local's object, marked by pointer bit 0 (only value-stack slots,
+never locals or anything C code sees). The runtime's translator decides which loads
+borrow (`LoadFastBorrow`, its own analysis: every copy consumed in the same basic block,
+no store to the local in between, no handler keeping it); the interpreter and both JIT
+tiers accept tagged entries wherever they consume stack values (tier 1 statically,
+per-instruction masks; tier 2 passes borrowed template inputs tagged). Writes to a
+running frame's locals from outside its code defer the release of the old value to the
+frame's end. `sys.getrefcount` reports real counts for borrowed locals (D27's
+caller-stack emulation is retired; only the argument-moving part remains).
+`RPYTHON_BORROW=0` disables it.
+
+## Design
 
 **Representation.** A value-stack slot (`Frame::slots[nlocalsplus..]`) may hold a
 *borrowed* reference: the object pointer with bit 0 set (`interp/borrow.rs`, `TAG`).

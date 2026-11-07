@@ -133,8 +133,74 @@ def refcounts():
     return sys.getrefcount(o) - base, len(lst)
 
 
+class Key:
+    # a dict key whose __eq__/__hash__ run Python code while the dict and the key
+    # are borrowed operands of the subscript (tier-2 templates get them tagged)
+    def __init__(self, v):
+        self.v = v
+
+    def __hash__(self):
+        return hash(self.v)
+
+    def __eq__(self, other):
+        return isinstance(other, Key) and other.v == self.v
+
+
+def subscripts(n):
+    d = {Key(i): i for i in range(8)}
+    keys = [Key(i & 7) for i in range(n)]
+    t = 0
+    for k in keys:
+        t += d[k]
+        if k in d:
+            t += 1
+        t += len(d) + isinstance(k, Key)
+    return t
+
+
+class Slots:
+    __slots__ = ("a", "b")
+
+    def __init__(self):
+        self.a = 1
+        self.b = [1, 2]
+
+
+def locals_mix(n):
+    s = Slots()
+    lst = []
+    t = 0
+    for i in range(n):
+        x = s.a
+        y = s.b
+        lst.append(x)
+        lst.append(y[0])
+        t += x + y[1] + len(lst)
+        if lst[-1] is x:
+            t -= 1
+        z = x
+        t += z
+        x = None
+        t += y is not None
+        if len(lst) > 50:
+            del lst[:]
+    return t
+
+
+def getrefcounts():
+    a = []
+    b = [a, a]
+    def f(x):
+        return sys.getrefcount(x)
+    return sys.getrefcount(a), f(a), sys.getrefcount(b), len(b)
+
+
 def main():
     for k in range(60):
+        if k == 0 or k == 59:
+            print(subscripts(40), locals_mix(70), getrefcounts())
+        subscripts(30)
+        locals_mix(60)
         r = victim()
         if k == 0:
             print(r)

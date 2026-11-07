@@ -85,13 +85,30 @@ pub unsafe fn any_borrowed(p: *const *mut PyObject, n: usize) -> bool {
     acc & TAG != 0
 }
 
-/// Copy n entries with their tags removed (scalar loop, see `any_borrowed`).
+/// Copy n entries with their tags removed. Call blocks are short: up to 8 entries are
+/// copied by straight-line code (one jump), longer ones by a scalar loop.
 #[inline(always)]
 pub unsafe fn copy_untagged(dst: *mut *mut PyObject, src: *const *mut PyObject, n: usize) {
-    let mut i = 0;
-    while i < n {
-        unsafe { *dst.add(i) = untag(std::ptr::read_volatile(src.add(i))) };
-        i += 1;
+    macro_rules! cp {
+        ($($i:expr),*) => {{ $( unsafe { *dst.add($i) = untag(*src.add($i)) }; )* }};
+    }
+    match n {
+        0 => {}
+        1 => cp!(0),
+        2 => cp!(0, 1),
+        3 => cp!(0, 1, 2),
+        4 => cp!(0, 1, 2, 3),
+        5 => cp!(0, 1, 2, 3, 4),
+        6 => cp!(0, 1, 2, 3, 4, 5),
+        7 => cp!(0, 1, 2, 3, 4, 5, 6),
+        8 => cp!(0, 1, 2, 3, 4, 5, 6, 7),
+        _ => {
+            let mut i = 0;
+            while i < n {
+                unsafe { *dst.add(i) = untag(std::ptr::read_volatile(src.add(i))) };
+                i += 1;
+            }
+        }
     }
 }
 
