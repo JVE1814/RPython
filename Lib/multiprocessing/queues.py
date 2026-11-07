@@ -94,11 +94,15 @@ class Queue(object):
         self._notempty.notify()
 
     def put(self, obj, block=True, timeout=None):
-        self._check_open()
+        if self._closed:
+            raise ValueError(f"Queue {self!r} is closed")
         if not self._sem.acquire(block, timeout):
             raise Full
         with self._notempty:
-            self._enqueue(obj)
+            if self._thread is None:
+                self._start_thread()
+            self._buffer.append(obj)
+            self._notempty.notify()
 
     def get(self, block=True, timeout=None):
         self._check_open()
@@ -228,7 +232,7 @@ class Queue(object):
                     notempty.wait()
                 batch = list(buffer)
                 buffer.clear()
-            for position, obj in enumerate(batch):
+            for obj in batch:
                 if obj is _sentinel:
                     debug('feeder thread got the stop marker')
                     reader_close()
@@ -253,9 +257,7 @@ class Queue(object):
                     # one item less
                     queue_sem.release()
                     onerror(exc, obj)
-                finally:
-                    obj = data = None
-            batch = None
+            obj = data = batch = None
 
     @staticmethod
     def _on_queue_feeder_error(e, obj):
