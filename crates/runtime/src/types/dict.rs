@@ -518,6 +518,9 @@ pub unsafe fn free_storage(op: *mut PyObject) {
 
 pub unsafe extern "C" fn dict_dealloc(op: *mut PyObject) {
     unsafe {
+        if crate::capi::watchers::dicts_watched() {
+            crate::capi::watchers::dict_event(crate::capi::watchers::DICT_DEALLOCATED, &*op, None, None);
+        }
         crate::gc::untrack(op);
         free_storage(op);
         let tp = (*op).type_ptr();
@@ -757,6 +760,11 @@ pub fn set_item(d: &PyObject, key: &PyObject, value: &PyObject) -> PyResult<()> 
 }
 
 pub fn set_item_hash(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) -> PyResult<()> {
+    if crate::capi::watchers::dicts_watched() {
+        // (capi2) watchers are told before the change
+        let ev = if contains_hash(d, key, h)? { crate::capi::watchers::DICT_MODIFIED } else { crate::capi::watchers::DICT_ADDED };
+        crate::capi::watchers::dict_event(ev, d, Some(key), Some(value));
+    }
     let (g, f) = find(d, key, h)?;
     let t = table(d);
     unsafe { incref(value.as_ptr()) };
@@ -800,6 +808,9 @@ pub fn set_item_str(d: &PyObject, key: &str, value: &PyObject) -> PyResult<()> {
 
 /// d.setdefault(key, default) → the value now stored for key.
 pub fn setdefault_hash(d: &PyObject, key: &PyObject, h: isize, default: &PyObject) -> PyResult<PyRef> {
+    if crate::capi::watchers::dicts_watched() && !contains_hash(d, key, h)? {
+        crate::capi::watchers::dict_event(crate::capi::watchers::DICT_ADDED, d, Some(key), Some(default));
+    }
     let (g, f) = find(d, key, h)?;
     let t = table(d);
     let r = match f {
@@ -832,6 +843,9 @@ pub fn del_item_hash(d: &PyObject, key: &PyObject, h: isize) -> PyResult<bool> {
 pub fn pop_item_hash(d: &PyObject, key: &PyObject, h: isize) -> PyResult<Option<PyRef>> {
     if dict_len(d) == 0 {
         return Ok(None);
+    }
+    if crate::capi::watchers::dicts_watched() && contains_hash(d, key, h)? {
+        crate::capi::watchers::dict_event(crate::capi::watchers::DICT_DELETED, d, Some(key), None);
     }
     let (g, f) = find(d, key, h)?;
     match f {
@@ -868,6 +882,9 @@ pub fn remove_at(d: &PyObject, ix: usize, _h: isize) -> (*mut PyObject, *mut PyO
 }
 
 pub fn clear(d: &PyObject) {
+    if crate::capi::watchers::dicts_watched() {
+        crate::capi::watchers::dict_event(crate::capi::watchers::DICT_CLEARED, d, None, None);
+    }
     let g = ob_lock(d);
     if unsafe { is_shared_empty(d) } {
         return;
@@ -1002,6 +1019,9 @@ pub fn merge_dict(d: &PyObject, other: &PyObject, overwrite: bool) -> PyResult<(
     // Fast path: empty target, exact source → bulk copy (no lookups needed).
     if dict_len(d) == 0 && nentries(d) == 0 {
         let items = items_hash_vec(other);
+        if crate::capi::watchers::dicts_watched() {
+            crate::capi::watchers::dict_event(crate::capi::watchers::DICT_CLONED, d, None, None);
+        }
         let g = ob_lock(d);
         let t = table(d);
         if t.used == 0 {
@@ -1054,6 +1074,11 @@ pub fn version(d: &PyObject) -> u64 {
 
 /// Pop the last item (LIFO), for popitem. Trims the entry array like CPython.
 pub fn pop_last(d: &PyObject) -> Option<(PyRef, PyRef)> {
+    if crate::capi::watchers::dicts_watched() {
+        if let Some((k, _)) = { let _g = ob_lock(d); let t = table(d); t.entries()[..t.nentries].iter().rev().find(|e| !e.key.is_null()).map(|e| unsafe { (PyRef::from_borrowed(e.key), ()) }) } {
+            crate::capi::watchers::dict_event(crate::capi::watchers::DICT_DELETED, d, Some(&k), None);
+        }
+    }
     let g = ob_lock(d);
     let t = table(d);
     let mut ix = t.nentries;

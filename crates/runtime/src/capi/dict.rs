@@ -487,48 +487,7 @@ pub unsafe extern "C" fn _PyDict_Pop(o: *mut PyObject, k: *mut PyObject, dflt: *
     }
 }
 
-// watchers: accepted but never fire (no specialising interpreter relies on them)
-static WATCHERS: std::sync::Mutex<[usize; 8]> = std::sync::Mutex::new([0; 8]);
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyDict_AddWatcher(cb: *mut std::ffi::c_void) -> c_int {
-    let mut w = WATCHERS.lock().unwrap();
-    for (i, slot) in w.iter_mut().enumerate() {
-        if *slot == 0 {
-            *slot = cb as usize;
-            return i as c_int;
-        }
-    }
-    let _ = crate::err!(RuntimeError, "no more dict watcher IDs available");
-    -1
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyDict_ClearWatcher(id: c_int) -> c_int {
-    let mut w = WATCHERS.lock().unwrap();
-    if !(0..8).contains(&id) || w[id as usize] == 0 {
-        let _ = value_error(&format!("Invalid dict watcher ID {}", id));
-        return -1;
-    }
-    w[id as usize] = 0;
-    0
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyDict_Watch(id: c_int, d: *mut PyObject) -> c_int {
-    unsafe {
-        if d.is_null() || !dict::is_dict(&*d) {
-            let _ = value_error("Cannot watch non-dictionary");
-            return -1;
-        }
-        if !(0..8).contains(&id) {
-            let _ = value_error(&format!("Invalid dict watcher ID {}", id));
-            return -1;
-        }
-        0
-    }
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyDict_Unwatch(id: c_int, d: *mut PyObject) -> c_int {
-    unsafe { PyDict_Watch(id, d) }
-}
+// (capi2) dict watchers: capi/watchers.rs
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyDictProxy_New(m: *mut PyObject) -> *mut PyObject {

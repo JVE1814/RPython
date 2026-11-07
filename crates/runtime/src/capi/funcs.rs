@@ -425,57 +425,7 @@ pub unsafe extern "C" fn PyFunction_SetVectorcall(o: *mut PyObject, vc: vectorca
         }
     }
 }
-static FUNC_WATCHERS: std::sync::Mutex<[usize; 8]> = std::sync::Mutex::new([0; 8]);
-static CODE_WATCHERS: std::sync::Mutex<[usize; 8]> = std::sync::Mutex::new([0; 8]);
-static CTX_WATCHERS: std::sync::Mutex<[usize; 8]> = std::sync::Mutex::new([0; 8]);
-fn add_watcher(w: &std::sync::Mutex<[usize; 8]>, cb: *mut c_void, what: &str) -> c_int {
-    let mut g = w.lock().unwrap();
-    for (i, s) in g.iter_mut().enumerate() {
-        if *s == 0 {
-            *s = cb as usize;
-            return i as c_int;
-        }
-    }
-    let _ = crate::err!(RuntimeError, "no more {} watcher IDs available", what);
-    -1
-}
-fn clear_watcher(w: &std::sync::Mutex<[usize; 8]>, id: c_int, what: &str) -> c_int {
-    let mut g = w.lock().unwrap();
-    if !(0..8).contains(&id) {
-        let _ = value_error(&format!("Invalid {} watcher ID {}", what, id));
-        return -1;
-    }
-    if g[id as usize] == 0 {
-        let _ = value_error(&format!("No {} watcher set for ID {}", what, id));
-        return -1;
-    }
-    g[id as usize] = 0;
-    0
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyFunction_AddWatcher(cb: *mut c_void) -> c_int {
-    add_watcher(&FUNC_WATCHERS, cb, "func")
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyFunction_ClearWatcher(id: c_int) -> c_int {
-    clear_watcher(&FUNC_WATCHERS, id, "func")
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyCode_AddWatcher(cb: *mut c_void) -> c_int {
-    add_watcher(&CODE_WATCHERS, cb, "code")
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyCode_ClearWatcher(id: c_int) -> c_int {
-    clear_watcher(&CODE_WATCHERS, id, "code")
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyContext_AddWatcher(cb: *mut c_void) -> c_int {
-    add_watcher(&CTX_WATCHERS, cb, "context")
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyContext_ClearWatcher(id: c_int) -> c_int {
-    clear_watcher(&CTX_WATCHERS, id, "context")
-}
+// (capi2) function / code / context watchers: capi/watchers.rs
 
 // ---------------------------------------------------------------- code objects
 

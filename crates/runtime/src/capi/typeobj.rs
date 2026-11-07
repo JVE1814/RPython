@@ -76,7 +76,8 @@ pub unsafe extern "C" fn PyType_GetFlags(t: *mut PyTypeObject) -> std::ffi::c_ul
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyType_Modified(t: *mut PyTypeObject) {
-    crate::types::slots::type_modified(t)
+    crate::types::slots::type_modified(t);
+    super::watchers::flush_type_events();
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyType_ClearCache() -> std::ffi::c_uint {
@@ -160,41 +161,7 @@ pub unsafe extern "C" fn PyType_Freeze(t: *mut PyTypeObject) -> c_int {
     }
 }
 
-static TYPE_WATCHERS: std::sync::Mutex<[usize; 8]> = std::sync::Mutex::new([0; 8]);
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyType_AddWatcher(cb: *mut c_void) -> c_int {
-    let mut w = TYPE_WATCHERS.lock().unwrap();
-    for (i, s) in w.iter_mut().enumerate() {
-        if *s == 0 {
-            *s = cb as usize;
-            return i as c_int;
-        }
-    }
-    let _ = crate::err!(RuntimeError, "no more type watcher IDs available");
-    -1
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyType_ClearWatcher(id: c_int) -> c_int {
-    let mut w = TYPE_WATCHERS.lock().unwrap();
-    if !(0..8).contains(&id) || w[id as usize] == 0 {
-        let _ = value_error(&format!("No type watcher set for ID {}", id));
-        return -1;
-    }
-    w[id as usize] = 0;
-    0
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyType_Watch(id: c_int, _t: *mut PyObject) -> c_int {
-    if !(0..8).contains(&id) {
-        let _ = value_error(&format!("Invalid type watcher ID {}", id));
-        return -1;
-    }
-    0
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyType_Unwatch(id: c_int, t: *mut PyObject) -> c_int {
-    unsafe { PyType_Watch(id, t) }
-}
+// (capi2) type watchers: capi/watchers.rs
 
 // ---------------------------------------------------------------- module association
 

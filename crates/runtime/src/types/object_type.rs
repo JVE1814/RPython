@@ -673,6 +673,7 @@ unsafe extern "C" fn type_setattro(op: *mut PyObject, nm: *mut PyObject, v: *mut
         }
         crate::types::slots::type_modified(tp);
         crate::types::slots::update_slot(tp, &n);
+        crate::capi::watchers::flush_type_events(); // (capi2)
         0
     }
 }
@@ -680,6 +681,9 @@ unsafe extern "C" fn type_setattro(op: *mut PyObject, nm: *mut PyObject, v: *mut
 unsafe extern "C" fn type_dealloc(op: *mut PyObject) {
     unsafe {
         let tp = op as *mut PyTypeObject;
+        if crate::capi::watchers::type_watched(tp) {
+            crate::capi::watchers::type_dealloc_event(tp); // (capi2) a watched type goes away
+        }
         crate::object::release_type_id(tp, false);
         crate::gc::untrack(op);
         crate::interp::cache::unwatch_type_dict(tp); // jit

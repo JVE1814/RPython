@@ -39,6 +39,7 @@ pub mod slots;
 pub mod typeobj;
 pub mod unicode;
 pub mod varargs;
+pub mod watchers;
 
 use crate::errors::*;
 use crate::ffi::*;

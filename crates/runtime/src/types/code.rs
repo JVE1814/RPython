@@ -628,6 +628,9 @@ unsafe fn alloc_code(
         c.co_linetable = linetable.into_raw();
         std::ptr::write(&mut c.data, AtomicPtr::new(std::ptr::null_mut()));
         c.meta = Box::into_raw(Box::new(meta));
+        if crate::capi::watchers::codes_watched() {
+            crate::capi::watchers::code_event(crate::capi::watchers::CODE_CREATE, op); // (capi2)
+        }
         PyRef::from_raw(op)
     }
 }
@@ -860,6 +863,9 @@ pub fn addr2location(co: &PyObject, addr: i64) -> (i32, i32, i32, i32) {
 
 unsafe extern "C" fn code_dealloc(op: *mut PyObject) {
     unsafe {
+        if crate::capi::watchers::codes_watched() {
+            crate::capi::watchers::code_event(crate::capi::watchers::CODE_DESTROY, op); // (capi2)
+        }
         let c = &mut *(op as *mut PyCodeObject);
         crate::types::weakref::clear_weakrefs_at(op, &mut c.co_weakreflist);
         crate::capi::funcs::free_code_extras(op);
