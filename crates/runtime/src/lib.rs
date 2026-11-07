@@ -65,7 +65,9 @@ pub fn initialize(cfg: &Config) -> PyResult<()> {
     modules::sys::INT_MAX_STR_DIGITS.store(rc.int_max_str_digits, std::sync::atomic::Ordering::Relaxed);
     modules::sys::BYTES_WARNING.store(rc.bytes_warning, std::sync::atomic::Ordering::Relaxed);
     modules::sys::OPTIMIZE.store(rc.optimize, std::sync::atomic::Ordering::Relaxed);
+    let dev_mode = rc.dev_mode;
     modules::sys_full::set_config(rc);
+    capi::mem::setup_from_config(dev_mode, ignore_env); // (capi3) PYTHONMALLOC=debug hooks
     hash::init_hash_secret(cfg.hash_seed);
     scalestats::init();
     let _ = threads::current();

@@ -27,6 +27,7 @@ pub mod import;
 pub mod lifecycle;
 pub mod long;
 pub mod mem;
+pub mod memdebug;
 pub mod misc;
 pub mod modsupport;
 pub mod module;
