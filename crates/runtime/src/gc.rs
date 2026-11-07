@@ -36,6 +36,9 @@ pub static THRESHOLD: AtomicUsize = AtomicUsize::new(2000);
 static COLLECTING: AtomicBool = AtomicBool::new(false);
 /// (scale1) Thread id of the thread running `collect_gen` (0: none).
 static COLLECTOR: AtomicUsize = AtomicUsize::new(0);
+/// (tail4) Thread state of the thread running a collection (0: none); published in the
+/// remote-debugging table so a sampling profiler can show a "<GC>" frame.
+pub static GC_COLLECTOR_TS: AtomicUsize = AtomicUsize::new(0);
 pub static COLLECTIONS: AtomicUsize = AtomicUsize::new(0);
 pub static COLLECTED: AtomicUsize = AtomicUsize::new(0);
 pub static UNCOLLECTABLE: AtomicUsize = AtomicUsize::new(0);
@@ -778,6 +781,7 @@ fn collect_gen(young_only: bool) -> usize {
     }
     COLLECTOR.store(crate::object::thread_id(), Release);
     let me = crate::threads::current_mut();
+    GC_COLLECTOR_TS.store(me as usize, Release);
     let saved_exc = crate::errors::take_exc();
     let t0 = std::time::Instant::now();
     // (stability3) references dropped while other threads existed wait in QSBR batches
@@ -828,6 +832,7 @@ fn collect_gen(young_only: bool) -> usize {
     if let Some(e) = saved_exc {
         crate::errors::set_exc(e);
     }
+    GC_COLLECTOR_TS.store(0, Release);
     n.unwrap_or(0)
 }
 

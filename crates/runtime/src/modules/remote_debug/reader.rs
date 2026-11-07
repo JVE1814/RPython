@@ -43,6 +43,7 @@ pub struct Table {
     pub thread_list_seq: u64,
     pub thread_list_cap: u64,
     pub main_thread: u64,
+    pub gc_collector: u64,
     pub task_list_head: u64,
     pub set_dummy: u64,
     pub code_type: u64,
@@ -173,6 +174,7 @@ impl Table {
             thread_list_seq: u64at!(fo!(t.thread_list_seq)),
             thread_list_cap: u64at!(fo!(t.thread_list_cap)),
             main_thread: u64at!(fo!(t.main_thread)),
+            gc_collector: u64at!(fo!(t.gc_collector)),
             task_list_head: u64at!(fo!(t.task_list_head)),
             set_dummy: u64at!(fo!(t.set_dummy)),
             code_type: u64at!(fo!(t.code_type)),
@@ -330,6 +332,7 @@ struct UnwinderState {
     stats_on: bool,
     stats: RefCell<Stats>,
     paused: std::cell::Cell<bool>,
+    gc: bool,
     /// cached FrameInfo per (thread native id, frame address)
     frame_cache: RefCell<HashMap<(u64, u64), (u64, u32, PyRef)>>,
     /// cached (filename, qualname, linetable bytes, firstlineno, pub_of_internal) per code addr
@@ -412,6 +415,7 @@ unsafe extern "C" fn unwinder_new(tp: *mut PyTypeObject, args: *mut PyObject, kw
                 stats_on: getb(9, false),
                 stats: RefCell::new(Stats::default()),
                 paused: std::cell::Cell::new(false),
+                gc: getb(10, true),
                 frame_cache: RefCell::new(HashMap::new()),
                 code_cache: RefCell::new(HashMap::new()),
             };
@@ -788,9 +792,14 @@ fn get_stack_trace(o: &PyObject) -> PyResult {
             }
             top = st.ptr(ts + st.table.t_frame)?;
         }
-        let Some(frames) = frames else {
+        let Some(mut frames) = frames else {
             raise!(RuntimeError, "could not read a consistent stack of thread {}", rec.native_id);
         };
+        // (tail4) a thread running the garbage collector gets a synthetic "<GC>" frame
+        if st.gc && st.table.gc_collector != 0 && st.ptr(st.table.gc_collector)? == ts {
+            let gc_frame = ss(frame_info_type(), vec![pystr::new_str("~"), none::none_ref(), pystr::new_str("<GC>"), none::none_ref()]);
+            frames.insert(0, gc_frame);
+        }
         let ti = ss(thread_info_type(), vec![int::new_int(rec.native_id as i64), int::new_int(rec.status), list::new_list(frames)]);
         match by_interp.iter_mut().find(|(id, _)| *id == rec.interp_id) {
             Some((_, v)) => v.push(ti),

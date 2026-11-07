@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::*};
 
 pub const MAGIC: [u8; 8] = *b"RPyDbgT\0";
 /// Bumped whenever the layout of `DebugTable` changes.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// Offsets of the pointer and length words inside a `Vec<T>` (std does not promise an
 /// order, so `init_table` measures it).
@@ -194,6 +194,8 @@ pub struct DebugTable {
     pub thread_list_cap: u64,
     /// `AtomicPtr<ThreadState>` of the main thread.
     pub main_thread: *const u8,
+    /// (tail4) `AtomicUsize`: the thread state running a garbage collection, or 0.
+    pub gc_collector: *const u8,
     /// Eval-breaker bit a debugger sets for `sys.remote_exec`; it lives alone in its
     /// byte (`remote_exec_byte` inside the word) so a one-byte write cannot clobber
     /// the bits the runtime updates atomically.
@@ -248,6 +250,7 @@ pub static RPY_DEBUG_TABLE: DebugTable = DebugTable {
     thread_list_seq: &crate::qsbr::LIST_VER as *const _ as *const u8,
     thread_list_cap: crate::qsbr::CAP as u64,
     main_thread: &crate::threads::MAIN_THREAD_STATE as *const _ as *const u8,
+    gc_collector: &crate::gc::GC_COLLECTOR_TS as *const _ as *const u8,
     eval_remote_exec_bit: EVAL_REMOTE_EXEC as u64,
     remote_exec_byte: off(offset_of!(ThreadState, c) + offset_of!(CThreadState, eval_breaker) + 7),
     remote_exec: &REMOTE_EXEC,
