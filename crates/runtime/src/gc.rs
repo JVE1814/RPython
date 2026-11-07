@@ -979,6 +979,74 @@ pub fn handshake_safepoint() {
     COLLECTING.store(false, Release);
 }
 
+/// (stability3) Run `f` with every other thread stopped at a safepoint (or outside
+/// the VM), e.g. to walk other threads' frame chains (faulthandler.dump_traceback).
+/// If the world cannot be stopped in time, `f` runs anyway (best effort).
+pub fn with_world_stopped<R>(f: impl FnOnce() -> R) -> R {
+    if !crate::threads::multi_threaded() {
+        return f();
+    }
+    let own = COLLECTOR.load(Acquire) == crate::object::thread_id();
+    while !own && COLLECTING.compare_exchange(false, true, AcqRel, Acquire).is_err() {
+        crate::threads::blocking(|| std::thread::sleep(std::time::Duration::from_micros(200)));
+    }
+    let me = crate::threads::current_mut();
+    let mut stopped = false;
+    let already = !RELEASE.load(SeqCst) && STW_OWNER.load(SeqCst) == unsafe { &(*me).mode as *const _ as usize };
+    if !already {
+        for _ in 0..40 {
+            if stop_the_world(me) {
+                stopped = true;
+                break;
+            }
+        }
+    }
+    let r = f();
+    if stopped {
+        start_the_world();
+    }
+    if !own {
+        COLLECTING.store(false, Release);
+    }
+    r
+}
+
+/// (stability3) `with_world_stopped` for a thread that is not a Python thread (the
+/// faulthandler watchdog). Bounded waits: if a collection holds the collector lock or
+/// a thread does not reach a safepoint within the deadline, `f` runs anyway.
+pub fn with_world_stopped_external<R>(f: impl FnOnce() -> R) -> R {
+    let mut have = false;
+    for _ in 0..1000 {
+        if COLLECTING.compare_exchange(false, true, AcqRel, Acquire).is_ok() {
+            have = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+    if !have {
+        return f();
+    }
+    STW_OWNER.store(0, SeqCst);
+    RELEASE.store(false, SeqCst);
+    let threads: Vec<usize> = crate::threads::ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for &t in &threads {
+        unsafe { &*(t as *const ThreadState) }.c.eval_breaker.fetch_or(crate::threads::EVAL_SAFEPOINT, SeqCst);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while std::time::Instant::now() < deadline
+        && threads.iter().any(|&t| {
+            let ts = unsafe { &*(t as *const ThreadState) };
+            ts.alive() && ts.mode.0.load(SeqCst) == crate::threads::ThreadMode::InVm as u8
+        })
+    {
+        std::thread::sleep(std::time::Duration::from_micros(50));
+    }
+    let r = f();
+    RELEASE.store(true, SeqCst);
+    COLLECTING.store(false, Release);
+    r
+}
+
 /// All tracked objects (for gc.get_objects / get_referrers).
 pub fn all_tracked() -> Vec<PyRef> {
     if !crate::threads::multi_threaded() {
