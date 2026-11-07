@@ -113,6 +113,34 @@
 - ntpath.py verdict: own structure already (`_Vocab`, own splitroot/join/expandvars scanner,
   `_emulated_abspath`, own isreserved tables); only the genericpath helper names changed.
 
+### urllib/parse.py (partial rewrite: the CPython-shaped helpers)
+- Verdict: result classes, splitting/joining core, quoting API and query parsing were
+  already own design (`_KeepEmpty`, `_make_result`, `_split_cached/_split_impl`, `_unsplit`,
+  `_deprecated_split`); the CPython-shaped pieces were replaced:
+  `_noop/_encode_result/_decode_args/_coerce_args` -> `_texts()` returning (str args,
+  was_bytes); `_coerce_components` -> `_component_texts`; `_splitparams` -> `_cut_params`
+  (rpartition/partition); `_splitnetloc` -> `_take_authority` (regex search for the first
+  '/', '?' or '#'); `_checknetloc` -> `_reject_lookalike_netloc`; `_check_bracketed_*` ->
+  `_validate_bracketed_*`; `_remove_dot_segments` -> `_drop_dot_segments`;
+  `_hextobyte/_hex_table` -> `_escape_table()` (all four hex-case spellings);
+  `_byte_quoter_factory` -> `_quoter_for`; quote_from_bytes' all-safe fast path uses
+  `bytes.translate(None, safe)`; `_parse_qsl` -> `_query_pairs`; `_ASCII_RUN` ->
+  `_ASCII_SPANS`; `_HOST_RE/_PORT_RE` dropped (`_splithost` via `_take_authority`,
+  `_splitport` via rpartition; a trailing ':' without digits is still dropped).
+- Kept (pinned by test_urlparse): `_Quoter` (repr contains 'Quoter'), `_ALWAYS_SAFE`,
+  `_to_bytes`, the `_split*` family and their deprecated public wrappers, `__getattr__`,
+  `clear_cache`, `to_bytes`, `unwrap`, `_encoded_counterpart/_decoded_counterpart`,
+  "Cannot mix str and non-str arguments", the port messages.
+- Tests: test_urlparse 1 failure on the first try (`_splitport('parrot:')` must give
+  ('parrot', None)) -> fixed; then test_urlparse, test_urllib2, test_robotparser,
+  test_http_cookiejar, test___all__, test_pydoc, test_genericalias, test_xmlrpc,
+  test_mimetypes, test_pathlib = (pass); test_urllib 2 errors (host control-char checks
+  in http.client) fail the same with the old file.
+- Differential fuzzing (13,000 random str/bytes URLs through every public function, the
+  result attributes, geturl/urlunsplit round trips and the `_split*` helpers): 0
+  differences, except that `_splithost(bytes)` now raises TypeError explicitly (the old
+  regex raised TypeError too, with another message).  Timing ~equal (noisy box).
+
 ## Reviewed: own text and structure, no action needed
 (none yet)
 
