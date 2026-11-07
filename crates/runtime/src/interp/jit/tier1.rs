@@ -125,6 +125,20 @@ struct Layout {
     entry_value: i32,
 }
 
+/// (perf5) C getter and closure of an exact getset descriptor, if readable.
+unsafe fn getset_getter(d: *mut PyObject) -> Option<(usize, usize)> {
+    unsafe {
+        if !(*d).is_type(crate::types::descr::getset_descr_type()) {
+            return None;
+        }
+        let g = (*(d as *mut crate::ffi::PyGetSetDescrObject)).d_getset;
+        if g.is_null() {
+            return None;
+        }
+        (*g).get.map(|f| (f as usize, (*g).closure as usize))
+    }
+}
+
 fn layout() -> &'static Layout {
     static L: std::sync::OnceLock<Layout> = std::sync::OnceLock::new();
     L.get_or_init(|| {
@@ -851,7 +865,44 @@ impl<'a> Gen<'a> {
                 self.a.load(Rax, m);
                 self.a.mov_ri(Rcx, crate::types::funcobject::function_type() as i64);
                 self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
+                let is_func = self.a.label();
+                self.a.jcc(Cc::E, is_func);
+                if arg == 1 {
+                    // (perf5) type(x): the argument's type
+                    let not_type = self.a.label();
+                    self.a.mov_ri(Rcx, crate::types::typeobject::type_type() as i64);
+                    self.a.cmp_rr(Rax, Rcx);
+                    self.a.jcc(Cc::NE, not_type);
+                    let sm = self.slot(base + 1);
+                    self.a.cmp_mi(sm, 0);
+                    self.a.jcc(Cc::NE, not_type);
+                    let am = self.slot(base + 2);
+                    self.a.load(Rcx, am);
+                    self.a.load(Rdx, M(Rcx, OB_TYPE));
+                    self.incref(Rdx);
+                    self.a.store(m, Rdx);
+                    self.a.mov_rr(Rax, Rcx);
+                    self.decref(Rax);
+                    self.a.mov_ri(Rax, crate::types::typeobject::type_type() as i64);
+                    self.decref(Rax);
+                    self.a.jmp(done);
+                    self.a.bind(not_type);
+                }
+                // (perf5) bound method with a free self slot: unpack it in the stack and
+                // retry with its function (CPython's bound-method call specialisation)
+                self.a.mov_ri(Rcx, crate::types::funcobject::method_type() as i64);
+                self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
                 self.a.jcc(Cc::NE, generic);
+                let ms = self.slot(base + 1);
+                self.a.cmp_mi(ms, 0);
+                self.a.jcc(Cc::NE, generic);
+                self.lea_sp(Rdi, base);
+                self.call(addr!(h::h_unpack_method));
+                self.a.load(Rax, m);
+                self.a.mov_ri(Rcx, crate::types::funcobject::function_type() as i64);
+                self.a.cmp_rm(Rcx, M(Rax, OB_TYPE));
+                self.a.jcc(Cc::NE, generic);
+                self.a.bind(is_func);
                 // a replaced vectorcall (C API) must be honoured
                 self.a.mov_ri(Rcx, crate::interp::function_vectorcall as usize as i64);
                 self.a.cmp_rm(Rcx, M(Rax, FUNC_VECTORCALL));
@@ -929,6 +980,20 @@ impl<'a> Gen<'a> {
                 self.helper_sp(&ins, d, addr!(h::h_load_super_attr), Some(arg as i64), Some(name), d - 3);
             }
             Op::GetAwaitable => self.helper_sp(&ins, d, addr!(h::h_get_awaitable), Some(arg as i64), None, d - 1),
+            // (perf5) raise / re-raise without leaving compiled code: the helper sets the
+            // exception, lasti/unwind_pc and stack_top; the caller unwinds (and continues
+            // at a handler of this frame in compiled code, jit::finish_in_interp)
+            Op::RaiseVarargs | Op::Reraise if super::raise_enabled() => {
+                self.set_lasti(pc);
+                self.a.mov_rr(Rdi, R13);
+                self.a.mov_rr(Rsi, Rbx);
+                self.lea_sp(Rdx, d);
+                self.a.mov_ri(Rcx, ins.op as i64 | (arg as i64) << 8);
+                self.a.mov_ri(R8, pc as i64);
+                self.call(addr!(h::h_raise));
+                self.a.mov_ri(Rax, ST_ERROR as i64);
+                self.a.jmp(self.exit);
+            }
             // instructions shared with the interpreter (eval::exec_misc)
             op if crate::interp::eval::is_misc(op) && super::misc_enabled() => {
                 let pops = match op {
@@ -1212,6 +1277,50 @@ impl<'a> Gen<'a> {
         self.a.test_rr(Rsi, Rsi);
         self.a.jcc(Cc::E, slow);
     }
+    /// The instance in rax does not have `name` itself (so a class attribute is not
+    /// shadowed): jumps or falls through to `ok` (bound right after by the caller),
+    /// else jumps to `slow`. Inline values: the
+    /// shape must lack the name (the entry memoises the id of a shape known to lack
+    /// it); a materialised dict must not contain it. Clobbers rcx, rdx, rsi, rdi, r14
+    /// and caller-saved registers on the helper paths; rax is preserved.
+    fn lacks_name(&mut self, e: &crate::interp::cache::Entry, name: i64, slow: Label, ok: Label) {
+        let not_values = self.a.label();
+        let (id_off, _len, _keys, _voff) = crate::shape::jit_layout();
+        self.a.load8(Rdx, M(Rax, GC_BITS));
+        self.a.and_ri(Rdx, crate::alloc::GC_BIT_MANAGED as i32);
+        self.a.jcc(Cc::E, not_values);
+        self.a.load(Rdx, M(Rax, MANAGED_DICT));
+        self.a.test_ri(Rdx, 1);
+        self.a.jcc(Cc::E, not_values);
+        // managed word = shape | 1 (perf2)
+        self.a.lea(Rdx, M(Rdx, -1));
+        self.a.load32(Rcx, M(Rdx, id_off));
+        let memo = (e as *const crate::interp::cache::Entry as i64) + E_MEMO as i64;
+        self.a.mov_ri(Rsi, memo);
+        self.a.cmp32_rm(Rcx, M(Rsi, 0));
+        self.a.jcc(Cc::E, ok);
+        self.a.mov_rr(R14, Rax);
+        self.a.mov_rr(Rdi, Rdx);
+        self.a.mov_rr(Rdx, Rsi);
+        self.a.mov_ri(Rsi, name);
+        self.call(addr!(h::h_shape_lacks_memo));
+        self.a.test_rr(Rax, Rax);
+        self.a.mov_rr(Rax, R14);
+        self.a.jcc(Cc::E, slow);
+        self.a.jmp(ok);
+        self.a.bind(not_values);
+        self.managed_dict(Rax, slow, ok);
+        self.a.cmp_mi(M(Rdx, MA_USED), 0);
+        self.a.jcc(Cc::E, ok);
+        self.a.mov_rr(R14, Rax);
+        self.a.mov_rr(Rdi, Rdx);
+        self.a.mov_ri(Rsi, name);
+        self.call(addr!(h::h_dict_lacks));
+        self.a.test_rr(Rax, Rax);
+        self.a.mov_rr(Rax, R14);
+        self.a.jcc(Cc::E, slow);
+    }
+
     /// rsi = value at entry `hint` of the dict in rdx if its key is `name`, else slow.
     /// Clobbers rdx.
     fn dict_hinted(&mut self, hint: u64, name: i64, slow: Label) -> bool {
@@ -1240,16 +1349,21 @@ impl<'a> Gen<'a> {
         let ep = es.as_ptr() as i64;
         let name = self.cd.names[ins.arg as usize].as_ptr() as i64;
         let done = self.a.label();
+        // (perf5) LoadMethod of a plain attribute: the attribute cases of LoadAttr, then
+        // NULL in the self slot (at `adone`)
+        let adone = if ins.op == Op::LoadMethod { self.a.label() } else { done };
         // one guarded case per filled entry (polymorphic inline cache), then the helper
         for e in es {
         let slow = self.a.label();
         let snap = e.read();
         let mut inline = false;
+        let mut attr_kind = false;
         if let Some(s) = snap {
             let tag = s.a as u32;
             let obj = self.slot(d - 1);
             match (ins.op, s.kind) {
-                (Op::LoadAttr, kind::INSTANCE_DICT) if s.b < (1 << 20) => {
+                (Op::LoadAttr | Op::LoadMethod, kind::INSTANCE_DICT) if s.b < (1 << 20) => {
+                    attr_kind = true;
                     self.a.load(Rax, obj);
                     self.guard_tag(Rax, tag, slow);
                     let dict_path = self.a.label();
@@ -1257,7 +1371,7 @@ impl<'a> Gen<'a> {
                     self.incref(Rsi);
                     self.a.store(obj, Rsi);
                     self.decref(Rax);
-                    self.a.jmp(done);
+                    self.a.jmp(adone);
                     self.a.bind(dict_path);
                     self.managed_dict(Rax, slow, slow);
                     if self.dict_hinted(s.b, name, slow) {
@@ -1267,7 +1381,8 @@ impl<'a> Gen<'a> {
                         inline = true;
                     }
                 }
-                (Op::LoadAttr, kind::SLOT) => {
+                (Op::LoadAttr | Op::LoadMethod, kind::SLOT) => {
+                    attr_kind = true;
                     self.a.load(Rax, obj);
                     self.guard_tag(Rax, tag, slow);
                     self.a.load(Rsi, M(Rax, s.c as i32));
@@ -1278,7 +1393,8 @@ impl<'a> Gen<'a> {
                     self.decref(Rax);
                     inline = true;
                 }
-                (Op::LoadAttr, kind::TYPE_ATTR) => {
+                (Op::LoadAttr | Op::LoadMethod, kind::TYPE_ATTR) => {
+                    attr_kind = true;
                     self.a.load(Rax, obj);
                     self.a.mov_ri(Rcx, s.b as i64);
                     self.a.cmp_rr(Rax, Rcx);
@@ -1291,9 +1407,10 @@ impl<'a> Gen<'a> {
                     self.decref(Rax);
                     inline = true;
                 }
-                (Op::LoadAttr, kind::CLASS_ATTR)
+                (Op::LoadAttr | Op::LoadMethod, kind::CLASS_ATTR)
                     if unsafe { (*(s.c as *mut PyObject)).ty().tp_descr_get.is_none() } =>
                 {
+                    attr_kind = true;
                     self.a.load(Rax, obj);
                     self.guard_tag(Rax, tag, slow);
                     self.a.mov_ri(Rsi, s.c as i64);
@@ -1302,7 +1419,8 @@ impl<'a> Gen<'a> {
                     self.decref(Rax);
                     inline = true;
                 }
-                (Op::LoadAttr, kind::MODULE) => {
+                (Op::LoadAttr | Op::LoadMethod, kind::MODULE) => {
+                    attr_kind = true;
                     // guards read from the entry at run time (module dicts change)
                     self.a.load(Rax, obj);
                     self.a.mov_ri(Rcx, crate::types::module::module_type() as i64);
@@ -1338,43 +1456,7 @@ impl<'a> Gen<'a> {
                     self.a.load(Rax, obj);
                     self.guard_tag(Rax, tag, slow);
                     if s.kind == kind::METHOD_SHADOWABLE {
-                        // inline values (shape.rs): the shape must lack the name;
-                        // the entry memoises the id of a shape known to lack it
-                        let not_values = self.a.label();
-                        let (id_off, _len, _keys, _voff) = crate::shape::jit_layout();
-                        self.a.load8(Rdx, M(Rax, GC_BITS));
-                        self.a.and_ri(Rdx, crate::alloc::GC_BIT_MANAGED as i32);
-                        self.a.jcc(Cc::E, not_values);
-                        self.a.load(Rdx, M(Rax, MANAGED_DICT));
-                        self.a.test_ri(Rdx, 1);
-                        self.a.jcc(Cc::E, not_values);
-                        // managed word = shape | 1 (perf2)
-                        self.a.lea(Rdx, M(Rdx, -1));
-                        self.a.load32(Rcx, M(Rdx, id_off));
-                        let memo = (e as *const crate::interp::cache::Entry as i64) + E_MEMO as i64;
-                        self.a.mov_ri(Rsi, memo);
-                        self.a.cmp32_rm(Rcx, M(Rsi, 0));
-                        self.a.jcc(Cc::E, push);
-                        self.a.mov_rr(R14, Rax);
-                        self.a.mov_rr(Rdi, Rdx);
-                        self.a.mov_rr(Rdx, Rsi);
-                        self.a.mov_ri(Rsi, name);
-                        self.call(addr!(h::h_shape_lacks_memo));
-                        self.a.test_rr(Rax, Rax);
-                        self.a.mov_rr(Rax, R14);
-                        self.a.jcc(Cc::E, slow);
-                        self.a.jmp(push);
-                        self.a.bind(not_values);
-                        self.managed_dict(Rax, slow, push);
-                        self.a.cmp_mi(M(Rdx, MA_USED), 0);
-                        self.a.jcc(Cc::E, push);
-                        self.a.mov_rr(R14, Rax);
-                        self.a.mov_rr(Rdi, Rdx);
-                        self.a.mov_ri(Rsi, name);
-                        self.call(addr!(h::h_dict_lacks));
-                        self.a.test_rr(Rax, Rax);
-                        self.a.mov_rr(Rax, R14);
-                        self.a.jcc(Cc::E, slow);
+                        self.lacks_name(e, name, slow, push);
                     }
                     self.a.bind(push);
                     self.a.mov_ri(Rsi, s.c as i64);
@@ -1382,6 +1464,141 @@ impl<'a> Gen<'a> {
                     self.a.store(obj, Rsi);
                     let m = self.slot(d);
                     self.a.store(m, Rax);
+                    inline = true;
+                }
+                (Op::LoadAttr | Op::LoadMethod, kind::CLASS_ATTR_SHADOWABLE)
+                    if unsafe { (*(s.c as *mut PyObject)).ty().tp_descr_get.is_none() } =>
+                {
+                    // (perf5) class attribute (no descriptor) the instance does not
+                    // shadow
+                    attr_kind = true;
+                    let push = self.a.label();
+                    self.a.load(Rax, obj);
+                    self.guard_tag(Rax, tag, slow);
+                    self.lacks_name(e, name, slow, push);
+                    self.a.bind(push);
+                    self.a.mov_ri(Rsi, s.c as i64);
+                    self.incref(Rsi);
+                    self.a.store(obj, Rsi);
+                    self.decref(Rax);
+                    inline = true;
+                }
+                (Op::LoadAttr | Op::LoadMethod, kind::DATA_DESCR)
+                    if unsafe { (*(s.c as *mut PyObject)).is_type(crate::types::property::property_type()) }
+                        && super::callpy::routine() != 0 =>
+                {
+                    attr_kind = true;
+                    // (perf5) property whose getter is a Python function with a fast
+                    // entry: call the getter through the machine-code call routine with
+                    // the stack laid out as [fget, obj] (the spare slot above the stack
+                    // holds obj as self)
+                    self.a.load(Rax, obj);
+                    self.guard_tag(Rax, tag, slow);
+                    self.a.mov_ri(Rcx, s.c as i64);
+                    self.a.load(Rcx, M(Rcx, crate::types::property::FGET_OFFSET as i32));
+                    self.a.test_rr(Rcx, Rcx);
+                    self.a.jcc(Cc::E, slow);
+                    self.a.mov_ri(Rdx, crate::types::funcobject::function_type() as i64);
+                    self.a.cmp_rm(Rdx, M(Rcx, OB_TYPE));
+                    self.a.jcc(Cc::NE, slow);
+                    self.a.mov_ri(Rdx, crate::interp::function_vectorcall as usize as i64);
+                    self.a.cmp_rm(Rdx, M(Rcx, FUNC_VECTORCALL));
+                    self.a.jcc(Cc::NE, slow);
+                    self.a.load(Rdx, M(Rcx, FUNC_CODE));
+                    self.a.test_rr(Rdx, Rdx);
+                    self.a.jcc(Cc::E, slow);
+                    self.a.load(Rdx, M(Rdx, CODE_DATA));
+                    self.a.test_rr(Rdx, Rdx);
+                    self.a.jcc(Cc::E, slow);
+                    self.a.cmp_mi(M(Rdx, CD_FAST_ENTRY), 0);
+                    self.a.jcc(Cc::E, slow);
+                    let selfm = self.slot(d);
+                    self.a.store(selfm, Rax);
+                    self.incref(Rcx);
+                    self.a.store(obj, Rcx);
+                    self.set_lasti(pc as u32);
+                    self.lea_sp(Rdi, d - 1);
+                    self.a.mov_ri(Rsi, 0);
+                    self.call(super::callpy::routine());
+                    self.check(pc as u32, d - 1);
+                    inline = true;
+                }
+                (Op::LoadAttr | Op::LoadMethod, kind::DATA_DESCR)
+                    if unsafe { getset_getter(s.c as *mut PyObject).is_some() } =>
+                {
+                    // (perf5) getset descriptor (frame.f_back, code.co_filename, ...):
+                    // its C getter directly (the type guard implies the descriptor's
+                    // owner check)
+                    attr_kind = true;
+                    let (get, closure) = unsafe { getset_getter(s.c as *mut PyObject).unwrap() };
+                    self.a.load(Rax, obj);
+                    self.guard_tag(Rax, tag, slow);
+                    self.set_lasti(pc as u32);
+                    self.a.mov_rr(Rdi, Rax);
+                    self.a.mov_ri(Rsi, closure as i64);
+                    self.call(get);
+                    self.a.test_rr(Rax, Rax);
+                    let err = self.error_label(pc as u32, d);
+                    self.a.jcc(Cc::E, err);
+                    self.a.mov_rr(Rsi, Rax);
+                    self.a.load(Rax, obj);
+                    self.a.store(obj, Rsi);
+                    self.decref(Rax);
+                    inline = true;
+                }
+                (Op::LoadAttr | Op::LoadMethod, kind::DATA_DESCR)
+                    if crate::modules::_collections::tuplegetter_index(s.c as *mut PyObject).is_some_and(|i| (0..1 << 20).contains(&i)) =>
+                {
+                    // (perf5) namedtuple field (`_tuplegetter`): the item itself
+                    attr_kind = true;
+                    let idx = crate::modules::_collections::tuplegetter_index(s.c as *mut PyObject).unwrap() as i32;
+                    self.a.load(Rax, obj);
+                    self.guard_tag(Rax, tag, slow);
+                    self.a.load(Rcx, M(Rax, OB_TYPE));
+                    self.a.load(Rdx, M(Rcx, offset_of!(PyTypeObject, tp_flags) as i32));
+                    self.a.test_ri(Rdx, crate::ffi::Py_TPFLAGS_TUPLE_SUBCLASS as i32);
+                    self.a.jcc(Cc::E, slow);
+                    self.a.cmp_mi(M(Rax, LIST_SIZE), idx);
+                    self.a.jcc(Cc::LE, slow);
+                    self.a.load(Rsi, M(Rax, TUPLE_ITEMS + 8 * idx));
+                    self.a.test_rr(Rsi, Rsi);
+                    self.a.jcc(Cc::E, slow);
+                    self.incref(Rsi);
+                    self.a.store(obj, Rsi);
+                    self.decref(Rax);
+                    inline = true;
+                }
+                (Op::LoadAttr | Op::LoadMethod, kind::TYPE_ATTR_META)
+                | (Op::LoadAttr | Op::LoadMethod, kind::TYPE_STATICMETHOD)
+                | (Op::LoadMethod, kind::TYPE_CLASSMETHOD) => {
+                    // (perf5) attribute of class b under a type-derived metatype:
+                    // identity and both version tags
+                    self.a.load(Rax, obj);
+                    self.a.mov_ri(Rcx, s.b as i64);
+                    self.a.cmp_rr(Rax, Rcx);
+                    self.a.jcc(Cc::NE, slow);
+                    self.a.cmp32_mi(M(Rax, TP_TAG), (s.a & 0xffff_ffff) as u32 as i32);
+                    self.a.jcc(Cc::NE, slow);
+                    self.a.load(Rcx, M(Rax, OB_TYPE));
+                    self.a.cmp32_mi(M(Rcx, TP_TAG), (s.a >> 32) as u32 as i32);
+                    self.a.jcc(Cc::NE, slow);
+                    self.a.mov_ri(Rsi, s.c as i64);
+                    if s.kind != kind::TYPE_ATTR_META {
+                        let off = std::mem::offset_of!(crate::types::funcobject::StaticOrClassMethod, callable) as i32;
+                        self.a.load(Rsi, M(Rsi, off));
+                        self.a.test_rr(Rsi, Rsi);
+                        self.a.jcc(Cc::E, slow);
+                    }
+                    self.incref(Rsi);
+                    self.a.store(obj, Rsi);
+                    if s.kind == kind::TYPE_CLASSMETHOD {
+                        // the class moves into the self slot
+                        let m = self.slot(d);
+                        self.a.store(m, Rax);
+                    } else {
+                        attr_kind = true;
+                        self.decref(Rax);
+                    }
                     inline = true;
                 }
                 (Op::StoreAttr, kind::SLOT) => {
@@ -1406,6 +1623,39 @@ impl<'a> Gen<'a> {
                     let val = self.slot(d - 2);
                     self.a.load(Rax, obj);
                     self.guard_tag(Rax, tag, slow);
+                    // (perf5) attribute-adding store (`__init__`): with the object in the
+                    // one shape that lacks the name and room left, store the value and
+                    // move to the child shape, while single-threaded (as tier 2 does)
+                    let trans = if s.c != 0 && crate::interp::cache::type_alive_with_tag(s.c, tag) {
+                        crate::shape::transitions_adding(s.c as *mut PyTypeObject, name as *mut PyObject, s.b as usize)
+                    } else {
+                        Vec::new()
+                    };
+                    if trans.len() == 1 {
+                        let (parent, child) = trans[0];
+                        let not_add = self.a.label();
+                        self.a.load8(Rdx, M(Rax, GC_BITS));
+                        self.a.and_ri(Rdx, crate::alloc::GC_BIT_MANAGED as i32);
+                        self.a.jcc(Cc::E, not_add);
+                        self.a.load(Rdx, M(Rax, MANAGED_DICT));
+                        self.a.mov_ri(Rsi, parent as i64 | 1);
+                        self.a.cmp_rr(Rdx, Rsi);
+                        self.a.jcc(Cc::NE, not_add);
+                        self.a.mov_ri(Rdi, (&raw const crate::threads::MULTI_THREADED) as i64);
+                        self.a.cmp_mi(M(Rdi, 0), 0);
+                        self.a.jcc(Cc::NE, slow);
+                        self.a.load8(Rcx, M(Rax, crate::shape::capacity_offset()));
+                        self.a.cmp_ri(Rcx, s.b as i32);
+                        self.a.jcc(Cc::BE, slow);
+                        let voff = unsafe { (*parent).voff } as i32;
+                        self.a.load(Rsi, val);
+                        self.a.store(M(Rax, voff + 8 * s.b as i32), Rsi);
+                        self.a.mov_ri(Rsi, child as i64 | 1);
+                        self.a.store(M(Rax, MANAGED_DICT), Rsi);
+                        self.decref(Rax);
+                        self.a.jmp(done);
+                        self.a.bind(not_add);
+                    }
                     // inline values (jit3): replace the existing attribute in place
                     // while single-threaded (rsi = old value, rdx = values word)
                     let dict_path = self.a.label();
@@ -1440,11 +1690,17 @@ impl<'a> Gen<'a> {
             }
         }
         if inline {
-            self.a.jmp(done);
+            self.a.jmp(if attr_kind { adone } else { done });
         }
         self.a.bind(slow);
         }
         self.helper_sp(ins, d, hf, Some(name), Some(ep), errd);
+        if ins.op == Op::LoadMethod {
+            self.a.jmp(done);
+            self.a.bind(adone);
+            let m = self.slot(d);
+            self.a.store_i(m, 0);
+        }
         self.a.bind(done);
     }
 

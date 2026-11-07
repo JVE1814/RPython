@@ -591,6 +591,13 @@ pub fn bind_arguments(func: &PyObject, frame: &mut Frame, args: &[*mut PyObject]
         }
     }
 
+    // (perf5) keywords that name parameters by identity (interned names), no *args /
+    // **kwargs: bind directly; anything else (and every error) takes the general path
+    if let Some(kn) = kwnames {
+        if !has_varargs && !has_varkw && nargs <= argcount && bind_kw_fast(f, &cd.d.localsplusnames, slots, args, nargs, kn, posonly, argcount, total_named) {
+            return Ok(());
+        }
+    }
     let qualname = || pystr::to_string_lossy(unsafe { &*f.func_qualname });
     let mut kwdict: Option<PyRef> = None;
     if has_varkw {
@@ -776,6 +783,77 @@ pub fn bind_arguments(func: &PyObject, frame: &mut Frame, args: &[*mut PyObject]
         }
     }
     Ok(())
+}
+
+/// `bind_arguments` for a call with keywords that each name a distinct parameter
+/// (not positional-only, not already given) by identity, defaults filling the rest.
+/// False with the slots of the named parameters cleared again when anything else
+/// applies (the general path then binds from scratch and reports errors).
+#[allow(clippy::too_many_arguments)]
+fn bind_kw_fast(
+    f: &PyFunctionObject,
+    names: &[PyRef],
+    slots: &mut [*mut PyObject],
+    args: &[*mut PyObject],
+    nargs: usize,
+    kn: &PyObject,
+    posonly: usize,
+    argcount: usize,
+    total_named: usize,
+) -> bool {
+    let keys = tuple::tuple_items(kn);
+    if names.len() < total_named || slots.len() < total_named || args.len() < nargs + keys.len() {
+        return false;
+    }
+    for i in 0..nargs {
+        unsafe { incref(args[i]) };
+        slots[i] = args[i];
+    }
+    let undo = |slots: &mut [*mut PyObject]| {
+        for s in slots[..total_named].iter_mut() {
+            unsafe { xdecref(std::mem::replace(s, std::ptr::null_mut())) };
+        }
+        false
+    };
+    let lo = posonly.max(nargs);
+    for (j, key) in keys.iter().enumerate() {
+        let mut found = usize::MAX;
+        for i in lo..total_named {
+            if names[i].is(key) {
+                found = i;
+                break;
+            }
+        }
+        if found == usize::MAX || !slots[found].is_null() {
+            return undo(slots);
+        }
+        let v = args[nargs + j];
+        unsafe { incref(v) };
+        slots[found] = v;
+    }
+    if nargs + keys.len() < total_named {
+        let defs = if f.func_defaults.is_null() { &[][..] } else { tuple::tuple_items(unsafe { &*f.func_defaults }) };
+        let defs = &defs[defs.len().saturating_sub(argcount)..];
+        let first_default = argcount - defs.len();
+        for i in nargs..argcount {
+            if slots[i].is_null() {
+                if i < first_default {
+                    return undo(slots);
+                }
+                slots[i] = defs[i - first_default].to_ref().into_raw();
+            }
+        }
+        for i in argcount..total_named {
+            if slots[i].is_null() {
+                let d = if f.func_kwdefaults.is_null() { None } else { dict::get_item_str(unsafe { &*f.func_kwdefaults }, &names[i]) };
+                match d {
+                    Some(v) => slots[i] = v.into_raw(),
+                    None => return undo(slots),
+                }
+            }
+        }
+    }
+    true
 }
 
 fn format_names(v: &[String]) -> String {

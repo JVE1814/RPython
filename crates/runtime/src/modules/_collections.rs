@@ -899,6 +899,17 @@ struct TupleGetter {
     doc: *mut PyObject,
 }
 
+/// (perf5) The fixed item index of an exact `_tuplegetter` (namedtuple field), for
+/// compiled attribute loads.
+pub fn tuplegetter_index(o: *mut PyObject) -> Option<isize> {
+    unsafe {
+        if !(*o).is_type(tuplegetter_type()) {
+            return None;
+        }
+        Some((*(o as *mut TupleGetter)).index)
+    }
+}
+
 unsafe extern "C" fn tuplegetter_new(tp: *mut PyTypeObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
     unsafe {
         into_c((|| -> PyResult {

@@ -79,7 +79,7 @@ pub fn stat_result_from(st: &libc::stat) -> PyRef {
     let (ai, af, ans) = time_parts(st.st_atime, st.st_atime_nsec);
     let (mi, mf, mns) = time_parts(st.st_mtime, st.st_mtime_nsec);
     let (ci, cf, cns) = time_parts(st.st_ctime, st.st_ctime_nsec);
-    let vals = vec![
+    let vals = [
         int::new_int(st.st_mode as i64),
         int::new_int_u128(st.st_ino as u128),
         int::new_int_u128(st.st_dev as u128),
@@ -164,7 +164,7 @@ pub fn os_fstat(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyR
 }
 
 fn statvfs_result_from(st: &libc::statvfs) -> PyRef {
-    let vals = vec![
+    let vals = [
         int::new_int(st.f_bsize as i64),
         int::new_int(st.f_frsize as i64),
         int::new_int_u128(st.f_blocks as u128),

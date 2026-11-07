@@ -595,6 +595,13 @@ fn check_free(p: *mut u8) {
     }
 }
 
+/// (perf5) This thread may keep freed objects for reuse (registered, not exiting, no
+/// heap checking): object free lists use it.
+#[inline]
+pub fn fast_free_ok() -> bool {
+    unsafe { (*(&raw const TC)).fast_free }
+}
+
 /// Free a block returned by `alloc_small` / `alloc_kind`.
 #[inline]
 pub fn free_small(p: *mut u8) {

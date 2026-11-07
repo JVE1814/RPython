@@ -365,6 +365,15 @@ pub mod kind {
     /// LoadAttr on a class object (metatype `type`): a = class tag, b = class ptr,
     /// c = value (plain, no __get__ binding needed).
     pub const TYPE_ATTR: u32 = 10;
+    /// (perf5) Like TYPE_ATTR for a class whose metatype is a subclass of `type`
+    /// with type's own attribute lookup: a = class tag | metatype tag << 32.
+    pub const TYPE_ATTR_META: u32 = 11;
+    /// (perf5) classmethod object c in the dict of class b (a as TYPE_ATTR_META, for
+    /// any such metatype including `type`): LoadMethod pushes its function with the
+    /// class as self; LoadAttr binds them.
+    pub const TYPE_CLASSMETHOD: u32 = 12;
+    /// (perf5) staticmethod object c in the dict of class b: its callable.
+    pub const TYPE_STATICMETHOD: u32 = 13;
     /// Instruction is not worth caching (megamorphic / unsupported).
     pub const UNCACHEABLE: u32 = 0xff;
 }
