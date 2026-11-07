@@ -6,7 +6,7 @@
 import gc, sys, threading, time, weakref
 
 NTHREADS = 6
-ROUNDS = 400
+ROUNDS = int(sys.argv[1]) if len(sys.argv) > 1 else 400
 lock = threading.Lock()
 made = [[] for _ in range(64)]   # per-thread lists: no contention (threads stay runnable)
 finalized = []
@@ -60,6 +60,8 @@ def check_ring(r, n, base):
         raise SystemExit("live ring corrupted: %r != %r" % (total, want))
 
 
+SRC = "K = 2\ndef f(x):\n    return x * K\nclass C:\n    def m(self):\n        return f\n"
+funcs = [None] * NTHREADS
 errors = []
 start = threading.Barrier(NTHREADS)
 
@@ -88,6 +90,18 @@ def work(tid):
             if i % 13 == 0 and r % 10 == 0:
                 f = Fin(i)
                 f.ring = g if isinstance(g, Node) else None
+        if r % 3 == 0:
+            # functions whose globals hold them (cycles), called by other threads
+            # (sharded reference counts), then dropped: sharded garbage
+            ns = {}
+            exec(SRC, ns)
+            funcs[tid] = ns["f"]
+            g = funcs[(tid + 1) % NTHREADS]
+            if g is not None:
+                for _ in range(6):
+                    if g(2) != 4:
+                        raise SystemExit("shared function broken")
+            del ns
         if r % 5 == 0:
             n = Node(r)
             n.nxt = n

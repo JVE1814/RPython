@@ -406,7 +406,6 @@ unsafe fn restore_task(t: &Task) {
         let special = &mut *t.special.get();
         let weak = &mut *t.weak.get();
         for &o in un.iter() {
-            crate::object::incref(o);
             let tp = (*o).type_ptr();
             if (*tp).tp_del.is_some() {
                 flags |= G_LEGACY;
@@ -415,7 +414,12 @@ unsafe fn restore_task(t: &Task) {
                 flags |= G_FINALIZE;
             }
             if crate::object::has_type_id(o) || crate::sharded::is_sharded(&*o) {
+                // counted through per-thread tables: the collector takes the reference
+                // itself (a delta left in this thread's table would outlive the
+                // unsharding of the object, see sharded.rs)
                 special.push(o);
+            } else {
+                crate::object::incref(o);
             }
             match crate::types::weakref::gc_weak_state(o) {
                 0 => {}
@@ -495,9 +499,9 @@ pub struct Analysis {
 pub struct Part {
     /// Thread state whose young buffer they came from (0: none).
     pub owner: usize,
-    /// Each holds a new reference.
+    /// Each holds a new reference, except those also in `special`.
     pub garbage: Vec<*mut PyObject>,
-    /// Need type-id release / unsharding.
+    /// Need type-id release / unsharding (no reference taken yet).
     pub special: Vec<*mut PyObject>,
     /// Take part in weak referencing (no callbacks).
     pub weak: Vec<*mut PyObject>,

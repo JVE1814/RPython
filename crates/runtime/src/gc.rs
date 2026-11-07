@@ -1122,6 +1122,7 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool, explicit: bool,
         // ---- phase 1 (stopped): find the unreachable objects
         // (scale3) young collections with threads parked at safepoints analyse in
         // parallel, each thread mostly its own young objects (gcpar.rs)
+        let mut held: Vec<PyRef> = Vec::new();
         let par = if young_only { crate::gcpar::analyse_young(me) } else { None };
         let mut unreachable = if let Some(a) = par {
             crate::gc_support::CANDIDATES.fetch_add(a.examined, Relaxed);
@@ -1138,12 +1139,15 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool, explicit: bool,
                 // parked at a safepoint clears its own garbage when it resumes
                 return Some(owner_clear(me, a, clock));
             }
-            // general path: drop the references the analysis took (each count goes
-            // back to its value before the analysis)
+            // general path: the references the analysis took are released once the
+            // garbage is ownerless (below: no merge-queue traffic while stopped)
             let mut u = Vec::with_capacity(a.unreachable_count());
             for p in a.parts {
+                let special: PtrSet = p.special.iter().map(|&o| o as usize).collect();
                 for o in p.garbage {
-                    decref(o);
+                    if !special.contains(&(o as usize)) {
+                        held.push(PyRef::from_raw(o));
+                    }
                     u.push(o);
                 }
             }
@@ -1204,6 +1208,7 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool, explicit: bool,
             // go to the shared field instead of the owners' merge queues
             crate::object::explicit_merge(o);
         }
+        drop(std::mem::take(&mut held));
         // (after the unsharding above: the registry must not keep entries for objects
         // that are about to be freed)
         DEAD_SHARDED.lock().unwrap_or_else(|e| e.into_inner()).extend(crate::sharded::dead_untracked());
@@ -1308,6 +1313,9 @@ unsafe fn owner_clear(me: *mut ThreadState, a: crate::gcpar::Analysis, clock: &m
         }
         for p in &a.parts {
             for &o in &p.special {
+                // the reference the analysis left to this thread (before the type id /
+                // sharded count goes: its own table entry is folded in by that)
+                crate::object::incref(o);
                 if crate::object::has_type_id(o) {
                     crate::object::release_type_id(o as *mut PyTypeObject, true);
                 } else if crate::sharded::is_sharded(&*o) {
