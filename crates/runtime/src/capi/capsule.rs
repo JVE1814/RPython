@@ -164,34 +164,44 @@ pub unsafe extern "C" fn PyCapsule_SetContext(o: *mut PyObject, ctx: *mut c_void
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyCapsule_Import(name: *const c_char, _no_block: c_int) -> *mut c_void {
     unsafe {
-        let full = cs(name).into_owned();
-        let parts: Vec<&str> = full.split('.').collect();
+        // "module.attr.attr...": only the module is imported, the rest are attribute
+        // lookups (capi2)
+        let full = CStr::from_ptr(name).to_bytes();
+        let (modpart, rest) = match full.iter().position(|&b| b == b'.') {
+            Some(i) => (&full[..i], Some(&full[i + 1..])),
+            None => (full, None),
+        };
+        let display = String::from_utf8_lossy(full).into_owned();
         let r = (|| -> PyResult<PyRef> {
-            let mut obj: Option<PyRef> = None;
-            let mut trace = String::new();
-            for p in parts.iter() {
-                if !trace.is_empty() {
-                    trace.push('.');
+            let modname = std::str::from_utf8(modpart).ok().filter(|m| !m.is_empty());
+            let module = match modname.map(crate::import::import_absolute) {
+                Some(Ok(m)) => m,
+                other => {
+                    if let Some(Err(_)) = other {
+                        clear_exc();
+                    }
+                    return Err(crate::err!(
+                        ImportError,
+                        "PyCapsule_Import could not import module \"{}\"",
+                        String::from_utf8_lossy(modpart)
+                    ));
                 }
-                trace.push_str(p);
-                obj = Some(match obj {
-                    None => crate::import::import_absolute(p)?,
-                    Some(o) => match ab::getattr_opt(&o, &pystr::new_str(p))? {
-                        Some(v) => v,
-                        None => match crate::import::import_absolute(&trace) {
-                            Ok(m) => m,
-                            Err(e) => return Err(e),
-                        },
-                    },
-                });
+            };
+            let Some(rest) = rest else {
+                return Err(crate::err!(AttributeError, "PyCapsule_Import \"{}\" is not valid", display));
+            };
+            let mut obj = module;
+            for comp in rest.split(|&b| b == b'.') {
+                let attr = super::unicode::decode_utf8(comp, None)?;
+                obj = ab::getattr(&obj, &attr)?;
             }
-            obj.ok_or_else(|| value_error("empty capsule name"))
+            Ok(obj)
         })();
         let Ok(o) = r else { return std::ptr::null_mut() };
         if PyCapsule_IsValid(o.as_ptr(), name) != 0 {
             return (*(o.as_ptr() as *mut PyCapsule)).pointer;
         }
-        let _ = crate::err!(AttributeError, "PyCapsule_Import \"{}\" is not valid", full);
+        let _ = crate::err!(AttributeError, "PyCapsule_Import \"{}\" is not valid", display);
         std::ptr::null_mut()
     }
 }

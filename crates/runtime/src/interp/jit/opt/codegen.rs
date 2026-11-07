@@ -1314,7 +1314,7 @@ fn emit_routines_body(a: &mut Asm, box_int: Label, box_float: Label, dshared: La
         let slow = a.label();
         let slow2 = a.label();
         a.lea(R10, M(Rax, 5));
-        a.cmp_ri(R10, 1030);
+        a.cmp_ri(R10, 1029); // -5..=1024 come from the small int table
         a.jcc(Cc::A, big);
         a.mov_ri(R11, small);
         a.load_idx(Rax, R11, R10, 8, 0);

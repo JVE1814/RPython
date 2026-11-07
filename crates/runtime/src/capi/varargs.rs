@@ -534,9 +534,14 @@ unsafe fn sys_write(name: &str, s: &PyObject) {
 unsafe fn c_vformat(fmt: *const c_char, ap: VaList) -> String {
     unsafe {
         let mut buf = vec![0u8; 1001];
-        vsnprintf(buf.as_mut_ptr() as *mut c_char, 1001, fmt, ap);
+        let full = vsnprintf(buf.as_mut_ptr() as *mut c_char, 1001, fmt, ap);
         let n = buf.iter().position(|&b| b == 0).unwrap_or(1000);
-        String::from_utf8_lossy(&buf[..n]).into_owned()
+        let mut s = String::from_utf8_lossy(&buf[..n]).into_owned();
+        // (capi2) longer output is cut at 1000 bytes and marked
+        if full > 1000 {
+            s.push_str("... truncated");
+        }
+        s
     }
 }
 #[unsafe(no_mangle)]

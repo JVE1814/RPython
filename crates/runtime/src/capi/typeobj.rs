@@ -76,7 +76,8 @@ pub unsafe extern "C" fn PyType_GetFlags(t: *mut PyTypeObject) -> std::ffi::c_ul
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyType_Modified(t: *mut PyTypeObject) {
-    crate::types::slots::type_modified(t)
+    crate::types::slots::type_modified(t);
+    super::watchers::flush_type_events();
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyType_ClearCache() -> std::ffi::c_uint {
@@ -154,47 +155,24 @@ pub unsafe extern "C" fn PyType_GetModuleName(t: *mut PyTypeObject) -> *mut PyOb
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyType_Freeze(t: *mut PyTypeObject) -> c_int {
     unsafe {
+        // (capi2) every other class on the MRO must be immutable already
+        let mro = (*t).tp_mro;
+        if !mro.is_null() {
+            for b in tuple::tuple_items(&*mro) {
+                let bt = b.as_ptr() as *mut PyTypeObject;
+                if bt != t && (*bt).tp_flags & Py_TPFLAGS_IMMUTABLETYPE == 0 {
+                    let _ = type_error(&format!("PyType_Freeze: base class '{}' is not immutable", to::type_fqname(bt)));
+                    return -1;
+                }
+            }
+        }
         (*t).tp_flags |= Py_TPFLAGS_IMMUTABLETYPE;
         PyType_Modified(t);
         0
     }
 }
 
-static TYPE_WATCHERS: std::sync::Mutex<[usize; 8]> = std::sync::Mutex::new([0; 8]);
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyType_AddWatcher(cb: *mut c_void) -> c_int {
-    let mut w = TYPE_WATCHERS.lock().unwrap();
-    for (i, s) in w.iter_mut().enumerate() {
-        if *s == 0 {
-            *s = cb as usize;
-            return i as c_int;
-        }
-    }
-    let _ = crate::err!(RuntimeError, "no more type watcher IDs available");
-    -1
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyType_ClearWatcher(id: c_int) -> c_int {
-    let mut w = TYPE_WATCHERS.lock().unwrap();
-    if !(0..8).contains(&id) || w[id as usize] == 0 {
-        let _ = value_error(&format!("No type watcher set for ID {}", id));
-        return -1;
-    }
-    w[id as usize] = 0;
-    0
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyType_Watch(id: c_int, _t: *mut PyObject) -> c_int {
-    if !(0..8).contains(&id) {
-        let _ = value_error(&format!("Invalid type watcher ID {}", id));
-        return -1;
-    }
-    0
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyType_Unwatch(id: c_int, t: *mut PyObject) -> c_int {
-    unsafe { PyType_Watch(id, t) }
-}
+// (capi2) type watchers: capi/watchers.rs
 
 // ---------------------------------------------------------------- module association
 
@@ -284,17 +262,34 @@ pub unsafe extern "C" fn PyType_GetBaseByToken_DuringGC(t: *mut PyTypeObject, to
         if !result.is_null() {
             *result = std::ptr::null_mut();
         }
+        if t.is_null() || !is_type(&*(t as *mut PyObject)) {
+            return -1; // (capi2) not a type: an error (reported by the non-GC variant)
+        }
         if token.is_null() {
-            return 0;
+            return -1; // (capi2) a NULL token is an error (reported by the non-GC variant)
         }
         let mro = (*t).tp_mro;
         let list: Vec<*mut PyTypeObject> = if mro.is_null() {
-            let mut v = vec![];
-            let mut b = t;
-            while !b.is_null() {
-                v.push(b);
-                b = (*b).tp_base;
+            // (capi2) without an MRO (type being built or torn down): the type, then its
+            // bases depth-first in declaration order
+            fn walk(t: *mut PyTypeObject, out: &mut Vec<*mut PyTypeObject>) {
+                unsafe {
+                    if out.contains(&t) {
+                        return;
+                    }
+                    out.push(t);
+                    let bases = (*t).tp_bases;
+                    if !bases.is_null() && tuple::is_tuple(&*bases) {
+                        for b in tuple::tuple_items(&*bases) {
+                            walk(as_type(b), out);
+                        }
+                    } else if !(*t).tp_base.is_null() {
+                        walk((*t).tp_base, out);
+                    }
+                }
             }
+            let mut v = vec![];
+            walk(t, &mut v);
             v
         } else {
             tuple::tuple_items(&*mro).iter().map(|x| as_type(x)).collect()
@@ -321,6 +316,13 @@ pub unsafe extern "C" fn PyType_GetBaseByToken(t: *mut PyTypeObject, token: *mut
                 "expected a type, got a '{}' object",
                 if t.is_null() { "NULL".into() } else { tname(&*(t as *mut PyObject)) }
             ));
+            return -1;
+        }
+        if token.is_null() {
+            if !result.is_null() {
+                *result = std::ptr::null_mut();
+            }
+            let _ = system_error("PyType_GetBaseByToken called with token=NULL");
             return -1;
         }
         let r = PyType_GetBaseByToken_DuringGC(t, token, result);
@@ -543,9 +545,9 @@ pub(crate) unsafe fn type_from_desc(desc: TypeDesc, token: *mut c_void) -> PyRes
             tok = std::ptr::null_mut();
         }
         // bases come from the argument, else Py_tp_bases, else Py_tp_base; each may be a
-        // tuple or a single type, and None counts as not given
+        // tuple or a single type
         let given = |p: *mut PyObject| -> Option<PyRef> {
-            if p.is_null() || (*p).is(crate::types::none::none()) {
+            if p.is_null() {
                 return None;
             }
             Some(if tuple::is_tuple(&*p) { (*p).to_ref() } else { tuple::new_tuple(vec![(*p).to_ref()]) })
@@ -555,11 +557,17 @@ pub(crate) unsafe fn type_from_desc(desc: TypeDesc, token: *mut c_void) -> PyRes
             .or_else(|| given(base_slot as *mut PyObject))
             .filter(|t| tuple::tuple_len(t) > 0)
             .unwrap_or_else(|| tuple::new_tuple(vec![type_ref(to::object_type())]));
+        // (capi2) managed weakref/dict storage lives in the GC pre-header
+        for (flag, fname) in [(Py_TPFLAGS_MANAGED_WEAKREF, "Py_TPFLAGS_MANAGED_WEAKREF"), (Py_TPFLAGS_MANAGED_DICT, "Py_TPFLAGS_MANAGED_DICT")] {
+            if desc.flags & flag != 0 && desc.flags & Py_TPFLAGS_HAVE_GC == 0 {
+                return Err(system_error(&format!("type {} has the {} flag but not Py_TPFLAGS_HAVE_GC flag", desc.name, fname)));
+            }
+        }
         // the best base
         let mut base: *mut PyTypeObject = std::ptr::null_mut();
         for b in tuple::tuple_items(&bases) {
             if !is_type(b) {
-                return Err(type_error("bases must be types"));
+                return Err(type_error(&format!("bases must be types; got '{}'", tname(b))));
             }
             let bt = as_type(b);
             if (*bt).tp_flags & Py_TPFLAGS_READY == 0 {
@@ -567,6 +575,14 @@ pub(crate) unsafe fn type_from_desc(desc: TypeDesc, token: *mut c_void) -> PyRes
             }
             if (*bt).tp_flags & Py_TPFLAGS_BASETYPE == 0 {
                 return Err(type_error(&format!("type '{}' is not an acceptable base type", to::type_fqname(bt))));
+            }
+            // an immutable type cannot extend a mutable one (capi2)
+            if desc.flags & Py_TPFLAGS_IMMUTABLETYPE != 0 && (*bt).tp_flags & Py_TPFLAGS_IMMUTABLETYPE == 0 {
+                return Err(type_error(&format!(
+                    "Creating immutable type {} from mutable base {} is not allowed",
+                    desc.name,
+                    to::type_fqname(bt)
+                )));
             }
             if base.is_null() || to::is_subtype(to::solid_base(bt), to::solid_base(base)) {
                 base = bt;
@@ -722,33 +738,32 @@ pub(crate) unsafe fn type_from_desc(desc: TypeDesc, token: *mut c_void) -> PyRes
     }
 }
 
-unsafe fn desc_from_spec(meta: *mut PyTypeObject, module: *mut PyObject, spec: *mut PyType_Spec, bases: *mut PyObject) -> TypeDesc {
+unsafe fn desc_from_spec(meta: *mut PyTypeObject, module: *mut PyObject, spec: *mut PyType_Spec, bases: *mut PyObject) -> PyResult<TypeDesc> {
     unsafe {
-        let mut slots = Vec::new();
-        let mut s = (*spec).slots;
-        while !s.is_null() && (*s).slot != 0 {
-            slots.push(((*s).slot, (*s).pfunc));
-            s = s.add(1);
-        }
-        TypeDesc {
-            name: cs((*spec).name).into_owned(),
+        let name = cs((*spec).name).into_owned();
+        let mut walker = super::slots::Walker::new(super::slots::Kind::Type, super::slots::Api::Spec, format!("type {}", name));
+        walker.walk_type_slots((*spec).slots, 0)?;
+        Ok(TypeDesc {
+            name,
             basicsize: (*spec).basicsize as isize,
             extra_basicsize: 0,
             itemsize: (*spec).itemsize as isize,
             flags: (*spec).flags as std::ffi::c_ulong,
-            slots,
+            slots: walker.out.iter().map(|e| (e.id as c_int, e.value)).collect(),
             metaclass: meta,
             module,
             bases,
-        }
+        })
     }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyType_FromMetaclass(meta: *mut PyTypeObject, module: *mut PyObject, spec: *mut PyType_Spec, bases: *mut PyObject) -> *mut PyObject {
     unsafe {
-        let d = desc_from_spec(meta, module, spec, bases);
-        ret(type_from_desc(d, spec as *mut c_void))
+        match desc_from_spec(meta, module, spec, bases) {
+            Ok(d) => ret(type_from_desc(d, spec as *mut c_void)),
+            Err(_) => std::ptr::null_mut(),
+        }
     }
 }
 #[unsafe(no_mangle)]
@@ -764,42 +779,13 @@ pub unsafe extern "C" fn PyType_FromSpec(spec: *mut PyType_Spec) -> *mut PyObjec
     unsafe { PyType_FromMetaclass(std::ptr::null_mut(), std::ptr::null_mut(), spec, std::ptr::null_mut()) }
 }
 
-/// Flatten a PySlot array (following Py_slot_subslots / Py_tp_slots / Py_mod_slots).
-pub(crate) unsafe fn flatten_slots(slots: *const PySlot, out: &mut Vec<(u16, u16, *mut c_void)>) {
-    unsafe {
-        let mut p = slots;
-        while !p.is_null() && (*p).sl_id != 0 {
-            match (*p).sl_id {
-                92 => flatten_slots((*p).sl_ptr as *const PySlot, out),
-                93 => {
-                    // array of old-style PyType_Slot
-                    let mut s = (*p).sl_ptr as *const PyType_Slot;
-                    while !s.is_null() && (*s).slot != 0 {
-                        out.push(((*s).slot as u16, 0, (*s).pfunc));
-                        s = s.add(1);
-                    }
-                }
-                94 => {
-                    let mut s = (*p).sl_ptr as *const PyModuleDef_Slot;
-                    while !s.is_null() && (*s).slot != 0 {
-                        // old module slot ids 1..4 map to 84..87
-                        let id = if (1..=4).contains(&(*s).slot) { (*s).slot + 83 } else { (*s).slot };
-                        out.push((id as u16, 0, (*s).value));
-                        s = s.add(1);
-                    }
-                }
-                id => out.push((id, (*p).sl_flags, (*p).sl_ptr)),
-            }
-            p = p.add(1);
-        }
-    }
-}
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyType_FromSlots(slots: *const PySlot) -> *mut PyObject {
     unsafe {
-        let mut flat = Vec::new();
-        flatten_slots(slots, &mut flat);
+        let mut walker = super::slots::Walker::new(super::slots::Kind::Type, super::slots::Api::Slots, "type".into());
+        if walker.walk_slots(slots, 0).is_err() {
+            return std::ptr::null_mut();
+        }
         let mut desc = TypeDesc {
             name: String::new(),
             basicsize: 0,
@@ -812,8 +798,9 @@ pub unsafe extern "C" fn PyType_FromSlots(slots: *const PySlot) -> *mut PyObject
             bases: std::ptr::null_mut(),
         };
         let mut have_name = false;
-        for (id, flags, p) in flat {
-            match id {
+        for e in &walker.out {
+            let p = e.value;
+            match e.id {
                 95 => {
                     desc.name = cs(p as *const c_char).into_owned();
                     have_name = true;
@@ -824,13 +811,7 @@ pub unsafe extern "C" fn PyType_FromSlots(slots: *const PySlot) -> *mut PyObject
                 99 => desc.flags = p as usize as std::ffi::c_ulong,
                 107 => desc.metaclass = p as *mut PyTypeObject,
                 108 => desc.module = p as *mut PyObject,
-                1..=83 | 88..=91 => desc.slots.push((id as c_int, p)),
-                _ => {
-                    if flags & 1 == 0 {
-                        let _ = system_error(&format!("invalid slot ID {} for a type", id));
-                        return std::ptr::null_mut();
-                    }
-                }
+                id => desc.slots.push((id as c_int, p)),
             }
         }
         if !have_name {

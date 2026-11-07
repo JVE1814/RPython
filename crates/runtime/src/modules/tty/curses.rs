@@ -280,6 +280,37 @@ fn need_color() -> PyResult<()> {
     Ok(())
 }
 
+/// C-API checks behind PyCursesSetupTermCalled / PyCursesInitialised /
+/// PyCursesInitialisedColor: 1, or 0 with _curses.error set.
+fn capi_check(f: fn() -> PyResult<()>) -> c_int {
+    if f().is_ok() { 1 } else { 0 }
+}
+extern "C" fn capi_setupterm_called() -> c_int {
+    capi_check(need_setupterm)
+}
+extern "C" fn capi_initialised() -> c_int {
+    capi_check(need_initscr)
+}
+extern "C" fn capi_initialised_color() -> c_int {
+    capi_check(need_color)
+}
+struct CapiTable([*mut std::ffi::c_void; 4]);
+unsafe impl Sync for CapiTable {}
+unsafe impl Send for CapiTable {}
+fn capi_table() -> *const *mut std::ffi::c_void {
+    static T: std::sync::OnceLock<CapiTable> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        CapiTable([
+            window_type() as *mut std::ffi::c_void,
+            capi_setupterm_called as *mut std::ffi::c_void,
+            capi_initialised as *mut std::ffi::c_void,
+            capi_initialised_color as *mut std::ffi::c_void,
+        ])
+    })
+    .0
+    .as_ptr()
+}
+
 fn ci(o: &PyObject) -> PyResult<c_int> {
     crate::modules::posix::path::c_int(o)
 }
@@ -2267,6 +2298,12 @@ pub fn init() -> PyResult {
     let set = |n: &str, v: i64| dict::set_item_str(&d, n, &int::new_int(v));
     dict::set_item_str(&d, "error", unsafe { &*ERROR.load(Ordering::Acquire) })?;
     dict::set_item_str(&d, "window", typeobject::type_obj(window_type()))?;
+    // the py_curses.h C API: the window type and the three "initialised" checks (capi2)
+    {
+        let cap = unsafe { crate::capi::capsule::PyCapsule_New(capi_table() as *mut std::ffi::c_void, c"_curses._C_API".as_ptr(), None) };
+        let cap = unsafe { crate::errors::from_c(cap) }?;
+        dict::set_item_str(&d, "_C_API", &cap)?;
+    }
     dict::set_item_str(&d, "version", &bytes::new_bytes(b"2.2"))?;
     dict::set_item_str(&d, "__version__", &bytes::new_bytes(b"2.2"))?;
     let ver = ncurses_version_obj()?;

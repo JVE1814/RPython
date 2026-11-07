@@ -401,7 +401,12 @@ pub fn add_interp_atexit(i: *mut c_void, f: usize, data: usize) {
 /// state is attached on return (null on failure, with the previous state back).
 pub fn new_interpreter(config: subinterp::Config, whence: i32) -> *mut c_void {
     match subinterp::create(config, whence) {
-        Ok((ts, _prev)) => ts as *mut c_void,
+        Ok((ts, _prev)) => {
+            // the new interpreter's thread state is current and is this thread's
+            // PyGILState thread state until the interpreter ends (capi2)
+            GILSTATE.with(|c| c.set(ts));
+            ts as *mut c_void
+        }
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -420,10 +425,19 @@ pub unsafe fn end_interpreter(ts: *mut c_void) {
             threads::set_current(ts);
             (*ts).mode.set(ThreadMode::InVm);
             subinterp::end_interpreter(ts);
+            forget_gilstate(ts);
             attach(prev);
             return;
         }
         subinterp::end_interpreter(ts);
+        forget_gilstate(ts);
+    }
+}
+/// A thread state that was destroyed is no longer this thread's PyGILState state (code
+/// run while an interpreter ends may have looked it up again). (capi2)
+fn forget_gilstate(ts: *mut ThreadState) {
+    if GILSTATE.with(|c| c.get()) == ts {
+        GILSTATE.with(|c| c.set(std::ptr::null_mut()));
     }
 }
 #[unsafe(no_mangle)]

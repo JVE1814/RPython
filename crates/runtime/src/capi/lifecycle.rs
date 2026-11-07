@@ -489,131 +489,6 @@ pub unsafe extern "C" fn PyConfig_SetWideStringList(_c: *mut c_void, list: *mut 
     }
 }
 
-/// PEP 741 config names mapped to sys attributes / flags.
-fn config_lookup(name: &str) -> PyResult {
-    let sys = |a: &str| crate::modules::sys::get_sys_attr(a).ok_or_else(|| value_error(&format!("unknown config option name: {}", name)));
-    let flag = |a: &str| -> PyResult {
-        let f = sys("flags")?;
-        ab::getattr_str(&f, a)
-    };
-    match name {
-        "argv" | "orig_argv" | "executable" | "base_executable" | "prefix" | "base_prefix" | "exec_prefix" | "base_exec_prefix"
-        | "platlibdir" | "pycache_prefix" | "stdlib_dir" | "warnoptions" | "module_search_paths" => {
-            let attr = match name {
-                "module_search_paths" => "path",
-                "stdlib_dir" => "_stdlib_dir",
-                n => n,
-            };
-            sys(attr)
-        }
-        "xoptions" => sys("_xoptions"),
-        "use_environment" => Ok(bool_::new_bool(ab::is_true(&*(flag("ignore_environment")?))? == false)),
-        "verbose" | "optimize" | "inspect" | "interactive" | "quiet" | "isolated" | "safe_path" | "dev_mode" | "utf8_mode"
-        | "warn_default_encoding" | "int_max_str_digits" | "bytes_warning" | "dont_write_bytecode" | "gil" => {
-            let attr = match name {
-                "dont_write_bytecode" => "dont_write_bytecode",
-                "bytes_warning" => "bytes_warning",
-                n => n,
-            };
-            flag(attr)
-        }
-        "write_bytecode" => Ok(bool_::new_bool(!ab::is_true(&*(flag("dont_write_bytecode")?))?)),
-        "site_import" => Ok(bool_::new_bool(!ab::is_true(&*(flag("no_site")?))?)),
-        "user_site_directory" => Ok(bool_::new_bool(!ab::is_true(&*(flag("no_user_site")?))?)),
-        "parse_argv" | "install_signal_handlers" | "import_time" | "configure_c_stdio" | "buffered_stdio" | "pathconfig_warnings" => {
-            Ok(bool_::new_bool(true))
-        }
-        "filesystem_encoding" => Ok(pystr::new_str("utf-8")),
-        "filesystem_errors" => Ok(pystr::new_str("surrogateescape")),
-        // core-runtime: further PEP 741 options with this runtime's fixed values
-        "code_debug_ranges" => {
-            let xo = sys("_xoptions")?;
-            let off = crate::types::dict::get_item_str(&xo, &pystr::new_str("no_debug_ranges")).is_some()
-                || (std::env::var_os("PYTHONNODEBUGRANGES").is_some_and(|v| !v.is_empty())
-                    && ab::is_true(&*(flag("ignore_environment")?))? == false);
-            Ok(bool_::new_bool(!off))
-        }
-        "coerce_c_locale" | "coerce_c_locale_warn" | "dump_refs" | "malloc_stats" | "pymalloc_hugepages" | "parser_debug"
-        | "show_ref_count" | "skip_source_first_line" | "faulthandler" | "use_hash_seed" => {
-            if name == "faulthandler" {
-                if let Some(m) = crate::import::get_loaded_module("faulthandler") {
-                    if let Ok(f) = ab::getattr_str(&m, "is_enabled") {
-                        return Ok(bool_::new_bool(ab::is_true(&*ab::call(&f, &[])?)?));
-                    }
-                }
-            }
-            if name == "parser_debug" {
-                return Ok(bool_::new_bool(ab::is_true(&*(flag("debug")?))?));
-            }
-            Ok(bool_::new_bool(false))
-        }
-        "configure_locale" | "use_frozen_modules" => Ok(bool_::new_bool(true)),
-        "allocator" | "hash_seed" | "perf_profiling" | "remote_debug" | "tracemalloc" | "enable_gil" | "tlbc_enabled" => {
-            Ok(int::new_int(if name == "enable_gil" { -1 } else { 0 }))
-        }
-        "cpu_count" => Ok(int::new_int(-1)),
-        "optimization_level" => flag("optimize"),
-        "lazy_imports" => Ok(int::new_int(crate::modules::sys_full::config().lazy_imports as i64)),
-        "thread_inherit_context" | "context_aware_warnings" => flag(name),
-        "check_hash_pycs_mode" => Ok(pystr::new_str("default")),
-        "home" | "dump_refs_file" | "run_command" | "run_filename" | "run_module" => Ok(none::none_ref()),
-        "program_name" => sys("executable"),
-        "stdio_encoding" => Ok(pystr::new_str("utf-8")),
-        "stdio_errors" => Ok(pystr::new_str("strict")),
-        _ => Err(value_error(&format!("unknown config option name: {}", name))),
-    }
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyConfig_Get(name: *const c_char) -> *mut PyObject {
-    unsafe { ret(config_lookup(&cs(name))) }
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyConfig_GetInt(name: *const c_char, value: *mut c_int) -> c_int {
-    unsafe {
-        let r = (|| -> PyResult<c_int> {
-            let v = config_lookup(&cs(name))?;
-            if !int::is_int(&v) {
-                return Err(type_error(&format!("config option {} is not an int", cs(name))));
-            }
-            Ok(int::as_i64(&v).unwrap_or(0) as c_int)
-        })();
-        match r {
-            Ok(v) => {
-                *value = v;
-                0
-            }
-            Err(_) => -1,
-        }
-    }
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyConfig_Names() -> *mut PyObject {
-    let names = [
-        "argv", "orig_argv", "executable", "base_executable", "prefix", "base_prefix", "exec_prefix", "base_exec_prefix", "platlibdir",
-        "pycache_prefix", "stdlib_dir", "warnoptions", "module_search_paths", "xoptions", "use_environment", "verbose", "optimize",
-        "inspect", "interactive", "quiet", "isolated", "safe_path", "dev_mode", "utf8_mode", "warn_default_encoding",
-        "int_max_str_digits", "bytes_warning", "write_bytecode", "site_import", "user_site_directory", "filesystem_encoding",
-        "filesystem_errors",
-    ];
-    ret(crate::types::set::new_frozenset_from_vec(names.iter().map(|n| pystr::new_str(n)).collect()))
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyConfig_Set(name: *const c_char, value: *mut PyObject) -> c_int {
-    unsafe {
-        let n = cs(name).into_owned();
-        let attr = match n.as_str() {
-            "argv" | "warnoptions" | "pycache_prefix" | "executable" => n.clone(),
-            "module_search_paths" => "path".into(),
-            "xoptions" => "_xoptions".into(),
-            _ => {
-                let _ = value_error(&format!("cannot set read-only option {:?}", n));
-                return -1;
-            }
-        };
-        ret_i(crate::modules::sys::set_sys_attr(&attr, &*value))
-    }
-}
-
 // ---------------------------------------------------------------- PyInitConfig (PEP 741)
 
 pub struct InitConfig {
@@ -651,7 +526,7 @@ pub unsafe extern "C" fn PyInitConfig_GetExitCode(_c: *mut InitConfig, _code: *m
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInitConfig_HasOption(_c: *mut InitConfig, name: *const c_char) -> c_int {
     unsafe {
-        let r = config_lookup(&cs(name)).is_ok();
+        let r = super::config::config_get(&cs(name)).is_ok();
         clear_exc();
         r as c_int
     }
@@ -665,7 +540,7 @@ unsafe fn set_err(c: *mut InitConfig, msg: &str) -> c_int {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInitConfig_GetInt(c: *mut InitConfig, name: *const c_char, value: *mut i64) -> c_int {
     unsafe {
-        match config_lookup(&cs(name)) {
+        match super::config::config_get(&cs(name)) {
             Ok(v) if int::is_int(&v) => {
                 *value = int::as_i64(&v).unwrap_or(0);
                 0
@@ -680,7 +555,7 @@ pub unsafe extern "C" fn PyInitConfig_GetInt(c: *mut InitConfig, name: *const c_
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInitConfig_GetStr(c: *mut InitConfig, name: *const c_char, value: *mut *mut c_char) -> c_int {
     unsafe {
-        match config_lookup(&cs(name)) {
+        match super::config::config_get(&cs(name)) {
             Ok(v) if pystr::is_str(&v) => {
                 *value = pymem_cstring(pystr::to_string_lossy(&v).as_bytes());
                 0
@@ -699,7 +574,7 @@ pub unsafe extern "C" fn PyInitConfig_GetStr(c: *mut InitConfig, name: *const c_
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInitConfig_GetStrList(c: *mut InitConfig, name: *const c_char, length: *mut usize, items: *mut *mut *mut c_char) -> c_int {
     unsafe {
-        match config_lookup(&cs(name)).and_then(|v| ab::collect_iterable(&v)) {
+        match super::config::config_get(&cs(name)).and_then(|v| ab::collect_iterable(&v)) {
             Ok(v) => {
                 let arr = super::mem::PyMem_Malloc(v.len().max(1) * 8) as *mut *mut c_char;
                 for (i, s) in v.iter().enumerate() {

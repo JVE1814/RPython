@@ -248,6 +248,17 @@ fn install_zipimport_hook() {
         if let Some(hooks) = crate::modules::sys::get_sys_attr("path_hooks") {
             list::insert(&hooks, 0, hook);
         }
+        // (capi2) importing zipimport itself walked sys.path before the hook existed and
+        // cached "no finder" for ZIP entries: forget those so the hook gets its chance
+        if let Some(cache) = crate::modules::sys::get_sys_attr("path_importer_cache") {
+            if dict::is_dict(&cache) {
+                for (k, v) in dict::items_vec(&cache) {
+                    if v.is(none::none()) {
+                        let _ = dict::del_item(&cache, &k);
+                    }
+                }
+            }
+        }
         Ok(())
     })();
     if r.is_err() {

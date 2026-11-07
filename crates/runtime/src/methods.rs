@@ -321,11 +321,47 @@ pub unsafe fn call_methoddef(
                 raise!(SystemError, "{}() method: bad call flags", qualname());
             }
         };
-        from_c(r)
+        check_c_result(r, meth, qualname)
     }
 }
 
 use crate::raise;
+
+/// Whether code at `addr` belongs to a loaded extension rather than this executable.
+fn is_extension_code(addr: *const c_void) -> bool {
+    static OWN_BASE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let base_of = |a: *const c_void| -> usize {
+        let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+        if unsafe { libc::dladdr(a, &mut info) } == 0 { 0 } else { info.dli_fbase as usize }
+    };
+    let own = *OWN_BASE.get_or_init(|| base_of(is_extension_code as *const c_void));
+    base_of(addr) != own
+}
+
+/// The result of a C-level method call: NULL needs an exception, and a result must not
+/// come with one (checked for extension functions; the runtime's own builtins are
+/// trusted). (capi2)
+#[inline]
+fn check_c_result(r: *mut PyObject, meth: *const c_void, qualname: &dyn Fn() -> String) -> PyResult {
+    if r.is_null() {
+        if !err_occurred() {
+            raise!(SystemError, "<built-in function {}> returned NULL without setting an exception", qualname());
+        }
+        return Err(PyErr);
+    }
+    if err_occurred() && is_extension_code(meth) {
+        unsafe { decref(r) };
+        let cause = take_exc();
+        let _ = crate::err!(SystemError, "<built-in function {}> returned a result with an exception set", qualname());
+        if let (Some(c), Some(e)) = (cause, take_exc()) {
+            crate::types::exceptions::set_exc_cause(&e, Some(&c));
+            crate::types::exceptions::set_context_and_cause(&e, Some(&c));
+            set_exc(e);
+        }
+        return Err(PyErr);
+    }
+    Ok(unsafe { PyRef::from_raw(r) })
+}
 
 // ---------------------------------------------------------------- getset / members
 

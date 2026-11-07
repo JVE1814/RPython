@@ -99,6 +99,16 @@ static FUNC_VERSION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32
 static mut NEWFUNC_CACHE: (usize, u64, *mut PyObject, *mut PyObject) = (0, 0, std::ptr::null_mut(), std::ptr::null_mut());
 
 pub fn new_function(code: &PyObject, globals: &PyObject, qualname: Option<&PyObject>) -> PyResult {
+    let r = new_function_inner(code, globals, qualname);
+    if crate::capi::watchers::funcs_watched() {
+        if let Ok(f) = &r {
+            crate::capi::watchers::func_event(crate::capi::watchers::FUNC_CREATE, f.as_ptr(), None); // (capi2)
+        }
+    }
+    r
+}
+
+fn new_function_inner(code: &PyObject, globals: &PyObject, qualname: Option<&PyObject>) -> PyResult {
     unsafe {
         let op = crate::alloc::alloc_object(function_type(), std::mem::size_of::<PyFunctionObject>());
         let f = &mut *(op as *mut PyFunctionObject);
@@ -180,6 +190,9 @@ macro_rules! clear_field {
 unsafe extern "C" fn func_dealloc(op: *mut PyObject) {
     unsafe {
         crate::gc::untrack(op);
+        if crate::capi::watchers::funcs_watched() {
+            crate::capi::watchers::func_event(crate::capi::watchers::FUNC_DESTROY, op, None); // (capi2)
+        }
         let f = &mut *(op as *mut PyFunctionObject);
         crate::types::weakref::clear_weakrefs_at(op, &mut f.func_weakreflist);
         func_clear(op);
@@ -300,6 +313,9 @@ fn f_set_code(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
             1,
         )?;
     }
+    if crate::capi::watchers::funcs_watched() {
+        crate::capi::watchers::func_event(crate::capi::watchers::FUNC_MODIFY_CODE, o.as_ptr(), Some(v));
+    }
     // perf-runtime: running call frames borrow their code object from the function
     // (interp::frame, no refcount traffic per call), so the old code object must
     // outlive any frame still executing it: it is retired instead of released.
@@ -322,6 +338,9 @@ fn f_set_defaults(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         None => None,
         Some(_) => raise!(TypeError, "__defaults__ must be set to a tuple object"),
     };
+    if crate::capi::watchers::funcs_watched() {
+        crate::capi::watchers::func_event(crate::capi::watchers::FUNC_MODIFY_DEFAULTS, o.as_ptr(), v);
+    }
     replace(&mut func(o).func_defaults, v);
     func(o).func_version = FUNC_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     crate::modules::testinternalcapi::rare_event(crate::modules::testinternalcapi::RareEvent::FuncModification);
@@ -337,6 +356,9 @@ fn f_set_kwdefaults(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         None => None,
         Some(_) => raise!(TypeError, "__kwdefaults__ must be set to a dict object"),
     };
+    if crate::capi::watchers::funcs_watched() {
+        crate::capi::watchers::func_event(crate::capi::watchers::FUNC_MODIFY_KWDEFAULTS, o.as_ptr(), v);
+    }
     replace(&mut func(o).func_kwdefaults, v);
     func(o).func_version = FUNC_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     crate::modules::testinternalcapi::rare_event(crate::modules::testinternalcapi::RareEvent::FuncModification);
@@ -369,6 +391,9 @@ fn f_qualname(o: &PyObject) -> PyResult {
 fn f_set_qualname(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     match v {
         Some(v) if pystr::is_str(v) => {
+            if crate::capi::watchers::funcs_watched() {
+                crate::capi::watchers::func_event(crate::capi::watchers::FUNC_MODIFY_QUALNAME, o.as_ptr(), Some(v));
+            }
             replace(&mut func(o).func_qualname, Some(v));
             Ok(())
         }
