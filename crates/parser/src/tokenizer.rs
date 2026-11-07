@@ -14,6 +14,9 @@ use crate::UnicodeHooks;
 pub const MAXINDENT: usize = 100;
 pub const MAXLEVEL: usize = 200;
 pub const MAX_EXPR_NESTING: usize = 150;
+/// Deepest allowed chain of replacement fields inside format specs
+/// (`{a:{b:{c}}}` is fine, one more level is not).
+const MAX_SPEC_NESTING: usize = 3;
 
 #[derive(Clone, Copy, Debug)]
 pub struct LexOptions {
@@ -1450,8 +1453,10 @@ impl<'a> Lexer<'a> {
 
     fn open_field(&mut self, start: usize, slineno: u32, scol: i32) -> Result<Token, LexError> {
         let midx = self.modes.len() - 1;
+        // replacement fields inside format specs may nest only so far
+        let in_specs = self.fields.iter().filter(|f| f.mode == midx && f.in_spec).count();
         let nfields = self.fields.iter().filter(|f| f.mode == midx).count();
-        if nfields + 1 >= MAX_EXPR_NESTING {
+        if nfields + 1 >= MAX_EXPR_NESTING || in_specs >= MAX_SPEC_NESTING {
             return Err(self.err_here(format!("{}-string: expressions nested too deeply", self.fprefix())));
         }
         if self.parens.len() >= MAXLEVEL {

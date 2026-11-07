@@ -353,6 +353,19 @@ fn is_incomplete_error() -> bool {
     inc
 }
 
+/// Is the pending SyntaxError about a bracket or triple-quoted string that the
+/// input so far leaves open?
+fn still_open_error() -> bool {
+    if !exc_matches(crate::types::exceptions::SyntaxError()) {
+        return false;
+    }
+    let e = take_exc().unwrap();
+    let msg = ab::getattr_str(&e, "msg").ok().map(|m| ab::str_string(&m).unwrap_or_default()).unwrap_or_default();
+    clear_exc();
+    set_exc(e);
+    msg.contains("was never closed") || msg.contains("unterminated triple-quoted string")
+}
+
 /// Call sys.__interactivehook__ (installed by site: readline completion and history).
 fn run_interactive_hook() {
     if let Some(h) = crate::modules::sys::get_sys_attr("__interactivehook__") {
@@ -551,6 +564,7 @@ fn repl(quiet: bool) -> i32 {
                 continue;
             }
         }
+        let at_eof = matches!(n, Ok(0) | Err(_));
         match n {
             Ok(0) | Err(_) => {
                 if buf.is_empty() {
@@ -602,7 +616,10 @@ fn repl(quiet: bool) -> i32 {
             Err(_) => {
                 // a compound statement is complete only after a blank line (its error, too)
                 let first = src.lines().next().unwrap_or("");
-                if (is_incomplete_error() || starts_compound(first)) && !blank {
+                // inside an open bracket or triple-quoted string a blank line is just
+                // part of the statement (only the end of input stops it there)
+                let open = still_open_error();
+                if ((is_incomplete_error() || starts_compound(first)) && !blank) || (open && !at_eof) {
                     clear_exc();
                     continue;
                 }
