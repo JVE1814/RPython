@@ -294,6 +294,8 @@ pub struct Built {
 struct B<'a> {
     u: &'a Unit<'a>,
     cfg: Cfg,
+    /// (jit6) further instructions an instruction consumed (fused UnpackSequence + StoreFast)
+    skip_extra: usize,
     f: Func,
     cur: BlockId,
     st: State,
@@ -1192,7 +1194,7 @@ impl<'a> B<'a> {
                 break;
             }
             let consumed_next = self.instr(i, last)?;
-            i += 1 + consumed_next as usize;
+            i += 1 + consumed_next as usize + std::mem::take(&mut self.skip_extra);
         }
         if !self.closed {
             // fall through into the next block
@@ -1475,7 +1477,7 @@ impl<'a> B<'a> {
                 }
             }
             Op::StoreSubscr => self.store_subscr(i),
-            Op::UnpackSequence => self.unpack_sequence(i),
+            Op::UnpackSequence => self.unpack_sequence(i, last),
             Op::DeleteFast | Op::LoadFastAndClear => self.template(i),
             _ => {
                 self.template(i);
@@ -3313,7 +3315,7 @@ impl<'a> B<'a> {
         self.pop();
     }
 
-    fn unpack_sequence(&mut self, i: usize) {
+    fn unpack_sequence(&mut self, i: usize, last: usize) {
         let ins = self.u.an.instrs[i];
         let n = ins.arg as usize;
         let (pa, _) = self.prof(i);
@@ -3344,7 +3346,7 @@ impl<'a> B<'a> {
             self.term(Term::Jump(join));
             self.switch_to(join);
             self.emit(Inst::Guard(Cond::CmpMem(Base::V(s), LIST_SIZE, n as i64, Cc::NE), snap));
-            self.unpack_items(n, (items, 0));
+            self.unpack_or_fuse(i, last, n, (items, 0));
             return;
         }
         let tp = if is_list { list_t() } else { tuple_t() };
@@ -3362,7 +3364,65 @@ impl<'a> B<'a> {
         } else {
             (s, TUPLE_ITEMS)
         };
-        self.unpack_items(n, base);
+        self.unpack_or_fuse(i, last, n, base);
+    }
+
+    /// (jit6) `a, b, c, ... = seq` with every target a distinct frame-represented
+    /// local: one call to `h2_unpack_store` instead of n inline incref/store/decref
+    /// sequences (the inline form is ~1.8 KB of machine code per statement, which
+    /// made functions with many such statements instruction-fetch bound). Otherwise
+    /// the items are pushed as usual.
+    fn unpack_or_fuse(&mut self, i: usize, last: usize, n: usize, base: (V, i32)) {
+        let ok = n >= 4 && n <= 15 && i + n <= last && self.inl.is_none() && {
+            let mut seen = Vec::with_capacity(n);
+            (1..=n).all(|k| {
+                let ins = self.u.an.instrs[i + k];
+                let li = ins.arg as usize;
+                let fine = ins.op == Op::StoreFast && li < 255 && self.reps[li] == Rep::Frame && !seen.contains(&li);
+                seen.push(li);
+                fine
+            })
+        };
+        if !ok {
+            self.unpack_items(n, base);
+            return;
+        }
+        let targets: Vec<u32> = (1..=n).map(|k| self.u.an.instrs[i + k].arg).collect();
+        for &t in &targets {
+            self.unborrow(t);
+            let dummy = AV::Obj(0, Own::Owned, Ty::Unknown);
+            self.note_store_kind(t as usize, &dummy);
+        }
+        let items = if base.1 == 0 {
+            base.0
+        } else {
+            let p = self.v(Class::G);
+            self.emit(Inst::Lea(p, Base::V(base.0), base.1));
+            p
+        };
+        let sl = self.v(Class::G);
+        self.emit(Inst::SlotAddr(sl, 0));
+        let (mut lo, mut hi) = (0u64, (n as u64) << 56);
+        for (k, &t) in targets.iter().enumerate() {
+            if k < 8 {
+                lo |= (t as u64) << (8 * k);
+            } else {
+                hi |= (t as u64) << (8 * (k - 8));
+            }
+        }
+        self.emit(Inst::Call { addr: h2_unpack_store as usize, args: vec![Opnd::V(items), Opnd::V(sl), Opnd::I(lo as i64), Opnd::I(hi as i64)], fargs: vec![], ret: None, fret: None });
+        // the old values' release may run arbitrary code
+        self.forget_tags();
+        let k = self.st.stack.len() - 1;
+        let a = self.pop();
+        self.discard(a, k);
+        for &t in &targets {
+            let li = t as usize;
+            self.st.locals[li] = LS::Frame(Ty::Unknown);
+            self.st.ptr[li] = None;
+            self.st.unb[li] = None;
+        }
+        self.skip_extra = n;
     }
 
     /// Push the n items at `base` (incref'd, last item deepest) in place of the
@@ -3481,6 +3541,29 @@ pub unsafe extern "C" fn h2_list_append(l: *mut PyObject, x: *mut PyObject, _unu
     unsafe {
         crate::types::list::append(&*l, (*x).to_ref());
         1
+    }
+}
+
+/// (jit6) Fused `UnpackSequence n` + n `StoreFast` (`unpack_or_fuse`): `items` are the
+/// sequence's n items (borrowed); local slot k gets item k. Slot indices are bytes:
+/// items 0..8 in `lo`, 8..15 in `hi`, n in the top byte of `hi`. All items are
+/// referenced before any old value is released (a release may run arbitrary code
+/// that drops the sequence).
+pub unsafe extern "C" fn h2_unpack_store(items: *const *mut PyObject, slots: *mut *mut PyObject, lo: u64, hi: u64) {
+    unsafe {
+        let n = ((hi >> 56) as usize).min(15);
+        let idx: [u8; 16] = std::mem::transmute([lo.to_le(), hi.to_le()]);
+        let mut old: [std::mem::MaybeUninit<*mut PyObject>; 15] = [std::mem::MaybeUninit::uninit(); 15];
+        for k in 0..n {
+            let x = *items.add(k);
+            crate::object::incref(x);
+            let s = slots.add(*idx.get_unchecked(k) as usize);
+            old.get_unchecked_mut(k).write(*s);
+            *s = x;
+        }
+        for k in 0..n {
+            crate::object::xdecref(old.get_unchecked(k).assume_init());
+        }
     }
 }
 
@@ -3688,6 +3771,7 @@ fn build_once(u: &Unit, reps: &[Rep], assume: &mut Vec<Option<State>>) -> Result
         is_gen: !resumes.is_empty(),
         inl_outer: Vec::new(),
         fatal: None,
+        skip_extra: 0,
         inl_cds: vec![u.cd as *const CodeData as usize],
     };
     // OSR unit / generator resumption: a separate entry block unboxes the unboxed
