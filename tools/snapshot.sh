@@ -27,4 +27,7 @@ bash "$WT/tools/build_test_exts.sh" "$DEST.tmp/lib/python3.15t" > "$DEST.tmp/bui
 rm -rf "$DEST.tmp/lib/python3.15t/obj"
 (cd "$WT" && git log -1 --format=%h) > "$DEST.tmp/REV"
 rm -rf "$DEST"; mv "$DEST.tmp" "$DEST"
+# PEP 739 build-details.json (and the pkg-config file it names), written by the new
+# interpreter at its final location (tail4)
+"$DEST/bin/python3" -I "$WT/tools/build_details.py" || echo "warning: build-details.json not written"
 echo "snapshot $(cat "$DEST/REV") -> $DEST"

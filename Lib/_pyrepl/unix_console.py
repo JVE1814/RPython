@@ -230,10 +230,14 @@ class UnixConsole(Console):
             self.__draw_cells(diff.start_x, y, diff.new_cells)
             return
         if (len(diff.new_cells) == 1 and not diff.old_cells
-                and diff.new_cells[0].width == 1 and caps["ich1"]
+                and diff.new_cells[0].width == 1 and (caps["ich1"] or caps["ich"])
                 and new.width < self.width):
             self.__move(diff.start_x, y)
-            self.__write_code(caps["ich1"])
+            # insert one blank (terminals without ich1 take a count)
+            if caps["ich1"]:
+                self.__write_code(caps["ich1"])
+            else:
+                self.__write_code(caps["ich"], 1)
             self.__draw_cells(diff.start_x, y, diff.new_cells)
             return
         if (len(diff.old_cells) == 1 and not diff.new_cells

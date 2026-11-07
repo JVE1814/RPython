@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::*};
 
 pub const MAGIC: [u8; 8] = *b"RPyDbgT\0";
 /// Bumped whenever the layout of `DebugTable` changes.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// Offsets of the pointer and length words inside a `Vec<T>` (std does not promise an
 /// order, so `init_table` measures it).
@@ -194,6 +194,13 @@ pub struct DebugTable {
     pub thread_list_cap: u64,
     /// `AtomicPtr<ThreadState>` of the main thread.
     pub main_thread: *const u8,
+    /// (tail4) `AtomicUsize`: the thread state running a garbage collection, or 0.
+    pub gc_collector: *const u8,
+    /// (tail4) collection statistics: `gc_stat_slots` records of `gc_stat_words` u64s
+    /// (layout in modules/gc_mod.rs).
+    pub gc_stats: *const u8,
+    pub gc_stat_slots: u64,
+    pub gc_stat_words: u64,
     /// Eval-breaker bit a debugger sets for `sys.remote_exec`; it lives alone in its
     /// byte (`remote_exec_byte` inside the word) so a one-byte write cannot clobber
     /// the bits the runtime updates atomically.
@@ -248,6 +255,10 @@ pub static RPY_DEBUG_TABLE: DebugTable = DebugTable {
     thread_list_seq: &crate::qsbr::LIST_VER as *const _ as *const u8,
     thread_list_cap: crate::qsbr::CAP as u64,
     main_thread: &crate::threads::MAIN_THREAD_STATE as *const _ as *const u8,
+    gc_collector: &crate::gc::GC_COLLECTOR_TS as *const _ as *const u8,
+    gc_stats: &crate::modules::gc_mod::GC_STATS as *const _ as *const u8,
+    gc_stat_slots: crate::modules::gc_mod::GC_STAT_SLOTS as u64,
+    gc_stat_words: crate::modules::gc_mod::GC_STAT_WORDS as u64,
     eval_remote_exec_bit: EVAL_REMOTE_EXEC as u64,
     remote_exec_byte: off(offset_of!(ThreadState, c) + offset_of!(CThreadState, eval_breaker) + 7),
     remote_exec: &REMOTE_EXEC,
@@ -344,20 +355,19 @@ pub static RPY_DEBUG_TABLE: DebugTable = DebugTable {
 /// Measure `Vec`'s field order: a vector with distinct capacity and length shows which
 /// word holds what.
 fn probe_vec_layout() -> (u64, u64) {
+    // (tail4) the vector goes through black_box so the optimizer cannot rewrite its
+    // representation; the pointer word is the one that is neither the length nor the
+    // capacity (an equality test on the pointer alone failed in some builds)
     let mut v: Vec<u32> = Vec::with_capacity(7);
     v.push(1);
     v.push(2);
+    let v = std::hint::black_box(v);
     let words: [usize; 3] = unsafe { std::mem::transmute_copy(&v) };
-    let ptr = v.as_ptr() as usize;
-    let mut p = 0;
-    let mut l = 0;
-    for (i, w) in words.iter().enumerate() {
-        if *w == ptr {
-            p = i;
-        } else if *w == 2 {
-            l = i;
-        }
-    }
+    let (len, cap, ptr) = (v.len(), v.capacity(), v.as_ptr() as usize);
+    let l = words.iter().position(|&w| w == len).unwrap_or(2);
+    let c = words.iter().enumerate().position(|(i, &w)| i != l && w == cap && w != ptr).unwrap_or(0);
+    let p = (0..3).find(|&i| i != l && i != c).unwrap_or(1);
+    debug_assert_eq!(words[p], ptr);
     ((p * 8) as u64, (l * 8) as u64)
 }
 

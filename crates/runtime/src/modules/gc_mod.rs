@@ -24,6 +24,64 @@ static THRESHOLD2: AtomicI64 = AtomicI64::new(0);
 static GEN_COUNTS: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
 static COLLECTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+// (tail4) Per-interpreter, per-generation collection statistics that an outside
+// process reads through the remote-debugging table (`_remote_debugging.get_gc_stats`).
+// Each record is GC_STAT_WORDS u64 words:
+//   [interpreter id + 1 (0: unused), generation, collections, collected,
+//    uncollectable, candidates, heap size, total duration (ns),
+//    start of the last collection (monotonic ns), its end (monotonic ns)]
+pub const GC_STAT_WORDS: usize = 10;
+pub const GC_STAT_SLOTS: usize = 16 * 3;
+
+pub struct GcStatTable(pub [[std::sync::atomic::AtomicU64; GC_STAT_WORDS]; GC_STAT_SLOTS]);
+
+#[allow(clippy::declare_interior_mutable_const)]
+const ZERO_WORD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[allow(clippy::declare_interior_mutable_const)]
+const ZERO_REC: [std::sync::atomic::AtomicU64; GC_STAT_WORDS] = [ZERO_WORD; GC_STAT_WORDS];
+pub static GC_STATS: GcStatTable = GcStatTable([ZERO_REC; GC_STAT_SLOTS]);
+
+fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+fn record_stats(generation: usize, start: u64, collected: usize, uncollectable: usize, candidates: usize, duration_ns: u64) {
+    let iid = crate::subinterp::current().id;
+    let key = (iid + 1) as u64;
+    let gen_no = generation.min(2) as u64;
+    let slots = &GC_STATS.0;
+    let mut pick = None;
+    for (i, rec) in slots.iter().enumerate() {
+        let k = rec[0].load(Relaxed);
+        if k == key && rec[1].load(Relaxed) == gen_no {
+            pick = Some(i);
+            break;
+        }
+        if k == 0 && pick.is_none() {
+            pick = Some(i);
+        }
+    }
+    let i = pick.unwrap_or(((iid as usize) % 16) * 3 + gen_no as usize);
+    let rec = &slots[i];
+    if rec[0].load(Relaxed) != key || rec[1].load(Relaxed) != gen_no {
+        for w in rec.iter() {
+            w.store(0, Relaxed);
+        }
+        rec[1].store(gen_no, Relaxed);
+        rec[0].store(key, Release);
+    }
+    rec[2].fetch_add(1, Relaxed);
+    rec[3].fetch_add(collected as u64, Relaxed);
+    rec[4].fetch_add(uncollectable as u64, Relaxed);
+    rec[5].fetch_add(candidates as u64, Relaxed);
+    rec[6].store(crate::gc::tracked_count().max(0) as u64, Relaxed);
+    rec[7].fetch_add(duration_ns.max(1), Relaxed);
+    rec[8].store(start, Relaxed);
+    rec[9].store(monotonic_ns().max(start + 1), Release);
+}
+
 fn module_list(p: &AtomicPtr<PyObject>) -> PyRef {
     let v = p.load(Acquire);
     if !v.is_null() {
@@ -73,6 +131,7 @@ pub fn collect_with_callbacks(generation: i64) -> usize {
         return 0;
     }
     run_callbacks("start", generation, 0, 0, 0, 0.0);
+    let ts_start = monotonic_ns();
     let before_unc = crate::gc::UNCOLLECTABLE.load(Relaxed);
     let before = gc_totals();
     let cand0 = crate::gc_support::CANDIDATES.load(Relaxed);
@@ -100,6 +159,8 @@ pub fn collect_with_callbacks(generation: i64) -> usize {
         }
     }
     let unc = crate::gc::UNCOLLECTABLE.load(Relaxed).saturating_sub(before_unc);
+    record_stats(generation.clamp(0, 2) as usize, ts_start, n.saturating_sub(unc), unc, candidates,
+        crate::gc_support::DURATION_NS.load(Relaxed).saturating_sub(dur0) as u64);
     run_callbacks("stop", generation, n.saturating_sub(unc), unc, candidates, duration);
     COLLECTING.store(false, Release);
     n
