@@ -33,6 +33,7 @@ pub fn decode(code: &[u32]) -> Vec<Instr> {
 }
 
 /// Stack effect: (fallthrough delta, jump delta).
+#[inline]
 pub fn effect(op: Op, arg: u32) -> (i32, i32) {
     use Op::*;
     let a = arg as i32;
@@ -82,6 +83,7 @@ pub fn effect(op: Op, arg: u32) -> (i32, i32) {
     (d, d)
 }
 
+#[inline]
 pub fn is_terminator(op: Op) -> bool {
     matches!(op, Op::Jump | Op::ReturnValue | Op::RaiseVarargs | Op::Reraise)
 }

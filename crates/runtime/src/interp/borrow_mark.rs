@@ -16,15 +16,23 @@ use rpy_compiler::bytecode::{self as bc, Op};
 /// block boundary, at a store to its local while a copy is live, under a handler that
 /// would keep a copy, or at an instruction this model does not know. Stack depths come
 /// from the same pass (forward jump targets record theirs; code reached only by a
-/// backward jump, which compiled code does not have, is skipped).
+/// backward jump, which compiled code does not have, is skipped). It runs for every
+/// translated code object, so it allocates nothing for code of up to 511 words.
 pub fn mark(code: &mut [u32], handlers: &[bc::ExceptionEntry]) -> usize {
     let n = code.len();
-    // jump targets and handler entries: basic-block starts
-    let mut target = vec![0u64; n / 64 + 1];
-    let set = |t: &mut [u64], i: usize| {
-        if i < n {
-            t[i / 64] |= 1 << (i % 64);
+    // per word: NOT_TARGET, or a block start with its entry depth (-1: not known yet)
+    const NOT_TARGET: i32 = i32::MIN;
+    let mut buf = std::mem::MaybeUninit::<[i32; 512]>::uninit();
+    let mut heap: Vec<i32> = Vec::new();
+    let entry: &mut [i32] = if n < 512 {
+        let p = buf.as_mut_ptr() as *mut i32;
+        for i in 0..=n {
+            unsafe { p.add(i).write(NOT_TARGET) };
         }
+        unsafe { std::slice::from_raw_parts_mut(p, n + 1) }
+    } else {
+        heap.resize(n + 1, NOT_TARGET);
+        &mut heap[..]
     };
     let mut any_load = false;
     let mut ext = 0u32;
@@ -36,8 +44,8 @@ pub fn mark(code: &mut [u32], handlers: &[bc::ExceptionEntry]) -> usize {
             continue;
         }
         ext = 0;
-        if op.is_jump() {
-            set(&mut target, arg as usize);
+        if op.is_jump() && (arg as usize) < n {
+            entry[arg as usize] = -1;
         }
         any_load |= op == Op::LoadFast;
     }
@@ -45,17 +53,12 @@ pub fn mark(code: &mut [u32], handlers: &[bc::ExceptionEntry]) -> usize {
         return 0;
     }
     for h in handlers {
-        set(&mut target, h.target as usize);
-    }
-    let is_target = |i: usize| i < n && target[i / 64] & (1 << (i % 64)) != 0;
-    // depth recorded for forward targets (-1: none yet)
-    let mut entry = vec![-1i32; n + 1];
-    for h in handlers {
         if (h.target as usize) < n {
             entry[h.target as usize] = h.depth as i32 + h.lasti as i32 + 1;
         }
     }
-    let mut cands: Vec<Cand> = Vec::new();
+    let mut cands: [Cand; MAX_CANDS] = [Cand { pc: 0, local: 0, al: [0; 4], na: 0 }; MAX_CANDS];
+    let mut nc = 0usize;
     let mut count = 0;
     let mut cur: i32 = 0; // -1: unknown (unreachable by fall-through)
     let mut hix = 0usize; // handler entries are sorted and do not overlap
@@ -70,9 +73,16 @@ pub fn mark(code: &mut [u32], handlers: &[bc::ExceptionEntry]) -> usize {
         }
         ext = 0;
         let first = std::mem::replace(&mut start, pc + 1);
-        if (first..=pc).any(is_target) {
-            cands.clear();
-            let e = (first..=pc).map(|k| entry[k]).max().unwrap_or(-1);
+        let mut e = entry[pc];
+        if first < pc {
+            // (EXTENDED_ARG prefixes: a jump may name the prefix)
+            for k in first..pc {
+                e = e.max(entry[k]);
+            }
+        }
+        if e != NOT_TARGET {
+            // a block starts here
+            nc = 0;
             if cur < 0 {
                 cur = e;
             }
@@ -80,32 +90,37 @@ pub fn mark(code: &mut [u32], handlers: &[bc::ExceptionEntry]) -> usize {
         if cur < 0 {
             continue;
         }
-        // deepest stack level an exception handler keeps here
-        while hix < handlers.len() && handlers[hix].end as usize <= pc {
-            hix += 1;
-        }
-        let keep = match handlers.get(hix) {
-            Some(h) if (h.start as usize) <= pc => h.depth as i32,
-            _ => -1,
-        };
-        let io = io(op, arg);
-        let mut k = 0;
-        while k < cands.len() {
-            match cands[k].step(&io, cur, keep) {
-                Step::Live => k += 1,
-                Step::Done => {
-                    let p = cands[k].pc;
-                    code[p] = (code[p] & !0xff) | Op::LoadFastBorrow as u32;
-                    count += 1;
-                    cands.swap_remove(k);
-                }
-                Step::Fail => {
-                    cands.swap_remove(k);
+        if nc > 0 {
+            // deepest stack level an exception handler keeps here
+            while hix < handlers.len() && handlers[hix].end as usize <= pc {
+                hix += 1;
+            }
+            let keep = match handlers.get(hix) {
+                Some(h) if (h.start as usize) <= pc => h.depth as i32,
+                _ => -1,
+            };
+            let io = io(op, arg);
+            let mut k = 0;
+            while k < nc {
+                match cands[k].step(&io, cur, keep) {
+                    Step::Live => k += 1,
+                    Step::Done => {
+                        let p = cands[k].pc;
+                        code[p] = (code[p] & !0xff) | Op::LoadFastBorrow as u32;
+                        count += 1;
+                        nc -= 1;
+                        cands[k] = cands[nc];
+                    }
+                    Step::Fail => {
+                        nc -= 1;
+                        cands[k] = cands[nc];
+                    }
                 }
             }
         }
-        if op == Op::LoadFast && cands.len() < 16 {
-            cands.push(Cand { pc, local: arg, al: [cur, 0, 0, 0], na: 1 });
+        if op == Op::LoadFast && nc < MAX_CANDS {
+            cands[nc] = Cand { pc, local: arg, al: [cur, 0, 0, 0], na: 1 };
+            nc += 1;
         }
         let (fall, jump) = super::jit::analysis::effect(op, arg);
         if op.is_jump() {
@@ -116,19 +131,23 @@ pub fn mark(code: &mut [u32], handlers: &[bc::ExceptionEntry]) -> usize {
         }
         if super::jit::analysis::is_terminator(op) {
             cur = -1;
-            cands.clear();
+            nc = 0;
         } else {
             cur += fall;
             if cur < 0 {
                 cur = -1;
-                cands.clear();
+                nc = 0;
             }
         }
     }
     count
 }
 
+/// Loads tracked at once (more are not borrowed).
+const MAX_CANDS: usize = 16;
+
 /// A `LoadFast` whose value may still be borrowed (`mark`).
+#[derive(Clone, Copy)]
 struct Cand {
     pc: usize,
     local: u32,
@@ -159,6 +178,7 @@ enum Io {
     Unknown,
 }
 
+#[inline]
 fn io(op: Op, arg: u32) -> Io {
     use Io::*;
     use Op::*;

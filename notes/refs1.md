@@ -89,8 +89,11 @@ object (`load_obj`) and skip the release (`release_obj`); every other template f
 owns all borrowed entries (`own_all`). Calls: the generic path uses `h_call_t` when an
 argument may be borrowed; the Python-function path takes the callee's references inline
 (dynamic tag test: a statically borrowed `self` slot may hold NULL or an unpacked owned
-self); the machine-code call routine (`callpy.rs`) converts any remaining tagged
-argument. `owned_loads`: call sites that the interpreter saw calling a Python function
+self) and the property-getter path takes a reference for `self`, so the machine-code
+call routine (`callpy.rs`) only ever moves owned arguments. Around a generic call
+(`h_call`/`h_call_t`) the template sets the frame's `stack_top` to the call's top and
+restores it (compiled code does not maintain it; D27's argument-moving rule reads the
+caller's operands). `owned_loads`: call sites that the interpreter saw calling a Python function
 (specialisation view) get their argument loads emitted as owned loads — tier 1 moves
 those arguments into the callee frame, and a reference taken at the load is cheaper
 than converting at the call.
