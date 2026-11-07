@@ -328,6 +328,7 @@ pub fn thread_exit() {
         crate::qsbr::thread_exit();
         crate::object::thread_exit_type_counts();
         crate::interp::frame::drain_pool();
+        crate::types::asyncgen::drain_free_lists();
         crate::gc::flush_thread_counts();
         // Nobody queues objects for this owner once `alive` is false (checked under
         // the ALL_THREADS lock). Drain the queue while this thread still counts as

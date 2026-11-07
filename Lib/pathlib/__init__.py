@@ -94,6 +94,9 @@ class PurePath:
         raw = []
         own_sep = self.parser.sep
         for arg in args:
+            if type(arg) is str:
+                raw.append(arg)
+                continue
             if isinstance(arg, PurePath):
                 if arg.parser is self.parser:
                     raw.extend(arg._raw_paths)
@@ -175,8 +178,20 @@ class PurePath:
             tail = ['.'] + tail
         return sep.join(tail)
 
+    def _from_str(self, text):
+        """self.with_segments(text) for one str argument.  When the class keeps
+        the default construction (with_segments, __new__ and __init__ are
+        PurePath's/Path's own), the new path is set up directly."""
+        cls = type(self)
+        if (type(text) is str and cls.with_segments is _default_with_segments
+                and cls.__init__ is _default_init and cls.__new__ in _default_news):
+            path = object.__new__(cls)
+            path._raw_paths = [text]
+            return path
+        return self.with_segments(text)
+
     def _from_parsed_string(self, text):
-        path = self.with_segments(text)
+        path = self._from_str(text)
         path._str = text or '.'
         return path
 
@@ -492,9 +507,11 @@ class PureWindowsPath(PurePath):
 def _scan_local(directory):
     with os.scandir(directory or '.') as entries:
         found = list(entries)
-    for entry in found:
-        yield entry.name, (lambda follow, entry=entry:
-                           entry.is_dir(follow_symlinks=follow))
+    return [(entry.name, entry) for entry in found]
+
+
+def _local_is_dir(entry, follow):
+    return entry.is_dir(follow_symlinks=follow)
 
 
 def _hostname_is_local(host):
@@ -636,7 +653,7 @@ class Path(PurePath):
     # ---- directories
 
     def _child(self, entry, text):
-        child = self.with_segments(text)
+        child = self._from_str(text)
         child._str = text
         child._info = DirEntryInfo(entry)
         return child
@@ -667,13 +684,16 @@ class Path(PurePath):
         base = '' if here == '.' else (here if here.endswith(sep) else here + sep)
         globber = _glob.Globber(sep, case_sensitive, _scan_local,
                                 os.path.lexists, recurse_symlinks,
-                                case_pedantic=case_sensitive != native)
+                                case_pedantic=case_sensitive != native,
+                                is_dir=_local_is_dir)
         anchor_len = len(self.anchor)
 
         def tidy(text):
             if len(text) > anchor_len and text.endswith(sep):
                 text = text[:-1]
-            return self.with_segments(text)
+            # the globber joins a normalized base with listed names and literal
+            # pattern parts: the text is already in normal form
+            return self._from_parsed_string(text)
 
         return map(tidy, globber.select(base, segments))
 
@@ -950,6 +970,11 @@ class Path(PurePath):
 
 _ReadablePath.register(Path)
 _WritablePath.register(Path)
+
+# the default construction, for PurePath._from_str
+_default_with_segments = PurePath.with_segments
+_default_init = PurePath.__init__
+_default_news = (PurePath.__new__, Path.__new__)
 
 
 def _refuse_instantiation(cls, *args, **kwargs):

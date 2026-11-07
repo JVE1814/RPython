@@ -19,6 +19,9 @@ pub struct PropertyObject {
     getter_doc: c_int,
 }
 
+/// Offset of the getter in a property object (perf5: tier-1 property loads).
+pub const FGET_OFFSET: usize = std::mem::offset_of!(PropertyObject, fget);
+
 #[unsafe(no_mangle)]
 pub static mut PyProperty_Type: PyTypeObject = PyTypeObject::ZERO;
 pub fn property_type() -> *mut PyTypeObject {
