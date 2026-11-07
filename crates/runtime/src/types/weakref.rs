@@ -190,10 +190,18 @@ pub fn first_weakref(o: &PyObject) -> Option<PyRef> {
     let _g = list_lock();
     unsafe {
         let slot = weaklist_slot(o.as_ptr());
-        if slot.is_null() || (*slot).is_null() {
+        if slot.is_null() {
             return None;
         }
-        Some(PyRef::from_borrowed(*slot))
+        // skip weakrefs that other threads are deallocating right now
+        let mut r = head(slot);
+        while !r.is_null() {
+            if crate::object::try_incref(r as *mut PyObject) {
+                return Some(PyRef::from_raw(r as *mut PyObject));
+            }
+            r = (*r).wr_next;
+        }
+        None
     }
 }
 
