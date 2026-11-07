@@ -982,17 +982,17 @@ pub fn new_cell(v: Option<PyRef>) -> PyRef {
 #[inline]
 pub fn cell_get(c: &PyObject) -> Option<PyRef> {
     unsafe {
-        let p = (*(c.as_ptr() as *mut PyCellObject)).ob_ref;
+        let p = std::sync::atomic::AtomicPtr::from_ptr(&raw mut (*(c.as_ptr() as *mut PyCellObject)).ob_ref).load(std::sync::atomic::Ordering::Acquire);
         if p.is_null() { None } else { Some(PyRef::from_borrowed(p)) }
     }
 }
+/// (stability3) Readers (LOAD_DEREF, inline in tier-1 code) take the contents without
+/// a lock, so the replaced value is released through QSBR: a thread that loaded the
+/// old pointer just before the store can still take its reference safely.
 #[inline]
 pub fn cell_set(c: &PyObject, v: Option<PyRef>) {
     unsafe {
-        let slot = &mut (*(c.as_ptr() as *mut PyCellObject)).ob_ref;
-        let old = *slot;
-        *slot = v.map_or(std::ptr::null_mut(), |v| v.into_raw());
-        xdecref(old);
+        crate::qsbr::swap_field(&raw mut (*(c.as_ptr() as *mut PyCellObject)).ob_ref, v.map_or(std::ptr::null_mut(), |v| v.into_raw()));
     }
 }
 unsafe extern "C" fn cell_dealloc(op: *mut PyObject) {

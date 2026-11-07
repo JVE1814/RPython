@@ -525,12 +525,12 @@ pub fn store_attr(o: &PyObject, nm: &PyObject, v: &PyObject, es: &[Entry]) -> Py
                             (crate::shape::Set::Missing, _) => {}
                             (crate::shape::Set::NotValues, _) => {}
                         }
-                        let slot = dict_slot(o.as_ptr());
-                        if !slot.is_null() {
-                            if (*slot).is_null() {
-                                *slot = dict::new_dict().into_raw();
-                            }
-                            let r = dict::set_item(&**slot, nm, v);
+                        // (stability3) an owned reference, created with a CAS: another
+                        // thread may assign `o.__dict__` meanwhile and release the
+                        // old dict (QSBR), and set_item may wait for the dict's lock
+                        // in blocked mode, which counts as a quiescent state
+                        if let Some(d) = crate::types::typeobject::instance_dict(o) {
+                            let r = dict::set_item(&d, nm, v);
                             if had_values && r.is_ok() {
                                 // the object's attributes just moved into a dict: later
                                 // stores (compiled hits, which record nothing) see the
