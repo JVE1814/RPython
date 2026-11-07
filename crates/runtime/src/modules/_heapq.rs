@@ -92,6 +92,7 @@ fn check_list(o: &PyObject) -> PyResult<()> {
 fn push_impl(a: &[&PyObject], name: &str, max: bool) -> PyResult {
     check_pos(name, a, 2, 2)?;
     check_list(a[0])?;
+    let _whole = crate::objlock::lock(a[0]); // heap operations are atomic w.r.t. each other
     list::append(a[0], a[1].to_ref());
     let n = list::list_len(a[0]);
     siftdown(a[0], 0, n - 1, max)?;
@@ -100,6 +101,7 @@ fn push_impl(a: &[&PyObject], name: &str, max: bool) -> PyResult {
 
 fn pop_impl(heap: &PyObject, max: bool) -> PyResult {
     check_list(heap)?;
+    let _whole = crate::objlock::lock(heap);
     let n = list::list_len(heap);
     if n == 0 {
         raise!(IndexError, "index out of range");
@@ -122,6 +124,7 @@ fn pop_impl(heap: &PyObject, max: bool) -> PyResult {
 fn replace_impl(a: &[&PyObject], name: &str, max: bool) -> PyResult {
     check_pos(name, a, 2, 2)?;
     check_list(a[0])?;
+    let _whole = crate::objlock::lock(a[0]);
     if list::list_len(a[0]) == 0 {
         raise!(IndexError, "index out of range");
     }
@@ -135,6 +138,7 @@ fn pushpop_impl(a: &[&PyObject], name: &str, max: bool) -> PyResult {
     check_pos(name, a, 2, 2)?;
     let (heap, item) = (a[0], a[1]);
     check_list(heap)?;
+    let _whole = crate::objlock::lock(heap);
     if list::list_len(heap) == 0 {
         return Ok(item.to_ref());
     }
@@ -154,6 +158,7 @@ fn pushpop_impl(a: &[&PyObject], name: &str, max: bool) -> PyResult {
 
 fn heapify_impl(heap: &PyObject, max: bool) -> PyResult {
     check_list(heap)?;
+    let _whole = crate::objlock::lock(heap);
     let n = list::list_len(heap);
     for i in (0..n / 2).rev() {
         siftup(heap, i, max)?;
