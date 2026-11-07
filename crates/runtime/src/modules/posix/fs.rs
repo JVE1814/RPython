@@ -171,7 +171,7 @@ pub fn os_pwrite(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     Ok(int::new_int(r as i64))
 }
 
-fn collect_buffers(o: &PyObject, writable: bool) -> PyResult<Vec<BufView>> {
+pub(super) fn collect_buffers(o: &PyObject, writable: bool) -> PyResult<Vec<BufView>> {
     if ab::get_iter(o).is_err() {
         clear_exc();
         raise!(TypeError, "buffers must be a sequence");
