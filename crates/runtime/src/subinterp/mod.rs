@@ -25,6 +25,7 @@ pub mod xidata;
 pub mod module;
 pub mod queues;
 pub mod channels;
+pub mod testapi;
 
 use crate::errors::*;
 use crate::ffi::PyObject;
@@ -531,10 +532,6 @@ fn init_current(argv: &[String]) -> PyResult<()> {
     let md = crate::modules::sys::modules_dict();
     dict::set_item_str(&md, "builtins", &b)?;
     let path = crate::modules::sys::get_sys_attr("path").unwrap();
-    // the main interpreter's script directory (or cwd) is importable here too
-    if let Some(p0) = crate::import::sys_path_0() {
-        list::append(&path, pystr::new_str(&p0));
-    }
     for p in INITIAL_PATH.lock().unwrap().clone() {
         list::append(&path, pystr::new_str(&p));
     }
@@ -544,6 +541,10 @@ fn init_current(argv: &[String]) -> PyResult<()> {
         clear_exc();
     }
     crate::modules::sys_full::import_site()?;
+    // the main interpreter's sys.path[0] (script directory, cwd or ''), as is
+    if let Some(p0) = crate::import::sys_path_0() {
+        list::insert(&path, 0, pystr::new_str(&p0));
+    }
     let main = pymodule::new_module("__main__")?;
     let d = pymodule::module_dict(&main);
     dict::set_item_str(&d, "__builtins__", &b)?;
@@ -650,6 +651,11 @@ pub fn mark_destroyed(i: &'static Interp) {
     unregister(i);
     queues::interp_destroyed(i.id);
     channels::interp_destroyed(i.id);
+}
+
+/// Attach `prev` again after `end_interpreter` (or a failed `create`).
+pub fn reattach(prev: *mut ThreadState) {
+    attach(prev);
 }
 
 /// After `create`: retire the new interpreter's initial thread state and
@@ -760,6 +766,49 @@ pub fn running_main_globals() -> Option<PyRef> {
 /// The interpreter's per-interpreter config flags checked by os/threading.
 pub fn current_config() -> Config {
     current().config
+}
+
+fn incompatible_extension(name: &str) -> PyErr {
+    crate::import::import_error_with(&format!("module {} does not support loading in subinterpreters", name), Some(&pystr::new_str(name)), None, None)
+}
+
+/// A single-phase extension module was initialised: refuse it in a
+/// subinterpreter that checks extensions.
+pub fn check_singlephase_extension(name: &str) -> PyResult<()> {
+    let i = current();
+    if !i.is_main() && i.checks_extensions() {
+        return Err(incompatible_extension(name));
+    }
+    Ok(())
+}
+
+/// A multi-phase extension module is about to be created: its
+/// Py_mod_multiple_interpreters slot says which interpreters it supports
+/// (none besides the main one, shared-GIL ones, or all).
+pub fn check_multiphase_extension(name: &str, def: *mut crate::ffi::PyModuleDef) -> PyResult<()> {
+    let i = current();
+    if i.is_main() || def.is_null() {
+        return Ok(());
+    }
+    // old (PyModuleDef_Slot) and new (PySlot) numbering of the slot
+    const SLOT_OLD: i32 = 3;
+    const SLOT_NEW: i32 = 86;
+    let mut level = 1usize; // the default: supported with a shared GIL
+    unsafe {
+        let mut s = (*def).m_slots;
+        while !s.is_null() && (*s).slot != 0 {
+            if (*s).slot == SLOT_OLD || (*s).slot == SLOT_NEW {
+                level = (*s).value as usize;
+            }
+            s = s.add(1);
+        }
+    }
+    let ok = match level {
+        0 => !i.checks_extensions(),
+        1 => i.config.gil != 2 || !i.checks_extensions(),
+        _ => true,
+    };
+    if ok { Ok(()) } else { Err(incompatible_extension(name)) }
 }
 
 /// RuntimeError unless the current interpreter allows `what`.

@@ -40,6 +40,8 @@ pub enum Xi {
     Tuple(Vec<Xi>),
     /// A memoryview's exporter; the target gets memoryview(exporter).
     Buffer(PyRef),
+    /// marshal data of anything marshal supports (code included)
+    Marshal(Vec<u8>),
     /// marshal data of (code, name, qualname)
     Func(Vec<u8>),
     Pickled { data: Vec<u8>, main_file: Option<String> },
@@ -255,7 +257,7 @@ fn is_plain(o: &PyObject) -> bool {
     o.is(none::none())
         || o.is(bool_::true_obj())
         || o.is(bool_::false_obj())
-        || int::is_int_exact(o)
+        || (int::is_int_exact(o) && int::as_i64(o).is_some())
         || float::is_float_exact(o)
         || pystr::is_str_exact(o)
         || bytes::is_bytes_exact(o)
@@ -356,6 +358,10 @@ fn pickle_loads(data: &[u8]) -> PyResult {
 fn main_script_file() -> Option<String> {
     let m = crate::import::get_loaded_module("__main__")?;
     let d = pymodule::module_dict(&m);
+    // a module run with -m is found by its real name
+    if dict::get_item_rs(&d, "__spec__").is_some_and(|s| !s.is(none::none())) {
+        return None;
+    }
     let f = dict::get_item_rs(&d, "__file__")?;
     if !pystr::is_str(&f) {
         return None;
@@ -369,6 +375,7 @@ impl Xi {
     pub fn to_object(&self) -> PyResult {
         match self {
             Xi::Plain(d) => crate::modules::marshal::loads_slice(d, false),
+            Xi::Marshal(d) => crate::modules::marshal::loads_slice(d, true),
             Xi::Tuple(items) => {
                 let mut v = Vec::with_capacity(items.len());
                 for it in items {
@@ -546,7 +553,13 @@ pub fn is_stateless_function(f: &PyObject) -> PyResult<bool> {
     let mut names = Vec::new();
     global_names(&code, &mut names)?;
     let b = crate::builtins::builtins_dict();
-    Ok(names.iter().all(|n| dict::get_item_rs(&b, n).is_some()))
+    Ok(names.iter().all(|n| is_builtin_name(&b, n)))
+}
+
+/// A global name that resolves to a builtin wherever the code runs (dunder
+/// names such as `__name__` are module attributes first).
+fn is_builtin_name(builtins: &PyObject, n: &str) -> bool {
+    !(n.starts_with("__") && n.ends_with("__")) && dict::get_item_rs(builtins, n).is_some()
 }
 
 /// Can `code` run as a script: no parameters, no free variables, and no return
@@ -602,6 +615,39 @@ pub fn script_code(o: &PyObject, what: &str) -> PyResult<Vec<u8>> {
     } else {
         raise!(TypeError, "unsupported {} {}", what, ab::repr_string(o).unwrap_or_default());
     };
+    crate::modules::marshal::dumps_vec(&code, 4, true)
+}
+
+/// A script (source text, or a function or code object that can run as a
+/// script) as marshalled code; `pure`: it may not use globals other than
+/// builtins.
+pub fn script_data(o: &PyObject, pure: bool) -> PyResult<Vec<u8>> {
+    let code = if pystr::is_str(o) || bytes::is_bytes(o) {
+        let src = if pystr::is_str(o) { pystr::as_utf8(o)?.as_bytes().to_vec() } else { bytes::bytes_data(o).to_vec() };
+        crate::compile::compile_bytes(&src, "<string>", crate::compile::Mode::Exec, 0, -1)?.code
+    } else if crate::types::code::is_code(o) {
+        check_script_code(o, "code")?;
+        o.to_ref()
+    } else if crate::types::funcobject::is_function(o) {
+        for attr in ["__closure__", "__defaults__", "__kwdefaults__"] {
+            if !ab::getattr_str(o, attr)?.is(none::none()) {
+                raise!(ValueError, "function must not have {}", attr.trim_matches('_'));
+            }
+        }
+        let c = ab::getattr_str(o, "__code__")?;
+        check_script_code(&c, "function")?;
+        c
+    } else {
+        raise!(TypeError, "unsupported script {}", ab::repr_string(o).unwrap_or_default());
+    };
+    if pure {
+        let mut names = Vec::new();
+        global_names(&code, &mut names)?;
+        let b = crate::builtins::builtins_dict();
+        if let Some(n) = names.iter().find(|n| !is_builtin_name(&b, n)) {
+            raise!(ValueError, "script uses global {:?}", n);
+        }
+    }
     crate::modules::marshal::dumps_vec(&code, 4, true)
 }
 

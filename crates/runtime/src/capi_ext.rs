@@ -181,12 +181,16 @@ unsafe fn create_from_initfunc(
         let ro = PyRef::from_raw(r);
         if is_moduledef(&ro) {
             let def = ro.as_ptr() as *mut PyModuleDef;
+            // (interp1) Py_mod_multiple_interpreters decides where it may load
+            crate::subinterp::check_multiphase_extension(name, def)?;
             let m = from_c(capi::module::PyModule_FromDefAndSpec2(def, spec.as_ptr(), 1013))?;
             return Ok((m, Some(def)));
         }
         if !tmod::is_module(&ro) {
             raise!(SystemError, "initialization of {} did not return an extension module", name.rsplit('.').next().unwrap());
         }
+        // (interp1) single-phase modules cannot be isolated
+        crate::subinterp::check_singlephase_extension(name)?;
         Ok((ro, None))
     }
 }
