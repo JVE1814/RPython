@@ -1,11 +1,13 @@
 # PROGRESS
 
-## Status 2026-11-07 (day 7)
-Master 0323d71 = core6 merged (call/inspect/patma/monitoring/opcache/tlbc fixes; notes/core6.md).
-Latest full suite: run 11 (pre-core6): 294/434 modules pass, 49,781 tests, 674 failures (241 without test_capi),
-616 errors. Baseline free-threaded CPython: 416/434. Running agents: perf4 (call path, allocation, startup),
-capi2 (test_capi, stable_abi_ctypes, fileutils), scale1 (multi-core scaling), tail1 (long-tail modules that pass
-on CPython: inspect signatures, codecs, time, path modules, ...).
+## Status 2026-11-07 (day 7, afternoon)
+Master f66b390: core6, perf4, tail1, capi2 merged today. Smoke on snap19: test_capi 40 failures (was 433 in run 11),
+stable_abi_ctypes/fileutils pass, cmd_line_script 1; tail1 fixed ~60 long-tail modules (inspect, codecs, time,
+path modules, math, buffer, logging, json, ...). Suite run 12 (snap19) running. Last complete run: run 11 (pre-merges):
+294/434 modules pass, 674 failures (241 without test_capi), 616 errors. Baseline free-threaded CPython: 416/434.
+Running agents: scale1 (multi-core scaling), perf5 (remaining slow benchmarks), stability3 (test_free_threading races,
+flaky crashes, gc hang), tail2 (alloc-failure injection, re.DEBUG, _zoneinfo, pdb, tkinter, leftovers),
+cleanroom1 (D19 audit/rewrite of Lib/ files that read like recalled text).
 Earlier history (2026-11-02): agents stopped when the weekly API limit was hit; resumed Nov 5.
 
 ## RESUMED (2026-11-01, 22:15 UTC) after a pause at user request
