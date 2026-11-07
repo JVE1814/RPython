@@ -703,6 +703,66 @@ Note on variance: some small benchmarks are bimodal between runs of the same bin
 deltablue's BinaryConstraint.input/output turn polymorphic after compilation: 2 x 65
 deopts) land in the measured window. Address-dependent hashing makes runs differ.
 
+### Full pyperformance wall-clock
+s/loop through tools/bench/run_bench.sh (shim), per benchmark ours / py-default / py-ft back
+to back, pinned to core 3 while other agents ran (binary = HEAD before the notes commits).
+ratio = ours / best CPython.
+
+| bench | ours | CPython default | CPython ft | ratio |
+|---|---|---|---|---|
+| async_generators | 0.457505145 | 0.224688465 | 0.274162526 | 2.04 |
+| asyncio_tcp | 1.52145308 | 0.600573721 | 0.619876104 | 2.53 |
+| barnes_hut | 0.700137195 | 0.574060754 | 0.653913638 | 1.22 |
+| base64 | 0.000567617332 | 0.0001905294 | 0.00020427235 | 2.98 |
+| bpe_tokeniser | 5.72067989 | 3.45788908 | 3.6496892 | 1.65 |
+| chaos | 0.0327104693 | 0.042845628 | 0.041902579 | 0.78 |
+| comprehensions | 1.72345304e-05 | 1.03925883e-05 | 1.15458282e-05 | 1.66 |
+| concurrent_imap | 0.034641641 | 0.025293479 | 0.027709688 | 1.37 |
+| coroutines | 0.0144920177 | 0.0145903696 | 0.014416989 | 1.01 |
+| decimal_pi | 0.24923996 | 7.14690494 | 8.29454095 | 0.03 |
+| deepcopy | 0.000321172441 | 0.000172302746 | 0.000232124766 | 1.86 |
+| deltablue | 0.00215188134 | 0.00249506041 | 0.00299351572 | 0.86 |
+| fannkuch | 0.332139107 | 0.283428993 | 0.375611438 | 1.17 |
+| float | 0.055055673 | 0.054506524 | 0.0906135315 | 1.01 |
+| gc_collect | 0.00140994771 | 0.00146398711 | 0.000947451547 | 1.49 |
+| gc_traversal | 0.00400660534 | 0.0032852057 | 0.00144473473 | 2.77 |
+| generators | 0.0479151805 | 0.0256009575 | 0.0234016787 | 2.05 |
+| go | 0.133279112 | 0.119595861 | 0.10294956 | 1.29 |
+| hexiom | 0.00575559962 | 0.00564053406 | 0.00644583997 | 1.02 |
+| json_dumps | 0.0188708442 | 0.00666291556 | 0.00824503056 | 2.83 |
+| json_loads | 2.90045119e-05 | 1.56931326e-05 | 2.65685469e-05 | 1.85 |
+| logging | 8.83630806e-06 | 6.33489927e-06 | 7.38362295e-06 | 1.39 |
+| mdp | 2.6153304 | 1.30503048 | 1.27559296 | 2.05 |
+| meteor_contest | 0.138361196 | 0.075765204 | 0.111422589 | 1.83 |
+| nbody | 0.025964333 | 0.0566142125 | 0.078340804 | 0.46 |
+| nqueens | 0.0789750995 | 0.056306227 | 0.0674788505 | 1.40 |
+| pathlib | 0.0215245835 | 0.00915194306 | 0.0106886408 | 2.35 |
+| pidigits | 0.08202222 | 0.170724226 | 0.153116564 | 0.54 |
+| pprint | 0.845196576 | 0.50923507 | 0.565307222 | 1.66 |
+| pyflate | 0.345273216 | 0.345372661 | 0.342094677 | 1.01 |
+| python_startup | 0.0139556831 | 0.009527825 | 0.01171518 | 1.46 |
+| raytrace | 0.195031015 | 0.19717512 | 0.209668282 | 0.99 |
+| regex_compile | 0.0146760095 | 0.0852426025 | 0.0939445075 | 0.17 |
+| regex_dna | 0.076409558 | 0.133652651 | 0.150021738 | 0.57 |
+| regex_effbot | 0.000885122187 | 0.00174519569 | 0.00205625416 | 0.51 |
+| regex_v8 | 0.013412733 | 0.0151606511 | 0.0161099688 | 0.88 |
+| richards | 0.0233166452 | 0.0306851428 | 0.037783592 | 0.76 |
+| richards_super | 0.0325946052 | 0.0354058008 | 0.0412224028 | 0.92 |
+| scimark | 0.180567149 | 0.17007228 | 0.195721506 | 1.06 |
+| spectral_norm | 0.0312990335 | 0.0592222075 | 0.066842873 | 0.53 |
+| sqlite_synth | 1.76122113e-06 | 1.44254576e-06 | 1.28736649e-06 | 1.37 |
+| telco | 0.0064321265 | 0.105442027 | 0.11169753 | 0.06 |
+| typing_runtime_protocols | 0.000255719045 | 0.000109048778 | 0.000132340415 | 2.34 |
+| unpack_sequence | 4.04747708e-08 | 2.7200829e-08 | 3.53087814e-08 | 1.49 |
+| xml_etree | 0.175923655 | 0.10275806 | 0.104314669 | 1.71 |
+
+
+Not run (harness: need a CLI argument or third-party packages; they fail for the baselines
+too): 2to3, argparse, async_tree, asyncio_websockets, chameleon, coverage, crypto_pyaes,
+dask, django_template, docutils, dulwich_log, fastapi, genshi, hg_startup, html5lib, mako,
+networkx, pickle, sphinx, sqlalchemy_*, sqlglot_v2, sympy, tomli_loads, tornado_http, xdsl,
+yaml.
+
 ### Open items
 * Genexpr fusion into the consuming loop (sum/any/tuple/set of a genexpr in tier 2):
   nqueens still pays a generator object, a frame and a resumption per item
