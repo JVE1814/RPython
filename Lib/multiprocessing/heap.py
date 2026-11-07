@@ -1,52 +1,52 @@
 #
-# multiprocessing.heap: a simple allocator of shared memory blocks.
+# multiprocessing.heap -- carving small blocks out of shared memory.
 #
-# Memory comes from "arenas" (mmap'ed temporary files, shared with child
-# processes).  Free space is kept as coalesced blocks indexed by length
-# (best fit through a sorted list of lengths) and by both ends (to merge
-# neighbours on free).  Arenas that become completely free are released.
+# Shared memory comes in "arenas": mmaps of unlinked temporary files, which
+# children inherit or receive as descriptors.  A Heap hands out blocks
+# (arena, start, stop) from them with a best-fit search over the free
+# blocks.  Freed blocks merge with free neighbours; an arena that becomes
+# entirely free is given back when it is big enough to matter.
 #
 
 import bisect
-from collections import defaultdict
 import mmap
 import os
 import sys
 import tempfile
 import threading
 
-from .context import reduction, assert_spawning
+from .context import reduction
 from . import util
 
 __all__ = ['BufferWrapper']
 
 
 class Arena(object):
-    """A shared memory region backed by an unlinked temporary file."""
+    """One mmap'ed region of shared memory backed by an unlinked file."""
 
-    # prefer RAM-backed storage when there is enough room
+    # Tried first for the backing file: RAM-backed and normally roomy.
     _dir_candidates = ['/dev/shm']
 
     def __init__(self, size, fd=-1):
         self.size = size
         self.fd = fd
         if fd == -1:
-            self.fd, name = tempfile.mkstemp(
-                 prefix='pym-%d-' % os.getpid(),
-                 dir=self._choose_dir(size))
-            os.unlink(name)
+            # A new arena: make an anonymous file of the right size.
+            self.fd, path = tempfile.mkstemp(prefix='pym-%d-' % os.getpid(),
+                                             dir=self._choose_dir(size))
+            os.unlink(path)
             util.Finalize(self, os.close, (self.fd,))
             os.ftruncate(self.fd, size)
         self.buffer = mmap.mmap(self.fd, self.size)
 
     def _choose_dir(self, size):
-        for d in self._dir_candidates:
+        for directory in self._dir_candidates:
             try:
-                st = os.statvfs(d)
+                info = os.statvfs(directory)
             except (OSError, AttributeError):
                 continue
-            if st.f_bavail * st.f_frsize >= size:
-                return d
+            if info.f_bavail * info.f_frsize >= size:
+                return directory
         return util.get_temp_dir()
 
 
@@ -64,41 +64,89 @@ def rebuild_arena(size, dupfd):
 reduction.register(Arena, reduce_arena)
 
 
+def _round_up(n, multiple):
+    return -(-n // multiple) * multiple
+
+
 class Heap(object):
 
     _alignment = 8
-    # Completely free arenas at least this big are given back.
+    # A completely free arena at least this large is unmapped.
     _DISCARD_FREE_SPACE_LARGER_THAN = 4 * 1024 ** 2
-    # New arenas double in size until they reach this size.
+    # Each new arena is twice the previous one, up to this size.
     _DOUBLE_ARENA_SIZE_UNTIL = 4 * 1024 ** 2
 
     def __init__(self, size=mmap.PAGESIZE):
         self._lastpid = os.getpid()
         self._lock = threading.Lock()
-        self._size = size
-        # sorted lengths of the free blocks (with repetition removed)
-        self._lengths = []
-        # length -> list of free blocks (arena, start, stop) of that length
-        self._len_to_seq = {}
-        # (arena, start) / (arena, stop) -> free block
-        self._start_to_block = {}
-        self._stop_to_block = {}
-        # arena -> set of (start, stop) of the blocks in use
-        self._allocated_blocks = defaultdict(set)
+        self._size = size           # minimum size of the next arena
         self._arenas = []
-        # blocks freed while the lock was busy (e.g. by the GC in the
-        # thread that holds it); freed on the next operation
+        # Free space.  _len_to_seq maps a length to the free blocks of that
+        # length; _sizes lists those lengths in order (for the best-fit
+        # search); the two edge maps find a free neighbour of a block.
+        self._len_to_seq = {}
+        self._sizes = []
+        self._free_at_start = {}    # (arena, start) -> free block
+        self._free_at_end = {}      # (arena, stop) -> free block
+        # Used space: arena -> {(start, stop), ...}
+        self._allocated_blocks = {}
+        # Blocks whose free() found the lock taken -- possibly by the very
+        # thread the garbage collector interrupted -- handled later.
         self._pending_free_blocks = []
         self._n_mallocs = 0
         self._n_frees = 0
 
-    @staticmethod
-    def _roundup(n, alignment):
-        mask = alignment - 1
-        return (n + mask) & ~mask
+    # -- free-space index ----------------------------------------------------
+
+    def _index_free(self, block):
+        arena, start, stop = block
+        length = stop - start
+        same_length = self._len_to_seq.get(length)
+        if same_length is None:
+            self._len_to_seq[length] = [block]
+            bisect.insort(self._sizes, length)
+        else:
+            same_length.append(block)
+        self._free_at_start[(arena, start)] = block
+        self._free_at_end[(arena, stop)] = block
+
+    def _unindex_free(self, block):
+        arena, start, stop = block
+        length = stop - start
+        same_length = self._len_to_seq[length]
+        same_length.remove(block)
+        if not same_length:
+            del self._len_to_seq[length]
+            del self._sizes[bisect.bisect_left(self._sizes, length)]
+        del self._free_at_start[(arena, start)]
+        del self._free_at_end[(arena, stop)]
+
+    def _take_best_fit(self, size):
+        # The smallest free block of at least *size* bytes, or None.
+        where = bisect.bisect_left(self._sizes, size)
+        if where == len(self._sizes):
+            return None
+        block = self._len_to_seq[self._sizes[where]][-1]
+        self._unindex_free(block)
+        return block
+
+    def _release_space(self, block):
+        # Return a block to the free space, merged with free neighbours.
+        arena, start, stop = block
+        before = self._free_at_end.get((arena, start))
+        if before is not None:
+            self._unindex_free(before)
+            start = before[1]
+        after = self._free_at_start.get((arena, stop))
+        if after is not None:
+            self._unindex_free(after)
+            stop = after[2]
+        self._index_free((arena, start, stop))
+
+    # -- arenas --------------------------------------------------------------
 
     def _new_arena(self, size):
-        length = self._roundup(max(self._size, size), mmap.PAGESIZE)
+        length = _round_up(max(self._size, size), mmap.PAGESIZE)
         if self._size < self._DOUBLE_ARENA_SIZE_UNTIL:
             self._size *= 2
         util.info('allocating a new mmap of length %d', length)
@@ -106,103 +154,52 @@ class Heap(object):
         self._arenas.append(arena)
         return (arena, 0, length)
 
-    def _discard_arena(self, arena):
-        length = arena.size
-        if length < self._DISCARD_FREE_SPACE_LARGER_THAN:
+    def _arena_emptied(self, arena):
+        # *arena* has no used block left: drop it if it is large enough.
+        if arena.size < self._DISCARD_FREE_SPACE_LARGER_THAN:
             return
-        blocks = self._allocated_blocks.pop(arena)
-        assert not blocks
-        del self._start_to_block[(arena, 0)]
-        del self._stop_to_block[(arena, length)]
+        self._unindex_free((arena, 0, arena.size))
         self._arenas.remove(arena)
-        self._forget_length(length, (arena, 0, length))
 
-    def _forget_length(self, length, block):
-        seq = self._len_to_seq[length]
-        seq.remove(block)
-        if not seq:
-            del self._len_to_seq[length]
-            self._lengths.remove(length)
+    # -- used blocks ---------------------------------------------------------
 
-    def _malloc(self, size):
-        i = bisect.bisect_left(self._lengths, size)
-        if i == len(self._lengths):
-            return self._new_arena(size)
-        length = self._lengths[i]
-        seq = self._len_to_seq[length]
-        block = seq.pop()
-        if not seq:
-            del self._len_to_seq[length]
-            del self._lengths[i]
-        (arena, start, stop) = block
-        del self._start_to_block[(arena, start)]
-        del self._stop_to_block[(arena, stop)]
-        return block
+    def _mark_used(self, arena, start, stop):
+        self._allocated_blocks.setdefault(arena, set()).add((start, stop))
 
-    def _add_free_block(self, block):
-        (arena, start, stop) = block
-
-        # merge with the free neighbours
-        prev_block = self._stop_to_block.get((arena, start))
-        if prev_block is not None:
-            start = self._absorb(prev_block)[0]
-        next_block = self._start_to_block.get((arena, stop))
-        if next_block is not None:
-            stop = self._absorb(next_block)[1]
-
-        block = (arena, start, stop)
-        length = stop - start
-        seq = self._len_to_seq.get(length)
-        if seq is None:
-            self._len_to_seq[length] = [block]
-            bisect.insort(self._lengths, length)
-        else:
-            seq.append(block)
-        self._start_to_block[(arena, start)] = block
-        self._stop_to_block[(arena, stop)] = block
-
-    def _absorb(self, block):
-        (arena, start, stop) = block
-        del self._start_to_block[(arena, start)]
-        del self._stop_to_block[(arena, stop)]
-        self._forget_length(stop - start, block)
-        return start, stop
-
-    def _remove_allocated_block(self, block):
+    def _mark_unused(self, block):
         arena, start, stop = block
-        blocks = self._allocated_blocks[arena]
-        blocks.remove((start, stop))
-        if not blocks:
-            self._discard_arena(arena)
+        used = self._allocated_blocks[arena]
+        used.remove((start, stop))
+        if not used:
+            del self._allocated_blocks[arena]
+            self._arena_emptied(arena)
+
+    def _really_free(self, block):
+        self._n_frees += 1
+        self._release_space(block)
+        self._mark_unused(block)
 
     def _free_pending_blocks(self):
-        while True:
-            try:
-                block = self._pending_free_blocks.pop()
-            except IndexError:
-                break
-            self._n_frees += 1
-            self._add_free_block(block)
-            self._remove_allocated_block(block)
+        pending = self._pending_free_blocks
+        while pending:
+            self._really_free(pending.pop())
+
+    # -- public operations ---------------------------------------------------
 
     def free(self, block):
-        """Give a block back (called by the finalizer of BufferWrapper)."""
+        """Give *block* back; called by BufferWrapper's finalizer."""
         if os.getpid() != self._lastpid:
             raise ValueError(
                 "My pid ({0:n}) is not last pid {1:n}".format(
                     os.getpid(), self._lastpid))
         if not self._lock.acquire(False):
-            # Busy (possibly in this very thread, if the GC runs us during
-            # malloc()): defer.
             self._pending_free_blocks.append(block)
-        else:
-            try:
-                self._n_frees += 1
-                self._free_pending_blocks()
-                self._add_free_block(block)
-                self._remove_allocated_block(block)
-            finally:
-                self._lock.release()
+            return
+        try:
+            self._free_pending_blocks()
+            self._really_free(block)
+        finally:
+            self._lock.release()
 
     def malloc(self, size):
         """Return a block (arena, start, stop) of at least *size* bytes."""
@@ -211,23 +208,25 @@ class Heap(object):
         if sys.maxsize <= size:
             raise OverflowError("Size {0:n} too large".format(size))
         if os.getpid() != self._lastpid:
-            # a forked child starts with a fresh heap
+            # A forked child must not touch the parent's bookkeeping.
             self.__init__()
         with self._lock:
             self._n_mallocs += 1
             self._free_pending_blocks()
-            size = self._roundup(max(size, 1), self._alignment)
-            (arena, start, stop) = self._malloc(size)
-            real_stop = start + size
-            if real_stop < stop:
-                # return the unused tail to the free lists
-                self._add_free_block((arena, real_stop, stop))
-            self._allocated_blocks[arena].add((start, real_stop))
-            return (arena, start, real_stop)
+            size = _round_up(max(size, 1), self._alignment)
+            block = self._take_best_fit(size)
+            if block is None:
+                block = self._new_arena(size)
+            arena, start, stop = block
+            end = start + size
+            if end < stop:
+                self._release_space((arena, end, stop))
+            self._mark_used(arena, start, end)
+            return (arena, start, end)
 
 
 class BufferWrapper(object):
-    """A chunk of shared memory, freed when the wrapper dies."""
+    """A block of shared memory that is freed when the wrapper is."""
 
     _heap = Heap()
 
@@ -236,10 +235,11 @@ class BufferWrapper(object):
             raise ValueError("Size {0:n} out of range".format(size))
         if sys.maxsize <= size:
             raise OverflowError("Size {0:n} too large".format(size))
-        block = BufferWrapper._heap.malloc(size)
+        heap = BufferWrapper._heap
+        block = heap.malloc(size)
         self._state = (block, size)
-        util.Finalize(self, BufferWrapper._heap.free, args=(block,))
+        util.Finalize(self, heap.free, args=(block,))
 
     def create_memoryview(self):
-        (arena, start, stop), size = self._state
+        (arena, start, _stop), size = self._state
         return memoryview(arena.buffer)[start:start + size]

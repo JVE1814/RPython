@@ -1,6 +1,7 @@
 #
-# multiprocessing.dummy.connection: Listener/Client/Pipe between threads,
-# built on queues.
+# multiprocessing.dummy.connection -- Listener, Client and Pipe for
+# threads.  A connection is a pair of queues; a listener's address is the
+# queue on which clients drop their halves of a new pair.
 #
 
 __all__ = ['Client', 'Listener', 'Pipe']
@@ -29,37 +30,43 @@ class Listener(object):
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_value, exc_tb):
+    def __exit__(self, *exc_info):
         self.close()
 
 
 def Client(address):
-    _in, _out = Queue(), Queue()
-    address.put((_out, _in))
-    return Connection(_in, _out)
+    """Connect to the Listener whose address is *address*."""
+    to_server, to_client = Queue(), Queue()
+    # The listener's side reads what we send and sends what we read.
+    address.put((to_server, to_client))
+    return Connection(to_client, to_server)
 
 
 def Pipe(duplex=True):
-    a, b = Queue(), Queue()
-    return Connection(a, b), Connection(b, a)
+    """Two connected Connection objects (always duplex)."""
+    one_way, other_way = Queue(), Queue()
+    return Connection(one_way, other_way), Connection(other_way, one_way)
 
 
 class Connection(object):
+    """One end of a queue-based connection: receives from *_in*, sends to
+    *_out*."""
 
     def __init__(self, _in, _out):
-        self._out = _out
         self._in = _in
+        self._out = _out
         self.send = self.send_bytes = _out.put
         self.recv = self.recv_bytes = _in.get
 
     def poll(self, timeout=0.0):
-        if self._in.qsize() > 0:
+        incoming = self._in
+        if incoming.qsize() > 0:
             return True
         if timeout <= 0.0:
             return False
-        with self._in.not_empty:
-            self._in.not_empty.wait(timeout)
-        return self._in.qsize() > 0
+        with incoming.not_empty:
+            incoming.not_empty.wait(timeout)
+        return incoming.qsize() > 0
 
     def close(self):
         pass
@@ -67,5 +74,5 @@ class Connection(object):
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_value, exc_tb):
+    def __exit__(self, *exc_info):
         self.close()
