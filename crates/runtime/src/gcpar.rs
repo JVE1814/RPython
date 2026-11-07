@@ -45,13 +45,20 @@ const S_DECREF: usize = 1;
 const S_SCAN: usize = 2;
 const S_RESTORE: usize = 3;
 
+const K_ENTRIES: u8 = 0;
+const K_LIST: u8 = 1;
+const K_PAGES: u8 = 2;
+/// Pages per task of a full collection's heap walk.
+const PAGES_PER_TASK: usize = 8;
+
 struct Task {
     /// Thread state whose buffer the entries come from (0: none).
     owner: usize,
     src: *const usize,
     len: usize,
-    /// The entries are objects already filtered (young large objects).
-    pre: bool,
+    /// K_ENTRIES: `src[..len]` are young-buffer entries; K_LIST: objects already
+    /// chosen (large objects); K_PAGES: segment `src as usize`, pages from `len`.
+    kind: u8,
     claimed: [AtomicBool; 4],
     objs: UnsafeCell<Vec<*mut PyObject>>,
     saved: UnsafeCell<Vec<usize>>,
@@ -296,27 +303,43 @@ fn wait_phase(job: &Job, phase: usize, mut w: Option<&mut Worker>) {
 unsafe fn snap_task(t: &Task) {
     unsafe {
         let objs = &mut *t.objs.get();
-        let entries = std::slice::from_raw_parts(t.src, t.len);
-        objs.reserve(t.len);
-        if t.pre {
+        if t.kind == K_ENTRIES {
+            objs.reserve(t.len);
+        }
+        if t.kind == K_LIST {
+            let entries = std::slice::from_raw_parts(t.src, t.len);
             objs.extend(entries.iter().map(|&p| p as *mut PyObject));
         } else {
             let tt = crate::types::tuple::tuple_type();
             let mut untracked = 0usize;
-            for &p in entries {
-                if !crate::young::claim(p, true, true) {
-                    continue;
-                }
-                let op = p as *mut PyObject;
+            let mut take = |op: *mut PyObject| {
                 if (*op).type_ptr() == tt && atomic_tuple(op) {
                     // a tuple of untracked items can never be part of a cycle
                     let b = &(*op).ob_gc_bits;
                     b.fetch_and(!(crate::alloc::GC_BIT_TRACKED | crate::alloc::GC_BIT_OLD | crate::young::GC_BIT_YOUNG_BUF), Relaxed);
                     crate::gc::note_untracked();
                     untracked += 1;
-                    continue;
+                    return;
                 }
                 objs.push(op);
+            };
+            if t.kind == K_ENTRIES {
+                for &p in std::slice::from_raw_parts(t.src, t.len) {
+                    if crate::young::claim(p, true, true) {
+                        take(p as *mut PyObject);
+                    }
+                }
+            } else {
+                // every tracked object of these pages: it becomes old and leaves its
+                // young buffer (each block is visited by exactly one task)
+                crate::tlab::for_each_gc_block_in(t.src as usize, t.len, t.len + PAGES_PER_TASK, |op| {
+                    let b = &(*op).ob_gc_bits;
+                    let bits = b.load(Relaxed);
+                    if bits & crate::alloc::GC_BIT_TRACKED != 0 {
+                        b.store((bits | crate::alloc::GC_BIT_OLD) & !crate::young::GC_BIT_YOUNG_BUF, Relaxed);
+                        take(op);
+                    }
+                });
             }
             *t.untracked.get() = untracked;
         }
@@ -513,17 +536,51 @@ impl Analysis {
     }
 }
 
+fn new_task(owner: usize, src: *const usize, len: usize, kind: u8) -> Task {
+    Task {
+        owner,
+        src,
+        len,
+        kind,
+        claimed: [const { AtomicBool::new(false) }; 4],
+        objs: UnsafeCell::new(Vec::new()),
+        saved: UnsafeCell::new(Vec::new()),
+        unreachable: UnsafeCell::new(Vec::new()),
+        untracked: UnsafeCell::new(0),
+        flags: UnsafeCell::new(0),
+        special: UnsafeCell::new(Vec::new()),
+        weak: UnsafeCell::new(Vec::new()),
+        dicts: UnsafeCell::new(0),
+    }
+}
+
+/// Is a parallel analysis worth starting (somebody to help)?
+fn helpers_available(me: *mut ThreadState) -> bool {
+    if crate::gc::helper_candidates() != 0 {
+        return true;
+    }
+    NO_HELPERS.fetch_add(1, Relaxed);
+    if crate::scalestats::gc_debug() {
+        let v: Vec<(u8, bool)> = crate::threads::ALL_THREADS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|&t| unsafe {
+                let t = &*(t as *const ThreadState);
+                (t.mode.0.load(SeqCst), t.alive())
+            })
+            .collect();
+        eprintln!("nohelp me={:?} {:?}", me, v);
+    }
+    false
+}
+
 /// World stopped, called by the collector for a young collection: run the analysis
 /// in parallel with the parked threads. None (nothing done, buffers untouched) when it
 /// is not worth it: few young objects or nobody parked to help.
 pub unsafe fn analyse_young(me: *mut ThreadState) -> Option<Analysis> {
     unsafe {
-        if crate::gc::helper_candidates() == 0 {
-            NO_HELPERS.fetch_add(1, Relaxed);
-            if crate::scalestats::gc_debug() {
-                let v: Vec<(u8, bool)> = crate::threads::ALL_THREADS.lock().unwrap().iter().map(|&t| { let t = &*(t as *const ThreadState); (t.mode.0.load(SeqCst), t.alive()) }).collect();
-                eprintln!("nohelp me={:?} {:?}", me, v);
-            }
+        if !helpers_available(me) {
             return None;
         }
         let mut bs = crate::young::take_buffers();
@@ -533,30 +590,15 @@ pub unsafe fn analyse_young(me: *mut ThreadState) -> Option<Analysis> {
             crate::young::give_back_orphans(std::mem::take(&mut bs.orphans));
             return None;
         }
-        let new_task = |owner: usize, src: *const usize, len: usize, pre: bool| Task {
-            owner,
-            src,
-            len,
-            pre,
-            claimed: [const { AtomicBool::new(false) }; 4],
-            objs: UnsafeCell::new(Vec::new()),
-            saved: UnsafeCell::new(Vec::new()),
-            unreachable: UnsafeCell::new(Vec::new()),
-            untracked: UnsafeCell::new(0),
-            flags: UnsafeCell::new(0),
-            special: UnsafeCell::new(Vec::new()),
-            weak: UnsafeCell::new(Vec::new()),
-            dicts: UnsafeCell::new(0),
-        };
         let mut tasks = Vec::new();
         for &bp in bs.bufs() {
             let b = &*(bp as *mut crate::young::YoungBuf);
             for c in b.entries.chunks(CHUNK) {
-                tasks.push(new_task(b.ts, c.as_ptr(), c.len(), false));
+                tasks.push(new_task(b.ts, c.as_ptr(), c.len(), K_ENTRIES));
             }
         }
         for c in bs.orphans.chunks(CHUNK) {
-            tasks.push(new_task(0, c.as_ptr(), c.len(), false));
+            tasks.push(new_task(0, c.as_ptr(), c.len(), K_ENTRIES));
         }
         let mut large: Vec<usize> = Vec::new();
         crate::alloc::for_each_large_gc(|op| {
@@ -567,8 +609,62 @@ pub unsafe fn analyse_young(me: *mut ThreadState) -> Option<Analysis> {
             }
         });
         if !large.is_empty() {
-            tasks.push(new_task(0, large.as_ptr(), large.len(), true));
+            tasks.push(new_task(0, large.as_ptr(), large.len(), K_LIST));
         }
+        let a = execute(me, tasks);
+        for &bp in bs.bufs() {
+            (*(bp as *mut crate::young::YoungBuf)).entries.clear();
+        }
+        drop(bs);
+        Some(a)
+    }
+}
+
+/// World stopped, called by the collector for a full collection: the same analysis
+/// over every tracked object, found by walking the GC pages in parallel (tasks of
+/// PAGES_PER_TASK pages, no affinity) plus the large-object registry. Every examined
+/// object becomes old and leaves the young buffers. None when not worth it.
+pub unsafe fn analyse_full(me: *mut ThreadState) -> Option<Analysis> {
+    unsafe {
+        if crate::gc::tracked_estimate() < MIN_PARALLEL || !helpers_available(me) {
+            return None;
+        }
+        let mut tasks = Vec::new();
+        for seg in 0..crate::tlab::segment_count() {
+            let mut p = 0;
+            while p < crate::tlab::PAGES_PER_SEGMENT {
+                // src encodes the segment, len the first page (see snap_task)
+                tasks.push(new_task(0, seg as *const usize, p, K_PAGES));
+                p += PAGES_PER_TASK;
+            }
+        }
+        let mut large: Vec<usize> = Vec::new();
+        crate::alloc::for_each_large_gc(|op| {
+            let b = &(*op).ob_gc_bits;
+            if b.load(Relaxed) & crate::alloc::GC_BIT_TRACKED != 0 {
+                b.fetch_or(crate::alloc::GC_BIT_OLD, Relaxed);
+                large.push(op as usize);
+            }
+        });
+        if !large.is_empty() {
+            tasks.push(new_task(0, large.as_ptr(), large.len(), K_LIST));
+        }
+        let a = execute(me, tasks);
+        // every buffered object was examined, its buffer bit cleared by the walk
+        let mut bs = crate::young::take_buffers();
+        bs.orphans.clear();
+        for &bp in bs.bufs() {
+            (*(bp as *mut crate::young::YoungBuf)).entries.clear();
+        }
+        drop(bs);
+        Some(a)
+    }
+}
+
+/// Run a job made of `tasks` (plus the root tasks) with the parked threads and
+/// collect its results.
+unsafe fn execute(me: *mut ThreadState, tasks: Vec<Task>) -> Analysis {
+    unsafe {
         let mut roots = vec![RootTask { ts: 0, claimed: AtomicBool::new(false) }];
         for &t in crate::threads::ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
             roots.push(RootTask { ts: t, claimed: AtomicBool::new(false) });
@@ -612,10 +708,6 @@ pub unsafe fn analyse_young(me: *mut ThreadState) -> Option<Analysis> {
         }
         crate::gc_support::UNTRACKED_TUPLES.fetch_add(untracked, Relaxed);
         *JOB.0.get() = None;
-        for &bp in bs.bufs() {
-            (*(bp as *mut crate::young::YoungBuf)).entries.clear();
-        }
-        drop(bs);
-        Some(Analysis { examined, flags, parts, dicts })
+        Analysis { examined, flags, parts, dicts }
     }
 }

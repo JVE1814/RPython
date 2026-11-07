@@ -202,6 +202,11 @@ pub unsafe fn set_finalized(op: *mut PyObject) {
         (*op).ob_gc_bits.fetch_or(GC_BIT_FINALIZED, Relaxed);
     }
 }
+/// (scale3) Tracked objects as last published (no flush; any thread, any time).
+pub fn tracked_estimate() -> usize {
+    TRACKED.load(Relaxed).max(0) as usize
+}
+
 pub fn tracked_count() -> isize {
     flush_thread_counts();
     TRACKED.load(Relaxed)
@@ -1123,7 +1128,7 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool, explicit: bool,
         // (scale3) young collections with threads parked at safepoints analyse in
         // parallel, each thread mostly its own young objects (gcpar.rs)
         let mut held: Vec<PyRef> = Vec::new();
-        let par = if young_only { crate::gcpar::analyse_young(me) } else { None };
+        let par = if young_only { crate::gcpar::analyse_young(me) } else { crate::gcpar::analyse_full(me) };
         let mut unreachable = if let Some(a) = par {
             crate::gc_support::CANDIDATES.fetch_add(a.examined, Relaxed);
             LAST_EXAMINED.store(a.examined, Relaxed);
@@ -1296,9 +1301,9 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool, explicit: bool,
     }
 }
 
-/// (scale3) World stopped, after a parallel young analysis whose garbage needs nothing
+/// (scale3) World stopped, after a parallel analysis whose garbage needs nothing
 /// but tp_clear (no finalizers, no legacy finalizers, no weakref callbacks; automatic
-/// collection). Garbage from the young buffer of a thread parked at an eval-breaker
+/// collection). Garbage owned by a thread parked at an eval-breaker
 /// safepoint goes back to that thread, which clears it when it resumes (its own
 /// objects, still in its cache; the frees go to its own allocator cache; and threads
 /// that make garbage pay for clearing it, so the collector cannot fall behind several
@@ -1326,20 +1331,36 @@ unsafe fn owner_clear(me: *mut ThreadState, a: crate::gcpar::Analysis, clock: &m
         DEAD_SHARDED.lock().unwrap_or_else(|e| e.into_inner()).extend(crate::sharded::dead_untracked());
         let weak: Vec<*mut PyObject> = a.parts.iter().flat_map(|p| p.weak.iter().copied()).collect();
         let late = if weak.is_empty() { None } else { Some(crate::types::weakref::detach_weakrefs_for_gc(&weak, false)) };
+        // threads that can take garbage, by the owner id their objects carry
+        let mut takers: Vec<(usize, *const ThreadState, Vec<usize>)> = Vec::new();
+        for &t in crate::threads::ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            let ts = t as *const ThreadState;
+            if t != me as usize && (*ts).at_safepoint.load(SeqCst) && (*ts).alive() {
+                takers.push(((*ts).owner_tid, ts, Vec::new()));
+            }
+        }
+        let my_id = crate::object::thread_id();
         let mut mine: Vec<usize> = Vec::new();
         let mut handed = 0usize;
         for p in a.parts {
-            let ts = p.owner as *const ThreadState;
-            if p.owner != 0 && p.owner != me as usize && (*ts).at_safepoint.load(SeqCst) && (*ts).alive() {
-                (*ts).gc_clear.lock().unwrap_or_else(|e| e.into_inner()).extend(p.garbage.iter().map(|&o| o as usize));
-                (*ts).c.eval_breaker.fetch_or(crate::threads::EVAL_GC_CLEAR, Release);
-                handed += p.garbage.len();
-            } else {
-                // cleared by this thread on behalf of their owners (see collect_phases)
-                for &o in &p.garbage {
-                    crate::object::explicit_merge(o);
+            for o in p.garbage {
+                let owner = (*o).ob_tid.load(Relaxed);
+                if let Some(t) = takers.iter_mut().find(|t| t.0 == owner) {
+                    t.2.push(o as usize);
+                    handed += 1;
+                } else {
+                    if owner != my_id {
+                        // cleared here on behalf of its owner (see collect_phases)
+                        crate::object::explicit_merge(o);
+                    }
+                    mine.push(o as usize);
                 }
-                mine.extend(p.garbage.iter().map(|&o| o as usize));
+            }
+        }
+        for (_, ts, v) in takers {
+            if !v.is_empty() {
+                (*ts).gc_clear.lock().unwrap_or_else(|e| e.into_inner()).extend(v);
+                (*ts).c.eval_breaker.fetch_or(crate::threads::EVAL_GC_CLEAR, Release);
             }
         }
         HANDED.fetch_add(handed, Relaxed);

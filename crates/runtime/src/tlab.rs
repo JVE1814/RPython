@@ -681,6 +681,40 @@ pub unsafe fn for_each_gc_block(mut f: impl FnMut(*mut crate::ffi::PyObject)) {
     }
 }
 
+/// (scale3) Number of segments mapped so far (for partitioned heap walks).
+pub fn segment_count() -> usize {
+    NSEGS.load(Acquire)
+}
+
+/// Pages per segment.
+pub const PAGES_PER_SEGMENT: usize = SEGMENT / PAGE;
+
+/// (scale3) `for_each_gc_block` restricted to pages `[p0, p1)` of segment `seg`, so that
+/// several threads can walk disjoint parts of the heap (world stopped).
+pub unsafe fn for_each_gc_block_in(seg: usize, p0: usize, p1: usize, mut f: impl FnMut(*mut crate::ffi::PyObject)) {
+    let base = SEGS[seg].load(Acquire);
+    for pi in p0..p1.min(PAGES_PER_SEGMENT) {
+        let page = base + pi * PAGE;
+        let h = page as *const PageHeader;
+        unsafe {
+            if std::ptr::read_volatile(&(*h).magic) != MAGIC {
+                return; // pages of a segment are handed out in address order
+            }
+            let kind = (*h).class as usize / NCLASSES;
+            if kind != KIND_RAW {
+                let pre = KIND_PRE[kind];
+                let block = (*h).block;
+                let end = (*h).carved.load(Acquire);
+                let mut b = (*h).first;
+                while b + block <= end {
+                    f((b + pre) as *mut crate::ffi::PyObject);
+                    b += block;
+                }
+            }
+        }
+    }
+}
+
 /// Layout of the per-thread cache for JIT-generated inline allocation/free (jit
 /// workstream). `tls_offset` is the cache address minus the thread pointer (fs:0);
 /// it is the same for every thread (static TLS of the executable).
