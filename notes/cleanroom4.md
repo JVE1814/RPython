@@ -163,8 +163,44 @@
   namespace bindings of an element no longer stay visible to its following siblings when
   resolving QName content.
 
-## Reviewed: own text and structure, no action needed
-(none yet)
+### zipfile/__init__.py (ZipExtFile rewritten)
+- `ZipExtFile` had CPython's decomposition (`_init_decrypter`, `_update_crc`, `_read2`,
+  the `_orig_*` attributes and seek logic).  New: `_restart()` resets the reading state
+  (used by __init__ and by backward seeks), `_start_decryption()`, `_fetch()` (was
+  `_read2`), `_check_crc()` with `_crc_seen`/`_crc_wanted`, `_sizes`, `_data_start`, one
+  `_read1()` dispatch per compression kind.  Kept (pinned by test_zipfile): `_read1(n)`
+  and its output bound, `MIN_READ_SIZE`, `MAX_N`, `MAX_SEEK_READ`, `_readbuffer`,
+  `_offset`, `_left`, `_compress_left`, `_eof`, the repr format, messages.
+- Differential check: 400 random archives (stored, deflate, bzip2, lzma, zstd; 0 B to
+  300 KB) x random read/read1/readline/peek/seek(3 modes)/tell sequences + repr: 0
+  differences.
+- test_zipfile 388, test_zipimport 152, test_zipapp 36, test_shutil 227 = (pass);
+  test_importlib 6 errors before and after.
 
-## Still to do
-see the end of this file.
+### _pyio.py, http/server.py (renames)
+- `_BufferedIOMixin` -> `_BufferedWrapper`, `_setmode` -> `_set_binary_mode`,
+  `_CHECK_ERRORS` -> `_REPORT_CLOSE_ERRORS`; http.server `_control_char_table` ->
+  `_log_escape_table`, `_get_best_family` -> `_pick_address_family` (nothing else used
+  them).  test_io 1056, test_httpservers 103 pass.
+
+## Reviewed: verdicts without a rewrite
+- asyncio/base_events.py: text already reworded by an earlier agent (own comments,
+  restructured `_ipaddr_info`/`_interleave_addrinfos`, `_thread_pool_class`), but the
+  method decomposition follows CPython; most of it is dictated by private attributes that
+  test_asyncio inspects (`_ready`, `_scheduled`, `_timer_cancelled_count`, `_selector`,
+  `_clock_resolution`, `_current_handle`, `_MIN_*` constants, `_ipaddr_info`,
+  `_interleave_addrinfos`, `_set_nodelay`; selector_events uses `_check_ssl_socket` and
+  `_HAS_IPv6`).  Not rewritten (risk/benefit; needs a dedicated session with the full
+  test_asyncio run).
+- mailbox.py classes (Maildir, mbox, MH, Babyl, message classes): comments reworded but
+  bodies keep CPython's layout (e.g. Maildir.add/__setitem__); test_mailbox reads many
+  private attributes.  Candidate for a dedicated rewrite.
+- zipfile ZipInfo/ZipFile bodies: still CPython's decomposition (method names are mostly
+  API); only ZipExtFile was rewritten here.
+
+## Still to do (priority order)
+1. mailbox classes; zipfile ZipInfo/ZipFile; asyncio/base_events (with full test_asyncio).
+2. Audit of email, multiprocessing, the rest of asyncio and xml (xml.dom, xml.sax,
+   xml.etree.ElementPath/ElementInclude) — not started.
+3. ElementTree: Element/QName/ElementTree classes and XMLPullParser keep the classic
+   (API-shaped) layout; reviewed only.
