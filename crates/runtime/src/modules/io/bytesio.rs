@@ -239,6 +239,11 @@ fn write_bytes(o: &PyObject, data: &[u8]) -> PyResult<usize> {
         return Ok(0);
     }
     let pos = s.pos;
+    // (tail2) growing the buffer is an allocation a failure-injecting hook may refuse;
+    // the stream is left as it was
+    if pos + data.len() > s.len() && crate::capi::mem::hooked_alloc_refuses(pos + data.len()) {
+        return Err(crate::errors::memory_error());
+    }
     let v = s.owned();
     if pos > v.len() {
         v.resize(pos, 0);
@@ -308,6 +313,10 @@ fn b_truncate(o: &PyObject, args: &[&PyObject]) -> PyResult {
         raise!(ValueError, "negative size value {}", size);
     }
     if (size as usize) < s.len() {
+        // (tail2) shrinking reallocates the buffer (refusable by a failure-injecting hook)
+        if crate::capi::mem::hooked_alloc_refuses(size as usize + 1) {
+            return Err(crate::errors::memory_error());
+        }
         s.owned().truncate(size as usize);
     }
     Ok(int::new_int(size as i64))

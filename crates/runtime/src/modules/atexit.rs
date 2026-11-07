@@ -73,6 +73,20 @@ fn atexit_unregister(_m: &PyObject, func: &PyObject) -> PyResult {
 
 /// Run and clear all callbacks. Errors are reported as unraisable.
 pub fn run_exitfuncs() {
+    // (tail2) running the callbacks starts from a snapshot of the registry; when a
+    // failure-injecting allocator hook refuses that allocation, the failure is reported
+    // and no callback runs (a later run would meet the same refusal)
+    let n = lock().len();
+    if n > 0 && crate::capi::mem::hooked_alloc_refuses(n * std::mem::size_of::<PyRef>()) {
+        let _ = crate::errors::memory_error();
+        crate::modules::sys_full::write_unraisable(
+            Some("Exception ignored while copying the atexit callback list"),
+            None,
+        );
+        let dropped: Vec<PyRef> = std::mem::take(&mut *lock());
+        drop(dropped);
+        return;
+    }
     loop {
         let entry = match lock().pop() {
             Some(e) => e,
