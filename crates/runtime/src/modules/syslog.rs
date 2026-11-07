@@ -14,6 +14,8 @@ use std::sync::Mutex;
 
 /// The ident string passed to openlog() must stay alive while the log is open.
 static STATE: Mutex<Option<CString>> = Mutex::new(None);
+/// Whether openlog() is in effect (the ident may be absent while it is).
+static OPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn utf8_arg(o: &PyObject) -> PyResult<CString> {
     let s = pystr::as_utf8(o)?;
@@ -56,6 +58,14 @@ fn do_openlog(ident: Option<CString>, opt: i32, facility: i32) {
     let p = ident.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null());
     unsafe { libc::openlog(p, opt, facility) };
     *g = ident;
+    OPENED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn ident_object(ident: &Option<CString>) -> PyRef {
+    match ident {
+        Some(c) => pystr::new_str(&c.to_string_lossy()),
+        None => none::none_ref(),
+    }
 }
 
 fn s_openlog(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
@@ -95,11 +105,14 @@ fn s_syslog(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     }
     let cmsg = utf8_arg(msg)?;
     crate::modules::sys_full::audit("syslog.syslog", &[&int::new_int(prio as i64), msg])?;
-    {
-        let opened = STATE.lock().unwrap_or_else(|e| e.into_inner()).is_some();
-        if !opened {
-            do_openlog(default_ident(), 0, libc::LOG_USER);
-        }
+    if !OPENED.load(std::sync::atomic::Ordering::Relaxed) {
+        // the implicit open is audited like an explicit one
+        let ident = default_ident();
+        crate::modules::sys_full::audit(
+            "syslog.openlog",
+            &[&ident_object(&ident), &int::new_int(0), &int::new_int(libc::LOG_USER as i64)],
+        )?;
+        do_openlog(ident, 0, libc::LOG_USER);
     }
     let _g = STATE.lock().unwrap_or_else(|e| e.into_inner());
     crate::threads::blocking(|| unsafe { libc::syslog(prio, c"%s".as_ptr(), cmsg.as_ptr()) });
@@ -111,6 +124,7 @@ fn s_closelog(_m: &PyObject) -> PyResult {
     let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
     unsafe { libc::closelog() };
     *g = None;
+    OPENED.store(false, std::sync::atomic::Ordering::Relaxed);
     Ok(none::none_ref())
 }
 

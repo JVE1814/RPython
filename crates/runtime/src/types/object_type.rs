@@ -203,6 +203,7 @@ fn object_set_class(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         Some(v) => v,
         None => raise!(TypeError, "can't delete __class__ attribute"),
     };
+    crate::modules::sys_full::audit("object.__setattr__", &[o, &pystr::new_str("__class__"), v])?;
     if !is_type(v) {
         raise!(TypeError, "__class__ must be set to a class, not '{}' object", tname(v));
     }
@@ -622,10 +623,10 @@ fn check_set_special(o: &PyObject, v: Option<&PyObject>, attr: &str) -> PyResult
     if unsafe { (*tp).tp_flags & Py_TPFLAGS_IMMUTABLETYPE != 0 } {
         raise!(TypeError, "cannot set '{}' attribute of immutable type '{}'", attr, type_name(unsafe { &*tp }));
     }
-    if v.is_none() {
+    let Some(v) = v else {
         raise!(TypeError, "cannot delete '{}' attribute of type '{}'", attr, type_name(unsafe { &*tp }));
-    }
-    Ok(())
+    };
+    crate::modules::sys_full::audit("object.__setattr__", &[o, &pystr::new_str(attr), v])
 }
 fn type_set_name(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     check_set_special(o, v, "__name__")?;

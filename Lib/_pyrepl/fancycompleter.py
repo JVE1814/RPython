@@ -73,9 +73,8 @@ def _section_color(value, section) -> str:
 
 def _color_for_obj(name: str, value, theme) -> str:
     color = _section_color(value, theme.fancycompleter)
-    if not color:
-        return name
-    return f"{color}{name}{theme.fancycompleter.reset}"
+    # the reset is emitted even when the theme has no colour for the kind
+    return f"{color}{name}{_colorize.ANSIColors.RESET}"
 
 
 def colorize_matches(names, values, theme):
@@ -118,7 +117,7 @@ class Completer(rlcompleter.Completer):
         if use_colors == "auto":
             use_colors = _colorize.can_colorize()
         self.use_colors = bool(use_colors)
-        self.theme = _colorize.get_theme(force_color=True) if self.use_colors else None
+        self.theme = _colorize.get_theme() if self.use_colors else None
         self.consider_getitems = consider_getitems
 
     def complete(self, text, state):

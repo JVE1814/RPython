@@ -910,6 +910,10 @@ def _find_and_load(name, import_):
     module = sys.modules.get(name, _NEEDS_LOADING)
     if module is _NEEDS_LOADING or _is_initializing(module):
         if module is _NEEDS_LOADING:
+            # announced before the parents are imported
+            sys.audit("import", name, None, getattr(sys, "path", None),
+                      getattr(sys, "meta_path", None),
+                      getattr(sys, "path_hooks", None))
             _resolve_parents(name, import_)
         lock = _get_module_lock(name)
         try:

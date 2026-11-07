@@ -283,9 +283,10 @@ fn sys_getframe(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     if f.is_null() {
         raise!(ValueError, "call stack is not deep enough");
     }
-    audit("sys._getframe", &[])?;
     let fo = crate::interp::eval::frame_object(unsafe { &mut *f });
-    Ok(unsafe { PyRef::from_borrowed(fo) })
+    let fo = unsafe { PyRef::from_borrowed(fo) };
+    audit("sys._getframe", &[&fo])?;
+    Ok(fo)
 }
 
 fn sys_getframemodulename(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
@@ -415,7 +416,9 @@ fn sys_displayhook(_m: &PyObject, o: &PyObject) -> PyResult {
 /// sys.excepthook and PyErr_Display do; a non-exception is reported as such.
 pub fn display_exception(v: &PyObject) {
     if crate::types::exceptions::is_exception_instance(v) {
-        print_exception_full(v);
+        // the interpreter's own report (sys.tracebacklimit keeps the
+        // innermost entries, colours when stderr is a terminal)
+        crate::modules::traceback_print::print_exception(v);
     } else {
         crate::modules::sys::write_stderr(&format!(
             "TypeError: print_exception(): Exception expected for value, {} found\n",
@@ -1364,7 +1367,7 @@ pub(crate) fn flush_std(name: &str) -> bool {
     if let Some(s) = crate::modules::sys::get_sys_attr(name) {
         if !s.is(none::none()) {
             if ab::call_method_str(&s, "flush", &[]).is_err() {
-                write_unraisable(Some(&format!("Exception ignored on flushing sys.{}", name)), None);
+                write_unraisable(Some(&format!("Exception ignored while flushing sys.{}", name)), None);
                 return false;
             }
         }

@@ -91,6 +91,46 @@ fn run_code_in_main(src: &[u8], filename: &str) -> Outcome {
     }
 }
 
+/// The magic number importlib writes into .pyc headers.
+fn pyc_magic() -> [u8; 4] {
+    let token = crate::import::import_absolute("_imp")
+        .and_then(|m| ab::getattr_str(&m, "pyc_magic_number_token"))
+        .and_then(|t| ab::as_i64(&t));
+    match token {
+        Ok(t) => (t as u32).to_le_bytes(),
+        Err(_) => {
+            clear_exc();
+            crate::modules::_imp::MAGIC.to_le_bytes()
+        }
+    }
+}
+
+/// Run a compiled script (the marshalled code after a .pyc header): the code
+/// keeps the file name it was compiled with.
+fn run_pyc_in_main(data: &[u8], path: &str) -> Outcome {
+    let r = (|| -> PyResult<()> {
+        let m = main_module()?;
+        let d = module::module_dict(&m);
+        dict::set_item_str(&d, "__file__", &pystr::new_str(path))?;
+        dict::set_item_str(&d, "__cached__", none::none())?;
+        if let Some(bs) = crate::import::get_loaded_module("_frozen_importlib_external") {
+            let cls = ab::getattr_str(&bs, "SourcelessFileLoader")?;
+            let l = ab::call(&cls, &[&pystr::new_str("__main__"), &pystr::new_str(path)])?;
+            dict::set_item_str(&d, "__loader__", &l)?;
+        }
+        let code = crate::modules::marshal::loads_slice(data, true)?;
+        if !crate::types::code::is_code(&code) {
+            crate::raise!(RuntimeError, "Bad code object in .pyc file");
+        }
+        crate::interp::eval_code(&code, &d, Some(&d))?;
+        Ok(())
+    })();
+    match r {
+        Ok(()) => Outcome::Ok,
+        Err(_) => Outcome::Exit(handle_error()),
+    }
+}
+
 fn abspath(p: &str) -> String {
     let pb = std::path::Path::new(p);
     if pb.is_absolute() {
@@ -178,6 +218,9 @@ fn run_script(path: &str, opts: &MainOptions) -> Outcome {
     // the script path is made absolute (like CPython 3.9+): __file__ and code filenames
     let abs = abspath(path);
     let path = abs.as_str();
+    if src.len() >= 16 && src[..4] == pyc_magic() {
+        return run_pyc_in_main(&src[16..], path);
+    }
     let r = (|| -> PyResult<()> {
         let m = main_module()?;
         let d = module::module_dict(&m);
@@ -433,6 +476,10 @@ fn repl(quiet: bool) -> i32 {
         if dict::get_item_rs(&sd, "ps2").is_none() {
             let _ = dict::set_item_str(&sd, "ps2", &pystr::new_str("... "));
         }
+    }
+    // __main__ must exist before the hook runs (rlcompleter imports it)
+    if main_module().is_err() {
+        clear_exc();
     }
     run_startup_file();
     run_interactive_hook();

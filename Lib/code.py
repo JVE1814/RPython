@@ -58,10 +58,18 @@ class InteractiveInterpreter:
         """Report the syntax error being handled (with `filename` as its
         file name if given)."""
         exc_type, exc, tb = sys.exc_info()
+        source = kwargs.pop('source', None)
         try:
             exc.__traceback__ = None
             if filename and issubclass(exc_type, SyntaxError):
                 exc.filename = filename
+            if (source and issubclass(exc_type, SyntaxError)
+                    and exc.text is None and exc.lineno):
+                # errors found after parsing (e.g. compiling an AST) carry
+                # no source line: take it from the text that was compiled
+                lines = source.splitlines()
+                if 0 < exc.lineno <= len(lines):
+                    exc.text = lines[exc.lineno - 1]
             self._report(exc_type, exc, None, **kwargs)
         finally:
             exc = None
@@ -84,7 +92,11 @@ class InteractiveInterpreter:
         hook = sys.excepthook
         if hook is sys.__excepthook__:
             colorize = kwargs.pop('colorize', False)
-            lines = traceback.format_exception(exc_type, exc, tb, colorize=colorize)
+            # reported like the interpreter does (sys.tracebacklimit keeps
+            # the innermost entries)
+            lines = traceback.format_exception(
+                exc_type, exc, tb, colorize=colorize,
+                limit=traceback.BUILTIN_EXCEPTION_LIMIT)
             self.write(''.join(lines))
             return
         try:
