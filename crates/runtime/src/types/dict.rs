@@ -45,36 +45,62 @@ pub fn is_anydict(o: &PyObject) -> bool {
 
 /// RAII guard for the per-object mutex (`PyObject.ob_mutex`, PyMutex-compatible:
 /// bit 0 = locked). Never hold it while running Python code or decref'ing.
+/// Extension critical sections on an object lock the same mutex
+/// (capi/pythread.rs), so Python-level operations on that object wait for them; a
+/// thread inside its own critical section on the object passes through (`m` null:
+/// nothing to release).
 pub struct ObGuard {
     m: *const AtomicU8,
 }
 impl Drop for ObGuard {
     #[inline(always)]
     fn drop(&mut self) {
-        unsafe { (*self.m).store(0, Release) }
+        if !self.m.is_null() {
+            unsafe { (*self.m).store(0, Release) }
+        }
     }
 }
 /// Lock `o`'s `ob_mutex`.
 #[inline(always)]
 pub fn ob_lock(o: &PyObject) -> ObGuard {
     let m = &o.ob_mutex;
-    if m.compare_exchange_weak(0, 1, Acquire, Relaxed).is_err() {
-        lock_slow(m);
+    if m.compare_exchange_weak(0, 1, Acquire, Relaxed).is_err() && !lock_slow(m) {
+        return ObGuard { m: std::ptr::null() };
     }
     ObGuard { m }
 }
+/// Contended: returns false if the calling thread already holds the mutex through a
+/// critical section. Long waits (a critical section can run arbitrary code) happen in
+/// Blocked mode so that a stop-the-world does not wait for this thread.
 #[cold]
-fn lock_slow(m: &AtomicU8) {
+fn lock_slow(m: &AtomicU8) -> bool {
     let mut spins = 0u32;
     loop {
-        if m.load(Relaxed) == 0 && m.compare_exchange_weak(0, 1, Acquire, Relaxed).is_ok() {
-            return;
+        let v = m.load(Relaxed);
+        if v & 1 == 0 && m.compare_exchange_weak(v, v | 1, Acquire, Relaxed).is_ok() {
+            return true;
         }
         spins += 1;
+        if spins == 1 && crate::capi::pythread::cs_holds_mutex(m as *const AtomicU8 as usize) {
+            return false;
+        }
         if spins < 64 {
             std::hint::spin_loop();
-        } else {
+        } else if spins < 2000 {
             std::thread::yield_now();
+        } else {
+            let ts = crate::threads::current_ptr();
+            if ts.is_null() {
+                std::thread::yield_now();
+                continue;
+            }
+            let ts = unsafe { &*ts };
+            let prev = ts.mode.replace(crate::threads::ThreadMode::Blocked);
+            while m.load(Relaxed) & 1 != 0 {
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+            // back in the VM (may wait for a stopped world) before taking the lock
+            ts.mode.set(prev);
         }
     }
 }

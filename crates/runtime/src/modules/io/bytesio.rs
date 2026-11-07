@@ -442,7 +442,13 @@ struct BytesIOBuffer {
 
 unsafe extern "C" fn buf_getbuffer(op: *mut PyObject, view: *mut Py_buffer, flags: c_int) -> c_int {
     unsafe {
-        let src = &*(*(op as *mut BytesIOBuffer)).source;
+        let srcp = (*(op as *mut BytesIOBuffer)).source;
+        if view.is_null() || srcp.is_null() {
+            // C code may allocate the type directly and ask for no view
+            let _ = crate::err!(BufferError, "bytesiobuf_getbuffer: view==NULL argument is obsolete");
+            return -1;
+        }
+        let src = &*srcp;
         let s = match state(src) {
             Ok(s) => s,
             Err(_) => return -1,
