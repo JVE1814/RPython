@@ -34,6 +34,8 @@ static ALLOCS_SINCE: AtomicUsize = AtomicUsize::new(0);
 pub static ENABLED: AtomicBool = AtomicBool::new(true);
 pub static THRESHOLD: AtomicUsize = AtomicUsize::new(2000);
 static COLLECTING: AtomicBool = AtomicBool::new(false);
+/// (scale1) Thread id of the thread running `collect_gen` (0: none).
+static COLLECTOR: AtomicUsize = AtomicUsize::new(0);
 pub static COLLECTIONS: AtomicUsize = AtomicUsize::new(0);
 pub static COLLECTED: AtomicUsize = AtomicUsize::new(0);
 pub static UNCOLLECTABLE: AtomicUsize = AtomicUsize::new(0);
@@ -636,16 +638,11 @@ fn collect_gen(young_only: bool) -> usize {
     if COLLECTING.swap(true, AcqRel) {
         return 0;
     }
+    COLLECTOR.store(crate::object::thread_id(), Release);
     let me = crate::threads::current_mut();
     let saved_exc = crate::errors::take_exc();
     let t0 = std::time::Instant::now();
     let n = unsafe { collect_phases(me, young_only) };
-    // sharded objects found dead while the world was stopped (sharded.rs), released
-    // now that it runs again
-    let dead = std::mem::take(&mut *DEAD_SHARDED.lock().unwrap_or_else(|e| e.into_inner()));
-    drop(dead);
-    let taken = std::mem::take(&mut *QSBR_TAKEN.lock().unwrap_or_else(|e| e.into_inner()));
-    crate::qsbr::release_taken(taken);
     if crate::scalestats::on() {
         crate::scalestats::GC_COUNT.fetch_add(1, Relaxed);
         crate::scalestats::add_ns(&crate::scalestats::GC_NS, t0);
@@ -671,7 +668,19 @@ fn collect_gen(young_only: bool) -> usize {
         // does not poll): retry after some more allocations
         ALLOCS_SINCE.store(THRESHOLD.load(Relaxed) / 2, Relaxed);
     }
+    COLLECTOR.store(0, Release);
     COLLECTING.store(false, Release);
+    // (scale1) sharded objects found dead and orphaned QSBR items, released only now:
+    // their deallocation can run finalizers and weakref callbacks, which may use the
+    // gc module (gc.get_objects waits for COLLECTING: a self-deadlock before)
+    let saved_exc = crate::errors::take_exc();
+    let dead = std::mem::take(&mut *DEAD_SHARDED.lock().unwrap_or_else(|e| e.into_inner()));
+    drop(dead);
+    let taken = std::mem::take(&mut *QSBR_TAKEN.lock().unwrap_or_else(|e| e.into_inner()));
+    crate::qsbr::release_taken(taken);
+    if let Some(e) = saved_exc {
+        crate::errors::set_exc(e);
+    }
     n.unwrap_or(0)
 }
 
@@ -887,7 +896,11 @@ pub fn all_tracked() -> Vec<PyRef> {
     }
     // the heap walk needs the other threads parked (they allocate and free on the
     // pages being walked); take references before they run again
-    while COLLECTING.compare_exchange(false, true, AcqRel, Acquire).is_err() {
+    // (scale1) called by the collecting thread itself (a finalizer or weakref callback
+    // run by the collection, with the world running again): it already holds
+    // COLLECTING; waiting for it would never end
+    let own = COLLECTOR.load(Acquire) == crate::object::thread_id();
+    while !own && COLLECTING.compare_exchange(false, true, AcqRel, Acquire).is_err() {
         crate::threads::blocking(|| std::thread::sleep(std::time::Duration::from_micros(200)));
     }
     let me = crate::threads::current_mut();
@@ -902,7 +915,9 @@ pub fn all_tracked() -> Vec<PyRef> {
     if stopped {
         start_the_world();
     }
-    COLLECTING.store(false, Release);
+    if !own {
+        COLLECTING.store(false, Release);
+    }
     v
 }
 

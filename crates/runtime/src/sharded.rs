@@ -359,6 +359,12 @@ pub unsafe fn note_decref(op: *mut PyObject) -> bool {
             add(op, -1);
             return true;
         }
+        // Only objects other threads hold references to right now (positive shared
+        // count) are candidates; an object handed over by its owner and dropped here
+        // (shared count <= 0) is not shared, and counting it would cost a CAS.
+        if ((*op).ob_ref_shared.load(Relaxed) >> REF_SHARED_SHIFT) <= 0 {
+            return false;
+        }
         consider(op)
     }
 }

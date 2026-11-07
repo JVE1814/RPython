@@ -139,6 +139,10 @@ struct Local {
     /// Remaining self re-arms of the eval breaker (see REARM).
     rearm: u32,
     retires: u32,
+    /// `retires` at the last eval-breaker visit (changed: still retiring, it comes back by itself).
+    last_open: usize,
+    /// The thread state this OS thread last retired items under.
+    ts: *const ThreadState,
     /// Listed in LOCALS (for collections to take the pending items).
     registered: bool,
     /// The thread has run `thread_exit`: later items go straight to the orphans.
@@ -154,6 +158,8 @@ static LOCAL: UnsafeCell<Local> = UnsafeCell::new(Local {
     scan_in: 0,
     rearm: 0,
     retires: 0,
+    last_open: 0,
+    ts: std::ptr::null(),
     registered: false,
     dead: false,
 });
@@ -250,7 +256,7 @@ fn retire(it: Item) {
     // deallocators (Python code). Releases happen at the next eval-breaker poll.
     if l.open.len() >= BATCH {
         retire_full();
-    } else if !l.closed.is_empty() {
+    } else {
         l.retires = l.retires.wrapping_add(1);
         if l.retires & 63 == 0 {
             come_back_soon(l);
@@ -261,7 +267,7 @@ fn retire(it: Item) {
 /// Have this thread visit `on_eval_breaker` at its next poll(s).
 #[cold]
 fn come_back_soon(l: &mut Local) {
-    l.rearm = l.rearm.max(8);
+    l.rearm = l.rearm.max(POLLS + 8);
     let t = me();
     if !t.is_null() {
         unsafe { (*t).c.eval_breaker.fetch_or(EVAL_QSBR, Release) };
@@ -281,6 +287,7 @@ fn retire_first() {
     // come back at the next polls to close the batch
     l.rearm = REARM;
     let t = me();
+    l.ts = t;
     if !t.is_null() {
         unsafe { (*t).c.eval_breaker.fetch_or(EVAL_QSBR, Release) };
     }
@@ -313,16 +320,26 @@ fn retire_full() {
 /// This bounds how long items wait when their thread stopped polling for them.
 pub fn take_all_for_gc() -> Vec<ItemSendBatch> {
     let mut out = Vec::new();
+    // Each thread's items are released by the thread itself (its own objects: cheap
+    // owner-side frees) at its next eval-breaker visit: everything retired so far gets
+    // a goal that every thread has passed, since all of them are stopped right now.
+    let goal = GLOBAL.fetch_add(1, SeqCst) + 1;
     let locals = LOCALS.lock().unwrap_or_else(|e| e.into_inner());
     for &lp in locals.iter() {
         let l = unsafe { &mut *(lp as *mut Local) };
         if !l.open.is_empty() {
-            out.push(ItemSendBatch(std::mem::take(&mut l.open), false));
-        }
-        for (_, items) in l.closed.drain(..) {
-            out.push(ItemSendBatch(items, true));
+            let items = std::mem::take(&mut l.open);
+            PENDING_TOTAL.fetch_add(items.len(), Relaxed);
+            l.closed.push_back((goal, items));
         }
         l.polls = 0;
+        if !l.closed.is_empty() {
+            l.known_min = l.known_min.max(goal);
+            l.rearm = l.rearm.max(8);
+            if !l.ts.is_null() {
+                unsafe { (*l.ts).c.eval_breaker.fetch_or(EVAL_QSBR, Release) };
+            }
+        }
     }
     drop(locals);
     let mut o = ORPHANS.lock().unwrap_or_else(|e| e.into_inner());
@@ -474,7 +491,11 @@ pub fn on_eval_breaker(ts: &ThreadState) {
     }
     poll(false);
     let l = local();
-    if (!l.closed.is_empty() || !l.open.is_empty() || ORPHAN_MIN.load(Relaxed) != u64::MAX) && l.rearm > 0 {
+    // A thread that is retiring quickly comes back by itself (every 64 retires and
+    // whenever a batch fills up): re-arming at every poll would only cost time.
+    let progressing = l.retires as usize != l.last_open;
+    l.last_open = l.retires as usize;
+    if (!l.closed.is_empty() || !l.open.is_empty() || ORPHAN_MIN.load(Relaxed) != u64::MAX) && l.rearm > 0 && !progressing {
         // not yet matured: check again at the next poll (a bounded number of times)
         l.rearm -= 1;
         ts.c.eval_breaker.fetch_or(EVAL_QSBR, Release);
