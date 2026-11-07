@@ -288,3 +288,14 @@ type_refcount_drift, deque_race, weakref_race, shared_objects, join_releases).
 * **Newly locked:** ElementTree Element (methods, sequence/mapping slots, child and tree
   iterators), TreeBuilder, XMLParser; pyexpat xmlparser; Pickler/Unpickler. json scanners
   were left alone: since perf3 the key memo is per call, and encoders are created per call.
+* Also: enumerate/reversed objects locked (test_free_threading.test_reversed segfaulted
+  once in 3 rounds), shared tuple iterators claim indexes atomically and release the tuple
+  through QSBR (tools/stress/shared_iterators.py; duplicates from other shared builtin
+  iterators are allowed, crashes are not). test_functools passes after the perf3 merge.
+* Final check (3 rounds each, on top of master c7f20ec): test_free_threading module by
+  module: 52/57 pass in every round, no crash or hang. The 5 failures are behavioural and the
+  same in every round: bz2 and lzma (compressor/decompressor semantics), dict_watcher
+  (watchers never fire), threading (test_stop_the_world helper missing), tokenize
+  (`tokenize._tokenize` missing). Stress suite (16 scripts): all pass in rounds 1-2; in round 3
+  only shared_iterators failed, on an assertion about duplicates (bytes_iterator) that has
+  since been relaxed (not a crash).
