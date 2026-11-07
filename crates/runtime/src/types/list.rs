@@ -700,8 +700,9 @@ pub fn extend(o: &PyObject, it: &PyObject) -> PyResult<()> {
         }
         return Ok(());
     }
-    if is_list_exact(it) || o.is(it) {
-        let items: Vec<PyRef> = if tuple::is_tuple_exact(it) { tuple::tuple_to_vec(it) } else { list_to_vec(it) };
+    // (perf5) exact sets, dicts and dict views: one snapshot instead of an iterator
+    let snap = if is_list_exact(it) || o.is(it) { Some(list_to_vec(it)) } else { ab::builtin_snapshot(it) };
+    if let Some(items) = snap {
         if items.is_empty() {
             return Ok(());
         }
