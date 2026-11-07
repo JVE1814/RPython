@@ -1038,12 +1038,24 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             let gsuper = popref!(f);
                             let nm = &cd.names[(arg >> 2) as usize];
                             let is_method = arg & 1 != 0;
-                            let sup = if gsuper.is(type_obj(crate::types::super_::super_type())) {
-                                crate::types::super_::new_super(&cls, &slf)?
+                            let two = arg & 2 != 0;
+                            // monitoring sees the super() call as in the unoptimised form
+                            let call_info = if crate::modules::sys::tracing_active() {
+                                crate::modules::sys_trace::before_call(ts, f, &gsuper, None, if two { Some(&*cls) } else { None }, false)?
                             } else {
-                                let two = arg & 2 != 0;
-                                if two { ab::call(&gsuper, &[&cls, &slf])? } else { ab::call(&gsuper, &[])? }
+                                None
                             };
+                            let sup = if gsuper.is(type_obj(crate::types::super_::super_type())) {
+                                crate::types::super_::new_super(&cls, &slf)
+                            } else if two {
+                                ab::call(&gsuper, &[&cls, &slf])
+                            } else {
+                                ab::call(&gsuper, &[])
+                            };
+                            if let Some(info) = call_info {
+                                crate::modules::sys_trace::after_call(ts, f, info, sup.is_ok())?;
+                            }
+                            let sup = sup?;
                             if is_method {
                                 let v = ab::getattr(&sup, nm)?;
                                 push!(f, v.into_raw());
