@@ -1165,6 +1165,7 @@ fn init_type() -> PyResult<()> {
             k += 1;
         }
         (*t).tp_getset = crate::methods::gstable(gs);
+        crate::methods::lock_self_methods_held(t); // one expat parser per object, not thread-safe
         crate::types::typeobject::type_ready(t)?;
     }
     Ok(())

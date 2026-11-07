@@ -135,6 +135,16 @@ pub fn table(mut v: Vec<PyMethodDef>) -> *mut PyMethodDef {
 /// Make every method in `tp`'s method table run with `objlock::lock(self)` held
 /// (types whose Rust state is not safe to share between threads otherwise).
 pub unsafe fn lock_self_methods(tp: *mut PyTypeObject) {
+    unsafe { mark_methods(tp, METH_LOCKSELF) }
+}
+
+/// As `lock_self_methods` with `objlock::lock_held` (I/O objects: the lock is never
+/// given up while a method runs).
+pub unsafe fn lock_self_methods_held(tp: *mut PyTypeObject) {
+    unsafe { mark_methods(tp, METH_LOCKSELF_HELD) }
+}
+
+unsafe fn mark_methods(tp: *mut PyTypeObject, flag: std::ffi::c_int) {
     unsafe {
         let mut m = (*tp).tp_methods;
         if m.is_null() {
@@ -142,7 +152,7 @@ pub unsafe fn lock_self_methods(tp: *mut PyTypeObject) {
         }
         while !(*m).ml_name.is_null() {
             if (*m).ml_flags & (METH_CLASS | METH_STATIC) == 0 {
-                (*m).ml_flags |= METH_LOCKSELF;
+                (*m).ml_flags |= flag;
             }
             m = m.add(1);
         }
@@ -190,8 +200,12 @@ pub unsafe fn call_methoddef(
     qualname: &dyn Fn() -> String,
 ) -> PyResult {
     unsafe {
-        let flags = (*ml).ml_flags & !(METH_CLASS | METH_STATIC | METH_COEXIST | METH_LOCKSELF);
-        let _locked = if (*ml).ml_flags & METH_LOCKSELF != 0 && !slf.is_null() {
+        let flags = (*ml).ml_flags & !(METH_CLASS | METH_STATIC | METH_COEXIST | METH_LOCKSELF | METH_LOCKSELF_HELD);
+        let _locked = if slf.is_null() {
+            None
+        } else if (*ml).ml_flags & METH_LOCKSELF_HELD != 0 {
+            Some(crate::objlock::lock_held(&*slf))
+        } else if (*ml).ml_flags & METH_LOCKSELF != 0 {
             Some(crate::objlock::lock(&*slf))
         } else {
             None

@@ -12,6 +12,13 @@
 //! * held across blocking calls (unlike a critical section, it is not given up while
 //!   the holder waits in a system call: a buffered writer's state must not change in
 //!   the middle of a flush);
+//! * two kinds: `lock` entries may be given up when their holder has to wait for
+//!   another object's entry (and are taken back in address order: no lock-order
+//!   deadlock, see `lock`); `lock_held` entries never are, for objects whose Rust state
+//!   is borrowed across the Python calls a method makes (I/O, iterators, parsers,
+//!   array, OrderedDict...). Deadlock remains possible only through cycles of held
+//!   entries. `lock` is used where state is re-read after every Python call (deque,
+//!   lru_cache, heapq);
 //! * no cost while the process has a single thread (no entry is taken).
 //! After fork() the child drops the entries of threads that do not exist there.
 
@@ -56,42 +63,129 @@ impl Drop for ObjGuard {
     }
 }
 
+thread_local! {
+    /// The calling thread's acquisitions, innermost last: (key, held across blocking).
+    static HELD: std::cell::RefCell<Vec<(usize, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Lock `o` for the calling thread (recursively). No-op while single-threaded.
+///
+/// Deadlock avoidance: a thread that finds the lock taken by another thread first
+/// gives up every lock it holds that may be suspended (all but the `lock_held` ones),
+/// then takes the whole set back, together with the new one, in address order. Two
+/// threads locking two objects in opposite orders therefore cannot wait for each other
+/// forever: the one that blocks lets go of what the other needs. (As with CPython's
+/// critical sections, an object's state can change while code that locked it is
+/// suspended this way, i.e. inside a nested call that had to wait for another lock.)
 pub fn lock(o: &PyObject) -> ObjGuard {
+    lock_impl(o, false)
+}
+
+/// As `lock`, but the lock is never given up to avoid a deadlock (buffered/text I/O:
+/// the object's state must not change in the middle of an operation such as a flush).
+pub fn lock_held(o: &PyObject) -> ObjGuard {
+    lock_impl(o, true)
+}
+
+fn lock_impl(o: &PyObject, hold: bool) -> ObjGuard {
     if !crate::threads::multi_threaded() {
         return ObjGuard { key: 0 };
     }
     let key = o.as_ptr() as usize;
     let me = crate::object::thread_id();
+    if !try_take(key, me, 1) {
+        contended(key, me);
+    }
+    let _ = HELD.try_with(|h| h.borrow_mut().push((key, hold)));
+    ObjGuard { key }
+}
+
+/// Take `key` (or add `depth` to our own entry); false if another thread holds it.
+fn try_take(key: usize, me: usize, depth: u32) -> bool {
     let s = shard(key);
     let mut g = guard(&s.held);
-    loop {
-        match g.iter_mut().find(|e| e.key == key) {
-            None => {
-                g.push(Entry { key, owner: me, depth: 1 });
-                return ObjGuard { key };
+    match g.iter_mut().find(|e| e.key == key) {
+        None => {
+            g.push(Entry { key, owner: me, depth });
+            true
+        }
+        Some(e) if e.owner == me => {
+            e.depth += depth;
+            true
+        }
+        Some(_) => false,
+    }
+}
+
+/// Wait until `key` is free (or ours), as a blocked thread: the owner may need a
+/// stop-the-world to finish before it can release the entry.
+fn wait_free(key: usize, me: usize) {
+    let s = shard(key);
+    let mut g = guard(&s.held);
+    while g.iter().any(|e| e.key == key && e.owner != me) {
+        s.waiters.fetch_add(1, SeqCst);
+        let ts = crate::threads::current_ptr();
+        let prev = if ts.is_null() { None } else { Some(unsafe { (*ts).mode.replace(crate::threads::ThreadMode::Blocked) }) };
+        let (g2, _) = s.freed.wait_timeout(g, std::time::Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner());
+        drop(g2);
+        s.waiters.fetch_sub(1, SeqCst);
+        // re-entering the VM may wait for a stopped world: not while holding the shard lock
+        if let Some(p) = prev {
+            unsafe { (*ts).mode.set(p) };
+        }
+        g = guard(&s.held);
+    }
+}
+
+/// Drop our entry for `key` entirely; returns its depth.
+fn release_entry(key: usize) -> u32 {
+    let s = shard(key);
+    let mut g = guard(&s.held);
+    let mut depth = 0;
+    if let Some(i) = g.iter().position(|e| e.key == key) {
+        depth = g[i].depth;
+        g.swap_remove(i);
+    }
+    drop(g);
+    if s.waiters.load(SeqCst) != 0 {
+        s.freed.notify_all();
+    }
+    depth
+}
+
+#[cold]
+fn contended(key: usize, me: usize) {
+    // the locks this thread may give up: held, and never taken with lock_held
+    let mut suspend: Vec<usize> = Vec::new();
+    let _ = HELD.try_with(|h| {
+        let h = h.borrow();
+        for &(k, _) in h.iter() {
+            if k != key && !suspend.contains(&k) && !h.iter().any(|&(k2, hold)| k2 == k && hold) {
+                suspend.push(k);
             }
-            Some(e) if e.owner == me => {
-                e.depth += 1;
-                return ObjGuard { key };
-            }
-            Some(_) => {
-                s.waiters.fetch_add(1, SeqCst);
-                // wait as a blocked thread: the owner may need a stop-the-world to
-                // finish before it can release the entry
-                let ts = crate::threads::current();
-                let prev = ts.mode.replace(crate::threads::ThreadMode::Blocked);
-                let (g2, _) = s.freed.wait_timeout(g, std::time::Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner());
-                drop(g2);
-                s.waiters.fetch_sub(1, SeqCst);
-                // re-entering the VM may wait for a stopped world: not while holding
-                // the shard lock
-                ts.mode.set(prev);
-                g = guard(&s.held);
+        }
+    });
+    if suspend.is_empty() {
+        loop {
+            wait_free(key, me);
+            if try_take(key, me, 1) {
+                return;
             }
         }
     }
+    let mut set: Vec<(usize, u32)> = suspend.iter().map(|&k| (k, release_entry(k))).filter(|&(_, d)| d > 0).collect();
+    set.push((key, 1));
+    set.sort_unstable_by_key(|&(k, _)| k);
+    for (k, depth) in set {
+        loop {
+            if try_take(k, me, depth) {
+                break;
+            }
+            wait_free(k, me);
+        }
+    }
 }
+
 
 /// Define `extern "C" fn $name(self, args...)` that calls slot function `$f` with
 /// `self` locked: `crate::locked_slot!(l_len, my_len, () -> isize);`
@@ -100,7 +194,7 @@ macro_rules! locked_slot {
     ($name:ident, $f:path, ($($arg:ident: $t:ty),*) -> $ret:ty) => {
         unsafe extern "C" fn $name(o: *mut $crate::ffi::PyObject $(, $arg: $t)*) -> $ret {
             unsafe {
-                let _g = $crate::objlock::lock(&*o);
+                let _g = $crate::objlock::lock_held(&*o);
                 $f(o $(, $arg)*)
             }
         }
@@ -115,6 +209,12 @@ pub fn with<R>(o: &PyObject, f: impl FnOnce() -> R) -> R {
 }
 
 fn unlock(key: usize) {
+    let _ = HELD.try_with(|h| {
+        let mut h = h.borrow_mut();
+        if let Some(i) = h.iter().rposition(|&(k, _)| k == key) {
+            h.remove(i);
+        }
+    });
     let s = shard(key);
     let mut g = guard(&s.held);
     if let Some(i) = g.iter().position(|e| e.key == key) {

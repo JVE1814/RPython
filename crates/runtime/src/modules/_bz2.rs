@@ -170,7 +170,7 @@ pub fn init_module() -> PyResult {
             ("flush", NOARGS, c_flush, "flush($self, /)\n--\n\nFinish the compression process."),
             ("__reduce__", NOARGS, cc::no_pickle),
         ];
-        crate::methods::lock_self_methods(ctype());
+        crate::methods::lock_self_methods_held(ctype());
         res = type_ready(ctype());
         if res.is_err() {
             return;
@@ -188,7 +188,7 @@ pub fn init_module() -> PyResult {
             ("unused_data", d_unused; "Data found after the end of the compressed stream."),
             ("needs_input", d_needs_input; "True if more input is needed before more decompressed data can be produced."),
         ];
-        crate::methods::lock_self_methods(dtype());
+        crate::methods::lock_self_methods_held(dtype());
         res = type_ready(dtype());
     });
     res?;

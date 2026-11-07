@@ -683,7 +683,7 @@ fn b_readline(o: &PyObject, args: &[&PyObject]) -> PyResult {
 unsafe extern "C" fn b_iternext(op: *mut PyObject) -> *mut PyObject {
     unsafe {
         let o = &*op;
-        let _lk = crate::objlock::lock(o);
+        let _lk = crate::objlock::lock_held(o);
         let exact = o.is_type(bufreader_type()) || o.is_type(bufrandom_type());
         let r = if exact { readline_impl(o, -1) } else { call0(o, "readline") };
         match r {
@@ -1275,7 +1275,7 @@ pub fn init_types() -> PyResult<()> {
                 // writer and add the reader methods directly.
                 tt.tp_base = base;
             }
-            crate::methods::lock_self_methods(t);
+            crate::methods::lock_self_methods_held(t);
             crate::types::typeobject::type_ready(t)?;
         }
 
@@ -1309,7 +1309,7 @@ pub fn init_types() -> PyResult<()> {
             ("detach", NOARGS, p_detach),
         ];
         t.tp_getset = crate::getset_table![("closed", p_get_closed)];
-        crate::methods::lock_self_methods(bufrwpair_type());
+        crate::methods::lock_self_methods_held(bufrwpair_type());
         crate::types::typeobject::type_ready(bufrwpair_type())?;
     }
     Ok(())

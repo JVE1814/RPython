@@ -3362,6 +3362,7 @@ pub fn init_module() -> PyResult {
                 ("bin", get_bin, set_bin),
                 ("fast", get_fast, set_fast),
             ];
+            crate::methods::lock_self_methods_held(pickler_type());
             type_ready(pickler_type())?;
             if let Some(d) = dict::get_item_rs(type_dict(pickler_type()), "persistent_id") {
                 if d.is_type(&raw mut crate::types::descr::PyMethodDescr_Type) {
@@ -3389,6 +3390,7 @@ pub fn init_module() -> PyResult {
                 ("__sizeof__", NOARGS, unpickler_sizeof, "Memory used by the unpickler, in bytes."),
             ];
             t.tp_getset = crate::getset_table![("memo", get_umemo, set_umemo)];
+            crate::methods::lock_self_methods_held(unpickler_type());
             type_ready(unpickler_type())?;
             if let Some(d) = dict::get_item_rs(type_dict(unpickler_type()), "persistent_load") {
                 if d.is_type(&raw mut crate::types::descr::PyMethodDescr_Type) {

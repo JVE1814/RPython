@@ -960,7 +960,7 @@ pub fn init_module() -> PyResult {
                 ("writerow", O, m_writerow, "writerow($self, row, /)\n--\n\nWrite one record built from the items of *row* (converted with str(), None as an empty field)."),
                 ("writerows", O, m_writerows, "writerows($self, rows, /)\n--\n\nWrite one record for every row in the iterable *rows*."),
             ];
-            crate::methods::lock_self_methods(writer_type());
+            crate::methods::lock_self_methods_held(writer_type());
             type_ready(writer_type())?;
 
             let ns = dict::new_dict();

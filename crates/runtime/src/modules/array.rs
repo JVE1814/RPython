@@ -1184,14 +1184,14 @@ unsafe extern "C" fn iter_dealloc(o: *mut PyObject) {
 fn lock2(a: &PyObject, b: &PyObject) -> (crate::objlock::ObjGuard, Option<crate::objlock::ObjGuard>) {
     let other_array = is_array(b) && !a.is(b);
     if !other_array {
-        return (crate::objlock::lock(a), None);
+        return (crate::objlock::lock_held(a), None);
     }
     if (a.as_ptr() as usize) < (b.as_ptr() as usize) {
-        let g1 = crate::objlock::lock(a);
-        (g1, Some(crate::objlock::lock(b)))
+        let g1 = crate::objlock::lock_held(a);
+        (g1, Some(crate::objlock::lock_held(b)))
     } else {
-        let g1 = crate::objlock::lock(b);
-        (g1, Some(crate::objlock::lock(a)))
+        let g1 = crate::objlock::lock_held(b);
+        (g1, Some(crate::objlock::lock_held(a)))
     }
 }
 
@@ -1199,7 +1199,7 @@ macro_rules! locked1 {
     ($name:ident, $f:ident, ($($arg:ident: $t:ty),*) -> $ret:ty) => {
         unsafe extern "C" fn $name(o: *mut PyObject $(, $arg: $t)*) -> $ret {
             unsafe {
-                let _g = crate::objlock::lock(&*o);
+                let _g = crate::objlock::lock_held(&*o);
                 $f(o $(, $arg)*)
             }
         }
@@ -1209,7 +1209,7 @@ macro_rules! locked2 {
     ($name:ident, $f:ident, ($($arg:ident: $t:ty),*) -> $ret:ty) => {
         unsafe extern "C" fn $name(a: *mut PyObject, b: *mut PyObject $(, $arg: $t)*) -> $ret {
             unsafe {
-                let _g = if b.is_null() { (crate::objlock::lock(&*a), None) } else { lock2(&*a, &*b) };
+                let _g = if b.is_null() { (crate::objlock::lock_held(&*a), None) } else { lock2(&*a, &*b) };
                 $f(a, b $(, $arg)*)
             }
         }
@@ -1231,21 +1231,21 @@ locked2!(l_richcompare, array_richcompare, (op: c_int) -> *mut PyObject);
 
 unsafe extern "C" fn l_ass_subscript(o: *mut PyObject, k: *mut PyObject, v: *mut PyObject) -> c_int {
     unsafe {
-        let _g = if v.is_null() { (crate::objlock::lock(&*o), None) } else { lock2(&*o, &*v) };
+        let _g = if v.is_null() { (crate::objlock::lock_held(&*o), None) } else { lock2(&*o, &*v) };
         array_ass_subscript(o, k, v)
     }
 }
 
 unsafe extern "C" fn iter_next(o: *mut PyObject) -> *mut PyObject {
     unsafe {
-        let _li = crate::objlock::lock(&*o);
+        let _li = crate::objlock::lock_held(&*o);
         let it = &mut *(o as *mut IterObj);
         if it.ao.is_null() {
             return std::ptr::null_mut();
         }
         let a = &*it.ao;
         let item = {
-            let _la = crate::objlock::lock(a);
+            let _la = crate::objlock::lock_held(a);
             if (it.index as usize) < nitems(a) { Some(get_item(a, it.index as usize)) } else { None }
         };
         if let Some(r) = item {
@@ -1517,7 +1517,7 @@ pub fn init_module() -> PyResult {
                 ("typecode", get_typecode; "the typecode character used to create the array"),
                 ("itemsize", get_itemsize; "the size, in bytes, of one array item"),
             ];
-            crate::methods::lock_self_methods(array_type());
+            crate::methods::lock_self_methods_held(array_type());
             type_ready(array_type())?;
 
             let t = &mut *iter_type();

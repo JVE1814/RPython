@@ -400,7 +400,7 @@ fn b_sizeof(o: &PyObject) -> PyResult {
 unsafe extern "C" fn b_iternext(op: *mut PyObject) -> *mut PyObject {
     unsafe {
         let o = &*op;
-        let _lk = crate::objlock::lock(o);
+        let _lk = crate::objlock::lock_held(o);
         if !o.is_type(bytesio_type()) {
             // subclass may override readline
             let r = call0(o, "readline");
@@ -501,14 +501,14 @@ unsafe extern "C" fn buf_traverse(op: *mut PyObject, visit: visitproc, arg: *mut
 unsafe extern "C" fn l_buf_getbuffer(op: *mut PyObject, view: *mut Py_buffer, flags: c_int) -> c_int {
     unsafe {
         let src = (*(op as *mut BytesIOBuffer)).source;
-        let _g = if src.is_null() { None } else { Some(crate::objlock::lock(&*src)) };
+        let _g = if src.is_null() { None } else { Some(crate::objlock::lock_held(&*src)) };
         buf_getbuffer(op, view, flags)
     }
 }
 unsafe extern "C" fn l_buf_releasebuffer(op: *mut PyObject, view: *mut Py_buffer) {
     unsafe {
         let src = (*(op as *mut BytesIOBuffer)).source;
-        let _g = if src.is_null() { None } else { Some(crate::objlock::lock(&*src)) };
+        let _g = if src.is_null() { None } else { Some(crate::objlock::lock_held(&*src)) };
         buf_releasebuffer(op, view)
     }
 }
@@ -570,7 +570,7 @@ pub fn init_types() -> PyResult<()> {
             ("__sizeof__", NOARGS, b_sizeof),
         ];
         t.tp_getset = crate::getset_table![("closed", b_closed)];
-        crate::methods::lock_self_methods(bytesio_type());
+        crate::methods::lock_self_methods_held(bytesio_type());
         crate::types::typeobject::type_ready(bytesio_type())?;
 
         let t = &mut *(&raw mut BYTESIOBUF_TYPE);

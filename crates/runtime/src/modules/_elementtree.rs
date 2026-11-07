@@ -962,7 +962,10 @@ fn iter_next_impl(it: &mut ElemIter) -> PyResult<Option<PyRef>> {
     }
     loop {
         let Some((top, idx)) = it.stack.last_mut() else { return Ok(None) };
-        let child = el(top).children.get(*idx).cloned();
+        let child = {
+            let _l = crate::objlock::lock_held(top);
+            el(top).children.get(*idx).cloned()
+        };
         match child {
             Some(child) => {
                 *idx += 1;
@@ -1932,6 +1935,26 @@ fn leak<T>(v: T) -> *mut T {
     Box::into_raw(Box::new(v))
 }
 
+// Elements (child vectors, attrib, text/tail) are shared between threads more often
+// than not: slots and methods run under the element's object lock, iterators under
+// their own (the tree iterator locks each element while it reads a child).
+crate::locked_slot!(l_element_len, element_len, () -> Py_ssize_t);
+crate::locked_slot!(l_element_item, element_item, (i: Py_ssize_t) -> *mut PyObject);
+crate::locked_slot!(l_element_ass_item, element_ass_item, (i: Py_ssize_t, v: *mut PyObject) -> c_int);
+crate::locked_slot!(l_element_subscript, element_subscript, (k: *mut PyObject) -> *mut PyObject);
+crate::locked_slot!(l_element_ass_subscript, element_ass_subscript, (k: *mut PyObject, v: *mut PyObject) -> c_int);
+crate::locked_slot!(l_element_bool, element_bool, () -> c_int);
+crate::locked_slot!(l_iter_next, iter_next, () -> *mut PyObject);
+
+unsafe extern "C" fn l_child_iter_next(o: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        let _li = crate::objlock::lock_held(&*o);
+        let e = fc::rs::<ChildIter>(&*o).elem.clone();
+        let _le = e.as_ref().map(|e| crate::objlock::lock_held(e));
+        child_iter_next(o)
+    }
+}
+
 fn init_types() -> PyResult<()> {
     unsafe {
         let t = element_type();
@@ -1946,17 +1969,17 @@ fn init_types() -> PyResult<()> {
         (*t).tp_iter = Some(element_iter);
         (*t).tp_setattro = Some(crate::types::typeobject::object_generic_setattro);
         let mut sq: PySequenceMethods = std::mem::zeroed();
-        sq.sq_length = Some(element_len);
-        sq.sq_item = Some(element_item);
-        sq.sq_ass_item = Some(element_ass_item);
+        sq.sq_length = Some(l_element_len);
+        sq.sq_item = Some(l_element_item);
+        sq.sq_ass_item = Some(l_element_ass_item);
         (*t).tp_as_sequence = leak(sq);
         let mut mp: PyMappingMethods = std::mem::zeroed();
-        mp.mp_length = Some(element_len);
-        mp.mp_subscript = Some(element_subscript);
-        mp.mp_ass_subscript = Some(element_ass_subscript);
+        mp.mp_length = Some(l_element_len);
+        mp.mp_subscript = Some(l_element_subscript);
+        mp.mp_ass_subscript = Some(l_element_ass_subscript);
         (*t).tp_as_mapping = leak(mp);
         let mut nb: PyNumberMethods = std::mem::zeroed();
-        nb.nb_bool = Some(element_bool);
+        nb.nb_bool = Some(l_element_bool);
         (*t).tp_as_number = leak(nb);
         (*t).tp_methods = mdefs![
             ("clear", NOARGS, m_clear, "Remove all subelements, attributes, text and tail."),
@@ -1987,18 +2010,19 @@ fn init_types() -> PyResult<()> {
             ("tail", get_tail, set_tail; "A string of text directly after the end tag, or None"),
             ("attrib", get_attrib, set_attrib; "A dictionary containing the element's attributes"),
         ];
+        crate::methods::lock_self_methods_held(t);
         crate::types::typeobject::type_ready(t)?;
 
         let it = &raw mut ITER_TYPE;
         fc::init_robj_type::<ElemIter>(it, c"_elementtree._element_iterator", Py_TPFLAGS_DISALLOW_INSTANTIATION);
         (*it).tp_iter = Some(self_iter);
-        (*it).tp_iternext = Some(iter_next);
+        (*it).tp_iternext = Some(l_iter_next);
         crate::types::typeobject::type_ready(it)?;
 
         let ci = &raw mut CHILD_ITER_TYPE;
         fc::init_robj_type::<ChildIter>(ci, c"_elementtree._child_iterator", Py_TPFLAGS_DISALLOW_INSTANTIATION);
         (*ci).tp_iter = Some(self_iter);
-        (*ci).tp_iternext = Some(child_iter_next);
+        (*ci).tp_iternext = Some(l_child_iter_next);
         crate::types::typeobject::type_ready(ci)?;
 
         let b = builder_type();
@@ -2015,6 +2039,7 @@ fn init_types() -> PyResult<()> {
             ("pi", FAST, b_pi, "pi($self, target, text=None, /)\n--\n\n"),
             ("close", NOARGS, b_close, "close($self, /)\n--\n\n"),
         ];
+        crate::methods::lock_self_methods_held(b);
         crate::types::typeobject::type_ready(b)?;
 
         let p = parser_type();
@@ -2031,6 +2056,7 @@ fn init_types() -> PyResult<()> {
             ("_setevents", FAST, p_setevents, "_setevents($self, events_queue, events_to_report=None, /)\n--\n\n"),
         ];
         (*p).tp_getset = crate::getset_table![("target", get_target), ("entity", get_entity), ("version", get_version)];
+        crate::methods::lock_self_methods_held(p);
         crate::types::typeobject::type_ready(p)?;
     }
     Ok(())
