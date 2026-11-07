@@ -2078,7 +2078,13 @@ unsafe extern "C" fn bytes_repeat(a: *mut PyObject, n: Py_ssize_t) -> *mut PyObj
         if n == 1 && bytes::is_bytes_exact(a) {
             return a.to_ref().into_raw();
         }
-        into_c(repeat_bytes(bytes::bytes_data(a), n, "bytes").and_then(|v| bytes::try_new_bytes(&v)))
+        // repetition always builds a new object, even for an empty or one-byte result
+        // (no sharing of the b"" / single-byte singletons: tracemalloc sees the block)
+        into_c(repeat_bytes(bytes::bytes_data(a), n, "bytes").and_then(|v| {
+            let r = bytes::try_alloc_bytes_uninit(v.len())?;
+            std::ptr::copy_nonoverlapping(v.as_ptr(), bytes::bytes_ptr(&r), v.len());
+            Ok(r)
+        }))
     }
 }
 unsafe extern "C" fn bytes_contains(o: *mut PyObject, x: *mut PyObject) -> c_int {

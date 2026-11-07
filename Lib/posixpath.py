@@ -286,17 +286,6 @@ def abspath(path):
     return normpath(path)
 
 
-class _AllButLast:
-    __slots__ = ()
-
-    def __repr__(self):
-        return 'os.path.ALL_BUT_LAST'
-
-    def __reduce__(self):
-        return 'ALL_BUT_LAST'
-
-ALL_BUT_LAST = _AllButLast()
-
 
 def realpath(filename, /, *, strict=False):
     """Return the canonical path of filename with all symbolic links resolved."""

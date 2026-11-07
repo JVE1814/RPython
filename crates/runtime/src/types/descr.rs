@@ -74,7 +74,8 @@ pub fn text_signature(name: &str, doc: &str) -> Option<String> {
 /// positional argument.  `first` names the implicit leading parameter
 /// ("$self", "$type", "$module"), or None when there is none.
 pub fn flags_text_signature(flags: i32, first: Option<&str>) -> Option<String> {
-    let base = flags & !(METH_CLASS | METH_STATIC | METH_COEXIST);
+    // the internal self-locking marks (METH_LOCKSELF*) do not change the calling convention
+    let base = flags & !(METH_CLASS | METH_STATIC | METH_COEXIST | METH_LOCKSELF | METH_LOCKSELF_HELD);
     let rest = if base == METH_NOARGS {
         ""
     } else if base == METH_O {

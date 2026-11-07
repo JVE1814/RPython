@@ -36,13 +36,16 @@ macro_rules! placeholder_types {
     };
 }
 placeholder_types!(
-    (PyPickleBuffer_Type, "pickle.PickleBuffer"),
     (PyStdPrinter_Type, "stderrprinter"),
 );
 
 /// Called before the first extension module is loaded.
 pub fn init() {
     init_placeholders();
+    // PyPickleBuffer_Type is _pickle's PickleBuffer: make sure it is ready
+    if crate::modules::_pickle::init_module().is_err() {
+        clear_exc();
+    }
     super::funcs::init_instancemethod_type();
     super::capsule::init_type();
 }

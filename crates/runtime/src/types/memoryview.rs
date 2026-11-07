@@ -416,10 +416,14 @@ fn pack_single(item: &PyObject, f: NFmt, fmtname: &str, out: &mut [u8; 16]) -> P
             out[0] = ab::is_true(item)? as u8;
         }
         Char => {
-            if !bytes::is_bytes(item) {
+            // same inputs as struct's 'c': a bytes or bytearray of length 1
+            let d = if bytes::is_bytes(item) {
+                bytes::bytes_data(item)
+            } else if crate::types::bytearray::is_bytearray(item) {
+                crate::types::bytearray::bytearray_data(item)
+            } else {
                 return Err(type_error_int(fmtname));
-            }
-            let d = bytes::bytes_data(item);
+            };
             if d.len() != 1 {
                 return Err(value_error_int(fmtname));
             }

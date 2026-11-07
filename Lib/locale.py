@@ -468,16 +468,10 @@ def _build_localename(localetuple):
 
 
 def getdefaultlocale(envvars=('LC_ALL', 'LC_CTYPE', 'LANG', 'LANGUAGE')):
-    """Try to determine the default locale settings (deprecated).
+    """Try to determine the default locale settings.
 
     Returns (language code, encoding) from the first set environment
     variable of envvars."""
-    import warnings
-    warnings._deprecated(
-        "locale.getdefaultlocale",
-        "{name!r} is deprecated and slated for removal in Python {remove}. "
-        "Use setlocale(), getencoding() and getlocale() instead.",
-        remove=(3, 15))
     return _getdefaultlocale(envvars)
 
 

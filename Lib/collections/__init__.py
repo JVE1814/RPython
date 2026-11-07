@@ -1032,19 +1032,25 @@ class UserDict(_collections_abc.MutableMapping):
     def __repr__(self):
         return repr(self.data)
 
+    # Merging accepts any mapping on the other side (dict, frozendict,
+    # mappingproxy, another UserDict); the result keeps our own class.
     def __or__(self, other):
         if isinstance(other, UserDict):
-            return self.__class__(self.data | other.data)
-        if isinstance(other, dict):
-            return self.__class__(self.data | other)
-        return NotImplemented
+            other = other.data
+        elif not isinstance(other, _collections_abc.Mapping):
+            return NotImplemented
+        merged = dict(self.data)
+        merged.update(other)
+        return self.__class__(merged)
 
     def __ror__(self, other):
         if isinstance(other, UserDict):
-            return self.__class__(other.data | self.data)
-        if isinstance(other, dict):
-            return self.__class__(other | self.data)
-        return NotImplemented
+            other = other.data
+        elif not isinstance(other, _collections_abc.Mapping):
+            return NotImplemented
+        merged = dict(other)
+        merged.update(self.data)
+        return self.__class__(merged)
 
     def __ior__(self, other):
         if isinstance(other, UserDict):
@@ -1352,6 +1358,8 @@ class UserString(_collections_abc.Sequence):
         return self.data.format_map(mapping)
 
     def index(self, sub, start=0, end=_sys.maxsize):
+        if isinstance(sub, UserString):
+            sub = sub.data
         return self.data.index(sub, start, end)
 
     def isalpha(self):
@@ -1420,6 +1428,8 @@ class UserString(_collections_abc.Sequence):
         return self.data.rfind(sub, start, end)
 
     def rindex(self, sub, start=0, end=_sys.maxsize):
+        if isinstance(sub, UserString):
+            sub = sub.data
         return self.data.rindex(sub, start, end)
 
     def rjust(self, width, *args):

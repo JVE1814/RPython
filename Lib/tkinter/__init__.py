@@ -252,6 +252,8 @@ class Event:
       detail - detail field (Enter, Leave, FocusIn, FocusOut, ...)
     """
 
+    __class_getitem__ = classmethod(types.GenericAlias)
+
     def __repr__(self):
         fields = {k: v for k, v in self.__dict__.items() if v != '??'}
         parts = []
