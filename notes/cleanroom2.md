@@ -67,3 +67,17 @@
   its test__all__, and the first lines of the opcode docs shown by `--annotate` (PROTO, FRAME,
   SHORT_BINUNICODE, MEMOIZE, TUPLE1, STOP).  The other opcode docs are short paraphrases.
   test_pickletools 202 =, test_pickle 1085 =.
+
+### glob.py (rewritten)
+- test_glob 22 =; test_fnmatch 24, test_shutil 227, test_tarfile 781, test_pathlib 1398,
+  test_zipfile 388 =; test_idle = (1 pre-existing calltip failure).
+- New structure: one `_Expander` object per call (file-system helpers honouring root_dir and
+  dir_fd, `expand()` recursing on the directory part, `_literal_child`/`_matching_children`/
+  `_descendants` for the last component); iglob filters out the empty result instead of
+  special-casing a leading '**'.  translate() builds the regex per component from
+  `fnmatch._translate` (output strings are pinned by test_glob and unchanged).
+- Kept: `glob iglob escape translate` and `has_magic` (public, widely used); audit events
+  "glob.glob" and "glob.glob/2".  Dropped: the private helpers (`_iglob`, `_glob0/1/2`,
+  `magic_check`, ...) and the deprecated `glob0`/`glob1` (their deprecation named 3.15 as the
+  removal version; nothing in Lib or the tests uses them).
+- Timing (same results): '**/*.py' over the stdlib ~equal, '**' with include_hidden 21 -> 8 ms.
