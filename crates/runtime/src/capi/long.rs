@@ -729,7 +729,7 @@ pub unsafe extern "C" fn PyFloat_FromDouble(v: f64) -> *mut PyObject {
 pub unsafe extern "C" fn PyFloat_AsDouble(o: *mut PyObject) -> f64 {
     unsafe {
         if o.is_null() {
-            let _ = bad_internal();
+            let _ = type_error("bad argument type for built-in operation");
             return -1.0;
         }
         if float::is_float(&*o) {
@@ -740,7 +740,27 @@ pub unsafe extern "C" fn PyFloat_AsDouble(o: *mut PyObject) -> f64 {
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyFloat_FromString(s: *mut PyObject) -> *mut PyObject {
-    unsafe { ret(ab::call(typeobject::type_obj(float::float_type()), &[&*s])) }
+    unsafe {
+        let o = &*s;
+        let fl = typeobject::type_obj(float::float_type());
+        if crate::types::str::is_str(o) || crate::types::bytes::is_bytes(o) || crate::types::bytearray::is_bytearray(o) {
+            return ret(ab::call(fl, &[o]));
+        }
+        // any other object must export a contiguous buffer holding the text
+        let contiguous = !crate::types::memoryview::is_memoryview(o) || ab::getattr_str(o, "contiguous").map(|c| c.is(crate::types::bool_::true_obj())).unwrap_or(false);
+        if contiguous && super::buffer::PyObject_CheckBuffer(s) != 0 {
+            let mut view: Py_buffer = std::mem::zeroed();
+            if super::buffer::PyObject_GetBuffer(s, &mut view, 0) < 0 {
+                clear_exc();
+            } else {
+                let data = std::slice::from_raw_parts(view.buf as *const u8, view.len.max(0) as usize).to_vec();
+                super::buffer::PyBuffer_Release(&mut view);
+                return ret(ab::call(fl, &[&crate::types::bytes::new_bytes(&data)]));
+            }
+        }
+        let _ = type_error(&format!("float() argument must be a string or a contiguous buffer, not '{}'", tname(o)));
+        std::ptr::null_mut()
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyFloat_GetMax() -> f64 {
@@ -755,12 +775,38 @@ pub unsafe extern "C" fn PyFloat_GetInfo() -> *mut PyObject {
     ret(crate::modules::sys::get_sys_attr("float_info").ok_or_else(|| system_error("sys.float_info missing")))
 }
 
+/// The bits of a NaN `x` in a narrower IEEE format with `mbits` mantissa bits and
+/// `ebits` exponent bits: the sign is kept and the mantissa (quiet bit + payload) keeps
+/// its high bits. A signalling NaN whose payload is shifted out entirely would read as
+/// infinity, so it becomes a quiet NaN.
+fn narrow_nan(x: f64, mbits: u32, ebits: u32) -> u64 {
+    let b = x.to_bits();
+    let sign = b >> 63;
+    let mut mant = (b & ((1u64 << 52) - 1)) >> (52 - mbits);
+    if mant == 0 {
+        mant = 1u64 << (mbits - 1);
+    }
+    (sign << (mbits + ebits)) | (((1u64 << ebits) - 1) << mbits) | mant
+}
+
+/// The double for a NaN in a narrower format (None if `bits` is not a NaN); the payload
+/// is moved into the high mantissa bits without quieting a signalling NaN.
+fn widen_nan(bits: u64, mbits: u32, ebits: u32) -> Option<f64> {
+    let emask = (1u64 << ebits) - 1;
+    let mant = bits & ((1u64 << mbits) - 1);
+    if (bits >> mbits) & emask != emask || mant == 0 {
+        return None;
+    }
+    let sign = (bits >> (mbits + ebits)) & 1;
+    Some(f64::from_bits((sign << 63) | (0x7ffu64 << 52) | (mant << (52 - mbits))))
+}
+
 /// IEEE half precision pack/unpack (round half to even; OverflowError on overflow).
 fn f64_to_f16(x: f64) -> Result<u16, ()> {
     let sign: u16 = if x.is_sign_negative() { 0x8000 } else { 0 };
     let a = x.abs();
     if x.is_nan() {
-        return Ok(sign | 0x7e00);
+        return Ok(narrow_nan(x, 10, 5) as u16);
     }
     if a.is_infinite() {
         return Ok(sign | 0x7c00);
@@ -869,12 +915,9 @@ pub unsafe extern "C" fn PyFloat_Pack4(x: f64, p: *mut c_char, le: c_int) -> c_i
             let _ = overflow_error("float too large to pack with f format");
             return -1;
         }
-        let bits = if x.is_nan() {
-            // keep the payload (quiet bit, sign) like a C cast does
-            y.to_bits()
-        } else {
-            y.to_bits()
-        };
+        // NaNs are converted bit by bit: the hardware conversion would quiet a
+        // signalling NaN
+        let bits = if x.is_nan() { narrow_nan(x, 23, 8) as u32 } else { y.to_bits() };
         store(p as *mut u8, &bits.to_le_bytes(), le);
         0
     }
@@ -888,11 +931,23 @@ pub unsafe extern "C" fn PyFloat_Pack8(x: f64, p: *mut c_char, le: c_int) -> c_i
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyFloat_Unpack2(p: *const c_char, le: c_int) -> f64 {
-    unsafe { f16_to_f64(u16::from_le_bytes(load::<2>(p as *const u8, le))) }
+    unsafe {
+        let h = u16::from_le_bytes(load::<2>(p as *const u8, le));
+        if let Some(x) = widen_nan(h as u64, 10, 5) {
+            return x;
+        }
+        f16_to_f64(h)
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyFloat_Unpack4(p: *const c_char, le: c_int) -> f64 {
-    unsafe { f32::from_bits(u32::from_le_bytes(load::<4>(p as *const u8, le))) as f64 }
+    unsafe {
+        let b = u32::from_le_bytes(load::<4>(p as *const u8, le));
+        if let Some(x) = widen_nan(b as u64, 23, 8) {
+            return x;
+        }
+        f32::from_bits(b) as f64
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyFloat_Unpack8(p: *const c_char, le: c_int) -> f64 {

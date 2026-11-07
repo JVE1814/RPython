@@ -28,6 +28,15 @@ unsafe fn flags_of(f: *mut PyCompilerFlags) -> u32 {
 
 pub(crate) fn compile_source(src: &[u8], filename: &str, start: c_int, flags: u32, optimize: i32) -> PyResult {
     let mode = mode_of(start)?;
+    // PyCF_IGNORE_COOKIE: the bytes are UTF-8 whatever an encoding declaration says
+    let text: Option<String> = if flags & 0x0800 != 0 {
+        match std::str::from_utf8(src) {
+            Ok(s) => Some(s.to_string()),
+            Err(_) => return Err(crate::compile::decode_source(src, filename).err().unwrap_or_else(|| value_error("source is not valid UTF-8"))),
+        }
+    } else {
+        None
+    };
     if flags & 0x0400 != 0 {
         // PyCF_ONLY_AST: go through builtins.compile
         let b = crate::builtins::builtins_module();
@@ -38,10 +47,17 @@ pub(crate) fn compile_source(src: &[u8], filename: &str, start: c_int, flags: u3
             345 => "func_type",
             _ => "exec",
         };
+        let srcobj: PyRef = match &text {
+            Some(t) => pystr::new_str(t),
+            None => crate::types::bytes::new_bytes(src),
+        };
         return ab::call(
             &c,
-            &[&crate::types::bytes::new_bytes(src), &pystr::new_str(filename), &pystr::new_str(m), &int::new_int(flags as i64), &crate::types::bool_::new_bool(true), &int::new_int(optimize as i64)],
+            &[&srcobj, &pystr::new_str(filename), &pystr::new_str(m), &int::new_int((flags & !0x0800) as i64), &crate::types::bool_::new_bool(true), &int::new_int(optimize as i64)],
         );
+    }
+    if let Some(t) = &text {
+        return Ok(compile::compile_str(t, filename, mode, flags, optimize)?.code);
     }
     Ok(compile::compile_bytes(src, filename, mode, flags, optimize)?.code)
 }
@@ -255,6 +271,15 @@ pub unsafe extern "C" fn PyRun_FileFlags(fp: *mut libc::FILE, p: *const c_char, 
 pub unsafe extern "C" fn PyRun_File(fp: *mut libc::FILE, p: *const c_char, s: c_int, g: *mut PyObject, l: *mut PyObject) -> *mut PyObject {
     unsafe { PyRun_FileExFlags(fp, p, s, g, l, 0, std::ptr::null_mut()) }
 }
+/// `__main__.__loader__` for a script run from a source file.
+unsafe fn set_main_loader(d: &PyObject, filename: &PyObject) -> PyResult<()> {
+    unsafe {
+        let m = from_c(super::import::PyImport_ImportModule(c"importlib.machinery".as_ptr()))?;
+        let cls = ab::getattr_str(&m, "SourceFileLoader")?;
+        let loader = ab::call(&cls, &[&pystr::new_str("__main__"), filename])?;
+        dict::set_item_str(d, "__loader__", &loader)
+    }
+}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyRun_SimpleFileExFlags(fp: *mut libc::FILE, filename: *const c_char, closeit: c_int, flags: *mut PyCompilerFlags) -> c_int {
     unsafe {
@@ -262,9 +287,33 @@ pub unsafe extern "C" fn PyRun_SimpleFileExFlags(fp: *mut libc::FILE, filename: 
         if closeit != 0 {
             libc::fclose(fp);
         }
-        let r = main_dict().and_then(|d| {
-            dict::set_item_str(&d, "__file__", &pystr::new_str(&cs(filename)))?;
-            run_string(&src, 257, d.as_ptr(), d.as_ptr(), flags, &cs(filename))
+        let fname_bytes: &[u8] = if filename.is_null() { b"???" } else { CStr::from_ptr(filename).to_bytes() };
+        let r = super::unicode::decode_fs(fname_bytes).and_then(|fname| {
+            let d = main_dict()?;
+            // __file__ is provided for the run only if __main__ has none
+            let set_file = dict::get_item_rs(&d, "__file__").is_none();
+            if set_file {
+                dict::set_item_str(&d, "__file__", &fname)?;
+                dict::set_item_str(&d, "__cached__", &none::none_ref())?;
+            }
+            let res = (|| {
+                if fname_bytes != b"<stdin>" {
+                    set_main_loader(&d, &fname)?;
+                }
+                run_string(&src, 257, d.as_ptr(), d.as_ptr(), flags, &pystr::to_string_lossy(&fname))
+            })();
+            if set_file {
+                let saved = take_exc();
+                for k in ["__file__", "__cached__"] {
+                    if dict::del_item(&d, &pystr::new_str(k)).is_err() {
+                        clear_exc();
+                    }
+                }
+                if let Some(e) = saved {
+                    set_exc(e);
+                }
+            }
+            res
         });
         match r {
             Ok(_) => 0,
@@ -285,19 +334,29 @@ pub unsafe extern "C" fn PyRun_SimpleFile(fp: *mut libc::FILE, p: *const c_char)
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyRun_AnyFileExFlags(fp: *mut libc::FILE, p: *const c_char, c: c_int, f: *mut PyCompilerFlags) -> c_int {
-    unsafe { PyRun_SimpleFileExFlags(fp, p, c, f) }
+    unsafe {
+        let name: *const c_char = if p.is_null() { c"???".as_ptr() } else { p };
+        if Py_FdIsInteractive(fp, name) != 0 {
+            let r = PyRun_InteractiveLoopFlags(fp, name, f);
+            if c != 0 {
+                libc::fclose(fp);
+            }
+            return r;
+        }
+        PyRun_SimpleFileExFlags(fp, name, c, f)
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyRun_AnyFileEx(fp: *mut libc::FILE, p: *const c_char, c: c_int) -> c_int {
-    unsafe { PyRun_SimpleFileExFlags(fp, p, c, std::ptr::null_mut()) }
+    unsafe { PyRun_AnyFileExFlags(fp, p, c, std::ptr::null_mut()) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyRun_AnyFileFlags(fp: *mut libc::FILE, p: *const c_char, f: *mut PyCompilerFlags) -> c_int {
-    unsafe { PyRun_SimpleFileExFlags(fp, p, 0, f) }
+    unsafe { PyRun_AnyFileExFlags(fp, p, 0, f) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyRun_AnyFile(fp: *mut libc::FILE, p: *const c_char) -> c_int {
-    unsafe { PyRun_SimpleFileExFlags(fp, p, 0, std::ptr::null_mut()) }
+    unsafe { PyRun_AnyFileExFlags(fp, p, 0, std::ptr::null_mut()) }
 }
 unsafe fn interactive_one(fp: *mut libc::FILE, filename: &str, flags: *mut PyCompilerFlags) -> c_int {
     unsafe {
@@ -321,7 +380,14 @@ unsafe fn interactive_one(fp: *mut libc::FILE, filename: &str, flags: *mut PyCom
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyRun_InteractiveOneObject(fp: *mut libc::FILE, filename: *mut PyObject, flags: *mut PyCompilerFlags) -> c_int {
-    unsafe { interactive_one(fp, &pystr::to_string_lossy(&*filename), flags) }
+    unsafe {
+        if filename.is_null() || !pystr::is_str(&*filename) {
+            let _ = type_error("filename must be a str");
+            super::errors::PyErr_Print();
+            return -1;
+        }
+        interactive_one(fp, &pystr::to_string_lossy(&*filename), flags)
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyRun_InteractiveOneFlags(fp: *mut libc::FILE, filename: *const c_char, flags: *mut PyCompilerFlags) -> c_int {

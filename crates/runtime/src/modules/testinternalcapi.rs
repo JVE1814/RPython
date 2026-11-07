@@ -272,6 +272,21 @@ fn tuple_from_pair(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     Ok(tuple::new_tuple_from_refs(&[args[0], args[1]]))
 }
 
+/// module_get_gc_hooks(module): addresses of the module state's traverse, clear and free
+/// functions (0 when absent). (capi2)
+fn module_get_gc_hooks(_m: &PyObject, o: &PyObject) -> PyResult {
+    if !crate::types::module::is_module(o) {
+        raise!(TypeError, "expected a module, got {}", crate::types::typeobject::tname(o));
+    }
+    let def = crate::types::module::m(o).md_def;
+    let (t, c, f) = if def.is_null() {
+        (0, 0, 0)
+    } else {
+        unsafe { ((*def).m_traverse.map_or(0, |p| p as usize), (*def).m_clear.map_or(0, |p| p as usize), (*def).m_free.map_or(0, |p| p as usize)) }
+    };
+    Ok(tuple::new_tuple(vec![int::new_int_usize(t), int::new_int_usize(c), int::new_int_usize(f)]))
+}
+
 pub fn init() -> PyResult {
     let m = crate::types::module::new_module("_testinternalcapi")?;
     let d = crate::types::module::module_dict(&m);
@@ -279,6 +294,7 @@ pub fn init() -> PyResult {
         &d,
         crate::mdefs![
             ("has_inline_values", O, has_inline_values),
+            ("module_get_gc_hooks", O, module_get_gc_hooks),
             ("pending_threadfunc", FASTKW, pending_threadfunc),
             ("tuple_from_pair", FAST, tuple_from_pair),
             ("tuple_from_pair_steal", FAST, tuple_from_pair),
