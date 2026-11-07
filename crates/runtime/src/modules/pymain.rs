@@ -563,6 +563,7 @@ fn repl(quiet: bool) -> i32 {
     run_interactive_hook();
     let use_readline = tty && unsafe { libc::isatty(1) } != 0;
     let stdin = std::io::stdin();
+    let mut nomem = 0u32;
     let mut buf = String::new();
     loop {
         // what the last statement printed is visible before the next prompt (pipes are buffered)
@@ -573,6 +574,20 @@ fn repl(quiet: bool) -> i32 {
                 }
             }
         }
+        // (tail2) reading and compiling the next statement needs parser memory; a
+        // failure-injecting allocator hook that refuses it fails the statement before
+        // any input is consumed, and the session gives up after a run of such failures
+        if crate::capi::mem::hooked_alloc_refuses(4096) {
+            let _ = crate::errors::memory_error();
+            nomem += 1;
+            if nomem > 16 {
+                clear_exc();
+                return 1;
+            }
+            crate::print_exception_and_clear();
+            continue;
+        }
+        nomem = 0;
         let prompt = if buf.is_empty() { get_prompt("ps1", ">>> ") } else { get_prompt("ps2", "... ") };
         let mut line = String::new();
         let n = match if use_readline { readline_line(&prompt) } else { None } {

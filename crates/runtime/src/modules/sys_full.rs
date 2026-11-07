@@ -1428,6 +1428,7 @@ pub fn register_system_modules() {
     crate::import::register_builtin("_signal", crate::modules::signal::init_module);
     crate::import::register_builtin("_imp", crate::modules::_imp::init_module);
     crate::import::register_builtin("_queue", crate::modules::_queue::init_module);
+    crate::import::register_builtin("_zoneinfo", crate::modules::_zoneinfo::init_module); // (tail2)
     crate::import::register_builtin("select", crate::modules::select::init_module);
     crate::import::register_builtin("gc", crate::modules::gc_mod::init_module);
     crate::import::register_builtin("faulthandler", crate::modules::faulthandler::init_module);

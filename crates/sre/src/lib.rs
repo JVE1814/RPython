@@ -3,6 +3,7 @@
 //! See `NOTES.md` in the crate directory for an overview of the API.
 
 mod compiler;
+mod debug;
 mod error;
 mod parser;
 mod search;
@@ -157,6 +158,18 @@ pub fn compile_with(
         warnings: parsed.warnings,
         prov: *prov,
     })
+}
+
+/// Text `re.DEBUG` prints for a pattern: CPython-format parse tree and code
+/// listing (tail2).  Errors are those compilation would raise.
+pub fn debug_text(
+    src: PatternSource<'_>,
+    flags: u32,
+    prov: &UnicodeProvider,
+) -> Result<String, CompileError> {
+    let (pattern, is_bytes) = src.to_vec();
+    let parsed = parser::parse(&pattern, is_bytes, flags, prov)?;
+    debug::debug_text(&parsed, prov)
 }
 
 /// Convenience: compile a str pattern given as Rust `&str`.

@@ -135,11 +135,12 @@ def _legacy_args(fname, argname, args, count, flags):
 
 
 def sub(pattern, repl, string, *args, count=_missing, flags=_missing):
-    """Replace non-overlapping matches of pattern in string by repl.
-
-    repl is either a string, in which backslash escapes and group
-    references are processed, or a callable that receives each Match
-    object and returns the replacement string.  At most count
+    """Return the string obtained by replacing the leftmost
+    non-overlapping occurrences of the pattern in string by the
+    replacement repl.  repl can be either a string or a callable;
+    if a string, backslash escapes in it are processed.  If it is
+    a callable, it's passed the Match object and must return
+    the text that takes the place of that match.  At most count
     replacements are made when count is positive."""
     count, flags = _legacy_args('sub', 'count', args, count, flags)
     return _compile(pattern, flags).sub(repl, string, count)
