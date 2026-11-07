@@ -793,18 +793,30 @@ impl Asm {
         let save = |cc: u8| if cc == JMP_OP { 3usize } else { 4 };
         let mut short = vec![false; n];
         let mut cum = vec![0usize; n + 1];
+        // candidates: (jump index, index of the first jump at or after the target), only
+        // jumps that could come within reach if every jump in between shrank (most jumps
+        // to the out-of-line stubs at the end cannot)
+        let mut cand: Vec<(usize, usize)> = Vec::new();
+        for i in 0..n {
+            let (p, l, _) = self.relax[i];
+            let Some(t) = self.labels[l.0 as usize] else { continue };
+            let k = self.relax.partition_point(|r| r.0 < t);
+            let between = if k > i { k - i - 1 } else { i - k };
+            if t.abs_diff(p) <= 127 + 6 + 4 * between {
+                cand.push((i, k));
+            }
+        }
         loop {
             for i in 0..n {
                 cum[i + 1] = cum[i] + if short[i] { save(self.relax[i].2) } else { 0 };
             }
             let mut changed = false;
-            for i in 0..n {
+            for &(i, k) in &cand {
                 if short[i] {
                     continue;
                 }
                 let (p, l, cc) = self.relax[i];
-                let Some(t) = self.labels[l.0 as usize] else { continue };
-                let k = self.relax.partition_point(|r| r.0 < t);
+                let t = self.labels[l.0 as usize].unwrap();
                 let newp = p - cum[i];
                 let mut newt = t - cum[k];
                 if t > p {
@@ -827,7 +839,7 @@ impl Asm {
         // rebuild the buffer
         let old = std::mem::take(&mut self.buf);
         let mut out = Vec::with_capacity(old.len());
-        let mut dropped = std::collections::HashSet::new();
+        let mut dropped: Vec<usize> = Vec::new(); // (ascending)
         let mut new_short = Vec::new();
         let (mut last, mut removed) = (0usize, 0usize);
         for i in 0..n {
@@ -838,10 +850,10 @@ impl Asm {
             out.extend_from_slice(&old[last..p]);
             if cc == JMP_OP {
                 out.push(0xeb);
-                dropped.insert(p + 1);
+                dropped.push(p + 1);
             } else {
                 out.push(0x70 | cc);
-                dropped.insert(p + 2);
+                dropped.push(p + 2);
             }
             new_short.push((out.len(), l));
             out.push(0);
@@ -861,7 +873,7 @@ impl Asm {
             }
         }
         let fixups = std::mem::take(&mut self.fixups);
-        self.fixups = fixups.into_iter().filter(|f| !dropped.contains(&f.0)).map(|(at, l)| (self.map_pos(at), l)).collect();
+        self.fixups = fixups.into_iter().filter(|f| dropped.binary_search(&f.0).is_err()).map(|(at, l)| (self.map_pos(at), l)).collect();
         let abs = std::mem::take(&mut self.abs_fixups);
         self.abs_fixups = abs.into_iter().map(|(at, l)| (self.map_pos(at), l)).collect();
         let sh = std::mem::take(&mut self.short_fixups);

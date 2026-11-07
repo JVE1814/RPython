@@ -40,6 +40,16 @@ if [ -z "$PROF" ]; then
   rm -rf "$RAW"
 fi
 echo "== optimized build with $PROF"
-RUSTFLAGS="$BASE -Cprofile-use=$PROF -Cllvm-args=-no-pgo-warn-mismatch" cargo build --release -j "$JOBS" \
-  --target "$TRIPLE" --target-dir "$T/pgo" -p python
+USE="$BASE -Cprofile-use=$PROF -Cllvm-args=-no-pgo-warn-mismatch"
+# (start-up order of the checked-in list first; step 5 replaces it)
+RUSTFLAGS="$USE" cargo build --release -j "$JOBS" --target "$TRIPLE" --target-dir "$T/pgo" -p python
+# (5) the profile changes inlining, so the start-up functions of this executable are not
+# the ones crates/launcher/startup.ld names: list them from this executable and relink
+# (only the launcher's link step runs again)
+if [ -z "${PGO_NO_ORDER:-}" ] && command -v valgrind >/dev/null; then
+  echo "== start-up order of the optimized executable"
+  ORDER_STARTUP_ONLY=1 bash "$ROOT/tools/bench/perf/gen_order.sh" "$T/pgo/$TRIPLE/release/python3" "$T/pgo-startup.ld"
+  RPY_ORDER_FILE="$T/pgo-startup.ld" RUSTFLAGS="$USE" cargo build --release -j "$JOBS" --target "$TRIPLE" \
+    --target-dir "$T/pgo" -p python
+fi
 echo "$T/pgo/$TRIPLE/release/python3"

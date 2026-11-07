@@ -8,6 +8,30 @@
 use std::collections::HashSet;
 use std::process::Command;
 
+/// `Cs<base62 hash>_` (a v0-mangled crate root with its disambiguator) -> `Cs*_`, as
+/// tools/bench/perf/gen_order.sh writes the names.
+fn without_crate_hashes(name: &str) -> String {
+    let b = name.as_bytes();
+    let mut out = String::with_capacity(name.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'C' && i + 1 < b.len() && b[i + 1] == b's' {
+            let mut j = i + 2;
+            while j < b.len() && b[j].is_ascii_alphanumeric() {
+                j += 1;
+            }
+            if j > i + 2 && j < b.len() && b[j] == b'_' {
+                out.push_str("Cs*_");
+                i = j + 1;
+                continue;
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
 #[test]
 fn startup_order_matches_the_executable() {
     let exe = env!("CARGO_BIN_EXE_python3");
@@ -22,8 +46,9 @@ fn startup_order_matches_the_executable() {
             if !matches!(kind, "t" | "T" | "w" | "W") {
                 return None;
             }
-            // ThinLTO's ".llvm.N" suffixes are matched by the script's patterns
-            Some(name.split(".llvm.").next().unwrap_or(name).to_string())
+            // ThinLTO's ".llvm.N" suffixes are matched by the script's patterns, and so
+            // are the crate hashes (`Cs<hash>_` -> `Cs*_`)
+            Some(without_crate_hashes(name.split(".llvm.").next().unwrap_or(name)))
         })
         .collect();
     if syms.is_empty() {

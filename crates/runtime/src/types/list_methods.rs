@@ -7,7 +7,7 @@ use crate::object::*;
 use crate::raise;
 use crate::types::list;
 use crate::types::typeobject::*;
-use crate::types::{exceptions, float, int, none, str as pystr, tuple};
+use crate::types::{bool_, exceptions, float, int, none, str as pystr, tuple};
 
 // ================================================================== methods
 
@@ -177,6 +177,7 @@ enum CmpKind {
     CompactInt,
     Int,
     Float,
+    Tuple(FirstKind),
 }
 
 struct Cmp {
@@ -197,16 +198,72 @@ impl Cmp {
                 CmpKind::Int => crate::types::int_methods::int_cmp(x, y) == std::cmp::Ordering::Less,
                 CmpKind::Float => float::float_value(x) < float::float_value(y),
                 CmpKind::Str => pystr::str_cmp(x, y) == std::cmp::Ordering::Less,
-                CmpKind::Generic => match ab::rich_compare_bool(x, y, Py_LT) {
-                    Ok(b) => b,
-                    Err(_) => {
-                        self.failed = true;
-                        false
-                    }
-                },
+                CmpKind::Generic => self.generic_lt(x, y),
+                CmpKind::Tuple(first) => self.tuple_lt(x, y, first),
             }
         }
     }
+    #[inline]
+    fn generic_lt(&mut self, x: &PyObject, y: &PyObject) -> bool {
+        match ab::rich_compare_bool(x, y, Py_LT) {
+            Ok(b) => b,
+            Err(_) => {
+                self.failed = true;
+                false
+            }
+        }
+    }
+    /// (perf7) Exact tuples: the first position whose items differ decides; items that
+    /// are plain values (exact int/str/float/bytes/tuple) are compared for equality
+    /// without the rich-comparison machinery, and the first items with the comparison
+    /// the pre-scan chose for them (all of one plain type). Same results as tuple's own
+    /// `<` (identity, then `==`, then `<` at the first difference, else the lengths).
+    fn tuple_lt(&mut self, x: &PyObject, y: &PyObject, first: FirstKind) -> bool {
+        let (a, b) = (tuple::tuple_items(x), tuple::tuple_items(y));
+        let n = a.len().min(b.len());
+        let mut i = 0;
+        while i < n {
+            let (p, q) = (a[i], b[i]);
+            let same = match ab::plain_eq(p, q) {
+                Some(e) => e,
+                None => match ab::rich_compare_bool(p, q, Py_EQ) {
+                    Ok(e) => e,
+                    Err(_) => {
+                        self.failed = true;
+                        return false;
+                    }
+                },
+            };
+            if !same {
+                break;
+            }
+            i += 1;
+        }
+        if i >= n {
+            return a.len() < b.len();
+        }
+        let (p, q) = (a[i], b[i]);
+        if i == 0 {
+            match first {
+                FirstKind::CompactInt => return int::compact_value(p) < int::compact_value(q),
+                FirstKind::Bool => return !p.is(bool_::true_obj()) && q.is(bool_::true_obj()),
+                FirstKind::Str => return pystr::str_cmp(p, q) == std::cmp::Ordering::Less,
+                FirstKind::Float => return float::float_value(p) < float::float_value(q),
+                FirstKind::Generic => {}
+            }
+        }
+        self.generic_lt(p, q)
+    }
+}
+
+/// (perf7) Type of every first item of a list of tuples being sorted.
+#[derive(Clone, Copy)]
+enum FirstKind {
+    Generic,
+    CompactInt,
+    Bool,
+    Str,
+    Float,
 }
 
 fn select_kind(keys: &[*mut PyObject]) -> CmpKind {
@@ -223,6 +280,23 @@ fn select_kind(keys: &[*mut PyObject]) -> CmpKind {
         if keys.iter().all(|k| int::is_compact(unsafe { &**k })) { CmpKind::CompactInt } else { CmpKind::Int }
     } else if t0 == float::float_type() {
         CmpKind::Float
+    } else if t0 == tuple::tuple_type() && keys.iter().all(|k| tuple::tuple_len(unsafe { &**k }) > 0) {
+        let first = |k: &*mut PyObject| tuple::tuple_items(unsafe { &**k })[0];
+        let f0 = first(&keys[0]).type_ptr();
+        let kind = if !keys.iter().all(|k| first(k).type_ptr() == f0) {
+            FirstKind::Generic
+        } else if f0 == int::int_type() && keys.iter().all(|k| int::is_compact(first(k))) {
+            FirstKind::CompactInt
+        } else if f0 == bool_::bool_type() {
+            FirstKind::Bool
+        } else if f0 == pystr::str_type() {
+            FirstKind::Str
+        } else if f0 == float::float_type() {
+            FirstKind::Float
+        } else {
+            FirstKind::Generic
+        };
+        CmpKind::Tuple(kind)
     } else {
         CmpKind::Generic
     }
