@@ -22,6 +22,8 @@ pub struct ForkState {
     depot: Option<crate::tlab::DepotForkGuard>,
     all_threads: Option<MutexGuard<'static, Vec<usize>>>,
     free_states: Option<MutexGuard<'static, Vec<usize>>>,
+    /// `_thread`'s non-daemon thread list (emptied in the child)
+    non_daemon: Option<MutexGuard<'static, Vec<usize>>>,
     /// Number of other live Python threads when fork() was called.
     pub other_threads: usize,
 }
@@ -31,16 +33,18 @@ pub fn prepare() -> ForkState {
     let import_lock = crate::modules::_imp::acquire_import_lock().is_ok();
     let other_threads = count_other_threads();
     let stopped = crate::gc::fork_prepare();
+    let non_daemon = Some(crate::modules::_thread::fork_lock_non_daemon());
     let depot = Some(crate::tlab::lock_depot_for_fork());
     let all_threads = Some(crate::threads::ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner()));
     let free_states = Some(crate::threads::FREE_STATES.lock().unwrap_or_else(|e| e.into_inner()));
-    ForkState { stopped, import_lock, depot, all_threads, free_states, other_threads }
+    ForkState { stopped, import_lock, depot, all_threads, free_states, non_daemon, other_threads }
 }
 
 fn release_locks(st: &mut ForkState) {
     drop(st.free_states.take());
     drop(st.all_threads.take());
     drop(st.depot.take());
+    drop(st.non_daemon.take());
 }
 
 /// In the parent after fork() (also when fork() failed).
@@ -54,6 +58,11 @@ pub fn parent(mut st: ForkState) {
 
 /// In the child after fork().
 pub fn child(mut st: ForkState) {
+    // the other threads are gone; their handles' list entries are leaked on purpose
+    // (a handle object may still point at the same HandleInner)
+    if let Some(nd) = st.non_daemon.as_mut() {
+        nd.clear();
+    }
     release_locks(&mut st);
     crate::gc::fork_child();
     // Only this thread exists now.
