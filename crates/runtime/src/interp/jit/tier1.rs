@@ -645,7 +645,31 @@ impl<'a> Gen<'a> {
                 self.call(addr!(h::h_store_global));
                 self.check(pc, d - 1);
             }
-            Op::LoadDeref | Op::StoreDeref => {
+            Op::LoadDeref => {
+                // (jit5) cell contents inline; unbound (or no cell): helper raises
+                let slow = self.a.label();
+                let done = self.a.label();
+                let l = self.local(arg);
+                self.a.load(Rax, l);
+                self.a.test_rr(Rax, Rax);
+                self.a.jcc(Cc::E, slow);
+                self.a.load(Rsi, M(Rax, std::mem::offset_of!(crate::types::funcobject::PyCellObject, ob_ref) as i32));
+                self.a.test_rr(Rsi, Rsi);
+                self.a.jcc(Cc::E, slow);
+                self.incref(Rsi);
+                let m = self.slot(d);
+                self.a.store(m, Rsi);
+                self.a.jmp(done);
+                self.a.bind(slow);
+                self.set_lasti(pc);
+                self.a.mov_rr(Rdi, Rbx);
+                self.lea_sp(Rsi, d);
+                self.a.mov_ri(Rdx, arg as i64);
+                self.call(addr!(h::h_load_deref));
+                self.check(pc, d);
+                self.a.bind(done);
+            }
+            Op::StoreDeref => {
                 self.set_lasti(pc);
                 self.a.mov_rr(Rdi, Rbx);
                 self.lea_sp(Rsi, d);
