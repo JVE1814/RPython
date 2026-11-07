@@ -1,7 +1,8 @@
-"""WeakSet: a set holding weak references to its elements.
+"""WeakSet: a set that refers to its elements through weak references.
 
-This module is imported very early (by abc/_py_abc), so it only depends on
-builtin modules.
+An element disappears from the set when the last strong reference to it
+goes away.  This module is imported very early (abc uses it), so it only
+imports builtin modules.
 """
 
 from _weakref import ref
@@ -11,69 +12,86 @@ GenericAlias = type(list[int])
 __all__ = ['WeakSet']
 
 
-class _IterationGuard:
-    """Context manager marking a weak container as being iterated.
+class _Iterating:
+    """Context manager telling a weak container that an iteration over it
+    is in progress; the container (which has an ``_iterating`` set and a
+    ``_commit_removals()`` method) postpones removing dead entries until
+    the last such iteration ends."""
 
-    While at least one guard is active, removals triggered by dying
-    referents are queued instead of mutating the underlying container.
-    """
+    __slots__ = ('_container', '__weakref__')
 
-    def __init__(self, weakcontainer):
-        self.weakcontainer = ref(weakcontainer)
+    def __init__(self, container):
+        self._container = ref(container)
 
     def __enter__(self):
-        container = self.weakcontainer()
+        container = self._container()
         if container is not None:
             container._iterating.add(self)
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback):
-        container = self.weakcontainer()
+    def __exit__(self, *exc_info):
+        container = self._container()
         if container is not None:
-            active = container._iterating
-            active.discard(self)
-            if not active:
+            running = container._iterating
+            running.discard(self)
+            if not running:
                 container._commit_removals()
 
 
+# weakref imports the guard under this name
+_IterationGuard = _Iterating
+
+
+def _dead_ref_callback(selfref):
+    # The callback of the element references.  It holds the set only
+    # weakly, so a WeakSet can be collected while elements are alive.
+    def element_died(wr, selfref=selfref):
+        owner = selfref()
+        if owner is None:
+            return
+        if owner._iterating:
+            owner._pending_removals.append(wr)
+        else:
+            owner.data.discard(wr)
+    return element_died
+
+
 class WeakSet:
+    """A set of weakly referenced (hashable, weak-referenceable) objects."""
+
     def __init__(self, data=None):
-        self.data = set()
-
-        def _remove(item, selfref=ref(self)):
-            owner = selfref()
-            if owner is not None:
-                if owner._iterating:
-                    owner._pending_removals.append(item)
-                else:
-                    owner.data.discard(item)
-
-        self._remove = _remove
-        # Weak references queued for removal while iterating.
-        self._pending_removals = []
-        self._iterating = set()
+        self.data = set()                   # weak references to elements
+        self._pending_removals = []         # died during an iteration
+        self._iterating = set()             # active _Iterating guards
+        self._remove = _dead_ref_callback(ref(self))
         if data is not None:
             self.update(data)
 
     def _commit_removals(self):
-        # Other threads may drain the same list concurrently: pop until it is
-        # empty instead of testing first and popping afterwards.
-        take = self._pending_removals.pop
+        # pop one at a time: another thread may be emptying the list too
+        pending = self._pending_removals
         discard = self.data.discard
-        while True:
+        while pending:
             try:
-                ref_ = take()
+                discard(pending.pop())
             except IndexError:
-                return
-            discard(ref_)
+                break
+
+    def _settle(self):
+        if self._pending_removals:
+            self._commit_removals()
+
+    def _ref(self, item):
+        return ref(item, self._remove)
+
+    # -- container protocol ---------------------------------------------------
 
     def __iter__(self):
-        with _IterationGuard(self):
-            for itemref in self.data:
-                item = itemref()
+        with _Iterating(self):
+            for wr in self.data:
+                item = wr()
                 if item is not None:
-                    # Hold a strong reference while the caller consumes it.
-                    yield item
+                    yield item              # a strong reference while in use
 
     def __len__(self):
         return len(self.data) - len(self._pending_removals)
@@ -82,50 +100,55 @@ class WeakSet:
         try:
             wr = ref(item)
         except TypeError:
-            return False
+            return False                    # cannot be an element
         return wr in self.data
 
+    def __repr__(self):
+        return repr(self.data)
+
+    __hash__ = None
+    __class_getitem__ = classmethod(GenericAlias)
+
     def __reduce__(self):
+        # The whole instance state goes along, including ``data``: a deep
+        # copy therefore refers to the same (not copied) elements, which
+        # would otherwise die as soon as the copy is made.
         return self.__class__, (list(self),), self.__getstate__()
 
+    # -- mutation ------------------------------------------------------------------
+
     def add(self, item):
-        if self._pending_removals:
-            self._commit_removals()
-        self.data.add(ref(item, self._remove))
+        self._settle()
+        self.data.add(self._ref(item))
 
     def clear(self):
-        if self._pending_removals:
-            self._commit_removals()
+        self._settle()
         self.data.clear()
 
     def copy(self):
         return self.__class__(self)
 
     def pop(self):
-        if self._pending_removals:
-            self._commit_removals()
+        self._settle()
         while True:
             try:
-                itemref = self.data.pop()
+                wr = self.data.pop()
             except KeyError:
                 raise KeyError('pop from empty WeakSet') from None
-            item = itemref()
+            item = wr()
             if item is not None:
                 return item
 
     def remove(self, item):
-        if self._pending_removals:
-            self._commit_removals()
+        self._settle()
         self.data.remove(ref(item))
 
     def discard(self, item):
-        if self._pending_removals:
-            self._commit_removals()
+        self._settle()
         self.data.discard(ref(item))
 
     def update(self, other):
-        if self._pending_removals:
-            self._commit_removals()
+        self._settle()
         for element in other:
             self.add(element)
 
@@ -133,18 +156,21 @@ class WeakSet:
         self.update(other)
         return self
 
+    # -- set algebra (other may be any iterable of weak-referenceable
+    # objects) -------------------------------------------------------------------
+
     def difference(self, other):
         result = self.copy()
         result.difference_update(other)
         return result
+
     __sub__ = difference
 
     def difference_update(self, other):
         self.__isub__(other)
 
     def __isub__(self, other):
-        if self._pending_removals:
-            self._commit_removals()
+        self._settle()
         if self is other:
             self.data.clear()
         else:
@@ -153,27 +179,58 @@ class WeakSet:
 
     def intersection(self, other):
         return self.__class__(item for item in other if item in self)
+
     __and__ = intersection
 
     def intersection_update(self, other):
         self.__iand__(other)
 
     def __iand__(self, other):
-        if self._pending_removals:
-            self._commit_removals()
+        self._settle()
         self.data.intersection_update(ref(item) for item in other)
         return self
 
+    def symmetric_difference(self, other):
+        result = self.copy()
+        result.symmetric_difference_update(other)
+        return result
+
+    __xor__ = symmetric_difference
+
+    def symmetric_difference_update(self, other):
+        self.__ixor__(other)
+
+    def __ixor__(self, other):
+        self._settle()
+        if self is other:
+            self.data.clear()
+        else:
+            # new members need the callback that removes them again
+            self.data.symmetric_difference_update(self._ref(item)
+                                                  for item in other)
+        return self
+
+    def union(self, other):
+        return self.__class__(item for group in (self, other)
+                              for item in group)
+
+    __or__ = union
+
+    def isdisjoint(self, other):
+        return len(self.intersection(other)) == 0
+
     def issubset(self, other):
         return self.data.issubset(ref(item) for item in other)
-    __le__ = issubset
 
-    def __lt__(self, other):
-        return self.data < set(map(ref, other))
+    __le__ = issubset
 
     def issuperset(self, other):
         return self.data.issuperset(ref(item) for item in other)
+
     __ge__ = issuperset
+
+    def __lt__(self, other):
+        return self.data < set(map(ref, other))
 
     def __gt__(self, other):
         return self.data > set(map(ref, other))
@@ -182,35 +239,3 @@ class WeakSet:
         if not isinstance(other, self.__class__):
             return NotImplemented
         return self.data == set(map(ref, other))
-
-    def symmetric_difference(self, other):
-        result = self.copy()
-        result.symmetric_difference_update(other)
-        return result
-    __xor__ = symmetric_difference
-
-    def symmetric_difference_update(self, other):
-        self.__ixor__(other)
-
-    def __ixor__(self, other):
-        if self._pending_removals:
-            self._commit_removals()
-        if self is other:
-            self.data.clear()
-        else:
-            self.data.symmetric_difference_update(ref(item, self._remove) for item in other)
-        return self
-
-    def union(self, other):
-        return self.__class__(e for s in (self, other) for e in s)
-    __or__ = union
-
-    def isdisjoint(self, other):
-        return len(self.intersection(other)) == 0
-
-    def __repr__(self):
-        return repr(self.data)
-
-    __hash__ = None
-
-    __class_getitem__ = classmethod(GenericAlias)
