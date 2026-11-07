@@ -436,7 +436,12 @@ fn fill_load_attr(o: &PyObject, nm: &PyObject, method: bool) -> Option<Fill> {
             return None;
         }
         if let Some(v) = lookup(cls, nm) {
-            let plain = v.ty().tp_descr_get.is_none() || funcobject::is_function(&v);
+            // (perf3) method and slot-wrapper descriptors read through their class are
+            // themselves as well
+            let plain = v.ty().tp_descr_get.is_none()
+                || funcobject::is_function(&v)
+                || v.is_type(crate::types::descr::method_descr_type())
+                || v.is_type(crate::types::descr::wrapper_descr_type());
             if plain {
                 return Some((kind::TYPE_ATTR, tag as u64, o.as_ptr() as u64, v.as_ptr() as usize));
             }
