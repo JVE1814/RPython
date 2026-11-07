@@ -57,6 +57,10 @@ pub struct RtConfig {
     pub stdlib_dir: Option<String>,
     /// -X cpu_count / PYTHON_CPU_COUNT: what os.cpu_count() reports (-1: the real count).
     pub cpu_count: i32,
+    /// Standard descriptors (bit n = fd n) the process was started without.
+    pub closed_std_fds: u8,
+    /// -X importtime[=2] / PYTHONPROFILEIMPORTTIME: 0 off, 1 timings, 2 also cached imports.
+    pub import_time: i32,
 }
 
 impl Default for RtConfig {
@@ -83,6 +87,8 @@ impl Default for RtConfig {
             gil: -1,
             thread_inherit_context: 1,
             cpu_count: -1,
+            closed_std_fds: 0,
+            import_time: 0,
             context_aware_warnings: 1,
             lazy_imports: -1,
             unbuffered: false,
@@ -858,13 +864,22 @@ fn sys_getunicodeinternedsize(_m: &PyObject, args: &[&PyObject], kw: Option<&PyO
 /// per-type free lists in this runtime (the small-object allocator keeps
 /// per-thread caches instead), so the free-list counts are all zero.
 fn sys_debugmallocstats(_m: &PyObject) -> PyResult {
-    let mut s = String::from("Small-object allocator: per-thread caches over 64 KiB pages (no pymalloc arenas)\n");
+    print_malloc_stats();
+    Ok(none::none_ref())
+}
+
+/// The statistics behind sys._debugmallocstats() and PYTHONMALLOCSTATS, on the C stderr.
+pub fn print_malloc_stats() {
+    let mut s = format!(
+        "Small block threshold = {}, in {} size classes.\nSmall-object allocator: per-thread caches over 64 KiB pages (no pymalloc arenas)\n",
+        crate::tlab::MAX_SMALL,
+        crate::tlab::CLASSES.len()
+    );
     s.push_str(&format!("{:>10} tracked GC objects\n", crate::gc::tracked_count()));
     for name in ["PyDictObjects", "PyListObjects", "PyFloatObjects", "PyTupleObjects"] {
         s.push_str(&format!("{:>10} free {}\n", 0, name));
     }
     crate::modules::sys::write_fd(2, s.as_bytes());
-    Ok(none::none_ref())
 }
 fn sys_get_coroutine_origin_tracking_depth(_m: &PyObject) -> PyResult {
     Ok(int::new_int(crate::threads::current().c.coroutine_origin_tracking_depth as i64))

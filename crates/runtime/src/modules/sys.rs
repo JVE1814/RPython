@@ -153,6 +153,11 @@ pub fn init_stdio() {
 }
 
 fn create_stdio(fd: i32, write: bool, name: &str, errors: &str, unbuffered: bool, force_line: bool) -> PyResult<PyRef> {
+    // a standard descriptor the process was started without: the stream is None
+    let closed_at_start = crate::modules::sys_full::config().closed_std_fds & (1 << fd) != 0;
+    if closed_at_start || unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+        return Ok(crate::types::none::none_ref());
+    }
     // PYTHONIOENCODING=encoding[:errors] (errors do not apply to stderr)
     let (enc, errs) = io_encoding();
     // an explicitly chosen encoding without an error handler is strict

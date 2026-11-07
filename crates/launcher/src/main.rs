@@ -51,23 +51,50 @@ arg ...: arguments passed to program in sys.argv[1:]
 ";
 
 const HELP_ENV: &str = "Environment variables that change behavior:
-PYTHONSTARTUP   : file executed on interactive startup (no default)
-PYTHONPATH      : ':'-separated list of directories prefixed to the
-                  default module search path.  The result is sys.path.
-PYTHONHOME      : alternate <prefix> directory (or <prefix>:<exec_prefix>).
-PYTHONPLATLIBDIR: override sys.platlibdir
-PYTHONCASEOK    : ignore case in 'import' statements (Windows)
-PYTHONIOENCODING: encoding[:errors] used for stdin/stdout/stderr
-PYTHONHASHSEED  : if this variable is set to 'random', a random value is used
-                  to seed the hashes of str and bytes objects.
-PYTHONINTMAXSTRDIGITS: limit the size of int<->str conversions
-PYTHONUTF8      : control the UTF-8 mode
-PYTHONWARNINGS  : warning control
-PYTHONSAFEPATH  : don't prepend a potentially unsafe path to sys.path
-PYTHONGIL       : when set to 0, disables the GIL
+PYTHONASYNCIODEBUG: turn on asyncio debug mode
+PYTHONBREAKPOINT: callable that breakpoint() calls (\"0\" disables it)
+PYTHONCASEOK    : ignore case in 'import' statements (Windows only)
+PYTHON_CONTEXT_AWARE_WARNINGS: warnings.catch_warnings() uses a context variable
+PYTHON_CPU_COUNT: number that os.cpu_count() and os.process_cpu_count() report
+PYTHONDEVMODE   : enable the development mode, like -X dev
+PYTHONFAULTHANDLER: dump the Python traceback on fatal errors, like -X faulthandler
+PYTHON_GIL      : 0 or 1: run without or with the global interpreter lock
+PYTHONHASHSEED  : 'random' or an integer in [0; 4294967295] seeding the hashes
+                  of str and bytes objects (0 disables the randomization)
+PYTHONHOME      : alternative <prefix> directory (or <prefix>:<exec_prefix>)
+PYTHONINTMAXSTRDIGITS: digit limit of int<->str conversions (0: no limit)
+PYTHONIOENCODING: encoding[:errors] of the standard streams
+PYTHON_LAZY_IMPORTS: 'all' or 'normal': which imports are lazy, like -X lazy_imports
+PYTHONMALLOC    : memory allocator and debug hooks ('debug' adds the hooks)
+PYTHONMALLOCSTATS: print allocator statistics at exit
+PYTHONNODEBUGRANGES: leave column information out of code objects
+PYTHONPATH      : ':'-separated directories put in front of the default module
+                  search path (the result is sys.path)
+PYTHONPLATLIBDIR: overrides sys.platlibdir
+PYTHONPYCACHEPREFIX: root of a separate tree for the .pyc cache files
+PYTHONSAFEPATH  : do not put a possibly unsafe directory in front of sys.path
+PYTHONSTARTUP   : file run when an interactive session starts
+PYTHON_THREAD_INHERIT_CONTEXT: new threads start with a copy of the creator's
+                  contextvars context
+PYTHON_TLBC     : 0 or 1: thread-local copies of specialised bytecode
+PYTHONTRACEMALLOC: trace allocations with tracemalloc (value: frames kept)
+PYTHONUSERBASE  : base directory of the user site-packages
+PYTHONUTF8      : 0 or 1: UTF-8 mode, like -X utf8
+PYTHONWARNDEFAULTENCODING: EncodingWarning when an encoding is left out
+PYTHONWARNINGS  : warning filters, like -W
+
+These variables have equivalent command-line options (see --help):
+PYTHONDEBUG     : -d
+PYTHONDONTWRITEBYTECODE: -B
+PYTHONINSPECT   : -i
+PYTHONNOUSERSITE: -s
+PYTHONOPTIMIZE  : -O
+PYTHONUNBUFFERED: -u
+PYTHONVERBOSE   : -v
 ";
 
 const HELP_X: &str = "The following implementation-specific options are available:
+-X cpu_count=N|default: number that os.cpu_count() reports
 -X dev : enable Python Development Mode
 -X faulthandler: dump the Python traceback on fatal errors
 -X frozen_modules=[on|off]: whether to use frozen modules
@@ -77,10 +104,64 @@ const HELP_X: &str = "The following implementation-specific options are availabl
 -X lazy_imports=[all|normal]: control lazy imports
 -X no_debug_ranges: don't include extra location information in code objects
 -X pycache_prefix=PATH: write .pyc files to a parallel tree under PATH
+-X tlbc=[0|1]: thread-local copies of specialised bytecode
 -X tracemalloc[=N]: trace Python memory allocations
 -X utf8[=0|1]: enable (1) or disable (0) UTF-8 mode
 -X warn_default_encoding: enable opt-in EncodingWarning for 'encoding=None'
 ";
+
+/// Whether --help output is colourised (PYTHON_COLORS, NO_COLOR, FORCE_COLOR, TERM, tty).
+fn help_colorized() -> bool {
+    let var = |n: &str| std::env::var(n).ok().filter(|v| !v.is_empty());
+    match var("PYTHON_COLORS").as_deref() {
+        Some("0") => return false,
+        Some("1") => return true,
+        _ => {}
+    }
+    if var("NO_COLOR").is_some() {
+        return false;
+    }
+    if var("FORCE_COLOR").is_some() {
+        return true;
+    }
+    if var("TERM").as_deref() == Some("dumb") {
+        return false;
+    }
+    unsafe { libc::isatty(1) == 1 }
+}
+
+/// Help text with headings and option names highlighted when colours are on.
+fn help_text(text: &str) -> String {
+    if !help_colorized() {
+        return text.to_string();
+    }
+    const BOLD: &str = "\x1b[1m";
+    const OPT: &str = "\x1b[1;36m";
+    const RESET: &str = "\x1b[0m";
+    let mut out = String::with_capacity(text.len() * 2);
+    for line in text.split_inclusive('\n') {
+        if let Some(rest) = line.strip_prefix("usage:") {
+            out.push_str(BOLD);
+            out.push_str("usage:");
+            out.push_str(RESET);
+            out.push_str(rest);
+        } else if line.starts_with('-') || line.starts_with("PYTHON") {
+            let end = line.find(|c: char| c == ' ' || c == ':').unwrap_or(line.len());
+            out.push_str(OPT);
+            out.push_str(&line[..end]);
+            out.push_str(RESET);
+            out.push_str(&line[end..]);
+        } else if line.ends_with(":\n") && !line.starts_with(' ') {
+            out.push_str(BOLD);
+            out.push_str(line.trim_end_matches('\n'));
+            out.push_str(RESET);
+            out.push('\n');
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
 
 fn prog_name() -> String {
     std::env::args().next().unwrap_or_else(|| "python3".into())
@@ -136,6 +217,24 @@ fn fatal(msg: &str) -> ! {
     eprintln!("Fatal Python error: {}", msg);
     std::process::exit(1);
 }
+
+/// Standard descriptors (bit n = fd n) that were closed when the process started. Rust's
+/// runtime reopens closed ones on /dev/null before `main`, so this is recorded by an ELF
+/// constructor, which runs earlier; sys.stdin/stdout/stderr are None for these, as in
+/// CPython.
+static CLOSED_STD_FDS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+extern "C" fn record_closed_std_fds() {
+    for fd in 0..3 {
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+            CLOSED_STD_FDS.fetch_or(1 << fd, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+#[used]
+#[unsafe(link_section = ".init_array")]
+static RECORD_CLOSED_STD_FDS: extern "C" fn() = record_closed_std_fds;
 
 fn main() {
     // Prefer running the interpreter on the process's main thread (like CPython:
@@ -222,7 +321,7 @@ fn real_main() -> i32 {
     let raw: Vec<Vec<u8>> = std::env::args_os().map(|a| std::os::unix::ffi::OsStringExt::into_vec(a)).collect();
     let args: Vec<String> = raw.iter().map(|b| String::from_utf8_lossy(b).into_owned()).collect();
     let any_undecodable = raw.iter().any(|b| std::str::from_utf8(b).is_err());
-    let mut cfg = RtConfig { orig_argv: args.clone(), ..Default::default() };
+    let mut cfg = RtConfig { orig_argv: args.clone(), closed_std_fds: CLOSED_STD_FDS.load(std::sync::atomic::Ordering::Relaxed), ..Default::default() };
     if any_undecodable {
         cfg.orig_argv_bytes = raw.clone();
     }
@@ -252,19 +351,19 @@ fn real_main() -> i32 {
         if let Some(long) = a.strip_prefix("--") {
             match long {
                 "help" => {
-                    print!("{}{}", USAGE.replace("{prog}", &prog_name()), HELP);
+                    print!("{}", help_text(&format!("{}{}", USAGE.replace("{prog}", &prog_name()), HELP)));
                     std::process::exit(0);
                 }
                 "help-env" => {
-                    print!("{}", HELP_ENV);
+                    print!("{}", help_text(HELP_ENV));
                     std::process::exit(0);
                 }
                 "help-xoptions" => {
-                    print!("{}", HELP_X);
+                    print!("{}", help_text(HELP_X));
                     std::process::exit(0);
                 }
                 "help-all" => {
-                    print!("{}{}{}{}", USAGE.replace("{prog}", &prog_name()), HELP, HELP_ENV, HELP_X);
+                    print!("{}", help_text(&format!("{}{}{}{}", USAGE.replace("{prog}", &prog_name()), HELP, HELP_ENV, HELP_X)));
                     std::process::exit(0);
                 }
                 "version" => {
@@ -328,7 +427,7 @@ fn real_main() -> i32 {
                 'd' => cfg.debug += 1,
                 'E' => cfg.ignore_environment = 1,
                 'h' | '?' => {
-                    print!("{}{}", USAGE.replace("{prog}", &prog_name()), HELP);
+                    print!("{}", help_text(&format!("{}{}", USAGE.replace("{prog}", &prog_name()), HELP)));
                     std::process::exit(0);
                 }
                 'i' => {
@@ -424,6 +523,9 @@ fn real_main() -> i32 {
             _ => fatal("PYTHON_LAZY_IMPORTS: invalid value; expected 'all' or 'normal'"),
         };
     }
+    if let Some(v) = env(&cfg, "PYTHONPROFILEIMPORTTIME") {
+        cfg.import_time = if v == "2" { 2 } else { 1 };
+    }
     if let Some(v) = env(&cfg, "PYTHON_TLBC") {
         if v != "0" && v != "1" {
             fatal("config_read_tlbc: PYTHON_TLBC=N: N is missing or invalid");
@@ -456,6 +558,15 @@ fn real_main() -> i32 {
             "warn_default_encoding" => cfg.warn_default_encoding = 1,
             // `-X pycache_prefix` or an empty value: no prefix, whatever the environment says
             "pycache_prefix" => cfg.pycache_prefix = v.filter(|s| !s.is_empty()).map(|s| s.to_string()),
+            "importtime" => {
+                cfg.import_time = match v.map(|s| s.parse::<i64>()) {
+                    None => 1,
+                    Some(Ok(n)) if (0..=2).contains(&n) => n as i32,
+                    Some(Ok(_)) => fatal("-X importtime: invalid number; expected 0, 1 or 2"),
+                    // any other value (e.g. "true") just switches it on
+                    Some(Err(_)) => 1,
+                }
+            }
             "tlbc" => match v {
                 Some("0") | Some("1") => {}
                 _ => fatal("config_read_tlbc: -X tlbc=n: n is missing or invalid"),

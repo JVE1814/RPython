@@ -77,7 +77,11 @@ fn run_code_in_main(src: &[u8], filename: &str) -> Outcome {
     let r = (|| -> PyResult<()> {
         let m = main_module()?;
         let d = module::module_dict(&m);
-        let code = crate::compile::compile_bytes(src, filename, crate::compile::Mode::Exec, 0, -1)?;
+        // `-c` code is text already: a coding cookie in it is not obeyed
+        let code = match std::str::from_utf8(src) {
+            Ok(text) if filename == "<string>" => crate::compile::compile_str(text, filename, crate::compile::Mode::Exec, 0, -1)?,
+            _ => crate::compile::compile_bytes(src, filename, crate::compile::Mode::Exec, 0, -1)?,
+        };
         if filename == "<string>" {
             // `-c` code: tracebacks show its lines like those of a file
             register_source(&code.code, &String::from_utf8_lossy(src), "<string>");

@@ -593,10 +593,23 @@ pub fn import_module_level(nm: &PyObject, globals: Option<&PyObject>, fromlist: 
         let modules = crate::modules::sys::modules_dict();
         if let Some(m) = dict::get_item(&modules, nm)? {
             if !m.is(none::none()) {
+                import_time_cached(&|| escaped_name(nm));
                 return Ok(m);
             }
         }
+        let display = escaped_name(nm);
+        let lossy = pystr::to_string_lossy(nm);
+        return IT_DISPLAY.with(|d| {
+            let old = d.replace(Some((lossy, display)));
+            let r = import_module_level_inner(nm, globals, fromlist, level);
+            d.replace(old);
+            r
+        });
     }
+    import_module_level_inner(nm, globals, fromlist, level)
+}
+
+fn import_module_level_inner(nm: &PyObject, globals: Option<&PyObject>, fromlist: &PyObject, level: i64) -> PyResult {
     let n = pystr::to_string_lossy(nm);
     let abs = if level > 0 {
         resolve_name(&n, globals, level)?
@@ -685,12 +698,92 @@ fn handle_fromlist(m: &PyObject, fromlist: &PyObject, modname: &str) -> PyResult
 
 static IMPORT_LOCKS: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
 
+// ---------------------------------------------------------------- -X importtime
+//
+// Every import that runs the import system reports its own time and the time
+// including nested imports (microseconds), indented by nesting depth; with
+// -X importtime=2 imports answered from sys.modules are reported as "cached".
+
+thread_local! {
+    /// Time spent in nested imports, one entry per import in progress.
+    static IT_NESTED: std::cell::RefCell<Vec<u128>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// (lossy name, display name) of a module name that has no exact Rust form.
+    static IT_DISPLAY: std::cell::RefCell<Option<(String, String)>> = const { std::cell::RefCell::new(None) };
+}
+static IT_HEADER: std::sync::Once = std::sync::Once::new();
+
+fn import_time_level() -> i32 {
+    crate::modules::sys_full::config().import_time
+}
+
+/// A module name as printed: lone surrogates as backslash escapes.
+fn escaped_name(nm: &PyObject) -> String {
+    let mut out = String::new();
+    for c in pystr::str_data(nm).iter() {
+        match char::from_u32(c) {
+            Some(ch) => out.push(ch),
+            None => out.push_str(&format!("\\u{:04x}", c)),
+        }
+    }
+    out
+}
+
+fn display_name(abs: &str) -> String {
+    IT_DISPLAY.with(|d| match &*d.borrow() {
+        Some((lossy, shown)) if lossy == abs => shown.clone(),
+        _ => abs.to_string(),
+    })
+}
+
+fn import_time_line(own: &str, total: &str, depth: usize, name: &str) {
+    IT_HEADER.call_once(|| crate::modules::sys::write_fd(2, b"import time: self [us] | cumulative | imported package\n"));
+    // numbers are right-aligned, the word "cached" left-aligned
+    let line = if own == "cached" {
+        format!("import time: {:<9} | {:<10} | {}{}\n", own, total, "  ".repeat(depth), name)
+    } else {
+        format!("import time: {:>9} | {:>10} | {}{}\n", own, total, "  ".repeat(depth), name)
+    };
+    crate::modules::sys::write_fd(2, line.as_bytes());
+}
+
+fn import_time_cached(name: &dyn Fn() -> String) {
+    if import_time_level() >= 2 {
+        let depth = IT_NESTED.with(|s| s.borrow().len());
+        import_time_line("cached", "cached", depth, &name());
+    }
+}
+
+fn import_timed(abs: &str, f: impl FnOnce() -> PyResult) -> PyResult {
+    if import_time_level() == 0 {
+        return f();
+    }
+    let depth = IT_NESTED.with(|s| {
+        let mut s = s.borrow_mut();
+        s.push(0);
+        s.len() - 1
+    });
+    let start = std::time::Instant::now();
+    let r = f();
+    let total = start.elapsed().as_micros();
+    let nested = IT_NESTED.with(|s| {
+        let mut s = s.borrow_mut();
+        let nested = s.pop().unwrap_or(0);
+        if let Some(parent) = s.last_mut() {
+            *parent += total;
+        }
+        nested
+    });
+    import_time_line(&(total.saturating_sub(nested)).to_string(), &total.to_string(), depth, &display_name(abs));
+    r
+}
+
 /// Import a module by absolute dotted name.
 pub fn import_absolute(abs: &str) -> PyResult {
     let active = importlib_active();
     if let Some(m) = get_loaded_module(abs) {
         // fast path: fully initialised module in sys.modules
         if !active || !spec_initializing(&m) {
+            import_time_cached(&|| display_name(abs));
             return Ok(m);
         }
     }
@@ -698,7 +791,7 @@ pub fn import_absolute(abs: &str) -> PyResult {
         let bs = bootstrap().unwrap();
         let f = ab::getattr_str(&bs, "_find_and_load")?;
         let imp = crate::builtins::builtin("__import__")?;
-        return ab::call(&f, &[&pystr::new_str(abs), &imp]).map_err(|e| {
+        return import_timed(abs, || ab::call(&f, &[&pystr::new_str(abs), &imp])).map_err(|e| {
             remove_importlib_frames();
             e
         });

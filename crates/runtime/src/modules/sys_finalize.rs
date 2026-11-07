@@ -55,8 +55,16 @@ pub fn finalize() -> bool {
     super::sys_full::flush_std("stdout");
     super::sys_full::flush_std("stderr");
     clear_exc();
+    if env_flag("PYTHONMALLOCSTATS") {
+        super::sys_full::print_malloc_stats();
+    }
     crate::capi::lifecycle::run_process_atexit();
     ok
+}
+
+/// A non-empty environment variable (ignored under -E / -I).
+fn env_flag(name: &str) -> bool {
+    super::sys_full::config().ignore_environment == 0 && std::env::var_os(name).is_some_and(|v| !v.is_empty())
 }
 
 /// threading._shutdown() joins the non-daemon threads; an error there (also a

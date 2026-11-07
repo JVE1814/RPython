@@ -42,10 +42,20 @@ fn get_recursion_depth(_m: &PyObject) -> PyResult {
     Ok(int::new_int(crate::threads::current().recursion_depth.get() as i64))
 }
 
-/// Name of the memory allocator family in use (not pymalloc: plain malloc for
-/// large blocks, our own small-object allocator otherwise).
+/// Name of the allocator family as a free-threaded build reports it: objects come from
+/// per-thread heaps (our small-object allocator plays the part mimalloc plays in
+/// CPython), with the debug hooks under PYTHONMALLOC=debug or -X dev.
 fn pymem_getallocatorsname(_m: &PyObject) -> PyResult {
-    Ok(crate::types::str::new_str("malloc"))
+    let c = crate::modules::sys_full::config();
+    let requested = if c.ignore_environment == 0 { std::env::var("PYTHONMALLOC").ok() } else { None };
+    let name = match requested.as_deref() {
+        Some("malloc") => "malloc",
+        Some("malloc_debug") => "malloc_debug",
+        Some("debug") | Some("mimalloc_debug") | Some("pymalloc_debug") => "mimalloc_debug",
+        _ if c.dev_mode => "mimalloc_debug",
+        _ => "mimalloc",
+    };
+    Ok(crate::types::str::new_str(name))
 }
 
 fn get_long_lived_total(_m: &PyObject) -> PyResult {
