@@ -1,7 +1,12 @@
 # PROGRESS
 
-## Status 2026-11-06
-All agents stopped 2026-11-02 when the account's weekly API limit was hit; resumed after the reset (Nov 5).
+## Status 2026-11-07 (day 7)
+Master 0323d71 = core6 merged (call/inspect/patma/monitoring/opcache/tlbc fixes; notes/core6.md).
+Latest full suite: run 11 (pre-core6): 294/434 modules pass, 49,781 tests, 674 failures (241 without test_capi),
+616 errors. Baseline free-threaded CPython: 416/434. Running agents: perf4 (call path, allocation, startup),
+capi2 (test_capi, stable_abi_ctypes, fileutils), scale1 (multi-core scaling), tail1 (long-tail modules that pass
+on CPython: inspect signatures, codecs, time, path modules, ...).
+Earlier history (2026-11-02): agents stopped when the weekly API limit was hit; resumed Nov 5.
 
 ## RESUMED (2026-11-01, 22:15 UTC) after a pause at user request
 Wave 10 running: jit3 (merge+enable tier 2, perf), numpy2 (numpy/other wheels own test suites vs baseline),
