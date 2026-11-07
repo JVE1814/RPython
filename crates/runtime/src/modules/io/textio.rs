@@ -1013,6 +1013,7 @@ fn t_readline(o: &PyObject, args: &[&PyObject]) -> PyResult {
 unsafe extern "C" fn t_iternext(op: *mut PyObject) -> *mut PyObject {
     unsafe {
         let o = &*op;
+        let _lk = crate::objlock::lock(o);
         let r = (|| -> PyResult<Option<PyRef>> {
             {
                 let st = state(o)?;
@@ -1702,6 +1703,7 @@ pub fn init_types() -> PyResult<()> {
             ("_CHUNK_SIZE", get_chunk_size, set_chunk_size),
             ("_finalizing", get_finalizing, set_finalizing),
         ];
+        crate::methods::lock_self_methods(textiowrapper_type());
         crate::types::typeobject::type_ready(textiowrapper_type())?;
 
         let t = &mut *nldecoder_type();

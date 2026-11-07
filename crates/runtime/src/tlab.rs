@@ -441,10 +441,51 @@ pub fn small_size_of(p: *mut u8) -> usize {
     CLASSES[small_class_of(p) % NCLASSES]
 }
 
+/// Debugging aid (stability workstream): with `RPY_TLAB_CHECK=1` in the environment,
+/// freed blocks are stamped in their second word and freeing a stamped block aborts
+/// ("double free"), instead of silently linking a cycle into the free list (which shows
+/// up much later as heap corruption or a thread-exit loop). Use with RPYTHON_JIT=0:
+/// the JIT's inline free path does not check.
+static CHECK_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+const FREED_STAMP: usize = 0xdead_f4ee_dead_f4ee;
+
+#[cold]
+fn check_mode_init() -> bool {
+    let on = std::env::var_os("RPY_TLAB_CHECK").is_some_and(|v| v != "0");
+    CHECK_MODE.store(if on { 2 } else { 1 }, Relaxed);
+    on
+}
+
+#[inline(always)]
+fn checking() -> bool {
+    match CHECK_MODE.load(Relaxed) {
+        1 => false,
+        2 => true,
+        _ => check_mode_init(),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn check_free(p: *mut u8) {
+    unsafe {
+        let w = (p as *mut usize).add(1);
+        if *w == FREED_STAMP {
+            let msg = format!("rpython: double free of small block {:p} (class {})\n", p, small_class_of(p));
+            libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+            libc::abort();
+        }
+        *w = FREED_STAMP;
+    }
+}
+
 /// Free a block returned by `alloc_small` / `alloc_kind`.
 #[inline]
 pub fn free_small(p: *mut u8) {
     let c = small_class_of(p);
+    if checking() {
+        check_free(p);
+    }
     unsafe {
         let tc = &mut *(&raw mut TC);
         if tc.dead {

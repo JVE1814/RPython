@@ -409,12 +409,16 @@ fn total_refcnt(o: &PyObject) -> isize {
         return isize::MAX / 2;
     }
     local as isize + (o.ob_ref_shared.load(Relaxed) >> REF_SHARED_SHIFT)
-        - unsafe { crate::object::has_type_id(o.as_ptr()) } as isize
+        - if unsafe { crate::object::has_type_id(o.as_ptr()) } { crate::object::TYPE_BIAS } else { 0 }
 }
 
 /// Multiplicative hash for object addresses (SipHash dominated collection time).
 #[derive(Default)]
-struct PtrHasher(u64);
+pub struct PtrHasher(u64);
+
+/// Hash set / map of object addresses with the cheap address hasher.
+pub type PtrSet = std::collections::HashSet<usize, std::hash::BuildHasherDefault<PtrHasher>>;
+pub type PtrMap<V> = std::collections::HashMap<usize, V, std::hash::BuildHasherDefault<PtrHasher>>;
 impl std::hash::Hasher for PtrHasher {
     fn finish(&self) -> u64 {
         self.0
@@ -429,53 +433,62 @@ impl std::hash::Hasher for PtrHasher {
     }
 }
 
-/// Trial-deletion graph. Membership and the dense index of an object are stored in
-/// its `ob_tid` while a collection runs (it temporarily holds `index << 2 | 3`; real
-/// owner ids are aligned thread pointers or 0, so the tag cannot collide), which
-/// avoids a hash map lookup per visited reference. The owners are restored before
-/// returning (the world is stopped meanwhile). The graph is passed to the visitors
-/// through their `arg`.
+/// Trial-deletion state kept in the objects themselves while a collection runs
+/// (perf3; the world is stopped): `ob_tid` temporarily holds
+/// `gc_refs << 3 | reachable << 2 | GRAPH_TAG`. Real owner ids are aligned thread
+/// pointers or 0, so the tag cannot collide and marks exactly the objects under
+/// examination. Subtracting internal references (multiples of 8) never disturbs the
+/// low bits. The owners are restored before returning. The mark stack is passed to
+/// the C visitors through their `arg`.
 struct Graph {
-    objs: Vec<*mut PyObject>,
-    saved_tid: Vec<usize>,
-    refs: Vec<isize>,
-    reachable: Vec<bool>,
-    stack: Vec<usize>,
+    stack: Vec<*mut PyObject>,
 }
 
 const GRAPH_TAG: usize = 3;
+const REACHABLE: usize = 4;
+const REFS_SHIFT: u32 = 3;
 
+/// The collection state word of `op` if it is under examination.
 #[inline(always)]
-unsafe fn graph_index(op: *mut PyObject) -> Option<usize> {
+unsafe fn graph_word<'a>(op: *mut PyObject) -> Option<&'a std::sync::atomic::AtomicUsize> {
     unsafe {
         if op.is_null() || (*op).ob_gc_bits.load(Relaxed) & GC_BIT_TRACKED == 0 {
             return None;
         }
-        let p = (*op).ob_tid.load(Relaxed);
-        if p & GRAPH_TAG == GRAPH_TAG { Some(p >> 2) } else { None }
+        let t = &(*op).ob_tid;
+        if t.load(Relaxed) & GRAPH_TAG == GRAPH_TAG { Some(t) } else { None }
     }
 }
 
-unsafe extern "C" fn visit_decref(op: *mut PyObject, arg: *mut c_void) -> c_int {
+#[inline(always)]
+unsafe fn decref_visit(op: *mut PyObject) {
     unsafe {
-        if let Some(i) = graph_index(op) {
-            let g = &mut *(arg as *mut Graph);
-            g.refs[i] -= 1;
+        if let Some(w) = graph_word(op) {
+            w.store(w.load(Relaxed).wrapping_sub(1 << REFS_SHIFT), Relaxed);
         }
     }
+}
+
+#[inline(always)]
+unsafe fn mark_visit(op: *mut PyObject, stack: &mut Vec<*mut PyObject>) {
+    unsafe {
+        if let Some(w) = graph_word(op) {
+            let v = w.load(Relaxed);
+            if v & REACHABLE == 0 {
+                w.store(v | REACHABLE, Relaxed);
+                stack.push(op);
+            }
+        }
+    }
+}
+
+unsafe extern "C" fn visit_decref(op: *mut PyObject, _arg: *mut c_void) -> c_int {
+    unsafe { decref_visit(op) };
     0
 }
 
 unsafe extern "C" fn visit_mark(op: *mut PyObject, arg: *mut c_void) -> c_int {
-    unsafe {
-        if let Some(i) = graph_index(op) {
-            let g = &mut *(arg as *mut Graph);
-            if !g.reachable[i] {
-                g.reachable[i] = true;
-                g.stack.push(i);
-            }
-        }
-    }
+    unsafe { mark_visit(op, &mut (*(arg as *mut Graph)).stack) };
     0
 }
 
@@ -488,40 +501,77 @@ unsafe fn traverse(op: *mut PyObject, visit: visitproc, arg: *mut c_void) {
     }
 }
 
+/// perf3: `traverse` with the visitor inlined for the containers that make up most
+/// of a heap (exact lists and tuples: their slots are exactly their items); other
+/// types go through their tp_traverse with the C visitor. The world is stopped.
+#[inline(always)]
+unsafe fn traverse_inline(op: *mut PyObject, visit: visitproc, arg: *mut c_void, mut f: impl FnMut(*mut PyObject)) {
+    unsafe {
+        let tp = (*op).type_ptr();
+        if tp == crate::types::list::list_type() {
+            let (items, n) = crate::types::list::raw_items(op);
+            for i in 0..n {
+                let it = *items.add(i);
+                if !it.is_null() {
+                    f(it);
+                }
+            }
+        } else if tp == crate::types::tuple::tuple_type() {
+            let n = crate::object::var_size(&*op) as usize;
+            let base = crate::types::tuple::item_ptr(op);
+            for i in 0..n {
+                let it = *base.add(i);
+                if !it.is_null() {
+                    f(it);
+                }
+            }
+        } else if let Some(t) = (*tp).tp_traverse {
+            t(op, visit, arg);
+        }
+    }
+}
+
 /// Compute the unreachable subset of `objs` (all tracked, no duplicates).
 unsafe fn find_unreachable(objs: Vec<*mut PyObject>) -> Vec<*mut PyObject> {
     unsafe {
-        let n = objs.len();
-        let mut g = Graph {
-            saved_tid: Vec::with_capacity(n),
-            refs: objs.iter().map(|&o| total_refcnt(&*o)).collect(),
-            reachable: vec![false; n],
-            stack: Vec::new(),
-            objs,
-        };
-        for (i, &o) in g.objs.iter().enumerate() {
+        // refcounts are taken before any tid is overwritten (the per-thread type
+        // counting reads the owner word)
+        let refs: Vec<isize> = objs.iter().map(|&o| total_refcnt(&*o)).collect();
+        let mut saved_tid: Vec<usize> = Vec::with_capacity(objs.len());
+        for (&o, &r) in objs.iter().zip(refs.iter()) {
             let t = &(*o).ob_tid;
-            g.saved_tid.push(t.load(Relaxed));
-            t.store((i << 2) | GRAPH_TAG, Relaxed);
+            saved_tid.push(t.load(Relaxed));
+            t.store(((r.clamp(0, 1 << 56) as usize) << REFS_SHIFT) | GRAPH_TAG, Relaxed);
         }
+        drop(refs);
+        let mut g = Graph { stack: Vec::new() };
         let gp = &mut g as *mut Graph as *mut c_void;
-        for i in 0..n {
-            traverse(g.objs[i], Some(visit_decref), gp);
+        // subtract the references the examined objects hold among themselves
+        for &op in &objs {
+            traverse_inline(op, Some(visit_decref), gp, |it| decref_visit(it));
         }
-        for i in 0..n {
-            if g.refs[i] > 0 && !g.reachable[i] {
-                g.reachable[i] = true;
-                g.stack.push(i);
+        // anything still referenced from outside is reachable, and so is everything
+        // it reaches
+        for &op in &objs {
+            let w = &(*op).ob_tid;
+            let v = w.load(Relaxed);
+            if (v as isize) >> REFS_SHIFT > 0 && v & REACHABLE == 0 {
+                w.store(v | REACHABLE, Relaxed);
+                g.stack.push(op);
             }
         }
-        while let Some(i) = g.stack.pop() {
-            let op = g.objs[i];
-            traverse(op, Some(visit_mark), gp);
+        while let Some(op) = g.stack.pop() {
+            traverse_inline(op, Some(visit_mark), gp, |it| mark_visit(it, &mut (*(gp as *mut Graph)).stack));
         }
-        for (i, &o) in g.objs.iter().enumerate() {
-            (*o).ob_tid.store(g.saved_tid[i], Relaxed);
+        let mut unreachable = Vec::new();
+        for (&o, &tid) in objs.iter().zip(saved_tid.iter()) {
+            let w = &(*o).ob_tid;
+            if w.load(Relaxed) & REACHABLE == 0 {
+                unreachable.push(o);
+            }
+            w.store(tid, Relaxed);
         }
-        g.objs.iter().zip(g.reachable.iter()).filter(|(_, r)| !**r).map(|(o, _)| *o).collect()
+        unreachable
     }
 }
 

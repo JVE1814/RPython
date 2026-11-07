@@ -58,6 +58,7 @@ pub fn child(mut st: ForkState) {
     crate::gc::fork_child();
     // Only this thread exists now.
     crate::threads::after_fork_child();
+    crate::objlock::after_fork_child();
     let me = crate::threads::current_ptr();
     if !me.is_null() {
         crate::threads::MAIN_THREAD_STATE.store(me, std::sync::atomic::Ordering::Release);

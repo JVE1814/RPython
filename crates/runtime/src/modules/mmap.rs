@@ -640,6 +640,13 @@ unsafe extern "C" fn mmap_repr(o: *mut PyObject) -> *mut PyObject {
     }
 }
 
+// index and slice access runs under the object lock, like the methods (atomic reads
+// and writes with respect to each other, as the free-threading tests expect)
+crate::locked_slot!(l_mmap_item, mmap_item, (i: Py_ssize_t) -> *mut PyObject);
+crate::locked_slot!(l_mmap_ass_item, mmap_ass_item, (i: Py_ssize_t, v: *mut PyObject) -> c_int);
+crate::locked_slot!(l_mmap_subscript, mmap_subscript, (item: *mut PyObject) -> *mut PyObject);
+crate::locked_slot!(l_mmap_ass_subscript, mmap_ass_subscript, (item: *mut PyObject, v: *mut PyObject) -> c_int);
+
 unsafe extern "C" fn mmap_len(o: *mut PyObject) -> Py_ssize_t {
     unsafe {
         match check_valid(&*o) {
@@ -805,13 +812,13 @@ fn init_types() -> PyResult<()> {
         (*t).tp_setattro = Some(typeobject::object_generic_setattro);
         let mut sq: PySequenceMethods = std::mem::zeroed();
         sq.sq_length = Some(mmap_len);
-        sq.sq_item = Some(mmap_item);
-        sq.sq_ass_item = Some(mmap_ass_item);
+        sq.sq_item = Some(l_mmap_item);
+        sq.sq_ass_item = Some(l_mmap_ass_item);
         (*t).tp_as_sequence = leak(sq);
         let mut mp: PyMappingMethods = std::mem::zeroed();
         mp.mp_length = Some(mmap_len);
-        mp.mp_subscript = Some(mmap_subscript);
-        mp.mp_ass_subscript = Some(mmap_ass_subscript);
+        mp.mp_subscript = Some(l_mmap_subscript);
+        mp.mp_ass_subscript = Some(l_mmap_ass_subscript);
         (*t).tp_as_mapping = leak(mp);
         let mut bp: PyBufferProcs = std::mem::zeroed();
         bp.bf_getbuffer = Some(mmap_getbuffer);
@@ -841,6 +848,7 @@ fn init_types() -> PyResult<()> {
             ("__sizeof__", NOARGS, m_sizeof),
         ];
         (*t).tp_getset = crate::getset_table![("closed", m_closed)];
+        crate::methods::lock_self_methods(t);
         typeobject::type_ready(t)?;
     }
     Ok(())

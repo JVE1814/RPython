@@ -328,8 +328,138 @@ pub fn contains_entry(o: &PyObject, key: &PyObject, hash: isize) -> PyResult<boo
     if so(o).used == 0 {
         return Ok(false);
     }
+    if can_borrow(o) {
+        ensure_init(o);
+        if let Some(r) = find_fast(so(o), key.as_ptr(), hash) {
+            return Ok(r.is_some());
+        }
+    }
     let (_g, f) = find(o, key, hash)?;
     Ok(matches!(f, SFound::Active(_)))
+}
+
+// ------------------------------------------------------------------ lock-free fast paths
+//
+// Set algebra on sets of plain keys (exact str/int, or identical objects) never runs
+// Python code, so the tables can be walked directly: no lock, no snapshot vector, no
+// reference count traffic. That is safe when nobody else can change the table while
+// we look at it: frozensets are immutable once built, and a mutable set cannot be
+// changed by another thread while only one thread exists (no Python code runs inside
+// these loops, so no thread can start meanwhile). Whenever two keys with equal hashes
+// need a real `__eq__` call, the fast path gives up (`None`) and the general,
+// locking implementation runs instead.
+
+/// True when the set's table may be read without its lock right now.
+#[inline]
+fn can_borrow(o: &PyObject) -> bool {
+    o.is_type(frozenset_type()) || !crate::qsbr::multi_threaded() || is_frozenset(o)
+}
+
+/// Equality of two distinct key objects with equal hashes when it can be decided
+/// without calling Python code.
+#[inline]
+fn plain_eq(a: *mut PyObject, b: *mut PyObject) -> Option<bool> {
+    unsafe { ab::plain_eq(&*a, &*b) }
+}
+
+#[derive(Clone, Copy)]
+enum Fast {
+    /// present at this index
+    Found(usize),
+    /// absent; this empty slot ends the probe sequence
+    Absent(usize),
+    /// needs a real `__eq__` call
+    Unknown,
+}
+
+/// Probe for `key` without locking or calling Python code.
+#[inline]
+fn probe_fast(s: &PySetObject, key: *mut PyObject, hash: isize) -> Fast {
+    let mask = s.mask as usize;
+    let mut perturb = hash as usize;
+    let mut i = (hash as usize) & mask;
+    loop {
+        let probes = if i + LINEAR_PROBES <= mask { LINEAR_PROBES } else { 0 };
+        for j in 0..=probes {
+            let idx = i + j;
+            let e = *entry(s, idx);
+            if e.key.is_null() {
+                return Fast::Absent(idx);
+            }
+            if e.hash == hash && e.key != dummy() {
+                if e.key == key {
+                    return Fast::Found(idx);
+                }
+                match plain_eq(e.key, key) {
+                    Some(true) => return Fast::Found(idx),
+                    Some(false) => {}
+                    None => return Fast::Unknown,
+                }
+            }
+        }
+        perturb >>= PERTURB_SHIFT;
+        i = (i.wrapping_mul(5).wrapping_add(1).wrapping_add(perturb)) & mask;
+    }
+}
+
+/// `probe_fast` as presence: Some(Some(index)), Some(None) = absent, None = unknown.
+#[inline]
+fn find_fast(s: &PySetObject, key: *mut PyObject, hash: isize) -> Option<Option<usize>> {
+    match probe_fast(s, key, hash) {
+        Fast::Found(i) => Some(Some(i)),
+        Fast::Absent(_) => Some(None),
+        Fast::Unknown => None,
+    }
+}
+
+/// The occupied entries of a set whose table can be borrowed (see `can_borrow`).
+#[inline]
+fn live_entries(s: &PySetObject) -> impl Iterator<Item = SetEntry> + '_ {
+    (0..=(s.mask as usize)).map(move |i| *entry(s, i)).filter(is_active)
+}
+
+/// Insert a key known to be absent into a set nobody else can see yet (a result under
+/// construction): no comparisons, no lock.
+fn insert_unique(r: &PyObject, key: *mut PyObject, hash: isize) {
+    let s = so(r);
+    unsafe { incref(key) };
+    if ((s.fill + 1) as usize) * 5 >= (s.mask as usize) * 3 {
+        let u = (s.used + 1) as usize;
+        table_resize(s, if u > 50000 { u * 2 } else { u * 4 });
+    }
+    insert_clean(s.table, s.mask as usize, key, hash);
+    s.fill += 1;
+    s.used += 1;
+}
+
+/// A new exact set/frozenset (`tp`) with the same contents as `src` (borrowable).
+fn copy_fast(tp: *mut PyTypeObject, src: &PyObject) -> PyResult {
+    let r = alloc_set(tp)?;
+    let s = so(src);
+    let d = so(&r);
+    if s.fill == s.used {
+        // no deleted slots: the table can be duplicated position by position
+        let n = s.mask as usize + 1;
+        if n > MINSIZE {
+            let t = unsafe { crate::alloc::buf_calloc(n * std::mem::size_of::<SetEntry>()) } as *mut SetEntry;
+            if t.is_null() {
+                return Err(memory_error());
+            }
+            d.table = t;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(s.table, d.table, n) };
+        d.mask = s.mask;
+        d.fill = s.used;
+        d.used = s.used;
+        for e in live_entries(d) {
+            unsafe { incref(e.key) };
+        }
+    } else {
+        for e in live_entries(s) {
+            insert_unique(&r, e.key, e.hash);
+        }
+    }
+    Ok(r)
 }
 
 /// Hash for set operations, with CPython's message rewriting.
@@ -388,7 +518,12 @@ pub fn items_with_hash(o: &PyObject) -> Vec<(PyRef, isize)> {
     v
 }
 pub fn set_items(o: &PyObject) -> Vec<PyRef> {
-    items_with_hash(o).into_iter().map(|(k, _)| k).collect()
+    ensure_init(o);
+    let _g = if can_borrow(o) { None } else { Some(ob_lock(o)) };
+    let s = so(o);
+    let mut v = Vec::with_capacity(s.used as usize);
+    v.extend(live_entries(s).map(|e| unsafe { PyRef::from_borrowed(e.key) }));
+    v
 }
 
 pub fn clear(o: &PyObject) {
@@ -426,6 +561,56 @@ pub fn clear(o: &PyObject) {
 /// Merge another set into `o` (set_merge).
 fn merge_set(o: &PyObject, other: &PyObject) -> PyResult<()> {
     if o.is(other) || so(other).used == 0 {
+        return Ok(());
+    }
+    ensure_init(other);
+    if can_borrow(other) {
+        let mut pending: Vec<SetEntry> = Vec::new();
+        {
+            let g = ob_lock(o);
+            let s = so(o);
+            let os = so(other);
+            let n = os.used;
+            if (s.fill + n) * 5 >= s.mask * 3 {
+                table_resize(s, ((s.used + n) * 2) as usize);
+            }
+            if s.fill == 0 {
+                let mask = s.mask as usize;
+                for e in live_entries(os) {
+                    unsafe { incref(e.key) };
+                    insert_clean(s.table, mask, e.key, e.hash);
+                }
+                s.fill = n;
+                s.used = n;
+                drop(g);
+                return Ok(());
+            }
+            for e in live_entries(os) {
+                match probe_fast(s, e.key, e.hash) {
+                    Fast::Found(_) => {}
+                    Fast::Absent(idx) => {
+                        unsafe { incref(e.key) };
+                        *entry(s, idx) = e;
+                        s.fill += 1;
+                        s.used += 1;
+                        if (s.fill as usize) * 5 >= (s.mask as usize) * 3 {
+                            let u = s.used as usize;
+                            table_resize(s, if u > 50000 { u * 2 } else { u * 4 });
+                        }
+                    }
+                    Fast::Unknown => pending.push(e),
+                }
+            }
+            // keep the pending keys alive past the lock: `other` may be a mutable set
+            for e in &pending {
+                unsafe { incref(e.key) };
+            }
+            drop(g);
+        }
+        for e in pending {
+            let k = unsafe { PyRef::from_raw(e.key) };
+            add_entry(o, &k, e.hash)?;
+        }
         return Ok(());
     }
     let items = items_with_hash(other);
@@ -501,7 +686,36 @@ pub fn difference_update_with(o: &PyObject, other: &PyObject) -> PyResult<()> {
         clear(o);
         return Ok(());
     }
-    if is_anyset(other) {
+    ensure_init(o);
+    if is_anyset(other) && so(o).used == 0 {
+        // nothing to remove
+    } else if is_anyset(other) && !crate::qsbr::multi_threaded() {
+        ensure_init(other);
+        let mut pending: Vec<(PyRef, isize)> = Vec::new();
+        let mut removed: Vec<*mut PyObject> = Vec::new();
+        {
+            let s = so(o);
+            for e in live_entries(so(other)) {
+                match probe_fast(s, e.key, e.hash) {
+                    Fast::Found(idx) => {
+                        let slot = entry(s, idx);
+                        removed.push(slot.key);
+                        slot.key = dummy();
+                        slot.hash = -1;
+                        s.used -= 1;
+                    }
+                    Fast::Absent(_) => {}
+                    Fast::Unknown => pending.push((unsafe { PyRef::from_borrowed(e.key) }, e.hash)),
+                }
+            }
+        }
+        for k in removed {
+            unsafe { decref(k) };
+        }
+        for (k, h) in pending {
+            discard_entry(o, &k, h)?;
+        }
+    } else if is_anyset(other) {
         for (k, h) in items_with_hash(other) {
             discard_entry(o, &k, h)?;
         }
@@ -548,6 +762,11 @@ pub fn symmetric_difference_update_with(o: &PyObject, other: &PyObject) -> PyRes
 }
 
 fn copy_of(o: &PyObject) -> PyResult {
+    ensure_init(o);
+    if can_borrow(o) {
+        let base = if is_subtype(o.type_ptr(), set_type()) { set_type() } else { frozenset_type() };
+        return copy_fast(base, o);
+    }
     make_new_set_basetype(o.type_ptr(), Some(o))
 }
 
@@ -558,6 +777,26 @@ fn intersection_with(o: &PyObject, other: &PyObject) -> PyResult {
     let result = make_new_set_basetype(o.type_ptr(), None)?;
     if is_anyset(other) {
         let (small, big) = if set_len(other) > set_len(o) { (o, other) } else { (other, o) };
+        ensure_init(small);
+        ensure_init(big);
+        if can_borrow(small) && can_borrow(big) {
+            let mut done = true;
+            let bs = so(big);
+            for e in live_entries(so(small)) {
+                match find_fast(bs, e.key, e.hash) {
+                    Some(Some(_)) => insert_unique(&result, e.key, e.hash),
+                    Some(None) => {}
+                    None => {
+                        done = false;
+                        break;
+                    }
+                }
+            }
+            if done {
+                return Ok(result);
+            }
+            clear(&result);
+        }
         for (k, h) in items_with_hash(small) {
             if contains_entry(big, &k, h)? {
                 add_entry(&result, &k, h)?;
@@ -592,6 +831,28 @@ fn difference_with(o: &PyObject, other: &PyObject) -> PyResult {
     }
     let result = make_new_set_basetype(o.type_ptr(), None)?;
     let is_d = dict::is_dict_exact(other);
+    if !is_d {
+        ensure_init(o);
+        ensure_init(other);
+        if can_borrow(o) && can_borrow(other) {
+            let os = so(other);
+            let mut done = true;
+            for e in live_entries(so(o)) {
+                match find_fast(os, e.key, e.hash) {
+                    Some(Some(_)) => {}
+                    Some(None) => insert_unique(&result, e.key, e.hash),
+                    None => {
+                        done = false;
+                        break;
+                    }
+                }
+            }
+            if done {
+                return Ok(result);
+            }
+            clear(&result);
+        }
+    }
     for (k, h) in items_with_hash(o) {
         let present = if is_d { dict::contains_hash(other, &k, h)? } else { contains_entry(other, &k, h)? };
         if !present {
@@ -614,6 +875,28 @@ fn issubset_rs(o: &PyObject, other: &PyObject) -> PyResult<bool> {
     }
     if set_len(o) > set_len(other) {
         return Ok(false);
+    }
+    ensure_init(o);
+    ensure_init(other);
+    if can_borrow(o) && can_borrow(other) {
+        let os = so(other);
+        let mut answer = Some(true);
+        for e in live_entries(so(o)) {
+            match find_fast(os, e.key, e.hash) {
+                Some(Some(_)) => {}
+                Some(None) => {
+                    answer = Some(false);
+                    break;
+                }
+                None => {
+                    answer = None;
+                    break;
+                }
+            }
+        }
+        if let Some(a) = answer {
+            return Ok(a);
+        }
     }
     for (k, h) in items_with_hash(o) {
         if !contains_entry(other, &k, h)? {
@@ -1136,7 +1419,7 @@ fn setiter_next_rs(o: &PyObject) -> PyResult<Option<PyRef>> {
         raise!(RuntimeError, "Set changed size during iteration");
     }
     let found = {
-        let _g = ob_lock(s_obj);
+        let _g = if can_borrow(s_obj) { None } else { Some(ob_lock(s_obj)) };
         let s = so(s_obj);
         let mask = s.mask as isize;
         let mut i = it.pos;

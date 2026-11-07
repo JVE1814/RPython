@@ -386,7 +386,7 @@ fn sys_is_immortal(_m: &PyObject, o: &PyObject) -> PyResult {
 }
 
 fn sys_getrefcount(_m: &PyObject, o: &PyObject) -> PyResult {
-    Ok(int::new_int(o.refcnt() as i64))
+    Ok(int::new_int(crate::object::visible_refcnt(o) as i64))
 }
 
 fn sys_displayhook(_m: &PyObject, o: &PyObject) -> PyResult {

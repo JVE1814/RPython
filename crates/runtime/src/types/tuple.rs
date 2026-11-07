@@ -218,16 +218,34 @@ pub fn tuple_hash(t: &PyObject) -> PyResult<isize> {
     }
     let items = tuple_items(t);
     let mut h = crate::hash::TupleHasher::new(items.len());
-    let ts = crate::threads::current();
-    crate::interp::enter_recursive_call(ts, " while hashing a tuple")?;
-    let r = (|| {
-        for it in items {
-            h.add(ab::hash(it)?);
-        }
-        Ok(())
-    })();
-    crate::interp::leave_recursive_call(ts);
-    r?;
+    // perf3: leading str/int items hash without the recursion guard (no Python code,
+    // no nesting); the guard covers the rest
+    let mut i = 0;
+    while i < items.len() {
+        let it = items[i];
+        let tp = it.type_ptr();
+        let v = if tp == crate::types::str::str_type() {
+            crate::types::str::str_hash(it)
+        } else if tp == crate::types::int::int_type() {
+            crate::types::int::int_hash(it)
+        } else {
+            break;
+        };
+        h.add(v);
+        i += 1;
+    }
+    if i < items.len() {
+        let ts = crate::threads::current();
+        crate::interp::enter_recursive_call(ts, " while hashing a tuple")?;
+        let r = (|| {
+            for it in &items[i..] {
+                h.add(ab::hash(it)?);
+            }
+            Ok(())
+        })();
+        crate::interp::leave_recursive_call(ts);
+        r?;
+    }
     let v = h.finish();
     cached.store(v, std::sync::atomic::Ordering::Relaxed);
     Ok(v)
@@ -331,48 +349,46 @@ fn tuple_getitem(o: &PyObject, k: &PyObject) -> PyResult {
 unsafe extern "C" fn tuple_subscript(o: *mut PyObject, k: *mut PyObject) -> *mut PyObject {
     unsafe { into_c(tuple_getitem(&*o, &*k)) }
 }
+/// Lexicographic comparison of two item sequences that stay alive meanwhile.
+fn compare_items(x: &[&PyObject], y: &[&PyObject], op: c_int) -> PyResult<bool> {
+    if (op == Py_EQ || op == Py_NE) && x.len() != y.len() {
+        return Ok(op == Py_NE);
+    }
+    for (a, b) in x.iter().zip(y.iter()) {
+        let eq = match ab::plain_eq(a, b) {
+            Some(e) => e,
+            None => ab::rich_compare_bool(a, b, Py_EQ)?,
+        };
+        if eq {
+            continue;
+        }
+        return match op {
+            Py_EQ => Ok(false),
+            Py_NE => Ok(true),
+            _ => ab::rich_compare_bool(a, b, op),
+        };
+    }
+    let (la, lb) = (x.len(), y.len());
+    Ok(match op {
+        Py_LT => la < lb,
+        Py_LE => la <= lb,
+        Py_EQ => la == lb,
+        Py_NE => la != lb,
+        Py_GT => la > lb,
+        _ => la >= lb,
+    })
+}
+
 unsafe extern "C" fn tuple_richcompare(a: *mut PyObject, b: *mut PyObject, op: c_int) -> *mut PyObject {
     unsafe {
         let (a, b) = (&*a, &*b);
         if !is_tuple(b) || !is_tuple(a) {
             return none::not_implemented().to_ref().into_raw();
         }
-        // (jit6, flagged: runtime fast path for mdp's tuple-keyed dicts) tuples are
-        // immutable and kept alive by the caller, so their items are compared borrowed,
-        // without the generic per-item closures and reference counting
+        // tuples are immutable and both are alive for the whole call: compare the
+        // item slices directly (perf3: no per-item closures and reference counts)
         let (x, y) = (tuple_items(a), tuple_items(b));
-        if (op == Py_EQ || op == Py_NE) && x.len() != y.len() {
-            return bool_::new_bool(op == Py_NE).into_raw();
-        }
-        let n = x.len().min(y.len());
-        for i in 0..n {
-            let (xi, yi) = (&x[i], &y[i]);
-            if xi.is(yi) {
-                continue;
-            }
-            match ab::rich_compare_bool(xi, yi, Py_EQ) {
-                Ok(true) => continue,
-                Ok(false) => {
-                    let r = match op {
-                        Py_EQ => Ok(false),
-                        Py_NE => Ok(true),
-                        _ => ab::rich_compare_bool(xi, yi, op),
-                    };
-                    return into_c(r.map(bool_::new_bool));
-                }
-                Err(e) => return into_c(Err::<PyRef, _>(e)),
-            }
-        }
-        let (la, lb) = (x.len(), y.len());
-        let r = match op {
-            Py_LT => la < lb,
-            Py_LE => la <= lb,
-            Py_EQ => la == lb,
-            Py_NE => la != lb,
-            Py_GT => la > lb,
-            _ => la >= lb,
-        };
-        bool_::new_bool(r).into_raw()
+        into_c(compare_items(x, y, op).map(bool_::new_bool))
     }
 }
 unsafe extern "C" fn tuple_contains(a: *mut PyObject, v: *mut PyObject) -> c_int {

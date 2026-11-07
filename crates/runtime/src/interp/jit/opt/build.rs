@@ -2493,6 +2493,10 @@ impl<'a> B<'a> {
                     self.emit(Inst::XDecref(old));
                 }
                 _ => {
+                    // __slots__ member: lock-free readers on other threads need the old
+                    // value released through QSBR, which the runtime path does
+                    let mta = self.imm(mt_addr);
+                    self.check(Cond::CmpMem(Base::V(mta), 0, 0, Cc::NE), f);
                     let old = self.v(Class::G);
                     self.emit(Inst::Load(old, Base::V(p), s.c as i32));
                     self.emit(Inst::Store(Base::V(p), s.c as i32, val));

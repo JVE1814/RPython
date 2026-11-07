@@ -79,7 +79,11 @@ fn new_context(vars: PyRef) -> PyResult {
     fc::robj_new(ctx_type(), Context { vars: Some(vars), prev: None, entered: false })
 }
 
+/// The context's current mapping. A context entered in one thread can be read from
+/// others while its owner replaces the mapping (ContextVar.set): the reference is
+/// taken and the field swapped under the context's leaf lock.
 fn ctx_vars(c: &PyObject) -> PyRef {
+    let _g = dict::ob_lock(c);
     rs::<Context>(c).vars.clone().unwrap()
 }
 
@@ -119,32 +123,51 @@ fn update_current(f: impl FnOnce(&PyObject) -> PyResult<()>) -> PyResult<()> {
     let c = current_context()?;
     let new = dict::copy(&ctx_vars(&c))?;
     f(&new)?;
-    let old = rs::<Context>(&c).vars.replace(new);
+    let old = {
+        let _g = dict::ob_lock(&c);
+        rs::<Context>(&c).vars.replace(new)
+    };
     drop(old);
     unsafe { (*crate::threads::current_mut()).c.context_ver += 1 };
     Ok(())
 }
 
 pub fn context_enter(c: &PyObject) -> PyResult<()> {
-    if rs::<Context>(c).entered {
+    let prev = current_context()?;
+    // check-and-set under the lock: two threads running the same context race here
+    let ok = {
+        let _g = dict::ob_lock(c);
+        let s = rs::<Context>(c);
+        if s.entered {
+            false
+        } else {
+            s.prev = Some(prev);
+            s.entered = true;
+            true
+        }
+    };
+    if !ok {
         raise!(RuntimeError, "cannot enter context: {} is already entered", ab::repr_string(c)?);
     }
-    let prev = current_context()?;
-    let s = rs::<Context>(c);
-    s.prev = Some(prev);
-    s.entered = true;
     set_current(Some(c.to_ref()));
     Ok(())
 }
 
 pub fn context_exit(c: &PyObject) -> PyResult<()> {
-    let s = rs::<Context>(c);
-    if !s.entered {
-        raise!(RuntimeError, "cannot exit context: {} has not been entered", ab::repr_string(c)?);
+    let prev = {
+        let _g = dict::ob_lock(c);
+        let s = rs::<Context>(c);
+        if !s.entered {
+            None
+        } else {
+            s.entered = false;
+            Some(s.prev.take())
+        }
+    };
+    match prev {
+        Some(prev) => set_current(prev),
+        None => raise!(RuntimeError, "cannot exit context: {} has not been entered", ab::repr_string(c)?),
     }
-    let prev = s.prev.take();
-    s.entered = false;
-    set_current(prev);
     Ok(())
 }
 

@@ -79,6 +79,7 @@ Ours (tools/run_tests.sh, 434 modules):
 | 6 | cd9478e | 259 | 158 | 13 | 4 | 39,273 | 660 | 2,377 |
 | 7 | c8fda7a | 268 | 157 | 5 | 4 | 42,747 | 542 | 2,539 |
 | 8 | 0b5f6a0 (jit5+core5, pre-lib6) | 280 | 144 | 3 | 7 | 42,339 | 275 | 2,485 |
+| 9 | 433df5d (jit6+interp1, pre-stability2) | 288 | 135 | 6 | 5 | 42,388 | 224 | 2,486 |
 Run 7 (pre-core4): crashes = test_capi (segfault after a lone-surrogate print), test_free_threading
 (deque race, test_collections), test_itertools (flaky; passes now), test_multiprocessing_fork/spawn
 (heap corruption in test_manager); timeouts = asyncio, cmd_line_script, os, subprocess. Largest
@@ -87,13 +88,46 @@ cmd_line 28, call 17, inspect 15, lazy_import 13, descr 13, compile 12, tracebac
 Run 8: crashes = test_free_threading (deque race), test_itertools (count race; fixed by lib6 since),
 test_multiprocessing_fork; timeouts = asyncio, capi, cmd_line_script, multiprocessing_forkserver/spawn, os,
 subprocess. Largest failure counts: importlib 20, call 17, inspect 15, dict 8, concurrent_futures 7.
+Run 9: crashes = test_free_threading (io heap corruption), test_functools (lru_cache race; fixed since), test_super
+(__class__ assignment race), test_multiprocessing_fork/forkserver/spawn; timeouts = asyncio, capi, cmd_line_script,
+os, subprocess. Largest failure counts: importlib 20, call 17, inspect 15, dict 8, concurrent_futures 7.
 Run 3 top blockers: array (39 modules), http (21), urllib (12), multiprocessing (11),
 importlib.resources (11), datetime (11), concurrent (9), xml/email (7 each), html (6).
 Run 1 top blockers: py_compile (230 modules; merged since), unittest.mock (57), doctest (24),
 array (24), socket (17), pathlib (16), http (14), multiprocessing, decimal, datetime, ntpath.
 
 ## Benchmarks
-### Latest (jit5, 2026-11-07; steady-state callgrind instructions per loop, millions; ratio = ours / best CPython)
+### Latest (jit6 + perf3, 2026-11-07; wall-clock ratio ours / best CPython, targeted runs at load ~4, not quiet-machine)
+| bench | jit5 | now | source |
+|---|---|---|---|
+| base64 | 2.98 | 1.45 | perf3 |
+| json_dumps | 2.83 | 1.00–1.06 | perf3 |
+| json_loads | 1.85 | 1.12–1.17 | perf3 |
+| gc_traversal | 2.77 | 1.35 | perf3 |
+| gc_collect | 1.49 | 0.81 | perf3 |
+| meteor_contest | 1.83 | 0.87 | perf3 |
+| sqlite_synth | 1.37 | 0.82 | perf3 |
+| typing_runtime_protocols | 2.34 | 1.86 | perf3 |
+| pathlib | 2.35 | 1.99 | perf3 |
+| deepcopy | 1.86 | 1.54 | perf3 |
+| xml_etree | 1.71 | 1.53 | perf3 |
+| pprint | 1.66 | 1.39 | perf3 |
+| mdp | 2.05 | 1.62–1.65 | jit6 + perf3 |
+| generators | 2.05 | 0.94–1.11 | jit6 |
+| async_generators | 2.04 | 1.34 | jit6 |
+| comprehensions | 1.66 | 1.38 | jit6 |
+| nqueens | 1.40 | 1.30 | jit6 |
+| unpack_sequence | 1.49 | 0.99 | jit6 |
+| go | 1.29 | 1.12 | jit6 |
+| barnes_hut | 1.22 | 1.00 | jit6 |
+| hexiom | 1.02 | 0.84 | jit6 |
+| richards | 0.76 | 0.61 | jit6 |
+Not yet worked on: asyncio_tcp (~2.5–3.3), bpe_tokeniser (~1.7), python_startup (~1.45), logging (~1.4).
+Measured remaining causes: non-inlined Python call ~500 instructions (CPython 150–200) outside jit6's compiled
+call routine; allocation ~100+50 instructions per object; expat allocates a Rust string per token. A full
+quiet-machine pyperformance run (D22) is still due.
+
+### Previous (jit5, 2026-11-07; steady-state callgrind instructions per loop, millions; ratio = ours / best CPython)
 | bench | CPython best | jit4 | jit5 | ratio |
 |---|---|---|---|---|
 | richards | 461.1 | 314.3 | 282.8–322.6 | 0.61–0.70 |

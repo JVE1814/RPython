@@ -50,6 +50,8 @@ macro_rules! iternext {
     ($name:ident, $imp:ident) => {
         unsafe extern "C" fn $name(o: *mut PyObject) -> *mut PyObject {
             unsafe {
+                // the iterator's Rust state is not safe to step from two threads
+                let _lk = crate::objlock::lock(&*o);
                 match $imp(&*o) {
                     Ok(Some(v)) => v.into_raw(),
                     Ok(None) => std::ptr::null_mut(),
@@ -1385,6 +1387,8 @@ unsafe fn teedata_new_impl(tp: *mut PyTypeObject, args: *mut PyObject, kw: *mut 
 tpnew!(teedata_new, teedata_new_impl);
 
 fn teedata_jumplink(d: &PyObject) -> PyResult {
+    // shared by every tee of the group, which may run on different threads
+    let _lk = crate::objlock::lock(d);
     let s = rs::<TeeData>(d);
     if let Some(n) = &s.next {
         return Ok(n.clone());
@@ -1396,19 +1400,27 @@ fn teedata_jumplink(d: &PyObject) -> PyResult {
 }
 
 fn teedata_getitem(d: &PyObject, i: usize) -> PyResult<Option<PyRef>> {
-    let s = rs::<TeeData>(d);
-    if i < s.values.len() {
-        return Ok(Some(s.values[i].clone()));
-    }
-    if s.running {
-        raise!(RuntimeError, "cannot re-enter the tee iterator");
-    }
-    let it = match &s.it {
-        Some(i) => i.clone(),
-        None => return Ok(None),
+    // The lock covers the bookkeeping only, not the call into the source iterator
+    // (it may block, waiting for another thread that uses this tee): the `running`
+    // flag makes a concurrent step fail with "cannot re-enter" instead of waiting.
+    let it = {
+        let _lk = crate::objlock::lock(d);
+        let s = rs::<TeeData>(d);
+        if i < s.values.len() {
+            return Ok(Some(s.values[i].clone()));
+        }
+        if s.running {
+            raise!(RuntimeError, "cannot re-enter the tee iterator");
+        }
+        let it = match &s.it {
+            Some(i) => i.clone(),
+            None => return Ok(None),
+        };
+        s.running = true;
+        it
     };
-    s.running = true;
     let r = ab::iter_next(&it);
+    let _lk = crate::objlock::lock(d);
     let s = rs::<TeeData>(d);
     s.running = false;
     match r? {

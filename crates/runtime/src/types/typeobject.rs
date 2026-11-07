@@ -284,11 +284,16 @@ pub fn instance_dict(o: &PyObject) -> Option<PyRef> {
         if slot.is_null() {
             return None;
         }
-        if (*slot).is_null() {
-            let d = dict::new_dict();
-            *slot = d.into_raw();
+        // create it with a CAS: threads setting the first attribute concurrently must
+        // all end up in the same dict (a plain store lost the other threads' items)
+        let a = std::sync::atomic::AtomicPtr::from_ptr(slot);
+        if a.load(std::sync::atomic::Ordering::Acquire).is_null() {
+            let d = dict::new_dict().into_raw();
+            if a.compare_exchange(std::ptr::null_mut(), d, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire).is_err() {
+                decref(d);
+            }
         }
-        Some(PyRef::from_borrowed(*slot))
+        Some(PyRef::from_borrowed(a.load(std::sync::atomic::Ordering::Acquire)))
     }
 }
 
@@ -569,11 +574,55 @@ pub unsafe extern "C" fn subtype_dealloc(op: *mut PyObject) {
         if b.is_null() || b == object_type() || (*b).tp_dealloc.is_none() {
             generic_free_and_type_decref(op, tp);
         } else {
-            // base dealloc frees memory; it will decref the heap type itself if it
-            // uses generic_free_and_type_decref with the object's type.
-            (*b).tp_dealloc.unwrap()(op);
+            // The base dealloc frees the memory. Who drops the instance's reference to
+            // its heap type: our own deallocs do it themselves
+            // (generic_free_and_type_decref with the object's type); an extension's
+            // heap-type dealloc does it too (Py_DECREF(Py_TYPE(self)), the C-API
+            // contract for heap types); an extension's *static* type knows nothing of
+            // heap types, so the reference is dropped here.
+            let f = (*b).tp_dealloc.unwrap();
+            f(op);
+            if !is_heap_type(b) && !is_own_code(f as usize) {
+                crate::object::decref_type(tp);
+            }
         }
     }
+}
+
+/// Is `addr` inside this executable's code (as opposed to an extension module's)?
+pub fn is_own_code(addr: usize) -> bool {
+    static RANGE: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    let &(lo, hi) = RANGE.get_or_init(|| {
+        // the first object dl_iterate_phdr reports is the main program; take the
+        // executable PT_LOAD segment that contains this very function
+        unsafe extern "C" fn cb(info: *mut libc::dl_phdr_info, _size: usize, data: *mut c_void) -> c_int {
+            unsafe {
+                let out = &mut *(data as *mut (usize, usize));
+                let me = is_own_code as usize;
+                let info = &*info;
+                let (mut lo, mut hi, mut mine) = (usize::MAX, 0usize, false);
+                for i in 0..info.dlpi_phnum as usize {
+                    let ph = &*info.dlpi_phdr.add(i);
+                    if ph.p_type == libc::PT_LOAD && ph.p_flags & libc::PF_X != 0 {
+                        let s = info.dlpi_addr as usize + ph.p_vaddr as usize;
+                        let e = s + ph.p_memsz as usize;
+                        mine |= (s..e).contains(&me);
+                        lo = lo.min(s);
+                        hi = hi.max(e);
+                    }
+                }
+                if mine {
+                    *out = (lo, hi);
+                    return 1;
+                }
+                0
+            }
+        }
+        let mut r = (0usize, 0usize);
+        unsafe { libc::dl_iterate_phdr(Some(cb), &mut r as *mut _ as *mut c_void) };
+        r
+    });
+    (lo..hi).contains(&addr)
 }
 
 unsafe fn clear_slots(tp: *mut PyTypeObject, op: *mut PyObject) {
@@ -821,6 +870,7 @@ pub fn add_subclass(base: *mut PyTypeObject, sub: *mut PyTypeObject) {
             (*base).tp_subclasses = Box::into_raw(Box::new(Vec::<usize>::new())) as *mut c_void;
         }
         let v = &mut *((*base).tp_subclasses as *mut Vec<usize>);
+        crate::object::enable_try_incref(sub as *mut PyObject); // see subclasses()
         if !v.contains(&(sub as usize)) {
             v.push(sub as usize);
         }
@@ -838,14 +888,34 @@ pub fn remove_subclass(base: *mut PyTypeObject, sub: *mut PyTypeObject) {
     }
 }
 
-pub fn subclasses(tp: *mut PyTypeObject) -> Vec<*mut PyTypeObject> {
+/// A subclass reached through `tp_subclasses` (which holds no references), kept
+/// alive while the caller works on it: another thread may drop the last reference
+/// to it at any time (classes are created and freed concurrently).
+pub struct SubType(PyRef);
+impl SubType {
+    #[inline]
+    pub fn p(&self) -> *mut PyTypeObject {
+        self.0.as_ptr() as *mut PyTypeObject
+    }
+    pub fn into_ref(self) -> PyRef {
+        self.0
+    }
+}
+
+/// The live direct subclasses of `tp` (dying ones are skipped).
+pub fn subclasses(tp: *mut PyTypeObject) -> Vec<SubType> {
     let _g = SUBCLASSES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     unsafe {
         if (*tp).tp_subclasses.is_null() {
             return Vec::new();
         }
         let v = &*((*tp).tp_subclasses as *mut Vec<usize>);
-        v.iter().map(|&x| x as *mut PyTypeObject).collect()
+        // a subclass is removed from the list in its dealloc, which needs this lock:
+        // its memory is valid here, and try_incref refuses one that is dying
+        v.iter()
+            .filter(|&&x| crate::object::try_incref(x as *mut PyObject))
+            .map(|&x| SubType(PyRef::from_raw(x as *mut PyObject)))
+            .collect()
     }
 }
 

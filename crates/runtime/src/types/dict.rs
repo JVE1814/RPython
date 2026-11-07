@@ -45,36 +45,62 @@ pub fn is_anydict(o: &PyObject) -> bool {
 
 /// RAII guard for the per-object mutex (`PyObject.ob_mutex`, PyMutex-compatible:
 /// bit 0 = locked). Never hold it while running Python code or decref'ing.
+/// Extension critical sections on an object lock the same mutex
+/// (capi/pythread.rs), so Python-level operations on that object wait for them; a
+/// thread inside its own critical section on the object passes through (`m` null:
+/// nothing to release).
 pub struct ObGuard {
     m: *const AtomicU8,
 }
 impl Drop for ObGuard {
     #[inline(always)]
     fn drop(&mut self) {
-        unsafe { (*self.m).store(0, Release) }
+        if !self.m.is_null() {
+            unsafe { (*self.m).store(0, Release) }
+        }
     }
 }
 /// Lock `o`'s `ob_mutex`.
 #[inline(always)]
 pub fn ob_lock(o: &PyObject) -> ObGuard {
     let m = &o.ob_mutex;
-    if m.compare_exchange_weak(0, 1, Acquire, Relaxed).is_err() {
-        lock_slow(m);
+    if m.compare_exchange_weak(0, 1, Acquire, Relaxed).is_err() && !lock_slow(m) {
+        return ObGuard { m: std::ptr::null() };
     }
     ObGuard { m }
 }
+/// Contended: returns false if the calling thread already holds the mutex through a
+/// critical section. Long waits (a critical section can run arbitrary code) happen in
+/// Blocked mode so that a stop-the-world does not wait for this thread.
 #[cold]
-fn lock_slow(m: &AtomicU8) {
+fn lock_slow(m: &AtomicU8) -> bool {
     let mut spins = 0u32;
     loop {
-        if m.load(Relaxed) == 0 && m.compare_exchange_weak(0, 1, Acquire, Relaxed).is_ok() {
-            return;
+        let v = m.load(Relaxed);
+        if v & 1 == 0 && m.compare_exchange_weak(v, v | 1, Acquire, Relaxed).is_ok() {
+            return true;
         }
         spins += 1;
+        if spins == 1 && crate::capi::pythread::cs_holds_mutex(m as *const AtomicU8 as usize) {
+            return false;
+        }
         if spins < 64 {
             std::hint::spin_loop();
-        } else {
+        } else if spins < 2000 {
             std::thread::yield_now();
+        } else {
+            let ts = crate::threads::current_ptr();
+            if ts.is_null() {
+                std::thread::yield_now();
+                continue;
+            }
+            let ts = unsafe { &*ts };
+            let prev = ts.mode.replace(crate::threads::ThreadMode::Blocked);
+            while m.load(Relaxed) & 1 != 0 {
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+            // back in the VM (may wait for a stopped world) before taking the lock
+            ts.mode.set(prev);
         }
     }
 }
@@ -343,16 +369,70 @@ unsafe fn free_table(p: *mut DictTable) {
     }
 }
 
+/// (perf3) The shared table of dicts created empty: never written, so a dict that
+/// stays empty (a `**kwargs` nobody passed, an unused `{}`) costs no table
+/// allocation. Every write path goes through `table()`, which swaps in a private
+/// table first. Its fields stay valid for lock-free and compiled readers (no
+/// entries, all index slots EMPTY). All empty dicts sharing its version stamps is
+/// sound: they have identical (empty) contents.
+fn empty_table() -> *mut DictTable {
+    static EMPTY: std::sync::atomic::AtomicPtr<DictTable> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+    let p = EMPTY.load(Acquire);
+    if !p.is_null() {
+        return p;
+    }
+    let mut t = DictTable::new(0);
+    // capacity 0 marks the shared table (every private table has room for entries)
+    t.cap = 0;
+    let fresh = alloc_table(t);
+    match EMPTY.compare_exchange(std::ptr::null_mut(), fresh, AcqRel, Acquire) {
+        Ok(_) => fresh,
+        Err(cur) => {
+            unsafe { free_table(fresh) };
+            cur
+        }
+    }
+}
+
 #[inline(always)]
 fn raw_table(d: &PyObject) -> *mut DictTable {
     unsafe {
         let dp = d.as_ptr() as *mut PyDictObject;
-        let mut t = (*dp).ma_keys as *mut DictTable;
-        if t.is_null() {
-            t = alloc_table(DictTable::new(0));
-            (*dp).ma_keys = t as *mut _;
+        let t = (*dp).ma_keys as *mut DictTable;
+        if t.is_null() || (*t).cap == 0 {
+            return private_table(dp);
         }
         t
+    }
+}
+
+#[cold]
+unsafe fn private_table(dp: *mut PyDictObject) -> *mut DictTable {
+    unsafe {
+        // a reader without the lock may get here at the same time as a writer:
+        // only one fresh table may be installed
+        let slot = std::sync::atomic::AtomicPtr::from_ptr(&raw mut (*dp).ma_keys);
+        let seen = slot.load(Acquire);
+        if !seen.is_null() && (*(seen as *mut DictTable)).cap != 0 {
+            return seen as *mut DictTable;
+        }
+        let t = alloc_table(DictTable::new(0));
+        match slot.compare_exchange(seen, t as *mut _, AcqRel, Acquire) {
+            Ok(_) => t,
+            Err(cur) => {
+                free_table(t);
+                cur as *mut DictTable
+            }
+        }
+    }
+}
+
+/// Does `d` still use the shared empty table?
+#[inline(always)]
+unsafe fn is_shared_empty(d: &PyObject) -> bool {
+    unsafe {
+        let t = (*(d.as_ptr() as *mut PyDictObject)).ma_keys as *mut DictTable;
+        !t.is_null() && (*t).cap == 0
     }
 }
 
@@ -360,6 +440,15 @@ fn raw_table(d: &PyObject) -> *mut DictTable {
 #[inline(always)]
 pub fn table(d: &PyObject) -> &mut DictTable {
     unsafe { &mut *raw_table(d) }
+}
+
+/// Table for reading only: may be the shared empty table (never written through).
+#[inline(always)]
+fn table_ro(d: &PyObject) -> &DictTable {
+    unsafe {
+        let t = (*(d.as_ptr() as *mut PyDictObject)).ma_keys as *mut DictTable;
+        if t.is_null() { &*raw_table(d) } else { &*t }
+    }
 }
 
 #[inline(always)]
@@ -389,7 +478,7 @@ pub fn new_dict_presized(n: usize) -> PyRef {
     unsafe {
         let op = alloc::alloc_object(dict_type(), std::mem::size_of::<PyDictObject>());
         let dp = op as *mut PyDictObject;
-        (*dp).ma_keys = alloc_table(DictTable::new(n)) as *mut _;
+        (*dp).ma_keys = if n == 0 { empty_table() } else { alloc_table(DictTable::new(n)) } as *mut _;
         crate::gc::track(op);
         PyRef::from_raw(op)
     }
@@ -409,7 +498,10 @@ pub unsafe fn init_dict_storage(op: *mut PyObject) {
 pub unsafe fn free_storage(op: *mut PyObject) {
     unsafe {
         let dp = op as *mut PyDictObject;
-        if !(*dp).ma_keys.is_null() {
+        if !(*dp).ma_keys.is_null() && (*((*dp).ma_keys as *mut DictTable)).cap == 0 {
+            (*dp).ma_keys = std::ptr::null_mut();
+            (*dp).ma_used = 0;
+        } else if !(*dp).ma_keys.is_null() {
             let t = (*dp).ma_keys as *mut DictTable;
             (*dp).ma_keys = std::ptr::null_mut();
             (*dp).ma_used = 0;
@@ -477,9 +569,9 @@ pub fn find(d: &PyObject, key: &PyObject, hash: isize) -> PyResult<(ObGuard, Fou
     'restart: loop {
         let mut g = ob_lock(d);
         let mut perturb = hash as usize;
-        let mut i = (hash as usize) & table(d).mask();
+        let mut i = (hash as usize) & table_ro(d).mask();
         loop {
-            let t = table(d);
+            let t = table_ro(d);
             let ix = t.indices()[i];
             if ix == EMPTY {
                 return Ok((g, Found::Missing));
@@ -495,6 +587,11 @@ pub fn find(d: &PyObject, key: &PyObject, hash: isize) -> PyResult<(ObGuard, Fou
                         if crate::types::str::str_eq(ek, key) {
                             return Ok((g, Found::At(ix as usize)));
                         }
+                    } else if let Some(eq) = crate::abstract_::plain_eq(ek, key) {
+                        // decided without Python code: the lock stays held (perf3)
+                        if eq {
+                            return Ok((g, Found::At(ix as usize)));
+                        }
                     } else {
                         let layout = t.layout;
                         let ek_owned = ek.to_ref();
@@ -503,7 +600,7 @@ pub fn find(d: &PyObject, key: &PyObject, hash: isize) -> PyResult<(ObGuard, Fou
                         drop(ek_owned);
                         let eq = eq?;
                         g = ob_lock(d);
-                        let t2 = table(d);
+                        let t2 = table_ro(d);
                         if t2.layout != layout || t2.entries().get(ix as usize).map(|x| x.key) != Some(e.key) {
                             drop(g);
                             continue 'restart;
@@ -515,7 +612,7 @@ pub fn find(d: &PyObject, key: &PyObject, hash: isize) -> PyResult<(ObGuard, Fou
                 }
             }
             perturb >>= 5;
-            i = (i.wrapping_mul(5).wrapping_add(perturb).wrapping_add(1)) & table(d).mask();
+            i = (i.wrapping_mul(5).wrapping_add(perturb).wrapping_add(1)) & table_ro(d).mask();
         }
     }
 }
@@ -772,6 +869,9 @@ pub fn remove_at(d: &PyObject, ix: usize, _h: isize) -> (*mut PyObject, *mut PyO
 
 pub fn clear(d: &PyObject) {
     let g = ob_lock(d);
+    if unsafe { is_shared_empty(d) } {
+        return;
+    }
     let t = table(d);
     if t.used == 0 && t.nentries == 0 {
         return;

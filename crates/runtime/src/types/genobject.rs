@@ -1278,8 +1278,7 @@ fn get_name(o: &PyObject) -> PyResult {
 fn set_name(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     match v {
         Some(v) if pystr::is_str(v) => {
-            let old = std::mem::replace(&mut g(o).name, v.to_ref().into_raw());
-            unsafe { xdecref(old) };
+            unsafe { crate::qsbr::swap_field(&raw mut g(o).name, v.to_ref().into_raw()) };
             Ok(())
         }
         _ => raise!(TypeError, "__name__ must be set to a string object"),
@@ -1291,8 +1290,7 @@ fn get_qualname(o: &PyObject) -> PyResult {
 fn set_qualname(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     match v {
         Some(v) if pystr::is_str(v) => {
-            let old = std::mem::replace(&mut g(o).qualname, v.to_ref().into_raw());
-            unsafe { xdecref(old) };
+            unsafe { crate::qsbr::swap_field(&raw mut g(o).qualname, v.to_ref().into_raw()) };
             Ok(())
         }
         _ => raise!(TypeError, "__qualname__ must be set to a string object"),

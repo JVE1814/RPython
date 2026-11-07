@@ -52,12 +52,11 @@ pub unsafe fn opt<'a>(p: *mut PyObject) -> Option<&'a PyObject> {
 #[inline]
 pub unsafe fn set_field(slot: *mut *mut PyObject, v: Option<PyRef>) {
     unsafe {
-        let old = *slot;
-        *slot = match v {
+        let new = match v {
             Some(r) => r.into_raw(),
             None => std::ptr::null_mut(),
         };
-        xdecref(old);
+        crate::qsbr::swap_field(slot, new);
     }
 }
 

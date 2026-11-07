@@ -437,11 +437,11 @@ pub unsafe fn member_get(obj: *mut PyObject, m: *const PyMemberDef) -> PyResult 
             Py_T_STRING_INPLACE => pystr::new_str(&CStr::from_ptr(p as *const std::ffi::c_char).to_string_lossy()),
             Py_T_CHAR => pystr::from_latin1(&[*p]),
             Py_T_OBJECT => {
-                let o = *(p as *const *mut PyObject);
+                let o = std::sync::atomic::AtomicPtr::from_ptr(p as *mut *mut PyObject).load(std::sync::atomic::Ordering::Acquire);
                 if o.is_null() { none::none_ref() } else { PyRef::from_borrowed(o) }
             }
             Py_T_OBJECT_EX => {
-                let o = *(p as *const *mut PyObject);
+                let o = std::sync::atomic::AtomicPtr::from_ptr(p as *mut *mut PyObject).load(std::sync::atomic::Ordering::Acquire);
                 if o.is_null() {
                     let tp = (*obj).type_ptr();
                     raise!(
@@ -469,19 +469,18 @@ pub unsafe fn member_set(obj: *mut PyObject, m: *const PyMemberDef, v: Option<&P
         let v = match v {
             Some(v) => v,
             None => {
-                if (*m).type_code == Py_T_OBJECT_EX {
-                    let old = *(p as *mut *mut PyObject);
+                // object members are read without a lock by other threads: swap
+                // atomically (one of two racing deletes fails) and release through QSBR
+                if (*m).type_code == Py_T_OBJECT_EX || (*m).type_code == Py_T_OBJECT {
+                    let slot = std::sync::atomic::AtomicPtr::from_ptr(p as *mut *mut PyObject);
+                    let old = slot.swap(std::ptr::null_mut(), std::sync::atomic::Ordering::AcqRel);
                     if old.is_null() {
-                        raise!(AttributeError, "'{}' object has no attribute '{}'", type_name((*obj).ty()), nm);
+                        if (*m).type_code == Py_T_OBJECT_EX {
+                            raise!(AttributeError, "'{}' object has no attribute '{}'", type_name((*obj).ty()), nm);
+                        }
+                        return Ok(());
                     }
-                    *(p as *mut *mut PyObject) = std::ptr::null_mut();
-                    decref(old);
-                    return Ok(());
-                }
-                if (*m).type_code == Py_T_OBJECT {
-                    let old = *(p as *mut *mut PyObject);
-                    *(p as *mut *mut PyObject) = std::ptr::null_mut();
-                    xdecref(old);
+                    crate::qsbr::decref_deferred(old);
                     return Ok(());
                 }
                 raise!(TypeError, "can't delete numeric/char attribute");
@@ -539,11 +538,7 @@ pub unsafe fn member_set(obj: *mut PyObject, m: *const PyMemberDef, v: Option<&P
             Py_T_ULONG | Py_T_ULONGLONG => int_member!(u64, i64::MIN as i128, u64::MAX as i128, true),
             Py_T_FLOAT => *(p as *mut f32) = ab::float_value(v)? as f32,
             Py_T_DOUBLE => *(p as *mut f64) = ab::float_value(v)?,
-            Py_T_OBJECT | Py_T_OBJECT_EX => {
-                let old = *(p as *mut *mut PyObject);
-                *(p as *mut *mut PyObject) = v.to_ref().into_raw();
-                xdecref(old);
-            }
+            Py_T_OBJECT | Py_T_OBJECT_EX => crate::qsbr::swap_field(p as *mut *mut PyObject, v.to_ref().into_raw()),
             Py_T_CHAR => {
                 if !pystr::is_str(v) || pystr::str_len(v) != 1 {
                     raise!(TypeError, "expected a character");

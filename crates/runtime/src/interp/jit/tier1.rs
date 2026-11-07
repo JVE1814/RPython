@@ -1385,6 +1385,11 @@ impl<'a> Gen<'a> {
                     let val = self.slot(d - 2);
                     self.a.load(Rax, obj);
                     self.guard_tag(Rax, tag, slow);
+                    // with threads the old value must go through QSBR (lock-free
+                    // readers): leave that to the helper
+                    self.a.mov_ri(Rdi, (&raw const crate::threads::MULTI_THREADED) as i64);
+                    self.a.cmp_mi(M(Rdi, 0), 0);
+                    self.a.jcc(Cc::NE, slow);
                     self.a.load(Rsi, val);
                     self.a.load(Rdx, M(Rax, s.c as i32));
                     self.a.store(M(Rax, s.c as i32), Rsi);

@@ -156,6 +156,12 @@ thread_local! {
     static AUTO_ATTACHED: AutoAttached = const { AutoAttached(Cell::new(std::ptr::null_mut())) };
 }
 
+/// Retire `ts` when the calling OS thread exits, unless it was retired before
+/// (states created for foreign threads by PyGILState_Ensure).
+pub fn retire_at_thread_exit(ts: *mut ThreadState) {
+    let _ = AUTO_ATTACHED.try_with(|g| g.0.set(ts));
+}
+
 #[cold]
 fn attach_new() -> &'static ThreadState {
     let ts = new_thread_state();
@@ -167,6 +173,13 @@ fn attach_new() -> &'static ThreadState {
 }
 
 pub fn new_thread_state() -> *mut ThreadState {
+    if let Some(path) = std::env::var_os("RPY_ATTACH_DEBUG") {
+        // debugging aid: append a backtrace of every thread-state creation to the file
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "new thread state (pid {}):\n{}", std::process::id(), std::backtrace::Backtrace::force_capture());
+        }
+    }
     unsafe {
         let mut c: CThreadState = std::mem::zeroed();
         c.py_recursion_limit = 1000;
@@ -469,7 +482,16 @@ pub fn after_fork_child() {
 /// stop-the-world operations do not wait for it; polls the safepoint on return.
 #[inline]
 pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
-    let ts = current();
+    // A thread without an attached state (inside Py_BEGIN_ALLOW_THREADS, or a C thread
+    // that never entered Python) is already safe for stop-the-world: do not attach a
+    // new state here. (Attaching made a second, never-detached InVm state for a
+    // thread blocking on a PyThread lock while detached; it stalled QSBR and every
+    // stop-the-world for the rest of the process.)
+    let p = current_ptr();
+    if p.is_null() {
+        return f();
+    }
+    let ts = unsafe { &*p };
     let prev = ts.mode.replace(ThreadMode::Blocked);
     let r = f();
     ts.mode.set(prev);

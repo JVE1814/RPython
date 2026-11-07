@@ -55,7 +55,7 @@ pub unsafe extern "C" fn Py_REFCNT(o: *mut PyObject) -> Py_ssize_t {
         if local == IMMORTAL_REFCNT_LOCAL {
             return (3isize) << 30;
         }
-        local as isize + ((*o).ob_ref_shared.load(Relaxed) >> REF_SHARED_SHIFT)
+        crate::object::visible_refcnt(&*o)
     }
 }
 

@@ -128,11 +128,23 @@ fn mon_use_tool_id(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     m.names[tool] = Some(args[1].to_ref().into_raw() as usize);
     Ok(none::none_ref())
 }
-fn clear_tool(m: &mut st::MonState, tool: usize) {
+/// Objects whose references were taken out of the monitoring state: released after
+/// MON is unlocked (a callback's deallocation can run Python code, which fires
+/// monitoring events and takes MON again: self-deadlock).
+struct Released(Vec<usize>);
+impl Drop for Released {
+    fn drop(&mut self) {
+        for &p in &self.0 {
+            unsafe { xdecref(p as *mut PyObject) };
+        }
+    }
+}
+
+fn clear_tool(m: &mut st::MonState, tool: usize, out: &mut Released) {
     m.global[tool] = 0;
     for ev in 0..EVENT_NAMES.len() {
         let old = std::mem::replace(&mut m.callbacks[tool][ev], 0);
-        unsafe { xdecref(old as *mut PyObject) };
+        out.0.push(old);
     }
     for (_, (_, l)) in m.local.iter_mut() {
         l[tool] = 0;
@@ -142,21 +154,29 @@ fn clear_tool(m: &mut st::MonState, tool: usize) {
 }
 fn mon_clear_tool_id(_m: &PyObject, t: &PyObject) -> PyResult {
     let tool = tool_arg(t)?;
-    let mut m = MON.lock().unwrap();
-    if m.names[tool].is_some() {
-        clear_tool(&mut m, tool);
+    let mut rel = Released(Vec::new());
+    {
+        let mut m = MON.lock().unwrap();
+        if m.names[tool].is_some() {
+            clear_tool(&mut m, tool, &mut rel);
+        }
     }
+    drop(rel);
     Ok(none::none_ref())
 }
 fn mon_free_tool_id(_m: &PyObject, t: &PyObject) -> PyResult {
     let tool = tool_arg(t)?;
-    let mut m = MON.lock().unwrap();
-    if m.names[tool].is_some() {
-        clear_tool(&mut m, tool);
-        if let Some(n) = m.names[tool].take() {
-            unsafe { decref(n as *mut PyObject) };
+    let mut rel = Released(Vec::new());
+    {
+        let mut m = MON.lock().unwrap();
+        if m.names[tool].is_some() {
+            clear_tool(&mut m, tool, &mut rel);
+            if let Some(n) = m.names[tool].take() {
+                rel.0.push(n);
+            }
         }
     }
+    drop(rel);
     Ok(none::none_ref())
 }
 fn mon_get_tool(_m: &PyObject, t: &PyObject) -> PyResult {
@@ -172,20 +192,25 @@ fn mon_register_callback(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     let tool = tool_arg(args[0])?;
     let ev = event_arg(args[1])?;
     crate::modules::sys_full::audit("sys.monitoring.register_callback", &[args[2]])?;
-    let mut m = MON.lock().unwrap();
-    // registering (or clearing) a callback does not require the tool to be in use
-    let nv = if args[2].is(none::none()) { 0 } else { args[2].to_ref().into_raw() as usize };
-    let evs: Vec<usize> = if ev == 18 { vec![8, 9] } else { vec![ev] };
-    let mut old = 0usize;
-    for (i, e) in evs.iter().enumerate() {
-        let nvi = if i > 0 && nv != 0 { unsafe { incref(nv as *mut PyObject); nv } } else { nv };
-        let o = std::mem::replace(&mut m.callbacks[tool][*e], nvi);
-        if i == 0 {
-            old = o;
-        } else {
-            unsafe { xdecref(o as *mut PyObject) };
+    let mut rel = Released(Vec::new());
+    let old = {
+        let mut m = MON.lock().unwrap();
+        // registering (or clearing) a callback does not require the tool to be in use
+        let nv = if args[2].is(none::none()) { 0 } else { args[2].to_ref().into_raw() as usize };
+        let evs: Vec<usize> = if ev == 18 { vec![8, 9] } else { vec![ev] };
+        let mut old = 0usize;
+        for (i, e) in evs.iter().enumerate() {
+            let nvi = if i > 0 && nv != 0 { unsafe { incref(nv as *mut PyObject); nv } } else { nv };
+            let o = std::mem::replace(&mut m.callbacks[tool][*e], nvi);
+            if i == 0 {
+                old = o;
+            } else {
+                rel.0.push(o);
+            }
         }
-    }
+        old
+    };
+    drop(rel);
     Ok(if old == 0 { none::none_ref() } else { unsafe { PyRef::from_raw(old as *mut PyObject) } })
 }
 fn mon_get_events(_m: &PyObject, t: &PyObject) -> PyResult {

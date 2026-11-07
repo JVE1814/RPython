@@ -199,6 +199,7 @@ fn set_collection_flag_recursive(tp: *mut PyTypeObject, flag: std::ffi::c_ulong)
         }
         (*tp).tp_flags = ((*tp).tp_flags & !COLLECTION_FLAGS) | flag;
         for sub in crate::types::typeobject::subclasses(tp) {
+            let sub = sub.p();
             set_collection_flag_recursive(sub, flag);
         }
     }

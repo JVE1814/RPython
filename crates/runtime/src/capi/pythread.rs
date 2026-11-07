@@ -51,7 +51,18 @@ pub(crate) fn mutex_lock(m: &AtomicU8) {
         if v & HAS_PARKED == 0 && m.compare_exchange(v, v | HAS_PARKED, Relaxed, Relaxed).is_err() {
             continue;
         }
-        let _ = b.cv.wait_timeout(g, Duration::from_millis(5)).unwrap();
+        // parked threads count as blocked (the holder may be waiting for a
+        // stop-the-world); re-enter the VM only after dropping the bucket lock
+        let ts = crate::threads::current_ptr();
+        if ts.is_null() {
+            let _ = b.cv.wait_timeout(g, Duration::from_millis(5)).unwrap();
+        } else {
+            let ts = unsafe { &*ts };
+            let prev = ts.mode.replace(crate::threads::ThreadMode::Blocked);
+            let r = b.cv.wait_timeout(g, Duration::from_millis(5)).unwrap();
+            drop(r);
+            ts.mode.set(prev);
+        }
     }
 }
 pub(crate) fn mutex_unlock(m: &AtomicU8) {
@@ -167,8 +178,19 @@ fn key_unlock(key: usize) {
     drop(held);
     s.freed.notify_all();
 }
+/// A critical section on an object locks the object's own `ob_mutex` (stability2): the
+/// runtime's leaf lock on that object (`dict::ob_lock`, used by every Python-level
+/// operation on dicts, lists, sets, bytearrays, ...) then waits for the section, as in
+/// CPython, and passes through for the thread holding it (`cs_holds_mutex`). (The
+/// separate lock table below is no longer used for objects.)
 fn object_key(op: *mut PyObject) -> *mut u8 {
-    (op as usize | KEY_OBJECT) as *mut u8
+    unsafe { (&raw const (*op).ob_mutex) as *mut u8 }
+}
+
+/// Does the calling thread hold mutex `key` through an active critical section?
+pub(crate) fn cs_holds_mutex(key: usize) -> bool {
+    let ts = crate::threads::current_ptr();
+    !ts.is_null() && unsafe { held_by_me(ts, key) }
 }
 
 /// The two lock keys of the record a chain link points at (0 = none).
@@ -401,8 +423,9 @@ pub unsafe extern "C" fn PyThread_acquire_lock_timed(l: *mut c_void, microsecond
             return 0;
         }
         let deadline = if microseconds > 0 { Some(Instant::now() + Duration::from_micros(microseconds as u64)) } else { None };
-        let ts = crate::threads::current();
-        let old = ts.mode.replace(crate::threads::ThreadMode::Blocked);
+        // a detached caller (no current state) is already safe: never attach one here
+        let tsp = crate::threads::current_ptr();
+        let old = if tsp.is_null() { None } else { Some((*tsp).mode.replace(crate::threads::ThreadMode::Blocked)) };
         let r = loop {
             if !*g {
                 *g = true;
@@ -419,11 +442,13 @@ pub unsafe extern "C" fn PyThread_acquire_lock_timed(l: *mut c_void, microsecond
                 None => Duration::from_millis(50),
             };
             g = lk.cv.wait_timeout(g, wait).unwrap().0;
-            if intr_flag != 0 && ts.c.eval_breaker.load(Relaxed) & crate::threads::EVAL_SIGNALS != 0 {
+            if intr_flag != 0 && !tsp.is_null() && (*tsp).c.eval_breaker.load(Relaxed) & crate::threads::EVAL_SIGNALS != 0 {
                 break 2;
             }
         };
-        ts.mode.set(old);
+        if let Some(old) = old {
+            (*tsp).mode.set(old);
+        }
         r
     }
 }

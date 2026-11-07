@@ -112,6 +112,18 @@ pub unsafe fn decref_deferred(p: *mut PyObject) {
     retire(Item::Decref(p));
 }
 
+/// Store `new` (an owned reference or null) into an object field that other threads
+/// read without a lock (getters taking a new reference to the current value), and
+/// release the previous value once no such reader can still hold the old pointer.
+pub unsafe fn swap_field(slot: *mut *mut PyObject, new: *mut PyObject) {
+    unsafe {
+        let old = std::sync::atomic::AtomicPtr::from_ptr(slot).swap(new, AcqRel);
+        if !old.is_null() {
+            decref_deferred(old);
+        }
+    }
+}
+
 /// Free raw storage `p` with `f` once no thread can still be reading it lock-free.
 pub unsafe fn free_deferred(p: *mut u8, f: unsafe fn(*mut u8)) {
     if !multi_threaded() {
@@ -272,6 +284,57 @@ pub fn thread_exit() {
             let ts = unsafe { &*(*t as *const ThreadState) };
             ts.c.eval_breaker.fetch_or(EVAL_QSBR, Release);
         }
+    }
+}
+
+/// The caller is at a quiescent point and wants deferred releases done as far as
+/// possible right now (thread join: references the joined thread dropped while other
+/// threads existed sit in batches it handed over at exit; `Thread.join()` followed by
+/// a weakref check must see them released). With no other attached thread, every
+/// pending item of this thread and every orphaned batch is released immediately.
+pub fn quiesce_now() {
+    if crate::threads::current_ptr().is_null() {
+        return;
+    }
+    let r = my_rec();
+    r.seen.store(GLOBAL.load(SeqCst), Release);
+    if std::env::var_os("RPY_QSBR_DEBUG").is_some() {
+        eprintln!("qsbr: quiesce mt={} pending={} orphans={}", multi_threaded(), PENDING_TOTAL.load(SeqCst), ORPHANS.lock().unwrap().len());
+    }
+    if !multi_threaded() {
+        close_batch();
+        poll();
+        return;
+    }
+    // Other threads are running: ask them to report a quiescent state and wait a
+    // little (the caller is blocking in join anyway) for the orphaned batches of the
+    // joined thread to mature. Threads in native/blocked mode count as quiescent, so
+    // this only waits for threads executing Python, which poll at backedges and calls.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+    loop {
+        poll();
+        let pending_orphans = !ORPHANS.lock().unwrap().is_empty();
+        if !pending_orphans || std::time::Instant::now() >= deadline {
+            if pending_orphans && std::env::var_os("RPY_QSBR_DEBUG").is_some() {
+                let recs = RECS.lock().unwrap();
+                eprintln!("qsbr: orphans left; LIVE={} GLOBAL={}", LIVE.load(SeqCst), GLOBAL.load(SeqCst));
+                for &t in crate::threads::ALL_THREADS.lock().unwrap().iter() {
+                    let ts = unsafe { &*(t as *const ThreadState) };
+                    let seen = recs.iter().find(|r| r.ts == t).map(|r| r.seen.load(SeqCst));
+                    eprintln!("  ts {:#x} alive={} mode={:?} seen={:?} me={} tid={} native={} gil={} frame={:?}", t, ts.alive(), ts.mode.get(), seen, t == me() as usize, ts.c.thread_id, ts.c.native_thread_id, ts.c.gilstate_counter, ts.frame.get());
+                }
+            }
+            break;
+        }
+        let me = me() as usize;
+        for t in crate::threads::ALL_THREADS.lock().unwrap().iter() {
+            if *t != me {
+                let ts = unsafe { &*(*t as *const ThreadState) };
+                ts.c.eval_breaker.fetch_or(EVAL_QSBR, Release);
+            }
+        }
+        crate::threads::blocking(|| std::thread::sleep(std::time::Duration::from_micros(200)));
+        r.seen.store(GLOBAL.load(SeqCst), Release);
     }
 }
 

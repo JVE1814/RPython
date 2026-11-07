@@ -414,6 +414,35 @@ pub unsafe extern "C" fn type_vectorcall(
         let nargs = nargsf & !PY_VECTORCALL_ARGUMENTS_OFFSET;
         let nkw = if kwnames.is_null() { 0 } else { tuple::tuple_len(&*kwnames) };
         let tp = callable as *mut PyTypeObject;
+        // perf3: one-argument conversions through the builtin types themselves
+        // (str(x), type(x), tuple(x), list(x)) without an args tuple
+        if nkw == 0 && nargs == 1 {
+            let a = &**args;
+            if tp == pystr::str_type() {
+                return into_c(ab::str(a));
+            }
+            if tp == type_type() {
+                return type_ref(a.type_ptr()).into_raw();
+            }
+            if tp == tuple::tuple_type() {
+                if list::is_list_exact(a) {
+                    return list::list_to_tuple(a).into_raw();
+                }
+                return into_c(ab::sequence_tuple(a));
+            }
+            if tp == crate::types::weakref::ref_type() {
+                return into_c(crate::types::weakref::new_ref(tp, a, None));
+            }
+            if tp == list::list_type() {
+                // exact-size copies of lists and tuples (like list.__init__)
+                if tuple::is_tuple_exact(a) {
+                    return list::new_list_from_slice(tuple::tuple_items(a)).into_raw();
+                }
+                if list::is_list_exact(a) {
+                    return list::new_list(list::list_to_vec(a)).into_raw();
+                }
+            }
+        }
         // perf-runtime: instantiate ordinary classes without an args tuple / kwargs
         // dict: object.__new__ + a Python __init__ called with self prepended.
         if (*tp).tp_new == Some(object_new)
@@ -424,6 +453,17 @@ pub unsafe extern "C" fn type_vectorcall(
                 if funcobject::is_function(&init) {
                     return instantiate_with_init(tp, &init, args, nargs, kwnames, nkw);
                 }
+            }
+        }
+        // perf3: a Python `__new__` (staticmethod on a class without a metaclass, so
+        // `cls.__new__` is that function) and a Python `__init__` or none: both are
+        // called with the vector arguments, no args tuple / kwargs dict in between.
+        if (*tp).tp_new == Some(crate::types::slots::slot_tp_new)
+            && (*callable).type_ptr() == type_type()
+            && (*tp).tp_flags & Py_TPFLAGS_IS_ABSTRACT == 0
+        {
+            if let Some(r) = instantiate_with_new(tp, args, nargs, kwnames, nkw) {
+                return r;
             }
         }
         let all = if nargs == 0 { &[][..] } else { std::slice::from_raw_parts(args, nargs) };
@@ -438,6 +478,90 @@ pub unsafe extern "C" fn type_vectorcall(
             }
         }
         type_call(callable, t.as_ptr(), d.as_ptr())
+    }
+}
+
+/// `type_call` for a class whose `__new__` is a plain Python function; None when the
+/// class does not qualify (the caller then takes the generic path).
+unsafe fn instantiate_with_new(
+    tp: *mut PyTypeObject,
+    args: *const *mut PyObject,
+    nargs: usize,
+    kwnames: *mut PyObject,
+    nkw: usize,
+) -> Option<*mut PyObject> {
+    unsafe {
+        let newf = lookup(tp, name!("__new__"))?;
+        if !newf.is_type(funcobject::staticmethod_type()) {
+            return None;
+        }
+        let newf = funcobject::sm_callable(&newf)?.to_ref();
+        if !funcobject::is_function(&newf) {
+            return None;
+        }
+        let n = nargs + nkw;
+        let mut buf = [std::ptr::null_mut::<PyObject>(); 9];
+        let mut heap_buf: Vec<*mut PyObject>;
+        let argv: &mut [*mut PyObject] = if n < buf.len() {
+            &mut buf[..n + 1]
+        } else {
+            heap_buf = vec![std::ptr::null_mut(); n + 1];
+            &mut heap_buf[..]
+        };
+        argv[0] = tp as *mut PyObject;
+        if n > 0 {
+            std::ptr::copy_nonoverlapping(args, argv.as_mut_ptr().add(1), n);
+        }
+        let kn = if nkw == 0 { None } else { Some(&*kwnames) };
+        let obj = match crate::interp::call_function(&newf, argv, nargs + 1, kn) {
+            Ok(o) => o,
+            Err(_) => return Some(std::ptr::null_mut()),
+        };
+        let ot = obj.type_ptr();
+        if !is_subtype(ot, tp) {
+            return Some(obj.into_raw());
+        }
+        match (*ot).tp_init {
+            None => {}
+            Some(f) if f as usize == object_init as usize => {}
+            Some(f)
+                if f as usize == crate::types::slots::slot_tp_init as usize
+                    && lookup(ot, name!("__init__")).is_some_and(|i| funcobject::is_function(&i)) =>
+            {
+                if let Some(init) = lookup(ot, name!("__init__")) {
+                    argv[0] = obj.as_ptr();
+                    let r = crate::interp::call_function(&init, argv, nargs + 1, kn);
+                    match r {
+                        Ok(r) if r.is(none::none()) => {}
+                        Ok(r) => {
+                            let _ = err!(TypeError, "__init__() should return None, not '{}'", type_name(r.ty()));
+                            return Some(std::ptr::null_mut());
+                        }
+                        Err(_) => return Some(std::ptr::null_mut()),
+                    }
+                }
+            }
+            Some(f) => {
+                // some other C-level __init__: give it the usual tuple and dict
+                let all = if nargs == 0 { &[][..] } else { std::slice::from_raw_parts(args, nargs) };
+                let t = tuple::new_tuple_from_ptrs(all);
+                let d = if nkw == 0 {
+                    None
+                } else {
+                    let d = dict::new_dict();
+                    for i in 0..nkw {
+                        if dict::set_item(&d, tuple::tuple_get(&*kwnames, i), &**args.add(nargs + i)).is_err() {
+                            return Some(std::ptr::null_mut());
+                        }
+                    }
+                    Some(d)
+                };
+                if f(obj.as_ptr(), t.as_ptr(), d.as_ref().map_or(std::ptr::null_mut(), |d| d.as_ptr())) < 0 {
+                    return Some(std::ptr::null_mut());
+                }
+            }
+        }
+        Some(obj.into_raw())
     }
 }
 
@@ -776,10 +900,13 @@ fn type_set_bases(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         // conflict), everything goes back to how it was and the error propagates
         if (*tp).tp_bases == ours {
             let mut changed: Vec<(*mut PyTypeObject, *mut PyObject)> = Vec::new();
+            let mut keep = Vec::new(); // keeps the subclasses in `changed` alive
             let mut todo = subclasses(tp);
             let mut seen = std::collections::HashSet::new();
             let mut failed = false;
-            while let Some(sub) = todo.pop() {
+            while let Some(subr) = todo.pop() {
+                let sub = subr.p();
+                keep.push(subr);
                 if !seen.insert(sub as usize) {
                     continue;
                 }
@@ -829,7 +956,8 @@ fn type_set_bases(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         // inherited slots of all subclasses may come from the new bases
         let mut todo = subclasses(tp);
         let mut seen = std::collections::HashSet::new();
-        while let Some(sub) = todo.pop() {
+        while let Some(subr) = todo.pop() {
+            let sub = subr.p();
             if seen.insert(sub as usize) {
                 crate::types::slots::fixup_slots(sub);
                 todo.extend(subclasses(sub));
@@ -1000,7 +1128,7 @@ fn type_mro_method(o: &PyObject) -> PyResult {
     Ok(list::new_list(tuple::tuple_to_vec(&r)))
 }
 fn type_subclasses_method(o: &PyObject) -> PyResult {
-    Ok(list::new_list(subclasses(t(o)).into_iter().map(type_ref).collect()))
+    Ok(list::new_list(subclasses(t(o)).into_iter().map(|s| s.into_ref()).collect()))
 }
 fn type_instancecheck(o: &PyObject, inst: &PyObject) -> PyResult {
     let tp = t(o);
@@ -1595,9 +1723,8 @@ fn subtype_set_dict(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         if crate::alloc::has_managed(o.as_ptr()) {
             o.ob_gc_bits.fetch_or(crate::alloc::GC_BIT_DICT_DETACHED, std::sync::atomic::Ordering::Relaxed);
         }
-        let old = *slot;
-        *slot = v.map_or(std::ptr::null_mut(), |v| v.to_ref().into_raw());
-        xdecref(old);
+        // readers take the dict without a lock: the old one goes through QSBR
+        crate::qsbr::swap_field(slot, v.map_or(std::ptr::null_mut(), |v| v.to_ref().into_raw()));
     }
     Ok(())
 }

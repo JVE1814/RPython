@@ -167,6 +167,15 @@ pub fn init_all() -> crate::errors::PyResult<()> {
     memoryview::ready()?;
     str_methods::ready_types()?;
     lang_init()?;
+    // perf3: str(x), tuple(x), list(x) dispatch through type_vectorcall, which
+    // handles one-argument conversions without building an argument tuple
+    for t in [str::str_type(), tuple::tuple_type(), list::list_type(), weakref::ref_type()] {
+        unsafe {
+            if (*t).tp_vectorcall.is_none() {
+                (*t).tp_vectorcall = Some(object_type::type_vectorcall);
+            }
+        }
+    }
     Ok(())
 }
 

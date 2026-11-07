@@ -132,6 +132,23 @@ pub fn table(mut v: Vec<PyMethodDef>) -> *mut PyMethodDef {
     Box::leak(v.into_boxed_slice()).as_mut_ptr()
 }
 
+/// Make every method in `tp`'s method table run with `objlock::lock(self)` held
+/// (types whose Rust state is not safe to share between threads otherwise).
+pub unsafe fn lock_self_methods(tp: *mut PyTypeObject) {
+    unsafe {
+        let mut m = (*tp).tp_methods;
+        if m.is_null() {
+            return;
+        }
+        while !(*m).ml_name.is_null() {
+            if (*m).ml_flags & (METH_CLASS | METH_STATIC) == 0 {
+                (*m).ml_flags |= METH_LOCKSELF;
+            }
+            m = m.add(1);
+        }
+    }
+}
+
 /// `mdefs![ ("name", O, func, "doc"), ... ]`
 #[macro_export]
 macro_rules! mdefs {
@@ -173,7 +190,12 @@ pub unsafe fn call_methoddef(
     qualname: &dyn Fn() -> String,
 ) -> PyResult {
     unsafe {
-        let flags = (*ml).ml_flags & !(METH_CLASS | METH_STATIC | METH_COEXIST);
+        let flags = (*ml).ml_flags & !(METH_CLASS | METH_STATIC | METH_COEXIST | METH_LOCKSELF);
+        let _locked = if (*ml).ml_flags & METH_LOCKSELF != 0 && !slf.is_null() {
+            Some(crate::objlock::lock(&*slf))
+        } else {
+            None
+        };
         let nkw = if kwnames.is_null() { 0 } else { crate::types::tuple::tuple_len(&*kwnames) };
         let npos = args.len() - nkw;
         let meth = (*ml).ml_meth;

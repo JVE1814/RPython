@@ -535,6 +535,14 @@ unsafe extern "C" fn handle_repr(op: *mut PyObject) -> *mut PyObject {
 fn handle_ident(o: &PyObject) -> PyResult {
     Ok(int::new_int_u128(hinner(o).ident.load(Relaxed) as u128))
 }
+/// After a successful join, the joined thread's last reference drops must be visible:
+/// merge what it queued for this thread and release what it retired through QSBR
+/// (deferred because another thread existed at the time; usually none does now).
+fn after_join() {
+    crate::threads::process_merge_queue(crate::threads::current());
+    crate::qsbr::quiesce_now();
+}
+
 fn handle_join(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
     static P: crate::args::Params = crate::args::Params::new("join", &["timeout"], 0, 0);
     let [t] = crate::args::parse::<1>(&P, args, kw)?;
@@ -549,7 +557,10 @@ fn handle_join(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRes
     let h = handle_arc(o);
     match h.effective_state() {
         HState::NotStarted => raise!(RuntimeError, "thread not started"),
-        HState::Done => return Ok(none::none_ref()),
+        HState::Done => {
+            after_join();
+            return Ok(none::none_ref());
+        }
         _ => {}
     }
     if h.ident.load(Relaxed) == my_ident() {
@@ -566,11 +577,8 @@ fn handle_join(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRes
         |s| *s == HState::Done || h.lost_by_fork(fgen),
         timeout,
     )?;
-    // references the finished thread dropped on objects this thread owns were queued for
-    // a refcount merge: apply them now, so the caller sees the objects freed
-    let ts = crate::threads::current();
-    if ts.c.eval_breaker.load(Relaxed) & crate::threads::EVAL_MERGE_REFCOUNTS != 0 {
-        crate::threads::process_merge_queue(ts);
+    if h.effective_state() == HState::Done {
+        after_join();
     }
     Ok(none::none_ref())
 }
@@ -1021,25 +1029,23 @@ unsafe extern "C" fn local_dealloc(op: *mut PyObject) {
         if let Some(m) = LIVE_LOCALS.lock().unwrap().as_mut() {
             m.remove(&(*l).id);
         }
+        let dicts: Vec<usize> = (*l).dicts.lock().unwrap().drain().map(|(_, d)| d).collect();
+        for d in dicts {
+            decref(d as *mut PyObject);
+        }
+        xdecref(std::mem::replace(&mut (*l).args, std::ptr::null_mut()));
+        xdecref(std::mem::replace(&mut (*l).kw, std::ptr::null_mut()));
         let tp = (*op).type_ptr();
-        // (hang1) subclass slots / managed dict are cleared first: a subclass's
-        // tp_clear chains to local_clear, which drains `dicts` -- after the
-        // map was dropped that was a use-after-free that corrupted the malloc
-        // heap (test_multiprocessing_*.test_manager aborts)
         if crate::types::typeobject::is_heap_type(tp) {
+            // clear subclass slots / managed dict (a subclass's tp_clear ends in
+            // local_clear, so the dict map must still be valid here)
             if let Some(clear) = (*tp).tp_clear {
                 if clear as usize != local_clear as usize {
                     clear(op);
                 }
             }
         }
-        let dicts: Vec<usize> = (*l).dicts.lock().unwrap().drain().map(|(_, d)| d).collect();
-        for d in dicts {
-            decref(d as *mut PyObject);
-        }
         std::ptr::drop_in_place(&raw mut (*l).dicts);
-        xdecref((*l).args);
-        xdecref((*l).kw);
         crate::types::typeobject::generic_free_and_type_decref(op, tp);
     }
 }

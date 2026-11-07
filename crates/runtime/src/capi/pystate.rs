@@ -221,13 +221,25 @@ pub unsafe extern "C" fn PyGILState_Ensure() -> c_int {
         }
         let mut g = gilstate();
         if g.is_null() {
+            // a thread the runtime does not know (C-created): its state lives until the
+            // matching outermost Release, or until the OS thread exits
             g = new_tstate(interp_ptr());
+            (*g).c.gilstate_counter = 0;
             GILSTATE.with(|c| c.set(g));
+            ENSURE_CREATED.with(|c| c.set(g));
+            threads::retire_at_thread_exit(g);
         }
         attach(g);
         (*g).c.gilstate_counter += 1;
         1
     }
+}
+
+thread_local! {
+    /// The state PyGILState_Ensure created for this OS thread (deleted when its count
+    /// returns to zero). Leaked states piled up (pandas: 100+), kept QSBR from
+    /// releasing anything and made every stop-the-world scan them.
+    static ENSURE_CREATED: Cell<*mut ThreadState> = const { Cell::new(std::ptr::null_mut()) };
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyGILState_Release(state: c_int) {
@@ -238,6 +250,13 @@ pub unsafe extern "C" fn PyGILState_Release(state: c_int) {
         }
         (*ts).c.gilstate_counter -= 1;
         if state == 1 {
+            if (*ts).c.gilstate_counter <= 0 && ENSURE_CREATED.with(|c| c.get()) == ts {
+                // outermost Release of a state Ensure created: delete it
+                ENSURE_CREATED.with(|c| c.set(std::ptr::null_mut()));
+                GILSTATE.with(|c| c.set(std::ptr::null_mut()));
+                threads::thread_exit(); // detaches (CURRENT = null) and recycles it
+                return;
+            }
             (*ts).mode.set(ThreadMode::InNative);
             threads::set_current(std::ptr::null_mut());
         }

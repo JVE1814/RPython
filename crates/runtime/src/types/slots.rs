@@ -675,6 +675,7 @@ pub fn update_slot(tp: *mut PyTypeObject, attr: &PyObject) {
             update_one_slot(tp, s);
         }
         for sub in subclasses(tp) {
+            let sub = sub.p();
             if is_heap_type(sub) {
                 rec(sub, slots);
             }
@@ -724,8 +725,15 @@ fn update_one_slot(tp: *mut PyTypeObject, slot: Slot) {
         if slot == Slot::TpNew {
             // __new__ is a staticmethod wrapping tp_new_wrapper of a builtin type
             if let Some(t) = crate::types::descr::tp_new_wrapper_type(&descr) {
-                if !use_generic && (chosen.is_null() || chosen == unsafe { (*t).tp_new.map_or(std::ptr::null_mut(), |f| f as *mut c_void) }) {
-                    chosen = unsafe { (*t).tp_new.map_or(std::ptr::null_mut(), |f| f as *mut c_void) };
+                // The allocation must suit the instance layout, which comes from the
+                // solid base (tp_base), not from whichever base comes first in the MRO:
+                // `class E(PlainExtBase, ExtWithFields)` must use ExtWithFields' tp_new
+                // (it initialises the C fields; the other one would leave them NULL).
+                let base = unsafe { (*tp).tp_base };
+                let own = if !base.is_null() && unsafe { (*base).tp_new.is_some() } && !is_subtype(t, base) { base } else { t };
+                let f = unsafe { (*own).tp_new.map_or(std::ptr::null_mut(), |f| f as *mut c_void) };
+                if !use_generic && (chosen.is_null() || chosen == f) {
+                    chosen = f;
                     continue;
                 }
             }
@@ -782,6 +790,7 @@ pub fn type_modified(tp: *mut PyTypeObject) {
         (*tp).tp_version_tag = 0;
         (*tp).tp_flags &= !Py_TPFLAGS_VALID_VERSION_TAG;
         for s in subclasses(tp) {
+            let s = s.p();
             type_modified(s);
         }
     }
@@ -1323,7 +1332,7 @@ pub unsafe extern "C" fn slot_tp_init(s: *mut PyObject, args: *mut PyObject, kw:
         }
     }
 }
-unsafe extern "C" fn slot_tp_new(tp: *mut PyTypeObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
+pub unsafe extern "C" fn slot_tp_new(tp: *mut PyTypeObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
     unsafe {
         let f = match crate::abstract_::getattr(type_obj(tp), name!("__new__")) {
             Ok(f) => f,
