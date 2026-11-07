@@ -1133,8 +1133,9 @@ fn baiter_length_hint(o: &PyObject) -> PyResult {
     Ok(int::new_int(n.max(0) as i64))
 }
 fn baiter_reduce(o: &PyObject) -> PyResult {
+    let f = crate::builtins::eval_builtin("iter")?;
     let (seq, index) = baiter_snapshot(o);
-    bm::iter_reduce(seq.as_ref().map_or(std::ptr::null_mut(), |s| s.as_ptr()), index)
+    bm::iter_reduce(f, seq.as_ref().map_or(std::ptr::null_mut(), |s| s.as_ptr()), index)
 }
 fn baiter_setstate(o: &PyObject, state: &PyObject) -> PyResult {
     let it = unsafe { &mut *(o.as_ptr() as *mut BaIter) };

@@ -503,7 +503,7 @@ fn fastiter_reduce(o: &PyObject) -> PyResult {
     let stop = int::new_int_i128(it.start as i128 + it.len as i128 * it.step as i128);
     let step = int::new_int(it.step);
     let rng = make_range(start, stop, step)?;
-    let iter_fn = crate::builtins::builtin("iter")?;
+    let iter_fn = crate::builtins::eval_builtin("iter")?;
     Ok(tuple::new_tuple(vec![iter_fn, tuple::new_tuple(vec![rng]), int::new_int(0)]))
 }
 fn fastiter_setstate(o: &PyObject, state: &PyObject) -> PyResult {
@@ -557,7 +557,7 @@ fn longiter_reduce(o: &PyObject) -> PyResult {
     let start = obj(it.start).to_ref();
     let stop = add(&start, &*mul(obj(it.len), obj(it.step))?)?;
     let rng = make_range(start, stop, obj(it.step).to_ref())?;
-    let iter_fn = crate::builtins::builtin("iter")?;
+    let iter_fn = crate::builtins::eval_builtin("iter")?;
     Ok(tuple::new_tuple(vec![iter_fn, tuple::new_tuple(vec![rng]), int::new_int(0)]))
 }
 fn longiter_setstate(o: &PyObject, state: &PyObject) -> PyResult {

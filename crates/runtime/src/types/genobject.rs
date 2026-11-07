@@ -76,6 +76,13 @@ pub fn g(o: &PyObject) -> &mut GenObject {
 }
 
 pub fn new_generator_for(frame: Box<Frame>, func: &PyObject, flags: u32) -> PyResult {
+    let fo = crate::types::funcobject::func(func);
+    unsafe { new_generator_named(frame, &*fo.func_name, &*fo.func_qualname, flags) }
+}
+
+/// (core6) A generator/coroutine over `frame` named explicitly (code run by eval/exec with
+/// top-level await has no function).
+pub fn new_generator_named(frame: Box<Frame>, name: &PyObject, qualname: &PyObject, flags: u32) -> PyResult {
     let tp = if flags & bc::co::COROUTINE != 0 {
         coro_type()
     } else if flags & bc::co::ASYNC_GENERATOR != 0 {
@@ -86,9 +93,8 @@ pub fn new_generator_for(frame: Box<Frame>, func: &PyObject, flags: u32) -> PyRe
     unsafe {
         let op = crate::alloc::alloc_object(tp, std::mem::size_of::<GenObject>());
         let gn = &mut *(op as *mut GenObject);
-        let fo = crate::types::funcobject::func(func);
-        gn.name = (*fo.func_name).to_ref().into_raw();
-        gn.qualname = (*fo.func_qualname).to_ref().into_raw();
+        gn.name = name.to_ref().into_raw();
+        gn.qualname = qualname.to_ref().into_raw();
         gn.code = (*frame).code().to_ref().into_raw();
         let fp = Box::into_raw(frame);
         (*fp).generator = op;

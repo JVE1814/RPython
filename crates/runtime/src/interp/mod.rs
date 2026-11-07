@@ -124,6 +124,8 @@ pub fn call_function(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwna
             && flags & (bc::co::VARARGS | bc::co::VARKEYWORDS) == 0
             && cobj.co_kwonlyargcount == 0
             && !code::code_data(co).eager_prologue
+            // (module-level code with top-level await stores names: general path)
+            && flags & bc::co::OPTIMIZED != 0
         {
             let mut frame = Frame::new_call(co, func, unsafe { &*f.func_globals }, unsafe { &*f.func_builtins });
             for (i, &a) in args[..nargs].iter().enumerate() {
@@ -609,6 +611,18 @@ pub fn eval_code(code: &PyObject, globals: &PyObject, locals: Option<&PyObject>)
         }
     };
     let frame = Frame::new(code, None, globals, &builtins, locals);
+    run_or_wrap(frame)
+}
+
+/// Run a frame of module-level code; code compiled with top-level await (a coroutine
+/// flag on non-function code) gives the coroutine to run instead, as CPython's eval does.
+fn run_or_wrap(mut frame: Box<Frame>) -> PyResult {
+    let co = frame.code().to_ref();
+    let flags = code::code(&co).flags();
+    if flags & (bc::co::GENERATOR | bc::co::COROUTINE | bc::co::ASYNC_GENERATOR) != 0 {
+        frame.make_owned();
+        return crate::types::genobject::new_generator_named(frame, &code::code_name(&co), &code::code_qualname(&co), flags);
+    }
     run_frame(frame)
 }
 
@@ -624,7 +638,7 @@ pub fn eval_code_with_closure(code: &PyObject, globals: &PyObject, locals: Optio
             for (i, cell) in tuple::tuple_items(c).iter().enumerate() {
                 frame.slots[nlp - n + i] = cell.to_ref().into_raw();
             }
-            run_frame(frame)
+            run_or_wrap(frame)
         }
     }
 }

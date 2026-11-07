@@ -1188,7 +1188,7 @@ fn setiter_len(o: &PyObject) -> PyResult {
     Ok(int::new_int(n.max(0) as i64))
 }
 fn setiter_reduce(o: &PyObject) -> PyResult {
-    let iter_fn = crate::builtins::builtin("iter")?;
+    let iter_fn = crate::builtins::eval_builtin("iter")?;
     let it = unsafe { &*(o.as_ptr() as *mut SetIter) };
     let mut items = Vec::new();
     if !it.set.is_null() {

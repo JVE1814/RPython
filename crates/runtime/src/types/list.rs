@@ -1188,7 +1188,7 @@ fn listreviter_len(o: &PyObject) -> PyResult {
     Ok(int::new_int(n as i64))
 }
 fn builtin_fn(name: &str) -> PyResult {
-    crate::builtins::builtin(name)
+    crate::builtins::eval_builtin(name)
 }
 fn listiter_reduce(o: &PyObject) -> PyResult {
     let iter_fn = builtin_fn("iter")?;

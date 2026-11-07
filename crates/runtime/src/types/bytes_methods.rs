@@ -2175,8 +2175,9 @@ fn bytesiter_length_hint(o: &PyObject) -> PyResult {
     Ok(int::new_int(n.max(0) as i64))
 }
 /// (iter, (seq,), index) / (iter, ((),)) — shared by the bytes-like iterators.
-pub fn iter_reduce(seq: *mut PyObject, index: isize) -> PyResult {
-    let it = crate::builtins::builtin("iter")?;
+/// `it` is the builtin `iter`, looked up before the iterator state is read (the lookup can
+/// run Python code that advances the iterator).
+pub fn iter_reduce(it: PyRef, seq: *mut PyObject, index: isize) -> PyResult {
     if seq.is_null() {
         return Ok(tuple::new_tuple(vec![it, tuple::new_tuple(vec![tuple::empty_tuple()])]));
     }
@@ -2184,8 +2185,9 @@ pub fn iter_reduce(seq: *mut PyObject, index: isize) -> PyResult {
     Ok(tuple::new_tuple(vec![it, tuple::new_tuple(vec![s]), int::new_int(index as i64)]))
 }
 fn bytesiter_reduce(o: &PyObject) -> PyResult {
+    let f = crate::builtins::eval_builtin("iter")?;
     let it = unsafe { &*(o.as_ptr() as *mut BytesIter) };
-    iter_reduce(it.seq, it.index)
+    iter_reduce(f, it.seq, it.index)
 }
 fn bytesiter_setstate(o: &PyObject, state: &PyObject) -> PyResult {
     let it = unsafe { &mut *(o.as_ptr() as *mut BytesIter) };

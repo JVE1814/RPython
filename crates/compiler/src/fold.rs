@@ -34,13 +34,15 @@ struct Folder<'w> {
     /// `from __future__ import annotations`: annotations are unparsed later and must keep
     /// their source form (no folding).
     string_annotations: bool,
+    /// (core6) replace `__debug__` by its value even at optimisation level 0 (PyCF_OPTIMIZED_AST)
+    fold_debug: bool,
 }
 
 type R = Result<(), CompileError>;
 
 pub fn fold_module(m: &mut Mod, optimize: i32, future: u32, warnings: &mut Vec<Warning>, max_depth: u32) -> R {
     let string_annotations = future & crate::cf::CO_FUTURE_ANNOTATIONS != 0;
-    let mut f = Folder { optimize, full: true, warnings: Some(warnings), depth: 0, max_depth, ctx: Vec::new(), string_annotations };
+    let mut f = Folder { optimize, full: true, warnings: Some(warnings), depth: 0, max_depth, ctx: Vec::new(), string_annotations, fold_debug: false };
     f.fold_mod(m)
 }
 
@@ -48,15 +50,17 @@ pub fn fold_module(m: &mut Mod, optimize: i32, future: u32, warnings: &mut Vec<W
 /// only (constant expressions are folded by the CFG optimiser, as in CPython 3.14+).
 pub fn fold_module_ast_only(m: &mut Mod, optimize: i32, future: u32, warnings: &mut Vec<Warning>, max_depth: u32) -> R {
     let string_annotations = future & crate::cf::CO_FUTURE_ANNOTATIONS != 0;
-    let mut f = Folder { optimize, full: false, warnings: Some(warnings), depth: 0, max_depth, ctx: Vec::new(), string_annotations };
+    let mut f = Folder { optimize, full: false, warnings: Some(warnings), depth: 0, max_depth, ctx: Vec::new(), string_annotations, fold_debug: false };
     f.fold_mod(m)
 }
 
 pub fn optimize_ast(m: &mut Mod, optimize: i32, _flags: u32) -> R {
     if optimize <= 0 {
-        return Ok(());
+        // only `__debug__` is replaced (by True)
+        let mut f = Folder { optimize, full: false, warnings: None, depth: 0, max_depth: crate::DEFAULT_MAX_DEPTH, ctx: Vec::new(), string_annotations: false, fold_debug: true };
+        return f.fold_mod(m);
     }
-    let mut f = Folder { optimize, full: false, warnings: None, depth: 0, max_depth: crate::DEFAULT_MAX_DEPTH, ctx: Vec::new(), string_annotations: false };
+    let mut f = Folder { optimize, full: false, warnings: None, depth: 0, max_depth: crate::DEFAULT_MAX_DEPTH, ctx: Vec::new(), string_annotations: false, fold_debug: true };
     f.fold_mod(m)?;
     if optimize >= 2 {
         strip_docstrings_mod(m);
@@ -1135,7 +1139,7 @@ impl<'w> Folder<'w> {
             }
             ExprKind::Starred { value, .. } => self.fold_expr(value)?,
             ExprKind::Name { id, ctx } => {
-                if *ctx == ExprContext::Load && id == "__debug__" && (self.full || self.optimize > 0) {
+                if *ctx == ExprContext::Load && id == "__debug__" && (self.full || self.optimize > 0 || self.fold_debug) {
                     replace = Some(mk_const(Constant::Bool(self.optimize <= 0), loc));
                 }
             }

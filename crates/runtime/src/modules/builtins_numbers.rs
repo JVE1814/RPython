@@ -124,12 +124,14 @@ fn b_sum(_m: &PyObject, a: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
                 s.add(float::float_value(&item));
                 continue;
             }
-            if int::is_int(&item) {
-                if let Some(v) = int::as_i64(&item) {
-                    if v.unsigned_abs() < (1u64 << 53) {
-                        s.add(v as f64);
+            if int::is_int_exact(&item) || crate::types::bool_::is_bool(&item) {
+                // (core6) any int that converts to a float joins the compensated sum
+                match int::to_f64(&item) {
+                    Ok(v) => {
+                        s.add(v);
                         continue;
                     }
+                    Err(_) => crate::errors::clear_exc(),
                 }
             }
             result = add(&float::new_float(s.value()), &item)?;
@@ -156,12 +158,13 @@ fn b_sum(_m: &PyObject, a: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
                 re.add(float::float_value(&item));
                 continue;
             }
-            if int::is_int(&item) {
-                if let Some(v) = int::as_i64(&item) {
-                    if v.unsigned_abs() < (1u64 << 53) {
-                        re.add(v as f64);
+            if int::is_int_exact(&item) || crate::types::bool_::is_bool(&item) {
+                match int::to_f64(&item) {
+                    Ok(v) => {
+                        re.add(v);
                         continue;
                     }
+                    Err(_) => crate::errors::clear_exc(),
                 }
             }
             result = add(&complex::new_complex(re.value(), im.value()), &item)?;

@@ -596,7 +596,7 @@ fn tupleiter_len(o: &PyObject) -> PyResult {
 }
 fn tupleiter_reduce(o: &PyObject) -> PyResult {
     let it = ti(o);
-    let iter_fn = crate::builtins::builtin("iter")?;
+    let iter_fn = crate::builtins::eval_builtin("iter")?;
     if it.seq.is_null() {
         return Ok(new_tuple(vec![iter_fn, new_tuple(vec![empty_tuple()])]));
     }

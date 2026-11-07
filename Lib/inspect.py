@@ -1571,11 +1571,16 @@ def _signature_get_user_defined_method(cls, method_name, *,
         method = getattr_static(cls, method_name, None)
     if method is None:
         return None
-    if follow_wrapper_chains and method_name != "__new__":
-        # (__new__ is looked up bound; unwrapping a bound method would
-        # lose the binding, so its wrapper chain is followed by the caller)
-        method = unwrap(method, stop=(lambda m: hasattr(m, "__signature__")
-                                      or _signature_is_builtin(m)))
+    if follow_wrapper_chains:
+        unwrapped = unwrap(method, stop=(lambda m: hasattr(m, "__signature__")
+                                         or _signature_is_builtin(m)))
+        if method_name != "__new__":
+            method = unwrapped
+        elif isinstance(unwrapped, _NonUserDefinedCallables):
+            # a wrapper around a builtin __new__ (e.g. warnings.deprecated)
+            return None
+        # (otherwise __new__ stays as looked up, bound: unwrapping a bound
+        # method would lose the binding; the caller follows the chain)
     if isinstance(method, _NonUserDefinedCallables):
         return None
     if method_name != '__new__':
