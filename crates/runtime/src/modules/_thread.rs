@@ -608,6 +608,8 @@ fn spawn_thread(func: PyRef, args: PyRef, kwargs: Option<PyRef>, handle: Arc<Han
     let started2 = started.clone();
     let ss = STACK_SIZE.load(Relaxed);
     let builder = std::thread::Builder::new().stack_size(if ss == 0 { DEFAULT_STACK } else { ss });
+    // (jit5) single-threaded fast paths stop before the second thread exists
+    crate::threads::MULTI_THREADED.store(1, std::sync::atomic::Ordering::SeqCst);
     THREAD_COUNT.fetch_add(1, Relaxed);
     let res = builder.spawn(move || {
         let (f, a, k) = (f, a, k);

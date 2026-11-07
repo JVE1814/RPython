@@ -237,6 +237,136 @@ pub fn gen_send_fast(o: &PyObject, arg: *mut PyObject) -> PyResult<SendResult> {
     r
 }
 
+/// Outcome of `jit_send`.
+pub const JS_YIELD: u32 = 0;
+pub const JS_RETURN: u32 = 1;
+pub const JS_ERROR: u32 = 2;
+/// the lean path does not apply (nothing consumed or changed)
+pub const JS_SLOW: u32 = 3;
+
+/// Lean resumption for compiled ForIter/Send (jit5): `o` is an exact generator or
+/// coroutine, `v` the value to send (owned; NULL = None, as for next()). When the
+/// generator is suspended (or just created, for None) in compiled code it is resumed
+/// right here, with only the bookkeeping the compiled continuation needs, and
+/// (status, value) is returned: JS_YIELD with the yielded value, JS_RETURN with the
+/// return value (the generator is finished), JS_ERROR with the exception set (also
+/// finished). Anything else returns JS_SLOW without consuming `v`.
+#[inline(always)]
+pub unsafe fn jit_send(ts: &crate::threads::ThreadState, o: *mut PyObject, v: *mut PyObject) -> (u32, *mut PyObject) {
+    use crate::interp::jit::tier1::ST_YIELD;
+    unsafe {
+        let gn = &mut *(o as *mut GenObject);
+        let fp = gn.frame;
+        if fp.is_null() || (*fp).resume == 0 {
+            return (JS_SLOW, std::ptr::null_mut());
+        }
+        let f = &mut *fp;
+        let none = none::none().as_ptr();
+        let push = match f.state {
+            FrameState::Suspended => true,
+            FrameState::Created if v.is_null() || v == none => false,
+            _ => return (JS_SLOW, std::ptr::null_mut()),
+        };
+        if crate::modules::sys::tracing_active() || !crate::interp::jit::genfast_enabled() {
+            return (JS_SLOW, std::ptr::null_mut());
+        }
+        let depth = ts.recursion_depth.get() + 1;
+        if depth > ts.c.py_recursion_limit || crate::interp::stack_pointer() < ts.stack_soft_limit() {
+            return (JS_SLOW, std::ptr::null_mut());
+        }
+        let flag = &*(&raw mut gn.running as *const std::sync::atomic::AtomicBool);
+        // claim: while only one thread exists (threads set MULTI_THREADED before the
+        // second one starts) nobody can race the claim, so a plain store does (a
+        // locked compare-exchange costs ~20 cycles per resumption)
+        if crate::threads::MULTI_THREADED.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return (JS_SLOW, std::ptr::null_mut());
+            }
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        } else if flag.compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire).is_err() {
+            return (JS_SLOW, std::ptr::null_mut());
+        }
+        if push {
+            let x = if v.is_null() {
+                incref(none);
+                none
+            } else {
+                v
+            };
+            *f.slots.as_mut_ptr().add(f.stack_top) = x;
+            f.stack_top += 1;
+        } else if !v.is_null() {
+            decref(v);
+        }
+        ts.recursion_depth.set(depth);
+        let tsm = ts as *const _ as *mut crate::threads::ThreadState;
+        gn.exc_state.previous_item = (*tsm).c.exc_info;
+        (*tsm).c.exc_info = &mut gn.exc_state;
+        let prev = ts.frame.get();
+        f.prev = prev;
+        ts.frame.set(fp);
+        f.state = FrameState::Executing;
+        let target = f.resume;
+        f.resume = 0;
+        let mut out: *mut PyObject = std::ptr::null_mut();
+        let st = crate::interp::jit::enter_registered(ts, f, target, &mut out);
+        if st == ST_YIELD {
+            ts.frame.set(prev);
+            f.prev = std::ptr::null_mut();
+            ts.recursion_depth.set(depth - 1);
+            (*tsm).c.exc_info = gn.exc_state.previous_item;
+            gn.exc_state.previous_item = std::ptr::null_mut();
+            f.state = FrameState::Suspended;
+            flag.store(false, std::sync::atomic::Ordering::Release);
+            return (JS_YIELD, out);
+        }
+        jit_send_end(ts, gn, fp, prev, depth, st, out)
+    }
+}
+
+/// The resumed generator returned, raised or deoptimised (`jit_send`).
+#[cold]
+#[inline(never)]
+unsafe fn jit_send_end(ts: &crate::threads::ThreadState, gn: &mut GenObject, fp: *mut Frame, prev: *mut Frame, depth: i32, st: u32, out: *mut PyObject) -> (u32, *mut PyObject) {
+    use crate::interp::jit::tier1::{ST_RETURN, ST_YIELD};
+    unsafe {
+        let f = &mut *fp;
+        let r = match st {
+            ST_RETURN => {
+                f.clear_stack();
+                Ok(crate::interp::Exit::Return(PyRef::from_raw(out)))
+            }
+            _ => crate::interp::jit::continue_in_interp(ts, f, st),
+        };
+        ts.frame.set(prev);
+        f.prev = std::ptr::null_mut();
+        ts.recursion_depth.set(depth - 1);
+        let tsm = ts as *const _ as *mut crate::threads::ThreadState;
+        (*tsm).c.exc_info = gn.exc_state.previous_item;
+        gn.exc_state.previous_item = std::ptr::null_mut();
+        let flag = &*(&raw mut gn.running as *const std::sync::atomic::AtomicBool);
+        let res = match r {
+            Ok(crate::interp::Exit::Yield(v)) => {
+                f.state = FrameState::Suspended;
+                (JS_YIELD, v.into_raw())
+            }
+            Ok(crate::interp::Exit::Return(v)) => {
+                f.state = FrameState::Completed;
+                finish(gn);
+                (JS_RETURN, v.into_raw())
+            }
+            Err(_) => {
+                f.state = FrameState::Completed;
+                finish(gn);
+                (JS_ERROR, std::ptr::null_mut())
+            }
+        };
+        let _ = ST_YIELD;
+        flag.store(false, std::sync::atomic::Ordering::Release);
+        res
+    }
+}
+
 #[inline(always)]
 fn resume_compiled(ts: &crate::threads::ThreadState, gn: &mut GenObject, f: &mut Frame, arg: *mut PyObject, depth: i32) -> PyResult<SendResult> {
     use crate::interp::jit::tier1::{ST_RETURN, ST_YIELD};
@@ -581,12 +711,46 @@ fn gen_throw(o: &PyObject, args: &[&PyObject]) -> PyResult {
     gen_throw_impl(o, args[0], args.get(1).copied(), args.get(2).copied(), true)
 }
 
+/// (jit5) Can closing this suspended generator skip throwing GeneratorExit into it?
+/// True when it is suspended at a plain `yield` whose only enclosing exception handler
+/// is the compiler's implicit StopIteration -> RuntimeError wrapper (the public RESUME
+/// after the yield carries the "exception depth 1" flag): nothing in the generator can
+/// observe the exception, so the effect is just finishing the frame. (An abandoned
+/// `any(x for x in ...)` closes its generator on every call.)
+fn close_without_throw(gn: &GenObject) -> bool {
+    if gn.running || crate::modules::sys::tracing_active() {
+        return false;
+    }
+    let f = unsafe { &*gn.frame };
+    if f.state != FrameState::Suspended || f.yield_from_send != -1 || !f.frame_obj.is_null() {
+        return false;
+    }
+    let co = f.code();
+    let m = crate::types::code::code_meta(co);
+    if !m.public {
+        return false;
+    }
+    let cd = crate::types::code::code_data(co);
+    let Some(&off) = cd.pub_of_internal.get(f.next_instr as usize) else { return false };
+    let code = crate::types::bytes::bytes_data(&m.co_code);
+    let k = off as usize * 2;
+    if k + 1 >= code.len() || code[k] != crate::interp::wc::op::RESUME {
+        return false;
+    }
+    let arg = code[k + 1];
+    arg & 3 == 1 && arg & 8 != 0
+}
+
 pub fn gen_close(o: &PyObject) -> PyResult {
     let gn = g(o);
     if gn.frame.is_null() {
         return Ok(none::none_ref());
     }
     if unsafe { (*gn.frame).state == FrameState::Created } {
+        finish(gn);
+        return Ok(none::none_ref());
+    }
+    if close_without_throw(gn) {
         finish(gn);
         return Ok(none::none_ref());
     }

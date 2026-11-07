@@ -189,3 +189,47 @@ print(r)
 class E(A):
     pass
 print(poly(3), [o.get() for o in (E(1), A(2))])
+
+# jit5: a generic attribute lookup that runs code changing a class the compiled code
+# has type facts about
+class Ax:
+    def __init__(self):
+        self.v = 1
+    def m(self):
+        return 'old'
+
+class Bx:
+    def __getattr__(self, name):
+        if name == 'v' and Bx.mutate:
+            Ax.m = lambda self: 'new'
+            Bx.mutate = False
+        return 2
+Bx.mutate = False
+
+class Cx:
+    def __init__(self):
+        self.v = 3
+
+def facts(objs, a):
+    out = []
+    for o in objs:
+        r1 = a.m()
+        w = o.v            # polymorphic site with a generic slow path (Bx)
+        r2 = a.m()         # must see a class change made by Bx.__getattr__
+        out.append((r1, w, r2))
+    return out
+
+def run_facts():
+    a = Ax()
+    objs = [Ax(), Cx()] * 3
+    res = None
+    for k in range(400):
+        if k == 390:
+            Bx.mutate = True
+            res = facts(objs + [Bx()] + objs, a)
+        else:
+            facts(objs, a)
+    Ax.m = lambda self: 'old'
+    return res
+
+print(run_facts())

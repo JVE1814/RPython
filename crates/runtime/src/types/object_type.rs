@@ -244,6 +244,7 @@ fn object_set_class(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         );
     }
     // shapes belong to the old type: move inline values into a real dict first
+    crate::interp::cache::TYPE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     crate::shape::materialize(o);
     unsafe {
         incref(new as *mut PyObject);

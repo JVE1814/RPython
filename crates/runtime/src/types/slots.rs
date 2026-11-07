@@ -778,6 +778,7 @@ fn update_one_slot(tp: *mut PyTypeObject, slot: Slot) {
 /// Invalidate any per-type caches (method cache, version tag).
 pub fn type_modified(tp: *mut PyTypeObject) {
     unsafe {
+        crate::interp::cache::TYPE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         (*tp).tp_version_tag = 0;
         (*tp).tp_flags &= !Py_TPFLAGS_VALID_VERSION_TAG;
         for s in subclasses(tp) {
