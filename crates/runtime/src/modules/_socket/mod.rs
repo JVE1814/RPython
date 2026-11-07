@@ -38,8 +38,8 @@ pub fn sock_type() -> *mut PyTypeObject {
     &raw mut SOCK_TYPE
 }
 
-pub static HERROR: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
-pub static GAIERROR: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
+pub static HERROR: crate::subinterp::InterpPtr = crate::subinterp::InterpPtr::new(); // (interp1) per interpreter
+pub static GAIERROR: crate::subinterp::InterpPtr = crate::subinterp::InterpPtr::new(); // (interp1) per interpreter
 
 /// Default timeout for new sockets (ns, -1 = None).
 static DEFAULT_TIMEOUT: AtomicI64 = AtomicI64::new(-1);
