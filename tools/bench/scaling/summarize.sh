@@ -11,12 +11,16 @@
 #              meaningful on a loaded machine while the wall-clock speedup may not.
 #   kept     = runs kept / runs made, per thread count
 #   vs-ft    = our median wall / py-ft median wall at the same N (below 1 = we are faster)
+# STAT=min uses the best run instead of the median (wall: best kept run; CPU: best of all
+# runs). Interference from other processes only ever adds time, so on a loaded machine
+# the minimum is the better estimate of the undisturbed cost.
 RAW="${1:?usage: summarize.sh raw.tsv}"
-awk -F'\t' '
+awk -F'\t' -v stat="${STAT:-median}" '
 function median(s,    a, n, i, j, t) {
   n = split(s, a, " ")
   if (n == 0) return ""
   for (i = 2; i <= n; i++) { t = a[i] + 0; for (j = i - 1; j >= 1 && a[j] + 0 > t; j--) a[j + 1] = a[j]; a[j + 1] = t }
+  if (stat == "min") return a[1]
   if (n % 2) return a[(n + 1) / 2]
   return (a[n / 2] + a[n / 2 + 1]) / 2
 }
@@ -34,7 +38,7 @@ END {
   for (i = 1; i <= nn; i++) for (j = i + 1; j <= nn; j++) if (ns[j] + 0 < ns[i] + 0) { t = ns[i]; ns[i] = ns[j]; ns[j] = t }
   for (i = 1; i <= ni; i++) for (w = 1; w <= nw; w++) for (x = 1; x <= nn; x++) {
     k = impls[i] SUBSEP wls[w] SUBSEP ns[x]
-    if (kept[k] > 0) { W[k] = median(kw[k]); C[k] = median(kc[k]); M[k] = "" }
+    if (kept[k] > 0) { W[k] = median(kw[k]); C[k] = median(stat == "min" ? all_c[k] : kc[k]); M[k] = "" }
     else if (made[k] > 0) { W[k] = median(all_w[k]); C[k] = median(all_c[k]); M[k] = "*" }
   }
   hdr = "| workload |"; sep = "|---|"
@@ -43,7 +47,7 @@ END {
     hdr = hdr " " impls[i] " cpu-infl@" ns[nn] " |"; sep = sep "---|"
   }
   hdr = hdr " ours/ft wall@1 | ours/ft wall@" ns[nn] " |"; sep = sep "---|---|"
-  print "Speedup (throughput vs 1 thread) and CPU inflation; medians of kept runs"
+  print "Speedup (throughput vs 1 thread) and CPU inflation; " (stat == "min" ? "best runs" : "medians of kept runs")
   print hdr; print sep
   for (w = 1; w <= nw; w++) {
     line = "| " wls[w] " |"

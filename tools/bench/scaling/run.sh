@@ -68,4 +68,4 @@ for rep in $(seq "$REPS"); do
     done
   done
 done
-bash "$HERE/summarize.sh" "$RAW" | tee "$OUT/summary.txt"
+{ bash "$HERE/summarize.sh" "$RAW"; echo; STAT=min bash "$HERE/summarize.sh" "$RAW"; } | tee "$OUT/summary.txt"
