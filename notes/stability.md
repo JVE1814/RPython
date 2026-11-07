@@ -226,3 +226,37 @@ type_refcount_drift, deque_race, weakref_race, shared_objects, join_releases).
   are behavioural: bz2 (compressor returns the header on the first call), lzma decompressor,
   tokenize (`tokenize._tokenize` missing), threading (`_testinternalcapi.test_stop_the_world`
   missing).
+* test_free_threading final pass (all 57 modules, one by one, merged master): no crash or
+  hang (test_readline needed two more fixes: QSBR for the hook slots, delims under the
+  lock). Behavioural failures left: bz2/lzma (above), tokenize, threading
+  (test_stop_the_world helper missing), dict_watcher (dict watchers never fire: known gap).
+* pandas 3.1.0 full suite in one process (`tools/wheels/run_numpy_tests.sh -t pandas`): all
+  ~215k tests ran to 100% (before: crash on the first MultiIndex test; earlier runs of this
+  branch crawled at 70% because of the leaked thread states, items 15/16). The process then
+  aborted while pytest built the junit XML (StringIO growth under `ulimit -v 6 GB`; now a
+  MemoryError; peak RSS ~3.8 GB, worth a look: StringIO stores 4 bytes per character).
+  Failures/errors: 6,877 ours vs 4,706 baseline (same wheels), 2,320 only on ours, 149 only on
+  the baseline. Largest ours-only clusters (behavioural, not stability): io/json (pandas'
+  ujson encoder raises "Maximum recursion level reached" for every Series: some C-API type
+  check it relies on fails; also on master), io/test_clipboard (360), arithmetic/
+  test_datetime64 (tz `utcoffset()` returns None inside tslibs: 'NoneType' has no
+  'total_seconds'), io/sas, tseries/offsets, tslibs/test_timezones. Lists: /tmp/s2/only_ours.txt.
+* numpy test_hashtable concurrent: 50/50 runs without a hang (was ~1/20). The likely cause
+  was the unlocked deque in threading.Condition's waiter list (lost notify).
+* bitarray: full suite 740 passed; test_free_threading mutable-exporter 10/10.
+* test_capi runs to the end (1,531 tests); test_threading completes (run6: TIMEOUT) and
+  test_no_refcycle_through_target passes in the full run.
+
+## Not done / next steps
+* objlock is held across Python callbacks (itertools next(), deque searches, I/O): two
+  threads locking two objects in opposite orders can deadlock (CPython avoids this by
+  suspending critical sections on contention). tee releases its lock around the source
+  iterator; the others do not.
+* QSBR still delays finalizers while several threads run (perf-runtime's design note);
+  `join` now flushes, but `del x` in a threaded program can see `__del__` run a few polls
+  later than CPython.
+* Not re-run after the fixes: test_multiprocessing_* manager heap corruption (coordinator
+  item 2; likely fixed by the file-object/deque locking), test_io write/readline races,
+  test_ssl, test_subprocess/test_cmd_line_script timeouts.
+* Remaining Rust-state objects without locking (not seen crashing): ElementTree, pyexpat
+  parsers, curses/tkinter objects, _pickle Pickler/Unpickler, _json scanners.
