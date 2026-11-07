@@ -1745,6 +1745,11 @@ fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyResult
                             let e = popref!(f);
                             check_exc_match_type(&t, true)?;
                             let (rest, matched) = crate::types::exceptiongroup::eg_match(&e, &t)?;
+                            if !matched.is(none::none()) && !crate::types::exceptiongroup::is_exception_group(&e) {
+                                // the wrapper of a naked exception starts its traceback at
+                                // this except* clause
+                                add_traceback(f, &matched);
+                            }
                             if !matched.is(none::none()) {
                                 // the matched group becomes the handled exception
                                 let prev = set_handled_exception(ts, matched.clone().into_raw());
