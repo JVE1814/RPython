@@ -673,6 +673,27 @@ unsafe extern "C" fn wrapper_descr_call(d: *mut PyObject, args: *mut PyObject, k
     }
 }
 
+/// (perf4) Call of a method-wrapper (`obj.__eq__`) or slot wrapper descriptor
+/// (`object.__init__`) with positional arguments, without the argument tuple the
+/// tp_call protocol needs. None: not such an object.
+pub unsafe fn call_wrapper_fast(callable: &PyObject, args: &[*mut PyObject]) -> Option<*mut PyObject> {
+    unsafe {
+        let refs: &[&PyObject] = std::slice::from_raw_parts(args.as_ptr() as *const &PyObject, args.len());
+        let tp = callable.type_ptr();
+        if tp == &raw mut _PyMethodWrapper_Type {
+            let mw = callable.as_ptr() as *mut MethodWrapper;
+            return Some(into_c(wrapper_call_impl((*mw).descr, &*(*mw).slf, refs, None)));
+        }
+        if tp == &raw mut PyWrapperDescr_Type && !refs.is_empty() {
+            if descr_check(callable, refs[0]).is_err() {
+                return Some(std::ptr::null_mut());
+            }
+            return Some(into_c(wrapper_call_impl(callable.as_ptr(), refs[0], &refs[1..], None)));
+        }
+        None
+    }
+}
+
 unsafe extern "C" fn method_wrapper_call(w: *mut PyObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
     unsafe {
         let mw = w as *mut MethodWrapper;

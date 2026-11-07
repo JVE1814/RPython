@@ -57,6 +57,18 @@ def ident(x):
     return x
 
 
+def raiser(a):
+    raise AttributeError(a)
+
+
+def catcher(a):
+    try:
+        raiser(a)
+    except AttributeError:
+        return 1
+    return 0
+
+
 def run(n, kind):
     o = C(1)
     if kind == 'kw':
@@ -107,6 +119,16 @@ def run(n, kind):
     elif kind == 'posmany':
         for i in range(n):
             posmany(i, i, i, i)
+    elif kind == 'exc':
+        for i in range(n):
+            catcher(i)
+    elif kind == 'keyerror':
+        d = {}
+        for i in range(n):
+            try:
+                d[i]
+            except KeyError:
+                pass
     elif kind == 'alloc':
         for i in range(n):
             (i, i)

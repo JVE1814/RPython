@@ -144,6 +144,12 @@ pub unsafe fn vectorcall_raw(
         let nargs = nargsf & !PY_VECTORCALL_ARGUMENTS_OFFSET;
         let nkw = if kwnames.is_null() { 0 } else { tuple::tuple_len(&*kwnames) };
         let all = if nargs + nkw == 0 { &[][..] } else { std::slice::from_raw_parts(args, nargs + nkw) };
+        if nkw == 0 {
+            // (perf4) slot wrappers without an argument tuple
+            if let Some(r) = crate::types::descr::call_wrapper_fast(callable, all) {
+                return check_result(callable, r);
+            }
+        }
         let t = tuple::new_tuple_from_ptrs(&all[..nargs]);
         let kw = if nkw > 0 {
             let d = dict::new_dict();

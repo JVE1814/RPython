@@ -96,7 +96,9 @@ unsafe extern "C" fn frame_dealloc(op: *mut PyObject) {
             f.owned = std::ptr::null_mut();
             f.frame = std::ptr::null_mut();
             b.frame_obj = std::ptr::null_mut();
-            drop(b);
+            // (perf4) back to the frame pool (a traceback frame used to cost a fresh
+            // frame allocation for a later call)
+            crate::interp::frame::recycle(b);
         } else if !f.frame.is_null() {
             (*f.frame).frame_obj = std::ptr::null_mut();
         }

@@ -371,6 +371,10 @@ fn run_call_frame(ts: &ThreadState, mut frame: Box<Frame>, tramp: usize, target:
 pub(crate) fn finish_in_interp(ts: &ThreadState, mut frame: Box<Frame>, st: u32) -> PyResult {
     if st == tier1::ST_DEOPT {
         opt::note_deopt(&crate::types::code::code_data(frame.code()).caches, &frame);
+    } else if st == tier1::ST_ERROR && crate::interp::eval::unwind_compiled_error(ts, &mut frame) {
+        // (perf4) no handler in this frame: propagate without the interpreter
+        crate::interp::frame_finished(frame);
+        return Err(crate::errors::PyErr);
     }
     // let the interpreter finish this activation (unwinding or deopt)
     let throw = if st == tier1::ST_ERROR {

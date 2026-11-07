@@ -1771,6 +1771,34 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
     }
 }
 
+/// (perf4) An exception raised in compiled code at `f.lasti` that no handler of the
+/// frame covers: do what `eval_inner`'s unwinding would (context chaining, traceback
+/// entry, propagation mark) without entering the interpreter. False (nothing done)
+/// when a handler exists, the raise is a bare re-raise, or tracing is active.
+pub(crate) fn unwind_compiled_error(ts: &ThreadState, f: &mut Frame) -> bool {
+    if crate::modules::sys::tracing_active() || ts.reraise_flag.get() || f.unwind_pc >= 0 {
+        return false;
+    }
+    if find_handler(f.code(), f.lasti).is_some() {
+        return false;
+    }
+    let Some(e) = take_exc() else { return false };
+    let prev = ts.frame.get();
+    f.prev = prev;
+    ts.frame.set(f as *mut Frame);
+    let propagated = ts.propagated_exc.replace((0, 0)) == exc_identity(&e);
+    if !propagated {
+        chain_context(ts, &e);
+    }
+    add_traceback(f, &e);
+    f.clear_stack();
+    ts.propagated_exc.set(exc_identity(&e));
+    set_exc(e);
+    ts.frame.set(prev);
+    f.prev = std::ptr::null_mut();
+    true
+}
+
 /// Identity of an exception in flight: its address and its traceback's.
 fn exc_identity(e: &PyObject) -> (usize, usize) {
     let tb = exc::exc_traceback(e).map_or(0, |t| t.as_ptr() as usize);
