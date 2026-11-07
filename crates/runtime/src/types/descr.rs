@@ -805,12 +805,15 @@ unsafe extern "C" fn descr_repr(o: *mut PyObject) -> *mut PyObject {
         } else {
             "slot wrapper"
         };
-        into_c(Ok(pystr::new_str(&format!(
-            "<{} '{}' of '{}' objects>",
-            kind,
-            descr_name(oo),
-            type_name(&*descr_owner(oo))
-        ))))
+        // (pdb1) as CPython: the owner's full tp_name ('_lsprof.Profiler'),
+        // which pstats shows for profiled builtin methods
+        let owner = descr_owner(oo);
+        let owner_name = if (*owner).tp_name.is_null() {
+            type_name(&*owner)
+        } else {
+            CStr::from_ptr((*owner).tp_name).to_string_lossy().into_owned()
+        };
+        into_c(Ok(pystr::new_str(&format!("<{} '{}' of '{}' objects>", kind, descr_name(oo), owner_name))))
     }
 }
 
