@@ -443,6 +443,8 @@ pub struct HandleInner {
     ident: AtomicU64,
     generation: AtomicU64,
     daemon: AtomicBool,
+    /// (interp1) interpreter the thread runs in (0: main)
+    interp: std::sync::atomic::AtomicUsize,
 }
 
 impl HandleInner {
@@ -453,6 +455,7 @@ impl HandleInner {
             ident: AtomicU64::new(0),
             generation: AtomicU64::new(FORK_GENERATION.load(Relaxed)),
             daemon: AtomicBool::new(true),
+            interp: std::sync::atomic::AtomicUsize::new(0),
         })
     }
     fn effective_state(&self) -> HState {
@@ -600,6 +603,10 @@ fn spawn_thread(func: PyRef, args: PyRef, kwargs: Option<PyRef>, handle: Arc<Han
         }
         *st = HState::Starting;
     }
+    // (interp1) the new thread runs in the interpreter of the thread starting it
+    let cur_ts = crate::threads::current_ptr();
+    let parent_interp = SendPtr(if cur_ts.is_null() { std::ptr::null_mut() } else { unsafe { (*cur_ts).c.interp as *mut PyObject } });
+    handle.interp.store(interp_key(parent_interp.0 as usize), Relaxed);
     let f = SendPtr(func.into_raw());
     let a = SendPtr(args.into_raw());
     let k = SendPtr(kwargs.map_or(std::ptr::null_mut(), |k| k.into_raw()));
@@ -612,8 +619,9 @@ fn spawn_thread(func: PyRef, args: PyRef, kwargs: Option<PyRef>, handle: Arc<Han
     crate::threads::MULTI_THREADED.store(1, std::sync::atomic::Ordering::SeqCst);
     THREAD_COUNT.fetch_add(1, Relaxed);
     let res = builder.spawn(move || {
-        let (f, a, k) = (f, a, k);
+        let (f, a, k, pi) = (f, a, k, parent_interp);
         let ts = crate::threads::current();
+        unsafe { (*(ts as *const crate::threads::ThreadState as *mut crate::threads::ThreadState)).c.interp = pi.0 as *mut std::ffi::c_void };
         h2.ident.store(ts.c.thread_id as u64, Release);
         h2.generation.store(FORK_GENERATION.load(Relaxed), Relaxed);
         *h2.state.lock().unwrap() = HState::Running;
@@ -692,6 +700,18 @@ fn spawn_thread(func: PyRef, args: PyRef, kwargs: Option<PyRef>, handle: Arc<Han
     }
 }
 
+/// (interp1) the interpreter's config may forbid (daemon) threads.
+fn check_threads_allowed(daemon: bool) -> PyResult<()> {
+    let cfg = crate::subinterp::current_config();
+    if !cfg.allow_threads {
+        raise!(RuntimeError, "thread is not supported for isolated subinterpreters");
+    }
+    if daemon && !cfg.allow_daemon_threads {
+        raise!(RuntimeError, "daemon threads are disabled in this (sub)interpreter");
+    }
+    Ok(())
+}
+
 fn start_new_thread(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     if args.len() < 2 || args.len() > 3 {
         raise!(TypeError, "start_new_thread expected at least 2 arguments, got {}", args.len());
@@ -709,6 +729,7 @@ fn start_new_thread(_m: &PyObject, args: &[&PyObject]) -> PyResult {
         None => None,
     };
     crate::modules::sys_full::audit("_thread.start_new_thread", &[func, args[1], kw.as_deref().unwrap_or(none::none())])?;
+    check_threads_allowed(true)?;
     let h = HandleInner::new();
     let ident = spawn_thread(func.to_ref(), args[1].to_ref(), kw, h, true)?;
     Ok(int::new_int_u128(ident as u128))
@@ -730,6 +751,7 @@ fn start_joinable_thread(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject
         "_thread.start_joinable_thread",
         &[f, &int::new_int(daemon as i64), h.unwrap_or(none::none())],
     )?;
+    check_threads_allowed(daemon)?;
     let hobj = match h {
         Some(h) if !h.is(none::none()) => {
             if !h.is_type(&raw mut HANDLE_TYPE) {
@@ -760,7 +782,14 @@ fn start_joinable_thread(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject
     }
 }
 
+/// (interp1) 0 for the main interpreter, else the address of its state.
+fn interp_key(p: usize) -> usize {
+    if p == 0 || p == crate::subinterp::main().as_ptr() as usize { 0 } else { p }
+}
+
 pub fn thread_shutdown(_m: &PyObject) -> PyResult {
+    // only the threads of the calling interpreter are waited for
+    let mine = interp_key(crate::subinterp::current().as_ptr() as usize);
     loop {
         let next: Option<Arc<HandleInner>> = {
             let nd = NON_DAEMON.lock().unwrap();
@@ -770,7 +799,7 @@ pub fn thread_shutdown(_m: &PyObject) -> PyResult {
                     Arc::increment_strong_count(p as *const HandleInner);
                     Arc::from_raw(p as *const HandleInner)
                 })
-                .find(|h| h.ident.load(Relaxed) != me && h.effective_state() != HState::Done)
+                .find(|h| h.ident.load(Relaxed) != me && h.effective_state() != HState::Done && h.interp.load(Relaxed) == mine)
         };
         match next {
             Some(h) => {
@@ -799,7 +828,9 @@ fn make_thread_handle(_m: &PyObject, ident: &PyObject) -> PyResult {
     Ok(new_handle_object(h))
 }
 fn get_main_thread_ident(_m: &PyObject) -> PyResult {
-    let id = crate::threads::MAIN_THREAD_ID.load(Acquire);
+    // (interp1) a subinterpreter's main thread is the one running its __main__
+    let sub = crate::subinterp::main_thread_ident();
+    let id = if sub != 0 { sub } else { crate::threads::MAIN_THREAD_ID.load(Acquire) };
     Ok(int::new_int_u128(if id == 0 { my_ident() } else { id } as u128))
 }
 
@@ -851,10 +882,10 @@ fn interrupt_main(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> P
     Ok(none::none_ref())
 }
 fn daemon_threads_allowed(_m: &PyObject) -> PyResult {
-    Ok(bool_::new_bool(true))
+    Ok(bool_::new_bool(crate::subinterp::current_config().allow_daemon_threads)) // (interp1)
 }
 fn is_main_interpreter(_m: &PyObject) -> PyResult {
-    Ok(bool_::new_bool(true))
+    Ok(bool_::new_bool(crate::subinterp::current().is_main())) // (interp1)
 }
 
 pub const NAME_MAXLEN: usize = 15;

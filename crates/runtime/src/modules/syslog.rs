@@ -71,6 +71,9 @@ fn ident_object(ident: &Option<CString>) -> PyRef {
 fn s_openlog(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
     static P: Params = Params::new("openlog", &["ident", "logoption", "facility"], 0, 0);
     let [ident, opt, fac] = crate::args::parse::<3>(&P, args, kw)?;
+    if !crate::subinterp::current().is_main() {
+        raise!(RuntimeError, "subinterpreter can't use syslog.openlog()"); // (interp1)
+    }
     let ident = match ident {
         Some(i) if !i.is(none::none()) => {
             if !pystr::is_str(i) {
@@ -106,6 +109,9 @@ fn s_syslog(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     let cmsg = utf8_arg(msg)?;
     crate::modules::sys_full::audit("syslog.syslog", &[&int::new_int(prio as i64), msg])?;
     if !OPENED.load(std::sync::atomic::Ordering::Relaxed) {
+        if !crate::subinterp::current().is_main() {
+            raise!(RuntimeError, "subinterpreter can't use syslog.syslog() until the syslog is opened by the main interpreter"); // (interp1)
+        }
         // the implicit open is audited like an explicit one
         let ident = default_ident();
         crate::modules::sys_full::audit(
@@ -120,6 +126,9 @@ fn s_syslog(_m: &PyObject, args: &[&PyObject]) -> PyResult {
 }
 
 fn s_closelog(_m: &PyObject) -> PyResult {
+    if !crate::subinterp::current().is_main() {
+        raise!(RuntimeError, "subinterpreter can't use syslog.closelog()"); // (interp1)
+    }
     crate::modules::sys_full::audit("syslog.closelog", &[])?;
     let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
     unsafe { libc::closelog() };

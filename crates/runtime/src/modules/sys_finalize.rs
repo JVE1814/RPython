@@ -33,6 +33,8 @@ pub fn finalize() -> bool {
     // the callback registry is per interpreter, not per atexit module object
     super::atexit::run_exitfuncs();
     crate::capi::lifecycle::run_interp_atexit();
+    // (interp1) subinterpreters that are still around are finalized first
+    crate::subinterp::destroy_all();
     // threads started by atexit callbacks are waited for as well (threading's
     // own bookkeeping already shut down: join the handles directly)
     if super::_thread::thread_shutdown(crate::types::none::none()).is_err() {
@@ -69,7 +71,7 @@ fn env_flag(name: &str) -> bool {
 
 /// threading._shutdown() joins the non-daemon threads; an error there (also a
 /// KeyboardInterrupt that ends the wait) is reported, then shutdown continues.
-fn wait_for_thread_shutdown() {
+pub(crate) fn wait_for_thread_shutdown() {
     let Some(m) = crate::import::get_loaded_module("threading") else {
         return;
     };
@@ -95,7 +97,7 @@ fn set_none(d: &PyObject, key: &str) {
 }
 
 /// Unregister and clear the modules (step 4 above).
-fn finalize_modules() {
+pub(crate) fn finalize_modules() {
     let sysd = super::sys::sys_dict();
     let bd = crate::builtins::builtins_dict();
     // state that keeps user objects alive and is not needed any more

@@ -8,24 +8,23 @@ use crate::interp::Exit;
 use crate::object::*;
 use crate::threads::ThreadState;
 use crate::types::{dict, list, none, str as pystr, tuple};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering::*};
 
-static SYS_MODULE: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
-static MODULES: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
+// (interp1) the sys module and sys.modules are per interpreter: see subinterp::Interp
 pub static TRACING: AtomicBool = AtomicBool::new(false);
 pub static OPTIMIZE: AtomicI32 = AtomicI32::new(0);
 
 pub fn sys_module() -> PyRef {
-    unsafe { PyRef::from_borrowed(SYS_MODULE.load(Acquire)) }
+    unsafe { PyRef::from_borrowed(crate::subinterp::current().sys.load(Acquire)) }
 }
 pub fn sys_dict() -> PyRef {
     crate::types::module::module_dict(&sys_module())
 }
 pub fn modules_dict() -> PyRef {
-    unsafe { PyRef::from_borrowed(MODULES.load(Acquire)) }
+    unsafe { PyRef::from_borrowed(crate::subinterp::current().modules.load(Acquire)) }
 }
 pub fn get_sys_attr(nm: &str) -> Option<PyRef> {
-    let p = SYS_MODULE.load(Acquire);
+    let p = crate::subinterp::current().sys.load(Acquire);
     if p.is_null() {
         return None;
     }
@@ -252,9 +251,9 @@ fn init_stdio_impl() -> PyResult<()> {
 
 pub fn create_sys_module(argv: &[String]) -> PyResult<PyRef> {
     let m = crate::types::module::new_module("sys")?;
-    SYS_MODULE.store(m.clone().into_raw(), Release);
+    crate::subinterp::current().sys.store(m.clone().into_raw(), Release);
     let modules = dict::new_dict();
-    MODULES.store(modules.clone().into_raw(), Release);
+    crate::subinterp::current().modules.store(modules.clone().into_raw(), Release);
     let d = crate::types::module::module_dict(&m);
     dict::set_item_str(&d, "modules", &modules)?;
     dict::set_item_str(&modules, "sys", &m)?;

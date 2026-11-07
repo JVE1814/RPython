@@ -40,7 +40,7 @@ pub fn hdr(o: &PyObject) -> &mut IoHeader {
     unsafe { &mut *(o.as_ptr() as *mut IoHeader) }
 }
 
-static UNSUPPORTED: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
+static UNSUPPORTED: crate::subinterp::InterpPtr = crate::subinterp::InterpPtr::new(); // (interp1) per interpreter
 
 pub fn unsupported_type() -> PyRef {
     unsafe { PyRef::from_borrowed(UNSUPPORTED.load(Ordering::Acquire)) }

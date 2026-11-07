@@ -28,6 +28,7 @@ pub mod modules;
 pub mod object;
 pub mod qsbr;
 pub mod shape;
+pub mod subinterp;
 pub mod threads;
 pub mod fork;
 pub mod tlab;
@@ -105,6 +106,8 @@ pub fn initialize(cfg: &Config) -> PyResult<()> {
             types::list::append(&path, types::str::new_str(&entry));
         }
     }
+    // (interp1) subinterpreters start from the same configured search path
+    subinterp::set_initial_path(types::list::list_to_vec(&path).iter().map(|p| types::str::to_string_lossy(p)).collect());
     modules::sys_full::post_init()?;
     // real std streams (and builtins.open) must exist before site runs .pth files
     modules::sys::init_stdio();

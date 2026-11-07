@@ -154,9 +154,13 @@ unsafe fn create_from_initfunc(
     spec: &PyObject,
 ) -> PyResult<(PyRef, Option<*mut PyModuleDef>)> {
     unsafe {
-        capi::import::push_package_context(name);
-        let r = f();
-        capi::import::pop_package_context();
+        // (interp1) in a subinterpreter the init function runs in the main one
+        let r = crate::subinterp::call_initfunc(name, || {
+            capi::import::push_package_context(name);
+            let r = f();
+            capi::import::pop_package_context();
+            r
+        })?;
         if r.is_null() {
             if !err_occurred() {
                 raise!(SystemError, "initialization of {} failed without raising an exception", name.rsplit('.').next().unwrap());
@@ -181,12 +185,16 @@ unsafe fn create_from_initfunc(
         let ro = PyRef::from_raw(r);
         if is_moduledef(&ro) {
             let def = ro.as_ptr() as *mut PyModuleDef;
+            // (interp1) Py_mod_multiple_interpreters decides where it may load
+            crate::subinterp::check_multiphase_extension(name, def)?;
             let m = from_c(capi::module::PyModule_FromDefAndSpec2(def, spec.as_ptr(), 1013))?;
             return Ok((m, Some(def)));
         }
         if !tmod::is_module(&ro) {
             raise!(SystemError, "initialization of {} did not return an extension module", name.rsplit('.').next().unwrap());
         }
+        // (interp1) single-phase modules cannot be isolated
+        crate::subinterp::check_singlephase_extension(name)?;
         Ok((ro, None))
     }
 }
@@ -214,6 +222,27 @@ unsafe fn has_mod_abi_slot(mut s: *const capi::typeobj::PySlot, depth: u32) -> b
     false
 }
 
+/// The value of the Py_mod_gil slot of a PySlot array, if present.
+unsafe fn mod_gil_slot(mut s: *const capi::typeobj::PySlot, depth: u32) -> Option<usize> {
+    const PY_MOD_GIL: u16 = 87;
+    const PY_SLOT_SUBSLOTS: u16 = 92;
+    unsafe {
+        while !s.is_null() && (*s).sl_id != 0 {
+            match (*s).sl_id {
+                PY_MOD_GIL => return Some((*s).sl_ptr as usize),
+                PY_SLOT_SUBSLOTS if depth < 8 => {
+                    if let Some(v) = mod_gil_slot((*s).sl_ptr as *const capi::typeobj::PySlot, depth + 1) {
+                        return Some(v);
+                    }
+                }
+                _ => {}
+            }
+            s = s.add(1);
+        }
+    }
+    None
+}
+
 unsafe fn create_from_export(
     name: &str,
     f: unsafe extern "C" fn() -> *const capi::typeobj::PySlot,
@@ -234,6 +263,10 @@ unsafe fn create_from_export(
             raise!(SystemError, "module export hook for {} did not provide a Py_mod_abi slot", name);
         }
         let m = from_c(capi::module::PyModule_FromSlotsAndSpec(slots, spec.as_ptr()))?;
+        // (interp1) Py_mod_gil (absent: the module may need the GIL)
+        if mod_gil_slot(slots, 0) != Some(1) {
+            crate::subinterp::note_gil_used(name);
+        }
         let def = if tmod::is_module(&m) { tmod::m(&m).md_def } else { std::ptr::null_mut() };
         Ok((m, if def.is_null() { None } else { Some(def) }))
     }
