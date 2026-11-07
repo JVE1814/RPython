@@ -620,7 +620,8 @@ fn remove_redundant_nops(cfg: &mut Cfg) {
                 let next = instrs[i + 1..].iter().find(|x| !is_pseudo_marker(x.op));
                 match next {
                     Some(nx) => {
-                        if nx.loc.line == ins.loc.line && nx.loc.is_some() {
+                        // (a following NOP on the same line is the one that goes)
+                        if nx.loc.line == ins.loc.line && nx.loc.is_some() && nx.op != O::NOP {
                             i += 1;
                             continue;
                         }
@@ -639,7 +640,11 @@ fn remove_redundant_nops(cfg: &mut Cfg) {
                                     if let Some((fb, fi)) = cfg.first_real(&pos, nb) {
                                         if fb != b {
                                             let f = cfg.blocks[fb as usize].instrs[fi];
-                                            if f.loc.is_some() && f.loc.line == ins.loc.line {
+                                            if f.op == O::NOP && f.loc.is_some() && f.loc.line == ins.loc.line {
+                                                // two NOPs for one line: the later one goes
+                                                // (e.g. `try:` keeps its NOP, a `pass` body loses it)
+                                                cfg.blocks[fb as usize].instrs[fi].loc = NO_POS;
+                                            } else if f.loc.is_some() && f.loc.line == ins.loc.line {
                                                 i += 1;
                                                 continue;
                                             }

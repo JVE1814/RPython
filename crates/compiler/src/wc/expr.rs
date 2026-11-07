@@ -811,7 +811,7 @@ impl<'a> Compiler<'a> {
             return Ok(());
         }
         self.compile_expr(func)?;
-        self.set_loc(e.loc);
+        self.set_loc(func.loc);
         self.emit(O::PUSH_NULL, 0);
         self.compile_call_args(e, e.loc, 0, args, keywords)
     }
