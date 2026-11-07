@@ -113,12 +113,21 @@ pub fn install(code: &[u8], patch: impl FnOnce(&mut [u8], usize)) -> Option<usiz
     }
 }
 
+fn under_valgrind() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("LD_PRELOAD").is_ok_and(|p| p.contains("vgpreload")) || std::env::var_os("RPYTHON_JIT_NOREUSE").is_some())
+}
+
 /// Return code memory (the caller guarantees no thread can still execute it).
 pub fn free(rx: usize, len: usize) {
     let size = (len + ALIGN - 1) & !(ALIGN - 1);
     let mut h = HEAP.lock().unwrap();
     if h.dual == Some(true) && h.chunks.iter().any(|c| rx >= c.rx && rx < c.rx + c.size) {
-        h.free.push((rx, size));
+        // (jit6) under valgrind, code written through the other mapping into a block
+        // it already translated would run stale translations: no reuse there
+        if !under_valgrind() {
+            h.free.push((rx, size));
+        }
         return;
     }
     drop(h);
