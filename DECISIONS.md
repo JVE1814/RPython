@@ -299,3 +299,18 @@ no GIL, and the main interpreter keeps reporting False (unchanged behaviour).
 import-in-a-loop microbenchmark (200k `import os` + builtin calls): +0.7%.
 
 Adopted by the coordinator 2026-11-07 (proposed by interp1).
+
+## D27 — sys.getrefcount reports CPython 3.14+ counts (interim emulation)
+Context: CPython 3.14+ borrows stack references for locals and moves call arguments into the callee, so
+`sys.getrefcount(x)` on a local returns a smaller number than older versions. Libraries depend on the exact
+value (pandas' chained-assignment warnings compare it against a threshold) and so does
+test_sys/test_list_overwrite_local. Our interpreter and JIT still hold owned references on the stack.
+Decision (wheels2, 2026-11-07): `sys.getrefcount` subtracts the references the caller's own frame holds
+for the argument (the stack copy when a local holds it, and the parent frame's call operand while it is
+inside a call); immortal objects are reported unchanged. `Py_REFCNT` from C still sees the real count.
+This is an emulation inside getrefcount only, not a test special case. The real fix — borrowed stack
+references and argument stealing in the interpreter and both JIT tiers (HotSpot-style: locals live in
+frames/registers without refcount traffic) — is open work for the core/JIT workstreams.
+Also recorded: pandas comparison methodology. Ours-only failures are counted with the baseline's pytest
+selection (`-m "not slow and not network and not db and not single_cpu"`); stability2's earlier 2,320
+compared different selections (fair count 1,502). wheels2 brought it to 3, then 0 (xz presets).
