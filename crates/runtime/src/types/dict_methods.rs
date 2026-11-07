@@ -292,7 +292,7 @@ pub fn get_m(o: &PyObject, args: &[&PyObject]) -> PyResult {
 
 pub fn sizeof_m(o: &PyObject) -> PyResult {
     let base = o.ty().tp_basicsize as usize;
-    Ok(int::new_int((base + dict::table_sizeof(o)) as i64))
+    Ok(int::new_int((base + dict::model_table_sizeof(o)) as i64))
 }
 
 pub fn keys_m(o: &PyObject) -> PyResult {

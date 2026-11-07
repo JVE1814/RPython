@@ -73,6 +73,28 @@ fn get_object_dict_values(_m: &PyObject, o: &PyObject) -> PyResult {
     Ok(tuple::new_tuple(out))
 }
 
+fn tlbc_code(f: &PyObject) -> PyResult<PyRef> {
+    let co = if crate::types::code::is_code(f) { f.to_ref() } else { ab::getattr(f, crate::name!("__code__"))? };
+    if !crate::types::code::is_code(&co) {
+        raise!(TypeError, "expected a function or code object");
+    }
+    Ok(co)
+}
+
+/// The current thread's copy of the (specialised) bytecode of a function.
+fn get_tlbc(_m: &PyObject, f: &PyObject) -> PyResult {
+    let co = tlbc_code(f)?;
+    let _ = crate::types::code::code_data(&co);
+    Ok(crate::types::bytes::new_bytes(&crate::interp::adaptive::adaptive_code(&co)))
+}
+
+/// An identifier of the current thread's copy of a function's bytecode.
+fn get_tlbc_id(_m: &PyObject, f: &PyObject) -> PyResult {
+    let co = tlbc_code(f)?;
+    let cd = crate::types::code::code_data(&co);
+    Ok(int::new_int(crate::interp::adaptive::view_id(cd) as i64))
+}
+
 fn compiler_cleandoc(_m: &PyObject, s: &PyObject) -> PyResult {
     if !pystr::is_str(s) {
         raise!(TypeError, "compiler_cleandoc() argument must be str, not {}", crate::types::typeobject::tname(s));
@@ -413,6 +435,8 @@ pub fn init() -> PyResult {
             ("has_split_table", O, has_split_table),
             ("get_object_dict_values", O, get_object_dict_values),
             ("compiler_cleandoc", O, compiler_cleandoc),
+            ("get_tlbc", O, get_tlbc),
+            ("get_tlbc_id", O, get_tlbc_id),
             ("dict_getitem_knownhash", FAST, dict_getitem_knownhash),
             ("get_recursion_depth", NOARGS, get_recursion_depth),
             ("get_long_lived_total", NOARGS, get_long_lived_total),

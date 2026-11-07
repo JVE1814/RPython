@@ -741,17 +741,19 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
     let caches = cd.caches.tables(code); // jit workstream: inline caches / profiles
     // bc-vm: specialisation view of public code (interp/adaptive.rs); `adapt_once` for
     // classifications too costly to repeat
+    // (core6: this thread's view, see adaptive::view)
+    let spec = super::adaptive::view(cd);
     macro_rules! adapt {
         ($e:expr) => {
-            if super::adaptive::active(cd) {
-                super::adaptive::note(cd, f.lasti as usize, $e);
+            if !spec.is_empty() {
+                super::adaptive::note_in(spec, f.lasti as usize, $e);
             }
         };
     }
     macro_rules! adapt_once {
         ($e:expr) => {
-            if super::adaptive::active(cd) && !super::adaptive::seen(cd, f.lasti as usize) {
-                super::adaptive::note(cd, f.lasti as usize, $e);
+            if !spec.is_empty() && !super::adaptive::seen_in(spec, f.lasti as usize) {
+                super::adaptive::note_in(spec, f.lasti as usize, $e);
             }
         };
     }
@@ -1451,7 +1453,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             return Ok(Some(Exit::Return(v)));
                         }
                         Op::Call | Op::CallKw => {
-                            if super::adaptive::active(cd) {
+                            if !spec.is_empty() {
                                 let nk = if op == Op::CallKw { 1 } else { 0 };
                                 let n = arg as usize;
                                 let base = f.stack_top - n - 2 - nk;

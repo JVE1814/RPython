@@ -1516,7 +1516,7 @@ pub fn populate(d: &PyObject) -> PyResult<()> {
         ("version", vi.clone()),
         ("hexversion", int::new_int(HEXVERSION)),
         ("_multiarch", s(MULTIARCH)),
-        ("supports_isolated_interpreters", bool_::new_bool(false)),
+        ("supports_isolated_interpreters", bool_::new_bool(true)), // D26 (subinterpreters)
     ])?;
     set("implementation", &impl_ns)?;
     let abi = crate::modules::sys_namespace::new_namespace(&[
