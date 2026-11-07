@@ -168,7 +168,7 @@ impl<'a, 'b> Cg<'a, 'b> {
         let a = self.a();
         a.load32(R11, M(r, OB_REF_LOCAL));
         a.add32_ri(R11, 1);
-        a.jcc(Cc::E, done);
+        a.jcc_short(Cc::E, done);
         a.cmp_rm(R15, M(r, OB_TID));
         a.jcc(Cc::NE, slow);
         a.store32(M(r, OB_REF_LOCAL), R11);
@@ -186,7 +186,7 @@ impl<'a, 'b> Cg<'a, 'b> {
         let a = self.a();
         a.load32(R11, M(r, OB_REF_LOCAL));
         a.cmp32_ri(R11, -1);
-        a.jcc(Cc::E, done);
+        a.jcc_short(Cc::E, done);
         a.cmp_rm(R15, M(r, OB_TID));
         a.jcc(Cc::NE, shared);
         a.sub32_ri(R11, 1);
@@ -616,7 +616,7 @@ impl<'a, 'b> Cg<'a, 'b> {
                 let r = self.gr(*v, Rax);
                 let skip = self.a().label();
                 self.a().test_rr(r, r);
-                self.a().jcc(Cc::E, skip);
+                self.a().jcc_short(Cc::E, skip);
                 self.decref(r);
                 self.a().bind(skip);
             }
@@ -914,7 +914,7 @@ impl<'a, 'b> Cg<'a, 'b> {
                 self.a().test_rr(Rax, Rax);
                 self.a().jcc(Cc::NE, l);
             }
-            Template(i, exit_snap) => {
+            Template(i, exit_snap, tags) => {
                 let i = *i as usize;
                 let saved = self.g.exit;
                 // with stale unboxed locals: publish where they live for the duration
@@ -937,7 +937,10 @@ impl<'a, 'b> Cg<'a, 'b> {
                         tramp = Some((t, orig));
                     }
                 }
+                // (refs1) borrowed inputs the builder stored tagged
+                self.g.tagm = *tags;
                 let r = self.g.emit(i);
+                self.g.tagm = 0;
                 self.g.exit = saved;
                 r?;
                 if exit_snap.is_some() {
@@ -1729,5 +1732,7 @@ pub fn codegen(u: &Unit, built: &Built, al: &Alloc, deopt_counter: usize) -> Res
     let _ = tier1_exit;
     let sites = std::mem::take(&mut cg.sites);
     let asm = cg.g.finish()?;
+    // (perf7) jump relaxation in `resolve` moved the code
+    let entries = entries.into_iter().map(|(pc, pos)| (pc, asm.map_pos(pos as usize) as u32)).collect();
     Ok(Out { asm, entries, sites })
 }

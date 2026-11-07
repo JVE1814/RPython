@@ -12,9 +12,9 @@ import stat
 import sys
 from _thread import allocate_lock as Lock
 if sys.platform in {'win32', 'cygwin'}:
-    from msvcrt import setmode as _setmode
+    from msvcrt import setmode as _set_binary_mode
 else:
-    _setmode = None
+    _set_binary_mode = None
 
 import io
 from io import (__all__, SEEK_SET, SEEK_CUR, SEEK_END, Reader, Writer)
@@ -27,7 +27,7 @@ if hasattr(os, 'SEEK_HOLE'):
 DEFAULT_BUFFER_SIZE = 128 * 1024
 
 _IOBASE_EMITS_UNRAISABLE = (hasattr(sys, "gettotalrefcount") or sys.flags.dev_mode)
-_CHECK_ERRORS = _IOBASE_EMITS_UNRAISABLE
+_REPORT_CLOSE_ERRORS = _IOBASE_EMITS_UNRAISABLE
 
 BlockingIOError = BlockingIOError
 
@@ -427,7 +427,7 @@ class BufferedIOBase(IOBase):
 io.BufferedIOBase.register(BufferedIOBase)
 
 
-class _BufferedIOMixin(BufferedIOBase):
+class _BufferedWrapper(BufferedIOBase):
 
     """Delegates the non-buffering methods to the wrapped raw stream."""
 
@@ -670,14 +670,14 @@ class BytesIO(BufferedIOBase):
         return True
 
 
-class BufferedReader(_BufferedIOMixin):
+class BufferedReader(_BufferedWrapper):
 
     """Buffer for a readable, sequential raw stream."""
 
     def __init__(self, raw, buffer_size=DEFAULT_BUFFER_SIZE):
         if not raw.readable():
             raise OSError('"raw" argument must be readable.')
-        _BufferedIOMixin.__init__(self, raw)
+        _BufferedWrapper.__init__(self, raw)
         if buffer_size <= 0:
             raise ValueError("invalid buffer size")
         self.buffer_size = buffer_size
@@ -808,7 +808,7 @@ class BufferedReader(_BufferedIOMixin):
         return written
 
     def tell(self):
-        pos = _BufferedIOMixin.tell(self) - len(self._read_buf) + self._read_pos
+        pos = _BufferedWrapper.tell(self) - len(self._read_buf) + self._read_pos
         if pos < 0:
             # a raw stream that always reports 0 (character devices)
             pos = 0
@@ -821,19 +821,19 @@ class BufferedReader(_BufferedIOMixin):
         with self._read_lock:
             if whence == 1:
                 pos -= len(self._read_buf) - self._read_pos
-            pos = _BufferedIOMixin.seek(self, pos, whence)
+            pos = _BufferedWrapper.seek(self, pos, whence)
             self._reset_read_buf()
             return pos
 
 
-class BufferedWriter(_BufferedIOMixin):
+class BufferedWriter(_BufferedWrapper):
 
     """Buffer for a writeable sequential raw stream."""
 
     def __init__(self, raw, buffer_size=DEFAULT_BUFFER_SIZE):
         if not raw.writable():
             raise OSError('"raw" argument must be writable.')
-        _BufferedIOMixin.__init__(self, raw)
+        _BufferedWrapper.__init__(self, raw)
         if buffer_size <= 0:
             raise ValueError("invalid buffer size")
         self.buffer_size = buffer_size
@@ -896,14 +896,14 @@ class BufferedWriter(_BufferedIOMixin):
             del self._write_buf[:n]
 
     def tell(self):
-        return _BufferedIOMixin.tell(self) + len(self._write_buf)
+        return _BufferedWrapper.tell(self) + len(self._write_buf)
 
     def seek(self, pos, whence=0):
         if whence not in valid_seek_flags:
             raise ValueError("invalid whence value")
         with self._write_lock:
             self._flush_unlocked()
-            return _BufferedIOMixin.seek(self, pos, whence)
+            return _BufferedWrapper.seek(self, pos, whence)
 
     def close(self):
         with self._write_lock:
@@ -1141,8 +1141,8 @@ class FileIO(RawIOBase):
             except AttributeError:
                 pass
 
-            if _setmode:
-                _setmode(fd, os.O_BINARY)
+            if _set_binary_mode:
+                _set_binary_mode(fd, os.O_BINARY)
 
             self.name = file
             if self._appending:
@@ -1509,7 +1509,7 @@ class TextIOWrapper(TextIOBase):
             errors = "strict"
         elif not isinstance(errors, str):
             raise ValueError("invalid errors: %r" % errors)
-        elif _CHECK_ERRORS:
+        elif _REPORT_CLOSE_ERRORS:
             codecs.lookup_error(errors)
         self._buffer = buffer
         self._decoded_chars = ''

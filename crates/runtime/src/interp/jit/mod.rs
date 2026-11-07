@@ -61,6 +61,10 @@ pub fn release_compiled(p: *mut Compiled) {
 // ------------------------------------------------------------------ configuration
 
 const UNSET: u32 = u32::MAX;
+const GEN_FLAGS: u32 = rpy_compiler::bytecode::co::GENERATOR
+    | rpy_compiler::bytecode::co::COROUTINE
+    | rpy_compiler::bytecode::co::ASYNC_GENERATOR
+    | rpy_compiler::bytecode::co::ITERABLE_COROUTINE;
 static ENABLED: AtomicU32 = AtomicU32::new(UNSET);
 static THRESHOLD: AtomicU32 = AtomicU32::new(100);
 static DEBUG: AtomicU32 = AtomicU32::new(0);
@@ -190,13 +194,21 @@ fn opt_entry(cd: &CodeData, pc: usize) -> Option<usize> {
 #[inline]
 fn run(ts: &ThreadState, f: &mut Frame, c: &Compiled, pc: usize) -> Run {
     let cd: &CodeData = unsafe { &*(crate::types::code::code_data(f.code()) as *const CodeData) };
-    let (target, t2) = match opt_entry(cd, pc) {
+    // (perf7) pc 0 of generator code is its eager prologue (a genexpr's `iter()` run at
+    // call time): tier 2 deoptimises at RETURN_GENERATOR, so every prologue run there
+    // was a deopt, and after DEOPT_LIMIT of them the unit (with the resumption entries
+    // the generator body needs) was discarded and recompiled, over and over
+    let gen_prologue = pc == 0 && crate::types::code::code(f.code()).flags() & GEN_FLAGS != 0;
+    let (target, t2) = match if gen_prologue { None } else { opt_entry(cd, pc) } {
         Some(t) => (t, true),
         None => match c.entries.get(pc) {
             Some(&o) if o != u32::MAX => (c.addr + o as usize, false),
             _ => return Run::NotRun,
         },
     };
+    // (refs1) compiled code is entered at block starts, where the borrow analysis
+    // leaves no borrowed stack entries; normalise anyway (stack usually empty here)
+    crate::interp::borrow::own_stack(f);
     crate::tlab::ensure_registered();
     let entry: EntryFn = unsafe { std::mem::transmute(c.addr) };
     let mut out: *mut PyObject = std::ptr::null_mut();
@@ -594,7 +606,7 @@ pub unsafe extern "C" fn h_call_py(base: *mut *mut PyObject, n: u64) -> u64 {
             || depth > ts.c.py_recursion_limit
             || crate::interp::stack_pointer() < ts.stack_soft_limit()
         {
-            return helpers::h_call(base.add(n as usize + 2), n, 0);
+            return helpers::h_call_t(base.add(n as usize + 2), n, 0);
         }
         let c = &*cd.caches.jit.load(Acquire);
         ts.recursion_depth.set(depth);
@@ -604,7 +616,8 @@ pub unsafe extern "C" fn h_call_py(base: *mut *mut PyObject, n: u64) -> u64 {
         let mut frame = Frame::new_call_raw(code, callable, (*f).func_globals, (*f).func_builtins, nlp, total);
         let s = frame.slots.as_mut_ptr();
         for i in 0..nargs {
-            *s.add(i) = *argp.add(i);
+            // (refs1) the callee frame owns its arguments
+            *s.add(i) = crate::interp::borrow::own(*argp.add(i));
             *argp.add(i) = std::ptr::null_mut();
         }
         if ndef != 0 {

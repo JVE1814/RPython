@@ -124,7 +124,7 @@ unsafe extern "C" fn frame_traverse(op: *mut PyObject, visit: visitproc, arg: *m
         let fr = &*f.owned;
         for i in 0..fr.stack_top {
             let p = fr.slots[i];
-            if !p.is_null() {
+            if !p.is_null() && !crate::interp::borrow::is_borrowed(p) {
                 let r = v(p, arg);
                 if r != 0 {
                     return r;

@@ -7,6 +7,8 @@ pub mod jump;
 pub mod jit;
 pub mod specialize;
 pub mod adaptive;
+pub mod borrow;
+pub mod borrow_mark;
 pub mod pep523;
 pub mod translate;
 pub mod wc;
@@ -376,7 +378,7 @@ fn genexpr_prologue(cd: &code::CodeData) -> Option<u32> {
         match op {
             Op::Nop | Op::Resume if !seen_load => {}
             Op::CopyFreeVars if !seen_load && i == 0 => nfree = a,
-            Op::LoadFast if !seen_load && a == 0 => seen_load = true,
+            Op::LoadFast | Op::LoadFastBorrow if !seen_load && a == 0 => seen_load = true,
             Op::GetIter if seen_load && !seen_iter => seen_iter = true,
             Op::ReturnGenerator if seen_iter => {
                 ok = i + 1 == cd.gen_start as usize;

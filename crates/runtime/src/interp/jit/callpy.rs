@@ -22,6 +22,8 @@
 //! caller's stack slots, rsi = argument count without self, rdx = callee CodeData,
 //! r13 = thread state, r15 = thread pointer (fs:0). Returns eax = 0 (result in
 //! *base) or 1 (exception set). Clobbers the caller-saved registers only.
+//! (refs1) The arguments must be owned references: callers own borrowed (tagged) stack
+//! entries first (tier1.rs, Call and the property getter path).
 
 use super::tier1::ST_RETURN;
 use super::x64::{Cc, M, R::*};
@@ -62,6 +64,7 @@ fn build() -> Option<usize> {
     let f_bgb = offset_of!(Frame, borrowed_gb) as i32;
     let f_state = offset_of!(Frame, state) as i32;
     let f_obj = offset_of!(Frame, frame_obj) as i32;
+    let f_keep = offset_of!(Frame, keep) as i32;
     let f_trace = offset_of!(Frame, f_trace) as i32;
     let f_lasti = offset_of!(Frame, lasti) as i32;
     let f_next = offset_of!(Frame, next_instr) as i32;
@@ -283,6 +286,9 @@ fn build() -> Option<usize> {
     a.jcc(Cc::NE, not_ret);
     // ---- plain return: release the frame (recycle_call)
     a.cmp_mi(M(Rbx, f_obj), 0);
+    a.jcc(Cc::NE, slow_rec);
+    // (refs1) values parked by borrow::keep_alive: the general release
+    a.cmp_mi(M(Rbx, f_keep), 0);
     a.jcc(Cc::NE, slow_rec);
     a.cmp_mi(M(Rbx, f_locals), 0);
     a.jcc(Cc::NE, slow_rec);

@@ -56,7 +56,7 @@ class UnpicklingError(PickleError):
     """
 
 
-class _Stop(Exception):
+class _Finished(Exception):
     # Raised by the STOP opcode handler to end the load loop.
     def __init__(self, value):
         self.value = value
@@ -150,7 +150,6 @@ __all__.extend(_n for _n in list(globals())
                if _n.isupper() and not _n.startswith('_'))
 
 _SMALL_TUPLE_OPS = (EMPTY_TUPLE, TUPLE1, TUPLE2, TUPLE3)
-_tuplesize2code = list(_SMALL_TUPLE_OPS)
 
 _MISSING = object()
 
@@ -241,7 +240,7 @@ def _private_alias(owner, name):
     return name
 
 
-def _getattribute(obj, dotted_path):
+def _resolve_path(obj, dotted_path):
     """Follow *dotted_path* (a list of names) starting at *obj*.
 
     Private names of classes are also tried in their mangled form.
@@ -286,7 +285,7 @@ def whichmodule(obj, name):
             if module is None or candidate in ('__main__', '__mp_main__'):
                 continue
             try:
-                found = _getattribute(module, path)
+                found = _resolve_path(module, path)
             except AttributeError:
                 continue
             if found is obj:
@@ -298,7 +297,7 @@ def whichmodule(obj, name):
     except (ImportError, ValueError, KeyError) as exc:
         raise PicklingError(f"Can't pickle {obj!r}: {exc!s}")
     try:
-        found = _getattribute(module, path)
+        found = _resolve_path(module, path)
     except AttributeError:
         raise PicklingError(f"Can't pickle {obj!r}: "
                             f"it's not found as {module_name}.{name}")
@@ -311,7 +310,7 @@ def whichmodule(obj, name):
 # ---------------------------------------------------------------------------
 # Output side
 
-class _Framer:
+class _FrameWriter:
     """Accumulates protocol 4+ output into frames of about
     _FRAME_SIZE_TARGET bytes, each preceded by a FRAME opcode."""
 
@@ -390,7 +389,7 @@ class _Pickler:
         except AttributeError:
             raise TypeError("file must have a 'write' attribute")
         self._buffer_callback = buffer_callback
-        self.framer = _Framer(self._file_write)
+        self.framer = _FrameWriter(self._file_write)
         self.write = self.framer.write
         self._write_large_bytes = self.framer.write_large_bytes
         self.memo = {}
@@ -966,7 +965,7 @@ except NameError:
 # ---------------------------------------------------------------------------
 # Input side
 
-class _Unframer:
+class _FrameReader:
     """Serves reads either from the current frame or from the file.
 
     A frame may only be left between two opcodes: an opcode argument that
@@ -1029,7 +1028,7 @@ class _Unframer:
             raise UnpicklingError("pickle exhausted before end of frame")
         return line
 
-    def load_frame(self, size):
+    def enter_frame(self, size):
         frame = self.current_frame
         if frame is not None and frame.read(1):
             raise UnpicklingError(
@@ -1076,7 +1075,7 @@ class _Unpickler:
         if not hasattr(self, "_file_read"):
             raise UnpicklingError("Unpickler.__init__() was not called by "
                                   "%s.__init__()" % type(self).__name__)
-        frames = self._unframer = _Unframer(self._file_read,
+        frames = self._frames = _FrameReader(self._file_read,
                                             self._file_readline)
         self.read = frames.read
         self.readinto = frames.readinto
@@ -1093,7 +1092,7 @@ class _Unpickler:
                 if not op:
                     raise EOFError
                 handlers[op[0]](self)
-        except _Stop as stop:
+        except _Finished as stop:
             return stop.value
 
     def pop_mark(self):
@@ -1132,7 +1131,7 @@ class _Unpickler:
         if self.proto < 4 or '.' not in name:
             return getattr(mod, name)
         try:
-            return _getattribute(mod, name.split('.'))
+            return _resolve_path(mod, name.split('.'))
         except AttributeError:
             raise AttributeError(
                 f"Can't resolve path {name!r} on module {module!r}")
@@ -1184,7 +1183,7 @@ class _Unpickler:
         size, = unpack('<Q', self.read(8))
         if size > maxsize:
             raise ValueError("frame size > sys.maxsize: %d" % size)
-        self._unframer.load_frame(size)
+        self._frames.enter_frame(size)
 
     @_opcode(PERSID)
     def load_persid(self):
@@ -1570,7 +1569,7 @@ class _Unpickler:
 
     @_opcode(STOP)
     def load_stop(self):
-        raise _Stop(self.stack.pop())
+        raise _Finished(self.stack.pop())
 
 for _name, _func in list(vars(_Unpickler).items()):
     if hasattr(_func, "_pickle_opcode"):
