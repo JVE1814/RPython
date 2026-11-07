@@ -191,6 +191,28 @@ unsafe fn create_from_initfunc(
 }
 
 /// PEP 793: module from a PyModExport_* slot array.
+/// Whether a PySlot array (or an array nested in it through Py_slot_subslots)
+/// contains Py_mod_abi.
+unsafe fn has_mod_abi_slot(mut s: *const capi::typeobj::PySlot, depth: u32) -> bool {
+    const PY_MOD_ABI: u16 = 109;
+    const PY_SLOT_SUBSLOTS: u16 = 92;
+    unsafe {
+        while !s.is_null() && (*s).sl_id != 0 {
+            match (*s).sl_id {
+                PY_MOD_ABI => return true,
+                PY_SLOT_SUBSLOTS if depth < 8 => {
+                    if has_mod_abi_slot((*s).sl_ptr as *const capi::typeobj::PySlot, depth + 1) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+            s = s.add(1);
+        }
+    }
+    false
+}
+
 unsafe fn create_from_export(
     name: &str,
     f: unsafe extern "C" fn() -> *const capi::typeobj::PySlot,
@@ -205,6 +227,10 @@ unsafe fn create_from_export(
                 raise!(SystemError, "module export hook for {} returned NULL without an exception", name);
             }
             return Err(PyErr);
+        }
+        // an exported slot array must declare the ABI it was built for
+        if !has_mod_abi_slot(slots, 0) {
+            raise!(SystemError, "module export hook for {} did not provide a Py_mod_abi slot", name);
         }
         let m = from_c(capi::module::PyModule_FromSlotsAndSpec(slots, spec.as_ptr()))?;
         let def = if tmod::is_module(&m) { tmod::m(&m).md_def } else { std::ptr::null_mut() };
@@ -303,7 +329,7 @@ pub fn load_extension(name: &str, path: &std::path::Path) -> PyResult {
 
 // ---------------------------------------------------------------- _imp
 
-fn imp_create_dynamic(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+pub fn imp_create_dynamic(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     if args.is_empty() || args.len() > 2 {
         raise!(TypeError, "create_dynamic expected 1 or 2 arguments, got {}", args.len());
     }
@@ -326,7 +352,7 @@ fn imp_create_dynamic(_m: &PyObject, args: &[&PyObject]) -> PyResult {
         Ok(m)
     }
 }
-fn imp_exec_dynamic(_m: &PyObject, module: &PyObject) -> PyResult {
+pub fn imp_exec_dynamic(_m: &PyObject, module: &PyObject) -> PyResult {
     let pending = {
         let mut g = PENDING_EXEC.lock().unwrap();
         let pos = g.iter().position(|&(m, _)| m == module.as_ptr() as usize);

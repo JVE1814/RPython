@@ -156,8 +156,10 @@ class _LazyModule(types.ModuleType):
                                           "substituted in sys.modules during a lazy "
                                           "load")
                 __dict__.update(attrs_updated)
-                # Finally stop being lazy.
-                self.__class__ = __class__
+                # Finally stop being lazy -- unless executing the module already
+                # gave it a class of its own choosing, which must be kept.
+                if isinstance(self, _LazyModule):
+                    object.__setattr__(self, '__class__', __class__)
 
         return getattr(self, attr)
 

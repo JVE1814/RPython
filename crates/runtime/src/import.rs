@@ -596,6 +596,16 @@ pub fn import_module_level(nm: &PyObject, globals: Option<&PyObject>, fromlist: 
                 return Ok(m);
             }
         }
+        // otherwise let importlib's own __import__ search for it: its finders
+        // keep the name a str (file names with undecodable bytes map to
+        // surrogate escapes)
+        if let Some(bs) = bootstrap() {
+            if importlib_active() {
+                let f = ab::getattr_str(&bs, "__import__")?;
+                let g = globals.map(|g| g.to_ref()).unwrap_or_else(none::none_ref);
+                return ab::call(&f, &[nm, &g, none::none(), fromlist, &crate::types::int::new_int(0)]);
+            }
+        }
     }
     let n = pystr::to_string_lossy(nm);
     let abs = if level > 0 {

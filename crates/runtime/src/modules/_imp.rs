@@ -268,7 +268,9 @@ fn imp_override_multi_interp(_m: &PyObject, v: &PyObject) -> PyResult {
 // ------------------------------------------------------------------ extensions
 
 pub fn extension_suffixes() -> Vec<&'static str> {
-    vec![EXT_SUFFIX, ".abi3.so", ".so"]
+    // the free-threaded build loads only its own ABI and the free-threaded
+    // stable ABI (abi3t); classic abi3 extensions assume a GIL
+    vec![EXT_SUFFIX, ".abi3t-x86_64-linux-gnu.so", ".abi3t.so", ".so"]
 }
 fn imp_extension_suffixes(_m: &PyObject) -> PyResult {
     Ok(list::new_list(extension_suffixes().into_iter().map(pystr::new_str).collect()))
@@ -292,10 +294,12 @@ fn imp_create_dynamic(_m: &PyObject, args: &[&PyObject]) -> PyResult {
         raise!(ValueError, "embedded null character");
     }
     crate::modules::sys_full::audit("import", &[&n, &origin, none::none(), none::none(), none::none()])?;
-    crate::capi_ext::load_extension(&name, std::path::Path::new(&path))
+    // create only: the module is neither executed (multi-phase exec slots run in
+    // exec_dynamic) nor put into sys.modules -- the import system does that
+    crate::capi_ext::imp_create_dynamic(_m, args)
 }
-fn imp_exec_dynamic(_m: &PyObject, _module: &PyObject) -> PyResult {
-    Ok(int::new_int(0))
+fn imp_exec_dynamic(m: &PyObject, module: &PyObject) -> PyResult {
+    crate::capi_ext::imp_exec_dynamic(m, module)
 }
 
 // ------------------------------------------------------------------ pyc helpers
@@ -425,6 +429,6 @@ pub fn init_module() -> PyResult {
     )?;
     let chk = crate::modules::sys_full::config().check_hash_based_pycs.clone();
     dict::set_item_str(&d, "check_hash_based_pycs", &pystr::new_str(&chk))?;
-    dict::set_item_str(&d, "pyc_magic_number_token", &int::new_int((MAGIC + 50) as i64))?;
+    dict::set_item_str(&d, "pyc_magic_number_token", &int::new_int(MAGIC as i64))?;
     Ok(m)
 }
