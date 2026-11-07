@@ -239,7 +239,8 @@ Two separate things kept the transport alive:
   test_concurrent_futures.test_init (above), test_descr (test_vicious_descriptor_nonsense,
   test_method_get_meth_method_invalid_type) and test_gc (test_get_referents_on_capsule,
   test_tuple_untrack_counts) — identical with core's own binary (target/core), so
-  pre-existing.  "env changed" (timing flakes under load ~10, none reproducible on rerun):
+  pre-existing.  "env changed" (timing flakes under load ~10; spawn.test_processes and test_ordered_dict
+  passed when rerun, the asyncio pair was not rerun):
   test_asyncio.test_events and test_streams (uncaught "Invalid file descriptor: -1" in
   test_utils' HTTP server thread, a race in the test helper also seen by cleanroom5 with the
   old files), test_multiprocessing_spawn.test_processes (ReentrantCallError from a semaphore
