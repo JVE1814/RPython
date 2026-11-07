@@ -366,83 +366,17 @@ pub fn set_lineno(f: &mut Frame, value: Option<&PyObject>) -> PyResult<()> {
     Ok(())
 }
 
-/// Locals that the code treats as bound at `target` (assigned on every path from the start
-/// of the code, so later reads are unchecked) but that are unbound in the frame get None.
+/// Every local that is unbound in the frame gets None (the observable rule for
+/// f_lineno jumps: no flow analysis, so code after the target never sees NULL locals).
 /// Returns how many were set.
-fn fill_unbound_locals(f: &mut Frame, ins: &[(usize, Op, u32)], target: usize) -> usize {
-    let cd = code::code_data(f.code());
+fn fill_unbound_locals(f: &mut Frame, _ins: &[(usize, Op, u32)], _target: usize) -> usize {
+    let co = f.code().to_ref();
+    let cd = code::code_data(&co);
     let nl = cd.localspluskinds.len().min(f.nlocalsplus);
-    let candidates: Vec<usize> = (0..nl)
-        .filter(|&i| f.slots[i].is_null() && cd.localspluskinds[i] & (fast::CELL | fast::FREE) == 0)
-        .collect();
-    if candidates.is_empty() || target >= ins.len() {
-        return 0;
-    }
-    let idx = |i: usize| candidates.iter().position(|&c| c == i);
-    let n = ins.len();
-    // must-assigned analysis (intersection over paths), exception edges included
-    let mut handler: Vec<Option<usize>> = vec![None; n];
-    for e in &cd.exception_table {
-        for h in handler.iter_mut().take((e.end as usize).min(n)).skip(e.start as usize) {
-            if h.is_none() {
-                *h = Some(e.target as usize);
-            }
-        }
-    }
-    let entry: Vec<bool> = candidates
-        .iter()
-        .map(|&c| cd.localspluskinds[c] & (fast::ARG_POS | fast::ARG_KW | fast::ARG_VAR) != 0)
-        .collect();
-    let mut st: Vec<Option<Vec<bool>>> = vec![None; n];
-    st[0] = Some(entry);
-    let mut work = vec![0usize];
-    while let Some(i) = work.pop() {
-        let Some(mut s) = st[i].clone() else { continue };
-        let (_, op, arg) = ins[i];
-        let before = s.clone();
-        match op {
-            Op::StoreFast => {
-                if let Some(k) = idx(arg as usize) {
-                    s[k] = true;
-                }
-            }
-            Op::DeleteFast | Op::LoadFastAndClear => {
-                if let Some(k) = idx(arg as usize) {
-                    s[k] = false;
-                }
-            }
-            _ => {}
-        }
-        let (fall, jump) = step(op, arg, &Vec::new());
-        let mut succ: Vec<(usize, &Vec<bool>)> = Vec::new();
-        if fall.is_some() {
-            succ.push((i + 1, &s));
-        }
-        if let Some((t, _)) = jump {
-            succ.push((t, &s));
-        }
-        if let Some(h) = handler[i] {
-            succ.push((h, &before));
-        }
-        for (t, v) in succ {
-            if t >= n {
-                continue;
-            }
-            let merged = match &st[t] {
-                None => v.clone(),
-                Some(old) => old.iter().zip(v.iter()).map(|(a, b)| *a && *b).collect(),
-            };
-            if st[t].as_ref() != Some(&merged) {
-                st[t] = Some(merged);
-                work.push(t);
-            }
-        }
-    }
-    let Some(at) = st[target].clone() else { return 0 };
     let mut count = 0;
-    for (k, &slot) in candidates.iter().enumerate() {
-        if at[k] {
-            f.slots[slot] = crate::types::none::none_ref().into_raw();
+    for i in 0..nl {
+        if f.slots[i].is_null() && cd.localspluskinds[i] & (fast::CELL | fast::FREE) == 0 {
+            f.slots[i] = crate::types::none::none_ref().into_raw();
             count += 1;
         }
     }
