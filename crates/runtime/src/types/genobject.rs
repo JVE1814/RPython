@@ -527,9 +527,32 @@ unsafe extern "C" fn gen_finalize(o: *mut PyObject) {
         if gn.frame.is_null() || (*gn.frame).state == FrameState::Created {
             if is_coroutine_exact(oo) && !gn.frame.is_null() {
                 let saved = take_exc();
-                let msg = format!("coroutine '{}' was never awaited", pystr::to_string_lossy(&*gn.qualname));
-                if crate::modules::warnings::warn_with_source(exc::RuntimeWarning(), &msg, 1, Some(oo)).is_err() {
-                    crate::modules::sys::write_unraisable_with_obj("Exception ignored while finalizing coroutine", Some(oo));
+                // the warnings module words the warning (with the creation origin when
+                // tracked); failures are reported as unraisable
+                let r = (|| -> PyResult<()> {
+                    let w = crate::import::import_absolute("warnings")?;
+                    match ab::getattr_opt(&w, &pystr::new_str("_warn_unawaited_coroutine"))? {
+                        Some(f) => {
+                            ab::call(&f, &[oo])?;
+                        }
+                        None => {
+                            let msg = format!("coroutine '{}' was never awaited", pystr::to_string_lossy(&*gn.qualname));
+                            crate::modules::warnings::warn_with_source(exc::RuntimeWarning(), &msg, 1, Some(oo))?;
+                        }
+                    }
+                    Ok(())
+                })();
+                if r.is_err() {
+                    let what = ab::repr_string(oo).unwrap_or_else(|_| {
+                        clear_exc();
+                        "<coroutine>".into()
+                    });
+                    crate::modules::sys_full::write_unraisable(Some(&format!("Exception ignored while finalizing coroutine {}", what)), None);
+                    // still warn, in the plain wording
+                    let msg = format!("coroutine '{}' was never awaited", pystr::to_string_lossy(&*gn.qualname));
+                    if crate::modules::warnings::warn_with_source(exc::RuntimeWarning(), &msg, 1, Some(oo)).is_err() {
+                        clear_exc();
+                    }
                 }
                 if let Some(s) = saved {
                     set_exc(s);
@@ -853,9 +876,15 @@ pub fn init_types() {
         (*(&raw mut CORO_ASYNC)).am_await = Some(coro_await);
         let t = &mut *coro_type();
         t.tp_as_async = &raw mut CORO_ASYNC;
+        t.tp_methods = crate::mdefs![
+            ("send", O, gen_send, "send($self, value, /)\n--\n\nSend a value into coroutine, resuming it; the value becomes the result of the\nawait it is suspended at."),
+            ("throw", FAST, gen_throw, "throw(value)\nthrow(type[,value[,traceback]])\n\nRaise an exception in coroutine at the point where it is suspended."),
+            ("close", NOARGS, gen_close_m, "close($self, /)\n--\n\nRaise GeneratorExit inside coroutine to make it finish."),
+            ("__sizeof__", NOARGS, gen_sizeof),
+        ];
         t.tp_getset = crate::getset_table![
-            ("__name__", get_name, set_name),
-            ("__qualname__", get_qualname, set_qualname),
+            ("__name__", get_name, set_name; "Name of the coroutine."),
+            ("__qualname__", get_qualname, set_qualname; "Qualified name of the coroutine."),
             ("cr_frame", get_frame),
             ("cr_running", get_running),
             ("cr_suspended", get_suspended),
