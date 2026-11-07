@@ -1065,12 +1065,23 @@ pub unsafe extern "C" fn PyWrapper_New(d: *mut PyObject, slf: *mut PyObject) -> 
 pub unsafe extern "C" fn PyMember_GetOne(obj: *const c_char, m: *mut PyMemberDef) -> *mut PyObject {
     unsafe {
         // PyMember_GetOne takes the object address (char*) and the def with an absolute offset
+        // (hang1) a relative offset cannot be resolved here: refused
+        if (*m).flags & Py_RELATIVE_OFFSET != 0 {
+            let _ = crate::err!(SystemError, "PyMember_GetOne used with Py_RELATIVE_OFFSET");
+            return std::ptr::null_mut();
+        }
         ret(descr::member_get(obj as *mut PyObject, m))
     }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyMember_SetOne(obj: *mut c_char, m: *mut PyMemberDef, v: *mut PyObject) -> c_int {
-    unsafe { ret_i(descr::member_set(obj as *mut PyObject, m, opt(v))) }
+    unsafe {
+        if (*m).flags & Py_RELATIVE_OFFSET != 0 {
+            let _ = crate::err!(SystemError, "PyMember_SetOne used with Py_RELATIVE_OFFSET");
+            return -1;
+        }
+        ret_i(descr::member_set(obj as *mut PyObject, m, opt(v)))
+    }
 }
 
 // ---------------------------------------------------------------- weak references

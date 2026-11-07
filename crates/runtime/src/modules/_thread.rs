@@ -1021,6 +1021,18 @@ unsafe extern "C" fn local_dealloc(op: *mut PyObject) {
         if let Some(m) = LIVE_LOCALS.lock().unwrap().as_mut() {
             m.remove(&(*l).id);
         }
+        let tp = (*op).type_ptr();
+        // (hang1) subclass slots / managed dict are cleared first: a subclass's
+        // tp_clear chains to local_clear, which drains `dicts` -- after the
+        // map was dropped that was a use-after-free that corrupted the malloc
+        // heap (test_multiprocessing_*.test_manager aborts)
+        if crate::types::typeobject::is_heap_type(tp) {
+            if let Some(clear) = (*tp).tp_clear {
+                if clear as usize != local_clear as usize {
+                    clear(op);
+                }
+            }
+        }
         let dicts: Vec<usize> = (*l).dicts.lock().unwrap().drain().map(|(_, d)| d).collect();
         for d in dicts {
             decref(d as *mut PyObject);
@@ -1028,15 +1040,6 @@ unsafe extern "C" fn local_dealloc(op: *mut PyObject) {
         std::ptr::drop_in_place(&raw mut (*l).dicts);
         xdecref((*l).args);
         xdecref((*l).kw);
-        let tp = (*op).type_ptr();
-        if crate::types::typeobject::is_heap_type(tp) {
-            // clear subclass slots / managed dict
-            if let Some(clear) = (*tp).tp_clear {
-                if clear as usize != local_clear as usize {
-                    clear(op);
-                }
-            }
-        }
         crate::types::typeobject::generic_free_and_type_decref(op, tp);
     }
 }
