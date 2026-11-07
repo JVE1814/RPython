@@ -26,6 +26,16 @@ pub use eval::{Exit, eval_frame};
 pub fn enter_recursive_call(ts: &ThreadState, where_: &str) -> PyResult<()> {
     let d = ts.recursion_depth.get() + 1;
     ts.recursion_depth.set(d);
+    // (perf4) the common case in two compares; limits/headroom in the slow path
+    if d <= ts.c.py_recursion_limit && stack_pointer() >= ts.stack_soft_limit() {
+        return Ok(());
+    }
+    enter_recursive_slow(ts, d, where_)
+}
+
+#[cold]
+#[inline(never)]
+fn enter_recursive_slow(ts: &ThreadState, d: i32, where_: &str) -> PyResult<()> {
     let limit = ts.c.py_recursion_limit;
     if d > limit + if ts.recursion_headroom_active() { 50 } else { 0 } || native_stack_exhausted(ts) {
         if !ts.recursion_headroom_active() {

@@ -170,6 +170,22 @@ pub fn tuple_refill(t: &PyObject, items: Vec<PyRef>) {
     }
 }
 
+/// (perf4) `tuple_refill` taking over `items.len()` owned references (old items are
+/// swapped into `items`, then released).
+pub unsafe fn tuple_refill_ptrs(t: &PyObject, items: &mut [*mut PyObject]) {
+    unsafe {
+        let base = item_ptr(t.as_ptr());
+        for (i, it) in items.iter_mut().enumerate() {
+            std::mem::swap(&mut *base.add(i), it);
+        }
+        (*(t.as_ptr() as *mut PyTupleObject)).ob_hash = -1;
+        track_if_needed(t.as_ptr());
+        for p in items.iter() {
+            xdecref(*p);
+        }
+    }
+}
+
 pub fn tuple2(a: PyRef, b: PyRef) -> PyRef {
     new_tuple(vec![a, b])
 }
