@@ -29,7 +29,8 @@ struct Registry {
     initialized: bool,
 }
 
-static REGISTRY: std::sync::LazyLock<Mutex<Registry>> = std::sync::LazyLock::new(||
+/// (interp1) one registry per interpreter.
+static REGISTRY: crate::subinterp::PerInterp<Mutex<Registry>> = crate::subinterp::PerInterp::new(||
     Mutex::new(Registry { search: Vec::new(), cache: HashMap::new(), errors: HashMap::new(), initialized: false }));
 
 const BUILTIN_HANDLERS: [&str; 8] =
@@ -37,7 +38,7 @@ const BUILTIN_HANDLERS: [&str; 8] =
 
 fn ensure_error_handlers() -> PyResult<()> {
     {
-        let r = REGISTRY.lock().unwrap();
+        let r = REGISTRY.get().lock().unwrap();
         if r.initialized {
             return Ok(());
         }
@@ -65,7 +66,7 @@ fn ensure_error_handlers() -> PyResult<()> {
             i += 1;
         }
     }
-    let mut r = REGISTRY.lock().unwrap();
+    let mut r = REGISTRY.get().lock().unwrap();
     if !r.initialized {
         for (n, f) in fns {
             r.errors.insert(n.to_string(), f);
@@ -78,7 +79,7 @@ fn ensure_error_handlers() -> PyResult<()> {
 /// `codecs.lookup_error(name)`.
 pub fn lookup_error(name: &str) -> PyResult {
     ensure_error_handlers()?;
-    let r = REGISTRY.lock().unwrap();
+    let r = REGISTRY.get().lock().unwrap();
     match r.errors.get(name) {
         Some(h) => Ok(h.clone()),
         None => {
@@ -118,7 +119,7 @@ pub fn registry_key(name: &str) -> PyResult<String> {
 }
 
 fn ensure_encodings_imported() -> PyResult<()> {
-    let empty = REGISTRY.lock().unwrap().search.is_empty();
+    let empty = REGISTRY.get().lock().unwrap().search.is_empty();
     if empty && crate::import::get_loaded_module("encodings").is_none() {
         crate::import::import_absolute("encodings")?;
     }
@@ -133,7 +134,7 @@ pub fn lookup(encoding: &str) -> PyResult {
     ensure_encodings_imported()?;
     let key = registry_key(encoding)?;
     let (funcs, cached) = {
-        let r = REGISTRY.lock().unwrap();
+        let r = REGISTRY.get().lock().unwrap();
         (r.search.clone(), r.cache.get(&key).cloned())
     };
     if let Some(c) = cached {
@@ -148,7 +149,7 @@ pub fn lookup(encoding: &str) -> PyResult {
         if !tuple::is_tuple(&res) || tuple::tuple_len(&res) != 4 {
             raise!(TypeError, "codec search functions must return 4-tuples");
         }
-        REGISTRY.lock().unwrap().cache.insert(key, res.clone());
+        REGISTRY.get().lock().unwrap().cache.insert(key, res.clone());
         return Ok(res);
     }
     raise!(LookupError, "unknown encoding: {}", encoding)
@@ -1063,12 +1064,12 @@ fn m_register(_m: &PyObject, f: &PyObject) -> PyResult {
     if !ab::is_callable(f) {
         raise!(TypeError, "argument must be callable");
     }
-    REGISTRY.lock().unwrap().search.push(f.to_ref());
+    REGISTRY.get().lock().unwrap().search.push(f.to_ref());
     Ok(none::none_ref())
 }
 
 fn m_unregister(_m: &PyObject, f: &PyObject) -> PyResult {
-    let mut r = REGISTRY.lock().unwrap();
+    let mut r = REGISTRY.get().lock().unwrap();
     if let Some(i) = r.search.iter().position(|x| x.is(f)) {
         r.search.remove(i);
         r.cache.clear();
@@ -1084,7 +1085,7 @@ fn m_lookup(_m: &PyObject, e: &PyObject) -> PyResult {
 fn m_forget_codec(_m: &PyObject, e: &PyObject) -> PyResult {
     let e = str_arg(e, "_forget_codec", 1)?;
     let key = registry_key(pystr::as_utf8(e)?)?;
-    REGISTRY.lock().unwrap().cache.remove(&key);
+    REGISTRY.get().lock().unwrap().cache.remove(&key);
     Ok(none::none_ref())
 }
 
@@ -1123,7 +1124,7 @@ fn m_register_error(_m: &PyObject, args: &[&PyObject]) -> PyResult {
         raise!(TypeError, "handler must be callable");
     }
     ensure_error_handlers()?;
-    REGISTRY.lock().unwrap().errors.insert(pystr::as_utf8(n)?.to_string(), h.to_ref());
+    REGISTRY.get().lock().unwrap().errors.insert(pystr::as_utf8(n)?.to_string(), h.to_ref());
     Ok(none::none_ref())
 }
 
@@ -1139,7 +1140,7 @@ fn m_unregister_error(_m: &PyObject, n: &PyObject) -> PyResult {
         raise!(ValueError, "cannot un-register built-in error handler '{}'", name);
     }
     ensure_error_handlers()?;
-    let removed = REGISTRY.lock().unwrap().errors.remove(name).is_some();
+    let removed = REGISTRY.get().lock().unwrap().errors.remove(name).is_some();
     Ok(bool_::new_bool(removed))
 }
 

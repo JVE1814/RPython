@@ -3,37 +3,22 @@
 //! PEP 788 guards/views/tokens, pending calls.
 //!
 //! Model: the current (attached) thread state lives in `threads::CURRENT`; each OS
-//! thread also remembers its "GILState" thread state. There is one real interpreter;
-//! `Py_NewInterpreter` creates additional interpreter *identities* (own id, dict and
-//! atexit list) that share the runtime — enough for the C-level thread-state API, not
-//! for isolation (sub-interpreter isolation is not supported).
+//! thread also remembers its "GILState" thread state. Interpreters (main and
+//! subinterpreters) are `subinterp::Interp`; a `PyInterpreterState *` points to one.
 
 use super::*;
+use crate::subinterp::{self, Interp};
 use crate::threads::{self, ThreadMode, ThreadState};
 use crate::types::dict;
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::sync::Mutex;
 
-pub struct Interp {
-    pub id: i64,
-    pub alive: std::sync::atomic::AtomicBool,
-    pub dict: Mutex<usize>,
-    pub atexit: Mutex<Vec<(usize, usize)>>,
-}
-static MAIN_INTERP: Interp = Interp {
-    id: 0,
-    alive: std::sync::atomic::AtomicBool::new(true),
-    dict: Mutex::new(0),
-    atexit: Mutex::new(Vec::new()),
-};
-static NEXT_INTERP_ID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
-
 pub fn interp_ptr() -> *mut c_void {
-    &MAIN_INTERP as *const Interp as *mut c_void
+    subinterp::MAIN.as_ptr()
 }
 unsafe fn interp<'a>(p: *mut c_void) -> &'a Interp {
-    unsafe { if p.is_null() { &MAIN_INTERP } else { &*(p as *const Interp) } }
+    unsafe { subinterp::from_ptr(p) }
 }
 unsafe fn interp_of(ts: *mut ThreadState) -> *mut c_void {
     unsafe {
@@ -314,14 +299,20 @@ pub unsafe extern "C" fn PyInterpreterState_Head() -> *mut c_void {
     interp_ptr()
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyInterpreterState_Next(_i: *mut c_void) -> *mut c_void {
-    std::ptr::null_mut()
+pub unsafe extern "C" fn PyInterpreterState_Next(i: *mut c_void) -> *mut c_void {
+    let all = subinterp::list_all();
+    let cur = unsafe { interp(i) } as *const Interp;
+    match all.iter().position(|&x| std::ptr::eq(x, cur)) {
+        Some(k) if k + 1 < all.len() => all[k + 1].as_ptr(),
+        _ => std::ptr::null_mut(),
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInterpreterState_ThreadHead(i: *mut c_void) -> *mut c_void {
+    let want = unsafe { interp(i) } as *const Interp;
     let g = threads::ALL_THREADS.lock().unwrap();
     g.iter()
-        .find(|&&t| unsafe { interp_of(t as *mut ThreadState) } == if i.is_null() { interp_ptr() } else { i })
+        .find(|&&t| std::ptr::eq(subinterp::of_ts(t as *const ThreadState), want))
         .map_or(std::ptr::null_mut(), |&t| t as *mut c_void)
 }
 #[unsafe(no_mangle)]
@@ -338,69 +329,69 @@ pub unsafe extern "C" fn PyInterpreterState_GetDict(i: *mut c_void) -> *mut PyOb
         *g as *mut PyObject
     }
 }
-fn new_interp() -> *mut c_void {
-    let i = Box::leak(Box::new(Interp {
-        id: NEXT_INTERP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        alive: std::sync::atomic::AtomicBool::new(true),
-        dict: Mutex::new(0),
-        atexit: Mutex::new(Vec::new()),
-    }));
-    i as *mut Interp as *mut c_void
-}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInterpreterState_New() -> *mut c_void {
-    new_interp()
+    subinterp::new_uninitialized().as_ptr()
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInterpreterState_Clear(_i: *mut c_void) {}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInterpreterState_Delete(i: *mut c_void) {
     unsafe {
-        if !i.is_null() && i != interp_ptr() {
-            interp(i).alive.store(false, std::sync::atomic::Ordering::Release);
+        let it = interp(i);
+        if !it.is_main() {
+            subinterp::mark_destroyed(it);
         }
     }
 }
 /// Run (and clear) the PyUnstable_AtExit callbacks of an interpreter.
 pub fn run_interp_atexit(i: *mut c_void) {
-    let v: Vec<(usize, usize)> = std::mem::take(&mut *unsafe { interp(i) }.atexit.lock().unwrap());
+    let v: Vec<(usize, usize)> = std::mem::take(&mut *unsafe { interp(i) }.c_atexit.lock().unwrap());
     for (f, d) in v.into_iter().rev() {
         let f: unsafe extern "C" fn(*mut c_void) = unsafe { std::mem::transmute(f) };
         unsafe { f(d as *mut c_void) };
     }
 }
 pub fn add_interp_atexit(i: *mut c_void, f: usize, data: usize) {
-    unsafe { interp(i) }.atexit.lock().unwrap().push((f, data));
+    unsafe { interp(i) }.c_atexit.lock().unwrap().push((f, data));
 }
-/// Py_NewInterpreter: a new interpreter identity with an attached thread state.
-pub fn new_interpreter() -> *mut c_void {
-    let i = new_interp();
-    let ts = new_tstate(i);
-    attach(ts);
-    GILSTATE.with(|c| c.set(ts));
-    ts as *mut c_void
+/// Py_NewInterpreter(FromConfig): a new, initialised interpreter whose thread
+/// state is attached on return (null on failure, with the previous state back).
+pub fn new_interpreter(config: subinterp::Config, whence: i32) -> *mut c_void {
+    match subinterp::create(config, whence) {
+        Ok((ts, _prev)) => ts as *mut c_void,
+        Err(_) => std::ptr::null_mut(),
+    }
 }
 pub unsafe fn end_interpreter(ts: *mut c_void) {
     unsafe {
         let ts = ts as *mut ThreadState;
-        let i = interp_of(ts);
-        run_interp_atexit(i);
-        interp(i).alive.store(false, std::sync::atomic::Ordering::Release);
-        if threads::current_ptr() == ts {
-            threads::set_current(std::ptr::null_mut());
+        if ts.is_null() || subinterp::of_ts(ts).is_main() {
+            return;
         }
         if GILSTATE.with(|c| c.get()) == ts {
             GILSTATE.with(|c| c.set(std::ptr::null_mut()));
         }
-        PyThreadState_Delete(ts as *mut c_void);
+        if threads::current_ptr() != ts {
+            // Py_EndInterpreter wants the interpreter's thread state attached
+            let prev = threads::current_ptr();
+            threads::set_current(ts);
+            (*ts).mode.set(ThreadMode::InVm);
+            subinterp::end_interpreter(ts);
+            attach(prev);
+            return;
+        }
+        subinterp::end_interpreter(ts);
     }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn _PyInterpreterState_RequiresIDRef(_i: *mut c_void) -> c_int {
-    0
+pub unsafe extern "C" fn _PyInterpreterState_RequiresIDRef(i: *mut c_void) -> c_int {
+    unsafe { interp(i) }.requires_idref.load(std::sync::atomic::Ordering::Relaxed) as c_int
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn _PyInterpreterState_RequireIDRef(_i: *mut c_void, _req: c_int) {}
+pub unsafe extern "C" fn _PyInterpreterState_RequireIDRef(i: *mut c_void, req: c_int) {
+    unsafe { interp(i) }.requires_idref.store(req != 0, std::sync::atomic::Ordering::Relaxed)
+}
 static EVAL_FRAME_FUNC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _PyInterpreterState_GetEvalFrameFunc(_i: *mut c_void) -> *mut c_void {

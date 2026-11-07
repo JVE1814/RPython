@@ -600,6 +600,9 @@ fn spawn_thread(func: PyRef, args: PyRef, kwargs: Option<PyRef>, handle: Arc<Han
         }
         *st = HState::Starting;
     }
+    // (interp1) the new thread runs in the interpreter of the thread starting it
+    let cur_ts = crate::threads::current_ptr();
+    let parent_interp = SendPtr(if cur_ts.is_null() { std::ptr::null_mut() } else { unsafe { (*cur_ts).c.interp as *mut PyObject } });
     let f = SendPtr(func.into_raw());
     let a = SendPtr(args.into_raw());
     let k = SendPtr(kwargs.map_or(std::ptr::null_mut(), |k| k.into_raw()));
@@ -612,8 +615,9 @@ fn spawn_thread(func: PyRef, args: PyRef, kwargs: Option<PyRef>, handle: Arc<Han
     crate::threads::MULTI_THREADED.store(1, std::sync::atomic::Ordering::SeqCst);
     THREAD_COUNT.fetch_add(1, Relaxed);
     let res = builder.spawn(move || {
-        let (f, a, k) = (f, a, k);
+        let (f, a, k, pi) = (f, a, k, parent_interp);
         let ts = crate::threads::current();
+        unsafe { (*(ts as *const crate::threads::ThreadState as *mut crate::threads::ThreadState)).c.interp = pi.0 as *mut std::ffi::c_void };
         h2.ident.store(ts.c.thread_id as u64, Release);
         h2.generation.store(FORK_GENERATION.load(Relaxed), Relaxed);
         *h2.state.lock().unwrap() = HState::Running;
@@ -692,6 +696,18 @@ fn spawn_thread(func: PyRef, args: PyRef, kwargs: Option<PyRef>, handle: Arc<Han
     }
 }
 
+/// (interp1) the interpreter's config may forbid (daemon) threads.
+fn check_threads_allowed(daemon: bool) -> PyResult<()> {
+    let cfg = crate::subinterp::current_config();
+    if !cfg.allow_threads {
+        raise!(RuntimeError, "thread is not supported for isolated subinterpreters");
+    }
+    if daemon && !cfg.allow_daemon_threads {
+        raise!(RuntimeError, "daemon threads are disabled in this (sub)interpreter");
+    }
+    Ok(())
+}
+
 fn start_new_thread(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     if args.len() < 2 || args.len() > 3 {
         raise!(TypeError, "start_new_thread expected at least 2 arguments, got {}", args.len());
@@ -709,6 +725,7 @@ fn start_new_thread(_m: &PyObject, args: &[&PyObject]) -> PyResult {
         None => None,
     };
     crate::modules::sys_full::audit("_thread.start_new_thread", &[func, args[1], kw.as_deref().unwrap_or(none::none())])?;
+    check_threads_allowed(true)?;
     let h = HandleInner::new();
     let ident = spawn_thread(func.to_ref(), args[1].to_ref(), kw, h, true)?;
     Ok(int::new_int_u128(ident as u128))
@@ -730,6 +747,7 @@ fn start_joinable_thread(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject
         "_thread.start_joinable_thread",
         &[f, &int::new_int(daemon as i64), h.unwrap_or(none::none())],
     )?;
+    check_threads_allowed(daemon)?;
     let hobj = match h {
         Some(h) if !h.is(none::none()) => {
             if !h.is_type(&raw mut HANDLE_TYPE) {

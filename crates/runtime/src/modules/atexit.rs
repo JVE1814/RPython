@@ -12,10 +12,11 @@ use std::sync::Mutex;
 
 /// Each entry is a tuple (func, args, kwargs-dict-or-None); identity of the
 /// tuple identifies the registration.
-static CALLBACKS: Mutex<Vec<PyRef>> = Mutex::new(Vec::new());
+/// (interp1) one list per interpreter.
+static CALLBACKS: crate::subinterp::PerInterp<Mutex<Vec<PyRef>>> = crate::subinterp::PerInterp::new(|| Mutex::new(Vec::new()));
 
 fn lock() -> std::sync::MutexGuard<'static, Vec<PyRef>> {
-    CALLBACKS.lock().unwrap_or_else(|e| e.into_inner())
+    CALLBACKS.get().lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn atexit_register(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {

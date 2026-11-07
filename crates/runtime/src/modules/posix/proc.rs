@@ -675,6 +675,8 @@ pub fn os_forkpty(_m: &PyObject) -> PyResult {
 /// runtime preparation (see crate::fork), the fork itself, runtime fix-up,
 /// Python after-hooks, and in the parent the multi-threaded fork warning.
 fn fork_with(name: &str, f: impl FnOnce() -> (i64, libc::c_int)) -> PyResult<(i64, libc::c_int)> {
+    // (interp1) isolated subinterpreters may not fork
+    crate::subinterp::check_allowed(crate::subinterp::current_config().allow_fork, "fork")?;
     run_before_fork();
     let st = crate::fork::prepare();
     let others = st.other_threads;
@@ -758,6 +760,7 @@ fn ptr_array(v: &[CString]) -> Vec<*const libc::c_char> {
 
 pub fn os_execv(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     crate::args::check_pos("execv", args, 2, 2)?;
+    crate::subinterp::check_allowed(crate::subinterp::current_config().allow_exec, "exec")?; // (interp1)
     let p = super::path::path("execv", args[0])?;
     let argv = argv_list("execv()", args[1], "arg 2")?;
     if argv.is_empty() {
@@ -773,6 +776,7 @@ pub fn os_execv(_m: &PyObject, args: &[&PyObject]) -> PyResult {
 
 pub fn os_execve(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
     let [path, argv, env] = kwparse::<3>("execve", &["path", "argv", "env"], 0, 3, 0, args, kw)?;
+    crate::subinterp::check_allowed(crate::subinterp::current_config().allow_exec, "exec")?; // (interp1)
     let p = path_fd("execve", path.unwrap())?;
     let argv = argv_list("execve:", argv.unwrap(), "argv")?;
     if argv.is_empty() {

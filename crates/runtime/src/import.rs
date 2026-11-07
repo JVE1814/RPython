@@ -33,10 +33,10 @@ pub fn find_builtin(name: &str) -> Option<ModInit> {
 /// returns the same object while it is alive, but a module dropped from
 /// sys.modules (and otherwise unreferenced) can be collected and is then
 /// initialised afresh by the next import.
-static BUILTIN_OBJECTS: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
+// (interp1) the table lives in the interpreter state: subinterp::Interp::builtin_objects
 
 fn builtin_entry(name: &str) -> Option<PyRef> {
-    let wr = BUILTIN_OBJECTS.lock().unwrap().iter().find(|(n, _)| n == name).map(|(_, p)| unsafe { PyRef::from_borrowed(*p as *mut PyObject) })?;
+    let wr = crate::subinterp::current().builtin_objects.lock().unwrap().iter().find(|(n, _)| n == name).map(|(_, p)| unsafe { PyRef::from_borrowed(*p as *mut PyObject) })?;
     if crate::types::weakref::is_weakref(&wr) {
         crate::types::weakref::get_object(&wr).filter(|o| !o.is(crate::types::none::none()))
     } else {
@@ -56,7 +56,7 @@ pub fn note_builtin_module(name: &str, m: &PyObject) {
             m.to_ref()
         }
     };
-    let mut g = BUILTIN_OBJECTS.lock().unwrap();
+    let mut g = crate::subinterp::current().builtin_objects.lock().unwrap();
     let old = match g.iter_mut().find(|(n, _)| n == name) {
         Some(e) => std::mem::replace(&mut e.1, held.into_raw() as usize),
         None => {
@@ -76,12 +76,12 @@ fn cached_builtin(name: &str) -> Option<PyRef> {
 
 /// The importlib bootstrap module once installed.
 pub fn bootstrap() -> Option<PyRef> {
-    let p = BOOTSTRAP.load(std::sync::atomic::Ordering::Acquire);
+    let p = crate::subinterp::current().bootstrap.load(std::sync::atomic::Ordering::Acquire);
     if p.is_null() { None } else { Some(unsafe { PyRef::from_borrowed(p) }) }
 }
-static BOOTSTRAP: std::sync::atomic::AtomicPtr<PyObject> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+// (interp1) per interpreter: subinterp::Interp::bootstrap
 /// True once the path-based finders (PathFinder) are installed.
-static EXTERNAL_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// (interp1) per interpreter: subinterp::Interp::importlib_ready
 
 /// Code object of an importlib bootstrap module. Compiling it from source on every
 /// start dominated startup time, so the compiled code is cached next to the source
@@ -178,7 +178,7 @@ pub fn install_importlib(stdlib: &str) -> PyResult<()> {
     let bs = exec_bootstrap_module("_frozen_importlib", &bs_file, "<frozen importlib._bootstrap>")?;
     let sys = crate::modules::sys::sys_module();
     ab::call(&*ab::getattr_str(&bs, "_install")?, &[&sys, &imp])?;
-    BOOTSTRAP.store(bs.clone().into_raw(), std::sync::atomic::Ordering::Release);
+    crate::subinterp::current().bootstrap.store(bs.clone().into_raw(), std::sync::atomic::Ordering::Release);
     let ext_file = format!("{}/importlib/_bootstrap_external.py", stdlib);
     let r = (|| -> PyResult<()> {
         exec_bootstrap_module("_frozen_importlib_external", &ext_file, "<frozen importlib._bootstrap_external>")?;
@@ -188,7 +188,7 @@ pub fn install_importlib(stdlib: &str) -> PyResult<()> {
     if r.is_err() {
         let e = take_exc();
         // fall back to the Rust import implementation entirely
-        BOOTSTRAP.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
+        crate::subinterp::current().bootstrap.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
         if let Some(mp) = crate::modules::sys::get_sys_attr("meta_path") {
             list::clear(&mp);
         }
@@ -200,7 +200,7 @@ pub fn install_importlib(stdlib: &str) -> PyResult<()> {
         }
         return Ok(());
     }
-    EXTERNAL_INSTALLED.store(true, std::sync::atomic::Ordering::Release);
+    crate::subinterp::current().importlib_ready.store(true, std::sync::atomic::Ordering::Release);
     if let Some(ext) = get_loaded_module("_frozen_importlib_external") {
         give_frozen_spec(&ext);
     }
@@ -249,7 +249,7 @@ fn install_zipimport_hook() {
 }
 
 pub fn importlib_active() -> bool {
-    EXTERNAL_INSTALLED.load(std::sync::atomic::Ordering::Acquire)
+    crate::subinterp::current().importlib_ready.load(std::sync::atomic::Ordering::Acquire)
 }
 
 pub fn get_loaded_module(name: &str) -> Option<PyRef> {
@@ -338,6 +338,10 @@ static SYS_PATH_0: Mutex<Option<String>> = Mutex::new(None);
 /// Record the directory start-up put in front of sys.path (script dir, cwd, '').
 pub fn set_sys_path_0(p: &str) {
     *SYS_PATH_0.lock().unwrap_or_else(|e| e.into_inner()) = Some(p.to_string());
+}
+/// (interp1) the entry start-up put in front of sys.path, if any.
+pub fn sys_path_0() -> Option<String> {
+    SYS_PATH_0.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Is the module file at `origin` possibly shadowing another module, i.e. does it
