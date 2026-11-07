@@ -127,7 +127,9 @@ pub fn new_function(code: &PyObject, globals: &PyObject, qualname: Option<&PyObj
                 return Ok(PyRef::from_raw(op));
             }
         }
-        // __builtins__ from globals, else the builtins module dict
+        // __builtins__ from globals, else the builtins of the running frame (only the first
+        // kind of result is remembered in NEWFUNC_CACHE)
+        let mut cacheable = true;
         let b = match dict::get_item_str(globals, name!("__builtins__")) {
             Some(b) => {
                 if crate::types::module::is_module(&b) {
@@ -136,7 +138,10 @@ pub fn new_function(code: &PyObject, globals: &PyObject, qualname: Option<&PyObj
                     b
                 }
             }
-            None => crate::builtins::builtins_dict(),
+            None => {
+                cacheable = false;
+                crate::interp::current_builtins()
+            }
         };
         f.func_builtins = b.into_raw();
         f.func_doc = match crate::types::code::code_docstring(code) {
@@ -148,7 +153,7 @@ pub fn new_function(code: &PyObject, globals: &PyObject, qualname: Option<&PyObj
             Some(m) => m.into_raw(),
             None => std::ptr::null_mut(),
         };
-        if ver0 != 0 && dict::table(globals).version == ver0 {
+        if cacheable && ver0 != 0 && dict::table(globals).version == ver0 {
             *(&raw mut NEWFUNC_CACHE) = (globals.as_ptr() as usize, ver0, f.func_builtins, f.func_module);
         }
         f.vectorcall = Some(crate::interp::function_vectorcall);
@@ -275,6 +280,16 @@ fn f_set_code(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
             nclosure,
             nfree
         );
+    }
+    // generator / coroutine / async generator kind
+    const KIND: u32 = 0x20 | 0x80 | 0x200;
+    let old_kind = unsafe { crate::types::code::code(&*func(o).func_code).flags() } & KIND;
+    if crate::types::code::code(v).flags() & KIND != old_kind {
+        crate::modules::warnings::warn(
+            crate::types::exceptions::DeprecationWarning(),
+            "assigning a code object of non-matching type (plain function, generator, coroutine or async generator) to __code__ is deprecated",
+            1,
+        )?;
     }
     // perf-runtime: running call frames borrow their code object from the function
     // (interp::frame, no refcount traffic per call), so the old code object must

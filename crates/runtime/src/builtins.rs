@@ -60,7 +60,7 @@ fn b_print(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult
             "end" => end = Some(v.to_ref()),
             "file" => file = Some(v.to_ref()),
             "flush" => flush = ab::is_true(v)?,
-            other => raise!(TypeError, "print() got an unexpected keyword argument '{}'", other),
+            _ => return Err(args::unexpected_keyword("print", k, &["sep", "end", "file", "flush"])),
         }
     }
     let check = |o: &Option<PyRef>, what: &str| -> PyResult<()> {
@@ -444,6 +444,9 @@ fn minmax(args: &[&PyObject], kw: Option<&PyObject>, op: std::ffi::c_int, fname:
     let (pos, kws) = args::split(args, kw);
     let mut key: Option<PyRef> = None;
     let mut default: Option<PyRef> = None;
+    if kws.len() > 2 {
+        raise!(TypeError, "{}() takes at most 2 keyword arguments ({} given)", fname, kws.len());
+    }
     for (k, v) in kws {
         match pystr::to_string_lossy(k).as_str() {
             "key" => {
@@ -452,7 +455,7 @@ fn minmax(args: &[&PyObject], kw: Option<&PyObject>, op: std::ffi::c_int, fname:
                 }
             }
             "default" => default = Some(v.to_ref()),
-            other => raise!(TypeError, "{}() got an unexpected keyword argument '{}'", fname, other),
+            _ => return Err(args::unexpected_keyword(fname, k, &["key", "default"])),
         }
     }
     if pos.is_empty() {

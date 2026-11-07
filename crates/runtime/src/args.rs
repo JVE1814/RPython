@@ -91,7 +91,8 @@ pub fn parse<'b, const N: usize>(p: &Params, args: &[&'b PyObject], kwnames: Opt
                 out[i] = Some(v);
             }
             _ => {
-                raise!(TypeError, "{}() got an unexpected keyword argument '{}'", p.fname, ks);
+                let kwable = &p.names[p.posonly..];
+                return Err(unexpected_keyword(p.fname, k, kwable));
             }
         }
     }
@@ -164,4 +165,28 @@ pub fn kwdict_to_vectorcall(args: &PyObject, kw: *mut PyObject) -> (Vec<crate::o
         v.push(val);
     }
     (v, Some(tuple::new_tuple(names)))
+}
+
+/// The error for a keyword argument `key` that none of `names` (the parameters that may be
+/// passed by keyword) accepts: a "Did you mean" hint for a close name; a str subclass that
+/// compares equal to one of the names gets the generic "invalid keyword argument" message.
+pub fn unexpected_keyword(fname: &str, key: &PyObject, names: &[&str]) -> PyErr {
+    if !pystr::is_str(key) {
+        return crate::err!(TypeError, "{}() keywords must be strings", fname);
+    }
+    if !pystr::is_str_exact(key) {
+        for n in names {
+            match crate::abstract_::rich_eq(key, &pystr::new_str(n)) {
+                Ok(true) => return crate::err!(TypeError, "invalid keyword argument for {}()", fname),
+                Ok(false) => {}
+                Err(e) => return e,
+            }
+        }
+    }
+    let ks = pystr::to_string_lossy(key);
+    let cands: Vec<crate::object::PyRef> = names.iter().map(|n| pystr::new_str(n)).collect();
+    match crate::modules::suggestions::suggest_keyword(&ks, &cands) {
+        Some(s) => crate::err!(TypeError, "{}() got an unexpected keyword argument '{}'. Did you mean '{}'?", fname, ks, s),
+        None => crate::err!(TypeError, "{}() got an unexpected keyword argument '{}'", fname, ks),
+    }
 }

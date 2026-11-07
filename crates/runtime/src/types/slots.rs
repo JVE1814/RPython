@@ -670,6 +670,22 @@ pub fn update_slot(tp: *mut PyTypeObject, attr: &PyObject) {
     if slots.is_empty() {
         return;
     }
+    if pystr::str_eq_ascii(attr, "__call__") {
+        // a vectorcall function would bypass the new __call__: drop the flag here and in the
+        // subclasses that inherit this class's tp_call (those defining their own keep theirs)
+        fn drop_vectorcall(tp: *mut PyTypeObject, top: bool) {
+            unsafe {
+                if !top && !(*tp).tp_dict.is_null() && dict::get_item_str(&*(*tp).tp_dict, name!("__call__")).is_some() {
+                    return;
+                }
+                (*tp).tp_flags &= !Py_TPFLAGS_HAVE_VECTORCALL;
+            }
+            for sub in subclasses(tp) {
+                drop_vectorcall(sub, false);
+            }
+        }
+        drop_vectorcall(tp, true);
+    }
     fn rec(tp: *mut PyTypeObject, slots: &[Slot]) {
         for &s in slots {
             update_one_slot(tp, s);
@@ -930,6 +946,9 @@ unsafe fn wrap_richcmp(_s: &PyObject, _a: &[&PyObject], _kw: Option<&PyObject>, 
 }
 pub unsafe fn call_wrapper(idx: usize, s: &PyObject, a: &[&PyObject], kw: Option<&PyObject>, w: *mut c_void) -> PyResult {
     let sd = &SLOTDEFS[idx];
+    if !matches!(sd.slot, Slot::TpInit | Slot::TpCall | Slot::TpNew) {
+        no_kwargs(kw, sd.name)?;
+    }
     unsafe {
         if sd.slot == Slot::TpRichcompare {
             return wrap_richcmp_op(s, a, kw, w, sd.op);

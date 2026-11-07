@@ -1165,7 +1165,7 @@ pub fn init_types() {
         let t = &mut *bytearray_type();
         t.tp_name = c"bytearray".as_ptr();
         t.tp_basicsize = std::mem::size_of::<PyByteArrayObject>() as isize;
-        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_SEQUENCE;
+        t.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE; // not a sequence for `match` (like str/bytes)
         t.tp_dealloc = Some(bytearray_dealloc);
         t.tp_repr = Some(bytearray_repr);
         t.tp_str = Some(bytearray_str);

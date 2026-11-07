@@ -1071,7 +1071,12 @@ pub unsafe extern "C" fn h_call_ex(sp: *mut *mut PyObject) -> u64 {
             if let Some(d) = &kwd {
                 st(eval::check_kwargs_keys(d))?;
             }
-            let r = st(ab::call_with_kwargs_dict(&callable, &v, kwd.as_deref()))?;
+            // core6: like the interpreter, a callable without vectorcall gets the tuple itself
+            let r = if self_or_null.is_none() && callable.ty().tp_call.is_some() && ab::vectorcall_func(&callable).is_none() {
+                st(ab::call_tp_call(&callable, &args, kwd.as_deref()))?
+            } else {
+                st(ab::call_with_kwargs_dict(&callable, &v, kwd.as_deref()))?
+            };
             put(sp.sub(4), r);
             Ok(OK)
         })

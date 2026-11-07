@@ -33,6 +33,62 @@ fn has_inline_values(_m: &PyObject, o: &PyObject) -> PyResult {
     Ok(bool_::new_bool(r))
 }
 
+/// The instance's attribute values in its class's key order ('<NULL>' for names this
+/// instance lacks), as CPython reports the inline values array. A dict materialised
+/// from the inline values counts as still sharing them; an assigned dict (or one with
+/// names the class never stored inline) has no values array: None.
+fn get_object_dict_values(_m: &PyObject, o: &PyObject) -> PyResult {
+    let tp = o.type_ptr();
+    let order = crate::shape::type_key_order(tp);
+    if order.is_empty() || unsafe { !crate::alloc::has_managed(o.as_ptr()) } {
+        return Ok(none::none_ref());
+    }
+    let null = || pystr::new_str("<NULL>");
+    let mut out = Vec::with_capacity(order.len());
+    if crate::shape::has_inline_values(o) {
+        for &k in &order {
+            out.push(match crate::shape::get(o, unsafe { &*k }) {
+                crate::shape::Get::Found(v) => v,
+                _ => null(),
+            });
+        }
+        return Ok(tuple::new_tuple(out));
+    }
+    if o.ob_gc_bits.load(std::sync::atomic::Ordering::Relaxed) & crate::alloc::GC_BIT_DICT_DETACHED != 0 {
+        return Ok(none::none_ref());
+    }
+    let d = unsafe { *crate::alloc::managed_dict_slot(o.as_ptr()) };
+    if d.is_null() || d as usize & 1 != 0 || !dict::is_dict_exact(unsafe { &*d }) {
+        return Ok(none::none_ref());
+    }
+    let d = unsafe { &*d };
+    for k in dict::keys_vec(d) {
+        if !pystr::is_str_exact(&k) || !order.iter().any(|&n| pystr::str_eq(unsafe { &*n }, &k)) {
+            return Ok(none::none_ref());
+        }
+    }
+    for &k in &order {
+        out.push(dict::get_item_str(d, unsafe { &*k }).unwrap_or_else(null));
+    }
+    Ok(tuple::new_tuple(out))
+}
+
+/// `_PyDict_GetItem_KnownHash` with the hash supplied by the caller.
+fn dict_getitem_knownhash(_m: &PyObject, a: &[&PyObject]) -> PyResult {
+    crate::args::check_pos("dict_getitem_knownhash", a, 3, 3)?;
+    if !dict::is_dict(a[0]) {
+        raise!(SystemError, "bad argument to internal function");
+    }
+    let _hash = ab::as_i64(a[2])?;
+    match dict::get_item(a[0], a[1])? {
+        Some(v) => Ok(v),
+        None => {
+            crate::types::dict_methods::raise_key_error(a[1]);
+            Err(PyErr)
+        }
+    }
+}
+
 fn has_split_table(_m: &PyObject, _o: &PyObject) -> PyResult {
     // instance dicts are combined tables in this runtime
     Ok(bool_::new_bool(false))
@@ -271,6 +327,8 @@ pub fn init() -> PyResult {
             ("has_inline_values", O, has_inline_values),
             ("pending_threadfunc", FASTKW, pending_threadfunc),
             ("has_split_table", O, has_split_table),
+            ("get_object_dict_values", O, get_object_dict_values),
+            ("dict_getitem_knownhash", FAST, dict_getitem_knownhash),
             ("get_recursion_depth", NOARGS, get_recursion_depth),
             ("get_long_lived_total", NOARGS, get_long_lived_total),
             ("pymem_getallocatorsname", NOARGS, pymem_getallocatorsname),

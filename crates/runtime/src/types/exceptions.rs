@@ -568,7 +568,7 @@ fn importerror_init(o: &PyObject, args: &PyObject, kw: Option<&PyObject>) -> PyR
     for (k, _) in &items {
         let ks = pystr::to_string_lossy(k);
         if !matches!(ks.as_str(), "name" | "path" | "name_from") {
-            raise!(TypeError, "{}() got an unexpected keyword argument '{}'", type_name(o.ty()), ks);
+            return Err(crate::args::unexpected_keyword(&type_name(o.ty()), k, &["name", "path", "name_from"]));
         }
     }
     // (re-)initialisation resets what is not given

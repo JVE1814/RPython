@@ -1566,7 +1566,12 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             } else {
                                 None
                             };
-                            let r = ab::call_with_kwargs_dict(&callable, &v, kwd.as_deref());
+                            // a callable without vectorcall gets the argument tuple itself (no copy)
+                            let r = if self_or_null.is_none() && callable.ty().tp_call.is_some() && ab::vectorcall_func(&callable).is_none() {
+                                ab::call_tp_call(&callable, &args, kwd.as_deref())
+                            } else {
+                                ab::call_with_kwargs_dict(&callable, &v, kwd.as_deref())
+                            };
                             if let Some(info) = call_info {
                                 crate::modules::sys_trace::after_call(ts, f, info, r.is_ok())?;
                             }
@@ -1857,6 +1862,7 @@ pub fn match_class(subject: &PyObject, cls: &PyObject, nargs: usize, names: &PyO
             crate::types::bytearray::bytearray_type(),
             crate::types::bytes::bytes_type(),
             dict::dict_type(),
+            crate::types::frozendict::frozendict_type(),
             float::float_type(),
             crate::types::set::frozenset_type(),
             int::int_type(),

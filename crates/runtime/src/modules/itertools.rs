@@ -487,6 +487,10 @@ impl Trav for Product {
 unsafe fn product_new_impl(tp: *mut PyTypeObject, args: *mut PyObject, kw: *mut PyObject) -> PyResult {
     let mut repeat: isize = 1;
     if let Some(k) = unsafe { opt(kw) } {
+        let n = crate::types::dict::dict_len(k);
+        if n > 1 {
+            raise!(TypeError, "product() takes at most 1 keyword argument ({} given)", n);
+        }
         for (key, v) in crate::types::dict::items_vec(k) {
             if pystr::is_str(&key) && pystr::to_string_lossy(&key) == "repeat" {
                 repeat = index_arg(&v)?;
@@ -494,7 +498,7 @@ unsafe fn product_new_impl(tp: *mut PyTypeObject, args: *mut PyObject, kw: *mut 
                     raise!(ValueError, "repeat argument cannot be negative");
                 }
             } else {
-                raise!(TypeError, "product() got an unexpected keyword argument '{}'", pystr::to_string_lossy(&key));
+                return Err(crate::args::unexpected_keyword("product", &key, &["repeat"]));
             }
         }
     }

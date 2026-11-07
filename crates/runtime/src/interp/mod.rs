@@ -441,7 +441,7 @@ pub fn bind_arguments(func: &PyObject, frame: &mut Frame, args: &[*mut PyObject]
                         );
                     }
                     let ks = pystr::to_string_lossy(key);
-                    let suggestion = crate::modules::suggestions::suggest_keyword(&ks, &names[..total_named]);
+                    let suggestion = crate::modules::suggestions::suggest_keyword(&ks, &names[posonly..total_named]);
                     match suggestion {
                         Some(s) => raise!(
                             TypeError,

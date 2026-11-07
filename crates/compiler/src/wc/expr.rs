@@ -1009,13 +1009,9 @@ impl<'a> Compiler<'a> {
         // positional args -> tuple
         if pushed == 0 && args.len() == 1 && !generic {
             if let ExprKind::Starred { value, .. } = &args[0].node {
-                // f(*a): pass a as is if it's already a tuple-producing expression
+                // f(*a): the value goes to CALL_FUNCTION_EX as is (a tuple is passed on without
+                // a copy; anything else is converted there)
                 self.compile_expr(value)?;
-                self.u().loc = l;
-                self.emit(O::BUILD_LIST, 0);
-                self.emit(O::SWAP, 2);
-                self.emit(O::LIST_EXTEND, 1);
-                self.emit(O::CALL_INTRINSIC_1, I1::LIST_TO_TUPLE);
             } else {
                 self.compile_expr(&args[0])?;
                 self.emit(O::BUILD_TUPLE, 1);
