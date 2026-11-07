@@ -554,8 +554,17 @@ fn new_task(owner: usize, src: *const usize, len: usize, kind: u8) -> Task {
     }
 }
 
+/// `RPY_GC_PARALLEL=0`: always analyse serially (diagnostics, measurements).
+fn parallel_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("RPY_GC_PARALLEL").is_none_or(|v| v != "0"))
+}
+
 /// Is a parallel analysis worth starting (somebody to help)?
 fn helpers_available(me: *mut ThreadState) -> bool {
+    if !parallel_enabled() {
+        return false;
+    }
     if crate::gc::helper_candidates() != 0 {
         return true;
     }

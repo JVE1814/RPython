@@ -522,7 +522,7 @@ pub fn clear_handed(ts: &ThreadState) {
         return;
     }
     let saved_exc = crate::errors::take_exc();
-    unsafe { clear_garbage(v) };
+    unsafe { clear_garbage(v, &mut crate::scalestats::PhaseClock::start()) };
     if let Some(e) = saved_exc {
         crate::errors::set_exc(e);
     }
@@ -530,9 +530,8 @@ pub fn clear_handed(ts: &ThreadState) {
 
 /// Break the cycles of `garbage` (entries hold a reference each) with tp_clear, then
 /// release the references (world running).
-unsafe fn clear_garbage(garbage: Vec<usize>) {
+unsafe fn clear_garbage(garbage: Vec<usize>, clock: &mut crate::scalestats::PhaseClock) {
     unsafe {
-        let mut clock = crate::scalestats::PhaseClock::start();
         for &p in &garbage {
             let op = p as *mut PyObject;
             if !is_tracked(&*op) {
@@ -1092,6 +1091,10 @@ fn collect_gen(young_only: bool, explicit: bool) -> usize {
     // gc module (gc.get_objects waits for COLLECTING: a self-deadlock before)
     let saved_exc = crate::errors::take_exc();
     let dead = std::mem::take(&mut *DEAD_SHARDED.lock().unwrap_or_else(|e| e.into_inner()));
+    if crate::scalestats::gc_debug() {
+        let tk = QSBR_TAKEN.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|b| b.len()).sum::<usize>();
+        eprintln!("  post: dead={} qsbr_taken={}", dead.len(), tk);
+    }
     drop(dead);
     let taken = std::mem::take(&mut *QSBR_TAKEN.lock().unwrap_or_else(|e| e.into_inner()));
     crate::qsbr::release_taken(taken);
@@ -1369,7 +1372,7 @@ unsafe fn owner_clear(me: *mut ThreadState, a: crate::gcpar::Analysis, clock: &m
         if let Some(l) = late {
             l.finish();
         }
-        clear_garbage(mine);
+        clear_garbage(mine, clock);
         COLLECTED.fetch_add(n, Relaxed);
         n
     }

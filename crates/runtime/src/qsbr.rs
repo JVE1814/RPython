@@ -487,6 +487,12 @@ pub fn take_all_for_gc() -> Vec<ItemSendBatch> {
 
 /// Items taken by `take_all_for_gc` (`.1`: counted in PENDING_TOTAL).
 pub struct ItemSendBatch(Vec<Item>, bool);
+impl ItemSendBatch {
+    /// (scale3, diagnostics) Number of items.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
 unsafe impl Send for ItemSendBatch {}
 
 /// Release what `take_all_for_gc` took (world running).
