@@ -3584,8 +3584,7 @@ def main():
         name = pyfile
     sys.argv[:] = [name] + rest
 
-    debugger = Pdb(mode='cli', backend='monitoring' if _default_backend == 'monitoring'
-                   else None)
+    debugger = Pdb(mode='cli')
     debugger.rcLines.extend(commands)
     while True:
         try:
