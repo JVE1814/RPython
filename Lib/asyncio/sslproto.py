@@ -201,7 +201,8 @@ class SSLProtocol(protocols.BufferedProtocol):
                  server_side=False, server_hostname=None,
                  call_connection_made=True,
                  ssl_handshake_timeout=None,
-                 ssl_shutdown_timeout=None):
+                 ssl_shutdown_timeout=None,
+                 context=None):
         if ssl is None:
             raise RuntimeError("stdlib ssl module not available")
 
@@ -241,6 +242,9 @@ class SSLProtocol(protocols.BufferedProtocol):
 
         self._waiter = waiter
         self._loop = loop
+        # contextvars context of the code that made the connection: the
+        # callbacks this protocol schedules for the application run in it
+        self._context = context
         self._set_app_protocol(app_protocol)
         self._app_transport = None
         self._app_transport_created = False
@@ -331,7 +335,8 @@ class SSLProtocol(protocols.BufferedProtocol):
             if self._app_state in (AppProtocolState.STATE_CON_MADE,
                                    AppProtocolState.STATE_EOF):
                 self._app_state = AppProtocolState.STATE_CON_LOST
-                self._loop.call_soon(self._app_protocol.connection_lost, exc)
+                self._loop.call_soon(self._app_protocol.connection_lost, exc,
+                                     context=self._context)
         self._set_state(SSLProtocolState.UNWRAPPED)
         self._transport = None
         self._app_transport = None

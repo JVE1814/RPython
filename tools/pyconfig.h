@@ -42,6 +42,9 @@
 #define HAVE_STD_ATOMIC 1
 
 #define HAVE_ALLOCA_H 1
+#define HAVE_GETENTROPY 1
+#define HAVE_GETRANDOM 1
+#define HAVE_GETRANDOM_SYSCALL 1
 #define HAVE_DIRENT_H 1
 #define HAVE_DLFCN_H 1
 #define HAVE_ERRNO_H 1

@@ -2224,8 +2224,10 @@ pub(crate) fn exec_misc(ts: &ThreadState, f: &mut Frame, cd: &crate::types::code
                 push!(f, none::none_ref().into_raw());
                 push!(f, val.into_raw());
             } else {
+                // (tail3) the exception was raised (and given this frame's traceback
+                // entry) at the SEND it was thrown into: passing it on is a re-raise
                 set_exc(e);
-                return Err(PyErr);
+                return Err(ReraiseMarker::mark(ts));
             }
         }
         Op::LoadBuildClass => {

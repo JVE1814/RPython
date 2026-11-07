@@ -506,13 +506,17 @@ def all_tasks(loop=None):
 
 _task_counter = _itertools.count(1)
 
+# step argument meaning "the exception is parked in task._task_step_exc"
+_STORED = object()
+
 
 class Task(Future):
     """A future that drives a coroutine on its loop."""
 
     __slots__ = ('_task_coro', '_task_context', '_task_name',
                  '_task_fut_waiter', '_task_must_cancel',
-                 '_task_num_cancels', '_task_log_destroy_pending')
+                 '_task_num_cancels', '_task_log_destroy_pending',
+                 '_task_step_exc')
 
     def __init__(self, coro, *, loop=None, name=None, context=None,
                  eager_start=False):
@@ -676,15 +680,25 @@ class Task(Future):
                     self._task_coro = None
                 else:
                     _register_task(self)
+                # this frame is the f_back of the step's frame, which the
+                # traceback of an exception set on the task refers to
+                self = displaced = previous = loop = None
 
     def _task_step_cb(self, exc=None):
         if self._fut_state != _PENDING:
             raise _exceptions.InvalidStateError(
                 f'__step(): already done: {self!r}, {exc!r}')
         if self._task_must_cancel:
-            if not isinstance(exc, _exceptions.CancelledError):
+            pending = self._task_step_exc if exc is _STORED else exc
+            if not isinstance(pending, _exceptions.CancelledError):
                 exc = self._make_cancelled_error()
+            pending = None
             self._task_must_cancel = False
+        if exc is not None and exc is not _STORED:
+            # park the exception on the task: no frame of ours holds it
+            # while the coroutine handles it (see _throw_stored)
+            self._task_step_exc = exc
+            exc = _STORED
         self._task_fut_waiter = None
         loop = self._fut_loop
         _enter_task(loop, self)
@@ -708,7 +722,10 @@ class Task(Future):
             if exc is None:
                 result = coro.send(None)
             else:
-                result = coro.throw(exc)
+                if exc is not _STORED:
+                    self._task_step_exc = exc
+                    exc = None
+                result = _throw_stored(coro, self)
         except StopIteration as stop:
             if self._task_must_cancel:
                 self._task_must_cancel = False
@@ -783,8 +800,10 @@ class Task(Future):
             if exc is None:
                 self._task_step_cb()
             else:
-                self._task_step_cb(exc)
-            self = exc = None
+                self._task_step_exc = exc
+                exc = None
+                self._task_step_cb(_STORED)
+            self = None
             return
         try:
             fut.result()
@@ -827,10 +846,24 @@ del _name
 Future.__module__ = Task.__module__ = '_asyncio'
 "#;
 
+/// (tail3) `_throw_stored(coro, task)`: throw the exception parked in
+/// `task._task_step_exc` into `coro`, emptying the slot first.  Only this native
+/// frame refers to the exception while the coroutine handles it, as with CPython's
+/// C task step (tests check the exception's referrers from inside the coroutine).
+fn throw_stored(_m: &crate::ffi::PyObject, a: &[&crate::ffi::PyObject]) -> PyResult {
+    crate::args::check_pos("_throw_stored", a, 2, 2)?;
+    let slot = crate::types::str::new_str("_task_step_exc");
+    let e = crate::abstract_::getattr(a[1], &slot)?;
+    crate::abstract_::setattr(a[1], &slot, crate::types::none::none())?;
+    crate::abstract_::call_method_str(a[0], "throw", &[&e])
+}
+
 pub fn init_module() -> PyResult {
     let m = crate::types::module::new_module("_asyncio")?;
     let d = crate::types::module::module_dict(&m);
     dict::set_item_str(&d, "__builtins__", &crate::builtins::builtins_module())?;
+    let defs = crate::mdefs![("_throw_stored", FAST, throw_stored)];
+    dict::set_item_str(&d, "_throw_stored", &crate::types::cfunction::new_cfunction(defs, None, None))?;
     let code = crate::compile::compile_str(SRC, "<_asyncio>", crate::compile::Mode::Exec, 0, -1)?;
     crate::interp::eval_code(&code.code, &d, Some(&d))?;
     Ok(m)

@@ -965,6 +965,10 @@ pub fn gen_throw_impl(o: &PyObject, typ: &PyObject, val: Option<&PyObject>, tb: 
                         SendResult::Return(r) => Err(stop_iteration_with(r)),
                     }
                 } else {
+                    // (tail3) the error enters this generator's frame afresh: it is
+                    // chained with this generator's handled exception there (not
+                    // treated as one propagating out of a callee)
+                    crate::threads::current().propagated_exc.set((0, 0));
                     resume_with_error(o, e)
                 }
             }

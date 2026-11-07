@@ -333,6 +333,31 @@ fn var_get(o: &PyObject, a: &[&PyObject]) -> PyResult {
     Err(set_err_obj(crate::types::exceptions::LookupError(), o.to_ref()))
 }
 
+/// (tail3) A new ContextVar without a default (for native modules that keep
+/// per-context state, such as _decimal's current context).
+pub fn new_var(name: &str) -> PyResult {
+    ensure_types()?;
+    let name = pystr::new_str(name);
+    let nh = ab::hash(&name)?;
+    let op = fc::robj_new(var_type(), ContextVar { name: Some(name), default: None, hash: 0 })?;
+    let h = (nh as usize ^ (op.as_ptr() as usize >> 4)).wrapping_mul(1000003) as isize;
+    rs::<ContextVar>(&op).hash = if h == -1 { -2 } else { h };
+    Ok(op)
+}
+
+/// (tail3) The variable's value in the current context, ignoring defaults.
+pub fn var_value(o: &PyObject) -> PyResult<Option<PyRef>> {
+    let c = current_context()?;
+    dict::get_item_hash(&ctx_vars(&c), o, rs::<ContextVar>(o).hash)
+}
+
+/// (tail3) Identifies the current thread's context state: unchanged as long as no
+/// context is entered or left and no variable is set on this thread state.
+pub fn context_stamp() -> (u64, u64) {
+    let ts = crate::threads::current_mut();
+    unsafe { ((*ts).c.id, (*ts).c.context_ver) }
+}
+
 /// PyContextVar_Set.
 pub fn var_set(o: &PyObject, value: &PyObject) -> PyResult {
     let c = current_context()?;

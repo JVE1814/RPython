@@ -412,7 +412,7 @@ class BaseEventLoop(events.AbstractEventLoop):
             extra=None, server=None,
             ssl_handshake_timeout=None,
             ssl_shutdown_timeout=None,
-            call_connection_made=True):
+            call_connection_made=True, context=None):
         raise NotImplementedError
 
     def _make_datagram_transport(self, sock, protocol,
@@ -1154,7 +1154,8 @@ class BaseEventLoop(events.AbstractEventLoop):
                 sock, protocol, context, waiter,
                 server_side=server_side, server_hostname=server_hostname,
                 ssl_handshake_timeout=ssl_handshake_timeout,
-                ssl_shutdown_timeout=ssl_shutdown_timeout)
+                ssl_shutdown_timeout=ssl_shutdown_timeout,
+                context=contextvars.copy_context())
         else:
             transport = self._make_socket_transport(sock, protocol, waiter)
         try:
