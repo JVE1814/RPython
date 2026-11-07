@@ -175,6 +175,62 @@ fn t_get_interp_settings(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     Ok(d)
 }
 
+// ------------------------------------------------------------------ pending calls
+
+struct Ident {
+    done: std::sync::Mutex<Option<i64>>,
+    cv: std::sync::Condvar,
+}
+
+unsafe extern "C" fn identify_cb(arg: *mut std::ffi::c_void) -> std::ffi::c_int {
+    let p = unsafe { std::sync::Arc::from_raw(arg as *const Ident) };
+    *p.done.lock().unwrap() = Some(super::current().id);
+    p.cv.notify_all();
+    0
+}
+
+/// pending_identify(interpid): run a pending call in that interpreter and
+/// return the ID of the interpreter it ran in.
+fn t_pending_identify(_m: &PyObject, o: &PyObject) -> PyResult {
+    let i = lookup_arg(o, false)?;
+    let st = std::sync::Arc::new(Ident { done: std::sync::Mutex::new(None), cv: std::sync::Condvar::new() });
+    loop {
+        let arg = std::sync::Arc::into_raw(st.clone()) as *mut std::ffi::c_void;
+        if crate::capi::pystate::add_pending_call_to(i, identify_cb, arg, false) == 0 {
+            break;
+        }
+        unsafe { drop(std::sync::Arc::from_raw(arg as *const Ident)) };
+        crate::threads::blocking(|| std::thread::sleep(std::time::Duration::from_millis(1)));
+    }
+    let id = crate::threads::blocking(|| {
+        let mut g = st.done.lock().unwrap();
+        while g.is_none() {
+            g = st.cv.wait(g).unwrap();
+        }
+        g.unwrap()
+    });
+    Ok(int::new_int(id))
+}
+
+unsafe extern "C" fn call_cb(arg: *mut std::ffi::c_void) -> std::ffi::c_int {
+    let f = unsafe { PyRef::from_raw(arg as *mut PyObject) };
+    match ab::call(&f, &[]) {
+        Ok(_) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// simple_pending_call(callable): call it from the current interpreter's
+/// pending calls.
+fn t_simple_pending_call(_m: &PyObject, f: &PyObject) -> PyResult {
+    let arg = f.to_ref().into_raw() as *mut std::ffi::c_void;
+    if crate::capi::pystate::add_pending_call(call_cb, arg, false) < 0 {
+        unsafe { xdecref(arg as *mut PyObject) };
+        raise!(RuntimeError, "pending call queue is full");
+    }
+    Ok(none::none_ref())
+}
+
 // ------------------------------------------------------------------ raw XI data
 
 const XID_NAME: &std::ffi::CStr = c"_testinternalcapi.xidata";
@@ -260,6 +316,8 @@ pub fn install(d: &PyObject, m: &PyObject) -> PyResult<()> {
             ("unlink_interpreter_refcount", O, t_unlink_interpreter_refcount),
             ("interpreter_refcount_linked", O, t_interpreter_refcount_linked),
             ("get_interp_settings", FAST, t_get_interp_settings),
+            ("pending_identify", O, t_pending_identify),
+            ("simple_pending_call", O, t_simple_pending_call),
             ("get_crossinterp_data", FASTKW, t_get_crossinterp_data),
             ("restore_crossinterp_data", O, t_restore_crossinterp_data),
         ],

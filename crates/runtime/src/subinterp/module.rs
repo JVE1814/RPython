@@ -71,9 +71,6 @@ fn interp_error(msg: &str) -> PyErr {
 
 /// Convert an interpreter ID argument (an int, or anything with __index__).
 pub fn id_arg(o: &PyObject) -> PyResult<i64> {
-    if pystr::is_str(o) || crate::types::bytes::is_bytes(o) || crate::types::float::is_float(o) {
-        raise!(TypeError, "interpreter ID must be an int, got {}", crate::types::typeobject::tname(o));
-    }
     let i = match ab::index(o) {
         Ok(i) => i,
         Err(_) => {

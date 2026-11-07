@@ -672,7 +672,7 @@ fn sys_getfilesystemencodeerrors(_m: &PyObject) -> PyResult {
     Ok(pystr::new_str("surrogateescape"))
 }
 fn sys_is_gil_enabled(_m: &PyObject) -> PyResult {
-    Ok(bool_::new_bool(false))
+    Ok(bool_::new_bool(crate::subinterp::gil_enabled())) // (interp1)
 }
 fn sys_settrace(_m: &PyObject, f: &PyObject) -> PyResult {
     crate::modules::sys_trace_api::settrace(f)

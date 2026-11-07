@@ -150,6 +150,10 @@ pub struct Interp {
     pub requires_idref: AtomicBool,
     /// `_imp._override_multi_interp_extensions_check`: -1 off, 0 config, 1 on.
     pub override_ext_check: AtomicI32,
+    /// Reported by sys._is_gil_enabled() (see `note_gil_used`).
+    pub gil_enabled: AtomicBool,
+    /// pthread id of the thread running (or that last ran) __main__ code
+    pub main_ident: std::sync::atomic::AtomicU64,
 }
 
 unsafe impl Sync for Interp {}
@@ -179,6 +183,8 @@ impl Interp {
             refs: AtomicI64::new(0),
             requires_idref: AtomicBool::new(false),
             override_ext_check: AtomicI32::new(0),
+            gil_enabled: AtomicBool::new(false),
+            main_ident: std::sync::atomic::AtomicU64::new(0),
         }
     }
     #[inline]
@@ -305,6 +311,39 @@ impl<T: Send + Sync + 'static> PerInterp<T> {
         }
         ext.push((key, fresh));
         fresh
+    }
+}
+
+/// An owned object pointer with one value per interpreter: a drop-in
+/// replacement for `static X: AtomicPtr<PyObject>` holding module-level heap
+/// objects (exception classes, heap types, caches) that must not be shared
+/// between interpreters.
+pub struct InterpPtr(PerInterp<OwnedPtr>);
+
+pub struct OwnedPtr(AtomicPtr<PyObject>);
+impl Drop for OwnedPtr {
+    fn drop(&mut self) {
+        unsafe { xdecref(self.0.swap(std::ptr::null_mut(), AcqRel)) };
+    }
+}
+
+impl InterpPtr {
+    pub const fn new() -> Self {
+        InterpPtr(PerInterp::new(|| OwnedPtr(AtomicPtr::new(std::ptr::null_mut()))))
+    }
+    #[inline]
+    pub fn load(&'static self, o: std::sync::atomic::Ordering) -> *mut PyObject {
+        self.0.get().0.load(o)
+    }
+    #[inline]
+    pub fn store(&'static self, p: *mut PyObject, o: std::sync::atomic::Ordering) {
+        self.0.get().0.store(p, o)
+    }
+    pub fn swap(&'static self, p: *mut PyObject, o: std::sync::atomic::Ordering) -> *mut PyObject {
+        self.0.get().0.swap(p, o)
+    }
+    pub fn compare_exchange(&'static self, cur: *mut PyObject, new: *mut PyObject, s: std::sync::atomic::Ordering, f: std::sync::atomic::Ordering) -> Result<*mut PyObject, *mut PyObject> {
+        self.0.get().0.compare_exchange(cur, new, s, f)
     }
 }
 
@@ -729,11 +768,26 @@ pub fn claim_running(i: &'static Interp) -> PyResult<()> {
     if i.running.compare_exchange(0, me, AcqRel, Acquire).is_err() {
         return Err(new_err(module::interpreter_error_type(), "interpreter already running"));
     }
+    i.main_ident.store(unsafe { libc::pthread_self() } as u64, Release);
     Ok(())
 }
 
 pub fn release_running(i: &'static Interp) {
     i.running.store(0, Release);
+}
+
+/// The thread ident (`_thread.get_ident()`) of the current subinterpreter's
+/// main thread: the thread running (or that last ran) its __main__ code; 0 in
+/// the main interpreter.
+pub fn main_thread_ident() -> u64 {
+    let i = current();
+    if i.is_main() {
+        return 0;
+    }
+    match i.main_ident.load(Acquire) {
+        0 => unsafe { libc::pthread_self() as u64 },
+        v => v,
+    }
 }
 
 /// The `__main__` module of the current interpreter (created if missing).
@@ -793,12 +847,18 @@ pub fn check_multiphase_extension(name: &str, def: *mut crate::ffi::PyModuleDef)
     // old (PyModuleDef_Slot) and new (PySlot) numbering of the slot
     const SLOT_OLD: i32 = 3;
     const SLOT_NEW: i32 = 86;
+    const GIL_OLD: i32 = 4;
+    const GIL_NEW: i32 = 87;
     let mut level = 1usize; // the default: supported with a shared GIL
+    let mut gil_used = true; // unless Py_mod_gil says Py_MOD_GIL_NOT_USED
     unsafe {
         let mut s = (*def).m_slots;
         while !s.is_null() && (*s).slot != 0 {
             if (*s).slot == SLOT_OLD || (*s).slot == SLOT_NEW {
                 level = (*s).value as usize;
+            }
+            if (*s).slot == GIL_OLD || (*s).slot == GIL_NEW {
+                gil_used = (*s).value as usize != 1;
             }
             s = s.add(1);
         }
@@ -808,7 +868,66 @@ pub fn check_multiphase_extension(name: &str, def: *mut crate::ffi::PyModuleDef)
         1 => i.config.gil != 2 || !i.checks_extensions(),
         _ => true,
     };
-    if ok { Ok(()) } else { Err(incompatible_extension(name)) }
+    if !ok {
+        return Err(incompatible_extension(name));
+    }
+    if gil_used {
+        note_gil_used(name);
+    }
+    Ok(())
+}
+
+/// Call an extension module's PyInit function.  In a subinterpreter it runs
+/// with the main interpreter attached (a single-phase init function creates its
+/// module there, where it can live); if it fails, its error is reported in the
+/// main interpreter and an ImportError is raised here.
+pub fn call_initfunc(name: &str, f: impl FnOnce() -> *mut PyObject) -> PyResult<*mut PyObject> {
+    if current().is_main() {
+        let r = f();
+        return if r.is_null() && err_occurred() { Err(PyErr) } else { Ok(r) };
+    }
+    let r = with_interp(&MAIN, || {
+        let r = f();
+        if err_occurred() {
+            crate::modules::sys_full::write_unraisable(Some(&format!("Exception ignored while initializing extension module {}", name)), None);
+            clear_exc();
+            unsafe { xdecref(r) };
+            return 0usize;
+        }
+        r as usize
+    });
+    if r == 0 {
+        return Err(crate::import::import_error_with(
+            "failed to import from subinterpreter due to exception",
+            Some(&pystr::new_str(name)),
+            None,
+            None,
+        ));
+    }
+    Ok(r as *mut PyObject)
+}
+
+/// An extension module that may need the GIL was loaded.  There is no GIL, but
+/// a subinterpreter reports it as enabled from then on (sys._is_gil_enabled())
+/// and warns once, so that code checking for it sees what it expects.  The
+/// main interpreter keeps reporting the GIL as disabled.
+pub fn note_gil_used(name: &str) {
+    let i = current();
+    if i.is_main() || i.gil_enabled.swap(true, AcqRel) {
+        return;
+    }
+    let msg = format!(
+        "The global interpreter lock (GIL) has been enabled to load module '{}', which has not declared that it can run safely without the GIL.",
+        name
+    );
+    if crate::modules::warnings::warn(crate::types::exceptions::RuntimeWarning(), &msg, 1).is_err() {
+        clear_exc();
+    }
+}
+
+/// Does the current interpreter report the GIL as enabled?
+pub fn gil_enabled() -> bool {
+    current().gil_enabled.load(Acquire)
 }
 
 /// RuntimeError unless the current interpreter allows `what`.

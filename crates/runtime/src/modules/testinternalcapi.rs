@@ -217,10 +217,8 @@ fn reset_rare_event_counters(_m: &PyObject) -> PyResult {
     Ok(none::none_ref())
 }
 
-const SRC: &str = r#"
-def get_interp_settings(interp=None):
-    return 0
-"#;
+// (interp1) get_interp_settings is provided by subinterp::testapi
+const SRC: &str = "";
 
 /// Runs a queued Python callable (the queue owns one reference to it).
 unsafe extern "C" fn run_pending_callable(arg: *mut std::ffi::c_void) -> std::ffi::c_int {

@@ -828,7 +828,9 @@ fn make_thread_handle(_m: &PyObject, ident: &PyObject) -> PyResult {
     Ok(new_handle_object(h))
 }
 fn get_main_thread_ident(_m: &PyObject) -> PyResult {
-    let id = crate::threads::MAIN_THREAD_ID.load(Acquire);
+    // (interp1) a subinterpreter's main thread is the one running its __main__
+    let sub = crate::subinterp::main_thread_ident();
+    let id = if sub != 0 { sub } else { crate::threads::MAIN_THREAD_ID.load(Acquire) };
     Ok(int::new_int_u128(if id == 0 { my_ident() } else { id } as u128))
 }
 
@@ -880,10 +882,10 @@ fn interrupt_main(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> P
     Ok(none::none_ref())
 }
 fn daemon_threads_allowed(_m: &PyObject) -> PyResult {
-    Ok(bool_::new_bool(true))
+    Ok(bool_::new_bool(crate::subinterp::current_config().allow_daemon_threads)) // (interp1)
 }
 fn is_main_interpreter(_m: &PyObject) -> PyResult {
-    Ok(bool_::new_bool(true))
+    Ok(bool_::new_bool(crate::subinterp::current().is_main())) // (interp1)
 }
 
 pub const NAME_MAXLEN: usize = 15;

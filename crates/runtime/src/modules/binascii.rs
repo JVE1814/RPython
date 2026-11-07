@@ -9,10 +9,11 @@ use crate::object::*;
 use crate::raise;
 use crate::types::typeobject::*;
 use crate::types::{bytes, dict, int, int_methods, none, str as pystr, tuple};
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::Ordering;
 
-static ERROR: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
-static INCOMPLETE: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
+// (interp1) per interpreter: a subinterpreter gets its own exception classes
+static ERROR: crate::subinterp::InterpPtr = crate::subinterp::InterpPtr::new();
+static INCOMPLETE: crate::subinterp::InterpPtr = crate::subinterp::InterpPtr::new();
 
 fn error(msg: &str) -> PyErr {
     new_err(ERROR.load(Ordering::Acquire) as *mut crate::ffi::PyTypeObject, msg)

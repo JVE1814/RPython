@@ -544,12 +544,20 @@ pub unsafe extern "C" fn PyThreadState_Release(tok: *mut c_void) {
 }
 // ---------------------------------------------------------------- pending calls
 
-// Two queues as in CPython: calls for the main thread (Py_AddPendingCall, at most 32 queued)
-// and calls any thread of the interpreter may run (at most 300). Queuing sets EVAL_PENDING
-// in the eval breaker of the thread(s) that may run them; the interpreter then calls
-// `run_pending_calls` between instructions.
-static PENDING_MAIN: Mutex<std::collections::VecDeque<(usize, usize)>> = Mutex::new(std::collections::VecDeque::new());
-static PENDING_ANY: Mutex<std::collections::VecDeque<(usize, usize)>> = Mutex::new(std::collections::VecDeque::new());
+// Two queues per interpreter, as in CPython: calls for the main thread
+// (Py_AddPendingCall in the main interpreter, at most 32 queued) and calls any
+// thread of the interpreter may run (at most 300). Queuing sets EVAL_PENDING in
+// the eval breaker of the thread(s) that may run them; the interpreter then
+// calls `run_pending_calls` between instructions. (interp1: per interpreter;
+// a subinterpreter has no main thread, so all its calls go to the second queue.)
+struct Pending {
+    main: Mutex<std::collections::VecDeque<(usize, usize)>>,
+    any: Mutex<std::collections::VecDeque<(usize, usize)>>,
+}
+static PENDING: subinterp::PerInterp<Pending> = subinterp::PerInterp::new(|| Pending {
+    main: Mutex::new(std::collections::VecDeque::new()),
+    any: Mutex::new(std::collections::VecDeque::new()),
+});
 const MAX_PENDING_MAIN: usize = 32;
 const MAX_PENDING_ANY: usize = 300;
 
@@ -558,9 +566,16 @@ fn request_pending(ts: *const ThreadState) {
         unsafe { (*ts).c.eval_breaker.fetch_or(threads::EVAL_PENDING, std::sync::atomic::Ordering::Release) };
     }
 }
-/// Queue `f(arg)`; `main_only`: only the main thread runs it. -1 if the queue is full.
+/// Queue `f(arg)` for the current interpreter; `main_only`: only the main
+/// thread runs it. -1 if the queue is full.
 pub(crate) fn add_pending_call(f: unsafe extern "C" fn(*mut c_void) -> c_int, arg: *mut c_void, main_only: bool) -> c_int {
-    let (q, max) = if main_only { (&PENDING_MAIN, MAX_PENDING_MAIN) } else { (&PENDING_ANY, MAX_PENDING_ANY) };
+    add_pending_call_to(subinterp::current(), f, arg, main_only)
+}
+/// Queue `f(arg)` for interpreter `i`.
+pub(crate) fn add_pending_call_to(i: &'static Interp, f: unsafe extern "C" fn(*mut c_void) -> c_int, arg: *mut c_void, main_only: bool) -> c_int {
+    let main_only = main_only && i.is_main();
+    let p = PENDING.get_in(i);
+    let (q, max) = if main_only { (&p.main, MAX_PENDING_MAIN) } else { (&p.any, MAX_PENDING_ANY) };
     {
         let mut g = q.lock().unwrap();
         if g.len() >= max {
@@ -568,11 +583,16 @@ pub(crate) fn add_pending_call(f: unsafe extern "C" fn(*mut c_void) -> c_int, ar
         }
         g.push_back((f as usize, arg as usize));
     }
-    request_pending(threads::MAIN_THREAD_STATE.load(std::sync::atomic::Ordering::Acquire));
+    if i.is_main() {
+        request_pending(threads::MAIN_THREAD_STATE.load(std::sync::atomic::Ordering::Acquire));
+    }
     if !main_only {
-        // any thread may serve it: wake them all (the first to look takes it)
+        // any thread of the interpreter may serve it: wake them all (the first
+        // to look takes it)
         for &t in threads::ALL_THREADS.lock().unwrap().iter() {
-            request_pending(t as *const ThreadState);
+            if std::ptr::eq(subinterp::of_ts(t as *const ThreadState), i) {
+                request_pending(t as *const ThreadState);
+            }
         }
     }
     0
@@ -583,20 +603,22 @@ pub(crate) fn run_pending_calls() -> PyResult<()> {
     if !ts.is_null() {
         unsafe { (*ts).c.eval_breaker.fetch_and(!threads::EVAL_PENDING, std::sync::atomic::Ordering::AcqRel) };
     }
-    let main = threads::is_main_thread();
+    let interp = subinterp::current();
+    let p = PENDING.get_in(interp);
+    let main = interp.is_main() && threads::is_main_thread();
     loop {
         let item = {
-            let a = if main { PENDING_MAIN.lock().unwrap().pop_front() } else { None };
+            let a = if main { p.main.lock().unwrap().pop_front() } else { None };
             match a {
                 Some(x) => Some(x),
-                None => PENDING_ANY.lock().unwrap().pop_front(),
+                None => p.any.lock().unwrap().pop_front(),
             }
         };
         let Some((f, arg)) = item else { return Ok(()) };
         let f: unsafe extern "C" fn(*mut c_void) -> c_int = unsafe { std::mem::transmute(f) };
         if unsafe { f(arg as *mut c_void) } < 0 {
             // leave the rest for the next check
-            if !PENDING_ANY.lock().unwrap().is_empty() || (main && !PENDING_MAIN.lock().unwrap().is_empty()) {
+            if !p.any.lock().unwrap().is_empty() || (main && !p.main.lock().unwrap().is_empty()) {
                 request_pending(ts);
             }
             if !err_occurred() {
@@ -609,7 +631,8 @@ pub(crate) fn run_pending_calls() -> PyResult<()> {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Py_AddPendingCall(func: Option<unsafe extern "C" fn(*mut c_void) -> c_int>, arg: *mut c_void) -> c_int {
     let Some(f) = func else { return -1 };
-    add_pending_call(f, arg, true)
+    // the main thread of the main interpreter serves these
+    add_pending_call_to(subinterp::main(), f, arg, true)
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Py_MakePendingCalls() -> c_int {
