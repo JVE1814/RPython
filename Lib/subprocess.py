@@ -416,7 +416,7 @@ def _as_id(value, lookup, kind):
         if value < 0:
             raise ValueError(f"{kind} ID cannot be negative, got {value}")
         if value >= 1 << 32:
-            raise ValueError(f"{kind} ID is too large: {value}")
+            raise OverflowError(f"{kind} ID is too large: {value}")
         return value
     return None
 
@@ -573,7 +573,11 @@ class Popen:
                 raise ValueError("Groups must be a list, not a string")
             gids = []
             for item in extra_groups:
-                value = _as_id(item, by_group_name, "Group")
+                try:
+                    value = _as_id(item, by_group_name, "Group")
+                except OverflowError as exc:
+                    # an invalid list item is a ValueError, unlike group=
+                    raise ValueError(str(exc)) from None
                 if value is None:
                     raise TypeError("Items in extra_groups must be a string "
                                     "or integer, not {}".format(type(item)))

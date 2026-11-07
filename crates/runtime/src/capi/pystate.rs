@@ -32,6 +32,10 @@ unsafe fn interp_of(ts: *mut ThreadState) -> *mut c_void {
 thread_local! {
     /// This OS thread's GILState thread state.
     static GILSTATE: Cell<*mut ThreadState> = const { Cell::new(std::ptr::null_mut()) };
+    /// (hang1) The thread state this OS thread last detached with
+    /// PyEval_SaveThread: PyThreadState_Ensure* for its interpreter, called
+    /// while detached, reattaches it instead of making another one.
+    static LAST_DETACHED: Cell<*mut ThreadState> = const { Cell::new(std::ptr::null_mut()) };
     /// Thread states created by PyThreadState_Ensure: (tstate, ensure depth, previous gilstate).
     static ENSURED: RefCell<Vec<(usize, usize, usize)>> = const { RefCell::new(Vec::new()) };
     /// Ensure depth of thread states that were not created by Ensure.
@@ -255,6 +259,7 @@ pub unsafe extern "C" fn PyEval_SaveThread() -> *mut c_void {
         super::pythread::suspend_all(ts);
         (*ts).mode.set(ThreadMode::InNative);
         threads::set_current(std::ptr::null_mut());
+        LAST_DETACHED.with(|c| c.set(ts));
         ts as *mut c_void
     }
 }
@@ -470,12 +475,27 @@ unsafe fn ensure(i: *mut c_void) -> *mut c_void {
             return cur as *mut c_void;
         }
         let g = gilstate();
-        let ts = if !g.is_null() && g != cur && interp_of(g) == i {
+        // (hang1) the thread's earlier state is reactivated only when no
+        // other interpreter is attached; re-entering an interpreter from
+        // another one gets a fresh state (no access to the old one's
+        // thread-locals), and Release makes the caller's state the thread's
+        // state again
+        let last = LAST_DETACHED.with(|c| c.get());
+        let last_ok = cur.is_null()
+            && !last.is_null()
+            && threads::ALL_THREADS.lock().unwrap().contains(&(last as usize))
+            && (*last).mode.get() != ThreadMode::InVm
+            && interp_of(last) == i;
+        let ts = if last_ok {
+            depth_inc(last);
+            last
+        } else if cur.is_null() && !g.is_null() && interp_of(g) == i {
             depth_inc(g);
             g
         } else {
             let t = new_tstate(i);
             let prev = GILSTATE.with(|c| c.replace(t));
+            let prev = if cur.is_null() { prev } else { cur };
             ENSURED.with(|e| e.borrow_mut().push((t as usize, 1, prev as usize)));
             t
         };

@@ -155,6 +155,7 @@ pub fn path_named(func: &str, arg: &str, o: &PyObject) -> PyResult<PathArg> {
 
 /// int -> fd (C int range).
 pub fn fd_from_index(o: &PyObject) -> PyResult<i32> {
+    warn_bool_fd(o)?;
     if crate::types::float::is_float(o) {
         raise!(TypeError, "'float' object cannot be interpreted as an integer");
     }
@@ -261,7 +262,16 @@ pub fn truthy(o: Option<&PyObject>, default: bool) -> PyResult<bool> {
 }
 
 /// Object -> file descriptor (int, or object with fileno()).
+/// (hang1) a bool passed as a file descriptor is almost certainly a bug
+pub fn warn_bool_fd(o: &PyObject) -> PyResult<()> {
+    if crate::types::bool_::is_bool(o) {
+        crate::modules::warnings::warn(crate::types::exceptions::RuntimeWarning(), "bool is used as a file descriptor", 1)?;
+    }
+    Ok(())
+}
+
 pub fn as_file_descriptor(o: &PyObject) -> PyResult<i32> {
+    warn_bool_fd(o)?;
     let fd = if int::is_int(o) {
         c_int(o)?
     } else {

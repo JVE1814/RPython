@@ -42,6 +42,10 @@ if 'posix' in sys.builtin_module_names:
         from posix import _have_functions
     except ImportError:
         pass
+    try:
+        from posix import _create_environ
+    except ImportError:
+        pass
     import posixpath as path
     import posix as _platform
 elif 'nt' in sys.builtin_module_names:
