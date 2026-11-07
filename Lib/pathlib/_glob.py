@@ -123,12 +123,16 @@ class Globber:
     current directory.  lexists(path_str) tells whether a path exists
     (without following a final symlink)."""
 
-    def __init__(self, sep, case_sensitive, scandir, lexists, recurse_symlinks):
+    def __init__(self, sep, case_sensitive, scandir, lexists, recurse_symlinks,
+                 case_pedantic=False):
         self.sep = sep
         self.case_sensitive = case_sensitive
         self.scandir = scandir
         self.lexists = lexists
         self.recurse_symlinks = recurse_symlinks
+        # True when case_sensitive differs from the file system's own rule:
+        # then even literal segments must be compared with directory listings
+        self.case_pedantic = case_pedantic
 
     def _scan(self, path):
         try:
@@ -153,7 +157,8 @@ class Globber:
                 if self._scan(path) is not None:
                     yield path
                 return
-            if part == '**' or has_magic(part):
+            if (part == '**' or has_magic(part)
+                    or (self.case_pedantic and part != '..')):
                 break
             if idx == n - 1:
                 if self.lexists(path + part):

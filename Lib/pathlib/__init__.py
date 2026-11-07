@@ -660,12 +660,14 @@ class Path(PurePath):
         sep = self.parser.sep
         if pattern._raw_path[-1:] in (sep, self.parser.altsep):
             segments.append('')    # a trailing separator selects directories
+        native = self.parser is posixpath
         if case_sensitive is None:
-            case_sensitive = self.parser is posixpath
+            case_sensitive = native
         here = str(self)
         base = '' if here == '.' else (here if here.endswith(sep) else here + sep)
         globber = _glob.Globber(sep, case_sensitive, _scan_local,
-                                os.path.lexists, recurse_symlinks)
+                                os.path.lexists, recurse_symlinks,
+                                case_pedantic=case_sensitive != native)
         anchor_len = len(self.anchor)
 
         def tidy(text):
