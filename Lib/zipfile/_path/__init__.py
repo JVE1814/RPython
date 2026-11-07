@@ -23,7 +23,7 @@ def _parents(path):
     """
     while True:
         path = posixpath.dirname(path.rstrip('/'))
-        if not path or path == '/':
+        if not path.strip('/'):  # nothing left but the (possibly doubled) root
             return
         yield path
 
@@ -257,7 +257,11 @@ class Path:
         return posixpath.relpath(str(self), str(other.joinpath(*extra)))
 
     def __str__(self):
-        return posixpath.join(self.root.filename, self.at)
+        # an archive without a file name (e.g. in memory) is shown as ":zipfile:"
+        root = self.root.filename
+        if root is None:
+            return posixpath.join(":zipfile:", self.at) if self.at else ":zipfile:"
+        return posixpath.join(root, self.at)
 
     def __repr__(self):
         return self.__repr.format(self=self)
