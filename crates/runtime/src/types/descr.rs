@@ -126,7 +126,12 @@ unsafe fn alloc_descr<T>(tp: *mut PyTypeObject, owner: *mut PyTypeObject, nm: Py
         (*d).d_type = owner;
         (*d).d_qualname = std::ptr::null_mut();
         (*d).d_name = nm.into_raw();
-        crate::gc::track(op);
+        // (perf4) a descriptor of a static type refers only to that (untracked,
+        // never freed) type and to strings: it cannot be part of a cycle, so the
+        // collector does not need to visit the thousands created at start-up
+        if (*owner).tp_flags & Py_TPFLAGS_HEAPTYPE != 0 {
+            crate::gc::track(op);
+        }
         op as *mut T
     }
 }
