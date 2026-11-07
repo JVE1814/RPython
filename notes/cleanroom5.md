@@ -121,3 +121,34 @@
   ",," as the RMAIL format does (the old file wrote one comma; both read back the same); a
   Babyl message whose header block runs past its end (no empty line) yields what can be read
   instead of an AssertionError.
+- (sslproto speed) pyperformance asyncio_tcp --ssl, s per run, old vs new interleaved:
+  46.8/36.8/39.9 vs 40.2/41.9/32.6 (equal within noise; TLS is slow on this build overall).
+
+### zipfile/__init__.py: ZipInfo, ZipFile, _MemberWriter (rewritten)
+- Verdict: ZipInfo and ZipFile's reading/writing/extracting methods were CPython's text with
+  reworded comments (the end-record writer, `_Extra`, `_find_end_record`, `_ArchiveView`,
+  `_CountingWriter` and ZipExtFile were already own design and are kept).
+- Tests (before -> after): test_zipfile 388 = 388 (pass); test_zipimport, test_zipapp,
+  test_shutil, test_pathlib, test_pydoc, test_tarfile = (pass); test_importlib 6 errors under
+  -j with the old and the new file alike (pre-existing).
+- Kept because pinned: public attributes of both classes, `ZipInfo.FileHeader`,
+  `_encodeFilenameFlags`, `_decodeExtra`, `_for_archive`, `_compresslevel`, `_stored_name`;
+  ZipFile's `fp`, `filelist`, `NameToInfo`, `start_dir`, `debug`, `_lock`, `_seekable`,
+  `_writing`, `_didModify`, `_filePassed`, `_fileRefCnt`, `_start_disk`, `_RealGetContents`,
+  `_open_to_write`, `_extract_member`, `_sanitize_windows_name`,
+  `_windows_illegal_name_trans_table`, `_writecheck`, `_fpclose`, `_write_end_record`; every
+  message and the printdir/repr formats.
+- New structure: DOS timestamps via `_dos_stamp`/`_from_dos_stamp`; ZIP64 extra fields read
+  from a `_ZIP64_SLOTS` table (`_apply_zip64`), the Unicode-path field by
+  `_apply_unicode_path`; directory records parsed from the in-memory directory by
+  `_parse_directory_entry`; open modes from `_FILE_MODES` (`_open_path`), mode set-up in
+  `_prepare_write`/`_prepare_append`; open() split into `_check_local_header` and
+  `_password_for`; `_safe_relative_path` for extraction, `_check_can_add`,
+  `_seek_to_append`, `_register`; `_MemberWriter._emit` counts compressed bytes.
+- Differential check (old vs new module, same interpreter, SOURCE_DATE_EPOCH fixed): 300
+  random archives (seekable/unseekable targets, prefixed stubs, all compression methods and
+  levels, writestr with names and ZipInfos, mkdir, open('w') with force_zip64, comments) —
+  identical archive bytes; each archive read by both modules (infolist attributes, reprs,
+  member data, printdir, testzip, comment, append mode, extractall) — identical; 300
+  randomly corrupted archives read by both — identical results and exceptions.
+- Behaviour changes: none found.
