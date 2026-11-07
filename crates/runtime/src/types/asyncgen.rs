@@ -32,6 +32,8 @@ struct Awaitable {
     state: *mut PyObject,
 }
 const A_GEN: usize = 0;
+/// (remote1) where the generator pointer of an asend/athrow object lives (debug table)
+pub(crate) const AWAITABLE_GEN_OFFSET: usize = std::mem::offset_of!(Awaitable, agen);
 const A_ARG: usize = 1;
 const A_STATE: usize = 2;
 

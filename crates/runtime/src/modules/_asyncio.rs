@@ -429,24 +429,39 @@ if hasattr(_os, 'register_at_fork'):
     _os.register_at_fork(after_in_child=_forget_current_tasks)
 
 
+# (remote1) out-of-process debuggers walk a native task registry; these hooks keep it
+# in sync. They are injected by the runtime before this source runs; fall back to no-ops.
+try:
+    _rd_link
+except NameError:
+    def _rd_link(task): pass
+    def _rd_unlink(task): pass
+    def _rd_running(task): pass
+    def _rd_layout(*args): pass
+
+
 def _register_task(task):
     """Add a task to the registry of known tasks."""
     _scheduled_tasks.add(task)
+    _rd_link(task)
 
 
 def _register_eager_task(task):
     """Add a task to the registry of known tasks."""
     _eager_tasks.add(task)
+    _rd_link(task)
 
 
 def _unregister_task(task):
     """Remove a task from the registry."""
     _scheduled_tasks.discard(task)
+    _rd_unlink(task)
 
 
 def _unregister_eager_task(task):
     """Remove a task from the registry."""
     _eager_tasks.discard(task)
+    _rd_unlink(task)
 
 
 def _enter_task(loop, task):
@@ -456,6 +471,7 @@ def _enter_task(loop, task):
         raise RuntimeError(f'Cannot enter into task {task!r} while another '
                            f'task {current!r} is being executed.')
     _current_tasks[loop] = task
+    _rd_running(task)
 
 
 def _leave_task(loop, task):
@@ -465,6 +481,7 @@ def _leave_task(loop, task):
         raise RuntimeError(f'Leaving task {task!r} does not match the '
                            f'current task {current!r}.')
     del _current_tasks[loop]
+    _rd_running(None)
 
 
 def _swap_current_task(loop, task):
@@ -539,8 +556,10 @@ class Task(Future):
         if context is None:
             context = _contextvars.copy_context()
         self._task_context = context
+        # name the task eagerly (like CPython's C accelerator) so an out-of-process
+        # debugger reading the task object always sees a name
         if name is None:
-            self._task_name = None
+            self._task_name = f'Task-{next(_task_counter)}'
         elif isinstance(name, str):
             self._task_name = name
         else:
@@ -554,6 +573,9 @@ class Task(Future):
             _register_task(self)
 
     def __del__(self):
+        # (remote1) drop the task from the native debug registry before its memory is
+        # freed, so an out-of-process reader never sees a dangling task node
+        _rd_unlink(self)
         try:
             pending = (self._fut_state == _PENDING and
                        self._task_log_destroy_pending)
@@ -835,6 +857,15 @@ class _builtin_function:
         return f'<built-in function {self.__name__}>'
 
 
+# (remote1) tell the runtime where a Task/Future keeps the fields a debugger reads
+try:
+    _rd_layout(Task, Task._task_name, Task._task_coro,
+               Future._fut_awaited_by, Future._fut_state,
+               Future.__await__.__code__)
+except Exception:
+    pass
+
+
 for _name in ('_get_running_loop', '_set_running_loop', 'get_running_loop',
               'get_event_loop', 'future_add_to_awaited_by',
               'future_discard_from_awaited_by', '_register_task',
@@ -878,6 +909,7 @@ pub fn init_module() -> PyResult {
     dict::set_item_str(&d, "__builtins__", &crate::builtins::builtins_module())?;
     let defs = crate::mdefs![("_throw_stored", FAST, throw_stored)];
     dict::set_item_str(&d, "_throw_stored", &crate::types::cfunction::new_cfunction(defs, None, None))?;
+    crate::modules::remote_debug::target::install_asyncio_hooks(&d)?;
     let code = crate::compile::compile_str(SRC, "<_asyncio>", crate::compile::Mode::Exec, 0, -1)?;
     crate::interp::eval_code(&code.code, &d, Some(&d))?;
     Ok(m)

@@ -941,7 +941,48 @@ fn sys_is_remote_debug_enabled(_m: &PyObject) -> PyResult {
 }
 fn sys_remote_exec(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     crate::args::check_pos("remote_exec", args, 2, 2)?;
-    raise!(RuntimeError, "Remote debugging is not enabled");
+    let pid = int::as_i64(args[0]).ok_or_else(|| err!(TypeError, "remote_exec() argument 1 must be int, not {}", crate::types::typeobject::tname(args[0])))? as i32;
+    // the script path: str or bytes-like (os.PathLike too, via os.fspath)
+    if !pystr::is_str(args[1]) && !crate::types::bytes::is_bytes(args[1]) {
+        // os.PathLike is accepted via fspath; a plain int/None is a TypeError
+        if ab::getattr_opt(args[1], crate::name!("__fspath__"))?.is_none() {
+            raise!(TypeError, "remote_exec() argument 2 must be a str, bytes or os.PathLike object, not {}", crate::types::typeobject::tname(args[1]));
+        }
+    }
+    let path_obj = crate::modules::posix::path::fspath(args[1])?;
+    let path_bytes: Vec<u8> = if pystr::is_str(&path_obj) {
+        crate::modules::posix::path::fs_encode_str(&path_obj)?
+    } else {
+        crate::types::bytes::bytes_data(&path_obj).to_vec()
+    };
+    crate::modules::sys_full::audit("sys.remote_exec", &[args[0], args[1]])?;
+    // the script must exist and be readable (reported now, not at the safe point)
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let os = std::ffi::OsStr::from_bytes(&path_bytes);
+        if std::fs::metadata(os).is_err() {
+            return Err(crate::types::exceptions::os_error_from_errno(libc::ENOENT, Some(&path_obj), None));
+        }
+    }
+    let self_pid = unsafe { libc::getpid() };
+    if pid == self_pid {
+        if !remote_debug_enabled() {
+            raise!(RuntimeError, "Remote debugging is not enabled");
+        }
+        crate::modules::remote_debug::queue_self_remote_exec(&path_bytes);
+        // ask the main thread to run it at its next safe point
+        if let Some(mt) = crate::threads::main_thread_state() {
+            mt.c.eval_breaker.fetch_or(crate::modules::remote_debug::EVAL_REMOTE_EXEC, std::sync::atomic::Ordering::Release);
+        }
+        return Ok(none::none_ref());
+    }
+    // another process
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::ESRCH);
+        return Err(crate::types::exceptions::os_error_from_errno(e, None, None));
+    }
+    crate::modules::remote_debug::reader::do_remote_exec(pid, &path_bytes)?;
+    Ok(none::none_ref())
 }
 fn sys_getallocatedblocks(_m: &PyObject) -> PyResult {
     Ok(int::new_int(0))
