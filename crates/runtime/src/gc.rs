@@ -249,6 +249,16 @@ pub fn enter_vm(cell: &crate::threads::ModeCell, safe: crate::threads::ThreadMod
     let me = cell as *const _ as usize;
     loop {
         cell.0.store(ThreadMode::InVm as u8, SeqCst);
+        if cell.1.load(SeqCst) != 0 {
+            // (scale2) another thread is merging this thread's queued objects on its
+            // behalf (threads::try_hold): a few atomic operations, wait them out
+            cell.0.store(safe as u8, SeqCst);
+            while cell.1.load(SeqCst) != 0 {
+                std::hint::spin_loop();
+                std::thread::yield_now();
+            }
+            continue;
+        }
         if STW_OWNER.load(SeqCst) == me {
             return;
         }
@@ -724,6 +734,9 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
         crate::sharded::merge_all();
         // (scale1) everything retired through QSBR before this stop can go
         QSBR_TAKEN.lock().unwrap_or_else(|e| e.into_inner()).extend(crate::qsbr::take_all_for_gc());
+        // (scale2) objects waiting in the merge queues of owners that do not poll
+        // (blocked threads) are merged now and released after the collection
+        DEAD_SHARDED.lock().unwrap_or_else(|e| e.into_inner()).extend(crate::threads::merge_all_queues_stopped());
         // ---- phase 1 (stopped): find the unreachable objects
         let mut objs = snapshot_gen(young_only);
         crate::gc_support::untrack_atomic_tuples(&mut objs);

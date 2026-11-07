@@ -196,6 +196,7 @@ fn time_sleep(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     if secs > 9.2e9 {
         raise!(OverflowError, "sleep length is too large");
     }
+    crate::threads::before_wait(); // scale2
     sleep_secs(secs)?;
     Ok(none::none_ref())
 }

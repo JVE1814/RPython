@@ -199,7 +199,7 @@ pub fn new_thread_state() -> *mut ThreadState {
         let stack_low = compute_stack_low();
         let st = ThreadState {
             c,
-            mode: ModeCell(std::sync::atomic::AtomicU8::new(ThreadMode::Blocked as u8)),
+            mode: ModeCell(std::sync::atomic::AtomicU8::new(ThreadMode::Blocked as u8), AtomicUsize::new(0)),
             merge_queue: Mutex::new(Vec::new()),
             frame: Cell::new(std::ptr::null_mut()),
             recursion_depth: Cell::new(0),
@@ -377,6 +377,22 @@ pub unsafe fn queue_object_for_merge(op: *mut PyObject) {
             let ts = &*(t as *const ThreadState);
             if ts.owner_tid == tid && ts.alive.load(SeqCst) {
                 ts.merge_queue.lock().unwrap_or_else(|e| e.into_inner()).push(op as usize);
+                if ts.mode.0.load(Relaxed) != ThreadMode::InVm as u8 && same_interp(ts) && try_hold(ts) {
+                    // (scale2) the owner is blocked and would not merge until it runs
+                    // again: merge its queue on its behalf (prompt deallocation, e.g.
+                    // concurrent.futures results freed while the producer waits)
+                    let items: Vec<usize> = std::mem::take(&mut *ts.merge_queue.lock().unwrap_or_else(|e| e.into_inner()));
+                    for &q in &items {
+                        // each entry owns a reference: the merged total stays >= 1
+                        crate::object::explicit_merge(q as *mut PyObject);
+                    }
+                    release_hold(ts);
+                    drop(threads);
+                    for q in items {
+                        crate::object::decref(q as *mut PyObject);
+                    }
+                    return;
+                }
                 ts.c.eval_breaker.fetch_or(EVAL_MERGE_REFCOUNTS, Release);
                 return;
             }
@@ -394,6 +410,50 @@ pub const EVAL_ASYNC_EXC: usize = 1 << 3;
 pub const EVAL_GC: usize = 1 << 4;
 /// Pending calls (Py_AddPendingCall) are queued for this thread (capi/pystate.rs).
 pub const EVAL_PENDING: usize = 1 << 6;
+
+/// (scale2) World stopped (collection): empty every thread's merge queue on behalf of
+/// its owner. An owner blocked in a wait never reaches the eval breaker that would
+/// process its queue, so objects whose last other reference was dropped by another
+/// thread stayed alive until the owner woke up (concurrent.futures: results unpickled
+/// by the executor's manager thread). Each queued object is merged now (its owner is
+/// stopped, so its local count is stable) and becomes ownerless; the queue entry's
+/// reference is returned, to be dropped by the caller once the world runs again (the
+/// drop may deallocate and run finalizers).
+pub fn merge_all_queues_stopped() -> Vec<crate::object::PyRef> {
+    let mut out = Vec::new();
+    let threads: Vec<usize> = ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for t in threads {
+        let ts = unsafe { &*(t as *const ThreadState) };
+        if !same_interp(ts) {
+            continue; // its objects are released in its own interpreter
+        }
+        let items: Vec<usize> = std::mem::take(&mut *ts.merge_queue.lock().unwrap_or_else(|e| e.into_inner()));
+        for op in items {
+            unsafe {
+                // the entry owns one reference: merged with it, the total stays >= 1
+                crate::object::explicit_merge(op as *mut PyObject);
+                out.push(crate::object::PyRef::from_raw(op as *mut PyObject));
+            }
+        }
+    }
+    out
+}
+
+/// (scale2) The calling thread is about to block in a Python-level wait (lock acquire,
+/// sleep, join, queue get): merge what other threads queued for it and release its
+/// matured deferred items now instead of after the wait. Only call where running
+/// deallocators (finalizers, weakref callbacks) is safe, i.e. with no internal lock held.
+pub fn before_wait() {
+    let p = current_ptr();
+    if p.is_null() {
+        return;
+    }
+    let ts = unsafe { &*p };
+    if ts.c.eval_breaker.load(Relaxed) & EVAL_MERGE_REFCOUNTS != 0 {
+        process_merge_queue(ts);
+    }
+    crate::qsbr::before_wait();
+}
 
 /// Process pending merges for the current thread.
 pub fn process_merge_queue(ts: &ThreadState) {
@@ -528,8 +588,40 @@ impl ThreadState {
 }
 
 
-/// Thread mode readable from other threads (stop-the-world coordination).
-pub struct ModeCell(pub std::sync::atomic::AtomicU8);
+/// Thread mode readable from other threads (stop-the-world coordination). `.1` (scale2):
+/// non-zero while another thread works on this thread's behalf (`try_hold`); the thread
+/// cannot switch to `InVm` meanwhile.
+pub struct ModeCell(pub std::sync::atomic::AtomicU8, pub AtomicUsize);
+
+/// (scale2) Per-thread handshake executed by the requester (HotSpot style): if `ts` is
+/// not executing Python (blocked in a wait or in native code), keep it from re-entering
+/// the VM until `release_hold` and return true; the caller may then do owner-only work
+/// on its objects (merge their local reference counts). False if `ts` runs Python code
+/// (it then does the work itself at its next eval-breaker poll) or is already held.
+pub fn try_hold(ts: &ThreadState) -> bool {
+    let me = crate::object::thread_id();
+    if ts.mode.1.compare_exchange(0, me, SeqCst, Relaxed).is_err() {
+        return false;
+    }
+    // Dekker with enter_vm: it stores InVm, then reads `.1`
+    if ts.mode.0.load(SeqCst) == ThreadMode::InVm as u8 || !ts.alive.load(SeqCst) {
+        ts.mode.1.store(0, SeqCst);
+        return false;
+    }
+    true
+}
+
+/// (scale2) Does `ts` belong to the calling thread's interpreter? Objects of another
+/// interpreter are only released on behalf of their owner by threads of the same
+/// interpreter (their finalizers and weakref callbacks use that interpreter's
+/// modules, which its own finalization may be tearing down).
+pub fn same_interp(ts: &ThreadState) -> bool {
+    std::ptr::eq(crate::subinterp::of_ts(ts), crate::subinterp::current())
+}
+
+pub fn release_hold(ts: &ThreadState) {
+    ts.mode.1.store(0, SeqCst);
+}
 impl ModeCell {
     #[inline]
     pub fn get(&self) -> ThreadMode {

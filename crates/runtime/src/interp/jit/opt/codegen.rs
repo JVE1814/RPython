@@ -763,6 +763,55 @@ impl<'a, 'b> Cg<'a, 'b> {
                 let r = self.gr(*v, R10);
                 crate::interp::jit::tier1::emit_note_attr_read(&mut self.g.a, r);
             }
+            TryLockFlag(d, v) => {
+                let r = self.gr(*v, R10);
+                let a = &mut self.g.a;
+                a.mov_ri(Rax, 0);
+                a.mov_ri(R11, 1);
+                a.lock_cmpxchg8(M(r, OB_MUTEX), R11);
+                let rd = self.dst(*d, R11);
+                self.a().setcc(Cc::E, rd);
+                self.put(*d, rd);
+            }
+            Xchg(d, b, off, s) => {
+                let rb = self.base(*b, R10);
+                let rs = self.gr(*s, R11);
+                let a = &mut self.g.a;
+                if rs != R11 {
+                    a.mov_rr(R11, rs);
+                }
+                a.xchg_mr(M(rb, *off), R11);
+                self.put(*d, R11);
+            }
+            ReleaseAttr(o, x) => {
+                let ro = self.gr(*o, R10);
+                let rx = self.gr(*x, Rax);
+                let skip = self.a().label();
+                let defer = self.a().label();
+                {
+                    let a = &mut self.g.a;
+                    a.test_rr(rx, rx);
+                    a.jcc(Cc::E, skip);
+                    a.cmp_rm(R15, M(ro, OB_TID));
+                    a.jcc(Cc::NE, defer);
+                    a.load8(R11, M(ro, OB_FLAGS));
+                    a.test_ri(R11, crate::qsbr::XREAD as i32);
+                    a.jcc(Cc::NE, defer);
+                }
+                self.decref(rx);
+                let rt = crate::interp::jit::tier1::decref_deferred_routine().ok_or("tier2: no deferred-release routine")?;
+                let a = &mut self.g.a;
+                a.jmp(skip);
+                a.bind(defer);
+                a.push(Rdi);
+                if rx != Rdi {
+                    a.mov_rr(Rdi, rx);
+                }
+                a.mov_ri(R11, rt as i64);
+                a.call_r(R11);
+                a.pop(Rdi);
+                a.bind(skip);
+            }
             Unlock(v) => {
                 let r = self.gr(*v, R10);
                 // (scale1) runtime waiters park on a contended ob_mutex (bit 1): a plain

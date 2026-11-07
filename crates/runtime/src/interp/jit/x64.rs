@@ -387,6 +387,12 @@ impl Asm {
             self.buf.extend_from_slice(&i.to_le_bytes());
         }
     }
+    /// xchg qword [m], r64 (implicitly locked: a full barrier) (scale2)
+    pub fn xchg_mr(&mut self, m: M, r: R) {
+        self.rex(true, r as u8, 0, m.0 as u8, false);
+        self.b(0x87);
+        self.modrm_mem(r as u8, m);
+    }
     /// lock or word [m], imm16 (scale2)
     pub fn lock_or16_mi(&mut self, m: M, i: u16) {
         self.b(0xf0);

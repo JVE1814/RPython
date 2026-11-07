@@ -70,6 +70,18 @@ impl RawLock {
             futex_wake(&self.state, 1);
         }
     }
+    /// `acquire_timed` for Python-level callers (lock.acquire, with lock: ...): before
+    /// waiting, the thread's pending merges and deferred releases are processed
+    /// (scale2: threads::before_wait), which internal users of the lock must not do.
+    pub fn acquire_py(&self, timeout: Option<Duration>) -> PyResult<AcquireResult> {
+        if self.try_acquire() {
+            return Ok(AcquireResult::Acquired);
+        }
+        if timeout != Some(Duration::ZERO) {
+            crate::threads::before_wait();
+        }
+        self.acquire_timed(timeout)
+    }
     /// Blocking acquire. `timeout` None = forever. When called on the main thread,
     /// pending Python signal handlers are run while waiting (errors propagate).
     pub fn acquire_timed(&self, timeout: Option<Duration>) -> PyResult<AcquireResult> {
@@ -248,13 +260,13 @@ unsafe extern "C" fn lock_repr(op: *mut PyObject) -> *mut PyObject {
 
 fn lock_acquire(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
     let t = parse_acquire_args("acquire", args, kw)?;
-    match lk(o).acquire_timed(t)? {
+    match lk(o).acquire_py(t)? {
         AcquireResult::Acquired => Ok(bool_::new_bool(true)),
         AcquireResult::TimedOut => Ok(bool_::new_bool(false)),
     }
 }
 fn lock_enter(o: &PyObject) -> PyResult {
-    lk(o).acquire_timed(None)?;
+    lk(o).acquire_py(None)?;
     Ok(bool_::new_bool(true))
 }
 fn lock_release(o: &PyObject) -> PyResult {
@@ -352,7 +364,7 @@ fn rlock_acquire_impl(o: &PyObject, t: Option<Duration>) -> PyResult {
         r.count.store(c + 1, Relaxed);
         return Ok(bool_::new_bool(true));
     }
-    match r.lock.acquire_timed(t)? {
+    match r.lock.acquire_py(t)? {
         AcquireResult::Acquired => {
             r.owner.store(me, Relaxed);
             r.count.store(1, Relaxed);
@@ -571,6 +583,7 @@ fn handle_join(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRes
         raise!(PythonFinalizationError, "cannot join thread at interpreter shutdown");
     }
     let fgen = h.generation.load(Relaxed);
+    crate::threads::before_wait(); // scale2
     wait_interruptible(
         &h.state,
         &h.cv,

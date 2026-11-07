@@ -125,6 +125,7 @@ fn sq_get_impl(o: &PyObject, block: bool, timeout: Option<Duration>) -> PyResult
     if !block {
         return Err(empty_err());
     }
+    crate::threads::before_wait(); // scale2
     let deadline = timeout.map(|t| Instant::now() + t);
     let main = crate::threads::is_main_thread();
     loop {

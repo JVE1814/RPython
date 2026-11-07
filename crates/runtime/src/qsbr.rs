@@ -388,8 +388,40 @@ pub fn take_all_for_gc() -> Vec<ItemSendBatch> {
     // a goal that every thread has passed, since all of them are stopped right now.
     let goal = GLOBAL.fetch_add(1, SeqCst) + 1;
     let locals = LOCALS.lock().unwrap_or_else(|e| e.into_inner());
+    let me_tid = crate::object::thread_id();
     for &lp in locals.iter() {
         let l = unsafe { &mut *(lp as *mut Local) };
+        // (scale2) a thread that is not executing Python (blocked in a wait, in native
+        // code) may not poll for a long time: its items are released by the caller
+        // instead. The objects are made ownerless now, while their owners are stopped,
+        // so that the caller's decrefs release them instead of queueing them for an
+        // owner that does not run.
+        let idle = !l.ts.is_null() && unsafe { (*l.ts).mode.get() != crate::threads::ThreadMode::InVm && crate::threads::same_interp(&*l.ts) };
+        if idle {
+            let mut batches: Vec<(Vec<Item>, bool)> = Vec::new();
+            if !l.open.is_empty() {
+                batches.push((std::mem::take(&mut l.open), false));
+            }
+            for (_, items) in l.closed.drain(..) {
+                batches.push((items, true));
+            }
+            for (items, counted) in batches {
+                for it in &items {
+                    if let Item::Decref(p) = *it {
+                        unsafe {
+                            let o = &*p;
+                            let tid = o.ob_tid.load(Relaxed);
+                            if tid != 0 && tid != me_tid && !o.is_immortal() && !crate::sharded::is_sharded(o) && !crate::object::has_type_id(p) {
+                                crate::object::explicit_merge(p);
+                            }
+                        }
+                    }
+                }
+                out.push(ItemSendBatch(items, counted));
+            }
+            l.polls = 0;
+            continue;
+        }
         if !l.open.is_empty() {
             let items = std::mem::take(&mut l.open);
             PENDING_TOTAL.fetch_add(items.len(), Relaxed);
@@ -538,6 +570,31 @@ fn poll(scan: bool) {
     }
     for b in orphan_ready {
         unsafe { release(b.into_iter().map(|i| i.0).collect()) };
+    }
+}
+
+/// (scale2) The calling thread is about to wait (lock acquire, sleep, join) and may not
+/// poll for a long time: close its open batch and release what has matured (with the
+/// other threads blocked too, that is everything), so that objects it retired are not
+/// kept alive for the whole wait (a weakref callback another thread waits for, a
+/// reference cycle through a frame...). Called where running deallocators is safe
+/// (the same places that run signal handlers).
+pub fn before_wait() {
+    let l = local();
+    if l.open.is_empty() && l.closed.is_empty() {
+        return;
+    }
+    if !l.open.is_empty() {
+        close_batch();
+    }
+    poll(true);
+    // Threads running Python report within microseconds (closing the batch asked them
+    // to); blocked ones already count as quiescent. Give them a moment rather than
+    // keeping the items for the whole wait.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2);
+    while !local().closed.is_empty() && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+        poll(true);
     }
 }
 

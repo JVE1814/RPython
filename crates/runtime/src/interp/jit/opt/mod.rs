@@ -37,6 +37,7 @@ pub mod layout {
     use std::mem::offset_of;
     pub const OB_TID: i32 = offset_of!(PyObject, ob_tid) as i32;
     pub const OB_MUTEX: i32 = offset_of!(PyObject, ob_mutex) as i32;
+    pub const OB_FLAGS: i32 = offset_of!(PyObject, ob_flags) as i32;
     pub const GC_BITS: i32 = offset_of!(PyObject, ob_gc_bits) as i32;
     pub const OB_REF_LOCAL: i32 = offset_of!(PyObject, ob_ref_local) as i32;
     pub const OB_REF_SHARED: i32 = offset_of!(PyObject, ob_ref_shared) as i32;
