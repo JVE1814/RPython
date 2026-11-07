@@ -487,14 +487,98 @@ pub unsafe extern "C" fn _PyDict_Pop(o: *mut PyObject, k: *mut PyObject, dflt: *
     }
 }
 
-// watchers: accepted but never fire (no specialising interpreter relies on them)
-static WATCHERS: std::sync::Mutex<[usize; 8]> = std::sync::Mutex::new([0; 8]);
+// ---------------------------------------------------------------- dict watchers
+// (wheels2) The set of watched dicts lives in a side table (the dict's
+// `_ma_watcher_tag` field already serves the interpreter's attribute caches);
+// mutations pay one relaxed atomic load while no dict is watched.
+
+const DICT_MAX_WATCHERS: usize = 8;
+static WATCHER_CBS: [std::sync::atomic::AtomicUsize; DICT_MAX_WATCHERS] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; DICT_MAX_WATCHERS];
+static WATCHER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static NWATCHED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static WATCHED: std::sync::Mutex<Option<std::collections::HashMap<usize, u8>>> = std::sync::Mutex::new(None);
+
+pub const EV_ADDED: c_int = 0;
+pub const EV_MODIFIED: c_int = 1;
+pub const EV_DELETED: c_int = 2;
+pub const EV_CLONED: c_int = 3;
+pub const EV_CLEARED: c_int = 4;
+pub const EV_DEALLOCATED: c_int = 5;
+const EV_NAMES: [&str; 6] = ["ADDED", "MODIFIED", "DELETED", "CLONED", "CLEARED", "DEALLOCATED"];
+
+/// The watcher bits of `d` (0 when unwatched; cheap while nothing is watched).
+#[inline(always)]
+pub fn watched_mask(d: *mut PyObject) -> u8 {
+    if NWATCHED.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return 0;
+    }
+    watched_mask_slow(d)
+}
+#[cold]
+fn watched_mask_slow(d: *mut PyObject) -> u8 {
+    let g = WATCHED.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref().and_then(|m| m.get(&(d as usize)).copied()).unwrap_or(0)
+}
+
+/// Run the callbacks of the watchers of `d` for one event (before the change is
+/// made). A failing callback is reported as unraisable; the mutation goes on.
+#[cold]
+pub fn notify(d: *mut PyObject, mask: u8, event: c_int, key: *mut PyObject, value: *mut PyObject) {
+    type Cb = unsafe extern "C" fn(c_int, *mut PyObject, *mut PyObject, *mut PyObject) -> c_int;
+    // a pending exception (e.g. during dealloc) must survive the callbacks
+    let saved = take_exc();
+    for i in 0..DICT_MAX_WATCHERS {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
+        let cb = WATCHER_CBS[i].load(std::sync::atomic::Ordering::Acquire);
+        if cb == 0 {
+            continue;
+        }
+        let f: Cb = unsafe { std::mem::transmute(cb) };
+        if unsafe { f(event, d, key, value) } < 0 {
+            let msg = format!(
+                "Exception ignored in PyDict_EVENT_{} watcher callback for <dict at {:p}>",
+                EV_NAMES.get(event as usize).copied().unwrap_or("?"),
+                d
+            );
+            crate::modules::sys_full::write_unraisable(Some(&msg), None);
+        }
+    }
+    if let Some(e) = saved {
+        set_exc(e);
+    }
+}
+
+/// Forget a dict that is going away (after its DEALLOCATED event).
+pub fn forget_watched(d: *mut PyObject) {
+    let mut g = WATCHED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(m) = g.as_mut() {
+        if m.remove(&(d as usize)).is_some() {
+            NWATCHED.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+fn check_watcher_id(id: c_int) -> bool {
+    if !(0..DICT_MAX_WATCHERS as c_int).contains(&id) {
+        let _ = value_error(&format!("Invalid dict watcher ID {}", id));
+        return false;
+    }
+    if WATCHER_CBS[id as usize].load(std::sync::atomic::Ordering::Acquire) == 0 {
+        let _ = value_error(&format!("No dict watcher set for ID {}", id));
+        return false;
+    }
+    true
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyDict_AddWatcher(cb: *mut std::ffi::c_void) -> c_int {
-    let mut w = WATCHERS.lock().unwrap();
-    for (i, slot) in w.iter_mut().enumerate() {
-        if *slot == 0 {
-            *slot = cb as usize;
+    let _g = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for (i, slot) in WATCHER_CBS.iter().enumerate() {
+        if slot.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            slot.store(cb as usize, std::sync::atomic::Ordering::Release);
             return i as c_int;
         }
     }
@@ -503,31 +587,52 @@ pub unsafe extern "C" fn PyDict_AddWatcher(cb: *mut std::ffi::c_void) -> c_int {
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyDict_ClearWatcher(id: c_int) -> c_int {
-    let mut w = WATCHERS.lock().unwrap();
-    if !(0..8).contains(&id) || w[id as usize] == 0 {
-        let _ = value_error(&format!("Invalid dict watcher ID {}", id));
+    let _g = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if !check_watcher_id(id) {
         return -1;
     }
-    w[id as usize] = 0;
+    WATCHER_CBS[id as usize].store(0, std::sync::atomic::Ordering::Release);
     0
 }
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyDict_Watch(id: c_int, d: *mut PyObject) -> c_int {
+
+unsafe fn watch_bit(id: c_int, d: *mut PyObject, on: bool) -> c_int {
     unsafe {
         if d.is_null() || !dict::is_dict(&*d) {
             let _ = value_error("Cannot watch non-dictionary");
             return -1;
         }
-        if !(0..8).contains(&id) {
-            let _ = value_error(&format!("Invalid dict watcher ID {}", id));
+        if !check_watcher_id(id) {
             return -1;
+        }
+        let mut g = WATCHED.lock().unwrap_or_else(|e| e.into_inner());
+        let m = g.get_or_insert_with(std::collections::HashMap::new);
+        let key = d as usize;
+        let old = m.get(&key).copied().unwrap_or(0);
+        let new = if on { old | (1 << id) } else { old & !(1 << id) };
+        match (old, new) {
+            (0, 0) => {}
+            (0, _) => {
+                m.insert(key, new);
+                NWATCHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            (_, 0) => {
+                m.remove(&key);
+                NWATCHED.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            _ => {
+                m.insert(key, new);
+            }
         }
         0
     }
 }
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyDict_Watch(id: c_int, d: *mut PyObject) -> c_int {
+    unsafe { watch_bit(id, d, true) }
+}
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyDict_Unwatch(id: c_int, d: *mut PyObject) -> c_int {
-    unsafe { PyDict_Watch(id, d) }
+    unsafe { watch_bit(id, d, false) }
 }
 
 #[unsafe(no_mangle)]

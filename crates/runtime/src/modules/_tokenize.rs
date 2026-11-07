@@ -80,6 +80,8 @@ fn syntax_error(e: &rpy_parser::SyntaxError) -> PyErr {
 
 unsafe extern "C" fn tokiter_next(o: *mut PyObject) -> *mut PyObject {
     unsafe {
+        // (wheels2) one iterator shared by several threads: each next() runs alone
+        let _lk = crate::objlock::lock(&*o);
         let st = &mut *(*(o as *mut TokIterObj)).state;
         into_c_opt((|| -> PyResult<Option<PyRef>> {
             if st.done {

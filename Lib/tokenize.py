@@ -18,6 +18,7 @@ from io import TextIOWrapper
 from token import *
 from token import EXACT_TOKEN_TYPES
 import token as _token
+import _tokenize
 
 __all__ = _token.__all__ + ["tokenize", "generate_tokens", "detect_encoding",
                             "untokenize", "TokenInfo", "open", "TokenError"]

@@ -132,6 +132,10 @@ def _int_arg(value):
     if not isinstance(value, int):
         raise TypeError('__index__ returned non-int (type %s)' %
                         type(value).__name__)
+    # the fields are C ints: out of that range it is an OverflowError, not
+    # the ValueError of the range checks (dateutil/pandas rely on the type)
+    if not -0x80000000 <= value <= 0x7fffffff:
+        raise OverflowError("Python int too large to convert to C int")
     return value
 
 
@@ -445,6 +449,16 @@ _US_PER_SECOND = 1000000
 _US_PER_DAY = 86400 * _US_PER_SECOND
 
 
+def _td_us(td):
+    """Total microseconds of a timedelta, read from its own fields.
+
+    Arithmetic with a timedelta operand works on the fields, never through
+    the operand's operators: a subclass (pandas' Timedelta counts nanoseconds
+    in a narrower range) must not take over datetime + delta."""
+    return ((td._dt_days * 86400 + td._dt_seconds) * _US_PER_SECOND
+            + td._dt_microseconds)
+
+
 def _as_microseconds(value, scale):
     """value * scale microseconds as (int, float remainder) for a number."""
     if isinstance(value, int):
@@ -572,19 +586,19 @@ class timedelta:
 
     def __add__(self, other):
         if isinstance(other, timedelta):
-            return timedelta._from_us(self._to_us() + other._to_us())
+            return timedelta._from_us(self._to_us() + _td_us(other))
         return NotImplemented
 
     __radd__ = __add__
 
     def __sub__(self, other):
         if isinstance(other, timedelta):
-            return timedelta._from_us(self._to_us() - other._to_us())
+            return timedelta._from_us(self._to_us() - _td_us(other))
         return NotImplemented
 
     def __rsub__(self, other):
         if isinstance(other, timedelta):
-            return -self + other
+            return timedelta._from_us(_td_us(other) - self._to_us())
         return NotImplemented
 
     def __neg__(self):
@@ -879,7 +893,7 @@ class date:
 
     def __add__(self, other):
         if isinstance(other, timedelta):
-            o = self.toordinal() + other.days
+            o = self.toordinal() + other._dt_days
             if 0 < o <= _MAXORDINAL:
                 return type(self).fromordinal(o)
             raise OverflowError("result out of range")
@@ -889,7 +903,7 @@ class date:
 
     def __sub__(self, other):
         if isinstance(other, timedelta):
-            return self + timedelta(-other.days)
+            return self + timedelta(-other._dt_days)
         if isinstance(other, date) and not isinstance(other, datetime):
             return timedelta(self.toordinal() - other.toordinal())
         return NotImplemented
@@ -1784,26 +1798,39 @@ class datetime(date):
         "datetime + timedelta."
         if not isinstance(other, timedelta):
             return NotImplemented
-        delta = timedelta(self.toordinal(), hours=self._dt_hour,
-                          minutes=self._dt_minute, seconds=self._dt_second,
-                          microseconds=self._dt_microsecond) + other
-        hour, rem = divmod(delta.seconds, 3600)
-        minute, second = divmod(rem, 60)
-        if 0 < delta.days <= _MAXORDINAL:
-            y, m, d = _ord2ymd(delta.days)
-            return type(self).combine(
-                date(y, m, d),
-                time(hour, minute, second, delta.microseconds,
-                     tzinfo=self._dt_tzinfo))
-        raise OverflowError("date value out of range")
+        return self._plus_us(_td_us(other))
 
     __radd__ = __add__
+
+    def _plus_us(self, us):
+        total = (self.toordinal() * _US_PER_DAY
+                 + ((self._dt_hour * 60 + self._dt_minute) * 60
+                    + self._dt_second) * _US_PER_SECOND
+                 + self._dt_microsecond + us)
+        days, rem = divmod(total, _US_PER_DAY)
+        secs, micro = divmod(rem, _US_PER_SECOND)
+        hour, rem = divmod(secs, 3600)
+        minute, second = divmod(rem, 60)
+        if 0 < days <= _MAXORDINAL:
+            y, m, d = _ord2ymd(days)
+            return type(self).combine(
+                date(y, m, d),
+                time(hour, minute, second, micro, tzinfo=self._dt_tzinfo))
+        raise OverflowError("date value out of range")
+
+    def __rsub__(self, other):
+        # the reflected call of datetime - datetime: a subclass on the left
+        # whose own __sub__ declined (pandas' Timestamp out of its range)
+        # still gets the plain datetime difference, as from a C slot
+        if isinstance(other, datetime):
+            return datetime.__sub__(other, self)
+        return NotImplemented
 
     def __sub__(self, other):
         "datetime - datetime or datetime - timedelta."
         if not isinstance(other, datetime):
             if isinstance(other, timedelta):
-                return self + -other
+                return self._plus_us(-_td_us(other))
             return NotImplemented
         days1 = self.toordinal()
         days2 = other.toordinal()

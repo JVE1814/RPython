@@ -197,6 +197,9 @@ class LocaleTime(object):
 # Format -> regular expression
 
 _Z_PATTERN = r"[+-]\d\d:?[0-5]\d(?::?[0-5]\d(?:\.\d{1,6})?)?|(?-i:Z)"
+# %:z: the separators are required; a value without them stops matching after
+# "+HH:MM" and the rest is reported as a missing colon
+_COLON_Z_PATTERN = r"[+-]\d\d:[0-5]\d(?::[0-5]\d(?:\.\d{1,6})?)?|(?-i:Z)"
 
 _MODIFIED = {
     'O': set('deHImMSuUVwWy'),
@@ -228,7 +231,7 @@ class TimeRE(dict):
             'y': r"(?P<y>\d\d)",
             'Y': r"(?P<Y>\d\d\d\d)",
             'z': r"(?P<z>" + _Z_PATTERN + r")?",
-            ':z': r"(?P<colon_z>" + _Z_PATTERN + r")?",
+            ':z': r"(?P<colon_z>" + _COLON_Z_PATTERN + r")?",
             'A': self._seq_to_re(self.locale_time.f_weekday, 'A'),
             'a': self._seq_to_re(self.locale_time.a_weekday, 'a'),
             'B': self._seq_to_re(self.locale_time.f_month[1:], 'B'),
@@ -283,6 +286,10 @@ class TimeRE(dict):
                 items.append(('dir', ':z'))
                 i += 3
                 continue
+            if d == ':':
+                # ':' only introduces %:z; name the pair that was found
+                bad = (d + format[i + 2:i + 3]).rstrip()
+                raise ValueError("'%s' is a bad directive in format '%s'" % (bad, format))
             if d in _MODIFIED:
                 nxt = format[i + 2:i + 3]
                 if nxt and nxt in _MODIFIED[d]:
@@ -414,7 +421,12 @@ def _strptime(data_string, format="%a %b %d %H:%M:%S %Y"):
     if not found:
         raise ValueError("time data %r does not match format %r" % (data_string, format))
     if len(data_string) != found.end():
-        raise ValueError("unconverted data remains: %s" % data_string[found.end():])
+        rest = data_string[found.end():]
+        if ('colon_z' in found.re.groupindex
+                and found.group('colon_z') is not None and rest[0] != ':'):
+            raise ValueError(f"Missing colon in %:z before '{rest}', got "
+                             f"'{data_string}'")
+        raise ValueError("unconverted data remains: %s" % rest)
 
     iso_year = year = None
     month = day = 1
