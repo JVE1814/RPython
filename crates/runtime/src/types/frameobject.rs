@@ -201,7 +201,14 @@ fn f_lineno(o: &PyObject) -> PyResult {
     if stored > 0 {
         return Ok(int::new_int(stored as i64));
     }
-    let l = if f.state == FrameState::Created { crate::types::code::code(f.code()).obj.co_firstlineno } else { f.lineno() };
+    let l = if f.state == FrameState::Created {
+        crate::types::code::code(f.code()).obj.co_firstlineno
+    } else if f.jump_to >= 0 {
+        // (pdb1) a jump requested by a trace function: report the target line
+        crate::types::code::frame_line(f.code(), f.jump_to as usize).map_or(-1, |l| l as i32)
+    } else {
+        f.lineno()
+    };
     Ok(if l < 0 { none::none_ref() } else { int::new_int(l as i64) })
 }
 fn f_set_lineno(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {

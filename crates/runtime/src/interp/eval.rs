@@ -813,6 +813,10 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             // the trace function assigned f_lineno
                             pc = f.jump_to as usize;
                             f.jump_to = -1;
+                            // (pdb1) the target line counts as reported: no new line
+                            // event fires on arrival, only on the lines after it
+                            f.trace_last = (pc as u32).wrapping_sub(1);
+                            f.trace_line = crate::types::code::frame_line(f.code(), pc).map_or(-1, |l| l as i32);
                             continue;
                         }
                     }
@@ -2136,7 +2140,11 @@ fn branch_event(ts: &ThreadState, f: &mut Frame, taken: bool, dest: usize) -> Py
 fn for_iter_event(ts: &ThreadState, f: &mut Frame, exhausted: bool, gen_iter: bool, returned: Option<&PyObject>, dest: usize) -> PyResult<()> {
     use crate::modules::sys_trace as st;
     if exhausted && gen_iter && st::wants(st::STOP_ITERATION) {
-        let si = ab::call(type_obj(exc::StopIteration()), &[])?;
+        // (pdb1) the StopIteration carries the generator's return value
+        let si = match returned.filter(|r| !r.is(none::none())) {
+            Some(r) => ab::call(type_obj(exc::StopIteration()), &[r])?,
+            None => ab::call(type_obj(exc::StopIteration()), &[])?,
+        };
         st::fire_exc_event(ts, f, st::STOP_ITERATION, &si)?;
     }
     // a legacy trace function sees an 'exception' event only when the generator
