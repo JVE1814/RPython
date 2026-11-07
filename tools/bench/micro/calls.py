@@ -119,6 +119,12 @@ def run(n, kind):
     elif kind == 'posmany':
         for i in range(n):
             posmany(i, i, i, i)
+    elif kind == 'builtin':
+        l = [1, 2]
+        for i in range(n):
+            isinstance(i, str)
+            id(l)
+            l.copy()
     elif kind == 'exc':
         for i in range(n):
             catcher(i)

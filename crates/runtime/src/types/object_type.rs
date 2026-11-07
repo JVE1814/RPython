@@ -444,7 +444,7 @@ pub unsafe extern "C" fn type_vectorcall(
                     return list::new_list_from_slice(tuple::tuple_items(a)).into_raw();
                 }
                 if list::is_list_exact(a) {
-                    return list::new_list(list::list_to_vec(a)).into_raw();
+                    return list::list_copy(a).into_raw();
                 }
             }
         }

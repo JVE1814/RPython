@@ -72,6 +72,13 @@ pub fn list_items(o: &PyObject) -> &[&PyObject] {
 }
 
 /// Owned snapshot of the items.
+/// (perf4) Shallow copy of a list (list.copy(), list(l)) without an intermediate
+/// vector: the items are copied under the list's lock.
+pub fn list_copy(o: &PyObject) -> PyRef {
+    let _g = ob_lock(o);
+    new_list_from_slice(list_items(o))
+}
+
 pub fn list_to_vec(o: &PyObject) -> Vec<PyRef> {
     let _g = ob_lock(o);
     list_items(o).iter().map(|x| x.to_ref()).collect()

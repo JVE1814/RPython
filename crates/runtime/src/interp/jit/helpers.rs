@@ -990,6 +990,40 @@ pub unsafe extern "C" fn h_get_yield_from_iter(sp: *mut *mut PyObject, code_flag
 
 // ------------------------------------------------------------------ calls
 
+/// (perf4) `h_call` of a builtin function (exact `builtin_function_or_method`) or of
+/// a method descriptor found by LoadMethod (`[descr, self, args..]`), positional
+/// arguments only. None: not such a call (or a convention `call_methoddef_fast`
+/// leaves to the general path).
+#[inline]
+unsafe fn call_builtin_fast(callable: *mut PyObject, self_or_null: *mut PyObject, base: *mut *mut PyObject, n: usize) -> Option<*mut PyObject> {
+    unsafe {
+        let c = &*callable;
+        let r = if c.is_type(&raw mut crate::types::cfunction::PyCFunction_Type) {
+            let f = callable as *mut PyCFunctionObject;
+            let ml = (*f).m_ml;
+            if (*ml).ml_flags & METH_STATIC != 0 {
+                return None;
+            }
+            let (argp, nargs) = if self_or_null.is_null() { (base.add(2), n) } else { (base.add(1), n + 1) };
+            crate::methods::call_methoddef_fast(ml, (*f).m_self, std::slice::from_raw_parts(argp, nargs))?
+        } else if c.is_type(&raw mut crate::types::descr::PyMethodDescr_Type) && !self_or_null.is_null() {
+            let d = callable as *mut PyMethodDescrObject;
+            let owner = (*d).d_common.d_type;
+            let st = (*self_or_null).type_ptr();
+            if st != owner && !crate::types::typeobject::is_subtype(st, owner) {
+                return None;
+            }
+            crate::methods::call_methoddef_fast((*d).d_method, self_or_null, std::slice::from_raw_parts(base.add(2), n))?
+        } else {
+            return None;
+        };
+        if r.is_null() && !err_occurred() {
+            let _ = err!(SystemError, "{} returned NULL without setting an exception", crate::types::typeobject::type_name(c.ty()));
+        }
+        Some(r)
+    }
+}
+
 /// Call / CallKw: [callable, self_or_null, args..(, kwnames)] -> [result]
 pub unsafe extern "C" fn h_call(sp: *mut *mut PyObject, n: u64, kw: u64) -> u64 {
     unsafe {
@@ -1017,7 +1051,12 @@ pub unsafe extern "C" fn h_call(sp: *mut *mut PyObject, n: u64, kw: u64) -> u64 
         }
         let nkw = kwnames.as_ref().map_or(0, |k| tuple::tuple_len(k));
         let kwp = kwnames.as_ref().map_or(std::ptr::null_mut(), |k| k.as_ptr());
-        let r = if self_or_null.is_null() {
+        // (perf4) builtin functions and method descriptors with the common calling
+        // conventions: their C function directly
+        let fast = if nkw == 0 { call_builtin_fast(callable, self_or_null, base, n) } else { None };
+        let r = if let Some(r) = fast {
+            r
+        } else if self_or_null.is_null() {
             let args = base.add(2) as *const *mut PyObject;
             if funcobject::is_function(&*callable) {
                 let all = std::slice::from_raw_parts(args, n);

@@ -130,7 +130,7 @@ fn clear_m(o: &PyObject) -> PyResult {
     Ok(none::none_ref())
 }
 fn copy_m(o: &PyObject) -> PyResult {
-    Ok(list::new_list(list::list_to_vec(o)))
+    Ok(list::list_copy(o))
 }
 fn reversed_m(o: &PyObject) -> PyResult {
     list::list_reversed(o)
