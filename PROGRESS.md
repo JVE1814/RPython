@@ -52,9 +52,10 @@ D2 extraction — revisit D2 for test_idle.
 | regex | 101 passed, 1 failed | same | 0 |
 | markupsafe 3.0.4 | 79 passed | 79 passed | 0 |
 | msgpack 1.2.4 | 160 passed | 160 passed | 0 |
-| msgspec 0.22.0 | 6,541 passed, 1 failed | 6,542 passed | 1 |
-| pandas 3.1.0 | crashes (use-after-free, stability2 investigating) | 182,561 passed | — |
+| msgspec 0.22.0 | unit suite 6,373 passed, 0 failed (wheels2) | — | **0** |
+| pandas 3.1.0 (baseline marker selection) | 182,557 passed, 3,347 failed, 1,362 errors (wheels2 run 2) | 182,561 passed, 3,344 failed, 1,362 errors | 3 at run 2 (xz presets, fixed since; that directory now passes) → expected **0** |
 numpy suite wall time: ours 7m30s vs CPython ft 10m12s. pip installs from PyPI over the network (ssl) and builds sdists.
+pandas: stability2 fixed the use-after-free (type refcount bias) and races; full suite runs in one process (peak RSS ~3.8 GB; a late "memory allocation failed" abort after the summary under a 6 GB ulimit remains). wheels2 fixed the behavioural differences (PyState_FindModule, zoneinfo transitions, datetime C API, 3.15 messages, getrefcount per D27, dict watchers).
 
 ### Earlier
 pip (bundled 26.2.2 via ensurepip) installs the unmodified numpy-2.5.4-cp315-cp315t-manylinux wheel in a venv on
