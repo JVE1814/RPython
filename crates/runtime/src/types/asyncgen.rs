@@ -48,9 +48,81 @@ fn is_wrapped(o: &PyObject) -> bool {
     o.is_type(wrapped_type())
 }
 
+// (perf5) Per-thread free lists for the objects every async generator step creates
+// (a wrapped value and an asend awaitable per level): reuse skips the generic
+// allocation and free paths. Kept objects are untracked, with their fields cleared.
+const FL_CAP: usize = 32;
+const FL_WRAPPED: usize = 0;
+const FL_ASEND: usize = 1;
+struct FreeList {
+    n: usize,
+    items: [*mut PyObject; FL_CAP],
+}
+#[thread_local]
+static mut FREE_LISTS: [FreeList; 2] = [const { FreeList { n: 0, items: [std::ptr::null_mut(); FL_CAP] } }; 2];
+
+fn fl_alloc(k: usize, tp: *mut PyTypeObject) -> PyResult {
+    unsafe {
+        let fl = &mut (*(&raw mut FREE_LISTS))[k];
+        if fl.n > 0 && !crate::modules::_tracemalloc::TRACING.load(std::sync::atomic::Ordering::Relaxed) {
+            fl.n -= 1;
+            let op = fl.items[fl.n];
+            crate::alloc::reinit_header(op);
+            crate::gc::track(op);
+            return Ok(PyRef::from_raw(op));
+        }
+    }
+    lu::alloc(tp)
+}
+
+/// Keep `op` (untracked, fields cleared) for reuse; false: the caller frees it.
+unsafe fn fl_keep(k: usize, op: *mut PyObject) -> bool {
+    unsafe {
+        let fl = &mut (*(&raw mut FREE_LISTS))[k];
+        if fl.n < FL_CAP && crate::tlab::fast_free_ok() && !crate::modules::_tracemalloc::TRACING.load(std::sync::atomic::Ordering::Relaxed) {
+            fl.items[fl.n] = op;
+            fl.n += 1;
+            return true;
+        }
+        false
+    }
+}
+
+/// Free the kept objects (thread exit).
+pub fn drain_free_lists() {
+    unsafe {
+        for (k, tp) in [(FL_WRAPPED, wrapped_type()), (FL_ASEND, &raw mut ASEND_TYPE)] {
+            let fl = &mut (*(&raw mut FREE_LISTS))[k];
+            while fl.n > 0 {
+                fl.n -= 1;
+                generic_free_and_type_decref(fl.items[fl.n], tp);
+            }
+        }
+    }
+}
+
+/// Untrack `op`, clear its first `n` pointer fields, then keep it in free list `k`
+/// or free it.
+unsafe fn fl_dealloc(k: usize, op: *mut PyObject, n: usize) {
+    unsafe {
+        crate::gc::untrack(op);
+        let p = (op as *mut u8).add(lu::HEADER) as *mut *mut PyObject;
+        for i in 0..n {
+            xdecref(std::mem::replace(&mut *p.add(i), std::ptr::null_mut()));
+        }
+        if !fl_keep(k, op) {
+            generic_free_and_type_decref(op, (*op).type_ptr());
+        }
+    }
+}
+
+unsafe extern "C" fn wrapped_dealloc(op: *mut PyObject) {
+    unsafe { fl_dealloc(FL_WRAPPED, op, 1) }
+}
+
 /// Wrap a value yielded by an async generator (Intrinsic1::AsyncGenWrap).
 pub fn wrap_value(v: PyRef) -> PyResult {
-    let o = lu::alloc(wrapped_type())?;
+    let o = fl_alloc(FL_WRAPPED, wrapped_type())?;
     set_field(&o, 0, Some(v));
     Ok(o)
 }
@@ -81,7 +153,7 @@ fn init_hooks(o: &PyObject) -> PyResult<()> {
 }
 
 fn new_awaitable(tp: *mut PyTypeObject, agen: &PyObject, arg: Option<PyRef>) -> PyResult {
-    let o = lu::alloc(tp)?;
+    let o = if tp == &raw mut ASEND_TYPE { fl_alloc(FL_ASEND, tp)? } else { lu::alloc(tp)? };
     set_field(&o, A_GEN, Some(agen.to_ref()));
     set_field(&o, A_ARG, arg);
     set_state(&o, STATE_INIT);
@@ -531,7 +603,11 @@ unsafe extern "C" fn self_iter(o: *mut PyObject) -> *mut PyObject {
 unsafe extern "C" fn awaitable_dealloc(o: *mut PyObject) {
     unsafe {
         if state(&*o) == STATE_CLOSED {
-            lu::ptrs_dealloc_unfinalized(o);
+            if (*o).is_type(&raw mut ASEND_TYPE) {
+                fl_dealloc(FL_ASEND, o, 3);
+            } else {
+                lu::ptrs_dealloc_unfinalized(o);
+            }
         } else {
             lu::ptrs_dealloc(o);
         }
@@ -685,6 +761,7 @@ pub fn init_types() -> PyResult<()> {
     unsafe {
         let t = wrapped_type();
         lu::setup_ptr_type(t, "async_generator_wrapped_value", std::mem::size_of::<PyObject>() + 8, 0);
+        (*t).tp_dealloc = Some(wrapped_dealloc);
 
         static mut AW_ASYNC: PyAsyncMethods = PyAsyncMethods::ZERO;
         (*(&raw mut AW_ASYNC)).am_await = Some(self_iter);
