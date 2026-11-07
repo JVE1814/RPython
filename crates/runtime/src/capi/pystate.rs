@@ -67,6 +67,10 @@ fn gilstate() -> *mut ThreadState {
 fn attach(ts: *mut ThreadState) {
     threads::set_current(ts);
     if !ts.is_null() {
+        // (jit6) see threads::MT_HANDSHAKE
+        if threads::MT_HANDSHAKE.load(std::sync::atomic::Ordering::Relaxed) && threads::MT_HANDSHAKE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            crate::gc::handshake_safepoint();
+        }
         unsafe { (*ts).mode.set(ThreadMode::InVm) };
     }
 }

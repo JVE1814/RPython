@@ -810,7 +810,14 @@ impl<'a> Gen<'a> {
                 self.set_lasti(pc);
                 self.lea_sp(Rdi, base);
                 self.a.mov_ri(Rsi, arg as i64);
-                self.call(addr!(super::h_call_py));
+                // (jit6) the machine-code call routine (falls back to h_call_py)
+                let r = super::callpy::routine();
+                if r != 0 {
+                    self.a.mov_rr(Rdx, Rcx);
+                    self.call(r);
+                } else {
+                    self.call(addr!(super::h_call_py));
+                }
                 self.check(pc, base);
                 self.a.jmp(done);
                 self.a.bind(generic);
@@ -1601,7 +1608,7 @@ impl<'a> Gen<'a> {
 /// * box_float: xmm0 = f64 -> rax = new float object
 /// * free_num:  rdi = object whose local refcount just dropped to zero: inline free
 ///              for exact int/float, else the generic path.
-fn emit_routines(a: &mut Asm, box_int: Label, box_float: Label, free_num: Label) {
+pub(crate) fn emit_routines(a: &mut Asm, box_int: Label, box_float: Label, free_num: Label) {
     let tl = crate::tlab::jit_layout();
     let tls = tl.tls_offset as i32;
     let heads = tl.heads as i32;

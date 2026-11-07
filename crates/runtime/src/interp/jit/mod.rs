@@ -23,6 +23,7 @@
 //! compilations and failures on stderr.
 
 pub mod analysis;
+pub mod callpy;
 pub mod helpers;
 pub mod mem;
 pub mod opt;
@@ -302,7 +303,7 @@ fn run_call_frame(ts: &ThreadState, mut frame: Box<Frame>, tramp: usize, target:
 
 #[cold]
 #[inline(never)]
-fn finish_in_interp(ts: &ThreadState, mut frame: Box<Frame>, st: u32) -> PyResult {
+pub(crate) fn finish_in_interp(ts: &ThreadState, mut frame: Box<Frame>, st: u32) -> PyResult {
     if st == tier1::ST_DEOPT {
         opt::note_deopt(&crate::types::code::code_data(frame.code()).caches, &frame);
     }
