@@ -175,6 +175,8 @@ pub unsafe extern "C" fn PyMem_SetupDebugHooks() {
             }
         }
     }
+    super::memdebug::INSTALLED.store(true, std::sync::atomic::Ordering::SeqCst);
+    crate::alloc::refresh_slow_paths();
 }
 
 /// (capi3) Install the debug hooks at startup when PYTHONMALLOC asks for them

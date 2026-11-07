@@ -23,6 +23,9 @@ use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::Mutex;
 
+/// The debug wrappers have been installed on at least one domain.
+pub static INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub const GUARD: u8 = 0xFD;
 pub const NEW_FILL: u8 = 0xCD;
 pub const DEAD_FILL: u8 = 0xDD;

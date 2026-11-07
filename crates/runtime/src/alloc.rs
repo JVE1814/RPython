@@ -45,7 +45,9 @@ pub unsafe fn reinit_header(op: *mut PyObject) {
 pub static SLOW_PATHS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn refresh_slow_paths() {
-    let on = crate::modules::_tracemalloc::TRACING.load(SeqCst) || crate::capi::pystate::REF_TRACING.load(SeqCst);
+    let on = crate::modules::_tracemalloc::TRACING.load(SeqCst)
+        || crate::capi::pystate::REF_TRACING.load(SeqCst)
+        || crate::capi::memdebug::INSTALLED.load(SeqCst);
     SLOW_PATHS.store(on, SeqCst);
 }
 
@@ -308,6 +310,12 @@ unsafe fn free_object_slow(op: *mut PyObject) {
     unsafe {
         if ref_tracing() {
             crate::capi::pystate::ref_trace(op, 1);
+        }
+        // (capi3) an object an extension built in PyObject_Malloc memory (PyObject_Init)
+        // under the debug hooks goes back through the object domain
+        if crate::capi::memdebug::INSTALLED.load(Relaxed) && crate::capi::memdebug::is_debug_block(op as *const std::ffi::c_void) {
+            crate::capi::mem::PyObject_Free(op as *mut std::ffi::c_void);
+            return;
         }
         let bits = (*op).ob_gc_bits.load(Relaxed);
         if bits & GC_BIT_TRACKED != 0 {
