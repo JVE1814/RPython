@@ -683,7 +683,9 @@ impl ModeCell {
             let cur = self.get();
             crate::gc::enter_vm(self, cur);
         } else {
-            self.0.store(m as u8, std::sync::atomic::Ordering::SeqCst)
+            self.0.store(m as u8, std::sync::atomic::Ordering::SeqCst);
+            // (scale3) wake a thread waiting for this one to stop
+            crate::gc::note_safe();
         }
     }
     #[inline]
