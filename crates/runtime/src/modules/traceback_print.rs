@@ -77,7 +77,10 @@ pub fn format_tb(tb: Option<PyRef>) -> String {
                 continue;
             }
             out.push_str(&format!("  File \"{}\", line {}, in {}\n", fname, tbo.tb_lineno, name));
-            if let Some(line) = crate::modules::sys_full::source_line(&fname, tbo.tb_lineno) {
+            // source lines are read with io.open, as the reference printer does: no
+            // source when it is gone
+            let source = if io_open_available() { crate::modules::sys_full::source_line(&fname, tbo.tb_lineno) } else { None };
+            if let Some(line) = source {
                 let l = line.trim();
                 if !l.is_empty() {
                     out.push_str(&format!("    {}\n", l));
@@ -304,4 +307,12 @@ fn print_with_traceback_module_inner(e: &PyObject) -> bool {
         crate::errors::set_exc(s);
     }
     r
+}
+
+/// Is `io.open` usable (the io module not imported yet counts as usable)?
+fn io_open_available() -> bool {
+    match crate::import::get_loaded_module("io") {
+        None => true,
+        Some(io) => matches!(ab::getattr_opt(&io, &pystr::new_str("open")), Ok(Some(_))),
+    }
 }
