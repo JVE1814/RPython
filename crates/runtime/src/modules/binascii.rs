@@ -142,6 +142,17 @@ fn alphabet_arg(o: Option<&PyObject>, default: &[u8], n: usize, decode: bool) ->
     }
 }
 
+/// Decoding table of the standard base64 alphabet.
+static BASE64_DECODE: [i16; 256] = {
+    let mut t = [-1i16; 256];
+    let mut i = 0;
+    while i < 64 {
+        t[BASE64[i] as usize] = i as i16;
+        i += 1;
+    }
+    t
+};
+
 fn decode_table(alpha: &[u8]) -> [i16; 256] {
     let mut t = [-1i16; 256];
     for (i, &c) in alpha.iter().enumerate() {
@@ -284,12 +295,20 @@ fn a2b_base64(_m: &PyObject, a: &[&PyObject], kw: Option<&PyObject>) -> PyResult
     let strict = bool_arg(strict, ign.is_some())?;
     let padded = bool_arg(padded, true)?;
     let canonical = bool_arg(canonical, false)?;
-    let alpha = alphabet_arg(alphabet, BASE64, 64, true)?;
-    let table = decode_table(&alpha);
-    let ign = ign.unwrap_or([false; 256]);
+    // perf3: the default alphabet and empty ignore set use prebuilt tables
+    let custom;
+    let table: &[i16; 256] = match alphabet {
+        None => &BASE64_DECODE,
+        Some(_) => {
+            custom = decode_table(&alphabet_arg(alphabet, BASE64, 64, true)?);
+            &custom
+        }
+    };
+    const NO_IGNORE: [bool; 256] = [false; 256];
+    let ign: &[bool; 256] = ign.as_ref().unwrap_or(&NO_IGNORE);
     let eq_ignorable = ign[b'=' as usize];
 
-    emit(d.len() / 4 * 3 + 3, |outbuf| decode64(&d, &table, outbuf, strict, padded, canonical, eq_ignorable, &ign))
+    emit(d.len() / 4 * 3 + 3, |outbuf| decode64(&d, table, outbuf, strict, padded, canonical, eq_ignorable, ign))
 }
 
 /// Base64 decoding proper; returns the number of bytes written to `outbuf` (which
