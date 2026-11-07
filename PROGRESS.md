@@ -1,7 +1,7 @@
 # PROGRESS
 
 ## Status 2026-11-07 (day 7, afternoon)
-Master d620c3b: core6, perf4, tail1, capi2, cleanroom1+2 (20 Lib modules rewritten clean-room), scale1 (multi-core scaling), tail2 (re.DEBUG, _zoneinfo, ssl PSK, alloc-failure injection, 22 modules), perf5, stability3 (test_free_threading passes), scale2 checkpoint (concurrent_futures + multiprocessing pass), pdb1 (clean-room pdb: test_pdb, test_remote_pdb pass), tail3 (crossinterp, getpath, nturl2path, ast, multiprocessing, httpservers, asyncio 10→2), cleanroom3, scale2, perf6 (startup image: python_startup 0.88x), remote1 (_remote_debugging, sys.remote_exec: test_external_inspection passes), capi3 (test_capi and test_sys: 0 failures), cleanroom4 (typing rewritten clean-room, _pydatetime, ElementTree, urllib.request) merged today; suite run 15 running; suite run 14: 417/434 pass or whole-module skip, 10 modules fail that pass on CPython, fewer skips than CPython; suite run 13: 396/434 pass or whole-module skip; suite run 12: 367/434 modules pass, 129 failures, 70 errors. Smoke on snap19: test_capi 40 failures (was 433 in run 11),
+Master d620c3b: core6, perf4, tail1, capi2, cleanroom1+2 (20 Lib modules rewritten clean-room), scale1 (multi-core scaling), tail2 (re.DEBUG, _zoneinfo, ssl PSK, alloc-failure injection, 22 modules), perf5, stability3 (test_free_threading passes), scale2 checkpoint (concurrent_futures + multiprocessing pass), pdb1 (clean-room pdb: test_pdb, test_remote_pdb pass), tail3 (crossinterp, getpath, nturl2path, ast, multiprocessing, httpservers, asyncio 10→2), cleanroom3, scale2, perf6 (startup image: python_startup 0.88x), remote1 (_remote_debugging, sys.remote_exec: test_external_inspection passes), capi3 (test_capi and test_sys: 0 failures), cleanroom4 (typing rewritten clean-room, _pydatetime, ElementTree, urllib.request), refs1 (borrowed stack references, D35), cleanroom5 (asyncio base_events/sslproto/streams, mailbox, zipfile), perf7 (PGO build D36, JIT jump relaxation) merged today; suite run 16 running on refs1; suite run 15: 417/434; suite run 14: 417/434 pass or whole-module skip, 10 modules fail that pass on CPython, fewer skips than CPython; suite run 13: 396/434 pass or whole-module skip; suite run 12: 367/434 modules pass, 129 failures, 70 errors. Smoke on snap19: test_capi 40 failures (was 433 in run 11),
 stable_abi_ctypes/fileutils pass, cmd_line_script 1; tail1 fixed ~60 long-tail modules (inspect, codecs, time,
 path modules, math, buffer, logging, json, ...). Run 11 (pre-merges):
 294/434 modules pass, 674 failures (241 without test_capi), 616 errors. Baseline free-threaded CPython: 416/434.
@@ -133,7 +133,28 @@ Run 1 top blockers: py_compile (230 modules; merged since), unittest.mock (57), 
 array (24), socket (17), pathlib (16), http (14), multiprocessing, decimal, datetime, ntpath.
 
 ## Benchmarks
-### Latest (perf6, 2026-11-07; wall ratio ours / best CPython, pinned, ±10–15%)
+### Latest (perf7, 2026-11-07; wall ratio ours / CPython default, min of 3 interleaved pinned runs, load 9–10, indicative)
+| benchmark | normal build | PGO build (D36) |
+|---|---|---|
+| typing_runtime_protocols | 1.22 | 0.87 |
+| deepcopy | 1.55 | 1.31 |
+| logging | 1.77 | 1.67 |
+| comprehensions | 1.24 | 0.68 |
+| nqueens | 1.23 | 0.87 |
+| mdp | 1.33 | 1.25 |
+| bpe_tokeniser | 1.29 | 1.13 |
+| xml_etree | 1.10 | 0.87 |
+| pathlib | 1.13 | 1.03 |
+| base64 | 1.21 | 0.95 |
+| async_generators | 0.72 | 0.50 |
+In one full-list run the PGO build beats the best CPython on about 30 benchmarks. Still behind there: asyncio_tcp 1.29, go 1.21,
+concurrent_imap 1.14, deltablue 1.13, generators 1.10, python_startup vs free-threaded CPython 1.09; also deepcopy, logging, mdp,
+bpe_tokeniser and pathlib above. argparse, async_tree, crypto_pyaes and pickle need packages that are not installed (for every
+binary). Cause of the gap: L1 instruction-cache misses are 5–8x CPython's (3–5x with PGO), from tier-2 code size and
+runtime code spread across the binary; instruction counts are within 10–35%. `-c pass`: 34.8M instructions with PGO (CPython
+40.5M), 9.5 ms vs 11.0 ms. Peak RSS 36.1 MB with PGO, 35.5 MB normal (CPython 32.4); the gap is file-backed start-up pages.
+
+### Previous (perf6, 2026-11-07; wall ratio ours / best CPython, pinned, ±10–15%)
 | benchmark | perf5 | perf6 |
 |---|---|---|
 | python_startup | 1.29 | 0.88 |
@@ -152,9 +173,9 @@ array (24), socket (17), pathlib (16), http (14), multiprocessing, decimal, date
 | async_generators | 1.17 | 1.12 |
 (perf5 and perf6 columns are separate noisy sweeps; perf6's own base→head showed no regressions.) Startup `-c pass`:
 39.2M instructions (CPython 40.5M), 8.9 ms vs 10.1 ms (D30 startup image). Peak RSS 35.8 MB (CPython 32.3); start-up RSS
-12.0 vs 9.2 MB, mostly file-backed. perf7 is on the remaining gaps.
+12.0 vs 9.2 MB, mostly file-backed.
 
-### Previous (perf5, 2026-11-07; wall ratio ours / best CPython, pinned one core, one run each, load 6–7, ±10–15%)
+### Older (perf5, 2026-11-07; wall ratio ours / best CPython, pinned one core, one run each, load 6–7, ±10–15%)
 | benchmark | perf4 | perf5 |
 |---|---|---|
 | xml_etree | 1.55 | 1.55 |

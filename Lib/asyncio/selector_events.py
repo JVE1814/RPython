@@ -988,9 +988,10 @@ class _SelectorSocketTransport(_SelectorTransport):
         try:
             super()._call_connection_lost(exc)
         finally:
+            # both callbacks are bound methods of this transport: drop them so
+            # that a transport torn down without close() (a fatal error) is not
+            # kept alive by a reference cycle
             self._write_ready = None
-            # the bound method refers back to the transport: a lost connection
-            # (forced close included) must not leave that cycle behind
             self._read_ready_cb = None
             if self._empty_waiter is not None:
                 self._empty_waiter.set_exception(
