@@ -1539,17 +1539,15 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             let mut tmp = std::mem::MaybeUninit::<[*mut PyObject; 16]>::uninit();
                             let mut tmpv: Vec<*mut PyObject> = Vec::new();
                             let mut argv: *const *mut PyObject = unsafe { f.slots.as_ptr().add(base) };
-                            if f.slots[base..f.stack_top].iter().fold(0usize, |a, &p| a | p as usize) & super::borrow::TAG != 0 {
-                                let src = &f.slots[base..f.stack_top];
-                                let dst: *mut *mut PyObject = if src.len() <= 16 {
+                            let nall = f.stack_top - base;
+                            if unsafe { super::borrow::any_borrowed(argv, nall) } {
+                                let dst: *mut *mut PyObject = if nall <= 16 {
                                     tmp.as_mut_ptr() as *mut *mut PyObject
                                 } else {
-                                    tmpv.resize(src.len(), std::ptr::null_mut());
+                                    tmpv.resize(nall, std::ptr::null_mut());
                                     tmpv.as_mut_ptr()
                                 };
-                                for (k, &s) in src.iter().enumerate() {
-                                    unsafe { *dst.add(k) = super::borrow::untag(s) };
-                                }
+                                unsafe { super::borrow::copy_untagged(dst, argv, nall) };
                                 argv = dst;
                             }
                             let callable = unsafe { *argv };

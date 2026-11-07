@@ -954,7 +954,7 @@ impl<'a> B<'a> {
             c.failed = true;
             return;
         }
-        self.materialize_stack();
+        let tags = self.materialize_for_template(i);
         let locals = self.dirty_locals();
         let exit = if locals.is_empty() {
             None
@@ -963,7 +963,7 @@ impl<'a> B<'a> {
             self.f.snaps.push(Snapshot { resume: ins.start, lasti: ins.pc, stack: Vec::new(), locals, kind: SnapKind::TemplateExit, inl: None });
             Some(self.f.snaps.len() as SnapId - 1)
         };
-        self.emit(Inst::Template(i as u32, exit));
+        self.emit(Inst::Template(i as u32, exit, tags));
         let ins = self.u.an.instrs[i];
         if matches!(ins.op, Op::DeleteFast | Op::LoadFastAndClear | Op::MakeCell | Op::CopyFreeVars) {
             // the template changed a frame slot: forget cached pointers / values
@@ -996,6 +996,34 @@ impl<'a> B<'a> {
             let s = self.snap_next(i);
             self.emit(Inst::Guard(Cond::FlagSet(self.u.invalid_flag), s));
         }
+    }
+    /// (refs1) Materialise the stack for template #i. Inputs of the template that are
+    /// borrowed from a local are stored as borrowed (tagged) entries instead of taking
+    /// a reference, when the tier-1 template accepts them (`tier1::tag_aware`): the
+    /// template consumes them, so no tagged entry outlives the instruction (an
+    /// exception unwinds them, a deopt re-executes the instruction in the
+    /// interpreter, which accepts them too). Returns their depth mask. LoadMethod is
+    /// left out: its template would pass a borrowed receiver on as `self`.
+    fn materialize_for_template(&mut self, i: usize) -> u64 {
+        let ins = self.u.an.instrs[i];
+        let len = self.st.stack.len();
+        let mut tags = 0u64;
+        if crate::interp::borrow::enabled() && ins.op != Op::LoadMethod && crate::interp::jit::tier1::tag_aware(ins.op) {
+            if let Some(p) = crate::interp::borrow::pops(ins.op, ins.arg) {
+                for k in len.saturating_sub(p as usize)..len.min(64) {
+                    if let AV::Obj(v, Own::Borrowed(_), ty) = self.st.stack[k] {
+                        let t = self.v(Class::G);
+                        self.emit(Inst::Alu(Alu::Or, t, v, Opnd::I(1)));
+                        let off = self.slot_off(k);
+                        self.emit(Inst::Store(Base::Slots, off, t));
+                        self.st.stack[k] = AV::InFrame(ty);
+                        tags |= 1u64 << k;
+                    }
+                }
+            }
+        }
+        self.materialize_stack();
+        tags
     }
     fn settle_after_template(&mut self, st: &mut State, nd: usize) {
         let keep = nd.saturating_sub(3).min(st.stack.len());

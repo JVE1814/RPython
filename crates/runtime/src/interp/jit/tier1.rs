@@ -477,13 +477,24 @@ impl<'a> Gen<'a> {
     /// Clobbers rax and r11.
     fn own_slot(&mut self, k: i32) {
         if self.tagged(k) {
-            let m = self.slot(k);
-            self.a.load(Rax, m);
-            self.a.and_ri(Rax, -2);
-            self.a.store(m, Rax);
-            self.incref(Rax);
+            self.emit_own_slot(k);
             self.tagm &= !(1u64 << k);
         }
+    }
+    /// The code of `own_slot` for a borrowed entry at depth k, on one path only (the
+    /// mask is left alone).
+    fn emit_own_slot(&mut self, k: i32) {
+        // (tested: a self slot statically marked borrowed holds NULL after a LoadMethod
+        // that found an attribute, or an owned self after a bound method was unpacked)
+        let skip = self.a.label();
+        let m = self.slot(k);
+        self.a.load(Rax, m);
+        self.a.test_ri(Rax, 1);
+        self.a.jcc(Cc::E, skip);
+        self.a.and_ri(Rax, -2);
+        self.a.store(m, Rax);
+        self.incref(Rax);
+        self.a.bind(skip);
     }
     /// `own_slot` for every borrowed entry (before a template that expects owned ones).
     fn own_all(&mut self) {
@@ -1077,6 +1088,14 @@ impl<'a> Gen<'a> {
                 self.a.jcc(Cc::E, generic);
                 self.a.cmp_mi(M(Rcx, CD_FAST_ENTRY), 0);
                 self.a.jcc(Cc::E, generic);
+                // (refs1) the callee frame owns its arguments: take the references here
+                // (inline, statically known entries) rather than in the call routine
+                for k in base + 1..d {
+                    if self.tagged(k) {
+                        // (rcx, the callee's code data, survives: incref clobbers r11)
+                        self.emit_own_slot(k);
+                    }
+                }
                 self.set_lasti(pc);
                 self.lea_sp(Rdi, base);
                 self.a.mov_ri(Rsi, arg as i64);
@@ -2415,7 +2434,7 @@ impl<'a> Gen<'a> {
 /// one, or they only call helpers that do the same (`take_sr`/`take`/`view` in
 /// helpers.rs, the interpreter's stack macros). Every other template first converts
 /// all borrowed entries of the stack to owned ones (`Gen::own_all`).
-fn tag_aware(op: Op) -> bool {
+pub(crate) fn tag_aware(op: Op) -> bool {
     use Op::*;
     matches!(
         op,

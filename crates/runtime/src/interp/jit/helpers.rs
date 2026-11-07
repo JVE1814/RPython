@@ -1084,27 +1084,18 @@ pub unsafe extern "C" fn h_unpack_method(base: *mut *mut PyObject) {
     }
 }
 
-/// (refs1) `base[..n]` itself when no entry is borrowed, else an untagged copy in
+/// (refs1) An untagged copy of `base[..n]` in
 /// `tmp` (n <= 16) or `tmpv`.
 #[inline(always)]
 unsafe fn untagged_args(base: *mut *mut PyObject, n: usize, tmp: &mut std::mem::MaybeUninit<[*mut PyObject; 16]>, tmpv: &mut Vec<*mut PyObject>) -> *mut *mut PyObject {
     unsafe {
-        let mut acc = 0usize;
-        for i in 0..n {
-            acc |= *base.add(i) as usize;
-        }
-        if acc & crate::interp::borrow::TAG == 0 {
-            return base;
-        }
         let dst: *mut *mut PyObject = if n <= 16 {
             tmp.as_mut_ptr() as *mut *mut PyObject
         } else {
             tmpv.resize(n, std::ptr::null_mut());
             tmpv.as_mut_ptr()
         };
-        for i in 0..n {
-            *dst.add(i) = crate::interp::borrow::untag(*base.add(i));
-        }
+        crate::interp::borrow::copy_untagged(dst, base, n);
         dst
     }
 }

@@ -72,6 +72,29 @@ pub unsafe fn release(p: *mut PyObject) {
     }
 }
 
+/// Does any of the n entries at `p` hold a borrowed reference? (Call arguments: short
+/// runs, so the loop is kept scalar; a vectorised one costs more for 2-5 entries.)
+#[inline(always)]
+pub unsafe fn any_borrowed(p: *const *mut PyObject, n: usize) -> bool {
+    let mut acc = 0usize;
+    let mut i = 0;
+    while i < n {
+        acc |= unsafe { std::ptr::read_volatile(p.add(i)) } as usize;
+        i += 1;
+    }
+    acc & TAG != 0
+}
+
+/// Copy n entries with their tags removed (scalar loop, see `any_borrowed`).
+#[inline(always)]
+pub unsafe fn copy_untagged(dst: *mut *mut PyObject, src: *const *mut PyObject, n: usize) {
+    let mut i = 0;
+    while i < n {
+        unsafe { *dst.add(i) = untag(std::ptr::read_volatile(src.add(i))) };
+        i += 1;
+    }
+}
+
 /// A popped value-stack entry: dereferences to the object; dropping it releases the
 /// reference only if it was owned. For consumers that only look at their operands.
 pub struct SRef(*mut PyObject);
