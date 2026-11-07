@@ -421,6 +421,9 @@ pub fn bind_arguments(func: &PyObject, frame: &mut Frame, args: &[*mut PyObject]
     if let Some(kn) = kwnames {
         let names = &cd.d.localsplusnames;
         for (j, key) in tuple::tuple_items(kn).iter().enumerate() {
+            if !pystr::is_str(key) {
+                raise!(TypeError, "{}() keywords must be strings", qualname());
+            }
             let value = args[nargs + j];
             let mut found = None;
             // identity first, then equality

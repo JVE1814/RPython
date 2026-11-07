@@ -462,6 +462,15 @@ pub unsafe extern "C" fn generic_alloc(tp: *mut PyTypeObject, nitems: Py_ssize_t
     unsafe {
         let size = (*tp).tp_basicsize as usize + ((nitems + 1) as usize) * (*tp).tp_itemsize as usize;
         let size = (size + 7) & !7;
+        // (core6) instances of Python classes honour a failure-injecting allocator hook
+        // (`_testcapi.set_nomemory`); exceptions are exempt so MemoryError stays raisable
+        if (*tp).tp_flags & Py_TPFLAGS_HEAPTYPE != 0
+            && (*tp).tp_flags & Py_TPFLAGS_BASE_EXC_SUBCLASS == 0
+            && crate::capi::mem::hooked_alloc_refuses(size)
+        {
+            let _ = memory_error();
+            return std::ptr::null_mut();
+        }
         let (extra, cap) = crate::shape::alloc_extra(tp);
         let op = alloc::alloc_object(tp, size + extra);
         if op.is_null() {

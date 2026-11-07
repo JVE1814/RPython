@@ -1187,6 +1187,11 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                                 .map(|i| unsafe { PyRef::from_raw(std::mem::replace(&mut f.slots[base + i], std::ptr::null_mut())) })
                                 .collect();
                             f.stack_top = base;
+                            // (a failure-injecting allocator hook refuses the list too)
+                            if crate::capi::mem::hooked_alloc_refuses(std::mem::size_of::<PyListObject>()) {
+                                drop(items);
+                                return Err(crate::errors::memory_error());
+                            }
                             push!(f, list::new_list(items).into_raw());
                         }
                         Op::BuildSet => {
@@ -1573,7 +1578,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             // keyword dict as is (its keys are the callee's business, as in CPython)
                             let direct = self_or_null.is_none() && callable.ty().tp_call.is_some() && ab::vectorcall_func(&callable).is_none();
                             if let Some(d) = &kwd {
-                                if !direct && !(self_or_null.is_none() && is_type(&callable)) {
+                                if !direct || is_type(&callable) {
                                     check_kwargs_keys(d)?;
                                 }
                             }

@@ -500,6 +500,10 @@ fn clear_m(o: &PyObject) -> PyResult {
     Ok(none::none_ref())
 }
 fn copy_m(o: &PyObject) -> PyResult {
+    // (a refusing allocator hook makes even an empty copy fail, as in CPython)
+    if crate::capi::mem::hooked_alloc_refuses(o.ty().tp_basicsize as usize) {
+        return Err(crate::errors::memory_error());
+    }
     dict::copy(o)
 }
 fn fromkeys_m(cls: &PyObject, args: &[&PyObject]) -> PyResult {
