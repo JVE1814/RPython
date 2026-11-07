@@ -185,6 +185,15 @@
   are largely API); a full rewrite would be the next step.
 - test_zipfile, test_zipfile64, test_zipimport, test_zipapp, test_shutil, test___all__ =.
 
+### tarfile.py (reviewed; one class rewritten)
+- Verdict: already restructured by earlier agents (`_RawFile`, `_GzipStreamWriter/Reader`,
+  `_CompressedStream`, `_Chain`, `_Encoder`, `_PeekableFile`, `_filtered_attrs`,
+  `_NAMED_FILTERS`, ...).  `stn nts nti itn calc_chksums copyfileobj` are module-level API
+  (tests call stn/nts/nti/itn).  The one CPython-shaped piece, `_FileInFile` (its
+  map/map_index cycling), is replaced by `_MemberData`: sorted segment list + bisect lookup,
+  gaps read as NUL.  Old vs new on 400 random sparse layouts x random read/seek sequences:
+  identical.  test_tarfile 1008 run =, test_shutil =.
+
 ## Reviewed: own text and structure, no action needed
 (none yet)
 
