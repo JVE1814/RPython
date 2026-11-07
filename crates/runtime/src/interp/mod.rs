@@ -27,6 +27,16 @@ pub use eval::{Exit, eval_frame};
 pub fn enter_recursive_call(ts: &ThreadState, where_: &str) -> PyResult<()> {
     let d = ts.recursion_depth.get() + 1;
     ts.recursion_depth.set(d);
+    // (perf4) the common case in two compares; limits/headroom in the slow path
+    if d <= ts.c.py_recursion_limit && stack_pointer() >= ts.stack_soft_limit() {
+        return Ok(());
+    }
+    enter_recursive_slow(ts, d, where_)
+}
+
+#[cold]
+#[inline(never)]
+fn enter_recursive_slow(ts: &ThreadState, d: i32, where_: &str) -> PyResult<()> {
     let limit = ts.c.py_recursion_limit;
     if d > limit + if ts.recursion_headroom_active() { 50 } else { 0 } || native_stack_exhausted(ts) {
         if !ts.recursion_headroom_active() {
@@ -131,6 +141,8 @@ pub fn call_function(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwna
             && flags & (bc::co::VARARGS | bc::co::VARKEYWORDS) == 0
             && cobj.co_kwonlyargcount == 0
             && !code::code_data(co).eager_prologue
+            // (module-level code with top-level await stores names: general path)
+            && flags & bc::co::OPTIMIZED != 0
         {
             let mut frame = Frame::new_call(co, func, unsafe { &*f.func_globals }, unsafe { &*f.func_builtins });
             for (i, &a) in args[..nargs].iter().enumerate() {
@@ -138,6 +150,7 @@ pub fn call_function(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwna
                 frame.slots[i] = a;
             }
             frame.make_owned();
+            copy_free_vars(&mut frame, f);
             pep523::note_entry(co); // (capi2) creating a generator runs its frame to the start
             return crate::types::genobject::new_generator_for(frame, func, flags);
         }
@@ -148,6 +161,11 @@ pub fn call_function(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwna
         }
     } else if let Some(r) = jit::call_fast(func, args, nargs, kwnames) {
         return r; // jit workstream: compiled callee, direct entry
+    } else if flags & bc::co::OPTIMIZED != 0 {
+        // (perf4) any other argument shape: bind, then enter compiled code directly
+        if let Some(r) = jit::call_bound(func, args, nargs, kwnames) {
+            return r;
+        }
     }
     // plain calls borrow code/func from the caller (perf-runtime, frame.rs `owns_fc`)
     let mut frame = Frame::new_call(co, func, unsafe { &*f.func_globals }, unsafe { &*f.func_builtins });
@@ -168,12 +186,175 @@ pub fn call_function(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwna
             // frame up to it now, so errors surface at call time.
             frame = run_generator_prologue(frame)?;
         } else {
+            // the free variables are in place from creation on (CPython copies them before
+            // RETURN_GENERATOR), so f_locals of a not yet started frame shows them; the
+            // CopyFreeVars at the first resume stores the same cells again
+            copy_free_vars(&mut frame, f);
             pep523::note_entry(co);
         }
         return crate::types::genobject::new_generator_for(frame, func, flags);
     }
     prepare_cells(&mut frame, f);
     run_frame(frame)
+}
+
+/// (perf4) `func(*args, **kw)` for a Python function (CALL_FUNCTION_EX): `args` is an
+/// exact tuple, `kw` a non-empty exact dict or None. Arguments are bound straight
+/// from the tuple and the dict (no argument vector, no kwnames tuple); a function
+/// whose only parameter is `*args` receives the tuple itself. Anything unusual
+/// (errors to report, non-str keys) goes through the general vectorcall path.
+pub fn call_function_ex(func: &PyObject, self_: Option<&PyObject>, args: &PyObject, kw: Option<&PyObject>) -> PyResult {
+    let f: &PyFunctionObject = funcobject::func(func);
+    if !f.func_code.is_null() {
+        let co = unsafe { &*f.func_code };
+        let cobj = code::code(co).obj;
+        let flags = cobj.co_flags as u32;
+        let plain = flags & (bc::co::GENERATOR | bc::co::COROUTINE | bc::co::ASYNC_GENERATOR) == 0 && flags & bc::co::OPTIMIZED != 0;
+        if plain {
+            let items = tuple::tuple_items(args);
+            if kw.is_none() && self_.is_none() && cobj.co_argcount == 0 && cobj.co_kwonlyargcount == 0 && flags & bc::co::VARKEYWORDS == 0 && flags & bc::co::VARARGS != 0 {
+                let mut frame = Frame::new_call(co, func, unsafe { &*f.func_globals }, unsafe { &*f.func_builtins });
+                frame.slots[0] = args.to_ref().into_raw();
+                return jit::run_bound(func, frame);
+            }
+            let n = items.len() + self_.is_some() as usize;
+            if n <= 16 {
+                let mut buf: [*mut PyObject; 16] = [std::ptr::null_mut(); 16];
+                let mut i = 0;
+                if let Some(s) = self_ {
+                    buf[0] = s.as_ptr();
+                    i = 1;
+                }
+                for (k, it) in items.iter().enumerate() {
+                    buf[i + k] = it.as_ptr();
+                }
+                match kw {
+                    None => return call_function(func, &buf[..n], n, None),
+                    Some(d) if dict::is_dict_exact(d) => {
+                        let mut frame = Frame::new_call(co, func, unsafe { &*f.func_globals }, unsafe { &*f.func_builtins });
+                        match bind_kwdict(f, &mut frame, &buf[..n], d) {
+                            Ok(true) => return jit::run_bound(func, frame),
+                            Ok(false) => frame::recycle(frame),
+                            Err(e) => {
+                                frame::recycle(frame);
+                                return Err(e);
+                            }
+                        }
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+    let mut v: Vec<&PyObject> = Vec::with_capacity(tuple::tuple_len(args) + 1);
+    if let Some(s) = self_ {
+        v.push(s);
+    }
+    v.extend_from_slice(tuple::tuple_items(args));
+    crate::abstract_::call_with_kwargs_dict(func, &v, kw)
+}
+
+/// Bind positional `args` and the entries of exact dict `kw` into `frame` (see
+/// `call_function_ex`). Ok(false): a case left to the general binder (which reports
+/// the errors); the frame is then partly filled and must be discarded.
+fn bind_kwdict(f: &PyFunctionObject, frame: &mut Frame, args: &[*mut PyObject], kw: &PyObject) -> PyResult<bool> {
+    let cd = code::code(unsafe { &*frame.code });
+    let co = cd.obj;
+    let argcount = co.co_argcount as usize;
+    let posonly = co.co_posonlyargcount as usize;
+    let kwonly = co.co_kwonlyargcount as usize;
+    let flags = co.co_flags as u32;
+    let total_named = argcount + kwonly;
+    let has_varargs = flags & bc::co::VARARGS != 0;
+    let has_varkw = flags & bc::co::VARKEYWORDS != 0;
+    let nargs = args.len();
+    if nargs > argcount && !has_varargs {
+        return Ok(false);
+    }
+    let slots = &mut frame.slots;
+    for i in 0..nargs.min(argcount) {
+        unsafe { incref(args[i]) };
+        slots[i] = args[i];
+    }
+    if has_varargs {
+        let extra = if nargs > argcount { unsafe { tuple::new_tuple_from_ptrs(&args[argcount..nargs]) } } else { tuple::empty_tuple() };
+        slots[total_named] = extra.into_raw();
+    }
+    let kwnew = if has_varkw {
+        let d = dict::new_dict_presized(dict::dict_len(kw));
+        slots[total_named + has_varargs as usize] = d.as_ptr();
+        Some(d.into_raw())
+    } else {
+        None
+    };
+    let names = &cd.d.localsplusnames;
+    {
+        // (no Python code runs below: exact str keys, str comparisons)
+        let _g = dict::ob_lock(kw);
+        let t = dict::table(kw);
+        for e in t.entries().iter() {
+            if e.key.is_null() {
+                continue;
+            }
+            let key = unsafe { &*e.key };
+            if !pystr::is_str_exact(key) {
+                return Ok(false);
+            }
+            let mut found = None;
+            for i in posonly..total_named {
+                if names[i].is(key) {
+                    found = Some(i);
+                    break;
+                }
+            }
+            if found.is_none() {
+                for i in posonly..total_named {
+                    if pystr::str_eq(&names[i], key) {
+                        found = Some(i);
+                        break;
+                    }
+                }
+            }
+            match found {
+                Some(i) => {
+                    if !slots[i].is_null() {
+                        return Ok(false);
+                    }
+                    unsafe { incref(e.value) };
+                    slots[i] = e.value;
+                }
+                None => match kwnew {
+                    // keys of a dict are unique: no comparisons needed
+                    Some(d) => dict::insert_unique(unsafe { &*d }, key, e.hash, unsafe { &*e.value }),
+                    None => return Ok(false),
+                },
+            }
+        }
+    }
+    if nargs < argcount {
+        let defs = if f.func_defaults.is_null() { &[][..] } else { tuple::tuple_items(unsafe { &*f.func_defaults }) };
+        let defs = &defs[defs.len().saturating_sub(argcount)..];
+        let first_default = argcount - defs.len();
+        for i in nargs..argcount {
+            if slots[i].is_null() {
+                if i < first_default {
+                    return Ok(false);
+                }
+                slots[i] = defs[i - first_default].to_ref().into_raw();
+            }
+        }
+    }
+    for i in argcount..total_named {
+        if slots[i].is_null() {
+            let nm = &cd.d.localsplusnames[i];
+            let d = if f.func_kwdefaults.is_null() { None } else { dict::get_item_str(unsafe { &*f.func_kwdefaults }, nm) };
+            match d {
+                Some(v) => slots[i] = v.into_raw(),
+                None => return Ok(false),
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Number of free variables if the code's eager generator prologue is exactly a
@@ -353,11 +534,27 @@ fn prepare_cells(frame: &mut Frame, f: &PyFunctionObject) {
     let _ = (frame, f);
 }
 
+fn copy_free_vars(frame: &mut Frame, f: &PyFunctionObject) {
+    if f.func_closure.is_null() {
+        return;
+    }
+    let n = code::code(frame.code()).nfreevars();
+    let items = tuple::tuple_items(unsafe { &*f.func_closure });
+    if n == 0 || items.len() < n || frame.nlocalsplus < n {
+        return;
+    }
+    let base = frame.nlocalsplus - n;
+    for i in 0..n {
+        let old = std::mem::replace(&mut frame.slots[base + i], items[i].to_ref().into_raw());
+        unsafe { xdecref(old) };
+    }
+}
+
 /// Put arguments into localsplus according to CPython's binding rules.
 pub fn bind_arguments(func: &PyObject, frame: &mut Frame, args: &[*mut PyObject], nargs: usize, kwnames: Option<&PyObject>) -> PyResult<()> {
     let f = funcobject::func(func);
-    let code_ref = frame.code().to_ref();
-    let cd = code::code(&code_ref);
+    // (perf4) borrowed: the frame holds the code for the whole call
+    let cd = code::code(unsafe { &*frame.code });
     let co = cd.obj;
     let argcount = co.co_argcount as usize;
     let posonly = co.co_posonlyargcount as usize;
@@ -375,6 +572,23 @@ pub fn bind_arguments(func: &PyObject, frame: &mut Frame, args: &[*mut PyObject]
             slots[i] = args[i];
         }
         return Ok(());
+    }
+    // (perf4) positional call relying on trailing defaults
+    if kwnames.is_none() && nargs < argcount && !has_varargs && !has_varkw && kwonly == 0 && !f.func_defaults.is_null() {
+        let defs = tuple::tuple_items(unsafe { &*f.func_defaults });
+        let ndef = defs.len().min(argcount);
+        if nargs + ndef >= argcount {
+            for i in 0..nargs {
+                unsafe { incref(args[i]) };
+                slots[i] = args[i];
+            }
+            let first_default = argcount - ndef;
+            let defs = &defs[defs.len() - ndef..];
+            for i in nargs..argcount {
+                slots[i] = defs[i - first_default].to_ref().into_raw();
+            }
+            return Ok(());
+        }
     }
 
     let qualname = || pystr::to_string_lossy(unsafe { &*f.func_qualname });
@@ -399,6 +613,9 @@ pub fn bind_arguments(func: &PyObject, frame: &mut Frame, args: &[*mut PyObject]
     if let Some(kn) = kwnames {
         let names = &cd.d.localsplusnames;
         for (j, key) in tuple::tuple_items(kn).iter().enumerate() {
+            if !pystr::is_str(key) {
+                raise!(TypeError, "{}() keywords must be strings", qualname());
+            }
             let value = args[nargs + j];
             let mut found = None;
             // identity first, then equality
@@ -452,7 +669,7 @@ pub fn bind_arguments(func: &PyObject, frame: &mut Frame, args: &[*mut PyObject]
                         );
                     }
                     let ks = pystr::to_string_lossy(key);
-                    let suggestion = crate::modules::suggestions::suggest_keyword(&ks, &names[..total_named]);
+                    let suggestion = crate::modules::suggestions::suggest_keyword(&ks, &names[posonly..total_named]);
                     match suggestion {
                         Some(s) => raise!(
                             TypeError,
@@ -589,6 +806,18 @@ pub fn eval_code(code: &PyObject, globals: &PyObject, locals: Option<&PyObject>)
         }
     };
     let frame = Frame::new(code, None, globals, &builtins, locals);
+    run_or_wrap(frame)
+}
+
+/// Run a frame of module-level code; code compiled with top-level await (a coroutine
+/// flag on non-function code) gives the coroutine to run instead, as CPython's eval does.
+fn run_or_wrap(mut frame: Box<Frame>) -> PyResult {
+    let co = frame.code().to_ref();
+    let flags = code::code(&co).flags();
+    if flags & (bc::co::GENERATOR | bc::co::COROUTINE | bc::co::ASYNC_GENERATOR) != 0 {
+        frame.make_owned();
+        return crate::types::genobject::new_generator_named(frame, &code::code_name(&co), &code::code_qualname(&co), flags);
+    }
     run_frame(frame)
 }
 
@@ -604,7 +833,7 @@ pub fn eval_code_with_closure(code: &PyObject, globals: &PyObject, locals: Optio
             for (i, cell) in tuple::tuple_items(c).iter().enumerate() {
                 frame.slots[nlp - n + i] = cell.to_ref().into_raw();
             }
-            run_frame(frame)
+            run_or_wrap(frame)
         }
     }
 }

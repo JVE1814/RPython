@@ -74,7 +74,8 @@ pub fn text_signature(name: &str, doc: &str) -> Option<String> {
 /// positional argument.  `first` names the implicit leading parameter
 /// ("$self", "$type", "$module"), or None when there is none.
 pub fn flags_text_signature(flags: i32, first: Option<&str>) -> Option<String> {
-    let base = flags & !(METH_CLASS | METH_STATIC | METH_COEXIST);
+    // the internal self-locking marks (METH_LOCKSELF*) do not change the calling convention
+    let base = flags & !(METH_CLASS | METH_STATIC | METH_COEXIST | METH_LOCKSELF | METH_LOCKSELF_HELD);
     let rest = if base == METH_NOARGS {
         ""
     } else if base == METH_O {
@@ -126,7 +127,12 @@ unsafe fn alloc_descr<T>(tp: *mut PyTypeObject, owner: *mut PyTypeObject, nm: Py
         (*d).d_type = owner;
         (*d).d_qualname = std::ptr::null_mut();
         (*d).d_name = nm.into_raw();
-        crate::gc::track(op);
+        // (perf4) a descriptor of a static type refers only to that (untracked,
+        // never freed) type and to strings: it cannot be part of a cycle, so the
+        // collector does not need to visit the thousands created at start-up
+        if (*owner).tp_flags & Py_TPFLAGS_HEAPTYPE != 0 {
+            crate::gc::track(op);
+        }
         op as *mut T
     }
 }
@@ -670,6 +676,27 @@ unsafe extern "C" fn wrapper_descr_call(d: *mut PyObject, args: *mut PyObject, k
             return std::ptr::null_mut();
         }
         into_c(wrapper_call_impl(d, items[0], &items[1..], if kw.is_null() { None } else { Some(&*kw) }))
+    }
+}
+
+/// (perf4) Call of a method-wrapper (`obj.__eq__`) or slot wrapper descriptor
+/// (`object.__init__`) with positional arguments, without the argument tuple the
+/// tp_call protocol needs. None: not such an object.
+pub unsafe fn call_wrapper_fast(callable: &PyObject, args: &[*mut PyObject]) -> Option<*mut PyObject> {
+    unsafe {
+        let refs: &[&PyObject] = std::slice::from_raw_parts(args.as_ptr() as *const &PyObject, args.len());
+        let tp = callable.type_ptr();
+        if tp == &raw mut _PyMethodWrapper_Type {
+            let mw = callable.as_ptr() as *mut MethodWrapper;
+            return Some(into_c(wrapper_call_impl((*mw).descr, &*(*mw).slf, refs, None)));
+        }
+        if tp == &raw mut PyWrapperDescr_Type && !refs.is_empty() {
+            if descr_check(callable, refs[0]).is_err() {
+                return Some(std::ptr::null_mut());
+            }
+            return Some(into_c(wrapper_call_impl(callable.as_ptr(), refs[0], &refs[1..], None)));
+        }
+        None
     }
 }
 

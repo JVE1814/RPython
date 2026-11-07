@@ -72,6 +72,13 @@ pub fn list_items(o: &PyObject) -> &[&PyObject] {
 }
 
 /// Owned snapshot of the items.
+/// (perf4) Shallow copy of a list (list.copy(), list(l)) without an intermediate
+/// vector: the items are copied under the list's lock.
+pub fn list_copy(o: &PyObject) -> PyRef {
+    let _g = ob_lock(o);
+    new_list_from_slice(list_items(o))
+}
+
 pub fn list_to_vec(o: &PyObject) -> Vec<PyRef> {
     let _g = ob_lock(o);
     list_items(o).iter().map(|x| x.to_ref()).collect()
@@ -189,6 +196,24 @@ pub fn new_list(items: Vec<PyRef>) -> PyRef {
     }
 }
 
+/// (perf4) New list taking over `n` owned references at `items` (no vector).
+#[inline]
+pub unsafe fn new_list_steal(items: *const *mut PyObject, n: usize) -> *mut PyObject {
+    unsafe {
+        let op = alloc::alloc_object(list_type(), std::mem::size_of::<PyListObject>());
+        let l = op as *mut PyListObject;
+        if n > 0 {
+            let arr = alloc_items(n);
+            std::ptr::copy_nonoverlapping(items, arr, n);
+            (*l).ob_item = arr;
+            (*l).allocated = n as isize;
+        }
+        (*l).ob_base.ob_size = n as isize;
+        crate::gc::track(op);
+        op
+    }
+}
+
 /// (jit5) New list of `n` borrowed items taken from `items` at start, start + step, ...
 /// (a resolved extended slice) without an intermediate vector.
 pub fn new_list_strided(items: &[&PyObject], start: isize, step: isize, n: isize) -> PyRef {
@@ -286,6 +311,27 @@ pub fn reserve(o: &PyObject, n: usize) {
             return;
         }
         grow_items(l, n);
+    }
+}
+
+/// (core6) `list.append`: like `append`, but false (item dropped) when the growth the list needs
+/// is refused (by a failure-injecting allocator hook (`_testcapi.set_nomemory`) or the system).
+pub fn try_append(o: &PyObject, item: PyRef) -> bool {
+    let _g = ob_lock(o);
+    unsafe {
+        let l = lp(o);
+        let n = (*l).ob_base.ob_size as usize;
+        if (n as isize) < (*l).allocated {
+            *(*l).ob_item.add(n) = item.into_raw();
+            publish_size(l, n + 1);
+            return true;
+        }
+        if crate::capi::mem::hooked_alloc_refuses((n + 1) * 8) || !reserve_locked(l, n + 1) {
+            return false;
+        }
+        *(*l).ob_item.add(n) = item.into_raw();
+        publish_size(l, n + 1);
+        true
     }
 }
 
@@ -592,6 +638,11 @@ pub unsafe extern "C" fn list_dealloc(op: *mut PyObject) {
         (*l).ob_base.ob_size = 0;
         release_array(arr, n, false);
         let tp = (*op).type_ptr();
+        if tp == list_type() {
+            // (perf4) exact list: static type with the generic free
+            crate::alloc::free_object(op);
+            return;
+        }
         crate::types::typeobject::generic_free_and_type_decref(op, tp);
     }
 }
@@ -1128,6 +1179,9 @@ unsafe extern "C" fn list_new(tp: *mut PyTypeObject, _args: *mut PyObject, kw: *
         if tp == list_type() && !kw.is_null() && crate::types::dict::dict_len(&*kw) > 0 {
             return into_c(Err(err!(TypeError, "list() takes no keyword arguments")));
         }
+        if crate::capi::mem::hooked_alloc_refuses((*tp).tp_basicsize as usize) {
+            return into_c(Err(crate::errors::memory_error()));
+        }
         let alloc = (*tp).tp_alloc.unwrap_or(generic_alloc);
         alloc(tp, 0)
     }
@@ -1225,7 +1279,7 @@ fn listreviter_len(o: &PyObject) -> PyResult {
     Ok(int::new_int(n as i64))
 }
 fn builtin_fn(name: &str) -> PyResult {
-    crate::builtins::builtin(name)
+    crate::builtins::eval_builtin(name)
 }
 fn listiter_reduce(o: &PyObject) -> PyResult {
     let iter_fn = builtin_fn("iter")?;

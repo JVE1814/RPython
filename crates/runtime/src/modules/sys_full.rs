@@ -182,6 +182,25 @@ static LAZY_FILTER: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
 static FLAGS_TYPE: AtomicPtr<PyTypeObject> = AtomicPtr::new(std::ptr::null_mut());
 static UNRAISABLE_ARGS_TYPE: AtomicPtr<PyTypeObject> = AtomicPtr::new(std::ptr::null_mut());
 static VERSION_INFO_TYPE: AtomicPtr<PyTypeObject> = AtomicPtr::new(std::ptr::null_mut());
+static FLOAT_INFO_TYPE: AtomicPtr<PyTypeObject> = AtomicPtr::new(std::ptr::null_mut());
+static INT_INFO_TYPE: AtomicPtr<PyTypeObject> = AtomicPtr::new(std::ptr::null_mut());
+static HASH_INFO_TYPE: AtomicPtr<PyTypeObject> = AtomicPtr::new(std::ptr::null_mut());
+static THREAD_INFO_TYPE: AtomicPtr<PyTypeObject> = AtomicPtr::new(std::ptr::null_mut());
+
+/// A struct-sequence type of `sys` shared by every interpreter: created by the first
+/// `sys` module, reused by the sys modules of subinterpreters (one type object per
+/// process, like the static types of the C implementation).
+fn shared_structseq(slot: &AtomicPtr<PyTypeObject>, name: &'static str, fields: &'static [&'static str], n_seq: usize) -> PyResult<*mut PyTypeObject> {
+    let tp = slot.load(Acquire);
+    if !tp.is_null() {
+        return Ok(tp);
+    }
+    let new = ss::make_type(name, fields, n_seq, false)?;
+    match slot.compare_exchange(std::ptr::null_mut(), new, AcqRel, Acquire) {
+        Ok(_) => Ok(new),
+        Err(existing) => Ok(existing),
+    }
+}
 
 pub fn unraisable_args_type() -> *mut PyTypeObject {
     UNRAISABLE_ARGS_TYPE.load(Acquire)
@@ -386,7 +405,62 @@ fn sys_is_immortal(_m: &PyObject, o: &PyObject) -> PyResult {
 }
 
 fn sys_getrefcount(_m: &PyObject, o: &PyObject) -> PyResult {
-    Ok(int::new_int(crate::object::visible_refcnt(o) as i64))
+    let mut n = crate::object::visible_refcnt(o) as i64;
+    // (wheels2) CPython 3.14+ loads a local argument with a borrowed reference
+    // (LOAD_FAST_BORROW), so `getrefcount(x)` no longer counts the argument itself.
+    // Our value stack owns that reference: when a fast local of the calling frame
+    // holds the object, that is where the argument came from, and the count leaves
+    // it out. pandas' chained-assignment detection compares these counts.
+    if n > 1 && !o.is_immortal() && caller_local_holds(o) {
+        n -= 1;
+        // CPython also moves the arguments of a Python-to-Python call from the
+        // caller's value stack into the callee's frame. Ours copies them: while
+        // the calling frame is still inside that call with the object among its
+        // operands, one of the counted references is that stack slot.
+        if n > 1 && parent_call_operand(o) {
+            n -= 1;
+        }
+    }
+    Ok(int::new_int(n))
+}
+
+fn parent_call_operand(o: &PyObject) -> bool {
+    use rpy_compiler::bytecode::{self as bc, Op};
+    let f = crate::interp::current_frame_ptr();
+    if f.is_null() {
+        return false;
+    }
+    unsafe {
+        let p = (*f).prev;
+        if p.is_null() || (*p).code.is_null() {
+            return false;
+        }
+        let p = &*p;
+        let cd = crate::types::code::code_data(&*p.code);
+        let Some(&w) = cd.code.get(p.lasti as usize) else { return false };
+        let (op, _) = bc::decode(w);
+        if !matches!(op, Op::Call | Op::CallKw) {
+            return false;
+        }
+        let lo = p.nlocalsplus.min(p.slots.len());
+        let hi = p.stack_top.min(p.slots.len());
+        lo < hi && p.slots[lo..hi].iter().any(|&q| q == o.as_ptr())
+    }
+}
+
+fn caller_local_holds(o: &PyObject) -> bool {
+    let f = crate::interp::current_frame_ptr();
+    if f.is_null() {
+        return false;
+    }
+    unsafe {
+        let f = &*f;
+        if !f.locals.is_null() {
+            return false; // module/class frames load names, not fast locals
+        }
+        let n = f.nlocalsplus.min(f.slots.len());
+        f.slots[..n].iter().any(|&p| p == o.as_ptr())
+    }
 }
 
 fn sys_displayhook(_m: &PyObject, o: &PyObject) -> PyResult {
@@ -758,7 +832,7 @@ fn sys_set_int_max_str_digits(_m: &PyObject, args: &[&PyObject], kw: Option<&PyO
         raise!(ValueError, "maxdigits must be >= 640 or 0 for unlimited");
     }
     let n = n.min(i32::MAX as i64);
-    crate::modules::sys::INT_MAX_STR_DIGITS.store(n as i32, Relaxed);
+    crate::modules::sys::set_int_max_str_digits(n as i32);
     Ok(none::none_ref())
 }
 
@@ -898,38 +972,6 @@ fn sys_set_coroutine_origin_tracking_depth(_m: &PyObject, args: &[&PyObject], kw
     }
     let ts = crate::threads::current_mut();
     unsafe { (*ts).c.coroutine_origin_tracking_depth = n.min(i32::MAX as i64) as i32 };
-    Ok(none::none_ref())
-}
-
-static ASYNCGEN_HOOKS_TYPE: AtomicPtr<PyTypeObject> = AtomicPtr::new(std::ptr::null_mut());
-
-fn sys_get_asyncgen_hooks(_m: &PyObject) -> PyResult {
-    let ts = crate::threads::current();
-    let g = |p: *mut PyObject| if p.is_null() { none::none_ref() } else { unsafe { PyRef::from_borrowed(p) } };
-    Ok(ss::new_instance(ASYNCGEN_HOOKS_TYPE.load(Acquire), vec![g(ts.c.async_gen_firstiter), g(ts.c.async_gen_finalizer)]))
-}
-fn sys_set_asyncgen_hooks(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
-    static P: crate::args::Params = crate::args::Params::new("set_asyncgen_hooks", &["firstiter", "finalizer"], 0, 0);
-    let [fi, fz] = crate::args::parse::<2>(&P, args, kw)?;
-    for (v, nm) in [(fz, "finalizer"), (fi, "firstiter")] {
-        if let Some(v) = v {
-            if !v.is(none::none()) && !ab::is_callable(v) {
-                raise!(TypeError, "callable {} expected, got {}", nm, crate::types::typeobject::tname(v));
-            }
-        }
-    }
-    let ts = crate::threads::current_mut();
-    unsafe {
-        let set = |slot: *mut *mut PyObject, v: Option<&PyObject>| {
-            if let Some(v) = v {
-                let nv = if v.is(none::none()) { std::ptr::null_mut() } else { v.to_ref().into_raw() };
-                let old = std::mem::replace(&mut *slot, nv);
-                xdecref(old);
-            }
-        };
-        set(&raw mut (*ts).c.async_gen_finalizer, fz);
-        set(&raw mut (*ts).c.async_gen_firstiter, fi);
-    }
     Ok(none::none_ref())
 }
 
@@ -1158,6 +1200,7 @@ fn compute_paths() -> PathConfig {
 
     // The base installation: <prefix>/bin/python3.15t -> <prefix>.
     let pythonhome = if use_env { std::env::var("PYTHONHOME").ok().filter(|v| !v.is_empty()) } else { None };
+    let home_from_env = pythonhome.is_some() && std::env::var("RPYTHON_PREFIX").is_err();
     let (base_prefix, base_exec_prefix) = if let Ok(p) = std::env::var("RPYTHON_PREFIX") {
         (p.clone(), p)
     } else if let Some(h) = pythonhome {
@@ -1184,7 +1227,8 @@ fn compute_paths() -> PathConfig {
         d
     } else {
         let p = format!("{}/lib/python3.15t", base_prefix);
-        if std::path::Path::new(&p).join("os.py").is_file() {
+        if std::path::Path::new(&p).join("os.py").is_file() || home_from_env {
+            // (an explicit PYTHONHOME is taken at its word, even when nothing is there)
             p
         } else {
             let dev = concat!(env!("CARGO_MANIFEST_DIR"), "/../../Lib");
@@ -1217,6 +1261,36 @@ pub fn stdlib_dir() -> String {
 
 /// The default module search path after PYTHONPATH: the stdlib zip, the
 /// stdlib directory and (if present) lib-dynload.
+/// (core6) With PYTHONHOME pointing where there is no standard library, startup cannot
+/// import `encodings`: report the path configuration and stop, as CPython does.
+pub fn check_stdlib_present() {
+    let c = config();
+    if c.ignore_environment != 0 || std::env::var("RPYTHON_PREFIX").is_ok() || c.stdlib_dir.is_some() {
+        return;
+    }
+    let Some(home) = std::env::var("PYTHONHOME").ok().filter(|v| !v.is_empty()) else { return };
+    let p = paths();
+    if std::path::Path::new(&p.stdlib_dir).join("encodings").join("__init__.py").is_file() {
+        return;
+    }
+    let pythonpath = std::env::var("PYTHONPATH").ok().filter(|v| !v.is_empty());
+    let mut msg = String::from("Python path configuration:\n");
+    msg.push_str(&format!("  PYTHONHOME = '{}'\n", home));
+    msg.push_str(&format!("  PYTHONPATH = {}\n", pythonpath.map_or("(not set)".to_string(), |v| format!("'{}'", v))));
+    msg.push_str(&format!("  isolated = {}\n  environment = 1\n", c.isolated));
+    msg.push_str(&format!("  sys.executable = '{}'\n  sys.prefix = '{}'\n  sys.exec_prefix = '{}'\n", p.executable, p.prefix, p.exec_prefix));
+    msg.push_str("  sys.path = [\n");
+    for e in default_search_path() {
+        msg.push_str(&format!("    '{}',\n", e));
+    }
+    msg.push_str("  ]\n");
+    msg.push_str("Fatal Python error: Failed to import encodings module\n");
+    msg.push_str("Python runtime state: core initialized\n");
+    msg.push_str("ModuleNotFoundError: No module named 'encodings'\n");
+    crate::modules::sys::write_fd(2, msg.as_bytes());
+    std::process::exit(1);
+}
+
 pub fn default_search_path() -> Vec<String> {
     let p = paths();
     let mut v = vec![p.zip_path.clone(), p.stdlib_dir.clone()];
@@ -1483,11 +1557,11 @@ pub fn populate(d: &PyObject) -> PyResult<()> {
     set("flags", &*make_flags()?)?;
     crate::capi::config::init_legacy_globals();
     // float_info
-    let fi = ss::make_type(
+    let fi = shared_structseq(
+        &FLOAT_INFO_TYPE,
         "sys.float_info",
         &["max", "max_exp", "max_10_exp", "min", "min_exp", "min_10_exp", "dig", "mant_dig", "epsilon", "radix", "rounds"],
         11,
-        false,
     )?;
     let fl = |v: f64| float::new_float(v);
     let i = |v: i64| int::new_int(v);
@@ -1498,18 +1572,18 @@ pub fn populate(d: &PyObject) -> PyResult<()> {
             vec![fl(f64::MAX), i(1024), i(308), fl(f64::MIN_POSITIVE), i(-1021), i(-307), i(15), i(53), fl(f64::EPSILON), i(2), i(1)],
         ),
     )?;
-    let ii = ss::make_type(
+    let ii = shared_structseq(
+        &INT_INFO_TYPE,
         "sys.int_info",
         &["bits_per_digit", "sizeof_digit", "default_max_str_digits", "str_digits_check_threshold"],
         4,
-        false,
     )?;
     set("int_info", &ss::new_instance(ii, vec![i(30), i(4), i(4300), i(640)]))?;
-    let hi = ss::make_type(
+    let hi = shared_structseq(
+        &HASH_INFO_TYPE,
         "sys.hash_info",
         &["width", "modulus", "inf", "nan", "imag", "algorithm", "hash_bits", "seed_bits", "cutoff"],
         9,
-        false,
     )?;
     set(
         "hash_info",
@@ -1518,13 +1592,10 @@ pub fn populate(d: &PyObject) -> PyResult<()> {
             vec![i(64), i((1i64 << 61) - 1), i(314159), i(0), i(1000003), s("siphash13"), i(64), i(128), i(0)],
         ),
     )?;
-    let ti = ss::make_type("sys.thread_info", &["name", "lock", "version"], 3, false)?;
+    let ti = shared_structseq(&THREAD_INFO_TYPE, "sys.thread_info", &["name", "lock", "version"], 3)?;
     set("thread_info", &ss::new_instance(ti, vec![s("pthread"), s("pymutex"), thread_lib_version()]))?;
-    let ua = ss::make_type("UnraisableHookArgs", &["exc_type", "exc_value", "exc_traceback", "err_msg", "object"], 5, false)?;
-    UNRAISABLE_ARGS_TYPE.store(ua, Release);
+    let ua = shared_structseq(&UNRAISABLE_ARGS_TYPE, "UnraisableHookArgs", &["exc_type", "exc_value", "exc_traceback", "err_msg", "object"], 5)?;
     set("UnraisableHookArgs", crate::types::typeobject::type_obj(ua))?;
-    let ah = ss::make_type("asyncgen_hooks", &["firstiter", "finalizer"], 2, false)?;
-    ASYNCGEN_HOOKS_TYPE.store(ah, Release);
     // implementation
     let impl_ns = crate::modules::sys_namespace::new_namespace(&[
         ("name", s("cpython")),
@@ -1532,7 +1603,7 @@ pub fn populate(d: &PyObject) -> PyResult<()> {
         ("version", vi.clone()),
         ("hexversion", int::new_int(HEXVERSION)),
         ("_multiarch", s(MULTIARCH)),
-        ("supports_isolated_interpreters", bool_::new_bool(false)),
+        ("supports_isolated_interpreters", bool_::new_bool(true)), // D26 (subinterpreters)
     ])?;
     set("implementation", &impl_ns)?;
     let abi = crate::modules::sys_namespace::new_namespace(&[
@@ -1601,8 +1672,6 @@ pub fn populate(d: &PyObject) -> PyResult<()> {
         ("_debugmallocstats", NOARGS, sys_debugmallocstats),
         ("get_coroutine_origin_tracking_depth", NOARGS, sys_get_coroutine_origin_tracking_depth),
         ("set_coroutine_origin_tracking_depth", FASTKW, sys_set_coroutine_origin_tracking_depth, "set_coroutine_origin_tracking_depth(depth)\n--\n\nRecord this many frames of creation context for new coroutines\n(0 disables the tracking)."),
-        ("get_asyncgen_hooks", NOARGS, sys_get_asyncgen_hooks),
-        ("set_asyncgen_hooks", FASTKW, sys_set_asyncgen_hooks),
         ("getdlopenflags", NOARGS, sys_getdlopenflags),
         ("setdlopenflags", O, sys_setdlopenflags),
         ("set_lazy_imports", FASTKW, sys_set_lazy_imports, "set_lazy_imports(mode)\n--\n\nChoose how lazy imports behave: \"normal\", \"all\" or \"none\"."),

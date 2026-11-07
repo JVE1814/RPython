@@ -1,8 +1,8 @@
 """A lexical analyzer class for simple shell-like syntaxes."""
 
-import os
+lazy import os
 import sys
-from collections import deque
+lazy from collections import deque
 from io import StringIO
 
 __all__ = ["shlex", "split", "quote", "join"]

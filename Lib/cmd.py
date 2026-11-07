@@ -180,7 +180,8 @@ class Cmd:
             end = readline.get_endidx() - stripped
             if start > 0:
                 command, args, _ = self.parseline(buffer.lstrip())
-                if command == '':
+                # no command name (empty, or '!' without do_shell): default completion
+                if not command:
                     completer = self.completedefault
                 else:
                     completer = getattr(self, 'complete_' + command,

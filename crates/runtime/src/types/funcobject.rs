@@ -75,6 +75,12 @@ pub fn cell_type() -> *mut PyTypeObject {
 pub fn is_function(o: &PyObject) -> bool {
     o.is_type(function_type())
 }
+/// (perf4) An exact function whose vectorcall slot is the interpreter's (not replaced
+/// through the C API): callers may use `interp::call_function` directly.
+#[inline]
+pub fn is_plain_function(o: &PyObject) -> bool {
+    is_function(o) && func(o).vectorcall.map(|p| p as usize) == Some(crate::interp::function_vectorcall as usize)
+}
 #[inline]
 pub fn is_method(o: &PyObject) -> bool {
     o.is_type(method_type())
@@ -137,7 +143,9 @@ fn new_function_inner(code: &PyObject, globals: &PyObject, qualname: Option<&PyO
                 return Ok(PyRef::from_raw(op));
             }
         }
-        // __builtins__ from globals, else the builtins module dict
+        // __builtins__ from globals, else the builtins of the running frame (only the first
+        // kind of result is remembered in NEWFUNC_CACHE)
+        let mut cacheable = true;
         let b = match dict::get_item_str(globals, name!("__builtins__")) {
             Some(b) => {
                 if crate::types::module::is_module(&b) {
@@ -146,7 +154,10 @@ fn new_function_inner(code: &PyObject, globals: &PyObject, qualname: Option<&PyO
                     b
                 }
             }
-            None => crate::builtins::builtins_dict(),
+            None => {
+                cacheable = false;
+                crate::interp::current_builtins()
+            }
         };
         f.func_builtins = b.into_raw();
         f.func_doc = match crate::types::code::code_docstring(code) {
@@ -158,7 +169,7 @@ fn new_function_inner(code: &PyObject, globals: &PyObject, qualname: Option<&PyO
             Some(m) => m.into_raw(),
             None => std::ptr::null_mut(),
         };
-        if ver0 != 0 && dict::table(globals).version == ver0 {
+        if cacheable && ver0 != 0 && dict::table(globals).version == ver0 {
             *(&raw mut NEWFUNC_CACHE) = (globals.as_ptr() as usize, ver0, f.func_builtins, f.func_module);
         }
         f.vectorcall = Some(crate::interp::function_vectorcall);
@@ -292,6 +303,16 @@ fn f_set_code(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
             nfree
         );
     }
+    // generator / coroutine / async generator kind
+    const KIND: u32 = 0x20 | 0x80 | 0x200;
+    let old_kind = unsafe { crate::types::code::code(&*func(o).func_code).flags() } & KIND;
+    if crate::types::code::code(v).flags() & KIND != old_kind {
+        crate::modules::warnings::warn(
+            crate::types::exceptions::DeprecationWarning(),
+            "assigning a code object of non-matching type (plain function, generator, coroutine or async generator) to __code__ is deprecated",
+            1,
+        )?;
+    }
     if crate::capi::watchers::funcs_watched() {
         crate::capi::watchers::func_event(crate::capi::watchers::FUNC_MODIFY_CODE, o.as_ptr(), Some(v));
     }
@@ -303,6 +324,7 @@ fn f_set_code(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         static RETIRED_CODE: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
         RETIRED_CODE.lock().unwrap().push(old as usize);
     }
+    crate::modules::testinternalcapi::rare_event(crate::modules::testinternalcapi::RareEvent::FuncModification);
     func(o).func_version = FUNC_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
@@ -321,6 +343,7 @@ fn f_set_defaults(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     }
     replace(&mut func(o).func_defaults, v);
     func(o).func_version = FUNC_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::modules::testinternalcapi::rare_event(crate::modules::testinternalcapi::RareEvent::FuncModification);
     Ok(())
 }
 fn f_kwdefaults(o: &PyObject) -> PyResult {
@@ -337,6 +360,8 @@ fn f_set_kwdefaults(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         crate::capi::watchers::func_event(crate::capi::watchers::FUNC_MODIFY_KWDEFAULTS, o.as_ptr(), v);
     }
     replace(&mut func(o).func_kwdefaults, v);
+    func(o).func_version = FUNC_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::modules::testinternalcapi::rare_event(crate::modules::testinternalcapi::RareEvent::FuncModification);
     Ok(())
 }
 fn f_globals(o: &PyObject) -> PyResult {
@@ -435,7 +460,7 @@ fn f_annotations(o: &PyObject) -> PyResult {
             let one = crate::types::int::new_int(1);
             let r = ab::call(unsafe { &*f.func_annotate }, &[&one])?;
             if !dict::is_dict(&r) {
-                raise!(TypeError, "__annotate__ returned non-dict of type '{}'", tname(&r));
+                raise!(TypeError, "__annotate__() must return a dict, not {}", tname(&r));
             }
             f.func_annotations = r.into_raw();
         } else {
@@ -590,6 +615,15 @@ unsafe extern "C" fn method_vectorcall(
             let r = ab::vectorcall_raw(f, slot, nargs + 1, kwnames);
             *slot = saved;
             return r;
+        }
+        if total <= 8 {
+            // (perf4) stack buffer for the usual few arguments
+            let mut buf: [*mut PyObject; 10] = [std::ptr::null_mut(); 10];
+            buf[1] = s.as_ptr();
+            if total > 0 {
+                std::ptr::copy_nonoverlapping(args, buf.as_mut_ptr().add(2), total);
+            }
+            return ab::vectorcall_raw(f, buf.as_ptr().add(1), (nargs + 1) | PY_VECTORCALL_ARGUMENTS_OFFSET, kwnames);
         }
         let mut v: Vec<*mut PyObject> = Vec::with_capacity(total + 2);
         v.push(std::ptr::null_mut());

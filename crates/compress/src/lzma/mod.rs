@@ -484,6 +484,17 @@ impl Decoder {
         if self.opos == self.out.len() {
             self.out.clear();
             self.opos = 0;
+            // (wheels2) the output limit was reached with nothing left over: go on
+            // through what needs no output space (end markers, block check, index,
+            // footer) like liblzma, so the call that returns the last bytes already
+            // reports the end of the stream; stops at the first new output byte
+            if n == max && max > 0 {
+                while !self.done && self.out.is_empty() {
+                    if !self.step(1)? {
+                        break;
+                    }
+                }
+            }
         }
         Ok(r)
     }

@@ -84,6 +84,14 @@ unsafe extern "C" fn sq_clear(op: *mut PyObject) -> c_int {
     }
 }
 
+/// The object plus its ring buffer of item pointers (at least 8 slots, grown by
+/// doubling).
+fn sq_sizeof(o: &PyObject) -> PyResult {
+    let cap = sq(o).q.lock().unwrap().capacity().max(8).next_power_of_two();
+    let base = unsafe { (*o.type_ptr()).tp_basicsize } as usize;
+    Ok(int::new_int((base + cap * std::mem::size_of::<usize>()) as i64))
+}
+
 fn sq_put_impl(o: &PyObject, item: &PyObject) {
     let s = sq(o);
     s.q.lock().unwrap().push_back(item.to_ref().into_raw() as usize);
@@ -201,6 +209,7 @@ pub fn init_module() -> PyResult {
                 ("get_nowait", NOARGS, sq_get_nowait),
                 ("empty", NOARGS, sq_empty),
                 ("qsize", NOARGS, sq_qsize),
+                ("__sizeof__", NOARGS, sq_sizeof, "__sizeof__($self, /)\n--\n\nSize of the queue in memory, in bytes."),
                 ("__class_getitem__", O, sq_class_getitem; METH_CLASS),
             ];
             crate::types::typeobject::type_ready(&raw mut SQ_TYPE)?;

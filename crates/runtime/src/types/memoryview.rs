@@ -416,10 +416,14 @@ fn pack_single(item: &PyObject, f: NFmt, fmtname: &str, out: &mut [u8; 16]) -> P
             out[0] = ab::is_true(item)? as u8;
         }
         Char => {
-            if !bytes::is_bytes(item) {
+            // same inputs as struct's 'c': a bytes or bytearray of length 1
+            let d = if bytes::is_bytes(item) {
+                bytes::bytes_data(item)
+            } else if crate::types::bytearray::is_bytearray(item) {
+                crate::types::bytearray::bytearray_data(item)
+            } else {
                 return Err(type_error_int(fmtname));
-            }
-            let d = bytes::bytes_data(item);
+            };
             if d.len() != 1 {
                 return Err(value_error_int(fmtname));
             }
@@ -804,7 +808,7 @@ pub fn get_contiguous(obj: &PyObject, buffertype: c_int, order: u8) -> PyResult 
 
 unsafe fn memory_from_contiguous_copy(src: &Py_buffer, order: u8) -> PyResult {
     unsafe {
-        let b = bytes::try_alloc_bytes(src.len as usize)?;
+        let b = bytes::try_alloc_bytes_uninit(src.len as usize)?;
         copy_to_contiguous(bytes::bytes_ptr(&b), src, if order == b'F' { b'F' } else { b'C' });
         let mbuf = mbuf_from_object(&b, PyBUF_FULL_RO)?;
         let mb = mbuf.as_ptr() as *mut ManagedBuffer;

@@ -72,7 +72,6 @@ impl Registry {
     }
 }
 
-static DICTS: Registry = Registry::new("dict", 0);
 static TYPES: Registry = Registry::new("type", 1);
 static FUNCS: Registry = Registry::new("func", 0);
 static CODES: Registry = Registry::new("code", 0);
@@ -109,116 +108,7 @@ fn repr_or(o: &PyObject, fallback: impl Fn() -> String) -> String {
 }
 
 // ---------------------------------------------------------------- dicts
-
-/// Watched dicts: address -> watcher bits.
-static WATCHED: Mutex<Option<HashMap<usize, u8>>> = Mutex::new(None);
-static WATCHED_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-pub const DICT_ADDED: c_int = 0;
-pub const DICT_MODIFIED: c_int = 1;
-pub const DICT_DELETED: c_int = 2;
-pub const DICT_CLONED: c_int = 3;
-pub const DICT_CLEARED: c_int = 4;
-pub const DICT_DEALLOCATED: c_int = 5;
-const DICT_EVENT_NAMES: [&str; 6] = ["ADDED", "MODIFIED", "DELETED", "CLONED", "CLEARED", "DEALLOCATED"];
-
-/// Whether any dict is watched (the hot-path test).
-#[inline(always)]
-pub fn dicts_watched() -> bool {
-    WATCHED_COUNT.load(Relaxed) != 0
-}
-
-fn dict_bits(d: *const PyObject) -> u8 {
-    let g = WATCHED.lock().unwrap_or_else(|e| e.into_inner());
-    g.as_ref().and_then(|m| m.get(&(d as usize)).copied()).unwrap_or(0)
-}
-
-/// Notify the watchers of `d` (call only when `dicts_watched()`).
-#[cold]
-pub fn dict_event(event: c_int, d: &PyObject, key: Option<&PyObject>, value: Option<&PyObject>) {
-    let bits = dict_bits(d.as_ptr());
-    if bits == 0 {
-        return;
-    }
-    if event == DICT_DEALLOCATED {
-        forget_dict(d.as_ptr());
-    }
-    let cbs = DICTS.callbacks(bits);
-    let dp = d.as_ptr();
-    let kp = key.map_or(std::ptr::null_mut(), |k| k.as_ptr());
-    let vp = value.map_or(std::ptr::null_mut(), |v| v.as_ptr());
-    dispatch(
-        cbs,
-        &mut |cb| unsafe {
-            let f: unsafe extern "C" fn(c_int, *mut PyObject, *mut PyObject, *mut PyObject) -> c_int = std::mem::transmute(cb);
-            f(event, dp, kp, vp)
-        },
-        &|_| format!("Exception ignored in PyDict_EVENT_{} watcher callback for <dict at {:p}>", DICT_EVENT_NAMES[event as usize], dp),
-    );
-}
-
-fn forget_dict(d: *const PyObject) {
-    let mut g = WATCHED.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(m) = g.as_mut() {
-        if m.remove(&(d as usize)).is_some() {
-            WATCHED_COUNT.fetch_sub(1, SeqCst);
-        }
-    }
-}
-
-unsafe fn watch_dict_arg(id: c_int, d: *mut PyObject) -> Result<(), ()> {
-    unsafe {
-        if d.is_null() || !tdict::is_dict(&*d) {
-            let _ = value_error("Cannot watch non-dictionary");
-            return Err(());
-        }
-        DICTS.check(id, false)
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyDict_AddWatcher(cb: *mut c_void) -> c_int {
-    DICTS.add(cb)
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyDict_ClearWatcher(id: c_int) -> c_int {
-    DICTS.clear(id, false)
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyDict_Watch(id: c_int, d: *mut PyObject) -> c_int {
-    unsafe {
-        if watch_dict_arg(id, d).is_err() {
-            return -1;
-        }
-        let mut g = WATCHED.lock().unwrap_or_else(|e| e.into_inner());
-        let m = g.get_or_insert_with(HashMap::new);
-        let e = m.entry(d as usize).or_insert_with(|| {
-            WATCHED_COUNT.fetch_add(1, SeqCst);
-            0
-        });
-        *e |= 1 << id;
-        0
-    }
-}
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyDict_Unwatch(id: c_int, d: *mut PyObject) -> c_int {
-    unsafe {
-        if watch_dict_arg(id, d).is_err() {
-            return -1;
-        }
-        let mut g = WATCHED.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(m) = g.as_mut() {
-            if let Some(b) = m.get_mut(&(d as usize)) {
-                *b &= !(1 << id);
-                if *b == 0 {
-                    m.remove(&(d as usize));
-                    WATCHED_COUNT.fetch_sub(1, SeqCst);
-                }
-            }
-        }
-        0
-    }
-}
+// (dict watchers: capi/dict.rs, wheels2)
 
 // ---------------------------------------------------------------- types
 

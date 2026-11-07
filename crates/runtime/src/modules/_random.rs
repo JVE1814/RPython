@@ -247,14 +247,15 @@ fn r_getrandbits(o: &PyObject, k: &PyObject) -> PyResult {
             if int::sign(&kk) < 0 {
                 raise!(ValueError, "number of bits must be non-negative");
             }
-            raise!(OverflowError, "Python int too large to convert to C int");
+            raise!(OverflowError, "Python int too large to convert to C int64_t");
         }
     };
     if k < 0 {
         raise!(ValueError, "number of bits must be non-negative");
     }
-    if k > i32::MAX as i64 {
-        raise!(OverflowError, "Python int too large to convert to C int");
+    // the result must be representable: at most isize::MAX bytes of digits
+    if k / 8 >= isize::MAX as i64 / 2 {
+        return Err(memory_error());
     }
     let _g = lock(o);
     let m = mt(o);
@@ -265,7 +266,7 @@ fn r_getrandbits(o: &PyObject, k: &PyObject) -> PyResult {
         return Ok(int::new_int((m.genrand_u32() >> (32 - k)) as i64));
     }
     let words = ((k - 1) / 32 + 1) as usize;
-    let mut bytes = Vec::with_capacity(words * 4);
+    let mut bytes: Vec<u8> = crate::errors::try_vec_with_capacity(words * 4)?;
     let mut rem = k;
     for _ in 0..words {
         let mut r = m.genrand_u32();

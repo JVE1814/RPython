@@ -12,7 +12,9 @@ use crate::types::{exceptions, float, int, none, str as pystr, tuple};
 // ================================================================== methods
 
 fn append_m(o: &PyObject, v: &PyObject) -> PyResult {
-    list::append(o, v.to_ref());
+    if !list::try_append(o, v.to_ref()) {
+        return Err(crate::errors::memory_error());
+    }
     Ok(none::none_ref())
 }
 fn extend_m(o: &PyObject, v: &PyObject) -> PyResult {
@@ -130,7 +132,7 @@ fn clear_m(o: &PyObject) -> PyResult {
     Ok(none::none_ref())
 }
 fn copy_m(o: &PyObject) -> PyResult {
-    Ok(list::new_list(list::list_to_vec(o)))
+    Ok(list::list_copy(o))
 }
 fn reversed_m(o: &PyObject) -> PyResult {
     list::list_reversed(o)
@@ -828,10 +830,12 @@ pub fn sort_list(l: &PyObject, key: Option<&PyObject>, reverse: bool) -> PyResul
     if reverse {
         items.reverse();
     }
-    let modified = list::list_len(l) != 0 || unsafe { (*(l.as_ptr() as *const PyListObject)).allocated } != -1;
     let saved_exc = if failed { take_exc() } else { None };
-    let extra = list::restore_items(l, items);
+    // the keys go first, while the list is still detached: their finalizers may
+    // mutate it, which counts as a modification during the sort
     drop(keys_owned);
+    let modified = list::list_len(l) != 0 || unsafe { (*(l.as_ptr() as *const PyListObject)).allocated } != -1;
+    let extra = list::restore_items(l, items);
     list::release_items(extra);
     if let Some(e) = saved_exc {
         set_exc(e);

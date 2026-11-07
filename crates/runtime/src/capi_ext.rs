@@ -195,6 +195,12 @@ unsafe fn create_from_initfunc(
         }
         // (interp1) single-phase modules cannot be isolated
         crate::subinterp::check_singlephase_extension(name)?;
+        // (wheels2) a single-phase module is findable through its def afterwards
+        // (PyState_FindModule), as the import system registers it after init
+        let def = tmod::m(&ro).md_def;
+        if !def.is_null() && (*def).m_slots.is_null() {
+            capi::modsupport::PyState_AddModule(ro.as_ptr(), def);
+        }
         Ok((ro, None))
     }
 }

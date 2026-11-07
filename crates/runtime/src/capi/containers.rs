@@ -500,7 +500,7 @@ pub unsafe extern "C" fn _PySlice_FromIndices(start: Py_ssize_t, stop: Py_ssize_
 fn clamp_index(v: &PyObject) -> PyResult<isize> {
     // like _PyEval_SliceIndex: clamp to [PY_SSIZE_T_MIN, PY_SSIZE_T_MAX]
     if !ab::has_index(v) {
-        return Err(type_error("slice indices must be integers or None or have an __index__ method"));
+        return Err(type_error("slice indices must be integers or have an __index__ method"));
     }
     let i = ab::index(v)?;
     Ok(match int::as_i64(&i) {

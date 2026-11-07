@@ -282,6 +282,20 @@ pub unsafe extern "C" fn PyEval_SaveThread() -> *mut c_void {
         ts as *mut c_void
     }
 }
+/// The innermost Python frame of the calling thread while it is detached by
+/// PyEval_SaveThread (its frame chain is frozen until it reattaches), or null.
+pub fn detached_own_frame() -> *mut crate::interp::frame::Frame {
+    let last = LAST_DETACHED.with(|c| c.get());
+    if last.is_null() || !threads::current_ptr().is_null() {
+        return std::ptr::null_mut();
+    }
+    let live = threads::ALL_THREADS.lock().map(|v| v.contains(&(last as usize))).unwrap_or(false);
+    if !live || unsafe { (*last).mode.get() } != ThreadMode::InNative {
+        return std::ptr::null_mut();
+    }
+    unsafe { (*last).frame.get() }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyEval_RestoreThread(ts: *mut c_void) {
     unsafe {

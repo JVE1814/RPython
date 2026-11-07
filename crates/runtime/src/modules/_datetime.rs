@@ -392,58 +392,18 @@ fn set_hashcode(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     }
 }
 
-// The private `_days`/`_seconds`/`_microseconds` getsets serve the embedded pure-Python
-// methods. CPython's timedelta has no such attributes, so a subclass with an instance
-// dict may use the names itself (pandas' Timedelta assigns `self._seconds`): for those,
-// the instance dict wins, as it would without these descriptors.
-fn own_attr(o: &PyObject, name: &str) -> Option<PyRef> {
-    unsafe {
-        let slot = crate::types::typeobject::dict_slot(o.as_ptr());
-        if slot.is_null() || (*slot).is_null() {
-            return None;
-        }
-        crate::types::dict::get_item_rs(&**slot, name)
-    }
-}
-fn set_own_attr(o: &PyObject, name: &str, v: Option<&PyObject>) -> PyResult<()> {
-    let d = match crate::types::typeobject::instance_dict(o) {
-        Some(d) => d,
-        None => crate::raise!(AttributeError, "attribute '{}' of 'timedelta' objects is not writable", name),
-    };
-    match v {
-        Some(v) => crate::types::dict::set_item_str(&d, name, v),
-        None => {
-            crate::types::dict::del_item(&d, &pystr::new_str(name))?;
-            Ok(())
-        }
-    }
-}
+// The private `_dt_*` getsets serve the embedded pure-Python methods. CPython's
+// types have no such attributes, so their names must not collide with what
+// subclasses define: pandas' Timestamp has its own `_year` (the real year when the
+// C fields hold a stand-in) and its Timedelta assigns `self._seconds`.
 fn g_days(o: &PyObject) -> PyResult {
-    if let Some(v) = own_attr(o, "_days") {
-        return Ok(v);
-    }
     small_int(delta(o).days as i64)
 }
 fn g_seconds(o: &PyObject) -> PyResult {
-    if let Some(v) = own_attr(o, "_seconds") {
-        return Ok(v);
-    }
     small_int(delta(o).seconds as i64)
 }
 fn g_microseconds(o: &PyObject) -> PyResult {
-    if let Some(v) = own_attr(o, "_microseconds") {
-        return Ok(v);
-    }
     small_int(delta(o).microseconds as i64)
-}
-fn s_days(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
-    set_own_attr(o, "_days", v)
-}
-fn s_seconds(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
-    set_own_attr(o, "_seconds", v)
-}
-fn s_microseconds(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
-    set_own_attr(o, "_microseconds", v)
 }
 
 fn g_year(o: &PyObject) -> PyResult {
@@ -593,7 +553,7 @@ fn copy_members(pure: &PyObject, native: *mut PyTypeObject) -> PyResult<()> {
         // methods implemented natively win over their pure counterparts
         if let Some(existing) = dict::get_item(dst, &k)? {
             let kind = type_name(existing.ty());
-            if kind == "method_descriptor" || kind == "classmethod_descriptor" {
+            if kind == "method_descriptor" || kind == "classmethod_descriptor" || kind == "member_descriptor" {
                 continue;
             }
         }
@@ -632,6 +592,19 @@ fn run_in(ns: &PyObject, src: &str, filename: &str) -> PyResult<()> {
 }
 
 static NS: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
+/// The pure `datetime.utcnow` function, run by the native classmethod.
+static PURE_UTCNOW: AtomicPtr<PyObject> = AtomicPtr::new(std::ptr::null_mut());
+
+/// `datetime.utcnow()` is a builtin classmethod (as in CPython); the work, including the
+/// deprecation warning, is the pure implementation's (no Python frame of its own is
+/// added between it and the caller, so the warning's stacklevel stays right).
+fn m_utcnow(cls: &PyObject) -> PyResult {
+    let f = PURE_UTCNOW.load(Ordering::Acquire);
+    if f.is_null() {
+        raise!(SystemError, "_datetime: utcnow is not initialised");
+    }
+    ab::call(unsafe { &*f }, &[cls])
+}
 
 const DATETIME_TEXT_SIGNATURES: &str = r#"
 def _with_text_signature(cls, name, sig):
@@ -677,6 +650,12 @@ fn build_namespace() -> PyResult<()> {
         let Some(pure) = dict::get_item_rs(&ns, name) else {
             raise!(SystemError, "_datetime: pure implementation lacks {}", name);
         };
+        if name == "datetime" {
+            if let Some(cm) = dict::get_item_rs(type_dict(pure.as_ptr() as *mut PyTypeObject), "utcnow") {
+                let f = ab::getattr(&cm, crate::name!("__func__"))?;
+                PURE_UTCNOW.store(f.into_raw(), Ordering::Release);
+            }
+        }
         copy_members(&pure, tp)?;
     }
     for (name, tp) in pairs {
@@ -931,6 +910,16 @@ fn init_types() -> PyResult<()> {
         (*delta_type()).tp_methods = mdefs![
             ("total_seconds", NOARGS, m_total_seconds, "total_seconds($self, /)\n--\n\nThe duration expressed in seconds, as a float."),
         ];
+        // (core6) the public fields are plain read-only members of the C struct, as in
+        // CPython (inspect.ismemberdescriptor(timedelta.days))
+        (*delta_type()).tp_members = crate::member_table![
+            ("days", Py_T_INT, std::mem::offset_of!(DeltaObj, days), Py_READONLY; "Whole days of the duration."),
+            ("seconds", Py_T_INT, std::mem::offset_of!(DeltaObj, seconds), Py_READONLY; "Seconds part of the duration, 0 <= seconds < 86400."),
+            ("microseconds", Py_T_INT, std::mem::offset_of!(DeltaObj, microseconds), Py_READONLY; "Microseconds part of the duration, 0 <= microseconds < 1000000."),
+        ];
+        (*datetime_type()).tp_methods = mdefs![
+            ("utcnow", NOARGS, m_utcnow, "utcnow($type, /)\n--\n\nThe current UTC date and time, naive (deprecated)."; METH_CLASS),
+        ];
         (*date_type()).tp_methods = mdefs![
             ("isocalendar", NOARGS, m_isocalendar, "isocalendar($self, /)\n--\n\nThe ISO 8601 (year, week, weekday) of this date as a named tuple."),
         ];
@@ -969,10 +958,10 @@ fn init_types() -> PyResult<()> {
             Some(delta_new),
             plain_dealloc,
             crate::getset_table![
-                ("_days", g_days, s_days),
-                ("_seconds", g_seconds, s_seconds),
-                ("_microseconds", g_microseconds, s_microseconds),
-                ("_hashcode", get_hashcode, set_hashcode),
+                ("_dt_days", g_days),
+                ("_dt_seconds", g_seconds),
+                ("_dt_microseconds", g_microseconds),
+                ("_dt_hashcode", get_hashcode, set_hashcode),
             ],
         )?;
         setup_type(
@@ -984,10 +973,10 @@ fn init_types() -> PyResult<()> {
             Some(date_new),
             plain_dealloc,
             crate::getset_table![
-                ("_year", g_year),
-                ("_month", g_month),
-                ("_day", g_day),
-                ("_hashcode", get_hashcode, set_hashcode),
+                ("_dt_year", g_year),
+                ("_dt_month", g_month),
+                ("_dt_day", g_day),
+                ("_dt_hashcode", get_hashcode, set_hashcode),
             ],
         )?;
         setup_type(
@@ -999,13 +988,13 @@ fn init_types() -> PyResult<()> {
             Some(time_new),
             time_dealloc,
             crate::getset_table![
-                ("_hour", t_hour),
-                ("_minute", t_minute),
-                ("_second", t_second),
-                ("_microsecond", t_microsecond),
-                ("_tzinfo", t_tzinfo),
-                ("_fold", t_fold),
-                ("_hashcode", get_hashcode, set_hashcode),
+                ("_dt_hour", t_hour),
+                ("_dt_minute", t_minute),
+                ("_dt_second", t_second),
+                ("_dt_microsecond", t_microsecond),
+                ("_dt_tzinfo", t_tzinfo),
+                ("_dt_fold", t_fold),
+                ("_dt_hashcode", get_hashcode, set_hashcode),
             ],
         )?;
         setup_type(
@@ -1017,12 +1006,12 @@ fn init_types() -> PyResult<()> {
             Some(datetime_new),
             datetime_dealloc,
             crate::getset_table![
-                ("_hour", dt_hour),
-                ("_minute", dt_minute),
-                ("_second", dt_second),
-                ("_microsecond", dt_microsecond),
-                ("_tzinfo", dt_tzinfo),
-                ("_fold", dt_fold),
+                ("_dt_hour", dt_hour),
+                ("_dt_minute", dt_minute),
+                ("_dt_second", dt_second),
+                ("_dt_microsecond", dt_microsecond),
+                ("_dt_tzinfo", dt_tzinfo),
+                ("_dt_fold", dt_fold),
             ],
         )?;
     }

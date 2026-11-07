@@ -147,6 +147,15 @@ fn field_names(tp: *mut PyTypeObject) -> Vec<String> {
     }
 }
 
+/// The items beyond the visible ones (hidden fields) are part of the object, as in CPython
+/// where they are counted in the type's basic size.
+fn ss_sizeof(o: &PyObject) -> PyResult {
+    let tp = o.type_ptr();
+    let n = n_fields(tp).max(var_size(o) as usize);
+    let t = unsafe { &*tp };
+    Ok(crate::types::int::new_int(t.tp_basicsize as i64 + t.tp_itemsize as i64 * n as i64))
+}
+
 fn ss_reduce(o: &PyObject) -> PyResult {
     let tp = o.type_ptr();
     let ns = var_size(o) as usize;
@@ -310,7 +319,7 @@ pub fn new_type(desc: &Desc) -> PyResult<*mut PyTypeObject> {
         if !desc.doc.is_empty() {
             t.tp_doc = crate::methods::cstr_static(desc.doc);
         }
-        t.tp_methods = crate::mdefs![("__reduce__", NOARGS, ss_reduce), ("__replace__", FASTKW, ss_replace, "__replace__($self, /, **changes)\n--\n\nReturn a copy with the named fields replaced."),];
+        t.tp_methods = crate::mdefs![("__reduce__", NOARGS, ss_reduce), ("__sizeof__", NOARGS, ss_sizeof), ("__replace__", FASTKW, ss_replace, "__replace__($self, /, **changes)\n--\n\nReturn a copy with the named fields replaced."),];
         let off0 = std::mem::offset_of!(PyTupleObject, ob_item);
         let mut members: Vec<PyMemberDef> = Vec::new();
         let mut nunnamed = 0;

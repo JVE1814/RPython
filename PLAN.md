@@ -88,6 +88,9 @@ internal form on first use; test_dis 145/145, test_code passes. Remaining: legac
 expression statement must stay a checked load (UnboundLocalError); settrace/monitoring event ordering.
 Finished: jit3 (tier 2 merged + on by default; wins on richards/nbody/spectral_norm). Running: jit4 (generators in tier 2, inlining).
 Later waves (2026-11-07): jit4, jit5, jit6 (callpy routine, generator chains, drain mode), core4/core5 (D24 follow-up, D25 pyc magic),
+Wave of 2026-11-07 afternoon: core6 and perf4 merged; running capi2 (test_capi, stable_abi_ctypes, fileutils), scale1 (multi-core
+scaling harness + fixes), tail1 (long-tail modules passing on CPython), perf5 (remaining slow benchmarks, in-JIT exception
+handlers, startup), stability3 (test_free_threading env-changed races, test_stop_the_world, flaky crashes).
 lib6 (stdlib failures), interp1 (subinterpreters, D26: done). Running: stability2 (free-threading crashes), perf3 (runtime fast paths).
 
 Unassigned: _testclinic re-implemented by us (spec lacks

@@ -189,6 +189,43 @@ pub fn method_name(ml: *const PyMethodDef) -> String {
     unsafe { CStr::from_ptr((*ml).ml_name).to_string_lossy().into_owned() }
 }
 
+/// (perf4) Direct call of a builtin's C function for the common calling conventions
+/// with positional arguments only (no kwnames): METH_O with one argument, METH_NOARGS
+/// with none, METH_FASTCALL (with or without METH_KEYWORDS). None when the method
+/// needs anything else (locking, defining class, other arity, other flags): the
+/// caller uses `call_methoddef`, which also produces the errors. The result is the C
+/// function's (NULL with an exception set on failure).
+#[inline]
+pub unsafe fn call_methoddef_fast(ml: *mut PyMethodDef, slf: *mut PyObject, args: &[*mut PyObject]) -> Option<*mut PyObject> {
+    unsafe {
+        let meth = (*ml).ml_meth;
+        if meth.is_null() {
+            return None;
+        }
+        let flags = (*ml).ml_flags;
+        match flags {
+            METH_O if args.len() == 1 => {
+                let f: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject = std::mem::transmute(meth);
+                Some(f(slf, args[0]))
+            }
+            METH_NOARGS if args.is_empty() => {
+                let f: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject = std::mem::transmute(meth);
+                Some(f(slf, std::ptr::null_mut()))
+            }
+            METH_FASTCALL => {
+                let f: unsafe extern "C" fn(*mut PyObject, *const *mut PyObject, Py_ssize_t) -> *mut PyObject = std::mem::transmute(meth);
+                Some(f(slf, args.as_ptr(), args.len() as Py_ssize_t))
+            }
+            x if x == METH_FASTCALL | METH_KEYWORDS => {
+                let f: unsafe extern "C" fn(*mut PyObject, *const *mut PyObject, Py_ssize_t, *mut PyObject) -> *mut PyObject =
+                    std::mem::transmute(meth);
+                Some(f(slf, args.as_ptr(), args.len() as Py_ssize_t, std::ptr::null_mut()))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Call a PyMethodDef with vectorcall-style arguments.
 /// `kwnames` is a tuple of keyword names (values follow positionals in `args`).
 pub unsafe fn call_methoddef(

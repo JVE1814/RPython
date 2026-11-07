@@ -288,6 +288,8 @@ struct PickleBufferObj {
     weakreflist: *mut PyObject,
 }
 
+// the C API's PyPickleBuffer_Type is this type
+#[unsafe(export_name = "PyPickleBuffer_Type")]
 static mut PICKLEBUFFER_TYPE: PyTypeObject = PyTypeObject::ZERO;
 fn picklebuffer_type() -> *mut PyTypeObject {
     &raw mut PICKLEBUFFER_TYPE
@@ -841,7 +843,8 @@ impl<'a> P<'a> {
             if tp == picklebuffer_type() {
                 return self.save_picklebuffer(o);
             }
-            if Some(tp) == frozendict_type() {
+            if Some(tp) == frozendict_type() && self.st.proto >= 2 {
+                // protocols 0 and 1 cannot express a frozendict: the generic reduce path refuses it
                 return self.save_frozendict(o);
             }
             if tp == crate::types::funcobject::function_type() {

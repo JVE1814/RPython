@@ -108,6 +108,8 @@ pub struct CodeData {
     pub pub_lines: Vec<i32>,
     /// Public objects: observed CPython specialisation per internal word (interp::adaptive).
     pub spec: Box<[std::sync::atomic::AtomicU8]>,
+    /// (core6) The same view for the other threads (thread-local bytecode, `-X tlbc`).
+    pub spec_tl: crate::interp::adaptive::ThreadViews,
 }
 
 impl CodeData {
@@ -291,12 +293,16 @@ fn build_exec(c: &PyCodeObject, m: &CodeMeta) -> CodeData {
         invalid: None,
         pub_lines: Vec::new(),
         spec: Box::new([]),
+        spec_tl: Default::default(),
     };
     match crate::interp::translate::translate(&inp) {
         Ok(out) => {
             let mut consts = m.consts.clone();
             consts.extend(out.extra_consts.iter().map(exec_extra_obj));
-            let mut d = base(out.code, out.locations, consts);
+            // (perf4) no per-instruction Location table for public code: lines come from
+            // `pub_lines` (16 bytes per internal instruction saved)
+            drop(out.locations);
+            let mut d = base(out.code, Vec::new(), consts);
             d.exception_table = out.exception_table;
             d.pub_of_internal = out.pub_of_internal;
             d.internal_of_pub = out.internal_of_pub;
@@ -680,6 +686,7 @@ pub fn new_code_from_parts(p: CodeParts) -> PyResult {
         invalid: None,
         pub_lines: Vec::new(),
         spec: Box::new([]),
+        spec_tl: Default::default(),
     });
     unsafe {
         let r = alloc_code(
@@ -799,6 +806,20 @@ fn encode_locations(locs: &[Location]) -> Vec<u8> {
 /// Line number for an internal instruction index (walking back over artificial ones).
 pub fn line_for_instr(co: &PyObject, i: usize) -> Option<u32> {
     let d = code_data(co);
+    if d.locations.is_empty() && !d.pub_lines.is_empty() {
+        // public code keeps only the line per instruction (`pub_lines`, -1 = none)
+        let mut j = i.min(d.pub_lines.len() - 1);
+        loop {
+            let l = d.pub_lines[j];
+            if l > 0 {
+                return Some(l as u32);
+            }
+            if j == 0 {
+                return None;
+            }
+            j -= 1;
+        }
+    }
     let mut j = i.min(d.locations.len().saturating_sub(1));
     loop {
         if let Some(l) = d.locations.get(j) {

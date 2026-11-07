@@ -446,10 +446,14 @@ pub(super) fn unpack_sequence(seq: &PyObject, n: usize, out: &mut Vec<PyRef>) ->
         }
     }
     if ab::iter_next(&it)?.is_some() {
-        if let Ok(len) = ab::length(seq) {
-            raise!(ValueError, "too many values to unpack (expected {}, got {})", n, len);
+        // the count is only shown for builtin containers whose size is known; a
+        // user-defined __len__ is never called for the message
+        if dict::is_dict_exact(seq) || crate::types::set::is_anyset_exact(seq) {
+            if let Ok(len) = ab::length(seq) {
+                raise!(ValueError, "too many values to unpack (expected {}, got {})", n, len);
+            }
+            clear_exc();
         }
-        clear_exc();
         raise!(ValueError, "too many values to unpack (expected {})", n);
     }
     Ok(())
@@ -743,17 +747,19 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
     let caches = cd.caches.tables(code); // jit workstream: inline caches / profiles
     // bc-vm: specialisation view of public code (interp/adaptive.rs); `adapt_once` for
     // classifications too costly to repeat
+    // (core6: this thread's view, see adaptive::view)
+    let spec = super::adaptive::view(cd);
     macro_rules! adapt {
         ($e:expr) => {
-            if super::adaptive::active(cd) {
-                super::adaptive::note(cd, f.lasti as usize, $e);
+            if !spec.is_empty() {
+                super::adaptive::note_in(spec, f.lasti as usize, $e);
             }
         };
     }
     macro_rules! adapt_once {
         ($e:expr) => {
-            if super::adaptive::active(cd) && !super::adaptive::seen(cd, f.lasti as usize) {
-                super::adaptive::note(cd, f.lasti as usize, $e);
+            if !spec.is_empty() && !super::adaptive::seen_in(spec, f.lasti as usize) {
+                super::adaptive::note_in(spec, f.lasti as usize, $e);
             }
         };
     }
@@ -1012,6 +1018,19 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             let nm = &cd.names[(arg >> 2) as usize];
                             let is_method = arg & 1 != 0;
                             let two = arg & 2 != 0;
+                            if gsuper.is(type_obj(crate::types::super_::super_type())) && !crate::modules::sys::tracing_active() {
+                                // (perf4) no super object / bound method in the common case
+                                if let Some(r) = crate::types::super_::lookup_fast(&cls, &slf, nm, is_method) {
+                                    let (v, unbound) = r?;
+                                    push!(f, v.into_raw());
+                                    if unbound {
+                                        push!(f, slf.into_raw());
+                                    } else if is_method {
+                                        push!(f, std::ptr::null_mut());
+                                    }
+                                    continue;
+                                }
+                            }
                             // monitoring sees the super() call as in the unoptimised form
                             let call_info = if crate::modules::sys::tracing_active() {
                                 crate::modules::sys_trace::before_call(ts, f, &gsuper, None, if two { Some(&*cls) } else { None }, false)?
@@ -1027,6 +1046,9 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             };
                             if let Some(info) = call_info {
                                 crate::modules::sys_trace::after_call(ts, f, info, sup.is_ok())?;
+                            }
+                            if crate::modules::sys::tracing_active() {
+                                crate::modules::sys_trace::fire_deferred_line(ts, f, sup.is_ok())?;
                             }
                             let sup = sup?;
                             if is_method {
@@ -1168,23 +1190,25 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             let s = crate::types::slice::new_slice(&start, &stop, step.as_deref().unwrap_or(none::none()));
                             push!(f, s.into_raw());
                         }
-                        Op::BuildTuple => {
+                        Op::BuildTuple | Op::BuildList => {
+                            // (perf4) items moved from the stack without a vector
                             let n = arg as usize;
                             let base = f.stack_top - n;
-                            let items: Vec<PyRef> = (0..n)
-                                .map(|i| unsafe { PyRef::from_raw(std::mem::replace(&mut f.slots[base + i], std::ptr::null_mut())) })
-                                .collect();
+                            // (a failure-injecting allocator hook refuses the list too)
+                            if op == Op::BuildList && crate::capi::mem::hooked_alloc_refuses(std::mem::size_of::<PyListObject>()) {
+                                for i in 0..n {
+                                    drop(unsafe { PyRef::from_raw(std::mem::replace(&mut f.slots[base + i], std::ptr::null_mut())) });
+                                }
+                                f.stack_top = base;
+                                return Err(crate::errors::memory_error());
+                            }
+                            let p = unsafe { f.slots.as_ptr().add(base) };
+                            let r = unsafe { if op == Op::BuildTuple { tuple::new_tuple_steal(p, n) } else { list::new_list_steal(p, n) } };
+                            for i in 0..n {
+                                f.slots[base + i] = std::ptr::null_mut();
+                            }
                             f.stack_top = base;
-                            push!(f, tuple::new_tuple(items).into_raw());
-                        }
-                        Op::BuildList => {
-                            let n = arg as usize;
-                            let base = f.stack_top - n;
-                            let items: Vec<PyRef> = (0..n)
-                                .map(|i| unsafe { PyRef::from_raw(std::mem::replace(&mut f.slots[base + i], std::ptr::null_mut())) })
-                                .collect();
-                            f.stack_top = base;
-                            push!(f, list::new_list(items).into_raw());
+                            push!(f, r);
                         }
                         Op::BuildSet => {
                             let n = arg as usize;
@@ -1383,7 +1407,21 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             adapt_once!(super::adaptive::for_iter(unsafe { &*peek!(f, 1) }));
                             let it = unsafe { &*top!(f) };
                             let gen_iter = crate::modules::sys::tracing_active() && crate::types::genobject::is_generator_exact(it);
-                            match ab::iter_next(it)? {
+                            // under tracing a generator is resumed directly, so that its return
+                            // value (reported as a StopIteration) is known
+                            let mut returned: Option<PyRef> = None;
+                            let next = if gen_iter {
+                                match crate::types::genobject::send_to(it, none::none())? {
+                                    crate::types::genobject::SendResult::Yield(v) => Some(v),
+                                    crate::types::genobject::SendResult::Return(r) => {
+                                        returned = Some(r);
+                                        None
+                                    }
+                                }
+                            } else {
+                                ab::iter_next(it)?
+                            };
+                            match next {
                                 Some(v) => push!(f, v.into_raw()),
                                 None => {
                                     unsafe { decref(pop!(f)) };
@@ -1391,7 +1429,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                                 }
                             }
                             if crate::modules::sys::tracing_active() {
-                                for_iter_event(ts, f, pc == arg as usize, gen_iter, pc)?;
+                                for_iter_event(ts, f, pc == arg as usize, gen_iter, returned.as_deref(), pc)?;
                             }
                         }
                         Op::GetYieldFromIter => {
@@ -1424,6 +1462,9 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                                     unsafe { decref(pop!(f)) };
                                     push!(f, r.into_raw());
                                     pc = arg as usize;
+                                    if crate::modules::sys::tracing_active() {
+                                        crate::modules::sys_trace::async_for_item(ts, f, pc)?;
+                                    }
                                 }
                             }
                         }
@@ -1444,7 +1485,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             return Ok(Some(Exit::Return(v)));
                         }
                         Op::Call | Op::CallKw => {
-                            if super::adaptive::active(cd) {
+                            if !spec.is_empty() {
                                 let nk = if op == Op::CallKw { 1 } else { 0 };
                                 let n = arg as usize;
                                 let base = f.stack_top - n - 2 - nk;
@@ -1555,8 +1596,13 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                                 Some(k) => Some(k.clone()),
                                 None => None,
                             };
+                            // a callable without vectorcall gets the argument tuple itself (no copy) and the
+                            // keyword dict as is (its keys are the callee's business, as in CPython)
+                            let direct = self_or_null.is_none() && callable.ty().tp_call.is_some() && ab::vectorcall_func(&callable).is_none();
                             if let Some(d) = &kwd {
-                                check_kwargs_keys(d)?;
+                                if !direct || is_type(&callable) {
+                                    check_kwargs_keys(d)?;
+                                }
                             }
                             let call_info = if crate::modules::sys::tracing_active() {
                                 let first = self_or_null.as_deref().or_else(|| tuple::tuple_items(&args).first().copied());
@@ -1769,6 +1815,34 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
     }
 }
 
+/// (perf4) An exception raised in compiled code at `f.lasti` that no handler of the
+/// frame covers: do what `eval_inner`'s unwinding would (context chaining, traceback
+/// entry, propagation mark) without entering the interpreter. False (nothing done)
+/// when a handler exists, the raise is a bare re-raise, or tracing is active.
+pub(crate) fn unwind_compiled_error(ts: &ThreadState, f: &mut Frame) -> bool {
+    if crate::modules::sys::tracing_active() || ts.reraise_flag.get() || f.unwind_pc >= 0 {
+        return false;
+    }
+    if find_handler(f.code(), f.lasti).is_some() {
+        return false;
+    }
+    let Some(e) = take_exc() else { return false };
+    let prev = ts.frame.get();
+    f.prev = prev;
+    ts.frame.set(f as *mut Frame);
+    let propagated = ts.propagated_exc.replace((0, 0)) == exc_identity(&e);
+    if !propagated {
+        chain_context(ts, &e);
+    }
+    add_traceback(f, &e);
+    f.clear_stack();
+    ts.propagated_exc.set(exc_identity(&e));
+    set_exc(e);
+    ts.frame.set(prev);
+    f.prev = std::ptr::null_mut();
+    true
+}
+
 /// Identity of an exception in flight: its address and its traceback's.
 fn exc_identity(e: &PyObject) -> (usize, usize) {
     let tb = exc::exc_traceback(e).map_or(0, |t| t.as_ptr() as usize);
@@ -1856,6 +1930,7 @@ pub fn match_class(subject: &PyObject, cls: &PyObject, nargs: usize, names: &PyO
             crate::types::bytearray::bytearray_type(),
             crate::types::bytes::bytes_type(),
             dict::dict_type(),
+            crate::types::frozendict::frozendict_type(),
             float::float_type(),
             crate::types::set::frozenset_type(),
             int::int_type(),
@@ -2017,11 +2092,20 @@ fn branch_event(ts: &ThreadState, f: &mut Frame, taken: bool, dest: usize) -> Py
 /// FOR_ITER: continuing the loop is the left branch, leaving it the right one; an
 /// exhausted generator reports STOP_ITERATION (no exception is raised for it).
 #[cold]
-fn for_iter_event(ts: &ThreadState, f: &mut Frame, exhausted: bool, gen_iter: bool, dest: usize) -> PyResult<()> {
+/// `returned`: the return value of an exhausted generator (when known).
+fn for_iter_event(ts: &ThreadState, f: &mut Frame, exhausted: bool, gen_iter: bool, returned: Option<&PyObject>, dest: usize) -> PyResult<()> {
     use crate::modules::sys_trace as st;
     if exhausted && gen_iter && st::wants(st::STOP_ITERATION) {
         let si = ab::call(type_obj(exc::StopIteration()), &[])?;
         st::fire_exc_event(ts, f, st::STOP_ITERATION, &si)?;
+    }
+    // a legacy trace function sees an 'exception' event only when the generator
+    // returned a value (a bare return ends the loop silently)
+    if let Some(r) = returned.filter(|r| !r.is(none::none())) {
+        if exhausted && st::wants_legacy_exception(ts, f) {
+            let si = ab::call(type_obj(exc::StopIteration()), &[r])?;
+            st::legacy_exception_event(ts, f, &si)?;
+        }
     }
     st::fire_branch(ts, f, if exhausted { st::BRANCH_RIGHT } else { st::BRANCH_LEFT }, dest)
 }
@@ -2119,6 +2203,9 @@ pub(crate) fn exec_misc(ts: &ThreadState, f: &mut Frame, cd: &crate::types::code
             drop(aiter);
             if is_subtype(e.type_ptr(), exc::StopAsyncIteration()) {
                 // done
+                if crate::modules::sys::tracing_active() {
+                    crate::modules::sys_trace::async_for_exit(ts, f, f.lasti as usize + 1)?;
+                }
             } else {
                 set_exc(e);
                 return Err(PyErr);

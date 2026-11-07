@@ -6,7 +6,7 @@ import stat
 
 __all__ = ['commonprefix', 'exists', 'getatime', 'getctime', 'getmtime',
            'getsize', 'isdevdrive', 'isdir', 'isfile', 'isjunction', 'islink',
-           'lexists', 'samefile', 'sameopenfile', 'samestat', 'ALLOW_MISSING']
+           'lexists', 'samefile', 'sameopenfile', 'samestat', 'ALLOW_MISSING', 'ALL_BUT_LAST']
 
 
 def exists(path):
@@ -157,13 +157,20 @@ def _check_arg_types(funcname, *args):
         raise TypeError("Can't mix strings and bytes in path components") from None
 
 
-class _AllowMissing:
-    __slots__ = ()
+# Markers accepted by realpath(strict=...).  Each pickles and copies as the
+# module-level name it is bound to, so identity survives a round trip.
+class _RealpathMode:
+    __slots__ = ('_name',)
+
+    def __init__(self, name):
+        self._name = name
 
     def __repr__(self):
-        return 'os.path.ALLOW_MISSING'
+        return 'os.path.' + self._name
 
     def __reduce__(self):
-        return self.__class__.__name__
+        return self._name
 
-ALLOW_MISSING = _AllowMissing()
+
+ALLOW_MISSING = _RealpathMode('ALLOW_MISSING')
+ALL_BUT_LAST = _RealpathMode('ALL_BUT_LAST')

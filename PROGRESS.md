@@ -1,7 +1,12 @@
 # PROGRESS
 
-## Status 2026-11-06
-All agents stopped 2026-11-02 when the account's weekly API limit was hit; resumed after the reset (Nov 5).
+## Status 2026-11-07 (day 7)
+Master 0323d71 = core6 merged (call/inspect/patma/monitoring/opcache/tlbc fixes; notes/core6.md).
+Latest full suite: run 11 (pre-core6): 294/434 modules pass, 49,781 tests, 674 failures (241 without test_capi),
+616 errors. Baseline free-threaded CPython: 416/434. Running agents: perf4 (call path, allocation, startup),
+capi2 (test_capi, stable_abi_ctypes, fileutils), scale1 (multi-core scaling), tail1 (long-tail modules that pass
+on CPython: inspect signatures, codecs, time, path modules, ...).
+Earlier history (2026-11-02): agents stopped when the weekly API limit was hit; resumed Nov 5.
 
 ## RESUMED (2026-11-01, 22:15 UTC) after a pause at user request
 Wave 10 running: jit3 (merge+enable tier 2, perf), numpy2 (numpy/other wheels own test suites vs baseline),
@@ -52,9 +57,10 @@ D2 extraction — revisit D2 for test_idle.
 | regex | 101 passed, 1 failed | same | 0 |
 | markupsafe 3.0.4 | 79 passed | 79 passed | 0 |
 | msgpack 1.2.4 | 160 passed | 160 passed | 0 |
-| msgspec 0.22.0 | 6,541 passed, 1 failed | 6,542 passed | 1 |
-| pandas 3.1.0 | crashes (use-after-free, stability2 investigating) | 182,561 passed | — |
+| msgspec 0.22.0 | unit suite 6,373 passed, 0 failed (wheels2) | — | **0** |
+| pandas 3.1.0 (baseline marker selection) | 182,557 passed, 3,347 failed, 1,362 errors (wheels2 run 2) | 182,561 passed, 3,344 failed, 1,362 errors | 3 at run 2 (xz presets, fixed since; that directory now passes) → expected **0** |
 numpy suite wall time: ours 7m30s vs CPython ft 10m12s. pip installs from PyPI over the network (ssl) and builds sdists.
+pandas: stability2 fixed the use-after-free (type refcount bias) and races; full suite runs in one process (peak RSS ~3.8 GB; a late "memory allocation failed" abort after the summary under a 6 GB ulimit remains). wheels2 fixed the behavioural differences (PyState_FindModule, zoneinfo transitions, datetime C API, 3.15 messages, getrefcount per D27, dict watchers).
 
 ### Earlier
 pip (bundled 26.2.2 via ensurepip) installs the unmodified numpy-2.5.4-cp315-cp315t-manylinux wheel in a venv on
@@ -81,6 +87,7 @@ Ours (tools/run_tests.sh, 434 modules):
 | 8 | 0b5f6a0 (jit5+core5, pre-lib6) | 280 | 144 | 3 | 7 | 42,339 | 275 | 2,485 |
 | 9 | 433df5d (jit6+interp1, pre-stability2) | 288 | 135 | 6 | 5 | 42,388 | 224 | 2,486 |
 | 10 | 55e6237 (stability2+perf3, pre-hang1) | 292 | 134 | 0 | 8 | 43,012 | 225 | 2,492 |
+| 11 | 9af79cb (hang1, pre-wheels2/core6) | 294 | 140 | 0 | 0 | 49,781 | 674 (241 excl. test_capi) | 3,200 |
 Run 7 (pre-core4): crashes = test_capi (segfault after a lone-surrogate print), test_free_threading
 (deque race, test_collections), test_itertools (flaky; passes now), test_multiprocessing_fork/spawn
 (heap corruption in test_manager); timeouts = asyncio, cmd_line_script, os, subprocess. Largest
@@ -92,6 +99,12 @@ subprocess. Largest failure counts: importlib 20, call 17, inspect 15, dict 8, c
 Run 9: crashes = test_free_threading (io heap corruption), test_functools (lru_cache race; fixed since), test_super
 (__class__ assignment race), test_multiprocessing_fork/forkserver/spawn; timeouts = asyncio, capi, cmd_line_script,
 os, subprocess. Largest failure counts: importlib 20, call 17, inspect 15, dict 8, concurrent_futures 7.
+Run 11: no crashes, no timeouts. The jump in failures is test_capi (433), which timed out in run 10 and now finishes in 89 s
+(capi2 is on it). Excluding it: 241 failures (225 in run 10; test_asyncio, cmd_line_script, multiprocessing_*, os were
+also timeouts before). Top remaining: importlib 20, call 17, inspect 15 (both 0 after core6), asyncio 10, dict 8.
+Errors (tests that raise; regrtest's total line omits them, run_tests.sh now records them in column 7): run 9 411,
+run 10 484, run 11 616. Largest in run 11: builtin 163, capi 110, inspect 102, fileutils 35, stable_abi_ctypes 34, codecs 31,
+crossinterp 30. Baseline (free-threaded CPython, tools/baseline_ft_results.tsv): 416 PASS / 18 FAIL, 24 failures.
 Run 10: no crashes. Timeouts = asyncio, capi, cmd_line_script, multiprocessing_fork/forkserver/spawn, os, subprocess
 (all fixed by hang1 since: each now finishes in 8–130 s). test_free_threading runs to completion (6 behavioural failures).
 Run 3 top blockers: array (39 modules), http (21), urllib (12), multiprocessing (11),
@@ -100,7 +113,32 @@ Run 1 top blockers: py_compile (230 modules; merged since), unittest.mock (57), 
 array (24), socket (17), pathlib (16), http (14), multiprocessing, decimal, datetime, ntpath.
 
 ## Benchmarks
-### Latest (jit6 + perf3, 2026-11-07; wall-clock ratio ours / best CPython, targeted runs at load ~4, not quiet-machine)
+### Latest (perf4, 2026-11-07; wall-clock ratio ours / best CPython, pinned to one core, one run each, loaded machine, ±10%)
+About 11 of 32 benchmarks beat or match the best CPython build (json_dumps 0.83, json_loads, raytrace, richards 0.60,
+deltablue, chaos 0.65, float, hexiom, gc_collect, coroutines 0.98, unpack_sequence); fannkuch and go within a few %.
+
+| benchmark | before perf4 | perf4 |
+|---|---|---|
+| pathlib | 2.12 | 1.76 |
+| asyncio_tcp | 2.80 | 1.65 |
+| concurrent_imap | — | 1.55 |
+| deepcopy | 1.75 | 1.51 |
+| mdp | — | 1.48 |
+| gc_traversal | — | 1.46 |
+| xml_etree | — | 1.45 |
+| typing_runtime_protocols | 1.84 | 1.43 |
+| logging | 1.67 | 1.35 |
+| bpe_tokeniser | 1.65 | 1.31 |
+| base64 | 2.11 | 1.27 |
+| python_startup | 1.43 | 1.27 |
+| pprint | 1.60 | 1.22 |
+| async_generators | 1.51 | 1.20 |
+
+Startup `-c pass`: 56.6M instructions (CPython 40.5M); `-S -c pass` 29.2M (27.7M). Peak RSS (startup_mem.sh):
+34.9 MB (CPython default 32.3, free-threaded 38.6). Instructions per call shape and per loop: notes/perf4.md.
+Multi-core scaling: being measured by scale1.
+
+### Previous (jit6 + perf3, 2026-11-07; wall-clock ratio ours / best CPython, targeted runs at load ~4, not quiet-machine)
 | bench | jit5 | now | source |
 |---|---|---|---|
 | base64 | 2.98 | 1.45 | perf3 |

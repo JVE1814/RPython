@@ -794,6 +794,22 @@ fn m_recv(o: &PyObject, args: &[&PyObject]) -> PyResult {
         raise!(ValueError, "negative buffersize in recv");
     }
     let flags = flags_arg(args.get(1).copied())?;
+    if n as usize > crate::tlab::MAX_SMALL {
+        // (perf4) receive straight into an uninitialised bytes object and shrink it
+        // in place (no zeroed buffer, no copy)
+        let b = bytes::try_alloc_bytes_uninit(n as usize)?;
+        let got = recv_into_buf(sk(o), bytes::bytes_ptr(&b), n as usize, flags)? as usize;
+        if got == n as usize {
+            return Ok(b);
+        }
+        if got <= 1 {
+            return Ok(bytes::new_bytes(unsafe { std::slice::from_raw_parts(bytes::bytes_ptr(&b), got) }));
+        }
+        return match unsafe { bytes::resize_unique(b, got) } {
+            Ok(r) => Ok(r),
+            Err(_) => Err(PyErr),
+        };
+    }
     let mut buf = crate::errors::try_zeroed_vec(n as usize)?;
     let got = recv_into_buf(sk(o), buf.as_mut_ptr(), n as usize, flags)?;
     Ok(bytes::new_bytes(&buf[..got as usize]))

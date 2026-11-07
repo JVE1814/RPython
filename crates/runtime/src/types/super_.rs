@@ -49,6 +49,52 @@ fn supercheck(typ: *mut PyTypeObject, obj: &PyObject) -> PyResult<PyRef> {
         type_name(unsafe { &*typ }));
 }
 
+/// (perf4) `super().name` / `super(cls, obj).name` evaluated without creating the super
+/// object, for the common case: `obj` is an instance (not a class) whose type has
+/// `cls` in its MRO, and `name` is found in a class after `cls`. With `method`, a
+/// plain function or method descriptor is returned unbound (`Ok((f, true))`: the
+/// caller passes `obj` as self); otherwise the descriptor is bound as `super`'s
+/// getattr would. None: use the general path (new_super + getattr), which also
+/// produces every error.
+pub fn lookup_fast(cls: &PyObject, obj: &PyObject, nm: &PyObject, method: bool) -> Option<PyResult<(PyRef, bool)>> {
+    if !is_type(cls) || is_type(obj) || crate::types::str::str_eq_ascii(nm, "__class__") {
+        return None;
+    }
+    unsafe {
+        let ot = obj.type_ptr();
+        let mro = (*ot).tp_mro;
+        if mro.is_null() {
+            return None;
+        }
+        let items = tuple::tuple_items(&*mro);
+        let mut i = 0;
+        while i < items.len() && !items[i].is(cls) {
+            i += 1;
+        }
+        if i == items.len() {
+            return None;
+        }
+        i += 1;
+        while i < items.len() {
+            let d = (*as_type(items[i])).tp_dict;
+            if !d.is_null() {
+                if let Some(res) = crate::types::dict::get_item_str(&*d, nm) {
+                    let rt = res.ty();
+                    if method && (crate::types::funcobject::is_function(&res) || rt.tp_flags & Py_TPFLAGS_METHOD_DESCRIPTOR != 0) {
+                        return Some(Ok((res, true)));
+                    }
+                    if let Some(g) = rt.tp_descr_get {
+                        return Some(from_c(g(res.as_ptr(), obj.as_ptr(), ot as *mut PyObject)).map(|v| (v, false)));
+                    }
+                    return Some(Ok((res, false)));
+                }
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
 pub fn new_super(typ: &PyObject, obj: &PyObject) -> PyResult {
     if !is_type(typ) {
         raise!(TypeError, "super() argument 1 must be a type, not {}", tname(typ));

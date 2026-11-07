@@ -104,11 +104,27 @@ pub fn flush_thread_counts() {
     }
 }
 
+/// (perf4) False until interpreter initialisation (importlib, site) is complete:
+/// no automatic collections before (start-up builds long-lived module state, not
+/// cyclic garbage, and every collection walks the whole heap).
+static STARTED: AtomicBool = AtomicBool::new(false);
+
+/// End of interpreter start-up: automatic collections are counted from here.
+pub fn startup_complete() {
+    if !STARTED.swap(true, Relaxed) {
+        ALLOCS_SINCE.store(0, Relaxed);
+        LAST_LIVE.store(TRACKED.load(Relaxed).max(0) as usize, Relaxed);
+    }
+}
+
 fn trigger_threshold() -> usize {
     // young collection after THRESHOLD net new tracked objects; 0 disables
     // automatic collection (gc.set_threshold(0)). A collection walks every GC page
     // (perf2: no young list), so the interval also grows with the live set (a quarter
     // of it), which keeps the walking cost per allocation constant.
+    if !STARTED.load(Relaxed) {
+        return usize::MAX;
+    }
     match THRESHOLD.load(Relaxed) {
         0 => usize::MAX,
         t => t.max(LAST_LIVE.load(Relaxed) / 4),
@@ -126,6 +142,13 @@ pub unsafe fn untrack(op: *mut PyObject) {
         o.ob_gc_bits.store(bits & !(GC_BIT_TRACKED | GC_BIT_OLD), Relaxed);
         note_tracked(-1);
     }
+}
+
+/// Count one object as untracked whose tracked bit the caller clears itself (the
+/// allocator's free fast path, which zeroes all GC bits).
+#[inline(always)]
+pub fn note_untracked() {
+    note_tracked(-1);
 }
 
 pub fn is_tracked(op: &PyObject) -> bool {

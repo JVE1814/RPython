@@ -579,20 +579,24 @@ pub fn materialize(o: &PyObject) -> bool {
             return true; // someone else materialised
         }
         let sh = (p & !1) as *const Shape;
+        // (perf4) the slots' references move into the dict (one bulk fill instead of
+        // an insert, an incref and a deferred decref per attribute). A lock-free reader
+        // that loaded a slot just before keeps a valid object: the dict now owns it.
+        let mut buf: [(*mut PyObject, isize, *mut PyObject); MAX_INLINE as usize] = [(std::ptr::null_mut(), 0, std::ptr::null_mut()); MAX_INLINE as usize];
+        let mut n = 0;
         for (i, &k) in (*sh).keys().iter().enumerate() {
             let val = slot(op, sh, i).load(Acquire);
             if !val.is_null() {
-                dict::insert_unique(&d, &*k, pystr::str_hash(&*k), &*val);
+                buf[n] = (k, pystr::str_hash(&*k), val);
+                n += 1;
             }
         }
+        dict::fill_fresh_steal(&d, &buf[..n]);
+        // publish the dict first: until then readers still find the values in the
+        // slots (alive: the dict holds them now)
         w.store(d.into_raw(), Release);
-        // the dict took its own references; drop the slots' ones (deferred: lock-free
-        // readers may still be looking at the slots)
         for i in 0..(*sh).len as usize {
-            let val = slot(op, sh, i).swap(std::ptr::null_mut(), AcqRel);
-            if !val.is_null() {
-                crate::qsbr::decref_deferred(val);
-            }
+            slot(op, sh, i).store(std::ptr::null_mut(), Release);
         }
     }
     true
@@ -670,6 +674,27 @@ pub fn transitions_adding(tp: *mut PyTypeObject, name: *mut PyObject, ix: usize)
             if s.len as usize == ix + 1 && !s.parent.is_null() && s.keys()[ix] == name { Some((s.parent, s as *const Shape)) } else { None }
         })
         .collect()
+}
+
+/// (core6) Every attribute name any instance of `tp` has stored inline, in the order the
+/// names first appeared (the counterpart of CPython's per-class shared keys; read by
+/// `_testinternalcapi.get_object_dict_values`). Shapes are kept in creation order and
+/// each adds one name, so the last key of each shape, deduplicated, is that order.
+pub fn type_key_order(tp: *mut PyTypeObject) -> Vec<*mut PyObject> {
+    let t = tree_of(tp);
+    if t.is_null() {
+        return Vec::new();
+    }
+    let g = unsafe { (*t).inner.lock().unwrap_or_else(|e| e.into_inner()) };
+    let mut out: Vec<*mut PyObject> = Vec::new();
+    for &s in g.shapes.iter() {
+        if let Some(&k) = unsafe { (*s).keys().last() } {
+            if !out.contains(&k) {
+                out.push(k);
+            }
+        }
+    }
+    out
 }
 
 /// Layout constants for JIT code: byte offsets of (shape.id, shape.len, shape.keys,

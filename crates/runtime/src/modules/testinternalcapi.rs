@@ -33,6 +33,92 @@ fn has_inline_values(_m: &PyObject, o: &PyObject) -> PyResult {
     Ok(bool_::new_bool(r))
 }
 
+/// The instance's attribute values in its class's key order ('<NULL>' for names this
+/// instance lacks), as CPython reports the inline values array. A dict materialised
+/// from the inline values counts as still sharing them; an assigned dict (or one with
+/// names the class never stored inline) has no values array: None.
+fn get_object_dict_values(_m: &PyObject, o: &PyObject) -> PyResult {
+    let tp = o.type_ptr();
+    let order = crate::shape::type_key_order(tp);
+    if order.is_empty() || unsafe { !crate::alloc::has_managed(o.as_ptr()) } {
+        return Ok(none::none_ref());
+    }
+    let null = || pystr::new_str("<NULL>");
+    let mut out = Vec::with_capacity(order.len());
+    if crate::shape::has_inline_values(o) {
+        for &k in &order {
+            out.push(match crate::shape::get(o, unsafe { &*k }) {
+                crate::shape::Get::Found(v) => v,
+                _ => null(),
+            });
+        }
+        return Ok(tuple::new_tuple(out));
+    }
+    if o.ob_gc_bits.load(std::sync::atomic::Ordering::Relaxed) & crate::alloc::GC_BIT_DICT_DETACHED != 0 {
+        return Ok(none::none_ref());
+    }
+    let d = unsafe { *crate::alloc::managed_dict_slot(o.as_ptr()) };
+    if d.is_null() || d as usize & 1 != 0 || !dict::is_dict_exact(unsafe { &*d }) {
+        return Ok(none::none_ref());
+    }
+    let d = unsafe { &*d };
+    for k in dict::keys_vec(d) {
+        if !pystr::is_str_exact(&k) || !order.iter().any(|&n| pystr::str_eq(unsafe { &*n }, &k)) {
+            return Ok(none::none_ref());
+        }
+    }
+    for &k in &order {
+        out.push(dict::get_item_str(d, unsafe { &*k }).unwrap_or_else(null));
+    }
+    Ok(tuple::new_tuple(out))
+}
+
+fn tlbc_code(f: &PyObject) -> PyResult<PyRef> {
+    let co = if crate::types::code::is_code(f) { f.to_ref() } else { ab::getattr(f, crate::name!("__code__"))? };
+    if !crate::types::code::is_code(&co) {
+        raise!(TypeError, "expected a function or code object");
+    }
+    Ok(co)
+}
+
+/// The current thread's copy of the (specialised) bytecode of a function.
+fn get_tlbc(_m: &PyObject, f: &PyObject) -> PyResult {
+    let co = tlbc_code(f)?;
+    let _ = crate::types::code::code_data(&co);
+    Ok(crate::types::bytes::new_bytes(&crate::interp::adaptive::adaptive_code(&co)))
+}
+
+/// An identifier of the current thread's copy of a function's bytecode.
+fn get_tlbc_id(_m: &PyObject, f: &PyObject) -> PyResult {
+    let co = tlbc_code(f)?;
+    let cd = crate::types::code::code_data(&co);
+    Ok(int::new_int(crate::interp::adaptive::view_id(cd) as i64))
+}
+
+fn compiler_cleandoc(_m: &PyObject, s: &PyObject) -> PyResult {
+    if !pystr::is_str(s) {
+        raise!(TypeError, "compiler_cleandoc() argument must be str, not {}", crate::types::typeobject::tname(s));
+    }
+    let cps = pystr::str_data(s).to_vec();
+    Ok(pystr::from_codepoints(&rpy_compiler::clean_docstring(&cps)))
+}
+
+/// `_PyDict_GetItem_KnownHash` with the hash supplied by the caller.
+fn dict_getitem_knownhash(_m: &PyObject, a: &[&PyObject]) -> PyResult {
+    crate::args::check_pos("dict_getitem_knownhash", a, 3, 3)?;
+    if !dict::is_dict(a[0]) {
+        raise!(SystemError, "bad argument to internal function");
+    }
+    let _hash = ab::as_i64(a[2])?;
+    match dict::get_item(a[0], a[1])? {
+        Some(v) => Ok(v),
+        None => {
+            crate::types::dict_methods::raise_key_error(a[1]);
+            Err(PyErr)
+        }
+    }
+}
+
 fn has_split_table(_m: &PyObject, _o: &PyObject) -> PyResult {
     // instance dicts are combined tables in this runtime
     Ok(bool_::new_bool(false))
@@ -194,13 +280,29 @@ fn get_static_builtin_types(_m: &PyObject) -> PyResult {
             continue;
         }
         list::append(&out, t.clone());
-        let subs = ab::call_method_str(&t, "__subclasses__", &[])?;
-        for s in list::list_items(&subs) {
-            stack.push(s.to_ref());
+        // read tp_subclasses directly: `type.__subclasses__` looked up on `type`
+        // itself would be the unbound method
+        for s in crate::types::typeobject::subclasses(tp) {
+            stack.push(s.into_ref());
         }
     }
     Ok(out)
 }
+
+/// The dunder names that can appear as slot wrappers in a type dict (names in the
+/// slot table that have a wrapper; repeated names are listed once per entry).
+fn identify_type_slot_wrappers(_m: &PyObject) -> PyResult {
+    let names = crate::types::slots::SLOTDEFS
+        .iter()
+        .filter(|d| d.wrapper.is_some())
+        .map(|d| crate::types::str::new_str(d.name))
+        .collect();
+    Ok(list::new_list(names))
+}
+
+// ---- PEP 523 frame-evaluation hook (test form) and rare-event counters
+
+// (capi2) the hook itself lives in interp/pep523.rs
 
 fn is_specialization_enabled(_m: &PyObject) -> PyResult {
     Ok(bool_::new_bool(crate::interp::pep523::specialization_enabled()))
@@ -213,6 +315,7 @@ fn set_eval_frame_record(_m: &PyObject, l: &PyObject) -> PyResult {
         raise!(TypeError, "argument must be a list");
     }
     crate::interp::pep523::install(crate::interp::pep523::ALL, Some(l));
+    rare_event(RareEvent::SetEvalFrameFunc);
     Ok(none::none_ref())
 }
 fn set_eval_frame_interp(_m: &PyObject, l: &PyObject) -> PyResult {
@@ -220,21 +323,46 @@ fn set_eval_frame_interp(_m: &PyObject, l: &PyObject) -> PyResult {
         raise!(TypeError, "argument must be a list");
     }
     crate::interp::pep523::install(crate::interp::pep523::OUTER, Some(l));
+    rare_event(RareEvent::SetEvalFrameFunc);
     Ok(none::none_ref())
 }
 fn set_eval_frame_default(_m: &PyObject) -> PyResult {
+    if crate::interp::pep523::installed() {
+        rare_event(RareEvent::SetEvalFrameFunc);
+    }
     crate::interp::pep523::install(crate::interp::pep523::NONE, None);
     Ok(none::none_ref())
 }
 
+/// Events that invalidate optimistic assumptions of the specializer/JIT, counted as
+/// CPython counts them for `_testinternalcapi.get_rare_event_counters()`.
+#[derive(Clone, Copy)]
+pub enum RareEvent {
+    SetClass = 0,
+    SetBases = 1,
+    SetEvalFrameFunc = 2,
+    BuiltinDict = 3,
+    FuncModification = 4,
+}
+const RARE_NAMES: [&str; 5] = ["set_class", "set_bases", "set_eval_frame_func", "builtin_dict", "func_modification"];
+static RARE: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+#[inline]
+pub fn rare_event(e: RareEvent) {
+    RARE[e as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn get_rare_event_counters(_m: &PyObject) -> PyResult {
     let d = dict::new_dict();
-    for k in ["set_class", "set_bases", "set_eval_frame_func", "builtin_dict", "func_modification"] {
-        dict::set_item_str(&d, k, &int::new_int(0))?;
+    for (i, k) in RARE_NAMES.iter().enumerate() {
+        dict::set_item_str(&d, k, &int::new_int(RARE[i].load(std::sync::atomic::Ordering::Relaxed) as i64))?;
     }
     Ok(d)
 }
 fn reset_rare_event_counters(_m: &PyObject) -> PyResult {
+    for c in RARE.iter() {
+        c.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(none::none_ref())
 }
 
@@ -286,6 +414,53 @@ fn pending_threadfunc(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) 
 /// tuple_from_pair(a, b) / tuple_from_pair_steal(a, b): a 2-tuple built like the
 /// internal pair constructors build it (tracked only if an item may be in a
 /// cycle). (hang1)
+/// Shared part of EncodeLocaleEx / DecodeLocaleEx (text-or-bytes, current_locale, errors):
+/// the filesystem codec with the three error handlers the startup converters know.
+/// A conversion failure is reported as RuntimeError("encode error: pos=N, reason=R").
+fn locale_convert(args: &[&PyObject], encode: bool) -> PyResult {
+    if args.len() != 3 {
+        raise!(TypeError, "expected 3 arguments, got {}", args.len());
+    }
+    let errors = pystr::to_string_lossy(args[2]);
+    if !matches!(errors.as_str(), "strict" | "surrogateescape" | "surrogatepass") {
+        raise!(ValueError, "unsupported error handler");
+    }
+    let codec = pystr::new_str("utf-8");
+    let meth = if encode { "encode" } else { "decode" };
+    match ab::call_method_str(args[0], meth, &[&codec, args[2]]) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            if !exc_matches(crate::types::exceptions::UnicodeError()) {
+                return Err(e);
+            }
+            let exc = take_exc().expect("exception set");
+            let pos = ab::getattr_str(&exc, "start").and_then(|p| ab::str_string(&p)).unwrap_or_default();
+            let reason = ab::getattr_str(&exc, "reason").and_then(|r| ab::str_string(&r)).unwrap_or_default();
+            clear_exc();
+            raise!(RuntimeError, "{} error: pos={}, reason={}", meth, pos, reason);
+        }
+    }
+}
+
+/// _PyTraceMalloc_GetTraceback(domain, ptr): the frames recorded for a traced block, or None.
+fn tracemalloc_get_traceback(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    check_args(args, 2)?;
+    let domain = ab::as_i64(args[0])?;
+    let ptr = int_arg(args[1])?.and_then(|p| usize::try_from(p).ok());
+    match (u32::try_from(domain), ptr) {
+        (Ok(d), Some(p)) => crate::modules::_tracemalloc::get_traceback(d, p),
+        _ => raise!(OverflowError, "domain or pointer out of range"),
+    }
+}
+
+fn encode_locale_ex(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    locale_convert(args, true)
+}
+
+fn decode_locale_ex(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    locale_convert(args, false)
+}
+
 fn tuple_from_pair(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     if args.len() != 2 {
         raise!(TypeError, "tuple_from_pair expected 2 arguments, got {}", args.len());
@@ -537,6 +712,11 @@ pub fn init() -> PyResult {
             ("tuple_from_pair", FAST, tuple_from_pair),
             ("tuple_from_pair_steal", FAST, tuple_from_pair),
             ("has_split_table", O, has_split_table),
+            ("get_object_dict_values", O, get_object_dict_values),
+            ("compiler_cleandoc", O, compiler_cleandoc),
+            ("get_tlbc", O, get_tlbc),
+            ("get_tlbc_id", O, get_tlbc_id),
+            ("dict_getitem_knownhash", FAST, dict_getitem_knownhash),
             ("get_recursion_depth", NOARGS, get_recursion_depth),
             ("get_long_lived_total", NOARGS, get_long_lived_total),
             ("pymem_getallocatorsname", NOARGS, pymem_getallocatorsname),
@@ -551,6 +731,18 @@ pub fn init() -> PyResult {
             ("is_static_immortal", O, is_static_immortal),
             ("py_thread_id", NOARGS, py_thread_id),
             ("get_static_builtin_types", NOARGS, get_static_builtin_types),
+            ("identify_type_slot_wrappers", NOARGS, identify_type_slot_wrappers),
+            ("EncodeLocaleEx", FAST, encode_locale_ex),
+            ("_PyTraceMalloc_GetTraceback", FAST, tracemalloc_get_traceback),
+            ("_PyTime_FromSeconds", O, pytime_from_seconds),
+            ("_PyTime_FromSecondsObject", FAST, pytime_from_seconds_object),
+            ("_PyTime_AsTimeval", FAST, pytime_as_timeval),
+            ("_PyTime_AsMilliseconds", FAST, pytime_as_milliseconds),
+            ("_PyTime_AsMicroseconds", FAST, pytime_as_microseconds),
+            ("_PyTime_ObjectToTime_t", FAST, object_to_time_t),
+            ("_PyTime_ObjectToTimeval", FAST, object_to_timeval),
+            ("_PyTime_ObjectToTimespec", FAST, object_to_timespec),
+            ("DecodeLocaleEx", FAST, decode_locale_ex),
             ("is_specialization_enabled", NOARGS, is_specialization_enabled),
             ("get_rare_event_counters", NOARGS, get_rare_event_counters),
             ("reset_rare_event_counters", NOARGS, reset_rare_event_counters),
@@ -591,4 +783,215 @@ pub fn init() -> PyResult {
     crate::interp::eval_code(&code.code, &d, Some(&d))?;
     let _ = tuple::new_tuple(vec![]);
     Ok(m)
+}
+
+// ---- timestamp conversion helpers (test_time's TestCPyTime / TestOldPyTime)
+//
+// Nanosecond timestamps are signed 64-bit integers.  Each helper takes the
+// rounding mode the C-level converters use: 0 floor, 1 ceiling, 2 half-even,
+// 3 away from zero.
+
+const NS_PER_SEC: i128 = 1_000_000_000;
+const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+
+#[derive(Clone, Copy)]
+enum Rounding {
+    Floor,
+    Ceiling,
+    HalfEven,
+    Up,
+}
+
+fn rounding_arg(o: &PyObject) -> PyResult<Rounding> {
+    Ok(match ab::as_i64(o)? {
+        0 => Rounding::Floor,
+        1 => Rounding::Ceiling,
+        2 => Rounding::HalfEven,
+        3 => Rounding::Up,
+        _ => raise!(ValueError, "invalid rounding mode"),
+    })
+}
+
+fn round_float(x: f64, mode: Rounding) -> f64 {
+    match mode {
+        Rounding::Floor => x.floor(),
+        Rounding::Ceiling => x.ceil(),
+        Rounding::HalfEven => x.round_ties_even(),
+        Rounding::Up => {
+            if x >= 0.0 {
+                x.ceil()
+            } else {
+                x.floor()
+            }
+        }
+    }
+}
+
+/// n / d rounded with `mode` (d > 0), computed exactly.
+fn div_rounded(n: i128, d: i128, mode: Rounding) -> i128 {
+    let q = n.div_euclid(d);
+    let r = n.rem_euclid(d);
+    if r == 0 {
+        return q;
+    }
+    let up = match mode {
+        Rounding::Floor => false,
+        Rounding::Ceiling => true,
+        Rounding::Up => n > 0,
+        Rounding::HalfEven => match (2 * r).cmp(&d) {
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Equal => q % 2 != 0,
+        },
+    };
+    if up { q + 1 } else { q }
+}
+
+fn pytime_overflow() -> PyErr {
+    new_err(crate::types::exceptions::OverflowError(), "timestamp out of range for C PyTime_t")
+}
+
+fn time_t_overflow() -> PyErr {
+    new_err(crate::types::exceptions::OverflowError(), "timestamp out of range for platform time_t")
+}
+
+fn nan_error() -> PyErr {
+    value_error("Invalid value NaN (not a number)")
+}
+
+/// Exact integer value of an int argument, None when it does not fit i128.
+fn int_arg(o: &PyObject) -> PyResult<Option<i128>> {
+    let i = ab::index(o)?;
+    Ok(int::as_i128(&i))
+}
+
+/// A nanosecond timestamp argument (must fit 64 bits).
+fn pytime_arg(o: &PyObject) -> PyResult<i64> {
+    match int_arg(o)? {
+        Some(v) if i64::try_from(v).is_ok() => Ok(v as i64),
+        _ => Err(pytime_overflow()),
+    }
+}
+
+fn float_to_i64(d: f64, overflow: fn() -> PyErr) -> PyResult<i64> {
+    if d.is_nan() {
+        return Err(nan_error());
+    }
+    if !(-TWO_POW_63..TWO_POW_63).contains(&d) {
+        return Err(overflow());
+    }
+    Ok(d as i64)
+}
+
+fn check_args(args: &[&PyObject], n: usize) -> PyResult<()> {
+    if args.len() != n {
+        raise!(TypeError, "function takes exactly {} arguments ({} given)", n, args.len());
+    }
+    Ok(())
+}
+
+fn pytime_from_seconds(_m: &PyObject, o: &PyObject) -> PyResult {
+    if !int::is_int(o) {
+        raise!(TypeError, "'{}' object cannot be interpreted as an integer", crate::types::typeobject::tname(o));
+    }
+    let secs = match int_arg(o)? {
+        Some(v) if i32::try_from(v).is_ok() => v,
+        _ => raise!(OverflowError, "signed integer is greater than maximum"),
+    };
+    Ok(int::new_int_i128(secs * NS_PER_SEC))
+}
+
+fn pytime_from_seconds_object(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    check_args(args, 2)?;
+    let mode = rounding_arg(args[1])?;
+    let o = args[0];
+    if crate::types::float::is_float(o) {
+        let d = crate::types::float::float_value(o);
+        if d.is_nan() {
+            return Err(nan_error());
+        }
+        let ns = float_to_i64(round_float(d * 1e9, mode), pytime_overflow)?;
+        return Ok(int::new_int(ns));
+    }
+    let ns = int_arg(o)?.and_then(|s| s.checked_mul(NS_PER_SEC)).filter(|v| i64::try_from(*v).is_ok());
+    match ns {
+        Some(v) => Ok(int::new_int_i128(v)),
+        None => Err(pytime_overflow()),
+    }
+}
+
+fn pytime_as_unit(args: &[&PyObject], ns_per_unit: i128) -> PyResult<i128> {
+    check_args(args, 2)?;
+    let ns = pytime_arg(args[0])?;
+    let mode = rounding_arg(args[1])?;
+    Ok(div_rounded(ns as i128, ns_per_unit, mode))
+}
+
+fn pytime_as_timeval(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    let us = pytime_as_unit(args, 1_000)?;
+    let (sec, usec) = (us.div_euclid(1_000_000), us.rem_euclid(1_000_000));
+    Ok(tuple::new_tuple(vec![int::new_int_i128(sec), int::new_int_i128(usec)]))
+}
+
+fn pytime_as_milliseconds(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    Ok(int::new_int_i128(pytime_as_unit(args, 1_000_000)?))
+}
+
+fn pytime_as_microseconds(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    Ok(int::new_int_i128(pytime_as_unit(args, 1_000)?))
+}
+
+/// Integer seconds argument as time_t.
+fn time_t_from_int(o: &PyObject) -> PyResult<i64> {
+    match int_arg(o)? {
+        Some(v) if i64::try_from(v).is_ok() => Ok(v as i64),
+        _ => Err(time_t_overflow()),
+    }
+}
+
+fn object_to_time_t(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    check_args(args, 2)?;
+    let mode = rounding_arg(args[1])?;
+    let o = args[0];
+    let secs = if crate::types::float::is_float(o) {
+        float_to_i64(round_float(crate::types::float::float_value(o), mode), time_t_overflow)?
+    } else {
+        time_t_from_int(o)?
+    };
+    Ok(int::new_int(secs))
+}
+
+/// (seconds, fraction) with the fraction in 1/`per_sec` units, always in [0, per_sec).
+fn object_to_sec_frac(args: &[&PyObject], per_sec: i64) -> PyResult {
+    check_args(args, 2)?;
+    let mode = rounding_arg(args[1])?;
+    let o = args[0];
+    let (secs, frac) = if crate::types::float::is_float(o) {
+        let d = crate::types::float::float_value(o);
+        if d.is_nan() {
+            return Err(nan_error());
+        }
+        let whole = d.trunc();
+        let mut frac = round_float((d - whole) * per_sec as f64, mode);
+        let mut whole = whole;
+        if frac < 0.0 {
+            frac += per_sec as f64;
+            whole -= 1.0;
+        } else if frac >= per_sec as f64 {
+            frac -= per_sec as f64;
+            whole += 1.0;
+        }
+        (float_to_i64(whole, time_t_overflow)?, frac as i64)
+    } else {
+        (time_t_from_int(o)?, 0)
+    };
+    Ok(tuple::new_tuple(vec![int::new_int(secs), int::new_int(frac)]))
+}
+
+fn object_to_timeval(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    object_to_sec_frac(args, 1_000_000)
+}
+
+fn object_to_timespec(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    object_to_sec_frac(args, 1_000_000_000)
 }

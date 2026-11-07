@@ -923,6 +923,10 @@ fn str_count(o: &PyObject) -> Option<usize> {
 
 /// `no_debug_ranges` is fixed at startup (-X / environment): look it up once.
 fn no_debug_ranges_cached() -> bool {
+    // _loads_without_positions asks for it per call, whatever the startup setting
+    if STRIP_COLUMNS.with(|c| c.get()) {
+        return true;
+    }
     static V: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
     match V.load(std::sync::atomic::Ordering::Relaxed) {
         2 => {
@@ -1021,7 +1025,7 @@ fn build_public_code(p: CodeParts) -> PyResult<PyRef> {
         p.linetable.to_ref()
     };
     let consts = if tuple::is_tuple_exact(p.consts) { p.consts.to_ref() } else { ab::sequence_tuple(p.consts)? };
-    code_mod::new_code_from_public(code_mod::PublicParts {
+    let r = code_mod::new_code_from_public(code_mod::PublicParts {
         argcount: p.argcount,
         posonlyargcount: p.posonly,
         kwonlyargcount: p.kwonly,
@@ -1046,7 +1050,17 @@ fn build_public_code(p: CodeParts) -> PyResult<PyRef> {
         } else {
             e
         }
-    })
+    })?;
+    // (core6) keep the co_consts tuple that was read (marshal back-references share it between
+    // code objects, as the compiler's constant merging did)
+    if tuple::is_tuple_exact(&consts) {
+        let c = unsafe { &mut *(r.as_ptr() as *mut crate::types::code::PyCodeObject) };
+        if !c.co_consts.is_null() && !consts.is(unsafe { &*c.co_consts }) {
+            let old = std::mem::replace(&mut c.co_consts, consts.to_ref().into_raw());
+            unsafe { xdecref(old) };
+        }
+    }
+    Ok(r)
 }
 
 fn build_code(p: CodeParts) -> PyResult<PyRef> {

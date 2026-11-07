@@ -303,8 +303,8 @@ fn self_or_new(o: &PyObject, start: usize, end: usize) -> PyResult {
     if start == 0 && end == d.len() && bytes::is_bytes_exact(o) {
         return Ok(o.to_ref());
     }
-    let v = d[start..end].to_vec();
-    new_like(o, &v)
+    // (perf4) no temporary vector (allocation cannot change `o`)
+    new_like(o, &d[start..end])
 }
 
 /// While alive, a bytearray `self` cannot be resized (methods that call back
@@ -365,7 +365,7 @@ pub fn slice_index(o: Option<&PyObject>, default: isize) -> PyResult<isize> {
         Some(x) if none::is_none(x) => Ok(default),
         Some(x) => {
             if !ab::has_index(x) {
-                raise!(TypeError, "slice indices must be integers or None or have an __index__ method");
+                raise!(TypeError, "slice indices must be integers or have an __index__ method");
             }
             ab::index_as_ssize(x, None)
         }
@@ -1533,6 +1533,11 @@ pub fn percent_format(fmt: &[u8], args: &PyObject) -> PyResult<Vec<u8>> {
             continue;
         }
         let mut opts = PercentOpts::from_spec(&spec);
+        // every argument the directive consumes must be there before any is checked
+        let nstars = (spec.width == PercentNum::Star) as usize + (spec.precision == PercentNum::Star) as usize;
+        if nstars > 0 && fa.dict.is_none() && fa.n.saturating_sub(fa.idx) < nstars + 1 {
+            raise!(TypeError, "not enough arguments for format string (got {})", fa.n);
+        }
         if spec.width == PercentNum::Star {
             let (v, p) = fa.next()?;
             if !int::is_int(&v) {
@@ -1750,6 +1755,13 @@ pub fn bytes_from_iterable(x: &PyObject, it_err_type: &str) -> PyResult<Vec<u8>>
 pub fn bytes_from_object(x: &PyObject) -> PyResult {
     if bytes::is_bytes_exact(x) {
         return Ok(x.to_ref());
+    }
+    if buffer::check_buffer(x) {
+        // (perf4) contiguous buffers are copied once, without a temporary vector
+        let b = BufferView::get(x, buffer::PyBUF_FULL_RO)?;
+        if buffer::is_contiguous(&b.view, b'C') {
+            return bytes::try_new_bytes(b.as_bytes());
+        }
     }
     bytes::try_new_bytes(&bytes_data_from_object(x)?)
 }
@@ -1997,6 +2009,12 @@ fn bytes_subscript_impl(o: &PyObject, k: &PyObject) -> PyResult {
         if start == 0 && step == 1 && len as usize == d.len() && bytes::is_bytes_exact(o) {
             return Ok(o.to_ref());
         }
+        if step == 1 {
+            // (perf4) contiguous slice: one copy, no temporary vector
+            let s = (start.max(0) as usize).min(d.len());
+            let e = (start + len).max(0).min(d.len() as isize) as usize;
+            return bytes::try_new_bytes(&d[s..e.max(s)]);
+        }
         return bytes::try_new_bytes(&slice_bytes(d, start, step, len));
     }
     if ab::has_index(k) {
@@ -2035,7 +2053,7 @@ unsafe extern "C" fn bytes_concat(a: *mut PyObject, b: *mut PyObject) -> *mut Py
                 return Ok(b.to_ref());
             }
             let total = va.len().checked_add(vb.len()).filter(|&t| t <= bytes::MAX_SIZE).ok_or_else(memory_error)?;
-            let r = bytes::try_alloc_bytes(total)?;
+            let r = bytes::try_alloc_bytes_uninit(total)?;
             std::ptr::copy_nonoverlapping(va.as_bytes().as_ptr(), bytes::bytes_ptr(&r), va.len());
             std::ptr::copy_nonoverlapping(vb.as_bytes().as_ptr(), bytes::bytes_ptr(&r).add(va.len()), vb.len());
             Ok(r)
@@ -2078,7 +2096,13 @@ unsafe extern "C" fn bytes_repeat(a: *mut PyObject, n: Py_ssize_t) -> *mut PyObj
         if n == 1 && bytes::is_bytes_exact(a) {
             return a.to_ref().into_raw();
         }
-        into_c(repeat_bytes(bytes::bytes_data(a), n, "bytes").and_then(|v| bytes::try_new_bytes(&v)))
+        // repetition always builds a new object, even for an empty or one-byte result
+        // (no sharing of the b"" / single-byte singletons: tracemalloc sees the block)
+        into_c(repeat_bytes(bytes::bytes_data(a), n, "bytes").and_then(|v| {
+            let r = bytes::try_alloc_bytes_uninit(v.len())?;
+            std::ptr::copy_nonoverlapping(v.as_ptr(), bytes::bytes_ptr(&r), v.len());
+            Ok(r)
+        }))
     }
 }
 unsafe extern "C" fn bytes_contains(o: *mut PyObject, x: *mut PyObject) -> c_int {
@@ -2189,8 +2213,9 @@ fn bytesiter_length_hint(o: &PyObject) -> PyResult {
     Ok(int::new_int(n.max(0) as i64))
 }
 /// (iter, (seq,), index) / (iter, ((),)) — shared by the bytes-like iterators.
-pub fn iter_reduce(seq: *mut PyObject, index: isize) -> PyResult {
-    let it = crate::builtins::builtin("iter")?;
+/// `it` is the builtin `iter`, looked up before the iterator state is read (the lookup can
+/// run Python code that advances the iterator).
+pub fn iter_reduce(it: PyRef, seq: *mut PyObject, index: isize) -> PyResult {
     if seq.is_null() {
         return Ok(tuple::new_tuple(vec![it, tuple::new_tuple(vec![tuple::empty_tuple()])]));
     }
@@ -2198,8 +2223,9 @@ pub fn iter_reduce(seq: *mut PyObject, index: isize) -> PyResult {
     Ok(tuple::new_tuple(vec![it, tuple::new_tuple(vec![s]), int::new_int(index as i64)]))
 }
 fn bytesiter_reduce(o: &PyObject) -> PyResult {
+    let f = crate::builtins::eval_builtin("iter")?;
     let it = unsafe { &*(o.as_ptr() as *mut BytesIter) };
-    iter_reduce(it.seq, it.index)
+    iter_reduce(f, it.seq, it.index)
 }
 fn bytesiter_setstate(o: &PyObject, state: &PyObject) -> PyResult {
     let it = unsafe { &mut *(o.as_ptr() as *mut BytesIter) };

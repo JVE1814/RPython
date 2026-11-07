@@ -43,6 +43,11 @@ pub fn install(mode: u8, sink: Option<&PyObject>) {
     unsafe { xdecref(old as *mut PyObject) };
 }
 
+/// Whether a hook is installed.
+pub fn installed() -> bool {
+    MODE.load(Relaxed) != NONE
+}
+
 /// Whether compiled code must stay off (every frame entry has to be observed).
 #[inline(always)]
 pub fn forces_interpreter() -> bool {

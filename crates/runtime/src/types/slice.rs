@@ -46,7 +46,7 @@ pub fn slice_index(v: &PyObject) -> PyResult<isize> {
         return Ok(x as isize);
     }
     if !ab::has_index(v) {
-        raise!(TypeError, "slice indices must be integers or None or have an __index__ method");
+        raise!(TypeError, "slice indices must be integers or have an __index__ method");
     }
     let i = ab::index(v)?;
     Ok(match int::as_i64(&i) {

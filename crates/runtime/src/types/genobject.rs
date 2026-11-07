@@ -76,6 +76,13 @@ pub fn g(o: &PyObject) -> &mut GenObject {
 }
 
 pub fn new_generator_for(frame: Box<Frame>, func: &PyObject, flags: u32) -> PyResult {
+    let fo = crate::types::funcobject::func(func);
+    unsafe { new_generator_named(frame, &*fo.func_name, &*fo.func_qualname, flags) }
+}
+
+/// (core6) A generator/coroutine over `frame` named explicitly (code run by eval/exec with
+/// top-level await has no function).
+pub fn new_generator_named(frame: Box<Frame>, name: &PyObject, qualname: &PyObject, flags: u32) -> PyResult {
     let tp = if flags & bc::co::COROUTINE != 0 {
         coro_type()
     } else if flags & bc::co::ASYNC_GENERATOR != 0 {
@@ -86,9 +93,8 @@ pub fn new_generator_for(frame: Box<Frame>, func: &PyObject, flags: u32) -> PyRe
     unsafe {
         let op = crate::alloc::alloc_object(tp, std::mem::size_of::<GenObject>());
         let gn = &mut *(op as *mut GenObject);
-        let fo = crate::types::funcobject::func(func);
-        gn.name = (*fo.func_name).to_ref().into_raw();
-        gn.qualname = (*fo.func_qualname).to_ref().into_raw();
+        gn.name = name.to_ref().into_raw();
+        gn.qualname = qualname.to_ref().into_raw();
         gn.code = (*frame).code().to_ref().into_raw();
         let fp = Box::into_raw(frame);
         (*fp).generator = op;
@@ -903,7 +909,14 @@ fn with_frame_on_stack<R>(o: &PyObject, f: impl FnOnce() -> R) -> R {
 pub fn gen_throw_impl(o: &PyObject, typ: &PyObject, val: Option<&PyObject>, tb: Option<&PyObject>, close_on_genexit: bool) -> PyResult {
     // delegate to sub-iterator first
     if let Some(yf) = yieldfrom(o) {
-        if typ.is(type_obj(exc::GeneratorExit())) && close_on_genexit {
+        // GeneratorExit (class, subclass or instance) closes the sub-iterator and
+        // is then raised here
+        let is_genexit = if exc::is_exception_class(typ) {
+            is_subtype(as_type(typ), exc::GeneratorExit())
+        } else {
+            is_subtype(typ.type_ptr(), exc::GeneratorExit())
+        };
+        if is_genexit && close_on_genexit {
             g(o).running = true;
             let r = close_iter(&yf);
             g(o).running = false;
@@ -1033,8 +1046,24 @@ fn close_iter(yf: &PyObject) -> PyResult<()> {
         gen_close(yf)?;
         return Ok(());
     }
-    if let Some(m) = ab::getattr_opt(yf, name!("close"))? {
-        ab::call(&m, &[])?;
+    match ab::getattr_opt(yf, name!("close")) {
+        Ok(Some(m)) => {
+            ab::call(&m, &[])?;
+        }
+        Ok(None) => {}
+        // a sub-iterator whose close cannot even be looked up does not stop the
+        // closing of the delegating generator: the failure is reported
+        Err(_) => {
+            let e = take_exc();
+            let r = ab::repr_string(yf).unwrap_or_else(|_| {
+                clear_exc();
+                String::from("<generator>")
+            });
+            if let Some(e) = e {
+                set_exc(e);
+            }
+            crate::modules::sys_full::write_unraisable(Some(&format!("Exception ignored while closing generator {}", r)), None);
+        }
     }
     Ok(())
 }

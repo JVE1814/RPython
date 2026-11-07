@@ -670,6 +670,22 @@ pub fn update_slot(tp: *mut PyTypeObject, attr: &PyObject) {
     if slots.is_empty() {
         return;
     }
+    if pystr::str_eq_ascii(attr, "__call__") {
+        // a vectorcall function would bypass the new __call__: drop the flag here and in the
+        // subclasses that inherit this class's tp_call (those defining their own keep theirs)
+        fn drop_vectorcall(tp: *mut PyTypeObject, top: bool) {
+            unsafe {
+                if !top && !(*tp).tp_dict.is_null() && dict::get_item_str(&*(*tp).tp_dict, name!("__call__")).is_some() {
+                    return;
+                }
+                (*tp).tp_flags &= !Py_TPFLAGS_HAVE_VECTORCALL;
+            }
+            for sub in subclasses(tp) {
+                drop_vectorcall(sub.p(), false);
+            }
+        }
+        drop_vectorcall(tp, true);
+    }
     fn rec(tp: *mut PyTypeObject, slots: &[Slot]) {
         for &s in slots {
             update_one_slot(tp, s);
@@ -944,6 +960,9 @@ unsafe fn wrap_richcmp(_s: &PyObject, _a: &[&PyObject], _kw: Option<&PyObject>, 
 }
 pub unsafe fn call_wrapper(idx: usize, s: &PyObject, a: &[&PyObject], kw: Option<&PyObject>, w: *mut c_void) -> PyResult {
     let sd = &SLOTDEFS[idx];
+    if !matches!(sd.slot, Slot::TpInit | Slot::TpCall | Slot::TpNew) {
+        no_kwargs(kw, sd.name)?;
+    }
     unsafe {
         if sd.slot == Slot::TpRichcompare {
             return wrap_richcmp_op(s, a, kw, w, sd.op);
@@ -1222,11 +1241,19 @@ unsafe extern "C" fn slot_tp_setattro(s: *mut PyObject, nm: *mut PyObject, v: *m
         if r.is_ok() { 0 } else { -1 }
     }
 }
-const RICHCMP_NAMES: [&str; 6] = ["__lt__", "__le__", "__eq__", "__ne__", "__gt__", "__ge__"];
 unsafe extern "C" fn slot_tp_richcompare(s: *mut PyObject, o: *mut PyObject, op: c_int) -> *mut PyObject {
     unsafe {
         let s = &*s;
-        let nm = pystr::intern_str(RICHCMP_NAMES[op as usize]);
+        // (perf4) cached interned names (intern_str hashed the name on every call)
+        let nm = match op {
+            0 => name!("__lt__"),
+            1 => name!("__le__"),
+            2 => name!("__eq__"),
+            3 => name!("__ne__"),
+            4 => name!("__gt__"),
+            _ => name!("__ge__"),
+        }
+        .to_ref();
         // a descriptor whose __get__ fails makes the comparison NotImplemented
         if let Some(f) = lookup(s.type_ptr(), &nm) {
             if !crate::types::funcobject::is_function(&f) {

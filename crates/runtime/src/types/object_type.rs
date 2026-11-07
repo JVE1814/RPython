@@ -243,6 +243,7 @@ fn object_set_class(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
             type_name(unsafe { &*old })
         );
     }
+    crate::modules::testinternalcapi::rare_event(crate::modules::testinternalcapi::RareEvent::SetClass);
     // shapes belong to the old type: move inline values into a real dict first
     crate::interp::cache::TYPE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     crate::shape::materialize(o);
@@ -444,7 +445,7 @@ pub unsafe extern "C" fn type_vectorcall(
                     return list::new_list_from_slice(tuple::tuple_items(a)).into_raw();
                 }
                 if list::is_list_exact(a) {
-                    return list::new_list(list::list_to_vec(a)).into_raw();
+                    return list::list_copy(a).into_raw();
                 }
             }
         }
@@ -836,6 +837,7 @@ fn type_get_bases(o: &PyObject) -> PyResult {
 }
 fn type_set_bases(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     check_set_special(o, v, "__bases__")?;
+    crate::modules::testinternalcapi::rare_event(crate::modules::testinternalcapi::RareEvent::SetBases);
     let v = v.unwrap();
     let tp = t(o);
     if !tuple::is_tuple(v) {
@@ -1269,6 +1271,13 @@ fn is_identifier(s: &PyObject) -> bool {
 }
 
 unsafe extern "C" fn type_new_slot(meta: *mut PyTypeObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
+    // (wheels2) an extension that calls PyType_Type.tp_new with an exception still
+    // set (msgspec after a failed annotation lookup) gets that exception back:
+    // CPython's type_new runs into it at its first optional namespace lookup
+    // (__classcell__, __doc__, ...) and fails with it.
+    if crate::errors::err_occurred() {
+        return std::ptr::null_mut();
+    }
     unsafe { into_c(type_new(meta, &*args, if kw.is_null() { None } else { Some(&*kw) })) }
 }
 
@@ -1294,6 +1303,13 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
     if !dict::is_anydict(ns) {
         raise!(TypeError, "type.__new__() argument 3 must be dict, not {}", tname(ns));
     }
+    // bases that would need __mro_entries__ are refused before the metaclass is
+    // worked out (their types are no metaclasses)
+    for b in tuple::tuple_items(bases) {
+        if !is_type(b) && ab::getattr_opt(b, name!("__mro_entries__"))?.is_some() {
+            raise!(TypeError, "type() doesn't support MRO entry resolution; use types.new_class()");
+        }
+    }
     // metaclass
     let winner = calculate_metaclass(meta, bases)?;
     if winner != meta {
@@ -1311,13 +1327,6 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
     let bases_owned: PyRef = if tuple::tuple_len(bases) == 0 {
         tuple::new_tuple(vec![type_ref(object_type())])
     } else {
-        for b in tuple::tuple_items(bases) {
-            if !is_type(b) {
-                if ab::getattr_opt(b, name!("__mro_entries__"))?.is_some() {
-                    raise!(TypeError, "type() doesn't support MRO entry resolution; use types.new_class()");
-                }
-            }
-        }
         bases.to_ref()
     };
     for b in tuple::tuple_items(&bases_owned) {
@@ -1638,9 +1647,10 @@ pub fn type_new(meta: *mut PyTypeObject, args: &PyObject, kw: Option<&PyObject>)
         }
         if let Some(cd) = dict::get_item_str(&dict, name!("__classdictcell__")) {
             if cd.is_type(funcobject::cell_type()) {
-                // the class-body namespace (not the type dict, which would make
-                // class -> dict -> __annotate__ -> cell -> dict cycles)
-                funcobject::cell_set(&cd, Some(ns.to_ref()));
+                // the type's own dict: lazily evaluated annotations, bounds and
+                // alias values see later changes to class attributes (the cycle
+                // dict -> function -> cell -> dict is left to the collector)
+                funcobject::cell_set(&cd, Some(dict.clone()));
             }
             dict::del_item(&dict, name!("__classdictcell__"))?;
         }

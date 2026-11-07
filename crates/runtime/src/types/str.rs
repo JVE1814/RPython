@@ -744,6 +744,10 @@ pub fn lookup_interned(s: &PyObject) -> Option<*mut PyObject> {
 }
 
 pub fn intern_str(s: &str) -> PyRef {
+    if s.is_ascii() {
+        // (perf4) an already interned name is found without allocating a str
+        return intern_latin1(s.as_bytes());
+    }
     intern(new_str(s))
 }
 

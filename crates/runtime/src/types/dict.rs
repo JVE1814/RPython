@@ -297,7 +297,8 @@ impl DictTable {
     #[inline]
     fn insert_new(&mut self, h: isize, key: *mut PyObject, value: *mut PyObject) {
         if self.nentries >= self.cap || self.fill >= self.cap {
-            self.resize(self.used * 3);
+            // (perf4) like CPython: the new index size is at least 3 * used (usable = 2/3 of it)
+            self.resize(self.used * 2);
         }
         let slot = self.find_empty_slot(h);
         if self.indices()[slot] == EMPTY {
@@ -518,8 +519,20 @@ pub unsafe fn free_storage(op: *mut PyObject) {
 
 pub unsafe extern "C" fn dict_dealloc(op: *mut PyObject) {
     unsafe {
-        if crate::capi::watchers::dicts_watched() {
-            crate::capi::watchers::dict_event(crate::capi::watchers::DICT_DEALLOCATED, &*op, None, None);
+        let wm = crate::capi::dict::watched_mask(op);
+        if wm != 0 {
+            // the callbacks see a live dict: resurrect it for their duration
+            // (same protocol as gc::call_finalizer_from_dealloc)
+            let o = &*op;
+            o.ob_ref_local.store(1, std::sync::atomic::Ordering::Relaxed);
+            o.ob_tid.store(crate::object::thread_id(), std::sync::atomic::Ordering::Relaxed);
+            crate::capi::dict::notify(op, wm, crate::capi::dict::EV_DEALLOCATED, std::ptr::null_mut(), std::ptr::null_mut());
+            crate::capi::dict::forget_watched(op);
+            let local = o.ob_ref_local.load(std::sync::atomic::Ordering::Relaxed) - 1;
+            o.ob_ref_local.store(local, std::sync::atomic::Ordering::Relaxed);
+            if local != 0 || (o.ob_ref_shared.load(std::sync::atomic::Ordering::Relaxed) >> 2) != 0 {
+                return; // a callback kept it alive
+            }
         }
         crate::gc::untrack(op);
         free_storage(op);
@@ -760,10 +773,10 @@ pub fn set_item(d: &PyObject, key: &PyObject, value: &PyObject) -> PyResult<()> 
 }
 
 pub fn set_item_hash(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) -> PyResult<()> {
-    if crate::capi::watchers::dicts_watched() {
-        // (capi2) watchers are told before the change
-        let ev = if contains_hash(d, key, h)? { crate::capi::watchers::DICT_MODIFIED } else { crate::capi::watchers::DICT_ADDED };
-        crate::capi::watchers::dict_event(ev, d, Some(key), Some(value));
+    let wm = crate::capi::dict::watched_mask(d.as_ptr());
+    if wm != 0 {
+        let ev = if contains_hash(d, key, h)? { crate::capi::dict::EV_MODIFIED } else { crate::capi::dict::EV_ADDED };
+        crate::capi::dict::notify(d.as_ptr(), wm, ev, key.as_ptr(), value.as_ptr());
     }
     let (g, f) = find(d, key, h)?;
     let t = table(d);
@@ -790,6 +803,10 @@ pub fn set_item_hash(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) -
 
 /// Insert a key known not to be present (fresh dict build, e.g. copy). Steals nothing.
 pub fn insert_unique(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) {
+    let wm = crate::capi::dict::watched_mask(d.as_ptr());
+    if wm != 0 {
+        crate::capi::dict::notify(d.as_ptr(), wm, crate::capi::dict::EV_ADDED, key.as_ptr(), value.as_ptr());
+    }
     let g = ob_lock(d);
     let t = table(d);
     unsafe {
@@ -801,6 +818,20 @@ pub fn insert_unique(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) {
     drop(g);
 }
 
+/// (perf4) Fill a fresh dict (no other reference yet) with entries whose keys are
+/// distinct and absent (borrowed key, its hash, owned value: the value reference is
+/// taken over). One lock and one size update for all of them.
+pub fn fill_fresh_steal(d: &PyObject, items: &[(*mut PyObject, isize, *mut PyObject)]) {
+    let g = ob_lock(d);
+    let t = table(d);
+    for &(k, h, v) in items {
+        unsafe { incref(k) };
+        t.insert_new(h, k, v);
+    }
+    set_used(d, t.used, std::ptr::null_mut());
+    drop(g);
+}
+
 pub fn set_item_str(d: &PyObject, key: &str, value: &PyObject) -> PyResult<()> {
     let k = crate::types::str::intern_str(key);
     set_item(d, &k, value)
@@ -808,8 +839,9 @@ pub fn set_item_str(d: &PyObject, key: &str, value: &PyObject) -> PyResult<()> {
 
 /// d.setdefault(key, default) → the value now stored for key.
 pub fn setdefault_hash(d: &PyObject, key: &PyObject, h: isize, default: &PyObject) -> PyResult<PyRef> {
-    if crate::capi::watchers::dicts_watched() && !contains_hash(d, key, h)? {
-        crate::capi::watchers::dict_event(crate::capi::watchers::DICT_ADDED, d, Some(key), Some(default));
+    let wm = crate::capi::dict::watched_mask(d.as_ptr());
+    if wm != 0 && !contains_hash(d, key, h)? {
+        crate::capi::dict::notify(d.as_ptr(), wm, crate::capi::dict::EV_ADDED, key.as_ptr(), default.as_ptr());
     }
     let (g, f) = find(d, key, h)?;
     let t = table(d);
@@ -844,8 +876,9 @@ pub fn pop_item_hash(d: &PyObject, key: &PyObject, h: isize) -> PyResult<Option<
     if dict_len(d) == 0 {
         return Ok(None);
     }
-    if crate::capi::watchers::dicts_watched() && contains_hash(d, key, h)? {
-        crate::capi::watchers::dict_event(crate::capi::watchers::DICT_DELETED, d, Some(key), None);
+    let wm = crate::capi::dict::watched_mask(d.as_ptr());
+    if wm != 0 && contains_hash(d, key, h)? {
+        crate::capi::dict::notify(d.as_ptr(), wm, crate::capi::dict::EV_DELETED, key.as_ptr(), std::ptr::null_mut());
     }
     let (g, f) = find(d, key, h)?;
     match f {
@@ -882,8 +915,9 @@ pub fn remove_at(d: &PyObject, ix: usize, _h: isize) -> (*mut PyObject, *mut PyO
 }
 
 pub fn clear(d: &PyObject) {
-    if crate::capi::watchers::dicts_watched() {
-        crate::capi::watchers::dict_event(crate::capi::watchers::DICT_CLEARED, d, None, None);
+    let wm = crate::capi::dict::watched_mask(d.as_ptr());
+    if wm != 0 && dict_len(d) != 0 {
+        crate::capi::dict::notify(d.as_ptr(), wm, crate::capi::dict::EV_CLEARED, std::ptr::null_mut(), std::ptr::null_mut());
     }
     let g = ob_lock(d);
     if unsafe { is_shared_empty(d) } {
@@ -1018,10 +1052,11 @@ pub fn merge_dict(d: &PyObject, other: &PyObject, overwrite: bool) -> PyResult<(
     }
     // Fast path: empty target, exact source → bulk copy (no lookups needed).
     if dict_len(d) == 0 && nentries(d) == 0 {
-        let items = items_hash_vec(other);
-        if crate::capi::watchers::dicts_watched() {
-            crate::capi::watchers::dict_event(crate::capi::watchers::DICT_CLONED, d, None, None);
+        let wm = crate::capi::dict::watched_mask(d.as_ptr());
+        if wm != 0 {
+            crate::capi::dict::notify(d.as_ptr(), wm, crate::capi::dict::EV_CLONED, other.as_ptr(), std::ptr::null_mut());
         }
+        let items = items_hash_vec(other);
         let g = ob_lock(d);
         let t = table(d);
         if t.used == 0 {
@@ -1074,9 +1109,11 @@ pub fn version(d: &PyObject) -> u64 {
 
 /// Pop the last item (LIFO), for popitem. Trims the entry array like CPython.
 pub fn pop_last(d: &PyObject) -> Option<(PyRef, PyRef)> {
-    if crate::capi::watchers::dicts_watched() {
-        if let Some((k, _)) = { let _g = ob_lock(d); let t = table(d); t.entries()[..t.nentries].iter().rev().find(|e| !e.key.is_null()).map(|e| unsafe { (PyRef::from_borrowed(e.key), ()) }) } {
-            crate::capi::watchers::dict_event(crate::capi::watchers::DICT_DELETED, d, Some(&k), None);
+    let wm = crate::capi::dict::watched_mask(d.as_ptr());
+    if wm != 0 {
+        let last = { let _g = ob_lock(d); let t = table(d); t.entries()[..t.nentries].iter().rev().find(|e| !e.key.is_null()).map(|e| unsafe { PyRef::from_borrowed(e.key) }) };
+        if let Some(k) = last {
+            crate::capi::dict::notify(d.as_ptr(), wm, crate::capi::dict::EV_DELETED, k.as_ptr(), std::ptr::null_mut());
         }
     }
     let g = ob_lock(d);
@@ -1119,4 +1156,31 @@ pub fn table_sizeof(d: &PyObject) -> usize {
     let _g = ob_lock(d);
     let t = table(d);
     t.data_bytes + std::mem::size_of::<DictTable>()
+}
+
+/// (core6) `dict.__sizeof__` beyond the object itself, in the terms of CPython's keys
+/// object for a table of this size (sys.getsizeof is compared with those layouts): none
+/// for a dict that never held a key, else the keys header (`n2BI2n`, 32 bytes), one index
+/// per slot (1/2/4/8 bytes wide by table size) and the usable entries (16 bytes when every
+/// key is an exact str, 24 otherwise).
+pub fn model_table_sizeof(d: &PyObject) -> usize {
+    let _g = ob_lock(d);
+    let t = table(d);
+    if t.used == 0 && t.nentries == 0 {
+        return 0;
+    }
+    // the size CPython would have grown to for these entries (our growth policy differs)
+    let size = t.size.min(size_for(t.nentries.max(1)));
+    let width = if size <= 1 << 7 {
+        1
+    } else if size <= 1 << 15 {
+        2
+    } else if size <= 1 << 31 {
+        4
+    } else {
+        8
+    };
+    let entries = unsafe { std::slice::from_raw_parts(t.entries_p, t.nentries) };
+    let unicode = entries.iter().all(|e| e.key.is_null() || unsafe { crate::types::str::is_str_exact(&*e.key) });
+    32 + size * width + usable_for(size) * if unicode { 16 } else { 24 }
 }

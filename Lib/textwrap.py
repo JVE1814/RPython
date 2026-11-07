@@ -117,7 +117,7 @@ class TextWrapper:
         """Deal with a chunk too long for any line."""
         space_left = 1 if width < 1 else width - cur_len
 
-        if self.break_long_words:
+        if self.break_long_words and space_left > 0:
             end = space_left
             chunk = reversed_chunks[-1]
             if self.break_on_hyphens and len(chunk) > space_left:
@@ -128,10 +128,11 @@ class TextWrapper:
                     end = hyphen + 1
             cur_line.append(chunk[:end])
             reversed_chunks[-1] = chunk[end:]
-        elif not cur_line:
+        elif not cur_line and not self.break_long_words:
             # Put the whole word on its own (overlong) line.
             cur_line.append(reversed_chunks.pop())
-        # Otherwise the word goes to the next line.
+        # Otherwise the word goes to the next line (a full line has no room
+        # for even a piece of it).
 
     def _wrap_chunks(self, chunks):
         """Assemble chunks into lines of at most self.width characters."""

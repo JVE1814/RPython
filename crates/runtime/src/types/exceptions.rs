@@ -278,6 +278,26 @@ fn get_field_opt(p: *mut PyObject) -> Option<PyRef> {
 
 /// Instantiate `tp(*args)` (fast path for builtin exception types).
 pub fn make_exception(tp: *mut PyTypeObject, args: &[PyRef]) -> PyResult {
+    unsafe {
+        // (perf4) exception types with BaseException's own __new__/__init__ (KeyError,
+        // IndexError, ...) under the plain `type` metaclass: what calling the type
+        // would do, without the call machinery and argument vectors
+        if (*tp).tp_new == Some(base_new as unsafe extern "C" fn(_, _, _) -> _)
+            && (*tp).tp_init == Some(base_init as unsafe extern "C" fn(_, _, _) -> _)
+            && (*(tp as *mut PyObject)).type_ptr() == &raw mut crate::types::typeobject::PyType_Type
+        {
+            let alloc = (*tp).tp_alloc.unwrap_or(generic_alloc);
+            let op = alloc(tp, 0);
+            if op.is_null() {
+                return Err(PyErr);
+            }
+            exc(&*op).args = match args.len() {
+                0 => tuple::empty_tuple().into_raw(),
+                _ => tuple::new_tuple(args.to_vec()).into_raw(),
+            };
+            return Ok(PyRef::from_raw(op));
+        }
+    }
     let refs: Vec<&PyObject> = args.iter().map(|a| &**a).collect();
     ab::call(type_obj(tp), &refs)
 }
@@ -573,7 +593,7 @@ fn importerror_init(o: &PyObject, args: &PyObject, kw: Option<&PyObject>) -> PyR
     for (k, _) in &items {
         let ks = pystr::to_string_lossy(k);
         if !matches!(ks.as_str(), "name" | "path" | "name_from") {
-            raise!(TypeError, "{}() got an unexpected keyword argument '{}'", type_name(o.ty()), ks);
+            return Err(crate::args::unexpected_keyword(&type_name(o.ty()), k, &["name", "path", "name_from"]));
         }
     }
     // (re-)initialisation resets what is not given

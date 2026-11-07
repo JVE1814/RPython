@@ -67,7 +67,7 @@ pub fn float_pow_value(iv: f64, iw: f64) -> PyResult<PowResult> {
     if iv == 0.0 {
         let odd = is_odd_integer(iw);
         if iw < 0.0 {
-            raise!(ZeroDivisionError, "0.0 cannot be raised to a negative power");
+            raise!(ZeroDivisionError, "zero to a negative power");
         }
         return Ok(Float(if odd { iv } else { 0.0 }));
     }
