@@ -1602,13 +1602,38 @@ impl<'a> Gen<'a> {
     }
 }
 
+/// (jit6) The routines below exist once per process; every unit binds its routine
+/// labels to a 13-byte `jmp` to them (each unit used to carry its own copies, which
+/// multiplied the instruction-cache footprint of hot code).
+pub(crate) fn emit_routines(a: &mut Asm, box_int: Label, box_float: Label, free_num: Label) {
+    static SHARED: std::sync::OnceLock<Option<[usize; 3]>> = std::sync::OnceLock::new();
+    let shared = SHARED.get_or_init(|| {
+        let mut b = Asm::new();
+        let l = [b.label(), b.label(), b.label()];
+        emit_routines_body(&mut b, l[0], l[1], l[2]);
+        b.resolve().ok()?;
+        let base = super::mem::install(&b.buf, |_, _| {})?;
+        Some([base + b.label_pos(l[0])?, base + b.label_pos(l[1])?, base + b.label_pos(l[2])?])
+    });
+    match shared {
+        Some(s) => {
+            for (l, &t) in [box_int, box_float, free_num].into_iter().zip(s.iter()) {
+                a.bind(l);
+                a.mov_ri(R11, t as i64);
+                a.jmp_r(R11);
+            }
+        }
+        None => emit_routines_body(a, box_int, box_float, free_num),
+    }
+}
+
 /// Shared per-function routines (called with `call`, SysV-like clobbers):
 /// * box_int:   rdi = i64 value -> rax = new int object (small-int cache, inline
 ///              TLAB allocation of 1-digit ints, else the runtime helper)
 /// * box_float: xmm0 = f64 -> rax = new float object
 /// * free_num:  rdi = object whose local refcount just dropped to zero: inline free
 ///              for exact int/float, else the generic path.
-pub(crate) fn emit_routines(a: &mut Asm, box_int: Label, box_float: Label, free_num: Label) {
+fn emit_routines_body(a: &mut Asm, box_int: Label, box_float: Label, free_num: Label) {
     let tl = crate::tlab::jit_layout();
     let tls = tl.tls_offset as i32;
     let heads = tl.heads as i32;
