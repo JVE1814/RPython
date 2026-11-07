@@ -170,7 +170,7 @@ pub struct DictTable {
     pub wseq: std::sync::atomic::AtomicU64,
     /// (scale1) Set (under the object lock) once a thread other than the owner reads or
     /// writes the table: from then on, replaced data blocks wait for lock-free readers.
-    shared_read: std::sync::atomic::AtomicBool,
+    pub(crate) shared_read: std::sync::atomic::AtomicBool,
 }
 
 /// A fresh, globally unique dict version stamp (the JIT's allocator). Every

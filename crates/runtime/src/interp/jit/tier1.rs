@@ -56,6 +56,10 @@ pub(crate) type Stub = Box<dyn FnOnce(&mut Asm, Label, i32)>;
 const TP_TAG: i32 = offset_of!(PyTypeObject, tp_version_tag) as i32;
 const GC_BITS: i32 = offset_of!(PyObject, ob_gc_bits) as i32;
 const MA_KEYS: i32 = offset_of!(PyDictObject, ma_keys) as i32;
+// (scale2) dict table fields read by the inline LoadGlobal with threads
+const WSEQ: i32 = offset_of!(crate::types::dict::DictTable, wseq) as i32;
+const SHARED_READ: i32 = offset_of!(crate::types::dict::DictTable, shared_read) as i32;
+const NENTRIES: i32 = offset_of!(crate::types::dict::DictTable, nentries) as i32;
 const MA_USED: i32 = offset_of!(PyDictObject, ma_used) as i32;
 const MANAGED_DICT: i32 = -(crate::alloc::MANAGED as i32);
 const MD_DICT: i32 = offset_of!(crate::types::module::PyModuleObject, md_dict) as i32;
@@ -1824,8 +1828,7 @@ impl<'a> Gen<'a> {
 
     /// LoadGlobal: inline read of the dict entry the cache points at (jit5; see
     /// specialize::load_global): seqlock, keys versions of globals (and builtins),
-    /// value from the entry. Single-threaded only (dict entries are read without the
-    /// dict lock); the helper otherwise.
+    /// value from the entry (with threads too, see below; scale2).
     fn load_global(&mut self, ins: &Instr, d: i32) {
         use crate::interp::cache::kind;
         let e = self.tables.entry(ins.pc as usize) as *const _ as i64;
@@ -1845,14 +1848,12 @@ impl<'a> Gen<'a> {
         self.a.jcc(Cc::NE, slow);
         self.a.cmp32_mi(M(Rcx, E_KIND), kind::GLOBAL as i32);
         self.a.jcc(Cc::NE, slow);
-        self.a.mov_ri(Rdx, (&raw const crate::threads::MULTI_THREADED) as i64);
-        self.a.cmp_mi(M(Rdx, 0), 0);
-        self.a.jcc(Cc::NE, slow);
-        self.a.mov_ri(Rdi, dict_t);
         // globals: exact dict with the recorded key layout
         self.a.load(Rax, M(Rbx, FRAME_GLOBALS));
+        self.a.mov_ri(Rdi, dict_t);
         self.a.cmp_rm(Rdi, M(Rax, OB_TYPE));
         self.a.jcc(Cc::NE, slow);
+        self.a.mov_rr(Rdi, Rax);
         self.a.load(Rax, M(Rax, MA_KEYS));
         self.a.test_rr(Rax, Rax);
         self.a.jcc(Cc::E, slow);
@@ -1863,14 +1864,40 @@ impl<'a> Gen<'a> {
         self.a.test_ri(R9, 1);
         self.a.jcc(Cc::NE, in_builtins);
         self.a.bind(have);
-        // rax = table, r9 = ix << 1 | flag
+        // rax = table, rdi = its dict, rdx = its keys version (checked), r9 = ix << 1 | flag.
+        // (scale2) Also with threads: the entry is read without the dict lock, validated
+        // by the table's sequence lock (wseq even and unchanged, keys version still the
+        // recorded one) as in dict::value_at_if; a value replaced meanwhile is released
+        // through QSBR when the table is marked shared_read (else only the owner can have
+        // written it: allowed when this thread is the owner, the slow path otherwise).
+        {
+            let ok = self.a.label();
+            self.a.mov_rr(R10, Rdx);
+            self.a.load(R11, M(Rax, WSEQ));
+            self.a.test_ri(R11, 1);
+            self.a.jcc(Cc::NE, slow);
+            self.a.cmp_rm(R10, M(Rax, kv));
+            self.a.jcc(Cc::NE, slow);
+            self.a.mov_ri(Rdx, (&raw const crate::threads::MULTI_THREADED) as i64);
+            self.a.cmp_mi(M(Rdx, 0), 0);
+            self.a.jcc(Cc::E, ok);
+            self.a.cmp8_mi(M(Rax, SHARED_READ), 0);
+            self.a.jcc(Cc::NE, ok);
+            self.a.cmp_rm(R15, M(Rdi, OB_TID));
+            self.a.jcc(Cc::NE, slow);
+            self.a.bind(ok);
+        }
         self.a.shr_ri(R9, 1);
+        self.a.cmp_rm(R9, M(Rax, NENTRIES));
+        self.a.jcc(Cc::AE, slow);
         self.a.imul_rri(R9, R9, esz);
         self.a.load(Rdx, M(Rax, ep));
         self.a.add_rr(Rdx, R9);
         self.a.load(Rsi, M(Rdx, evalue));
         self.a.test_rr(Rsi, Rsi);
         self.a.jcc(Cc::E, slow);
+        self.a.cmp_rm(R11, M(Rax, WSEQ));
+        self.a.jcc(Cc::NE, slow);
         self.a.mov_ri(Rdx, crate::types::lazyimport::lazy_import_type() as i64);
         self.a.cmp_rm(Rdx, M(Rsi, OB_TYPE));
         self.a.jcc(Cc::E, slow);
@@ -1883,8 +1910,10 @@ impl<'a> Gen<'a> {
         // builtins: exact dict with the recorded key layout (globals checked above)
         self.a.bind(in_builtins);
         self.a.load(Rax, M(Rbx, FRAME_BUILTINS));
+        self.a.mov_ri(Rdi, dict_t);
         self.a.cmp_rm(Rdi, M(Rax, OB_TYPE));
         self.a.jcc(Cc::NE, slow);
+        self.a.mov_rr(Rdi, Rax);
         self.a.load(Rax, M(Rax, MA_KEYS));
         self.a.test_rr(Rax, Rax);
         self.a.jcc(Cc::E, slow);
