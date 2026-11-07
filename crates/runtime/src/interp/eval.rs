@@ -1504,10 +1504,20 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             }
                             push!(f, r);
                             // periodic check after a call (as CPython does after calls into C):
-                            // e.g. references other threads queued for this owner while it
-                            // waited in a join() are merged before the next statement runs
-                            if ts.c.eval_breaker.load(std::sync::atomic::Ordering::Relaxed) != 0 {
-                                handle_eval_breaker(ts)?;
+                            // signals raised by the callee arrive now, and references other
+                            // threads queued for this owner (e.g. while it waited in a join())
+                            // are merged before the next statement runs. Not after a with
+                            // statement's __enter__ call: an interrupt requested there must
+                            // arrive inside the block, so that __exit__ runs.
+                            let eb = ts.c.eval_breaker.load(std::sync::atomic::Ordering::Relaxed);
+                            if eb != 0 {
+                                if called_enter(&cd.code, f.lasti as usize) {
+                                    if eb & crate::threads::EVAL_MERGE_REFCOUNTS != 0 {
+                                        crate::threads::process_merge_queue(ts);
+                                    }
+                                } else {
+                                    handle_eval_breaker(ts)?;
+                                }
                             }
                         }
                         Op::CallFunctionEx => {
@@ -2377,4 +2387,14 @@ pub(crate) fn exec_misc(ts: &ThreadState, f: &mut Frame, cd: &crate::types::code
 #[cold]
 fn jumps_back_to_send(code: &[u32], target: usize) -> bool {
     code.get(target).is_some_and(|&w| bc::decode(w).0 == Op::Send)
+}
+
+/// Whether the CALL at `call_pc` calls the `__enter__` loaded right before it (the with
+/// statement prologue: LOAD_SPECIAL __enter__; CALL 0).
+#[cold]
+fn called_enter(code: &[u32], call_pc: usize) -> bool {
+    call_pc > 0 && code.get(call_pc - 1).is_some_and(|&w| {
+        let (op, arg) = bc::decode(w);
+        op == Op::LoadSpecial && arg == 0
+    })
 }
