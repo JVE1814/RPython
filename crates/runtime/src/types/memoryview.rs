@@ -804,7 +804,7 @@ pub fn get_contiguous(obj: &PyObject, buffertype: c_int, order: u8) -> PyResult 
 
 unsafe fn memory_from_contiguous_copy(src: &Py_buffer, order: u8) -> PyResult {
     unsafe {
-        let b = bytes::try_alloc_bytes(src.len as usize)?;
+        let b = bytes::try_alloc_bytes_uninit(src.len as usize)?;
         copy_to_contiguous(bytes::bytes_ptr(&b), src, if order == b'F' { b'F' } else { b'C' });
         let mbuf = mbuf_from_object(&b, PyBUF_FULL_RO)?;
         let mb = mbuf.as_ptr() as *mut ManagedBuffer;

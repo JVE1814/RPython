@@ -75,6 +75,44 @@ New tooling:
 * `getattr(cls, name, default)` / `hasattr(cls, name)` on classes: no AttributeError is
   raised and cleared for a missing name (`type_getattr_impl` with suppression).
 
+### Second round
+* Builtin calls from compiled code (`h_call` → `call_builtin_fast`): exact
+  `builtin_function_or_method` objects and method descriptors found by LoadMethod with
+  METH_O / METH_NOARGS / METH_FASTCALL(|KEYWORDS) and positional arguments call their C
+  function directly (`methods::call_methoddef_fast`), skipping vectorcall_raw,
+  cfunction_vectorcall, call_methoddef and the result check (locking methods and every
+  other convention keep the general path, which also produces the errors).
+* `list.copy()` / `list(lst)`: no intermediate vector (`list::list_copy`).
+* Exceptions leaving a compiled frame that has no handler for the raising instruction are
+  propagated without entering the interpreter (`eval::unwind_compiled_error`, used by
+  `jit::finish_in_interp`): context chaining, traceback entry and propagation mark as in
+  `eval_inner`'s unwinding.
+* A frame object that owns its finished frame (tracebacks) gives the frame back to the
+  frame pool when it dies (a traceback cost a fresh `Box<Frame>` + slot vector for a later
+  call).
+* `obj.__eq__(x)` / `object.__init__(self)`-style calls of slot wrappers (method-wrapper,
+  wrapper_descriptor) go to the wrapper without the tp_call argument tuple
+  (`descr::call_wrapper_fast` from `vectorcall_raw`).
+* `alloc_object` fast path restricted to blocks up to 512 bytes (zeroing needs no library
+  call) with the heap-type reference in a tail call: the fast path saves no registers.
+* `__dict__` materialisation (shape.rs) moves the inline values into the new dict with one
+  bulk fill under one lock (`dict::fill_fresh_steal`; the dict is published before the
+  slots are cleared, so lock-free readers never see a hole).
+* Bytes/bytearray copies: bytearray growth and front deletion copy into uninitialised
+  storage (no calloc zeroing of the part that is copied over, no temporary vector);
+  growth for slice assignment/extend does not zero the bytes it overwrites
+  (`raw_resize_z`); `bytearray.extend(bytes)` without a temporary copy; `bytes[a:b]`,
+  `bytes(buffer)`, bytes concatenation and contiguous memoryview copies copy once into
+  uninitialised storage; `socket.recv(n)` (n > 2 KiB) receives straight into an
+  uninitialised bytes object that is shrunk in place.
+* Lib/asyncio: the socket transport keeps exact `bytes` passed to `write()` without a
+  private copy (they cannot change); `StreamReader._consume` copies once
+  (`bytes(memoryview(buf)[:n])`, or the whole buffer + clear).
+* The executable exports only the C API (`crates/launcher/exports.map`, version script:
+  `Py*`, `_Py*`, `PY_*`, `RPY_*`); `--export-dynamic` alone exported ~3700 internal Rust
+  symbols (.dynstr 325 KB -> 36 KB). `RPY_EXPORT_ALL=1` at build time restores the old
+  behaviour.
+
 ### Start-up and memory
 * `python -c`: the command's source is no longer registered with linecache at start (that
   imported linecache, ~3.4M instructions, 1 ms): it is kept by the runtime and linecache

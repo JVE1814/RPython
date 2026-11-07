@@ -303,8 +303,8 @@ fn self_or_new(o: &PyObject, start: usize, end: usize) -> PyResult {
     if start == 0 && end == d.len() && bytes::is_bytes_exact(o) {
         return Ok(o.to_ref());
     }
-    let v = d[start..end].to_vec();
-    new_like(o, &v)
+    // (perf4) no temporary vector (allocation cannot change `o`)
+    new_like(o, &d[start..end])
 }
 
 /// While alive, a bytearray `self` cannot be resized (methods that call back
@@ -1751,6 +1751,13 @@ pub fn bytes_from_object(x: &PyObject) -> PyResult {
     if bytes::is_bytes_exact(x) {
         return Ok(x.to_ref());
     }
+    if buffer::check_buffer(x) {
+        // (perf4) contiguous buffers are copied once, without a temporary vector
+        let b = BufferView::get(x, buffer::PyBUF_FULL_RO)?;
+        if buffer::is_contiguous(&b.view, b'C') {
+            return bytes::try_new_bytes(b.as_bytes());
+        }
+    }
     bytes::try_new_bytes(&bytes_data_from_object(x)?)
 }
 
@@ -1997,6 +2004,12 @@ fn bytes_subscript_impl(o: &PyObject, k: &PyObject) -> PyResult {
         if start == 0 && step == 1 && len as usize == d.len() && bytes::is_bytes_exact(o) {
             return Ok(o.to_ref());
         }
+        if step == 1 {
+            // (perf4) contiguous slice: one copy, no temporary vector
+            let s = (start.max(0) as usize).min(d.len());
+            let e = (start + len).max(0).min(d.len() as isize) as usize;
+            return bytes::try_new_bytes(&d[s..e.max(s)]);
+        }
         return bytes::try_new_bytes(&slice_bytes(d, start, step, len));
     }
     if ab::has_index(k) {
@@ -2035,7 +2048,7 @@ unsafe extern "C" fn bytes_concat(a: *mut PyObject, b: *mut PyObject) -> *mut Py
                 return Ok(b.to_ref());
             }
             let total = va.len().checked_add(vb.len()).filter(|&t| t <= bytes::MAX_SIZE).ok_or_else(memory_error)?;
-            let r = bytes::try_alloc_bytes(total)?;
+            let r = bytes::try_alloc_bytes_uninit(total)?;
             std::ptr::copy_nonoverlapping(va.as_bytes().as_ptr(), bytes::bytes_ptr(&r), va.len());
             std::ptr::copy_nonoverlapping(vb.as_bytes().as_ptr(), bytes::bytes_ptr(&r).add(va.len()), vb.len());
             Ok(r)

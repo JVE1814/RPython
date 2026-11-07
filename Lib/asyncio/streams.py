@@ -453,8 +453,14 @@ class StreamReader:
             self._waiter = None
 
     def _consume(self, n):
-        chunk = bytes(self._buffer[:n])
-        del self._buffer[:n]
+        if n >= len(self._buffer):
+            chunk = bytes(self._buffer)
+            self._buffer.clear()
+        else:
+            # one copy (slicing the bytearray first would copy twice); the
+            # temporary view is gone before the buffer shrinks
+            chunk = bytes(memoryview(self._buffer)[:n])
+            del self._buffer[:n]
         self._maybe_resume_transport()
         return chunk
 

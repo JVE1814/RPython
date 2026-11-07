@@ -165,6 +165,13 @@ unsafe fn set_storage(o: &PyObject, storage: Option<PyRef>, start: usize, size: 
 /// Change the logical size, keeping the data at the logical start; new bytes
 /// are zeroed. Does not check exports.
 fn raw_resize(o: &PyObject, newsize: usize) -> PyResult<()> {
+    raw_resize_z(o, newsize, true)
+}
+
+/// (perf4) `raw_resize`; with `zero == false` the bytes added at the end are left
+/// unset (the caller overwrites them: slice assignment, extend), only the trailing
+/// NUL is written.
+fn raw_resize_z(o: &PyObject, newsize: usize, zero: bool) -> PyResult<()> {
     unsafe {
         let size = bytearray_len(o);
         if newsize == size && !(*ba(o)).ob_start.is_null() {
@@ -185,7 +192,7 @@ fn raw_resize(o: &PyObject, newsize: usize) -> PyResult<()> {
                 new_alloc = newsize; // major downsize
             } else {
                 let p = bytearray_ptr(o);
-                if newsize > size {
+                if newsize > size && zero {
                     std::ptr::write_bytes(p.add(size), 0, newsize - size);
                 }
                 (*ba(o)).ob_base.ob_size = newsize as isize;
@@ -204,7 +211,11 @@ fn raw_resize(o: &PyObject, newsize: usize) -> PyResult<()> {
             match bytes::resize_unique(old, new_alloc) {
                 Ok(s) => {
                     let p = bytes::bytes_ptr(&s);
-                    std::ptr::write_bytes(p.add(keep), 0, new_alloc + 1 - keep);
+                    if zero {
+                        std::ptr::write_bytes(p.add(keep), 0, new_alloc + 1 - keep);
+                    } else {
+                        *p.add(newsize) = 0;
+                    }
                     s
                 }
                 Err(old) => {
@@ -214,8 +225,15 @@ fn raw_resize(o: &PyObject, newsize: usize) -> PyResult<()> {
                 }
             }
         } else {
-            let s = bytes::try_alloc_bytes(new_alloc)?;
-            std::ptr::copy_nonoverlapping(bytearray_ptr(o), bytes::bytes_ptr(&s), keep);
+            // (perf4) no zeroing of the part that is copied over
+            let s = bytes::try_alloc_bytes_uninit(new_alloc)?;
+            let p = bytes::bytes_ptr(&s);
+            std::ptr::copy_nonoverlapping(bytearray_ptr(o), p, keep);
+            if zero {
+                std::ptr::write_bytes(p.add(keep), 0, new_alloc + 1 - keep);
+            } else {
+                *p.add(newsize) = 0;
+            }
             s
         };
         set_storage(o, Some(storage), 0, newsize);
@@ -549,12 +567,13 @@ fn setslice_linear(o: &PyObject, lo: usize, hi: usize, bytes: &[u8]) -> PyResult
                     // apply the downsize policy
                     let cap = capacity(o);
                     if newsize < cap / 2 || newsize == 0 {
-                        let keep: Vec<u8> = data_unlocked(o).to_vec();
                         if newsize == 0 {
                             set_storage(o, None, 0, 0);
                         } else {
-                            let s = bytes::try_alloc_bytes(newsize)?;
-                            std::ptr::copy_nonoverlapping(keep.as_ptr(), bytes::bytes_ptr(&s), newsize);
+                            // (perf4) copied straight from the old storage (still owned
+                            // until set_storage), no temporary vector, no zeroing
+                            let s = bytes::try_alloc_bytes_uninit(newsize)?;
+                            std::ptr::copy_nonoverlapping(bytearray_ptr(o), bytes::bytes_ptr(&s), newsize);
                             set_storage(o, Some(s), 0, newsize);
                         }
                     } else {
@@ -575,7 +594,9 @@ fn setslice_linear(o: &PyObject, lo: usize, hi: usize, bytes: &[u8]) -> PyResult
         if size.checked_add(growth).is_none_or(|n| n > bytes::MAX_SIZE) {
             return Err(memory_error());
         }
-        resize_nl(o, size + growth)?;
+        // (perf4) the grown part is overwritten below: not zeroed first
+        can_resize(o)?;
+        raw_resize_z(o, size + growth, false)?;
         unsafe {
             let p = bytearray_ptr(o);
             std::ptr::copy(p.add(hi), p.add(hi + growth), size - hi);
@@ -834,6 +855,13 @@ fn m_append(o: &PyObject, item: &PyObject) -> PyResult {
 fn m_extend(o: &PyObject, it: &PyObject) -> PyResult {
     if pystr::is_str(it) {
         raise!(TypeError, "expected iterable of integers; got: 'str'");
+    }
+    if bytes::is_bytes_exact(it) {
+        // (perf4) immutable source: appended without a temporary copy
+        let _g = wlock(o);
+        let size = bytearray_len(o);
+        setslice_linear(o, size, size, bytes::bytes_data(it))?;
+        return Ok(none::none_ref());
     }
     if buffer::check_buffer(it) {
         let n = bytearray_len(o);
