@@ -580,6 +580,7 @@ fn plain_eq_depth(a: &PyObject, b: &PyObject, depth: u32) -> Option<bool> {
     if ta != b.type_ptr() {
         return None;
     }
+    let ta = ta as *mut crate::ffi::PyTypeObject;
     if ta == pystr::str_type() {
         return Some(pystr::str_eq(a, b));
     }
@@ -589,7 +590,8 @@ fn plain_eq_depth(a: &PyObject, b: &PyObject, depth: u32) -> Option<bool> {
     if ta == crate::types::float::float_type() {
         return Some(crate::types::float::float_value(a) == crate::types::float::float_value(b));
     }
-    if ta == tuple::tuple_type() && depth < 16 {
+    // tuples and tuple subclasses that keep tuple equality (namedtuples)
+    if depth < 16 && (ta == tuple::tuple_type() || unsafe { (*ta).tp_richcompare == (*tuple::tuple_type()).tp_richcompare && (*ta).tp_flags & crate::ffi::Py_TPFLAGS_TUPLE_SUBCLASS != 0 }) {
         let (x, y) = (tuple::tuple_items(a), tuple::tuple_items(b));
         if x.len() != y.len() {
             return Some(false);
