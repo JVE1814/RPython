@@ -386,6 +386,66 @@ struct Scanner<'a> {
     sc: &'a ScannerObj,
     s: &'a PyObject,
     d: StrData<'a>,
+    /// Object keys seen during this call (equal keys share one str object). Kept
+    /// here instead of in the scanner's `memo` dict, which the call would empty
+    /// again anyway (perf3).
+    memo: std::cell::RefCell<KeyMemo>,
+}
+
+/// Small open-addressing set of key strs keyed by their (cached) hash.
+#[derive(Default)]
+struct KeyMemo {
+    slots: Vec<*mut PyObject>,
+    len: usize,
+}
+
+impl KeyMemo {
+    /// The memoized str equal to `key`, or `key` itself after remembering it.
+    fn intern(&mut self, key: PyRef) -> PyRef {
+        if self.slots.is_empty() {
+            self.slots = vec![std::ptr::null_mut(); 32];
+        }
+        let h = pystr::str_hash(&key) as usize;
+        let mask = self.slots.len() - 1;
+        let mut i = (h ^ (h >> 17)) & mask;
+        loop {
+            let p = self.slots[i];
+            if p.is_null() {
+                break;
+            }
+            let o = unsafe { &*p };
+            if pystr::str_hash(o) as usize == h && pystr::str_eq(o, &key) {
+                return o.to_ref();
+            }
+            i = (i + 1) & mask;
+        }
+        self.slots[i] = key.to_ref().into_raw();
+        self.len += 1;
+        if self.len * 2 > self.slots.len() {
+            let n2 = self.slots.len() * 2;
+            let old = std::mem::replace(&mut self.slots, vec![std::ptr::null_mut(); n2]);
+            let mask = self.slots.len() - 1;
+            for p in old.into_iter().filter(|p| !p.is_null()) {
+                let h = pystr::str_hash(unsafe { &*p }) as usize;
+                let mut j = (h ^ (h >> 17)) & mask;
+                while !self.slots[j].is_null() {
+                    j = (j + 1) & mask;
+                }
+                self.slots[j] = p;
+            }
+        }
+        key
+    }
+}
+
+impl Drop for KeyMemo {
+    fn drop(&mut self) {
+        for &p in &self.slots {
+            if !p.is_null() {
+                unsafe { crate::object::decref(p) };
+            }
+        }
+    }
 }
 
 const WS: [u32; 4] = [0x20, 0x09, 0x0a, 0x0d];
@@ -495,6 +555,18 @@ impl<'a> Scanner<'a> {
                 i = j;
             }
         }
+        if !is_float && i - start <= 18 {
+            let pi = unsafe { &*self.sc.parse_int };
+            if pi.is(type_obj(int::int_type())) {
+                // machine-word integer: digits accumulated directly
+                let neg = self.d.get(start) == 0x2d;
+                let mut v: i64 = 0;
+                for k in (start + neg as usize)..i {
+                    v = v * 10 + (self.d.get(k) - 0x30) as i64;
+                }
+                return Ok(Some((int::new_int(if neg { -v } else { v }), i)));
+            }
+        }
         let text: String = (start..i).map(|k| self.d.get(k) as u8 as char).collect();
         let v = if is_float {
             let pf = unsafe { &*self.sc.parse_float };
@@ -521,7 +593,8 @@ impl<'a> Scanner<'a> {
         let s = self.s;
         let pairs_hook = opt(self.sc.object_pairs_hook);
         let mut pairs: Vec<(PyRef, PyRef)> = Vec::new();
-        let memo = unsafe { &*self.sc.memo };
+        // without a pairs hook the members go straight into the dict
+        let direct = if pairs_hook.is_none() { Some(dict::new_dict()) } else { None };
         end = self.skip_ws(end);
         if self.at(end) != Some(0x7d) {
             loop {
@@ -530,13 +603,7 @@ impl<'a> Scanner<'a> {
                 }
                 let (key, e) = scan_string(s, &self.d, end + 1, self.sc.strict)?;
                 // key memoization (identical keys share one object)
-                let key = match dict::get_item(memo, &key)? {
-                    Some(k) => k,
-                    None => {
-                        dict::set_item(memo, &key, &key)?;
-                        key
-                    }
-                };
+                let key = self.memo.borrow_mut().intern(key);
                 end = self.skip_ws(e);
                 if self.at(end) != Some(0x3a) {
                     return Err(decode_error("Expecting ':' delimiter", s, end));
@@ -546,7 +613,10 @@ impl<'a> Scanner<'a> {
                     Some(v) => v,
                     None => return Err(decode_error("Expecting value", s, end)),
                 };
-                pairs.push((key, val));
+                match &direct {
+                    Some(d) => dict::set_item(d, &key, &val)?,
+                    None => pairs.push((key, val)),
+                }
                 end = self.skip_ws(e);
                 match self.at(end) {
                     Some(0x7d) => break,
@@ -567,10 +637,10 @@ impl<'a> Scanner<'a> {
             let l = list::new_list(items);
             return Ok((ab::call(h, &[&l])?, end));
         }
-        let d = dict::new_dict_presized(pairs.len());
-        for (k, v) in pairs.iter() {
-            dict::set_item(&d, k, v)?;
-        }
+        let d = match direct {
+            Some(d) => d,
+            None => dict::new_dict(),
+        };
         if let Some(h) = opt(self.sc.object_hook) {
             return Ok((ab::call(h, &[&d])?, end));
         }
@@ -682,22 +752,27 @@ unsafe extern "C" fn scanner_dealloc(o: *mut PyObject) {
 unsafe extern "C" fn scanner_call(o: *mut PyObject, args: *mut PyObject, kw: *mut PyObject) -> *mut PyObject {
     unsafe {
         let r = (|| -> PyResult {
-            let (pos, kwn) = crate::args::kwdict_to_vectorcall(&*args, kw);
-            let refs: Vec<&PyObject> = pos.iter().map(|x| &**x).collect();
-            let p = crate::args::Params::new("scan_once", &["string", "idx"], 0, 2);
-            let [s, idx] = crate::args::parse::<2>(&p, &refs, kwn.as_deref())?;
-            let s = s.unwrap();
+            let (s, idx): (PyRef, PyRef) = if kw.is_null() && tuple::tuple_len(&*args) == 2 {
+                (tuple::tuple_get(&*args, 0).to_ref(), tuple::tuple_get(&*args, 1).to_ref())
+            } else {
+                let (pos, kwn) = crate::args::kwdict_to_vectorcall(&*args, kw);
+                let refs: Vec<&PyObject> = pos.iter().map(|x| &**x).collect();
+                let p = crate::args::Params::new("scan_once", &["string", "idx"], 0, 2);
+                let [s, idx] = crate::args::parse::<2>(&p, &refs, kwn.as_deref())?;
+                (s.unwrap().to_ref(), idx.unwrap().to_ref())
+            };
+            let s: &PyObject = &s;
             if !pystr::is_str(s) {
                 raise!(TypeError, "first argument must be a string, not {}", tname(s));
             }
-            let idx = index_arg(idx.unwrap())?;
+            let idx = index_arg(&idx)?;
             if idx < 0 {
                 raise!(ValueError, "idx cannot be negative");
             }
             let so = &*(o as *const ScannerObj);
-            let sc = Scanner { sc: so, s, d: pystr::str_data(s) };
+            let sc = Scanner { sc: so, s, d: pystr::str_data(s), memo: Default::default() };
             let r = sc.scan_once(idx as usize);
-            dict::clear(&*so.memo);
+            drop(sc);
             match r? {
                 Some((v, e)) => Ok(tuple::tuple2(v, int::new_int(e as i64))),
                 None => Err(stop_iteration(idx)),
