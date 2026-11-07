@@ -1569,16 +1569,20 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                                 Some(k) => Some(k.clone()),
                                 None => None,
                             };
+                            // a callable without vectorcall gets the argument tuple itself (no copy) and the
+                            // keyword dict as is (its keys are the callee's business, as in CPython)
+                            let direct = self_or_null.is_none() && callable.ty().tp_call.is_some() && ab::vectorcall_func(&callable).is_none();
                             if let Some(d) = &kwd {
-                                check_kwargs_keys(d)?;
+                                if !direct && !(self_or_null.is_none() && is_type(&callable)) {
+                                    check_kwargs_keys(d)?;
+                                }
                             }
                             let call_info = if crate::modules::sys::tracing_active() {
                                 crate::modules::sys_trace::before_call(ts, f, &callable, self_or_null.as_deref(), v.first().copied(), false)?
                             } else {
                                 None
                             };
-                            // a callable without vectorcall gets the argument tuple itself (no copy)
-                            let r = if self_or_null.is_none() && callable.ty().tp_call.is_some() && ab::vectorcall_func(&callable).is_none() {
+                            let r = if direct {
                                 ab::call_tp_call(&callable, &args, kwd.as_deref())
                             } else {
                                 ab::call_with_kwargs_dict(&callable, &v, kwd.as_deref())
