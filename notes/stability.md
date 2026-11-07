@@ -173,6 +173,31 @@ type_refcount_drift, deque_race, weakref_race, shared_objects, join_releases).
    (valgrind); monitoring callbacks were released while holding MON (self-deadlock in
    test_free_threading.test_monitoring); `_weakrefset`/`weakref` removal queues were
    drained with check-then-pop (IndexError under threads); heappop could push None.
+11. **Zombie thread states.** `threads::blocking()` and `PyThread_acquire_lock_timed` called
+    `threads::current()`, which *attaches a new state* when the thread has none. A thread
+    waiting on a PyThread lock while detached (Py_BEGIN_ALLOW_THREADS, e.g.
+    `_testcapi.call_in_temporary_c_thread`, and any extension that waits on a lock with
+    the GIL released) got a second state, InVm forever, never polling: every later
+    stop-the-world timed out (no cycle collections: memory growth, 100 ms stalls) and
+    QSBR never released anything (test_no_refcycle_through_target failed in the full
+    test_threading run). Both now leave detached threads alone (`current_ptr()`).
+    `qsbr::quiesce_now` (join) also waits up to 50 ms for running threads to report.
+12. **Extension critical sections = `ob_mutex`** (issue 4): `PyCriticalSection_Begin(op)`
+    locks the object's own `ob_mutex` (CPython's bit protocol), so the runtime's leaf lock
+    (`dict::ob_lock`, used by dict/list/set/bytearray/... operations) waits for another
+    thread's section; the section's own thread passes through (`cs_holds_mutex`, ObGuard
+    with a null mutex). Long leaf-lock waits and PyMutex parking happen in Blocked mode.
+    bitarray's mutable-exporter test: 10/10 (was flaky). Tier-2 TryLock deopts on a held
+    mutex (correct, slower for a thread inside its own section).
+13. `_PyTuple_Resize` on a shared tuple moved the items out of it (test_capi passed a code
+    constant: crash later in test_tuple); now SystemError unless refcount 1 or empty.
+    `PyUnstable_Object_ClearWeakRefsNoCallbacks` called the callbacks. `_BytesIOBuffer`
+    getbuffer with NULL view/source (test_capi.test_misc crash).
+14. Coordinator run-7 list: (1) deque race — fixed (item 4); (2) multiprocessing manager
+    heap corruption — the likely causes (unlocked file objects/deque/Condition waiters) are
+    fixed, see results; (3) test_capi crash after "text[\udc80]" — it was test_tuple
+    (item 13); test_capi now runs to the end; (4) test_itertools — passes (9 ordinary
+    failures); the old binary died with "stack smashing detected".
 10. `RPY_TLAB_CHECK=1` (tlab.rs): stamps freed small blocks and aborts on a double free
     (use with RPYTHON_JIT=0). tools/wheels/run_numpy_tests.sh passed its own arguments to
     pytest (fixed).
