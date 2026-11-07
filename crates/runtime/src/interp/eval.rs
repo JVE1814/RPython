@@ -808,7 +808,9 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                     match op {
                         Op::Nop | Op::Resume => {
                             if op == Op::Resume { adapt!(rpy_compiler::wordcode::opcodes::RESUME_CHECK); }
-                            let eb = ts.c.eval_breaker.load(std::sync::atomic::Ordering::Relaxed);
+                            // not when resuming after `yield from` / `await` (arg 2, 3): a pending
+                            // signal is then raised in the innermost generator, where the value goes
+                            let eb = if op == Op::Resume && arg >= 2 { 0 } else { ts.c.eval_breaker.load(std::sync::atomic::Ordering::Relaxed) };
                             if eb != 0 {
                                 handle_eval_breaker(ts)?;
                             }
@@ -1299,7 +1301,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                                 // length: long loop bodies get compiled after fewer iterations)
                                 cd.backedge_count.fetch_add(1 + ((pc - arg as usize) / 32) as u32, std::sync::atomic::Ordering::Relaxed);
                                 let eb = ts.c.eval_breaker.load(std::sync::atomic::Ordering::Relaxed);
-                                if eb != 0 {
+                                if eb != 0 && !jumps_back_to_send(&cd.code, arg as usize) {
                                     handle_eval_breaker(ts)?;
                                 }
                                 // jit workstream: on-stack replacement into compiled code
@@ -2367,4 +2369,12 @@ pub(crate) fn exec_misc(ts: &ThreadState, f: &mut Frame, cd: &crate::types::code
         _ => unreachable!("exec_misc: {:?}", op),
     }
     Ok(())
+}
+
+/// The backward jump that closes a `yield from` / `await` loop (CPython's
+/// JUMP_BACKWARD_NO_INTERRUPT, which goes back to the SEND): pending signals are not
+/// handled there, so that they are raised in the innermost generator.
+#[cold]
+fn jumps_back_to_send(code: &[u32], target: usize) -> bool {
+    code.get(target).is_some_and(|&w| bc::decode(w).0 == Op::Send)
 }

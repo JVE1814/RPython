@@ -831,10 +831,21 @@ unsafe extern "C" fn gen_finalize(o: *mut PyObject) {
                 crate::modules::sys::write_unraisable_with_obj("Exception ignored while finalizing generator", Some(oo));
             }
         } else if gen_close(oo).is_err() {
-            crate::modules::sys::write_unraisable_with_obj(
-                &format!("Exception ignored while closing {}", kind_name(oo)),
-                Some(oo),
-            );
+            // the message names the object (its repr), there is no separate object
+            let failure = take_exc();
+            let shown = ab::repr_string(oo).unwrap_or_else(|_| {
+                clear_exc();
+                String::new()
+            });
+            if let Some(f) = failure {
+                set_exc(f);
+            }
+            let msg = if shown.is_empty() {
+                format!("Exception ignored while closing {}", kind_name(oo))
+            } else {
+                format!("Exception ignored while closing {} {}", kind_name(oo), shown)
+            };
+            crate::modules::sys::write_unraisable_with_obj(&msg, None);
         }
         if let Some(s) = saved {
             set_exc(s);
@@ -959,6 +970,23 @@ fn get_running(o: &PyObject) -> PyResult {
 pub fn get_suspended(o: &PyObject) -> PyResult {
     let gn = g(o);
     Ok(crate::types::bool_::new_bool(!gn.frame.is_null() && unsafe { (*gn.frame).state == FrameState::Suspended }))
+}
+/// `gi_state`: the generator's state under the names inspect.getgeneratorstate() uses.
+fn get_gen_state(o: &PyObject) -> PyResult {
+    let gn = g(o);
+    let state = if gn.running {
+        "GEN_RUNNING"
+    } else if gn.frame.is_null() {
+        "GEN_CLOSED"
+    } else {
+        match unsafe { (*gn.frame).state } {
+            FrameState::Created => "GEN_CREATED",
+            FrameState::Executing => "GEN_RUNNING",
+            FrameState::Suspended => "GEN_SUSPENDED",
+            FrameState::Completed | FrameState::Cleared => "GEN_CLOSED",
+        }
+    };
+    Ok(crate::types::str::new_str(state))
 }
 fn get_code(o: &PyObject) -> PyResult {
     unsafe { Ok(PyRef::from_borrowed(g(o).code)) }
@@ -1135,6 +1163,7 @@ pub fn init_types() {
             ("gi_frame", get_frame),
             ("gi_running", get_running),
             ("gi_suspended", get_suspended),
+            ("gi_state", get_gen_state),
             ("gi_code", get_code),
             ("gi_yieldfrom", get_yieldfrom),
         ];
