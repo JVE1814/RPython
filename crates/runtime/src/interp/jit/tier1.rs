@@ -994,6 +994,19 @@ impl<'a> Gen<'a> {
                 self.a.mov_ri(Rax, ST_ERROR as i64);
                 self.a.jmp(self.exit);
             }
+            // (perf6) the exception-handler instructions through their own helpers (the
+            // generic exec_misc dispatch cost ~170 instructions each)
+            Op::PushExcInfo | Op::PopExcept if super::misc_enabled() => {
+                self.a.mov_rr(Rdi, R13);
+                self.lea_sp(Rsi, d);
+                self.call(if ins.op == Op::PushExcInfo { addr!(h::h_push_exc_info) } else { addr!(h::h_pop_except) });
+            }
+            Op::CheckExcMatch if super::misc_enabled() => {
+                self.set_lasti(pc);
+                self.lea_sp(Rdi, d);
+                self.call(addr!(h::h_check_exc_match));
+                self.check(pc, d - 1);
+            }
             // instructions shared with the interpreter (eval::exec_misc)
             op if crate::interp::eval::is_misc(op) && super::misc_enabled() => {
                 let pops = match op {
