@@ -170,6 +170,26 @@ fn test_bit_length(_m: &PyObject) -> PyResult {
     Ok(none::none_ref())
 }
 
+/// _PyLong_NumBits and PyLong_GetSign on values around 30-bit digit boundaries.
+fn test_long_numbits(_m: &PyObject) -> PyResult {
+    for mag in [0i64, 1, 5, 8, (1 << 15) - 1, 1 << 15, (1 << 30) - 1, 1 << 30, (1 << 31) + 7, (1 << 60) - 1, 1 << 60, i64::MAX] {
+        let nbits = 64 - mag.leading_zeros() as i64;
+        for v in [mag, -mag] {
+            unsafe {
+                let o = crate::capi::long::PyLong_FromLongLong(v);
+                check!(!o.is_null(), "PyLong_FromLongLong({}) failed", v);
+                let n = crate::capi::long::_PyLong_NumBits(o);
+                let mut sign: std::ffi::c_int = -7;
+                let r = crate::capi::long::PyLong_GetSign(o, &mut sign);
+                decref(o);
+                check!(n == nbits, "_PyLong_NumBits({}) == {}, expected {}", v, n, nbits);
+                check!(r == 0 && sign == v.signum() as std::ffi::c_int, "PyLong_GetSign({}) gave {}", v, sign);
+            }
+        }
+    }
+    Ok(none::none_ref())
+}
+
 // ---------------------------------------------------------------- hash tables
 
 /// The runtime's hash tables: dict (open addressing with deletions and colliding
@@ -980,6 +1000,7 @@ pub fn methods() -> *mut PyMethodDef {
         ("test_popcount", NOARGS, test_popcount),
         ("test_bit_length", NOARGS, test_bit_length),
         ("test_hashtable", NOARGS, test_hashtable),
+        ("test_long_numbits", NOARGS, test_long_numbits),
         ("test_edit_cost", NOARGS, test_edit_cost),
         ("test_bytes_find", NOARGS, test_bytes_find),
         ("test_tstate_capi", NOARGS, test_tstate_capi),

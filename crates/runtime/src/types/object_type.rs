@@ -441,11 +441,16 @@ pub unsafe extern "C" fn type_vectorcall(
             }
             if tp == list::list_type() {
                 // exact-size copies of lists and tuples (like list.__init__)
+                // (capi3) with list.__init__'s slot rounding (list::reserve)
                 if tuple::is_tuple_exact(a) {
-                    return list::new_list_from_slice(tuple::tuple_items(a)).into_raw();
+                    let l = list::new_list_from_slice(tuple::tuple_items(a));
+                    list::reserve(&l, list::list_len(&l));
+                    return l.into_raw();
                 }
                 if list::is_list_exact(a) {
-                    return list::list_copy(a).into_raw();
+                    let l = list::list_copy(a);
+                    list::reserve(&l, list::list_len(&l));
+                    return l.into_raw();
                 }
             }
         }
@@ -1178,7 +1183,13 @@ fn type_dir(o: &PyObject) -> PyResult {
 }
 fn type_sizeof(o: &PyObject) -> PyResult {
     let tp = t(o);
-    let n = if is_heap_type(tp) { std::mem::size_of::<PyHeapTypeObject>() } else { std::mem::size_of::<PyTypeObject>() };
+    let mut n = if is_heap_type(tp) { std::mem::size_of::<PyHeapTypeObject>() } else { std::mem::size_of::<PyTypeObject>() };
+    if is_heap_type(tp) && unsafe { (*tp).tp_flags } & Py_TPFLAGS_INLINE_VALUES != 0 {
+        // (capi3) a class whose instances keep inline values owns the table that names
+        // their attributes (our shapes); reported as the fixed-capacity shared-keys block
+        // free-threaded CPython allocates for it: header, 64 index bytes, 42 entries
+        n += 32 + 64 + 42 * 16;
+    }
     Ok(int::new_int(n as i64))
 }
 fn type_or(a: &PyObject, b: &PyObject) -> PyResult {

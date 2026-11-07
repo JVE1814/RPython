@@ -392,13 +392,13 @@ fn sys_intern(_m: &PyObject, s: &PyObject) -> PyResult {
     if !pystr::is_str_exact(s) {
         raise!(TypeError, "intern() argument must be str, not {}", crate::types::typeobject::tname(s));
     }
-    Ok(pystr::intern(s.to_ref()))
+    Ok(pystr::intern_requested(s.to_ref())) // (capi3)
 }
 fn sys_is_interned(_m: &PyObject, s: &PyObject) -> PyResult {
     if !pystr::is_str(s) {
         raise!(TypeError, "_is_interned() argument must be str, not {}", crate::types::typeobject::tname(s));
     }
-    Ok(bool_::new_bool(pystr::is_interned(s)))
+    Ok(bool_::new_bool(pystr::is_interned_here(s)))
 }
 fn sys_is_immortal(_m: &PyObject, o: &PyObject) -> PyResult {
     Ok(bool_::new_bool(o.is_immortal()))

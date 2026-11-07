@@ -304,6 +304,9 @@ pub struct DictIter {
     used: isize,
     pos: isize,
     len: isize,
+    /// (capi3) unused; keeps the object the size of CPython's dict iterator, which
+    /// sys.getsizeof reports
+    _reserved: usize,
 }
 
 #[unsafe(no_mangle)]
