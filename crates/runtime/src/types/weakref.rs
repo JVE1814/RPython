@@ -395,7 +395,7 @@ impl DetachedWeakrefs {
 /// any Python code or releasing anything (usable while the world is stopped).
 pub unsafe fn detach_weakrefs_for_gc(garbage: &[*mut PyObject], callbacks_only: bool) -> DetachedWeakrefs {
     unsafe {
-        let set: std::collections::HashSet<usize> = garbage.iter().map(|&p| p as usize).collect();
+        let set: crate::gc::PtrSet = garbage.iter().map(|&p| p as usize).collect();
         let mut pending: Vec<(PyRef, PyRef)> = Vec::new();
         let mut dropped: Vec<PyRef> = Vec::new();
         {

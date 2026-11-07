@@ -285,6 +285,34 @@ pub fn call_with_kwargs_dict(callable: &PyObject, args: &[&PyObject], kw: Option
     }
 }
 
+/// CALL_FUNCTION_EX with the positional arguments already in an exact tuple
+/// (perf3): callables without vectorcall get that tuple as is (no vector, no second
+/// tuple); others get a stack vector.
+pub fn call_ex_tuple(callable: &PyObject, self_or_null: Option<&PyObject>, args: &PyObject, kw: Option<&PyObject>) -> PyResult {
+    let kw = kw.filter(|k| dict::dict_len(k) > 0);
+    let items = tuple::tuple_items(args);
+    if self_or_null.is_none() && vectorcall_func(callable).is_none() && callable.ty().tp_call.is_some() {
+        return call_tp_call(callable, args, kw);
+    }
+    let n = items.len() + self_or_null.is_some() as usize;
+    if n <= 8 {
+        let mut buf: [&PyObject; 8] = [callable; 8];
+        let mut i = 0;
+        if let Some(s) = self_or_null {
+            buf[0] = s;
+            i = 1;
+        }
+        buf[i..n].copy_from_slice(items);
+        return call_with_kwargs_dict(callable, &buf[..n], kw);
+    }
+    let mut v: Vec<&PyObject> = Vec::with_capacity(n);
+    if let Some(s) = self_or_null {
+        v.push(s);
+    }
+    v.extend_from_slice(items);
+    call_with_kwargs_dict(callable, &v, kw)
+}
+
 /// Call `f` (found on the type) with `self_` prepended, avoiding a bound method
 /// for plain functions and method descriptors.
 pub fn call_unbound(f: &PyObject, self_: &PyObject, args: &[&PyObject]) -> PyResult {
@@ -1203,6 +1231,9 @@ pub fn collect_iterable(o: &PyObject) -> PyResult<Vec<PyRef>> {
     if list::is_list_exact(o) {
         return Ok(list::list_to_vec(o));
     }
+    if crate::types::set::is_anyset_exact(o) {
+        return Ok(crate::types::set::set_items(o));
+    }
     let it = get_iter(o)?;
     let mut v = Vec::new();
     if let Ok(n) = length_hint(o, 0) {
@@ -1252,6 +1283,9 @@ pub fn length_hint(o: &PyObject, default: usize) -> PyResult<usize> {
 pub fn sequence_tuple(o: &PyObject) -> PyResult {
     if tuple::is_tuple_exact(o) {
         return Ok(o.to_ref());
+    }
+    if list::is_list_exact(o) {
+        return Ok(list::list_to_tuple(o));
     }
     Ok(tuple::new_tuple(collect_iterable(o)?))
 }

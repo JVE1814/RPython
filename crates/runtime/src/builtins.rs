@@ -466,6 +466,11 @@ fn minmax(args: &[&PyObject], kw: Option<&PyObject>, op: std::ffi::c_int, fname:
         }
         pos.iter().map(|x| x.to_ref()).collect()
     };
+    if key.is_none() && items.len() > 1 {
+        if let Some(i) = minmax_plain(&items, op == Py_GT) {
+            return Ok(items[i].clone());
+        }
+    }
     let mut best: Option<(PyRef, PyRef)> = None;
     for it in items {
         let k = match &key {
@@ -489,6 +494,45 @@ fn minmax(args: &[&PyObject], kw: Option<&PyObject>, op: std::ffi::c_int, fname:
         },
     }
 }
+/// Index of the first minimum (or maximum) when every item is a machine-sized exact
+/// int, or every item is an exact float: no comparison can run Python code then, so
+/// the values are compared directly. None for any other mix.
+fn minmax_plain(items: &[PyRef], want_max: bool) -> Option<usize> {
+    use crate::types::{float, int};
+    let first = &items[0];
+    if int::is_int_exact(first) && int::is_compact(first) {
+        let mut best = int::compact_value(first);
+        let mut at = 0;
+        for (i, it) in items.iter().enumerate().skip(1) {
+            if !int::is_int_exact(it) || !int::is_compact(it) {
+                return None;
+            }
+            let v = int::compact_value(it);
+            if if want_max { v > best } else { v < best } {
+                best = v;
+                at = i;
+            }
+        }
+        return Some(at);
+    }
+    if float::is_float_exact(first) {
+        let mut best = float::float_value(first);
+        let mut at = 0;
+        for (i, it) in items.iter().enumerate().skip(1) {
+            if !float::is_float_exact(it) {
+                return None;
+            }
+            let v = float::float_value(it);
+            if if want_max { v > best } else { v < best } {
+                best = v;
+                at = i;
+            }
+        }
+        return Some(at);
+    }
+    None
+}
+
 fn b_min(_m: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
     minmax(args, kw, Py_LT, "min")
 }

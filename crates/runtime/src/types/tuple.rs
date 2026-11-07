@@ -330,21 +330,42 @@ fn tuple_getitem(o: &PyObject, k: &PyObject) -> PyResult {
 unsafe extern "C" fn tuple_subscript(o: *mut PyObject, k: *mut PyObject) -> *mut PyObject {
     unsafe { into_c(tuple_getitem(&*o, &*k)) }
 }
+/// Lexicographic comparison of two item sequences that stay alive meanwhile.
+fn compare_items(x: &[&PyObject], y: &[&PyObject], op: c_int) -> PyResult<bool> {
+    if (op == Py_EQ || op == Py_NE) && x.len() != y.len() {
+        return Ok(op == Py_NE);
+    }
+    for (a, b) in x.iter().zip(y.iter()) {
+        if a.is(b) || ab::rich_compare_bool(a, b, Py_EQ)? {
+            continue;
+        }
+        return match op {
+            Py_EQ => Ok(false),
+            Py_NE => Ok(true),
+            _ => ab::rich_compare_bool(a, b, op),
+        };
+    }
+    let (la, lb) = (x.len(), y.len());
+    Ok(match op {
+        Py_LT => la < lb,
+        Py_LE => la <= lb,
+        Py_EQ => la == lb,
+        Py_NE => la != lb,
+        Py_GT => la > lb,
+        _ => la >= lb,
+    })
+}
+
 unsafe extern "C" fn tuple_richcompare(a: *mut PyObject, b: *mut PyObject, op: c_int) -> *mut PyObject {
     unsafe {
         let (a, b) = (&*a, &*b);
         if !is_tuple(b) || !is_tuple(a) {
             return none::not_implemented().to_ref().into_raw();
         }
+        // tuples are immutable and both are alive for the whole call: compare the
+        // item slices directly (perf3: no per-item closures and reference counts)
         let (x, y) = (tuple_items(a), tuple_items(b));
-        let r = crate::types::list::seq_richcompare(
-            &|i| x.get(i).map(|o| o.to_ref()),
-            &|| x.len(),
-            &|i| y.get(i).map(|o| o.to_ref()),
-            &|| y.len(),
-            op,
-        );
-        into_c(r.map(bool_::new_bool))
+        into_c(compare_items(x, y, op).map(bool_::new_bool))
     }
 }
 unsafe extern "C" fn tuple_contains(a: *mut PyObject, v: *mut PyObject) -> c_int {

@@ -199,6 +199,11 @@ def loads(s, *, cls=None, object_hook=None, parse_float=None,
         raise TypeError(f'the JSON object must be str, bytes or bytearray, '
                         f'not {type(s).__name__}')
 
+    # the common call with no hooks needs no option mappings
+    if (cls is None and object_hook is None and parse_float is None
+            and parse_int is None and parse_constant is None
+            and object_pairs_hook is None and array_hook is None and not kw):
+        return _shared_decoder.decode(s)
     hooks = dict(object_hook=object_hook, parse_float=parse_float,
                  parse_int=parse_int, parse_constant=parse_constant,
                  object_pairs_hook=object_pairs_hook, array_hook=array_hook)

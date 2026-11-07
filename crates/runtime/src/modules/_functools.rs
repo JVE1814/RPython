@@ -653,11 +653,15 @@ fn lobj(o: &PyObject) -> &mut LruWrapper {
     unsafe { &mut *(o.as_ptr() as *mut LruWrapper) }
 }
 
-fn make_key(args: &[&PyObject], kw: Option<&PyObject>, typed: bool) -> PyResult {
+fn make_key(args: &[&PyObject], args_tuple: Option<&PyObject>, kw: Option<&PyObject>, typed: bool) -> PyResult {
     let kw = kw.filter(|k| dict::dict_len(k) > 0);
     if kw.is_none() && !typed {
         if args.len() == 1 && (pystr::is_str_exact(args[0]) || int::is_int_exact(args[0])) {
             return Ok(args[0].to_ref());
+        }
+        // the (immutable) argument tuple itself serves as the key
+        if let Some(t) = args_tuple.filter(|t| tuple::is_tuple_exact(t)) {
+            return Ok(t.to_ref());
         }
         return Ok(tuple::new_tuple(args.iter().map(|x| x.to_ref()).collect()));
     }
@@ -681,14 +685,19 @@ fn make_key(args: &[&PyObject], kw: Option<&PyObject>, typed: bool) -> PyResult 
     Ok(tuple::new_tuple(v))
 }
 
-fn lru_call_impl(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
+/// The wrapper's lock while more than one thread exists.
+fn lru_guard(o: &PyObject) -> Option<dict::ObGuard> {
+    if crate::qsbr::multi_threaded() { Some(dict::ob_lock(o)) } else { None }
+}
+
+fn lru_call_impl(o: &PyObject, args: &[&PyObject], args_tuple: Option<&PyObject>, kw: Option<&PyObject>) -> PyResult {
     let w = lobj(o);
     let func = unsafe { (*w.func).to_ref() };
     if w.maxsize == 0 {
         w.misses += 1;
         return ab::call_with_kwargs_dict(&func, args, kw);
     }
-    let key = make_key(args, kw, w.typed)?;
+    let key = make_key(args, args_tuple, kw, w.typed)?;
     let hash = ab::hash(&key)?;
     let cache = unsafe { (*w.cache).to_ref() };
     if w.maxsize < 0 {
@@ -702,7 +711,10 @@ fn lru_call_impl(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyR
         dict::set_item_hash(&cache, &key, hash, &r)?;
         return Ok(r);
     }
-    // bounded
+    // bounded: the node list is plain Rust data shared by all callers; once a
+    // second thread exists its updates (and the matching dict updates) run under
+    // the wrapper's lock (perf3: concurrent misses corrupted the heap)
+    let guard = lru_guard(o);
     if let Some(ix) = dict::get_item_hash(&cache, &key, hash)? {
         let i = int::as_i64(&ix).unwrap_or(0) as usize;
         let l = unsafe { &mut *lobj(o).list };
@@ -714,7 +726,9 @@ fn lru_call_impl(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyR
         }
     }
     lobj(o).misses += 1;
+    drop(guard);
     let result = ab::call_with_kwargs_dict(&func, args, kw)?;
+    let guard = lru_guard(o);
     let w = lobj(o);
     // The call may have re-entered and already cached this key.
     if dict::get_item_hash(&cache, &key, hash)?.is_some() {
@@ -746,6 +760,7 @@ fn lru_call_impl(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyR
         return Err(e);
     }
     l.append(i);
+    drop(guard);
     drop(okey);
     drop(oresult);
     Ok(result)
@@ -758,7 +773,7 @@ unsafe extern "C" fn lru_call(o: *mut PyObject, args: *mut PyObject, kw: *mut Py
         if crate::interp::enter_recursive_call(ts, " while calling a Python object").is_err() {
             return std::ptr::null_mut();
         }
-        let r = lru_call_impl(o, targs(args), opt(kw));
+        let r = lru_call_impl(o, targs(args), if args.is_null() { None } else { Some(&*args) }, opt(kw));
         crate::interp::leave_recursive_call(ts);
         into_c(r)
     }
@@ -813,6 +828,7 @@ fn lru_cache_info(o: &PyObject) -> PyResult {
 }
 
 fn lru_cache_clear(o: &PyObject) -> PyResult {
+    let guard = lru_guard(o);
     let w = lobj(o);
     w.hits = 0;
     w.misses = 0;
@@ -820,6 +836,7 @@ fn lru_cache_clear(o: &PyObject) -> PyResult {
     // Replace the dict first so re-entrant code sees an empty cache.
     let oldd = unsafe { (*w.cache).to_ref() };
     unsafe { fc::set_field(&raw mut w.cache, Some(dict::new_dict())) };
+    drop(guard);
     dict::clear(&oldd);
     drop(old);
     Ok(fc::none())

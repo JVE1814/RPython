@@ -527,7 +527,12 @@ pub fn items_with_hash(o: &PyObject) -> Vec<(PyRef, isize)> {
     v
 }
 pub fn set_items(o: &PyObject) -> Vec<PyRef> {
-    items_with_hash(o).into_iter().map(|(k, _)| k).collect()
+    ensure_init(o);
+    let _g = if can_borrow(o) { None } else { Some(ob_lock(o)) };
+    let s = so(o);
+    let mut v = Vec::with_capacity(s.used as usize);
+    v.extend(live_entries(s).map(|e| unsafe { PyRef::from_borrowed(e.key) }));
+    v
 }
 
 pub fn clear(o: &PyObject) {

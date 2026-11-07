@@ -606,7 +606,7 @@ pub(super) fn call_intrinsic1(ts: &ThreadState, f: &mut Frame, which: u32, v: Py
             }
         }
         Intrinsic1::UnaryPositive => ab::positive(&v),
-        Intrinsic1::ListToTuple => Ok(tuple::new_tuple(list::list_to_vec(&v))),
+        Intrinsic1::ListToTuple => Ok(list::list_to_tuple(&v)),
         Intrinsic1::TypeVar => crate::types::typevar::make_typevar(&v, None, None, false),
         Intrinsic1::ParamSpec => crate::types::typevar::make_paramspec(&v),
         Intrinsic1::TypeVarTuple => crate::types::typevar::make_typevartuple(&v),
@@ -1238,12 +1238,9 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                         Op::ListExtend => {
                             let it = popref!(f);
                             let l = peek!(f, arg as usize);
-                            match ab::collect_iterable(&it) {
-                                Ok(v) => {
-                                    for x in v {
-                                        list::append(unsafe { &*l }, x);
-                                    }
-                                }
+                            // perf3: list::extend copies tuples/lists without a temporary vector
+                            match list::extend(unsafe { &*l }, &it) {
+                                Ok(()) => {}
                                 Err(e) => {
                                     if exc_matches(exc::TypeError()) && it.ty().tp_iter.is_none() && !is_sequence_like(&it) {
                                         clear_exc();
@@ -1532,11 +1529,6 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                                     }
                                 }
                             };
-                            let mut v: Vec<&PyObject> = Vec::with_capacity(tuple::tuple_len(&args) + 1);
-                            if let Some(s) = &self_or_null {
-                                v.push(s);
-                            }
-                            v.extend(tuple::tuple_items(&args).iter().copied());
                             let kwd = match &kw {
                                 Some(k) if !dict::is_dict(k) => {
                                     let d = dict::new_dict();
@@ -1550,11 +1542,13 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                                 check_kwargs_keys(d)?;
                             }
                             let call_info = if crate::modules::sys::tracing_active() {
-                                crate::modules::sys_trace::before_call(ts, f, &callable, self_or_null.as_deref(), v.first().copied(), false)?
+                                let first = self_or_null.as_deref().or_else(|| tuple::tuple_items(&args).first().copied());
+                                crate::modules::sys_trace::before_call(ts, f, &callable, self_or_null.as_deref(), first, false)?
                             } else {
                                 None
                             };
-                            let r = ab::call_with_kwargs_dict(&callable, &v, kwd.as_deref());
+                            // perf3: tuple passed through to tp_call callables, no heap vector
+                            let r = ab::call_ex_tuple(&callable, self_or_null.as_deref(), &args, kwd.as_deref());
                             if let Some(info) = call_info {
                                 crate::modules::sys_trace::after_call(ts, f, info, r.is_ok())?;
                             }
