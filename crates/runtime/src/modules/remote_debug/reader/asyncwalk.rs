@@ -71,7 +71,8 @@ fn frame_delegate(st: &RdState, frame: u64) -> PyResult<u64> {
     if slots == 0 {
         return Ok(0);
     }
-    ptr(st, slots + ((stack_top - 1) as u64) * 8)
+    // (tail4) value-stack slots may hold borrowed references tagged in bit 0 (refs1)
+    Ok(ptr(st, slots + ((stack_top - 1) as u64) * 8)? & !1)
 }
 
 /// Does `obj` have one of the generator/coroutine/asend/athrow types (something whose
