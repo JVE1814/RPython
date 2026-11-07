@@ -236,9 +236,14 @@ fn emit_warning_m(
     };
     let m = pystr::new_str(msg);
     let f = pystr::new_str(filename);
-    let derived = if module.is_none() { module_name_for_file(filename) } else { None };
-    let module = module.or(derived.as_deref());
-    let r = crate::modules::_warnings::warn_explicit(cat, &m, &f, lineno as i64, module, None);
+    let r = match module {
+        // compile(..., module=...): filters match exactly that name
+        Some(given) => crate::modules::_warnings::warn_explicit_exact_module(cat, &m, &f, lineno as i64, given),
+        None => {
+            let derived = module_name_for_file(filename);
+            crate::modules::_warnings::warn_explicit(cat, &m, &f, lineno as i64, derived.as_deref(), None)
+        }
+    };
     if r.is_err() {
         if exc_matches(cat) {
             clear_exc();

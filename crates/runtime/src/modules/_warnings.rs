@@ -207,11 +207,25 @@ pub fn module_names_of_path(filename: &str) -> Vec<String> {
 
 /// A filter's module pattern matches the module name, or (for a warning
 /// located in a file) one of the dotted names the file path stands for.
+thread_local! {
+    /// Set while a warning with a caller-chosen module name (compile(..., module=...)) is
+    /// filtered: only that name is matched, not the names derived from the file path.
+    static EXACT_MODULE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// warn_explicit() for a warning whose module name the caller chose explicitly.
+pub fn warn_explicit_exact_module(category: *mut PyTypeObject, msg: &PyObject, filename: &PyObject, lineno: i64, module: &PyObject) -> PyResult<()> {
+    let prev = EXACT_MODULE.with(|c| c.replace(true));
+    let r = warn_explicit(category, msg, filename, lineno, Some(module), None);
+    EXACT_MODULE.with(|c| c.set(prev));
+    r
+}
+
 fn module_matches(pattern: &PyObject, module: &PyObject, filename: &PyObject) -> PyResult<bool> {
     if check_matched(pattern, module)? {
         return Ok(true);
     }
-    if pattern.is(none::none()) || !pystr::is_str(filename) {
+    if pattern.is(none::none()) || !pystr::is_str(filename) || EXACT_MODULE.with(|c| c.get()) {
         return Ok(false);
     }
     for cand in module_names_of_path(&pystr::to_string_lossy(filename)) {
