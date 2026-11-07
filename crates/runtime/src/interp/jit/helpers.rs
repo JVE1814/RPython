@@ -1072,7 +1072,7 @@ pub unsafe extern "C" fn h_call_ex(sp: *mut *mut PyObject) -> u64 {
             // keyword dict as they are
             let direct = self_or_null.is_none() && callable.ty().tp_call.is_some() && ab::vectorcall_func(&callable).is_none();
             if let Some(d) = &kwd {
-                if !direct {
+                if !direct && !(self_or_null.is_none() && crate::types::typeobject::is_type(&callable)) {
                     st(eval::check_kwargs_keys(d))?;
                 }
             }
