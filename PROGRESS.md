@@ -82,6 +82,7 @@ Ours (tools/run_tests.sh, 434 modules):
 | 8 | 0b5f6a0 (jit5+core5, pre-lib6) | 280 | 144 | 3 | 7 | 42,339 | 275 | 2,485 |
 | 9 | 433df5d (jit6+interp1, pre-stability2) | 288 | 135 | 6 | 5 | 42,388 | 224 | 2,486 |
 | 10 | 55e6237 (stability2+perf3, pre-hang1) | 292 | 134 | 0 | 8 | 43,012 | 225 | 2,492 |
+| 11 | 9af79cb (hang1, pre-wheels2/core6) | 294 | 140 | 0 | 0 | 49,781 | 674 (241 excl. test_capi) | 3,200 |
 Run 7 (pre-core4): crashes = test_capi (segfault after a lone-surrogate print), test_free_threading
 (deque race, test_collections), test_itertools (flaky; passes now), test_multiprocessing_fork/spawn
 (heap corruption in test_manager); timeouts = asyncio, cmd_line_script, os, subprocess. Largest
@@ -93,6 +94,9 @@ subprocess. Largest failure counts: importlib 20, call 17, inspect 15, dict 8, c
 Run 9: crashes = test_free_threading (io heap corruption), test_functools (lru_cache race; fixed since), test_super
 (__class__ assignment race), test_multiprocessing_fork/forkserver/spawn; timeouts = asyncio, capi, cmd_line_script,
 os, subprocess. Largest failure counts: importlib 20, call 17, inspect 15, dict 8, concurrent_futures 7.
+Run 11: no crashes, no timeouts. The jump in failures is test_capi (433), which timed out in run 10 and now finishes in 89 s
+(capi2 is on it). Excluding it: 241 failures (225 in run 10; test_asyncio, cmd_line_script, multiprocessing_*, os were
+also timeouts before). Top remaining: importlib 20, call 17, inspect 15 (both 0 after core6), asyncio 10, dict 8.
 Run 10: no crashes. Timeouts = asyncio, capi, cmd_line_script, multiprocessing_fork/forkserver/spawn, os, subprocess
 (all fixed by hang1 since: each now finishes in 8–130 s). test_free_threading runs to completion (6 behavioural failures).
 Run 3 top blockers: array (39 modules), http (21), urllib (12), multiprocessing (11),
