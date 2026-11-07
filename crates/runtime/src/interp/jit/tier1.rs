@@ -1999,7 +1999,20 @@ pub fn compile_mode(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crat
 /// every other general register and xmm0-15, whatever the stack alignment at entry.
 pub(crate) fn incref_sharded_routine() -> Option<usize> {
     static R: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *R.get_or_init(|| {
+    *R.get_or_init(|| preserving_routine(h::h_incref_sharded as usize))
+}
+
+/// (scale1) Same calling convention: unlock the `ob_mutex` of the object in rdi when
+/// waiters may be parked on it (tier-2 inline Unlock).
+pub(crate) fn unlock_slow_routine() -> Option<usize> {
+    static R: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *R.get_or_init(|| preserving_routine(h::h_ob_unlock_slow as usize))
+}
+
+/// A routine calling `target(rdi)` that preserves every other general register and
+/// xmm0-15 and aligns the stack itself.
+fn preserving_routine(target: usize) -> Option<usize> {
+    {
         let mut a = Asm::new();
         a.push(Rbp);
         a.mov_rr(Rbp, Rsp);
@@ -2011,7 +2024,7 @@ pub(crate) fn incref_sharded_routine() -> Option<usize> {
         for k in 0..16u8 {
             a.movsd_store(M(Rsp, 8 * k as i32), X(k));
         }
-        a.call_abs(h::h_incref_sharded as usize);
+        a.call_abs(target);
         for k in 0..16u8 {
             a.movsd_load(X(k), M(Rsp, 8 * k as i32));
         }
@@ -2024,7 +2037,7 @@ pub(crate) fn incref_sharded_routine() -> Option<usize> {
         a.ret();
         a.resolve().ok()?;
         crate::interp::jit::mem::install(&a.buf, |_, _| {})
-    })
+    }
 }
 
 /// Out-of-line part of an inline incref when the object in `r` (not r11) is owned by

@@ -56,7 +56,12 @@ impl Drop for ObGuard {
     #[inline(always)]
     fn drop(&mut self) {
         if !self.m.is_null() {
-            unsafe { (*self.m).store(0, Release) }
+            // (scale1) waiters may have parked (bit 1): wake them
+            unsafe {
+                if (*self.m).compare_exchange(1, 0, Release, Relaxed).is_err() {
+                    crate::capi::pythread::mutex_unlock(&*self.m);
+                }
+            }
         }
     }
 }
@@ -83,6 +88,12 @@ fn lock_slow(m: &AtomicU8) -> bool {
         spins += 1;
         if spins == 1 && crate::capi::pythread::cs_holds_mutex(m as *const AtomicU8 as usize) {
             return false;
+        }
+        if spins == 2 {
+            // (scale1) spin briefly, then park (PyMutex protocol) instead of thousands
+            // of sched_yield calls: contended writers burned whole cores
+            crate::capi::pythread::mutex_lock(m);
+            return true;
         }
         if spins < 64 {
             std::hint::spin_loop();
@@ -1293,7 +1304,9 @@ pub fn merge_dict(d: &PyObject, other: &PyObject, overwrite: bool) -> PyResult<(
         let t = table(d);
         if t.used == 0 {
             if t.size < size_for(items.len()) {
-                *t = DictTable::new(items.len());
+                // (scale1) not `*t = DictTable::new(..)`: lock-free readers may be on
+                // the old block, and the header's sequence/sharing state must stay
+                t.resize(items.len());
             }
             for (k, v, h) in items {
                 t.insert_new(h, k.into_raw(), v.into_raw());
