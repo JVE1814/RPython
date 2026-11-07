@@ -1,12 +1,12 @@
 # PROGRESS
 
 ## Status 2026-11-07 (day 7, afternoon)
-Master d620c3b: core6, perf4, tail1, capi2, cleanroom1+2 (20 Lib modules rewritten clean-room), scale1 (multi-core scaling), tail2 (re.DEBUG, _zoneinfo, ssl PSK, alloc-failure injection, 22 modules), perf5, stability3 (test_free_threading passes), scale2 checkpoint (concurrent_futures + multiprocessing pass), pdb1 (clean-room pdb: test_pdb, test_remote_pdb pass), tail3 (crossinterp, getpath, nturl2path, ast, multiprocessing, httpservers, asyncio 10→2), cleanroom3, scale2, perf6 (startup image: python_startup 0.88x), remote1 (_remote_debugging, sys.remote_exec: test_external_inspection passes) merged today; suite run 14: 417/434 pass or whole-module skip, 10 modules fail that pass on CPython, fewer skips than CPython; suite run 13: 396/434 pass or whole-module skip; suite run 12: 367/434 modules pass, 129 failures, 70 errors. Smoke on snap19: test_capi 40 failures (was 433 in run 11),
+Master d620c3b: core6, perf4, tail1, capi2, cleanroom1+2 (20 Lib modules rewritten clean-room), scale1 (multi-core scaling), tail2 (re.DEBUG, _zoneinfo, ssl PSK, alloc-failure injection, 22 modules), perf5, stability3 (test_free_threading passes), scale2 checkpoint (concurrent_futures + multiprocessing pass), pdb1 (clean-room pdb: test_pdb, test_remote_pdb pass), tail3 (crossinterp, getpath, nturl2path, ast, multiprocessing, httpservers, asyncio 10→2), cleanroom3, scale2, perf6 (startup image: python_startup 0.88x), remote1 (_remote_debugging, sys.remote_exec: test_external_inspection passes), capi3 (test_capi and test_sys: 0 failures) merged today; suite run 14: 417/434 pass or whole-module skip, 10 modules fail that pass on CPython, fewer skips than CPython; suite run 13: 396/434 pass or whole-module skip; suite run 12: 367/434 modules pass, 129 failures, 70 errors. Smoke on snap19: test_capi 40 failures (was 433 in run 11),
 stable_abi_ctypes/fileutils pass, cmd_line_script 1; tail1 fixed ~60 long-tail modules (inspect, codecs, time,
 path modules, math, buffer, logging, json, ...). Run 11 (pre-merges):
 294/434 modules pass, 674 failures (241 without test_capi), 616 errors. Baseline free-threaded CPython: 416/434.
 Running agents: refs1 (borrowed stack references), perf7 (remaining benchmark gaps, memory), cleanroom4 (D19 Lib audit, round 4),
-capi3 (remaining test_capi, test_sys sizes, per-interpreter interning), tail4 (profiling.sampling completion, pyrepl, last single-failure modules,
+scale3 (parallel GC, remaining scaling gaps), tail4 (profiling.sampling completion, pyrepl, last single-failure modules,
 importlib/build_details errors).
 Earlier history (2026-11-02): agents stopped when the weekly API limit was hit; resumed Nov 5.
 
