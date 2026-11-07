@@ -267,7 +267,7 @@ pub fn fill_attribute_error_context(o: &PyObject, name: &PyObject) {
 /// reference without a lock), so the old value is released through QSBR.
 fn set_field(slot: &mut *mut PyObject, v: Option<&PyObject>) {
     let new = v.map_or(std::ptr::null_mut(), |v| v.to_ref().into_raw());
-    unsafe { crate::qsbr::swap_field(slot as *mut *mut PyObject, new) };
+    unsafe { crate::qsbr::swap_field_unlocked(slot as *mut *mut PyObject, new) }; // scale2: at once when no other thread runs
 }
 fn get_field(p: *mut PyObject) -> PyRef {
     unsafe { if p.is_null() { none::none_ref() } else { PyRef::from_borrowed(p) } }

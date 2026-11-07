@@ -119,7 +119,14 @@ pub unsafe extern "C" fn h_ob_unlock_slow(o: *mut PyObject) {
 /// (scale2) Deferred release of a value replaced in attribute storage that another
 /// thread may be reading lock-free (JIT stores, see qsbr::release_attr).
 pub unsafe extern "C" fn h_decref_deferred(o: *mut PyObject) {
-    unsafe { crate::qsbr::decref_deferred(o) }
+    unsafe {
+        // (the store before was a locked instruction: see qsbr::others_quiescent)
+        if crate::qsbr::others_quiescent() {
+            crate::object::decref(o);
+        } else {
+            crate::qsbr::decref_deferred(o)
+        }
+    }
 }
 /// (scale1) Non-owner incref of a sharded object (tier1::incref_sharded_routine).
 pub unsafe extern "C" fn h_incref_sharded(o: *mut PyObject) {

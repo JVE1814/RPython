@@ -193,6 +193,21 @@ pub fn tag_alive(tag: u64) -> bool {
     g.as_ref().is_some_and(|(by_tag, _)| by_tag.contains_key(&(tag as u32)))
 }
 
+/// (scale2) The live type `tag` was handed out to, if any (its pointer may only be
+/// dereferenced while the type is alive: callers use it at compile time, under the
+/// tag guards of the code they generate).
+pub fn type_for_tag(tag: u64) -> Option<usize> {
+    if tag == 0 || tag > u32::MAX as u64 {
+        return None;
+    }
+    let g = TAGS.lock().unwrap_or_else(|e| e.into_inner());
+    let tp = *g.as_ref()?.0.get(&(tag as u32))?;
+    // (read under the lock: a type being freed first forgets its tags under it)
+    let r = if type_tag(tp as *mut PyTypeObject) == tag as u32 { Some(tp) } else { None };
+    drop(g);
+    r
+}
+
 /// Is `tp` (possibly a dangling pointer from a cache entry) a live type whose
 /// current version tag is `tag`? Never dereferences a freed type.
 pub fn type_alive_with_tag(tp: usize, tag: u32) -> bool {

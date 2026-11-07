@@ -706,9 +706,7 @@ unsafe extern "C" fn type_dealloc(op: *mut PyObject) {
             xdecref(p);
         }
         xdecref((*tp).tp_base as *mut PyObject);
-        if !(*tp).tp_subclasses.is_null() {
-            drop(Box::from_raw((*tp).tp_subclasses as *mut Vec<usize>));
-        }
+        crate::types::typeobject::free_subclasses(tp);
         if !(*h)._ht_tpname.is_null() {
             crate::alloc::raw_free((*h)._ht_tpname as *mut u8);
         }
@@ -1749,7 +1747,7 @@ fn subtype_set_dict(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
             o.ob_gc_bits.fetch_or(crate::alloc::GC_BIT_DICT_DETACHED, std::sync::atomic::Ordering::Relaxed);
         }
         // readers take the dict without a lock: the old one goes through QSBR
-        crate::qsbr::swap_field(slot, v.map_or(std::ptr::null_mut(), |v| v.to_ref().into_raw()));
+        crate::qsbr::swap_field_unlocked(slot, v.map_or(std::ptr::null_mut(), |v| v.to_ref().into_raw()));
     }
     Ok(())
 }

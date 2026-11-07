@@ -170,7 +170,7 @@ pub struct DictTable {
     pub wseq: std::sync::atomic::AtomicU64,
     /// (scale1) Set (under the object lock) once a thread other than the owner reads or
     /// writes the table: from then on, replaced data blocks wait for lock-free readers.
-    shared_read: std::sync::atomic::AtomicBool,
+    pub(crate) shared_read: std::sync::atomic::AtomicBool,
 }
 
 /// A fresh, globally unique dict version stamp (the JIT's allocator). Every
@@ -789,6 +789,24 @@ unsafe fn block_layout(tp: *mut DictTable) -> Option<(*mut i32, *mut Entry, usiz
     }
 }
 
+/// (scale2) Key equality decided without running Python code (so a lock-free reader
+/// may evaluate it): same-type str/int/float/tuple keys (`plain_eq`), and a str
+/// against an int or float, which never compare equal. Ints and other keys besides
+/// str used to send every lookup to the locked path (a shared dict with int keys was
+/// a lock ping-pong).
+#[inline]
+fn pure_key_eq(a: &PyObject, b: &PyObject) -> Option<bool> {
+    if let Some(r) = crate::abstract_::plain_eq(a, b) {
+        return Some(r);
+    }
+    let num = |o: &PyObject| crate::types::int::is_int_exact(o) || o.is_type(crate::types::float::float_type());
+    let s = |o: &PyObject| crate::types::str::is_str_exact(o);
+    if (s(a) && num(b)) || (num(a) && s(b)) {
+        return Some(false);
+    }
+    None
+}
+
 #[inline]
 fn lookup_lockfree_raw(d: &PyObject, key: &PyObject, hash: isize) -> LfRead {
     use std::sync::atomic::{AtomicI32, AtomicIsize, AtomicPtr};
@@ -831,13 +849,14 @@ fn lookup_lockfree_raw(d: &PyObject, key: &PyObject, hash: isize) -> LfRead {
                             break;
                         }
                         if !ek.is_null() && AtomicIsize::from_ptr(&raw mut (*e).hash).load(Relaxed) == hash {
-                            if str_key && crate::types::str::is_str_exact(&*ek) {
-                                if crate::types::str::str_eq(&*ek, key) {
+                            let eq = if str_key && crate::types::str::is_str_exact(&*ek) { Some(crate::types::str::str_eq(&*ek, key)) } else { pure_key_eq(&*ek, key) };
+                            match eq {
+                                Some(true) => {
                                     res = LfRead::Hit(ix as usize, AtomicPtr::from_ptr(&raw mut (*e).value).load(Acquire));
                                     break;
                                 }
-                            } else {
-                                break; // a comparison that may run Python code: locked path
+                                Some(false) => {}
+                                None => break, // a comparison that may run Python code: locked path
                             }
                         }
                     }
