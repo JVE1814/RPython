@@ -1101,32 +1101,6 @@ unsafe fn untagged_args(base: *mut *mut PyObject, n: usize, tmp: &mut std::mem::
     }
 }
 
-/// (refs1) Run a call into a Python function with the calling (compiled) frame's
-/// `stack_top` at `top` (one past the call's operands), restored afterwards: compiled
-/// code does not maintain it, and `sys.getrefcount` (D27: the argument a Python callee
-/// got as a copy is still an operand of the caller) looks at the caller's operands. The
-/// slots below `top` are all live during the call.
-#[inline(always)]
-unsafe fn with_stack_top<R>(top: *mut *mut PyObject, call: impl FnOnce() -> R) -> R {
-    unsafe {
-        let f = crate::interp::current_frame_ptr();
-        if f.is_null() {
-            return call();
-        }
-        let base = (*f).slots.as_mut_ptr();
-        let len = (*f).slots.len();
-        if top < base || top > base.add(len) {
-            return call();
-        }
-        let idx = top.offset_from(base) as usize;
-        let saved = (*f).stack_top;
-        (*f).stack_top = idx;
-        let r = call();
-        (*f).stack_top = saved;
-        r
-    }
-}
-
 /// Call / CallKw: [callable, self_or_null, args..(, kwnames)] -> [result]. No entry
 /// may be borrowed (refs1: compiled code calls `h_call_t` when one may be).
 pub unsafe extern "C" fn h_call(sp: *mut *mut PyObject, n: u64, kw: u64) -> u64 {
@@ -1179,7 +1153,7 @@ unsafe fn call_impl<const TAGS: bool>(sp: *mut *mut PyObject, n: u64, kw: u64) -
             let args = base.add(2) as *const *mut PyObject;
             if funcobject::is_function(&*callable) {
                 let all = std::slice::from_raw_parts(args, n);
-                into_c(with_stack_top(top, || crate::interp::call_function(&*callable, all, n - nkw, kwnames.as_deref())))
+                into_c(crate::interp::call_function(&*callable, all, n - nkw, kwnames.as_deref()))
             } else {
                 ab::vectorcall_raw(&*callable, args, (n - nkw) | PY_VECTORCALL_ARGUMENTS_OFFSET, kwp)
             }
@@ -1187,7 +1161,7 @@ unsafe fn call_impl<const TAGS: bool>(sp: *mut *mut PyObject, n: u64, kw: u64) -
             let args = base.add(1) as *const *mut PyObject;
             if funcobject::is_function(&*callable) {
                 let all = std::slice::from_raw_parts(args, n + 1);
-                into_c(with_stack_top(top, || crate::interp::call_function(&*callable, all, n + 1 - nkw, kwnames.as_deref())))
+                into_c(crate::interp::call_function(&*callable, all, n + 1 - nkw, kwnames.as_deref()))
             } else {
                 ab::vectorcall_raw(&*callable, args, n + 1 - nkw, kwp)
             }

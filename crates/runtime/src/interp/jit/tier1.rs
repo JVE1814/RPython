@@ -530,6 +530,17 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// Call / CallKw through `h_call`/`h_call_t` (`hc`). (refs1) The frame's stack_top
+    /// is the call's top for the duration of the call (compiled code does not keep it
+    /// otherwise): sys.getrefcount's argument-moving rule (D27) reads the caller's
+    /// operands; restored afterwards (r14 survives the helper).
+    fn generic_call(&mut self, ins: &Instr, d: i32, hc: usize, kw: i64, base: i32) {
+        self.a.load(R14, M(Rbx, STACK_TOP));
+        self.a.store_i(M(Rbx, STACK_TOP), self.nlp + d);
+        self.helper_sp(ins, d, hc, Some(ins.arg as i64), Some(kw), base);
+        self.a.store(M(Rbx, STACK_TOP), R14);
+    }
+
     pub(crate) fn emit(&mut self, i: usize) -> Result<(), String> {
         let ins = self.an.instrs[i];
         let d = self.an.depth[i];
@@ -1122,7 +1133,7 @@ impl<'a> Gen<'a> {
                 self.a.jmp(done);
                 self.a.bind(generic);
                 let hc = if tagged_args { addr!(h::h_call_t) } else { addr!(h::h_call) };
-                self.helper_sp(&ins, d, hc, Some(arg as i64), Some(0), base);
+                self.generic_call(&ins, d, hc, 0, base);
                 // C calls: observe signals, pending calls and safepoints right after
                 // (Python callees poll at their own Resume)
                 self.poll(pc, base + 1);
@@ -1131,7 +1142,7 @@ impl<'a> Gen<'a> {
             Op::CallKw => {
                 let base = d - arg as i32 - 3;
                 let hc = if (base..d).any(|k| self.tagged(k)) { addr!(h::h_call_t) } else { addr!(h::h_call) };
-                self.helper_sp(&ins, d, hc, Some(arg as i64), Some(1), base);
+                self.generic_call(&ins, d, hc, 1, base);
                 self.poll(pc, base + 1);
             }
             Op::CallFunctionEx => {
@@ -1762,7 +1773,9 @@ impl<'a> Gen<'a> {
                     self.a.jcc(Cc::E, slow);
                     let selfm = self.slot(d);
                     if self.tagged(d - 1) {
-                        self.a.or_ri(Rax, 1);
+                        // (refs1) the getter's frame owns its self: a borrowed receiver
+                        // gets a reference (the call routine moves arguments as they are)
+                        self.incref(Rax);
                     }
                     self.a.store(selfm, Rax);
                     self.incref(Rcx);
