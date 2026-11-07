@@ -109,6 +109,14 @@ fn shared() -> bool {
     crate::qsbr::multi_threaded()
 }
 
+/// (scale1) Lock-free readers of this list may exist: other threads exist and the
+/// caller's reference is not the only one (a list referenced once, by this thread,
+/// e.g. a comprehension's result being built, cannot be read by anybody else).
+#[inline(always)]
+fn shared_l(o: &PyObject) -> bool {
+    shared() && !crate::object::exclusively_owned(o)
+}
+
 unsafe fn free_items_now(p: *mut u8) {
     unsafe { alloc::buf_free(p) }
 }
@@ -155,7 +163,8 @@ unsafe fn reserve_locked(l: *mut PyListObject, need: usize) -> bool {
 unsafe fn grow_items(l: *mut PyListObject, cap: usize) -> bool {
     unsafe {
         let old = (*l).ob_item;
-        let arr = if shared() {
+        let sh = shared_l(&*(l as *mut PyObject));
+        let arr = if sh {
             let a = alloc::buf_calloc(cap * 8) as *mut *mut PyObject;
             if !a.is_null() && !old.is_null() {
                 let n = ((*l).ob_base.ob_size.max(0) as usize).min((*l).allocated.max(0) as usize);
@@ -170,7 +179,7 @@ unsafe fn grow_items(l: *mut PyListObject, cap: usize) -> bool {
         }
         publish_items(l, arr);
         (*l).allocated = cap as isize;
-        if shared() && !old.is_null() {
+        if sh && !old.is_null() {
             free_items(old);
         }
         true
@@ -280,7 +289,7 @@ fn resize_locked(o: &PyObject, newsize: usize) {
         if newsize == 0 {
             new_alloc = 0;
         }
-        if shared() {
+        if shared_l(o) {
             // never shrink while lock-free readers may exist
             if newsize > allocated && !grow_items(l, new_alloc.max(newsize)) {
                 return;
@@ -529,7 +538,7 @@ pub fn pop_index(o: &PyObject, i: isize) -> Result<PyRef, usize> {
         let it = *arr.add(i);
         std::ptr::copy(arr.add(i + 1), arr.add(i), n - i - 1);
         resize_locked(o, n - 1);
-        if shared() {
+        if shared_l(o) {
             // a lock-free reader may have loaded `it` just before: keep it alive
             // for a grace period even if the caller drops it at once
             incref(it);
@@ -1256,6 +1265,33 @@ pub fn list_reversed(o: &PyObject) -> PyResult {
 /// is released after the lock is dropped (its deallocation may run code).
 unsafe fn listiter_step(o: *mut PyObject, step: isize) -> *mut PyObject {
     unsafe {
+        if crate::threads::multi_threaded() && exclusively_owned(&*o) {
+            // (scale1) only this thread can step the iterator (one reference, its own):
+            // no iterator lock; the list is read like the lock-free subscript
+            let it = &mut *(o as *mut ListIter);
+            if it.seq.is_null() {
+                return std::ptr::null_mut();
+            }
+            if it.index >= 0 {
+                if let Some(v) = get_signed(&*it.seq, it.index as i64) {
+                    it.index += step;
+                    return v.into_raw();
+                }
+                // out of range, or a racing writer left a hole: decide under the lock
+                if (it.index as usize) < list_len(&*it.seq) {
+                    if let Some(v) = get(&*it.seq, it.index as usize) {
+                        it.index += step;
+                        return v.into_raw();
+                    }
+                }
+            }
+            if step < 0 {
+                it.index = -1;
+            }
+            let finished = std::mem::replace(&mut it.seq, std::ptr::null_mut());
+            decref(finished);
+            return std::ptr::null_mut();
+        }
         let mut finished: *mut PyObject = std::ptr::null_mut();
         let r = {
             let _g = if crate::threads::multi_threaded() { Some(ob_lock(&*o)) } else { None };

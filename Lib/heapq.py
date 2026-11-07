@@ -1,23 +1,12 @@
-"""Heap queue algorithm (a.k.a. priority queue).
+"""Priority queues kept in plain lists (binary min-heaps).
 
-Heaps are lists for which a[k] <= a[2*k+1] and a[k] <= a[2*k+2] for all k
-(counting from 0), so a[0] is always the smallest element.  The *_max
-functions maintain the mirrored invariant (a[0] is the largest element).
-
-Usage:
-
-heap = []            # creates an empty heap
-heappush(heap, item) # pushes a new item on the heap
-item = heappop(heap) # pops the smallest item from the heap
-item = heap[0]       # smallest item on the heap without popping it
-heapify(x)           # transforms list into a heap, in-place, in linear time
-item = heappushpop(heap, item) # pushes a new item and then returns
-                               # the smallest item; the heap size is unchanged
-item = heapreplace(heap, item) # pops and returns smallest item, and adds
-                               # new item; the heap size is unchanged
+A list is a heap when a[k] <= a[2*k+1] and a[k] <= a[2*k+2] for every k
+that has children, so a[0] is its smallest item.  heapify() makes a heap of
+a list in linear time; heappush()/heappop() add and remove items in
+logarithmic time; heappushpop() and heapreplace() combine a push and a pop.
+The *_max variants work on max-heaps (a[0] is the largest item).  merge(),
+nsmallest() and nlargest() are built on the same machinery.
 """
-
-__about__ = "Heap queues"
 
 __all__ = ['heappush', 'heappop', 'heapify', 'heapreplace', 'merge',
            'nlargest', 'nsmallest', 'heappushpop',

@@ -1,4 +1,4 @@
-"""Abstract base classes related to import."""
+"""ABCs describing finders, loaders and resource readers of the import system."""
 from . import _bootstrap_external
 from . import machinery
 try:

@@ -27,6 +27,8 @@ pub mod methods;
 pub mod modules;
 pub mod object;
 pub mod qsbr;
+pub mod scalestats;
+pub mod sharded;
 pub mod shape;
 pub mod subinterp;
 pub mod threads;
@@ -65,6 +67,7 @@ pub fn initialize(cfg: &Config) -> PyResult<()> {
     modules::sys::OPTIMIZE.store(rc.optimize, std::sync::atomic::Ordering::Relaxed);
     modules::sys_full::set_config(rc);
     hash::init_hash_secret(cfg.hash_seed);
+    scalestats::init();
     let _ = threads::current();
     threads::set_main_thread();
     types::int::init_small_ints();
