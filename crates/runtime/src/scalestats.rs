@@ -140,8 +140,8 @@ impl PhaseClock {
 }
 
 fn report_phases(e: &mut impl std::io::Write) {
-    let _ = writeln!(e, "gcphase stopped {:.3} ms  examined {}  unreachable {}", GC_STOPPED_NS.load(Relaxed) as f64 / 1e6,
-        GC_EXAMINED.load(Relaxed), GC_GARBAGE.load(Relaxed));
+    let _ = writeln!(e, "gcphase stopped {:.3} ms  examined {}  unreachable {}  parallel jobs {} helps {} (serial: {} no helper, {} small) handed {}", GC_STOPPED_NS.load(Relaxed) as f64 / 1e6,
+        GC_EXAMINED.load(Relaxed), GC_GARBAGE.load(Relaxed), crate::gcpar::JOBS.load(Relaxed), crate::gcpar::HELPS.load(Relaxed), crate::gcpar::NO_HELPERS.load(Relaxed), crate::gcpar::TOO_SMALL.load(Relaxed), crate::gc::HANDED.load(Relaxed));
     let mut s = String::from("gcphase cpu/wall ms:");
     for (i, n) in PHASES.iter().enumerate() {
         s.push_str(&format!(" {}={:.1}/{:.1}", n, PHASE_CPU_NS[i].load(Relaxed) as f64 / 1e6, PHASE_WALL_NS[i].load(Relaxed) as f64 / 1e6));

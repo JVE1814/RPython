@@ -107,6 +107,12 @@ pub struct ThreadState {
     pub exited: std::sync::atomic::AtomicBool,
     /// Value of the QSBR sequence this state saw at its last quiescent point (qsbr.rs).
     pub qsbr_seen: std::sync::atomic::AtomicU64,
+    /// (scale3) Parked at an eval-breaker safepoint (it returns to the eval breaker
+    /// when the world restarts): a collection may hand it garbage to clear.
+    pub at_safepoint: std::sync::atomic::AtomicBool,
+    /// (scale3) Garbage handed to this thread by a collection (each entry holds a
+    /// reference); cleared at its next eval-breaker visit (`gc::clear_handed`).
+    pub gc_clear: Mutex<Vec<usize>>,
 }
 
 unsafe impl Sync for ThreadState {}
@@ -222,6 +228,8 @@ pub fn new_thread_state() -> *mut ThreadState {
             tracing_depth: Cell::new(0),
             exited: std::sync::atomic::AtomicBool::new(false),
             qsbr_seen: std::sync::atomic::AtomicU64::new(crate::qsbr::initial_seen()),
+            at_safepoint: std::sync::atomic::AtomicBool::new(false),
+            gc_clear: Mutex::new(Vec::new()),
         };
         // Reuse the memory of a dead thread state (pointers to thread states stay valid).
         let recycled = FREE_STATES.lock().unwrap().pop();
@@ -316,6 +324,8 @@ pub fn thread_exit() {
     }
     unsafe {
         let ts = &*p;
+        // (scale3) garbage a collection handed to this thread
+        crate::gc::clear_handed(ts);
         process_merge_queue(ts);
         // release owned per-thread objects
         let e = std::mem::replace(&mut (*p).c.current_exception, std::ptr::null_mut());
@@ -434,6 +444,8 @@ pub const EVAL_ASYNC_EXC: usize = 1 << 3;
 pub const EVAL_GC: usize = 1 << 4;
 /// Pending calls (Py_AddPendingCall) are queued for this thread (capi/pystate.rs).
 pub const EVAL_PENDING: usize = 1 << 6;
+/// (scale3) A collection handed this thread garbage to clear (`ThreadState::gc_clear`).
+pub const EVAL_GC_CLEAR: usize = 1 << 7;
 
 /// (scale2) World stopped (collection): empty every thread's merge queue on behalf of
 /// its owner. An owner blocked in a wait never reaches the eval breaker that would

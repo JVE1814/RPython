@@ -161,6 +161,13 @@ pub fn take_buffers() -> Buffers {
     Buffers { reg, orphans }
 }
 
+/// Return orphaned entries taken by `take_buffers` but not processed.
+pub fn give_back_orphans(v: Vec<usize>) {
+    if !v.is_empty() {
+        ORPHANS.lock().unwrap_or_else(|e| e.into_inner()).extend(v);
+    }
+}
+
 /// The calling thread's buffer (null if it has none).
 pub fn mine() -> *mut YoungBuf {
     unsafe { MINE }
