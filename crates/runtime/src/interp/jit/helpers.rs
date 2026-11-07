@@ -1185,7 +1185,21 @@ pub unsafe extern "C" fn h_load_super_attr(sp: *mut *mut PyObject, arg: u64, nam
         let cls = take(sp.sub(2));
         let gsuper = take(sp.sub(3));
         helper!({
-            let sup = if gsuper.is(type_obj(crate::types::super_::super_type())) {
+            let is_super = gsuper.is(type_obj(crate::types::super_::super_type()));
+            if is_super {
+                // (perf4) no super object, and no bound method for super().m(...)
+                if let Some(r) = crate::types::super_::lookup_fast(&cls, &slf, &*name, arg & 1 != 0) {
+                    let (v, unbound) = st(r)?;
+                    put(sp.sub(3), v);
+                    if unbound {
+                        put(sp.sub(2), slf);
+                    } else if arg & 1 != 0 {
+                        *sp.sub(2) = std::ptr::null_mut();
+                    }
+                    return Ok(OK);
+                }
+            }
+            let sup = if is_super {
                 st(crate::types::super_::new_super(&cls, &slf))?
             } else if arg & 2 != 0 {
                 st(ab::call(&gsuper, &[&cls, &slf]))?

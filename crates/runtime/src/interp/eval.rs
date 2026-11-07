@@ -1007,6 +1007,19 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             let nm = &cd.names[(arg >> 2) as usize];
                             let is_method = arg & 1 != 0;
                             let two = arg & 2 != 0;
+                            if gsuper.is(type_obj(crate::types::super_::super_type())) && !crate::modules::sys::tracing_active() {
+                                // (perf4) no super object / bound method in the common case
+                                if let Some(r) = crate::types::super_::lookup_fast(&cls, &slf, nm, is_method) {
+                                    let (v, unbound) = r?;
+                                    push!(f, v.into_raw());
+                                    if unbound {
+                                        push!(f, slf.into_raw());
+                                    } else if is_method {
+                                        push!(f, std::ptr::null_mut());
+                                    }
+                                    continue;
+                                }
+                            }
                             // monitoring sees the super() call as in the unoptimised form
                             let call_info = if crate::modules::sys::tracing_active() {
                                 crate::modules::sys_trace::before_call(ts, f, &gsuper, None, if two { Some(&*cls) } else { None }, false)?
