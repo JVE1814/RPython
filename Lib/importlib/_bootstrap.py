@@ -516,8 +516,6 @@ def _init_module_attrs(spec, module, *, override=False):
     if spec.has_location:
         if wanted('__file__'):
             _set_module_attr(module, '__file__', spec.origin)
-        if wanted('__cached__') and spec.cached is not None:
-            _set_module_attr(module, '__cached__', spec.cached)
     return module
 
 
@@ -890,14 +888,18 @@ def _is_initializing(module):
 
 
 def _resolve_parents(name, import_):
-    """Make sure every package above *name* is imported, waiting for those
-    another thread is still initialising."""
+    """Before *name* is loaded: wait (outermost first) for the packages above
+    it that another thread is still initialising, and import the immediate
+    parent if it is missing.  Missing packages further up are left alone (a
+    hand-made parent in sys.modules needs no ancestors)."""
+    parent = name.rpartition('.')[0]
     dot = name.find('.')
     while dot != -1:
         ancestor = name[:dot]
         module = sys.modules.get(ancestor, _NEEDS_LOADING)
         if module is _NEEDS_LOADING:
-            _call_with_frames_removed(import_, ancestor)
+            if ancestor == parent:
+                _call_with_frames_removed(import_, ancestor)
         elif module is not None and _is_initializing(module):
             _lock_unlock_module(ancestor)
         dot = name.find('.', dot + 1)
@@ -1008,10 +1010,14 @@ def __import__(name, globals=None, locals=None, fromlist=(), level=0):
         return _gcd_import(name.partition('.')[0])
     if not name:
         return module
-    # "from . import a.b" style without fromlist: return the module of the
-    # first component below the package
-    tail = len(name) - len(name.partition('.')[0])
-    return sys.modules[module.__name__[:len(module.__name__) - tail]]
+    # relative "import .a.b" without fromlist: the result is the module of
+    # the first component, found through the resolved absolute name
+    absolute = _resolve_name(name, package, level)
+    first = absolute[:len(absolute) - (len(name) - len(name.partition('.')[0]))]
+    try:
+        return sys.modules[first]
+    except KeyError:
+        raise KeyError(f'{first!r} not in sys.modules as expected') from None
 
 
 # ---------------------------------------------------------------- start-up

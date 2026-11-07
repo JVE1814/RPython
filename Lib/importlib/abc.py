@@ -55,7 +55,7 @@ class MetaPathFinder(metaclass=abc.ABCMeta):
         importlib.invalidate_caches())."""
 
 _register(MetaPathFinder, machinery.BuiltinImporter, machinery.FrozenImporter,
-          machinery.PathFinder)
+          machinery.PathFinder, machinery.WindowsRegistryFinder)
 
 
 class PathEntryFinder(metaclass=abc.ABCMeta):
