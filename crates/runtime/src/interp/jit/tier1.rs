@@ -1282,15 +1282,22 @@ impl<'a> Gen<'a> {
         self.a.bind(done);
     }
 
-    /// LoadGlobal: inline check of the cache entry (seqlock + both dict versions).
+    /// LoadGlobal: inline read of the dict entry the cache points at (jit5; see
+    /// specialize::load_global): seqlock, keys versions of globals (and builtins),
+    /// value from the entry. Single-threaded only (dict entries are read without the
+    /// dict lock); the helper otherwise.
     fn load_global(&mut self, ins: &Instr, d: i32) {
         use crate::interp::cache::kind;
         let e = self.tables.entry(ins.pc as usize) as *const _ as i64;
         let name = self.cd.names[ins.arg as usize].as_ptr() as i64;
         let slow = self.a.label();
         let done = self.a.label();
+        let have = self.a.label();
+        let in_builtins = self.a.label();
         let dict_t = crate::types::dict::dict_type() as i64;
-        let ver = layout().version;
+        let kv = std::mem::offset_of!(crate::types::dict::DictTable, keys_version) as i32;
+        let lay = layout();
+        let (ep, esz, evalue) = (lay.entries_ptr, lay.entry_size, lay.entry_value);
         self.a.mov_ri(Rcx, e);
         self.a.load32(R8, M(Rcx, E_SEQ));
         self.a.mov_rr(R9, R8);
@@ -1298,25 +1305,53 @@ impl<'a> Gen<'a> {
         self.a.jcc(Cc::NE, slow);
         self.a.cmp32_mi(M(Rcx, E_KIND), kind::GLOBAL as i32);
         self.a.jcc(Cc::NE, slow);
+        self.a.mov_ri(Rdx, (&raw const crate::threads::MULTI_THREADED) as i64);
+        self.a.cmp_mi(M(Rdx, 0), 0);
+        self.a.jcc(Cc::NE, slow);
         self.a.mov_ri(Rdi, dict_t);
-        for (field, eoff) in [(FRAME_GLOBALS, E_A), (FRAME_BUILTINS, E_B)] {
-            self.a.load(Rax, M(Rbx, field));
-            self.a.cmp_rm(Rdi, M(Rax, OB_TYPE));
-            self.a.jcc(Cc::NE, slow);
-            self.a.load(Rax, M(Rax, MA_KEYS));
-            self.a.test_rr(Rax, Rax);
-            self.a.jcc(Cc::E, slow);
-            self.a.load(Rax, M(Rax, ver));
-            self.a.cmp_rm(Rax, M(Rcx, eoff));
-            self.a.jcc(Cc::NE, slow);
-        }
-        self.a.load(Rsi, M(Rcx, E_C));
+        // globals: exact dict with the recorded key layout
+        self.a.load(Rax, M(Rbx, FRAME_GLOBALS));
+        self.a.cmp_rm(Rdi, M(Rax, OB_TYPE));
+        self.a.jcc(Cc::NE, slow);
+        self.a.load(Rax, M(Rax, MA_KEYS));
+        self.a.test_rr(Rax, Rax);
+        self.a.jcc(Cc::E, slow);
+        self.a.load(Rdx, M(Rax, kv));
+        self.a.cmp_rm(Rdx, M(Rcx, E_A));
+        self.a.jcc(Cc::NE, slow);
+        self.a.load(R9, M(Rcx, E_C));
+        self.a.test_ri(R9, 1);
+        self.a.jcc(Cc::NE, in_builtins);
+        self.a.bind(have);
+        // rax = table, r9 = ix << 1 | flag
+        self.a.shr_ri(R9, 1);
+        self.a.imul_rri(R9, R9, esz);
+        self.a.load(Rdx, M(Rax, ep));
+        self.a.add_rr(Rdx, R9);
+        self.a.load(Rsi, M(Rdx, evalue));
+        self.a.test_rr(Rsi, Rsi);
+        self.a.jcc(Cc::E, slow);
+        self.a.mov_ri(Rdx, crate::types::lazyimport::lazy_import_type() as i64);
+        self.a.cmp_rm(Rdx, M(Rsi, OB_TYPE));
+        self.a.jcc(Cc::E, slow);
         self.a.cmp32_rm(R8, M(Rcx, E_SEQ));
         self.a.jcc(Cc::NE, slow);
         self.incref(Rsi);
         let m = self.slot(d);
         self.a.store(m, Rsi);
         self.a.jmp(done);
+        // builtins: exact dict with the recorded key layout (globals checked above)
+        self.a.bind(in_builtins);
+        self.a.load(Rax, M(Rbx, FRAME_BUILTINS));
+        self.a.cmp_rm(Rdi, M(Rax, OB_TYPE));
+        self.a.jcc(Cc::NE, slow);
+        self.a.load(Rax, M(Rax, MA_KEYS));
+        self.a.test_rr(Rax, Rax);
+        self.a.jcc(Cc::E, slow);
+        self.a.load(Rdx, M(Rax, kv));
+        self.a.cmp_rm(Rdx, M(Rcx, E_B));
+        self.a.jcc(Cc::NE, slow);
+        self.a.jmp(have);
         self.a.bind(slow);
         self.set_lasti(ins.pc);
         self.a.mov_rr(Rdi, Rbx);

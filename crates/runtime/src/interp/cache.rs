@@ -269,7 +269,8 @@ pub fn mc_store(tag: u32, name: &PyObject, value: Option<&PyObject>) {
 /// Kinds of cache entries (`Entry::kind`).
 pub mod kind {
     pub const EMPTY: u32 = 0;
-    /// LoadGlobal: a = globals version, b = builtins version, c = value (borrowed)
+    /// LoadGlobal (jit5): a = globals keys_version, b = builtins keys_version (names
+    /// found in builtins only), c = entry index << 1 | found-in-builtins
     pub const GLOBAL: u32 = 1;
     /// LoadAttr/StoreAttr: attribute lives in the instance dict. a = type tag,
     /// b = entry-index hint in the dict; c = class attribute fallback (LoadAttr) or

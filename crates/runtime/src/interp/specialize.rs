@@ -20,30 +20,58 @@ use rpy_compiler::bytecode::BinOp;
 // ------------------------------------------------------------------ globals
 
 /// LoadGlobal through the instruction's cache entry.
+///
+/// (jit5) The entry records where the name lives, not its value: a = the globals
+/// dict's `keys_version`, b = the builtins dict's `keys_version` (only for names found
+/// in builtins), c = entry index << 1 | found-in-builtins. Key versions change only
+/// when keys are added/removed or a table is rebuilt, so rebinding a global (go's
+/// `TIMESTAMP += 1`) does not invalidate every LoadGlobal in the module; the value is
+/// read from the entry each time.
 #[inline]
 pub fn load_global(f: &Frame, nm: &PyObject, e: &Entry) -> PyResult<PyRef> {
     let g = f.globals();
     let b = f.builtins();
     if dict::is_dict_exact(g) && dict::is_dict_exact(b) {
-        let gv = dict::version(g);
-        let bv = dict::version(b);
         if let Some(s) = e.read() {
-            if s.kind == kind::GLOBAL && s.a == gv && s.b == bv {
-                return Ok(unsafe { PyRef::from_borrowed(s.c as *mut PyObject) });
+            if s.kind == kind::GLOBAL {
+                let ix = s.c >> 1;
+                let r = if s.c & 1 == 0 {
+                    dict::value_at_if(g, s.a, ix)
+                } else if dict::table(g).keys_version == s.a {
+                    dict::value_at_if(b, s.b, ix)
+                } else {
+                    None
+                };
+                if let Some(v) = r {
+                    if !crate::types::lazyimport::is_lazy(&v) {
+                        return Ok(v);
+                    }
+                }
             }
         }
-        return load_global_fill(f, nm, e, gv, bv);
+        return load_global_fill(f, nm, e);
     }
     super::eval::load_global(f, nm)
 }
 
 #[cold]
-fn load_global_fill(f: &Frame, nm: &PyObject, e: &Entry, gv: u64, bv: u64) -> PyResult<PyRef> {
+fn load_global_fill(f: &Frame, nm: &PyObject, e: &Entry) -> PyResult<PyRef> {
     let r = super::eval::load_global(f, nm)?;
-    // only cache if neither dict changed during the lookup (str-keyed lookups never
-    // run Python code, but globals may contain non-str keys)
-    if dict::version(f.globals()) == gv && dict::version(f.builtins()) == bv && e.note_miss() {
-        e.write(kind::GLOBAL, gv, bv, r.as_ptr() as usize);
+    if pystr::is_str_exact(nm) && !crate::types::lazyimport::is_lazy(&r) && e.note_miss() {
+        let (g, b) = (f.globals(), f.builtins());
+        if let Some((gix, gkv)) = dict::str_key_index(g, nm) {
+            match gix {
+                Some(ix) => e.write(kind::GLOBAL, gkv, 0, ix << 1),
+                None => {
+                    if let Some((Some(ix), bkv)) = dict::str_key_index(b, nm) {
+                        // the globals must still lack the name
+                        if dict::table(g).keys_version == gkv {
+                            e.write(kind::GLOBAL, gkv, bkv, ix << 1 | 1);
+                        }
+                    }
+                }
+            }
+        }
     }
     Ok(r)
 }

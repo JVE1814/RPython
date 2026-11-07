@@ -2250,7 +2250,18 @@ impl<'a> B<'a> {
         // no dict and no values: nothing can shadow
         self.term(Term::Branch(Cond::Test(w, Opnd::V(w), Cc::E), cont, check));
         self.switch_to(check);
-        self.check(Cond::Test(w, Opnd::I(1), Cc::E), f);
+        // a real instance dict (objects that outgrew their inline values): look the
+        // name up instead of deoptimising
+        let _ = f;
+        let in_dict = self.new_block(u32::MAX);
+        let values = self.new_block(u32::MAX);
+        self.term(Term::Branch(Cond::Test(w, Opnd::I(1), Cc::E), in_dict, values));
+        self.switch_to(in_dict);
+        let rd = self.v(Class::G);
+        self.emit(Inst::Call { addr: h2_dict_lacks as usize, args: vec![Opnd::V(w), Opnd::I(name as i64)], fargs: vec![], ret: Some(rd), fret: None });
+        self.emit(Inst::Guard(Cond::Test(rd, Opnd::V(rd), Cc::E), snap));
+        self.term(Term::Jump(cont));
+        self.switch_to(values);
         let sh = self.shape_of(w);
         let cell = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0))) as *const _ as usize;
         self.cells.push(cell);
@@ -3247,6 +3258,33 @@ pub extern "C" fn h_fpow(x: f64, y: f64) -> f64 {
 
 /// Does shape `sh` lack attribute `name` (interned)? If so remember the shape in the
 /// site's memo cell. 1: lacks it, 0: has it (or no shape).
+/// Does instance dict `d` (an exact dict) certainly lack the interned str `name`? 1 if
+/// so; 0 if it has it or the answer would need a comparison that can run code (a
+/// non-str key with the same hash) or a long scan. Only reads the entries.
+pub unsafe extern "C" fn h2_dict_lacks(d: *mut PyObject, name: *mut PyObject) -> u64 {
+    unsafe {
+        let d = &*d;
+        if !crate::types::dict::is_dict_exact(d) {
+            return 0;
+        }
+        let t = crate::types::dict::table(d);
+        let es = t.entries();
+        if es.len() > 64 {
+            return 0;
+        }
+        let h = crate::types::str::str_hash(&*name);
+        for e in es {
+            if e.key.is_null() || e.value.is_null() || e.hash != h {
+                continue;
+            }
+            if e.key == name || !crate::types::str::is_str_exact(&*e.key) || crate::types::str::str_eq(&*e.key, &*name) {
+                return 0;
+            }
+        }
+        1
+    }
+}
+
 pub unsafe extern "C" fn h_shape_lacks(sh: *const crate::shape::Shape, name: *mut PyObject, cell: *const std::sync::atomic::AtomicUsize) -> u64 {
     unsafe {
         if sh.is_null() {
