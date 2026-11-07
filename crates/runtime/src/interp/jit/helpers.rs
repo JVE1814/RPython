@@ -1038,7 +1038,7 @@ pub unsafe extern "C" fn h_get_yield_from_iter(sp: *mut *mut PyObject, code_flag
 /// a method descriptor found by LoadMethod (`[descr, self, args..]`), positional
 /// arguments only. None: not such a call (or a convention `call_methoddef_fast`
 /// leaves to the general path).
-#[inline]
+#[inline(always)]
 unsafe fn call_builtin_fast(callable: *mut PyObject, self_or_null: *mut PyObject, base: *mut *mut PyObject, n: usize) -> Option<*mut PyObject> {
     unsafe {
         let c = &*callable;
@@ -1084,17 +1084,18 @@ pub unsafe extern "C" fn h_unpack_method(base: *mut *mut PyObject) {
     }
 }
 
-/// (refs1) An untagged copy of `base[..n]` in
-/// `tmp` (n <= 16) or `tmpv`.
+/// (refs1) The n entries at `base` as plain pointers: an untagged copy in `tmp`, or,
+/// for more than 16 entries (rare), the entries themselves made owned in place.
 #[inline(always)]
-unsafe fn untagged_args(base: *mut *mut PyObject, n: usize, tmp: &mut std::mem::MaybeUninit<[*mut PyObject; 16]>, tmpv: &mut Vec<*mut PyObject>) -> *mut *mut PyObject {
+unsafe fn untagged_args(base: *mut *mut PyObject, n: usize, tmp: &mut std::mem::MaybeUninit<[*mut PyObject; 16]>) -> *mut *mut PyObject {
     unsafe {
-        let dst: *mut *mut PyObject = if n <= 16 {
-            tmp.as_mut_ptr() as *mut *mut PyObject
-        } else {
-            tmpv.resize(n, std::ptr::null_mut());
-            tmpv.as_mut_ptr()
-        };
+        if n > 16 {
+            for i in 0..n {
+                *base.add(i) = crate::interp::borrow::own(*base.add(i));
+            }
+            return base;
+        }
+        let dst = tmp.as_mut_ptr() as *mut *mut PyObject;
         crate::interp::borrow::copy_untagged(dst, base, n);
         dst
     }
@@ -1141,9 +1142,8 @@ unsafe fn call_impl<const TAGS: bool>(sp: *mut *mut PyObject, n: u64, kw: u64) -
         // (refs1) callees see plain pointers: borrowed entries are passed through a copy
         // (the stack keeps them tagged for the release below)
         let mut tmp = std::mem::MaybeUninit::<[*mut PyObject; 16]>::uninit();
-        let mut tmpv: Vec<*mut PyObject> = Vec::new();
         let stack_base = base;
-        let base = if TAGS { untagged_args(base, n + 2, &mut tmp, &mut tmpv) } else { base };
+        let base = if TAGS { untagged_args(base, n + 2, &mut tmp) } else { base };
         // (perf4) builtin functions and method descriptors with the common calling
         // conventions: their C function directly
         let fast = if nkw == 0 { call_builtin_fast(callable, self_or_null, base, n) } else { None };

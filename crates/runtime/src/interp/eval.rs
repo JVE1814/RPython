@@ -1537,18 +1537,20 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             // through a copy (the frame keeps the slots tagged, so the GC and
                             // the unwinding below still know they are borrowed)
                             let mut tmp = std::mem::MaybeUninit::<[*mut PyObject; 16]>::uninit();
-                            let mut tmpv: Vec<*mut PyObject> = Vec::new();
                             let mut argv: *const *mut PyObject = unsafe { f.slots.as_ptr().add(base) };
                             let nall = f.stack_top - base;
                             if unsafe { super::borrow::any_borrowed(argv, nall) } {
-                                let dst: *mut *mut PyObject = if nall <= 16 {
-                                    tmp.as_mut_ptr() as *mut *mut PyObject
+                                if nall <= 16 {
+                                    let dst = tmp.as_mut_ptr() as *mut *mut PyObject;
+                                    unsafe { super::borrow::copy_untagged(dst, argv, nall) };
+                                    argv = dst;
                                 } else {
-                                    tmpv.resize(nall, std::ptr::null_mut());
-                                    tmpv.as_mut_ptr()
-                                };
-                                unsafe { super::borrow::copy_untagged(dst, argv, nall) };
-                                argv = dst;
+                                    // (rare) more than 16 entries: owned in place
+                                    for i in base..f.stack_top {
+                                        f.slots[i] = unsafe { super::borrow::own(f.slots[i]) };
+                                    }
+                                    argv = unsafe { f.slots.as_ptr().add(base) };
+                                }
                             }
                             let callable = unsafe { *argv };
                             let self_or_null = unsafe { *argv.add(1) };

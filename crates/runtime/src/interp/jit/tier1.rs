@@ -188,6 +188,8 @@ pub(crate) struct Gen<'a> {
     /// instruction being emitted: exact, from `tag_masks` (standalone) or set by tier 2
     /// for an embedded template
     pub(crate) tagm: u64,
+    /// (refs1) per instruction: a LoadFastBorrow emitted as an owned load (`owned_loads`)
+    pub(crate) own_load: Vec<bool>,
 }
 
 fn fnaddr<T>(f: T) -> usize
@@ -572,7 +574,7 @@ impl<'a> Gen<'a> {
                 let unbound = self.a.label();
                 self.a.test_rr(Rax, Rax);
                 self.a.jcc(Cc::E, unbound);
-                if ins.op == Op::LoadFastBorrow && self.borrow && (0..64).contains(&d) {
+                if ins.op == Op::LoadFastBorrow && self.borrow && (0..64).contains(&d) && !self.own_load.get(i).copied().unwrap_or(false) {
                     // (refs1) borrowed: tag bit, no reference taken
                     self.a.or_ri(Rax, 1);
                 } else {
@@ -2388,7 +2390,7 @@ impl<'a> Gen<'a> {
     pub(crate) fn new_embedded(a: Asm, an: &'a Analysis, cd: &'a CodeData, nlp: usize, flags: u32, tables: &'a crate::interp::cache::Tables, ilabel: Vec<Label>, exit: Label) -> Gen<'a> {
         let mut a = a;
         let (rt_box_int, rt_box_float, rt_free_num) = (a.label(), a.label(), a.label());
-        Gen { a, nlp: nlp as i32, an, cd, tables, ilabel, exit, stubs: Vec::new(), rt_box_int, rt_box_float, rt_free_num, flags, no_fuse: true, drain: false, borrow: false, tagm: 0 }
+        Gen { a, nlp: nlp as i32, an, cd, tables, ilabel, exit, stubs: Vec::new(), rt_box_int, rt_box_float, rt_free_num, flags, no_fuse: true, drain: false, borrow: false, tagm: 0, own_load: Vec::new() }
     }
     /// Emit the out-of-line stubs and shared routines; resolve labels.
     pub(crate) fn finish(mut self) -> Result<Asm, String> {
@@ -2454,7 +2456,7 @@ pub(crate) fn tag_aware(op: Op) -> bool {
 /// every other instruction consumes its inputs and pushes owned values (and a template
 /// that is not `tag_aware` owns everything first). Basic blocks start without
 /// borrowed entries (interp/borrow.rs), so entry points start from 0.
-fn tag_masks(an: &Analysis, borrow: bool) -> Vec<u64> {
+fn tag_masks(an: &Analysis, borrow: bool, own: &[bool]) -> Vec<u64> {
     let n = an.instrs.len();
     let mut out = vec![0u64; n];
     if !borrow {
@@ -2471,6 +2473,10 @@ fn tag_masks(an: &Analysis, borrow: bool) -> Vec<u64> {
             continue;
         }
         out[i] = m;
+        if own.get(i).copied().unwrap_or(false) {
+            // a LoadFastBorrow emitted as an owned load (`owned_loads`)
+            continue;
+        }
         if m != 0 && !tag_aware(ins.op) {
             m = 0;
         }
@@ -2516,6 +2522,87 @@ fn tag_masks(an: &Analysis, borrow: bool) -> Vec<u64> {
     out
 }
 
+/// (refs1) Did the interpreter see the call at internal pc `pc` call a Python function
+/// (specialisation view)?
+pub(crate) fn py_call_site(cd: &CodeData, pc: u32) -> bool {
+    use rpy_compiler::wordcode::opcodes as o;
+    let k = cd.spec.get(pc as usize).map_or(0, |s| s.load(std::sync::atomic::Ordering::Relaxed)) as u16;
+    k != 0 && [o::CALL_PY_EXACT_ARGS, o::CALL_PY_GENERAL, o::CALL_BOUND_METHOD_EXACT_ARGS, o::CALL_BOUND_METHOD_GENERAL].iter().any(|&c| c & 0xff == k)
+}
+
+/// (refs1) LoadFastBorrow instructions tier 1 emits as owned loads: arguments (and the
+/// receiver passed on as `self`) of call sites that the interpreter saw calling a
+/// Python function. Tier 1 moves the arguments of such a call into the callee frame,
+/// which must own them: a reference taken at the load costs less than converting a
+/// borrowed entry at the call. (C callees take borrowed arguments, so the other call
+/// sites keep them borrowed.) Uses the specialisation view (`cd.spec`); empty when
+/// that is off.
+fn owned_loads(an: &Analysis, cd: &CodeData) -> Vec<bool> {
+    let n = an.instrs.len();
+    let mut own = vec![false; n];
+    if cd.spec.is_empty() {
+        return own;
+    }
+    let py_call = |pc: u32| py_call_site(cd, pc);
+    // producer (LoadFastBorrow instruction) of the borrowed entry at each depth
+    let mut prod: Vec<Option<usize>> = vec![None; 64];
+    let clear_from = |prod: &mut Vec<Option<usize>>, b: i32| {
+        for p in prod.iter_mut().skip(b.max(0) as usize) {
+            *p = None;
+        }
+    };
+    for i in 0..n {
+        let ins = an.instrs[i];
+        let d = an.depth[i];
+        if d < 0 || i == 0 || an.is_target[i] || (i > 0 && an.instrs[i - 1].op == Op::YieldValue) {
+            clear_from(&mut prod, 0);
+        }
+        if d < 0 {
+            continue;
+        }
+        let du = d as usize;
+        if !tag_aware(ins.op) {
+            clear_from(&mut prod, 0);
+        }
+        match ins.op {
+            Op::LoadFastBorrow => {
+                if du < 64 {
+                    prod[du] = Some(i);
+                }
+            }
+            Op::Swap => {
+                let (a, b) = (d - 1, d - ins.arg as i32);
+                if (0..64).contains(&a) && (0..64).contains(&b) {
+                    prod.swap(a as usize, b as usize);
+                }
+            }
+            Op::LoadMethod => {
+                if (1..=64).contains(&du) {
+                    let r = prod[du - 1].take();
+                    if du < 64 {
+                        prod[du] = r;
+                    }
+                }
+            }
+            Op::Copy | Op::LoadConst | Op::LoadFast | Op::LoadFastCheck | Op::LoadGlobal | Op::PushNull | Op::LoadDeref
+            | Op::Nop | Op::Resume => {}
+            op => {
+                let pops = crate::interp::borrow::pops(op, ins.arg).unwrap_or(d as u32) as i32;
+                if matches!(op, Op::Call | Op::CallKw) && py_call(ins.pc) {
+                    let base = d - pops;
+                    for k in (base + 1).max(0)..d.min(64) {
+                        if let Some(j) = prod[k as usize] {
+                            own[j] = true;
+                        }
+                    }
+                }
+                clear_from(&mut prod, d - pops);
+            }
+        }
+    }
+    own
+}
+
 /// Compile a code object. Err: not compilable (stays in the interpreter).
 pub fn compile(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crate::interp::cache::Tables) -> Result<Output, String> {
     compile_mode(cd, nlocalsplus, flags, tables, false)
@@ -2528,7 +2615,7 @@ pub fn compile_mode(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crat
     let ilabel: Vec<Label> = (0..an.instrs.len()).map(|_| a.label()).collect();
     let exit = a.label();
     let (rt_box_int, rt_box_float, rt_free_num) = (a.label(), a.label(), a.label());
-    let mut g = Gen { a, nlp: nlocalsplus as i32, an: &an, cd, tables, ilabel, exit, stubs: Vec::new(), rt_box_int, rt_box_float, rt_free_num, flags, no_fuse: false, drain, borrow: crate::interp::borrow::enabled(), tagm: 0 };
+    let mut g = Gen { a, nlp: nlocalsplus as i32, an: &an, cd, tables, ilabel, exit, stubs: Vec::new(), rt_box_int, rt_box_float, rt_free_num, flags, no_fuse: false, drain, borrow: crate::interp::borrow::enabled(), tagm: 0, own_load: Vec::new() };
 
     // prologue
     g.a.push(Rbp);
@@ -2556,7 +2643,8 @@ pub fn compile_mode(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crat
     g.a.pop(Rbp);
     g.a.ret();
 
-    let masks = tag_masks(&an, g.borrow);
+    g.own_load = if g.borrow { owned_loads(&an, cd) } else { Vec::new() };
+    let masks = tag_masks(&an, g.borrow, &g.own_load);
     let mut entries = vec![u32::MAX; cd.code.len() + 1];
     let mut prev_yield = false;
     let mut skip_next = false;

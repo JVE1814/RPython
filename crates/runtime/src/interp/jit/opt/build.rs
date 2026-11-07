@@ -1008,7 +1008,10 @@ impl<'a> B<'a> {
         let ins = self.u.an.instrs[i];
         let len = self.st.stack.len();
         let mut tags = 0u64;
-        if crate::interp::borrow::enabled() && ins.op != Op::LoadMethod && crate::interp::jit::tier1::tag_aware(ins.op) {
+        // (calls of Python functions move their arguments into the callee frame, which
+        // owns them: tier1.rs `owned_loads`)
+        let py_call = matches!(ins.op, Op::Call | Op::CallKw) && crate::interp::jit::tier1::py_call_site(self.u.cd, ins.pc);
+        if crate::interp::borrow::enabled() && ins.op != Op::LoadMethod && !py_call && crate::interp::jit::tier1::tag_aware(ins.op) {
             if let Some(p) = crate::interp::borrow::pops(ins.op, ins.arg) {
                 for k in len.saturating_sub(p as usize)..len.min(64) {
                     if let AV::Obj(v, Own::Borrowed(_), ty) = self.st.stack[k] {

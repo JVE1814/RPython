@@ -411,10 +411,10 @@ fn sys_getrefcount(_m: &PyObject, o: &PyObject) -> PyResult {
     // Our value stack owns that reference: when a fast local of the calling frame
     // holds the object, that is where the argument came from, and the count leaves
     // it out. pandas' chained-assignment detection compares these counts.
-    // (refs1) only while the copy on the value stack is an owned one: a borrowed copy
-    // (LoadFastBorrow) is not counted in the first place
     if n > 1 && !o.is_immortal() && caller_local_holds(o) {
-        if caller_stack_owns(o) {
+        // (refs1) with borrowed loads (interp/borrow.rs, all tiers) the count is the
+        // real one: only RPYTHON_BORROW=0 leaves an owned copy of the local to discount
+        if !crate::interp::borrow::enabled() {
             n -= 1;
         }
         // CPython also moves the arguments of a Python-to-Python call from the
@@ -450,21 +450,6 @@ fn parent_call_operand(o: &PyObject) -> bool {
         let lo = p.nlocalsplus.min(p.slots.len());
         let hi = p.stack_top.min(p.slots.len());
         lo < hi && p.slots[lo..hi].iter().any(|&q| q == o.as_ptr())
-    }
-}
-
-/// (refs1) The calling frame's value stack holds an owned reference to `o` (borrowed
-/// entries are tagged and never compare equal).
-fn caller_stack_owns(o: &PyObject) -> bool {
-    let f = crate::interp::current_frame_ptr();
-    if f.is_null() {
-        return false;
-    }
-    unsafe {
-        let f = &*f;
-        let lo = f.nlocalsplus.min(f.slots.len());
-        let hi = f.stack_top.min(f.slots.len());
-        f.slots[lo..hi].iter().any(|&q| q == o.as_ptr())
     }
 }
 
