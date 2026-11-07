@@ -729,7 +729,10 @@ class StackSummary(list):
             # the interpreter's own reports keep the innermost entries
             limit = getattr(sys, 'tracebacklimit', None)
             if limit is not None:
-                limit = -limit if limit > 0 else 0
+                if limit >= sys.maxsize:
+                    limit = None    # more entries than can exist: keep them all
+                else:
+                    limit = -limit if limit > 0 else 0
         elif limit is None:
             limit = getattr(sys, 'tracebacklimit', None)
             if limit is not None and limit < 0:
