@@ -1256,7 +1256,11 @@ unsafe extern "C" fn slot_tp_richcompare(s: *mut PyObject, o: *mut PyObject, op:
         .to_ref();
         // a descriptor whose __get__ fails makes the comparison NotImplemented
         if let Some(f) = lookup(s.type_ptr(), &nm) {
-            if !crate::types::funcobject::is_function(&f) {
+            // (perf6) a plain function: called with the one lookup
+            if crate::types::funcobject::is_function(&f) {
+                return into_c(ab::call_unbound(&f, s, &[&*o]));
+            }
+            {
                 if let Some(get) = f.ty().tp_descr_get {
                     if f.ty().tp_flags & Py_TPFLAGS_METHOD_DESCRIPTOR == 0 {
                         let bound = get(f.as_ptr(), s.as_ptr(), s.type_ptr() as *mut PyObject);
@@ -1273,12 +1277,9 @@ unsafe extern "C" fn slot_tp_richcompare(s: *mut PyObject, o: *mut PyObject, op:
                     }
                 }
             }
+            return into_c(ab::call_unbound(&f, s, &[&*o]));
         }
-        match call_special(s, &nm, &[&*o]) {
-            Ok(Some(r)) => r.into_raw(),
-            Ok(None) => crate::types::none::not_implemented().to_ref().into_raw(),
-            Err(_) => std::ptr::null_mut(),
-        }
+        crate::types::none::not_implemented().to_ref().into_raw()
     }
 }
 unsafe extern "C" fn slot_tp_iter(s: *mut PyObject) -> *mut PyObject {

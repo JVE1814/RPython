@@ -203,8 +203,8 @@ pub enum Ev {
     AttlistDecl(Box<AttlistDeclEv>),
     EntityDecl(Box<EntityDeclEv>),
     NotationDecl(Box<NotationDeclEv>),
-    StartElement { name: String, attrs: Vec<(String, String)>, nspecified: usize },
-    EndElement { name: String },
+    StartElement { name: Name, attrs: Vec<(Name, String)>, nspecified: usize },
+    EndElement { name: Name },
     StartNs { prefix: Option<String>, uri: Option<String> },
     EndNs { prefix: Option<String> },
     CharData(String),
@@ -341,10 +341,45 @@ enum State {
 }
 
 struct Frame {
-    raw_name: String,
-    name: String,
+    raw_name: Name,
+    name: Name,
     ns_declared: Vec<(Option<String>, Option<String>)>, // (prefix, previous binding)
 }
+
+/// (perf6) An element or attribute name in events: shared, cloning it is a reference
+/// count increment.
+pub type Name = Arc<str>;
+
+/// (perf6) Multiplicative hash for the per-parser name table (keys are short; the table
+/// is bounded, so a weak hash cannot make it grow without limit).
+#[derive(Default)]
+pub struct FxHasher(u64);
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+impl std::hash::Hasher for FxHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.add(b as u64);
+        }
+    }
+    fn write_u32(&mut self, v: u32) {
+        self.add(v as u64);
+    }
+    fn write_u64(&mut self, v: u64) {
+        self.add(v);
+    }
+    fn write_usize(&mut self, v: usize) {
+        self.add(v as u64);
+    }
+}
+type FxBuild = std::hash::BuildHasherDefault<FxHasher>;
 
 pub struct Engine {
     // configuration
@@ -404,6 +439,10 @@ pub struct Engine {
     indirect_bytes: u64,
 
     events: Vec<Event>,
+    /// (perf6) names seen so far (bounded)
+    names: HashMap<Box<[char]>, Name, FxBuild>,
+    /// (perf6) element, text and namespace events carry no position (see `emit_at`)
+    pub lazy_positions: bool,
     ev_override: Option<(u64, u64, i64)>,
 }
 
@@ -458,6 +497,8 @@ impl Engine {
             direct_bytes: 0,
             indirect_bytes: 0,
             events: Vec::new(),
+            names: HashMap::default(),
+            lazy_positions: false,
             ev_override: None,
         }
     }
@@ -467,6 +508,7 @@ impl Engine {
     pub fn new_external(parent: &Engine, context: Option<String>, encoding: Option<String>) -> Engine {
         let mut e = Engine::new(parent.ns_sep.clone(), encoding);
         e.ns_triplets = parent.ns_triplets;
+        e.lazy_positions = parent.lazy_positions;
         e.param_entity_parsing = parent.param_entity_parsing;
         e.reparse_deferral = parent.reparse_deferral;
         e.ampl_threshold = parent.ampl_threshold;
@@ -504,21 +546,30 @@ impl Engine {
             return (self.track_line, self.track_col, self.track_byte);
         }
         let end = idx.min(self.buf.len());
-        for i in self.track_idx..end {
-            let c = self.buf[i];
-            self.track_byte += self.widths[i] as i64;
-            if c == '\n' {
-                self.track_line += 1;
-                self.track_col = 0;
-            } else {
-                self.track_col += 1;
+        // (perf6) whole-range sums instead of a per-character state machine
+        let s = self.track_idx.min(end);
+        self.track_byte += self.widths[s..end].iter().map(|&w| w as i64).sum::<i64>();
+        let chars = &self.buf[s..end];
+        match chars.iter().rposition(|&c| c == '\n') {
+            Some(last) => {
+                self.track_line += chars[..=last].iter().filter(|&&c| c == '\n').count() as u64;
+                self.track_col = (chars.len() - last - 1) as u64;
             }
+            None => self.track_col += chars.len() as u64,
         }
         self.track_idx = end;
         (self.track_line, self.track_col, self.track_byte)
     }
 
     fn emit_at(&mut self, idx: usize, ev: Ev) {
+        // (perf6) a consumer that reads positions only for errors and entity references
+        // (ElementTree) gets none for the frequent events; the tracker catches up in bulk
+        if self.lazy_positions
+            && matches!(ev, Ev::StartElement { .. } | Ev::EndElement { .. } | Ev::CharData(_) | Ev::StartNs { .. } | Ev::EndNs { .. })
+        {
+            self.events.push(Event { ev, line: 0, col: 0, byte: 0 });
+            return;
+        }
         let (line, col, byte) = match self.ev_override {
             Some(p) => p,
             None => self.position_at(idx),
@@ -675,6 +726,10 @@ impl Engine {
     }
 
     fn compact(&mut self) {
+        if self.lazy_positions && self.pos > 4096 && self.track_idx < self.pos {
+            let p = self.pos;
+            self.position_at(p);
+        }
         if self.pos > 4096 && self.pos == self.track_idx {
             self.buf.drain(..self.pos);
             self.widths.drain(..self.pos);
@@ -861,6 +916,16 @@ impl Engine {
                         if b != b'\r' && self.pending_cr_width == 0 {
                             // a run of plain ASCII needs no per-character work
                             let mut j = i + 1;
+                            // (perf6) eight bytes at a time: no high bit, no CR
+                            while j + 8 <= n {
+                                let w = u64::from_le_bytes(raw[j..j + 8].try_into().unwrap());
+                                let cr = w ^ 0x0d0d_0d0d_0d0d_0d0d;
+                                let has_cr = cr.wrapping_sub(0x0101_0101_0101_0101) & !cr & 0x8080_8080_8080_8080;
+                                if (w & 0x8080_8080_8080_8080) | has_cr != 0 {
+                                    break;
+                                }
+                                j += 8;
+                            }
                             while j < n && raw[j] < 0x80 && raw[j] != b'\r' {
                                 j += 1;
                             }
@@ -1050,7 +1115,27 @@ impl Engine {
     }
 
     fn text(&self, a: usize, b: usize) -> String {
-        self.buf[a..b].iter().collect()
+        let s = &self.buf[a..b];
+        // (perf6) ASCII: one allocation, no per-character encoding
+        if s.iter().all(|&c| (c as u32) < 0x80) {
+            let v: Vec<u8> = s.iter().map(|&c| c as u8).collect();
+            return unsafe { String::from_utf8_unchecked(v) };
+        }
+        s.iter().collect()
+    }
+
+    /// (perf6) Element and attribute names, shared through a per-parser table: a
+    /// document repeats a few names many times.
+    fn name_at(&mut self, a: usize, b: usize) -> Name {
+        let key = &self.buf[a..b];
+        if let Some(n) = self.names.get(key) {
+            return n.clone();
+        }
+        let n: Name = Name::from(self.text(a, b));
+        if self.names.len() < 4096 {
+            self.names.insert(key.into(), n.clone());
+        }
+        n
     }
 
     fn skip_ws(&self, mut i: usize) -> usize {
@@ -2246,6 +2331,11 @@ impl Engine {
         let mut utf8_len = 0usize;
         while k < n {
             let ch = self.buf[k];
+            // (perf6) printable ASCII other than the markup characters
+            if !chunked && (0x20..0x7f).contains(&(ch as u32)) && ch != '<' && ch != '&' && ch != ']' {
+                k += 1;
+                continue;
+            }
             if ch == '<' || ch == '&' || ch == '\n' {
                 break;
             }
@@ -2534,9 +2624,8 @@ impl Engine {
             Some(e) => e,
         };
         let ne = self.scan_name(i + 1)?.unwrap_or(end);
-        let raw_name = self.text(i + 1, ne);
-        let mut attrs: Vec<(String, String)> = Vec::new();
-        let mut raw_attr_names: Vec<String> = Vec::new();
+        let raw_name = self.name_at(i + 1, ne);
+        let mut attrs: Vec<(Name, String)> = Vec::new();
         let mut p = ne;
         let mut empty = false;
         loop {
@@ -2558,7 +2647,7 @@ impl Engine {
                 None => return Err((E_INVALID_TOKEN, q)),
                 Some(e) => e,
             };
-            let aname = self.text(q, ae);
+            let aname = self.name_at(q, ae);
             let mut r = self.skip_ws(ae);
             if self.ch(r) != Some('=') {
                 return Err((E_INVALID_TOKEN, r));
@@ -2574,13 +2663,18 @@ impl Engine {
             while ve < end && self.buf[ve] != qch {
                 ve += 1;
             }
-            let lit: Vec<char> = self.buf[vs..ve].to_vec();
-            let mut value = String::new();
-            self.attr_value(&lit, vs, &mut value, 0)?;
-            if raw_attr_names.contains(&aname) {
+            // (perf6) a literal without references, '<' or line breaks is the value
+            let value = if self.buf[vs..ve].iter().all(|&c| !matches!(c, '&' | '<' | '\t' | '\n' | '\r') && is_xml_char(c)) {
+                self.text(vs, ve)
+            } else {
+                let lit: Vec<char> = self.buf[vs..ve].to_vec();
+                let mut value = String::new();
+                self.attr_value(&lit, vs, &mut value, 0)?;
+                value
+            };
+            if attrs.iter().any(|(n, _)| *n == aname) {
                 return Err((E_DUPLICATE_ATTRIBUTE, q));
             }
-            raw_attr_names.push(aname.clone());
             attrs.push((aname, value));
             p = ve + 1;
         }
@@ -2588,15 +2682,15 @@ impl Engine {
         let nspecified = attrs.len();
         {
             let dtd = self.dtd.lock().unwrap();
-            if let Some(defs) = dtd.attlists.get(&raw_name) {
+            if let Some(defs) = if dtd.attlists.is_empty() { None } else { dtd.attlists.get(&*raw_name) } {
                 for def in defs {
-                    if let Some(pos) = attrs.iter().position(|(n, _)| *n == def.name) {
+                    if let Some(pos) = attrs.iter().position(|(n, _)| **n == *def.name) {
                         if !def.is_cdata {
                             let v = attrs[pos].1.split(' ').filter(|x| !x.is_empty()).collect::<Vec<_>>().join(" ");
                             attrs[pos].1 = v;
                         }
                     } else if let Some(d) = &def.default {
-                        attrs.push((def.name.clone(), d.clone()));
+                        attrs.push((Name::from(def.name.as_str()), d.clone()));
                     }
                 }
             }
@@ -2610,11 +2704,15 @@ impl Engine {
         Ok(true)
     }
 
-    fn ns_lookup(&self, prefix: &str) -> Option<String> {
+    fn ns_lookup(&self, prefix: &str) -> Option<&str> {
         if prefix == "xml" {
-            return Some(XML_NS.to_string());
+            return Some(XML_NS);
         }
-        self.ns_bindings.get(prefix).and_then(|v| v.last().cloned()).filter(|u| !u.is_empty())
+        // (perf6) documents without namespace declarations: no hashing
+        if self.ns_bindings.is_empty() {
+            return None;
+        }
+        self.ns_bindings.get(prefix).and_then(|v| v.last()).map(|u| u.as_str()).filter(|u| !u.is_empty())
     }
 
     fn expand(&self, uri: &str, local: &str, prefix: Option<&str>) -> String {
@@ -2632,8 +2730,17 @@ impl Engine {
         s
     }
 
-    fn start_element(&mut self, at: usize, raw_name: String, attrs: Vec<(String, String)>, nspecified: usize) -> R<()> {
+    fn start_element(&mut self, at: usize, raw_name: Name, attrs: Vec<(Name, String)>, nspecified: usize) -> R<()> {
         if self.ns_sep.is_none() {
+            self.emit_at(at, Ev::StartElement { name: raw_name.clone(), attrs, nspecified });
+            self.stack.push(Frame { raw_name: raw_name.clone(), name: raw_name, ns_declared: vec![] });
+            return Ok(());
+        }
+        // (perf6) no prefixes, no declarations and nothing bound: names stay as they are
+        if self.ns_bindings.is_empty()
+            && !raw_name.contains(':')
+            && attrs.iter().all(|(n, _)| !n.contains(':') && &**n != "xmlns")
+        {
             self.emit_at(at, Ev::StartElement { name: raw_name.clone(), attrs, nspecified });
             self.stack.push(Frame { raw_name: raw_name.clone(), name: raw_name, ns_declared: vec![] });
             return Ok(());
@@ -2643,7 +2750,7 @@ impl Engine {
         let mut rest = Vec::new();
         let mut nspec = 0;
         for (idx, (n, v)) in attrs.into_iter().enumerate() {
-            let prefix = if n == "xmlns" {
+            let prefix = if &*n == "xmlns" {
                 Some(String::new())
             } else if let Some(p) = n.strip_prefix("xmlns:") {
                 Some(p.to_string())
@@ -2682,26 +2789,26 @@ impl Engine {
             self.emit_at(at, Ev::StartNs { prefix: pfx.clone(), uri: uri.clone() });
         }
         // element name
-        let name = match raw_name.split_once(':') {
+        let name: Name = match raw_name.split_once(':') {
             Some((p, local)) => match self.ns_lookup(p) {
-                Some(uri) => self.expand(&uri, local, Some(p)),
+                Some(uri) => self.expand(uri, local, Some(p)).into(),
                 None => return Err((E_UNBOUND_PREFIX, at)),
             },
             None => match self.ns_lookup("") {
-                Some(uri) => self.expand(&uri, &raw_name, None),
+                Some(uri) => self.expand(uri, &raw_name, None).into(),
                 None => raw_name.clone(),
             },
         };
-        let mut out = Vec::with_capacity(rest.len());
+        let mut out: Vec<(Name, String)> = Vec::with_capacity(rest.len());
         for (n, v) in rest {
-            let en = match n.split_once(':') {
+            let en: Name = match n.split_once(':') {
                 Some((p, local)) => match self.ns_lookup(p) {
-                    Some(uri) => self.expand(&uri, local, Some(p)),
+                    Some(uri) => self.expand(uri, local, Some(p)).into(),
                     None => return Err((E_UNBOUND_PREFIX, at)),
                 },
                 None => n,
             };
-            if out.iter().any(|(x, _): &(String, String)| *x == en) {
+            if out.iter().any(|(x, _)| *x == en) {
                 return Err((E_DUPLICATE_ATTRIBUTE, at));
             }
             out.push((en, v));
@@ -2743,7 +2850,7 @@ impl Engine {
         }
         // perf3: compare with the open tag without building a String
         match self.stack.last() {
-            Some(f) if f.raw_name.chars().eq(self.buf[ns..ne].iter().copied()) => {}
+            Some(f) if f.raw_name.len() >= ne - ns && f.raw_name.chars().eq(self.buf[ns..ne].iter().copied()) => {}
             _ => return Err((E_TAG_MISMATCH, ns)),
         }
         self.pos = k + 1;
