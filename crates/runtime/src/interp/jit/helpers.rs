@@ -620,8 +620,13 @@ unsafe fn take_n(sp: *mut *mut PyObject, n: usize) -> Vec<PyRef> {
 pub unsafe extern "C" fn h_build_tuple(sp: *mut *mut PyObject, n: u64) -> u64 {
     unsafe {
         let n = n as usize;
-        let items = take_n(sp, n);
-        put(sp.sub(n), tuple::new_tuple(items));
+        // (perf4) items moved straight from the stack, no vector
+        let base = sp.sub(n);
+        let t = tuple::new_tuple_steal(base, n);
+        for i in 1..n {
+            *base.add(i) = std::ptr::null_mut();
+        }
+        *base = t;
         OK
     }
 }
@@ -629,8 +634,12 @@ pub unsafe extern "C" fn h_build_tuple(sp: *mut *mut PyObject, n: u64) -> u64 {
 pub unsafe extern "C" fn h_build_list(sp: *mut *mut PyObject, n: u64) -> u64 {
     unsafe {
         let n = n as usize;
-        let items = take_n(sp, n);
-        put(sp.sub(n), list::new_list(items));
+        let base = sp.sub(n);
+        let l = list::new_list_steal(base, n);
+        for i in 1..n {
+            *base.add(i) = std::ptr::null_mut();
+        }
+        *base = l;
         OK
     }
 }

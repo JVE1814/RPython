@@ -189,6 +189,24 @@ pub fn new_list(items: Vec<PyRef>) -> PyRef {
     }
 }
 
+/// (perf4) New list taking over `n` owned references at `items` (no vector).
+#[inline]
+pub unsafe fn new_list_steal(items: *const *mut PyObject, n: usize) -> *mut PyObject {
+    unsafe {
+        let op = alloc::alloc_object(list_type(), std::mem::size_of::<PyListObject>());
+        let l = op as *mut PyListObject;
+        if n > 0 {
+            let arr = alloc_items(n);
+            std::ptr::copy_nonoverlapping(items, arr, n);
+            (*l).ob_item = arr;
+            (*l).allocated = n as isize;
+        }
+        (*l).ob_base.ob_size = n as isize;
+        crate::gc::track(op);
+        op
+    }
+}
+
 /// (jit5) New list of `n` borrowed items taken from `items` at start, start + step, ...
 /// (a resolved extended slice) without an intermediate vector.
 pub fn new_list_strided(items: &[&PyObject], start: isize, step: isize, n: isize) -> PyRef {

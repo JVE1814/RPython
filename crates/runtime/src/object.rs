@@ -274,9 +274,47 @@ unsafe fn merge_with_delta(op: *mut PyObject, delta: isize) {
 /// freeing a deeply nested container must not recurse once per level on the C stack).
 const TRASHCAN_DEPTH: u32 = 64;
 
+/// (perf4) plain `#[thread_local]` (no lazy-init/destructor-state check per dealloc)
+#[thread_local]
+static mut DEALLOC_DEPTH: u32 = 0;
 thread_local! {
-    static DEALLOC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static TRASH: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn trash_defer(op: *mut PyObject) {
+    unsafe {
+        crate::gc::untrack(op);
+        if TRASH.try_with(|t| t.borrow_mut().push(op as usize)).is_ok() {
+            TRASH_PENDING = true;
+        } else {
+            // thread is exiting: no deferral list any more
+            call_dealloc(op);
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn trash_drain() {
+    loop {
+        let next = TRASH.try_with(|t| t.borrow_mut().pop()).ok().flatten();
+        match next {
+            Some(p) => unsafe { call_dealloc(p as *mut PyObject) },
+            None => break,
+        }
+    }
+    unsafe { TRASH_PENDING = false };
+}
+
+/// Set when `trash_defer` queued something (cleared by the drain).
+#[thread_local]
+static mut TRASH_PENDING: bool = false;
+
+#[inline(always)]
+fn trash_pending() -> bool {
+    unsafe { TRASH_PENDING }
 }
 
 #[inline]
@@ -297,28 +335,21 @@ pub unsafe fn dealloc(op: *mut PyObject) {
         if !is_gc {
             return call_dealloc(op);
         }
-        let Ok(depth) = DEALLOC_DEPTH.try_with(|d| d.get()) else {
-            return call_dealloc(op); // thread is exiting
-        };
+        let dp = &raw mut DEALLOC_DEPTH;
+        let depth = *dp;
         if depth >= TRASHCAN_DEPTH {
             // defer: the outermost dealloc on this thread frees it
-            crate::gc::untrack(op);
-            TRASH.with(|t| t.borrow_mut().push(op as usize));
-            return;
+            return trash_defer(op);
         }
-        DEALLOC_DEPTH.with(|d| d.set(depth + 1));
+        *dp = depth + 1;
         call_dealloc(op);
-        if depth == 0 {
+        // (only a dealloc nested TRASHCAN_DEPTH deep can have deferred anything, and
+        // the outermost one drains)
+        if depth == 0 && trash_pending() {
             // drain deferred objects (each may defer more)
-            loop {
-                let next = TRASH.with(|t| t.borrow_mut().pop());
-                match next {
-                    Some(p) => call_dealloc(p as *mut PyObject),
-                    None => break,
-                }
-            }
+            trash_drain();
         }
-        DEALLOC_DEPTH.with(|d| d.set(depth));
+        *dp = depth;
     }
 }
 

@@ -59,6 +59,35 @@ static CLASS_OF: [u8; MAX_SMALL / 8 + 1] = {
     t
 };
 
+/// (perf4) Free-list slot for (kind, size in 8-byte units rounded up): kind 0 rounds
+/// to 16 bytes, the GC kinds use the 8-byte classes. Saves the rounding and the
+/// `kind * NCLASSES` arithmetic on the allocation fast path.
+pub static SLOT_OF: [[u8; MAX_SMALL / 8 + 1]; NKINDS] = {
+    let mut t = [[0u8; MAX_SMALL / 8 + 1]; NKINDS];
+    let mut k = 0;
+    while k < NKINDS {
+        let mut i = 0;
+        while i <= MAX_SMALL / 8 {
+            let size = if k == KIND_RAW { (i * 8 + 15) & !15 } else { i * 8 };
+            t[k][i] = (CLASS_OF[size / 8] as usize + k * NCLASSES) as u8;
+            i += 1;
+        }
+        k += 1;
+    }
+    t
+};
+
+/// Block size of each free-list slot.
+pub static SLOT_SIZE: [u16; NSLOTS] = {
+    let mut t = [0u16; NSLOTS];
+    let mut s = 0;
+    while s < NSLOTS {
+        t[s] = CLASSES[s % NCLASSES] as u16;
+        s += 1;
+    }
+    t
+};
+
 #[repr(C)]
 struct PageHeader {
     magic: u32,
@@ -189,6 +218,9 @@ struct ThreadCache {
     carve_end: [usize; NSLOTS],
     registered: bool,
     dead: bool,
+    /// (perf4) registered, not exiting and not in double-free checking mode: a free
+    /// may push onto the free list without further tests.
+    fast_free: bool,
 }
 
 #[thread_local]
@@ -199,6 +231,7 @@ static mut TC: ThreadCache = ThreadCache {
     carve_end: [0; NSLOTS],
     registered: false,
     dead: false,
+    fast_free: false,
 };
 
 struct ExitGuard;
@@ -207,6 +240,7 @@ impl Drop for ExitGuard {
         unsafe {
             let tc = &mut *(&raw mut TC);
             tc.dead = true;
+            tc.fast_free = false;
             let mut g = DEPOT.lock().unwrap_or_else(|e| e.into_inner());
             let d = g.get_or_insert_with(new_depot);
             for c in 0..NSLOTS {
@@ -239,7 +273,8 @@ thread_local! {
 #[cold]
 fn register(tc: &mut ThreadCache) {
     tc.registered = true;
-    let _ = GUARD.try_with(|_| ());
+    let guarded = GUARD.try_with(|_| ()).is_ok();
+    tc.fast_free = guarded && !tc.dead && !checking();
 }
 
 /// Take a batch of freed blocks from the depot, or else a carving range.
@@ -340,21 +375,45 @@ fn spill(slot: usize, tc: &mut ThreadCache) {
 #[inline(always)]
 unsafe fn zero_block(p: *mut u8, size: usize) {
     unsafe {
-        // constant-size stores for the common small classes (avoids a memset call)
-        match size {
-            16 => std::ptr::write_bytes(p, 0, 16),
-            32 => std::ptr::write_bytes(p, 0, 32),
-            40 => std::ptr::write_bytes(p, 0, 40),
-            48 => std::ptr::write_bytes(p, 0, 48),
-            56 => std::ptr::write_bytes(p, 0, 56),
-            64 => std::ptr::write_bytes(p, 0, 64),
-            72 => std::ptr::write_bytes(p, 0, 72),
-            80 => std::ptr::write_bytes(p, 0, 80),
-            88 => std::ptr::write_bytes(p, 0, 88),
-            96 => std::ptr::write_bytes(p, 0, 96),
-            112 => std::ptr::write_bytes(p, 0, 112),
-            128 => std::ptr::write_bytes(p, 0, 128),
-            _ => std::ptr::write_bytes(p, 0, size),
+        // (perf4) inline wide stores (block sizes are multiples of 8), opaque to the
+        // optimiser so that LLVM does not turn them back into a memset call of
+        // variable size (it merged the previous per-size `write_bytes` arms into
+        // exactly that).
+        if size > 512 {
+            std::ptr::write_bytes(p, 0, size);
+            return;
+        }
+        let mut off = 0;
+        while off + 32 <= size {
+            store_zero::<32>(p.add(off));
+            off += 32;
+        }
+        if off + 16 <= size {
+            store_zero::<16>(p.add(off));
+            off += 16;
+        }
+        if off < size {
+            store_zero::<8>(p.add(off));
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn store_zero<const N: usize>(p: *mut u8) {
+    // (blocks are only 8-byte aligned: unaligned vector stores)
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
+    unsafe {
+        let z = std::arch::x86_64::_mm256_setzero_si256();
+        match N {
+            32 => std::arch::asm!("vmovdqu ymmword ptr [{p}], {z}", p = in(reg) p, z = in(ymm_reg) z, options(nostack, preserves_flags)),
+            16 => std::arch::asm!("vmovdqu xmmword ptr [{p}], {z}", p = in(reg) p, z = in(xmm_reg) std::arch::x86_64::_mm256_castsi256_si128(z), options(nostack, preserves_flags)),
+            _ => std::ptr::write_volatile(p as *mut u64, 0),
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx")))]
+    unsafe {
+        for i in 0..N / 8 {
+            std::ptr::write_volatile((p as *mut u64).add(i), 0);
         }
     }
 }
@@ -368,8 +427,43 @@ pub fn alloc_small(size: usize) -> *mut u8 {
 /// Allocate a zeroed small block (size <= MAX_SMALL) of the given kind. Null on OOM.
 #[inline(always)]
 pub fn alloc_kind(size: usize, kind: usize) -> *mut u8 {
-    let rounded = if kind == KIND_RAW { (size + 15) & !15 } else { (size + 7) & !7 };
-    let c = CLASS_OF[rounded / 8] as usize + kind * NCLASSES;
+    let c = SLOT_OF[kind][(size + 7) / 8] as usize;
+    unsafe {
+        let p = pop_slot(c);
+        if !p.is_null() {
+            zero_block(p, SLOT_SIZE[c] as usize);
+            return p;
+        }
+        alloc_slot_slow(c)
+    }
+}
+
+/// (perf4) Pop a block off this thread's free list for `slot` (not zeroed); null when
+/// the list is empty (the caller then takes `alloc_slot_slow`).
+#[inline(always)]
+pub unsafe fn pop_slot(slot: usize) -> *mut u8 {
+    unsafe {
+        let tc = &mut *(&raw mut TC);
+        let p = *tc.heads.get_unchecked(slot);
+        if p == 0 {
+            return std::ptr::null_mut();
+        }
+        *tc.heads.get_unchecked_mut(slot) = *(p as *const usize);
+        *tc.counts.get_unchecked_mut(slot) -= 1;
+        p as *mut u8
+    }
+}
+
+/// Zero a block of free-list slot `slot`.
+#[inline(always)]
+pub unsafe fn zero_slot(p: *mut u8, slot: usize) {
+    unsafe { zero_block(p, *SLOT_SIZE.get_unchecked(slot) as usize) }
+}
+
+/// Refill path of `alloc_kind`: a zeroed block of `slot`, null on OOM.
+#[cold]
+#[inline(never)]
+pub fn alloc_slot_slow(c: usize) -> *mut u8 {
     unsafe {
         let tc = &mut *(&raw mut TC);
         let mut p = tc.heads[c];
@@ -483,6 +577,25 @@ fn check_free(p: *mut u8) {
 #[inline]
 pub fn free_small(p: *mut u8) {
     let c = small_class_of(p);
+    unsafe {
+        let tc = &mut *(&raw mut TC);
+        if tc.fast_free {
+            *(p as *mut usize) = *tc.heads.get_unchecked(c);
+            *tc.heads.get_unchecked_mut(c) = p as usize;
+            let n = *tc.counts.get_unchecked(c) + 1;
+            *tc.counts.get_unchecked_mut(c) = n;
+            if n as usize > CACHE_LIMIT {
+                spill(c, tc);
+            }
+            return;
+        }
+    }
+    free_small_slow(p, c)
+}
+
+#[cold]
+#[inline(never)]
+fn free_small_slow(p: *mut u8, c: usize) {
     if checking() {
         check_free(p);
     }

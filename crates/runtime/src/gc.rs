@@ -128,6 +128,13 @@ pub unsafe fn untrack(op: *mut PyObject) {
     }
 }
 
+/// Count one object as untracked whose tracked bit the caller clears itself (the
+/// allocator's free fast path, which zeroes all GC bits).
+#[inline(always)]
+pub fn note_untracked() {
+    note_tracked(-1);
+}
+
 pub fn is_tracked(op: &PyObject) -> bool {
     op.ob_gc_bits.load(Relaxed) & GC_BIT_TRACKED != 0
 }

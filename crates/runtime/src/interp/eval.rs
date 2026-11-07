@@ -1163,23 +1163,17 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             let s = crate::types::slice::new_slice(&start, &stop, step.as_deref().unwrap_or(none::none()));
                             push!(f, s.into_raw());
                         }
-                        Op::BuildTuple => {
+                        Op::BuildTuple | Op::BuildList => {
+                            // (perf4) items moved from the stack without a vector
                             let n = arg as usize;
                             let base = f.stack_top - n;
-                            let items: Vec<PyRef> = (0..n)
-                                .map(|i| unsafe { PyRef::from_raw(std::mem::replace(&mut f.slots[base + i], std::ptr::null_mut())) })
-                                .collect();
+                            let p = unsafe { f.slots.as_ptr().add(base) };
+                            let r = unsafe { if op == Op::BuildTuple { tuple::new_tuple_steal(p, n) } else { list::new_list_steal(p, n) } };
+                            for i in 0..n {
+                                f.slots[base + i] = std::ptr::null_mut();
+                            }
                             f.stack_top = base;
-                            push!(f, tuple::new_tuple(items).into_raw());
-                        }
-                        Op::BuildList => {
-                            let n = arg as usize;
-                            let base = f.stack_top - n;
-                            let items: Vec<PyRef> = (0..n)
-                                .map(|i| unsafe { PyRef::from_raw(std::mem::replace(&mut f.slots[base + i], std::ptr::null_mut())) })
-                                .collect();
-                            f.stack_top = base;
-                            push!(f, list::new_list(items).into_raw());
+                            push!(f, r);
                         }
                         Op::BuildSet => {
                             let n = arg as usize;

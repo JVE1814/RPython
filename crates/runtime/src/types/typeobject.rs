@@ -492,9 +492,12 @@ pub unsafe extern "C" fn generic_alloc(tp: *mut PyTypeObject, nitems: Py_ssize_t
 
 /// Free memory of an object whose contents are already released, and drop the
 /// reference a heap type instance holds on its type.
+#[inline]
 pub unsafe fn generic_free_and_type_decref(op: *mut PyObject, tp: *mut PyTypeObject) {
     unsafe {
         match (*tp).tp_free {
+            // (perf4) the common case without the indirect call
+            Some(f) if f as usize == generic_free as usize => alloc::free_object(op),
             Some(f) => f(op as *mut c_void),
             None => alloc::free_object(op),
         }

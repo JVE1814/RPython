@@ -103,6 +103,29 @@ pub unsafe fn new_tuple_from_ptrs(items: &[*mut PyObject]) -> PyRef {
     }
 }
 
+/// (perf4) Create a tuple taking over `n` owned references at `items` (the slots are
+/// not cleared). No intermediate vector.
+#[inline]
+pub unsafe fn new_tuple_steal(items: *const *mut PyObject, n: usize) -> *mut PyObject {
+    unsafe {
+        if n == 0 {
+            return empty_tuple().into_raw();
+        }
+        let op = alloc_tuple_of(tuple_type(), n);
+        let base = item_ptr(op);
+        let mut tracked = false;
+        for i in 0..n {
+            let it = *items.add(i);
+            tracked |= crate::gc::is_tracked(&*it);
+            *base.add(i) = it;
+        }
+        if tracked {
+            crate::gc::track(op);
+        }
+        op
+    }
+}
+
 /// GC-track a freshly filled exact tuple only if one of its items may be part of
 /// a cycle (a tracked GC object); tuples of atomic values are never tracked.
 pub unsafe fn track_if_needed(op: *mut PyObject) {
