@@ -81,9 +81,14 @@ lowest-id parent, "(N parents)"), `_child_monitor` (limits, waiting message), `_
   thread's specialisation view (helpers.rs, flagged tail4).
 * test_asyncio 2 -> 0 (sslproto *_failed_certificate_no_cycles): (1) the start_tls waiter was kept
   by a QSBR-deferred decref of a replaced dict value; QSBR now releases at once when every other
-  thread is quiescent (at retire time for dict value replacement: `qsbr::release_unpublished`, and
-  at every poll for everything pending); (2) `_SelectorSocketTransport` drops `_read_ready_cb`
-  (a bound method referring back to it) when the connection is lost.
+  thread is quiescent (at retire time for dict value replacement: `qsbr::release_unpublished`, used
+  by core's `release_replaced` for tables other threads read — cleanroom6 made unshared tables
+  release immediately in parallel — and at every poll for everything pending); (2)
+  `_SelectorSocketTransport` drops `_read_ready_cb` (a bound method referring back to it) when the
+  connection is lost (cleanroom6 made the same fix; core's version kept at the merge).
+* Debug table: the Vec layout probe could misidentify the pointer word in some builds (remote async
+  walks then read garbage); it now identifies length and capacity and takes the remaining word.
+  Async walks strip refs1's borrowed-reference tag from value-stack slots.
 * test_importlib 6 err -> 0 (20 failures = baseline): unittest.mock imports pkgutil at import time
   (patch() resolved targets while test code had replaced sys.path).
 * test_build_details 1 fail + 10 err -> 0: tools/build_details.py (run by the installed
