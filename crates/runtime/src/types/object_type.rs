@@ -706,9 +706,7 @@ unsafe extern "C" fn type_dealloc(op: *mut PyObject) {
             xdecref(p);
         }
         xdecref((*tp).tp_base as *mut PyObject);
-        if !(*tp).tp_subclasses.is_null() {
-            drop(Box::from_raw((*tp).tp_subclasses as *mut Vec<usize>));
-        }
+        crate::types::typeobject::free_subclasses(tp);
         if !(*h)._ht_tpname.is_null() {
             crate::alloc::raw_free((*h)._ht_tpname as *mut u8);
         }
