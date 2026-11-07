@@ -1,6 +1,6 @@
 //! `frame.f_lineno = n` from a trace function: validation and execution of the jump.
 //!
-//! The value stack of every instruction is described by an abstract interpretation
+//! The value stac of every instruction is described by an abstract interpretation
 //! over the bytecode that records the *kind* of each stack entry (plain object,
 //! iterator of a `for` loop, saved/handled exception of an `except` block, NULL
 //! marker, `with` exit pair, ...). A jump is allowed when the target's stack is a
@@ -325,12 +325,8 @@ pub fn set_lineno(f: &mut Frame, value: Option<&PyObject>) -> PyResult<()> {
             }
             continue;
         }
-        if cur[ts.len()..].iter().any(|k| *k == Kind::Null) {
-            if err.is_none() {
-                err = Some("can't jump: popping a NULL from the value stack is not allowed".into());
-            }
-            continue;
-        }
+        // (pdb1) NULL entries (the "self or NULL" slot of a call being set up) may be
+        // popped like any other value: jumping out of a multi-line call is allowed
         // among compatible targets prefer the deepest stack (fewest pops), e.g. the
         // exceptional copy of a `finally` body when jumping inside it
         if chosen.as_ref().is_none_or(|(_, best)| ts.len() > best.len()) {

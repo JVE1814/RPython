@@ -268,7 +268,11 @@ pub fn trace_call(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
     let t = ts.trace_func.get();
     if !t.is_null() {
         let r = call_trace(ts, t, f, "call", none::none())?;
-        set_f_trace(f, r);
+        // (pdb1) as in CPython, a None result keeps the frame's current local trace
+        // function (a resumed generator stays traced)
+        if !r.is(none::none()) {
+            set_f_trace(f, r);
+        }
     }
     Ok(())
 }
@@ -719,7 +723,10 @@ pub fn stop_iteration_event(ts: &ThreadState, f: &mut Frame, value: &PyObject, a
     let saved_lasti = f.lasti;
     f.lasti = at as u32;
     let r = (|| -> PyResult<()> {
-        let si = ab::call(crate::types::typeobject::type_obj(crate::types::exceptions::StopIteration()), &[value])?;
+        // (pdb1) a None result gives a StopIteration without arguments (as when it is
+        // raised by a generator that returns nothing)
+        let st = crate::types::typeobject::type_obj(crate::types::exceptions::StopIteration());
+        let si = if value.is(none::none()) { ab::call(st, &[])? } else { ab::call(st, &[value])? };
         if want_mon {
             let off = offset(f);
             fire(ts, f, STOP_ITERATION, off, &[&si])?;
