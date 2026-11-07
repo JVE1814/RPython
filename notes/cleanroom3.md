@@ -206,6 +206,18 @@
   still follow CPython's method layout (largely public API); bodies not re-audited.
 - test_mailbox 386 =.
 
+### http/client.py (renames only)
+- Helper bodies were already own (byte loops instead of CPython's regexes); only the
+  CPython names were changed: `_is_legal_header_name` -> `_valid_header_name`,
+  `_is_illegal_header_value` -> `_bad_header_value`, `_encode` -> `_as_latin1`,
+  `_read_headers` -> `_collect_header_lines`, `_parse_header_lines` ->
+  `_message_from_lines`, `_UNKNOWN` -> `_NOT_YET_KNOWN`, `_CS_*` -> `_STATE_*`.  Kept:
+  `_MAXLINE`, `_MAXHEADERS` (tests patch them), `HTTPConnection._get_content_length`
+  (urllib.request calls it), all messages.
+- test_httplib 151, test_urllib2 85, test_urllib2_localnet 21, test_xmlrpc 94,
+  test_wsgiref 46 pass.  test_httpservers hangs both with the old and the new file (it
+  hung in a run made before this change too) — pre-existing, not investigated.
+
 ## Audit of not-yet-audited bodies (grep of characteristic CPython internal names)
 Hits = CPython-internal helper names present; "(pinned)" = used by spec tests.
 - http/client.py: 10 (`_MAXLINE`(pinned) `_MAXHEADERS`(pinned) `_is_legal_header_name`

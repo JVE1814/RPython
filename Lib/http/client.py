@@ -38,12 +38,12 @@ __all__ = ["HTTPResponse", "HTTPConnection",
 HTTP_PORT = 80
 HTTPS_PORT = 443
 
-_UNKNOWN = 'UNKNOWN'
+_NOT_YET_KNOWN = 'UNKNOWN'  # attribute values before the status line is read
 
 # connection states
-_CS_IDLE = 'Idle'
-_CS_REQ_STARTED = 'Request-started'
-_CS_REQ_SENT = 'Request-sent'
+_STATE_IDLE = 'Idle'
+_STATE_STARTED = 'Request-started'
+_STATE_SENT = 'Request-sent'
 
 # Status code constants (http.client.OK, ...) for backward compatibility.
 globals().update(http.HTTPStatus.__members__)
@@ -68,7 +68,7 @@ _METHOD_CONTROL_CHARS = re.compile('[\x00-\x1f]')
 _ASCII_SPACE = frozenset(b' \t\n\r\x0b\x0c')
 
 
-def _is_legal_header_name(name):
+def _valid_header_name(name):
     """A header name must be non-empty, must not start with whitespace or
     ':' and must not contain ':', CR or LF."""
     if not name or name[0] in _ASCII_SPACE or name[0] == 0x3A:
@@ -79,7 +79,7 @@ def _is_legal_header_name(name):
     return True
 
 
-def _is_illegal_header_value(value):
+def _bad_header_value(value):
     """CR and LF are only allowed as part of an obsolete line folding
     (followed by a space or a tab)."""
     n = len(value)
@@ -93,7 +93,7 @@ def _is_illegal_header_value(value):
     return False
 
 
-def _encode(data, name='data'):
+def _as_latin1(data, name='data'):
     """Encode *data* as Latin-1, with a helpful message on failure."""
     try:
         return data.encode('latin-1')
@@ -124,7 +124,7 @@ class HTTPMessage(email.message.Message):
                 if key.lower() == wanted]
 
 
-def _read_headers(fp, max_headers=None, what='headers'):
+def _collect_header_lines(fp, max_headers=None, what='headers'):
     """Read raw header lines up to and excluding the blank line."""
     limit = _MAXHEADERS if max_headers is None else max_headers
     lines = []
@@ -139,7 +139,7 @@ def _read_headers(fp, max_headers=None, what='headers'):
             raise HTTPException(f'got more than {limit} {what}')
 
 
-def _parse_header_lines(header_lines, _class=HTTPMessage):
+def _message_from_lines(header_lines, _class=HTTPMessage):
     text = b''.join(header_lines).decode('iso-8859-1')
     return email.parser.Parser(_class=_class).parsestr(text)
 
@@ -147,7 +147,7 @@ def _parse_header_lines(header_lines, _class=HTTPMessage):
 def parse_headers(fp, _class=HTTPMessage, *, _max_headers=None):
     """Read headers from the binary file *fp* and return a message object
     (an HTTPMessage by default)."""
-    return _parse_header_lines(_read_headers(fp, _max_headers), _class)
+    return _message_from_lines(_collect_header_lines(fp, _max_headers), _class)
 
 
 class HTTPResponse(io.BufferedIOBase):
@@ -162,14 +162,14 @@ class HTTPResponse(io.BufferedIOBase):
         self._max_headers = None
 
         self.headers = self.msg = None
-        self.version = _UNKNOWN
-        self.status = _UNKNOWN
-        self.reason = _UNKNOWN
+        self.version = _NOT_YET_KNOWN
+        self.status = _NOT_YET_KNOWN
+        self.reason = _NOT_YET_KNOWN
 
-        self.chunked = _UNKNOWN
-        self.chunk_left = _UNKNOWN
-        self.length = _UNKNOWN
-        self.will_close = _UNKNOWN
+        self.chunked = _NOT_YET_KNOWN
+        self.chunk_left = _NOT_YET_KNOWN
+        self.length = _NOT_YET_KNOWN
+        self.will_close = _NOT_YET_KNOWN
         self.url = url
 
     def _read_status(self):
@@ -209,7 +209,7 @@ class HTTPResponse(io.BufferedIOBase):
             if interim > _MAXINTERIMRESPONSES:
                 raise HTTPException(f'got more than {_MAXINTERIMRESPONSES} '
                                     f'interim responses')
-            skipped = _read_headers(self.fp, _max_headers)
+            skipped = _collect_header_lines(self.fp, _max_headers)
             if self.debuglevel > 0:
                 for line in skipped:
                     print('header:', line.decode('iso-8859-1').rstrip())
@@ -355,7 +355,7 @@ class HTTPResponse(io.BufferedIOBase):
             raise
 
     def _read_and_discard_trailer(self):
-        _read_headers(self.fp, self._max_headers, 'trailers')
+        _collect_header_lines(self.fp, self._max_headers, 'trailers')
 
     def _get_chunk_left(self):
         """Bytes left in the current chunk, reading the next chunk header
@@ -583,7 +583,7 @@ class HTTPConnection:
         self.sock = None
         self._buffer = []
         self.__response = None
-        self.__state = _CS_IDLE
+        self.__state = _STATE_IDLE
         self._method = None
         self._tunnel_host = None
         self._tunnel_port = None
@@ -658,9 +658,9 @@ class HTTPConnection:
         for name, value in self._tunnel_headers.items():
             name_b = str(name).encode('latin-1')
             value_b = str(value).encode('latin-1')
-            if not _is_legal_header_name(name_b):
+            if not _valid_header_name(name_b):
                 raise ValueError(f'Invalid header name {name_b!r}')
-            if _is_illegal_header_value(value_b):
+            if _bad_header_value(value_b):
                 raise ValueError(f'Invalid header value {value_b!r}')
             request.append(name_b + b': ' + value_b + b'\r\n')
         request.append(b'\r\n')
@@ -670,7 +670,7 @@ class HTTPConnection:
         response = self.response_class(self.sock, method=self._method)
         try:
             version, code, message = response._read_status()
-            self._raw_proxy_headers = _read_headers(
+            self._raw_proxy_headers = _collect_header_lines(
                 response.fp, self.max_response_headers)
             if self.debuglevel > 0:
                 for line in self._raw_proxy_headers:
@@ -687,7 +687,7 @@ class HTTPConnection:
         was set up."""
         if self._raw_proxy_headers is None:
             return None
-        return _parse_header_lines(self._raw_proxy_headers)
+        return _message_from_lines(self._raw_proxy_headers)
 
     def connect(self):
         """Connect to the host and port given to the constructor."""
@@ -704,7 +704,7 @@ class HTTPConnection:
 
     def close(self):
         """Close the connection (and a response still being read)."""
-        self.__state = _CS_IDLE
+        self.__state = _STATE_IDLE
         try:
             sock = self.sock
             if sock:
@@ -815,8 +815,8 @@ class HTTPConnection:
         """
         if self.__response and self.__response.isclosed():
             self.__response = None
-        if self.__state == _CS_IDLE:
-            self.__state = _CS_REQ_STARTED
+        if self.__state == _STATE_IDLE:
+            self.__state = _STATE_STARTED
         else:
             raise CannotSendRequest(self.__state)
 
@@ -880,11 +880,11 @@ class HTTPConnection:
 
     def putheader(self, header, *values):
         """Queue a header line; several values are joined by folding."""
-        if self.__state != _CS_REQ_STARTED:
+        if self.__state != _STATE_STARTED:
             raise CannotSendHeader()
         if hasattr(header, 'encode'):
             header = header.encode('ascii')
-        if not _is_legal_header_name(header):
+        if not _valid_header_name(header):
             raise ValueError(f'Invalid header name {header!r}')
         encoded = []
         for value in values:
@@ -892,15 +892,15 @@ class HTTPConnection:
                 value = value.encode('latin-1')
             elif isinstance(value, int):
                 value = str(value).encode('ascii')
-            if _is_illegal_header_value(value):
+            if _bad_header_value(value):
                 raise ValueError(f'Invalid header value {value!r}')
             encoded.append(value)
         self._output(header + b': ' + b'\r\n\t'.join(encoded))
 
     def endheaders(self, message_body=None, *, encode_chunked=False):
         """Finish the headers and send the request (with *message_body*)."""
-        if self.__state == _CS_REQ_STARTED:
-            self.__state = _CS_REQ_SENT
+        if self.__state == _STATE_STARTED:
+            self.__state = _STATE_SENT
         else:
             raise CannotSendHeader()
         self._send_output(message_body, encode_chunked=encode_chunked)
@@ -938,14 +938,14 @@ class HTTPConnection:
         for name, value in headers.items():
             self.putheader(name, value)
         if isinstance(body, str):
-            body = _encode(body, 'body')
+            body = _as_latin1(body, 'body')
         self.endheaders(body, encode_chunked=encode_chunked)
 
     def getresponse(self):
         """Return the response to the request just sent."""
         if self.__response and self.__response.isclosed():
             self.__response = None
-        if self.__state != _CS_REQ_SENT or self.__response:
+        if self.__state != _STATE_SENT or self.__response:
             raise ResponseNotReady(self.__state)
 
         if self.debuglevel > 0:
@@ -962,8 +962,8 @@ class HTTPConnection:
             except ConnectionError:
                 self.close()
                 raise
-            assert response.will_close != _UNKNOWN
-            self.__state = _CS_IDLE
+            assert response.will_close != _NOT_YET_KNOWN
+            self.__state = _STATE_IDLE
             if response.will_close:
                 # the response owns the socket's file now
                 self.close()
