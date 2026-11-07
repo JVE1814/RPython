@@ -350,275 +350,276 @@ class ElementTree:
 
         encoding: 'unicode' for text output, otherwise a codec name
         (default us-ascii); xml_declaration: None means only for encodings
-        other than us-ascii, utf-8 and unicode; method: 'xml', 'html',
-        'text' or 'c14n'.
+        other than us-ascii, utf-8 and unicode; method: 'xml', 'html' or
+        'text'.
         """
         if self._root is None:
             raise TypeError('ElementTree not initialized')
-        if not method:
-            method = "xml"
-        elif method not in _serialize:
+        method = method or "xml"
+        if method not in _OUTPUT_METHODS:
             raise ValueError("unknown method %r" % method)
         if not encoding:
             encoding = "utf-8" if method == "c14n" else "us-ascii"
-        with _get_writer(file_or_filename, encoding) as (write, declared_encoding):
-            if method == "xml" and (xml_declaration or
-                    (xml_declaration is None and
-                     encoding.lower() != "unicode" and
-                     declared_encoding.lower() not in ("utf-8", "us-ascii"))):
-                write("<?xml version='1.0' encoding='%s'?>\n" % (
-                    declared_encoding,))
-            # Serializers produce many small pieces: hand them to the
-            # stream joined, in one write.
-            # (tostringlist() wants the individual pieces.)
-            pieces = []
-            if isinstance(file_or_filename, _ListDataStream):
-                collect = write
-            else:
-                collect = pieces.append
+        with _text_sink(file_or_filename, encoding) as (write, declared):
+            if method == "xml" and _declaration_wanted(xml_declaration,
+                                                       encoding, declared):
+                write("<?xml version='1.0' encoding='%s'?>\n" % (declared,))
+            if isinstance(file_or_filename, _ChunkCollector):
+                # tostringlist() keeps the individual pieces
+                _emit(write, self._root, method, default_namespace,
+                      short_empty_elements)
+                return
+            # the emitters produce many small strings: write them at once
+            chunks = []
             try:
-                if method == "text":
-                    _serialize_text(collect, self._root)
-                else:
-                    qnames, namespaces = _namespaces(self._root,
-                                                     default_namespace)
-                    serialize = _serialize[method]
-                    serialize(collect, self._root, qnames, namespaces,
-                              short_empty_elements=short_empty_elements)
+                _emit(chunks.append, self._root, method, default_namespace,
+                      short_empty_elements)
             finally:
-                if pieces:
-                    write("".join(pieces))
+                if chunks:
+                    write("".join(chunks))
 
     def write_c14n(self, file):
         return self.write(file, method="c14n")
 
 
+def _declaration_wanted(requested, encoding, declared):
+    if requested is not None:
+        return bool(requested)
+    return (encoding.lower() != "unicode"
+            and declared.lower() not in ("utf-8", "us-ascii"))
+
+
+class _BinaryWriteAdapter(io.BufferedIOBase):
+    # Presents an object that only has write(bytes) as a binary stream that
+    # TextIOWrapper accepts.
+
+    def __init__(self, target):
+        self._target = target
+
+    def writable(self):
+        return True
+
+    def write(self, data):
+        return self._target.write(data)
+
+    def seekable(self):
+        probe = getattr(self._target, 'seekable', None)
+        return bool(probe()) if probe is not None else False
+
+    def tell(self):
+        return self._target.tell()
+
+
 @contextlib.contextmanager
-def _get_writer(file_or_filename, encoding):
-    # Yields (write function, encoding to declare).
-    try:
-        write = file_or_filename.write
-    except AttributeError:
+def _text_sink(target, encoding):
+    """Yield (write(str) function, encoding name for the declaration) for a
+    file name or a text/binary file object."""
+    write = getattr(target, "write", None)
+    if write is None:
         if encoding.lower() == "unicode":
             encoding = "utf-8"
-        with open(file_or_filename, "w", encoding=encoding,
+        with open(target, "w", encoding=encoding,
                   errors="xmlcharrefreplace") as file:
             yield file.write, encoding
         return
     if encoding.lower() == "unicode":
-        yield write, getattr(file_or_filename, "encoding", None) or "utf-8"
+        # a text stream: str goes straight through
+        yield write, getattr(target, "encoding", None) or "utf-8"
         return
-    with contextlib.ExitStack() as stack:
-        if isinstance(file_or_filename, io.BufferedIOBase):
-            file = file_or_filename
-        elif isinstance(file_or_filename, io.RawIOBase):
-            file = io.BufferedWriter(file_or_filename)
-            stack.callback(file.detach)
-        else:
-            # A file-like object with a write method that takes bytes.
-            file = io.BufferedIOBase()
-            file.writable = lambda: True
-            file.write = write
-            try:
-                file.seekable = file_or_filename.seekable
-                file.tell = file_or_filename.tell
-            except AttributeError:
-                pass
-        file = io.TextIOWrapper(file, encoding=encoding,
-                                errors="xmlcharrefreplace", newline="\n")
-        stack.callback(file.detach)
-        yield file.write, encoding
+    if isinstance(target, io.BufferedIOBase):
+        binary, detach_binary = target, False
+    elif isinstance(target, io.RawIOBase):
+        binary, detach_binary = io.BufferedWriter(target), True
+    else:
+        binary, detach_binary = _BinaryWriteAdapter(target), False
+    text = io.TextIOWrapper(binary, encoding=encoding,
+                            errors="xmlcharrefreplace", newline="\n")
+    try:
+        yield text.write, encoding
+    finally:
+        # flush and hand the stream back without closing it
+        text.detach()
+        if detach_binary:
+            binary.detach()
 
 
-def _namespaces(elem, default_namespace=None):
-    # Map tags/attribute names to their serialized forms and collect the
-    # namespace declarations needed on the root.
+def _unserializable(value):
+    raise TypeError("cannot serialize %r (type %s)"
+                    % (value, type(value).__name__))
+
+
+def _qualified_names(root, default_namespace=None):
+    """Return (qnames, namespaces) for serializing *root*.
+
+    qnames maps every tag and attribute name (and QName value) found in the
+    tree to its text in the output, 'prefix:local' or 'local'; namespaces
+    maps each namespace URI used to its prefix ('' for the default one).
+    """
     qnames = {None: None}
     namespaces = {}
     if default_namespace:
         namespaces[default_namespace] = ""
 
-    def add_qname(qname):
-        try:
-            if qname[:1] == "{":
-                uri, tag = qname[1:].rsplit("}", 1)
-                prefix = namespaces.get(uri)
-                if prefix is None:
-                    prefix = _namespace_map.get(uri)
-                    if prefix is None:
-                        prefix = "ns%d" % len(namespaces)
-                    if prefix != "xml":
-                        namespaces[uri] = prefix
-                if prefix:
-                    qnames[qname] = "%s:%s" % (prefix, tag)
-                else:
-                    qnames[qname] = tag
-            else:
-                if default_namespace:
-                    raise ValueError(
-                        "cannot use non-qualified names with "
-                        "default_namespace option"
-                    )
-                qnames[qname] = qname
-        except TypeError:
-            _raise_serialization_error(qname)
+    def register(name):
+        if name in qnames:
+            return
+        if not isinstance(name, str):
+            _unserializable(name)
+        if not name.startswith("{"):
+            if default_namespace:
+                raise ValueError("cannot use non-qualified names with "
+                                 "default_namespace option")
+            qnames[name] = name
+            return
+        uri, sep, local = name[1:].rpartition("}")
+        if not sep:
+            raise ValueError(f"malformed qualified name {name!r}")
+        prefix = namespaces.get(uri)
+        if prefix is None:
+            prefix = _namespace_map.get(uri) or "ns%d" % len(namespaces)
+            if prefix != "xml":
+                namespaces[uri] = prefix
+        qnames[name] = "%s:%s" % (prefix, local) if prefix else local
 
-    for elem in elem.iter():
+    for elem in root.iter():
         tag = elem.tag
         if isinstance(tag, QName):
-            if tag.text not in qnames:
-                add_qname(tag.text)
+            register(tag.text)
         elif isinstance(tag, str):
-            if tag not in qnames:
-                add_qname(tag)
+            register(tag)
         elif tag is not None and tag is not Comment and tag is not PI:
-            _raise_serialization_error(tag)
+            _unserializable(tag)
         for key, value in elem.items():
-            if isinstance(key, QName):
-                key = key.text
-            if key not in qnames:
-                add_qname(key)
-            if isinstance(value, QName) and value.text not in qnames:
-                add_qname(value.text)
-        text = elem.text
-        if isinstance(text, QName) and text.text not in qnames:
-            add_qname(text.text)
+            register(key.text if isinstance(key, QName) else key)
+            if isinstance(value, QName):
+                register(value.text)
+        if isinstance(elem.text, QName):
+            register(elem.text.text)
     return qnames, namespaces
 
 
-def _serialize_xml(write, elem, qnames, namespaces,
-                   short_empty_elements, **kwargs):
-    tag = elem.tag
-    text = elem.text
-    if tag is Comment:
-        write("<!--%s-->" % text)
-    elif tag is ProcessingInstruction:
-        write("<?%s?>" % text)
-    else:
-        tag = qnames[tag]
-        if tag is None:
-            if text:
-                write(_escape_cdata(text))
-            for e in elem:
-                _serialize_xml(write, e, qnames, None,
-                               short_empty_elements=short_empty_elements)
-        else:
-            write("<" + tag)
-            if namespaces:
-                for uri, prefix in sorted(namespaces.items(),
-                                          key=lambda x: x[1]):
-                    if prefix:
-                        prefix = ":" + prefix
-                    write(" xmlns%s=\"%s\"" % (prefix, _escape_attrib(uri)))
-            for key, value in elem.items():
-                if isinstance(key, QName):
-                    key = key.text
-                if isinstance(value, QName):
-                    value = qnames[value.text]
-                else:
-                    value = _escape_attrib(value)
-                write(" %s=\"%s\"" % (qnames[key], value))
-            if text or len(elem) or not short_empty_elements:
-                write(">")
-                if text:
-                    write(_escape_cdata(text))
-                for e in elem:
-                    _serialize_xml(write, e, qnames, None,
-                                   short_empty_elements=short_empty_elements)
-                write("</" + tag + ">")
-            else:
-                write(" />")
-    if elem.tail:
-        write(_escape_cdata(elem.tail))
+def _escaped(text, replacements):
+    try:
+        for char, entity in replacements:
+            if char in text:
+                text = text.replace(char, entity)
+        return text
+    except (TypeError, AttributeError):
+        _unserializable(text)
 
 
+_TEXT_ESCAPES = (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"))
+_ATTRIBUTE_ESCAPES = _TEXT_ESCAPES + (('"', "&quot;"), ("\r", "&#13;"),
+                                      ("\n", "&#10;"), ("\t", "&#09;"))
+_HTML_ATTRIBUTE_ESCAPES = (("&", "&amp;"), (">", "&gt;"), ('"', "&quot;"))
+
+# HTML elements written without an end tag
 HTML_EMPTY = {"area", "base", "basefont", "br", "col", "embed", "frame", "hr",
               "img", "input", "isindex", "link", "meta", "param", "source",
               "track", "wbr"}
 
-
+# HTML elements whose text is written without escaping
 _HTML_RAW_TEXT = {"script", "style", "xmp", "iframe", "noembed", "noframes",
                   "plaintext"}
 
+_OUTPUT_METHODS = ("xml", "html", "text")
 
-def _serialize_html(write, elem, qnames, namespaces, **kwargs):
-    tag = elem.tag
-    text = elem.text
-    if tag is Comment:
-        write("<!--%s-->" % text)
-    elif tag is ProcessingInstruction:
-        write("<?%s?>" % text)
-    else:
-        tag = qnames[tag]
-        if tag is None:
-            if text:
-                write(_escape_cdata(text))
-            for e in elem:
-                _serialize_html(write, e, qnames, None)
+
+def _emit(write, root, method, default_namespace, short_empty_elements):
+    """Write *root* and its subtree (and its tail) with *write*."""
+    if method == "text":
+        for piece in root.itertext():
+            write(piece)
+        if root.tail:
+            write(root.tail)
+        return
+    qnames, namespaces = _qualified_names(root, default_namespace)
+    html = method == "html"
+    # Work stack of elements to open and of ('close', end text, tail) items,
+    # so that deep trees need no recursion.
+    stack = [root]
+    declare = sorted(namespaces.items(), key=lambda item: item[1])
+    while stack:
+        item = stack.pop()
+        if type(item) is tuple:
+            end, tail = item
+            if end:
+                write(end)
+            if tail:
+                write(_escaped(tail, _TEXT_ESCAPES))
+            continue
+        elem = item
+        tag, text = elem.tag, elem.text
+        if tag is Comment:
+            write("<!--%s-->" % text)
+            end = None
+        elif tag is ProcessingInstruction:
+            write("<?%s?>" % text)
+            end = None
         else:
-            write("<" + tag)
-            if namespaces:
-                for uri, prefix in sorted(namespaces.items(),
-                                          key=lambda x: x[1]):
-                    if prefix:
-                        prefix = ":" + prefix
-                    write(" xmlns%s=\"%s\"" % (prefix, _escape_attrib(uri)))
-            for key, value in elem.items():
-                if isinstance(key, QName):
-                    key = key.text
-                if value is None:
-                    # an attribute without a value (HTML only)
-                    write(" %s" % qnames[key])
-                    continue
-                if isinstance(value, QName):
-                    value = qnames[value.text]
+            name = qnames[tag]
+            end = None
+            if name is not None:
+                write("<" + name)
+                if elem is root:
+                    # namespace declarations go on the root element only
+                    for uri, prefix in declare:
+                        write(' xmlns%s="%s"' % (":" + prefix if prefix else "",
+                                                 _escaped(uri, _ATTRIBUTE_ESCAPES)))
+                _write_attributes(write, elem, qnames, html)
+                if html:
+                    write(">")
+                    lowered = name.lower()
+                    if lowered not in HTML_EMPTY and lowered != "plaintext":
+                        end = "</" + name + ">"
+                    if text and lowered in _HTML_RAW_TEXT:
+                        write(text)
+                        text = None
+                elif text or len(elem) or not short_empty_elements:
+                    write(">")
+                    end = "</" + name + ">"
                 else:
-                    value = _escape_attrib_html(value)
-                write(" %s=\"%s\"" % (qnames[key], value))
-            write(">")
-            ltag = tag.lower()
+                    write(" />")
             if text:
-                if ltag in _HTML_RAW_TEXT:
-                    write(text)
-                else:
-                    write(_escape_cdata(text))
-            for e in elem:
-                _serialize_html(write, e, qnames, None)
-            if ltag not in HTML_EMPTY and ltag != "plaintext":
-                write("</" + tag + ">")
-    if elem.tail:
-        write(_escape_cdata(elem.tail))
+                write(_escaped(text, _TEXT_ESCAPES))
+            stack.append((end, elem.tail))
+            stack.extend(reversed(elem))
+            continue
+        if elem.tail:
+            write(_escaped(elem.tail, _TEXT_ESCAPES))
 
 
-def _serialize_text(write, elem):
-    for part in elem.itertext():
-        write(part)
-    if elem.tail:
-        write(elem.tail)
-
-
-def _serialize_c14n(write, elem, qnames, namespaces, **kwargs):
-    raise ValueError("canonicalization via ElementTree.write is not supported; "
-                     "use canonicalize()")
-
-
-_serialize = {
-    "xml": _serialize_xml,
-    "html": _serialize_html,
-    "text": _serialize_text,
-}
+def _write_attributes(write, elem, qnames, html):
+    for key, value in elem.items():
+        if isinstance(key, QName):
+            key = key.text
+        if html and value is None:
+            # HTML boolean attribute
+            write(" " + qnames[key])
+            continue
+        if isinstance(value, QName):
+            value = qnames[value.text]
+        else:
+            value = _escaped(value, _HTML_ATTRIBUTE_ESCAPES if html
+                             else _ATTRIBUTE_ESCAPES)
+        write(' %s="%s"' % (qnames[key], value))
 
 
 def register_namespace(prefix, uri):
-    """Register a prefix to use for *uri* when serializing."""
+    """Register a prefix to use for *uri* when serializing.
+
+    Prefixes of the form ns<digits> are reserved for generated names.
+    Any earlier mapping of the prefix or of the URI is replaced.
+    """
     if re.match(r"ns\d+$", prefix):
         raise ValueError("Prefix format reserved for internal use")
-    for k, v in list(_namespace_map.items()):
-        if k == uri or v == prefix:
-            del _namespace_map[k]
+    for known_uri, known_prefix in list(_namespace_map.items()):
+        if known_uri == uri or known_prefix == prefix:
+            del _namespace_map[known_uri]
     _namespace_map[uri] = prefix
 
 
+# namespace URI -> preferred prefix
 _namespace_map = {
     "http://www.w3.org/XML/1998/namespace": "xml",
     "http://www.w3.org/1999/xhtml": "html",
@@ -628,60 +629,8 @@ _namespace_map = {
     "http://www.w3.org/2001/XMLSchema-instance": "xsi",
     "http://purl.org/dc/elements/1.1/": "dc",
 }
+# the tests reach the table through the function
 register_namespace._namespace_map = _namespace_map
-
-
-def _raise_serialization_error(text):
-    raise TypeError(
-        "cannot serialize %r (type %s)" % (text, type(text).__name__)
-    )
-
-
-def _escape_cdata(text):
-    try:
-        if "&" in text:
-            text = text.replace("&", "&amp;")
-        if "<" in text:
-            text = text.replace("<", "&lt;")
-        if ">" in text:
-            text = text.replace(">", "&gt;")
-        return text
-    except (TypeError, AttributeError):
-        _raise_serialization_error(text)
-
-
-def _escape_attrib(text):
-    try:
-        if "&" in text:
-            text = text.replace("&", "&amp;")
-        if "<" in text:
-            text = text.replace("<", "&lt;")
-        if ">" in text:
-            text = text.replace(">", "&gt;")
-        if "\"" in text:
-            text = text.replace("\"", "&quot;")
-        if "\r" in text:
-            text = text.replace("\r", "&#13;")
-        if "\n" in text:
-            text = text.replace("\n", "&#10;")
-        if "\t" in text:
-            text = text.replace("\t", "&#09;")
-        return text
-    except (TypeError, AttributeError):
-        _raise_serialization_error(text)
-
-
-def _escape_attrib_html(text):
-    try:
-        if "&" in text:
-            text = text.replace("&", "&amp;")
-        if ">" in text:
-            text = text.replace(">", "&gt;")
-        if "\"" in text:
-            text = text.replace("\"", "&quot;")
-        return text
-    except (TypeError, AttributeError):
-        _raise_serialization_error(text)
 
 
 def tostring(element, encoding=None, method=None, *,
@@ -698,11 +647,11 @@ def tostring(element, encoding=None, method=None, *,
     return stream.getvalue()
 
 
-class _ListDataStream(io.BufferedIOBase):
-    """A write-only stream collecting written chunks in a list."""
+class _ChunkCollector(io.BufferedIOBase):
+    """Write-only stream that keeps every chunk written, in a list."""
 
-    def __init__(self, lst):
-        self.lst = lst
+    def __init__(self, chunks):
+        self.chunks = chunks
 
     def writable(self):
         return True
@@ -710,66 +659,72 @@ class _ListDataStream(io.BufferedIOBase):
     def seekable(self):
         return True
 
-    def write(self, b):
-        self.lst.append(b)
+    def write(self, data):
+        self.chunks.append(data)
 
     def tell(self):
-        return len(self.lst)
+        return len(self.chunks)
 
 
 def tostringlist(element, encoding=None, method=None, *,
                  xml_declaration=None, default_namespace=None,
                  short_empty_elements=True):
-    """Like tostring(), but return a list of string chunks."""
-    lst = []
-    stream = _ListDataStream(lst)
-    ElementTree(element).write(stream, encoding,
+    """Like tostring(), but return the output as a list of chunks."""
+    chunks = []
+    ElementTree(element).write(_ChunkCollector(chunks), encoding,
                                xml_declaration=xml_declaration,
                                default_namespace=default_namespace,
                                method=method,
                                short_empty_elements=short_empty_elements)
-    return lst
+    return chunks
 
 
 def dump(elem):
     """Write an element tree to sys.stdout (for debugging)."""
-    if not isinstance(elem, ElementTree):
-        elem = ElementTree(elem)
-    elem.write(sys.stdout, encoding="unicode")
-    tail = elem.getroot().tail
-    if not tail or tail[-1] != "\n":
+    tree = elem if isinstance(elem, ElementTree) else ElementTree(elem)
+    tree.write(sys.stdout, encoding="unicode")
+    tail = tree.getroot().tail
+    if not tail or not tail.endswith("\n"):
         sys.stdout.write("\n")
 
 
+def _blank(text):
+    return not text or not text.strip(" \t\r\n")
+
+
 def indent(tree, space="  ", level=0):
-    """Add whitespace (text and tails) so that the tree is pretty-printed
-    with *space* per nesting level."""
+    """Pretty-print in place: make every element that has children start
+    them on new lines indented by *space* per level, replacing text and
+    tails that are only whitespace."""
     if isinstance(tree, ElementTree):
         tree = tree.getroot()
     if level < 0:
         raise ValueError(f"Initial indentation level must be >= 0, got {level}")
     if not len(tree):
         return
-    indentations = ["\n" + level * space]
+    # one string object per depth, shared by all elements at that depth
+    prefixes = ["\n" + space * level]
 
-    def walk(elem, level):
-        child_level = level + 1
-        try:
-            child_indent = indentations[child_level]
-        except IndexError:
-            child_indent = indentations[level] + space
-            indentations.append(child_indent)
-        if not elem.text or not elem.text.strip(" \t\r\n"):
-            elem.text = child_indent
+    def prefix(depth):
+        while len(prefixes) <= depth:
+            prefixes.append(prefixes[-1] + space)
+        return prefixes[depth]
+
+    pending = [(tree, 0)]
+    while pending:
+        elem, depth = pending.pop()
+        inner = prefix(depth + 1)
+        if _blank(elem.text):
+            elem.text = inner
+        child = None
         for child in elem:
             if len(child):
-                walk(child, child_level)
-            if not child.tail or not child.tail.strip(" \t\r\n"):
-                child.tail = child_indent
-        if not child.tail.strip(" \t\r\n"):
-            child.tail = indentations[level]
-
-    walk(tree, 0)
+                pending.append((child, depth + 1))
+            if _blank(child.tail):
+                child.tail = inner
+        # the last child's tail leads back to this element's level
+        if _blank(child.tail):
+            child.tail = prefix(depth)
 
 
 # --------------------------------------------------------------------
@@ -789,7 +744,7 @@ def iterparse(source, events=None, parser=None):
     and 'end-ns' (default: 'end' only).  The iterator has a 'root'
     attribute once parsing is complete and a close() method.
     """
-    return _IterParseIterator(source, events, parser)
+    return _IterParser(source, events, parser)
 
 
 class _IterParseState:
@@ -817,7 +772,7 @@ def _iterparse_events(pull, source, owns_source, state):
             source.close()
 
 
-class _IterParseIterator(collections.abc.Iterator):
+class _IterParser(collections.abc.Iterator):
 
     def __init__(self, source, events, parser):
         self._owns_source = False
@@ -934,201 +889,194 @@ def fromstringlist(sequence, parser=None):
 
 
 class TreeBuilder:
-    """Build an element tree from start/end/data/comment/pi calls."""
+    """Build an element tree from start/end/data/comment/pi calls.
+
+    element_factory(tag, attrs) creates elements (default Element);
+    comment_factory and pi_factory create comments and processing
+    instructions, which are only put into the tree when insert_comments /
+    insert_pis is true.
+    """
 
     def __init__(self, element_factory=None, *,
                  comment_factory=None, pi_factory=None,
                  insert_comments=False, insert_pis=False):
-        self._data = []
-        self._elem = []
-        self._last = None
-        self._root = None
-        self._tail = None
-        if comment_factory is None:
-            comment_factory = Comment
-        self._comment_factory = comment_factory
+        self._make_element = Element if element_factory is None else element_factory
+        self._make_comment = Comment if comment_factory is None else comment_factory
+        self._make_pi = ProcessingInstruction if pi_factory is None else pi_factory
         self.insert_comments = insert_comments
-        if pi_factory is None:
-            pi_factory = ProcessingInstruction
-        self._pi_factory = pi_factory
         self.insert_pis = insert_pis
-        if element_factory is None:
-            element_factory = Element
-        self._factory = element_factory
+        self._open = []         # elements started but not yet ended
+        self._root = None
+        self._text = []         # character data not yet attached
+        self._anchor = None     # the node that pending text belongs to ...
+        self._as_tail = False   # ... as its tail (after it) or its text
 
     def close(self):
         """Return the root element."""
-        assert len(self._elem) == 0, "missing end tags"
-        assert self._root is not None, "missing toplevel element"
+        if self._open:
+            raise AssertionError("missing end tags")
+        if self._root is None:
+            raise AssertionError("missing toplevel element")
         return self._root
 
-    def _flush(self):
-        if self._data:
-            if self._last is not None:
-                text = "".join(self._data)
-                if self._tail:
-                    assert self._last.tail is None, "internal error (tail)"
-                    self._last.tail = text
-                else:
-                    assert self._last.text is None, "internal error (text)"
-                    self._last.text = text
-            self._data = []
+    def _attach_text(self):
+        if not self._text:
+            return
+        node = self._anchor
+        if node is not None:
+            text = "".join(self._text)
+            if self._as_tail:
+                if node.tail is not None:
+                    raise AssertionError("internal error (tail)")
+                node.tail = text
+            else:
+                if node.text is not None:
+                    raise AssertionError("internal error (text)")
+                node.text = text
+        self._text = []
 
     def data(self, data):
         """Add text to the current element."""
-        self._data.append(data)
+        self._text.append(data)
 
     def start(self, tag, attrs):
         """Open an element."""
-        self._flush()
-        self._last = elem = self._factory(tag, attrs)
-        if self._elem:
-            self._elem[-1].append(elem)
+        self._attach_text()
+        elem = self._make_element(tag, attrs)
+        if self._open:
+            self._open[-1].append(elem)
         elif self._root is None:
             self._root = elem
-        self._elem.append(elem)
-        self._tail = 0
+        self._open.append(elem)
+        self._anchor, self._as_tail = elem, False
         return elem
 
     def end(self, tag):
         """Close the current element."""
-        self._flush()
-        self._last = self._elem.pop()
-        assert self._last.tag == tag,\
-               "end tag mismatch (expected %s, got %s)" % (
-                   self._last.tag, tag)
-        self._tail = 1
-        return self._last
+        self._attach_text()
+        elem = self._open.pop()
+        if elem.tag != tag:
+            raise AssertionError("end tag mismatch (expected %s, got %s)"
+                                 % (elem.tag, tag))
+        self._anchor, self._as_tail = elem, True
+        return elem
+
+    def _leaf(self, node, insert):
+        # a comment or PI: in the tree, it ends the preceding text
+        if insert:
+            self._attach_text()
+            if self._open:
+                self._open[-1].append(node)
+            self._anchor, self._as_tail = node, True
+        return node
 
     def comment(self, text):
         """Create a comment (inserted into the tree if insert_comments)."""
-        return self._handle_single(
-            self._comment_factory, self.insert_comments, text)
+        return self._leaf(self._make_comment(text), self.insert_comments)
 
     def pi(self, target, text=None):
         """Create a processing instruction (inserted if insert_pis)."""
-        return self._handle_single(
-            self._pi_factory, self.insert_pis, target, text)
+        return self._leaf(self._make_pi(target, text), self.insert_pis)
 
-    def _handle_single(self, factory, insert, *args):
-        elem = factory(*args)
-        if insert:
-            self._flush()
-            self._last = elem
-            if self._elem:
-                self._elem[-1].append(elem)
-            self._tail = 1
-        return elem
+
+def _expat_module():
+    try:
+        from xml.parsers import expat
+    except ImportError:
+        try:
+            import pyexpat as expat
+        except ImportError:
+            raise ImportError("No module named expat; ElementTree needs it "
+                              "for parsing") from None
+    return expat
 
 
 class XMLParser:
-    """An expat based parser feeding a target (by default a TreeBuilder)."""
+    """An expat based parser feeding a target (by default a TreeBuilder).
+
+    The target receives start(tag, attrs), end(tag), data(text),
+    comment(text), pi(target, data), start_ns(prefix, uri), end_ns(prefix)
+    and doctype(name, pubid, system) calls for whichever of these methods
+    it has; close() returns the result of target.close().
+    """
 
     def __init__(self, *, target=None, encoding=None):
-        try:
-            from xml.parsers import expat
-        except ImportError:
-            try:
-                import pyexpat as expat
-            except ImportError:
-                raise ImportError(
-                    "No module named expat; use SimpleXMLTreeBuilder instead"
-                )
+        expat = _expat_module()
         parser = expat.ParserCreate(encoding, "}")
         if target is None:
             target = TreeBuilder()
         self.parser = self._parser = parser
         self.target = self._target = target
         self._error = expat.error
-        self._names = {}
+        self._clark_names = {}      # expat's "uri}local" -> "{uri}local"
+        self.entity = {}            # replacement text of undeclared entities
         parser.DefaultHandlerExpand = self._default
-        if hasattr(target, 'start'):
-            parser.StartElementHandler = self._start
-        if hasattr(target, 'end'):
-            parser.EndElementHandler = self._end
-        if hasattr(target, 'start_ns'):
-            parser.StartNamespaceDeclHandler = self._start_ns
-        if hasattr(target, 'end_ns'):
-            parser.EndNamespaceDeclHandler = self._end_ns
-        if hasattr(target, 'data'):
-            parser.CharacterDataHandler = target.data
-        if hasattr(target, 'comment'):
-            parser.CommentHandler = target.comment
-        if hasattr(target, 'pi'):
-            parser.ProcessingInstructionHandler = target.pi
+        for method, slot, handler in (
+                ("start", "StartElementHandler", self._start),
+                ("end", "EndElementHandler", self._end),
+                ("start_ns", "StartNamespaceDeclHandler", self._start_ns),
+                ("end_ns", "EndNamespaceDeclHandler", self._end_ns),
+                ("data", "CharacterDataHandler", None),
+                ("comment", "CommentHandler", None),
+                ("pi", "ProcessingInstructionHandler", None)):
+            if hasattr(target, method):
+                setattr(parser, slot, handler or getattr(target, method))
         parser.StartDoctypeDeclHandler = self._start_doctype
         parser.buffer_text = 1
         parser.ordered_attributes = 1
-        self._doctype = None
-        self.entity = {}
         try:
             self.version = "Expat %d.%d.%d" % expat.version_info
         except AttributeError:
             pass
 
     def _setevents(self, events_queue, events_to_report):
+        # Used by XMLPullParser: every reported event appends
+        # (event name, result of the target call) to events_queue.
         parser = self._parser
         append = events_queue.append
-        for event_name in events_to_report:
-            if event_name == "start":
+
+        def reporting(event, call):
+            def handler(*args):
+                append((event, call(*args)))
+            return handler
+
+        target = self.target
+        for event in events_to_report:
+            if event == "start":
                 parser.ordered_attributes = 1
-
-                def handler(tag, attrib_in, event=event_name, append=append,
-                            start=self._start):
-                    append((event, start(tag, attrib_in)))
-                parser.StartElementHandler = handler
-            elif event_name == "end":
-                def handler(tag, event=event_name, append=append,
-                            end=self._end):
-                    append((event, end(tag)))
-                parser.EndElementHandler = handler
-            elif event_name == "start-ns":
-                if hasattr(self.target, "start_ns"):
-                    def handler(prefix, uri, event=event_name, append=append,
-                                start_ns=self._start_ns):
-                        append((event, start_ns(prefix, uri)))
-                else:
-                    def handler(prefix, uri, event=event_name, append=append):
-                        append((event, (prefix or '', uri or '')))
-                parser.StartNamespaceDeclHandler = handler
-            elif event_name == "end-ns":
-                if hasattr(self.target, "end_ns"):
-                    def handler(prefix, event=event_name, append=append,
-                                end_ns=self._end_ns):
-                        append((event, end_ns(prefix)))
-                else:
-                    def handler(prefix, event=event_name, append=append):
-                        append((event, None))
-                parser.EndNamespaceDeclHandler = handler
-            elif event_name == 'comment':
-                def handler(text, event=event_name, append=append,
-                            self=self):
-                    append((event, self.target.comment(text)))
-                parser.CommentHandler = handler
-            elif event_name == 'pi':
-                def handler(pi_target, data, event=event_name, append=append,
-                            self=self):
-                    append((event, self.target.pi(pi_target, data)))
-                parser.ProcessingInstructionHandler = handler
+                parser.StartElementHandler = reporting(event, self._start)
+            elif event == "end":
+                parser.EndElementHandler = reporting(event, self._end)
+            elif event == "start-ns":
+                call = (self._start_ns if hasattr(target, "start_ns")
+                        else lambda prefix, uri: (prefix or '', uri or ''))
+                parser.StartNamespaceDeclHandler = reporting(event, call)
+            elif event == "end-ns":
+                call = (self._end_ns if hasattr(target, "end_ns")
+                        else lambda prefix: None)
+                parser.EndNamespaceDeclHandler = reporting(event, call)
+            elif event == "comment":
+                parser.CommentHandler = reporting(
+                    event, lambda text: self.target.comment(text))
+            elif event == "pi":
+                parser.ProcessingInstructionHandler = reporting(
+                    event, lambda name, data: self.target.pi(name, data))
             else:
-                raise ValueError("unknown event %r" % event_name)
+                raise ValueError("unknown event %r" % event)
 
-    def _raiseerror(self, value):
-        err = ParseError(value)
-        err.code = value.code
-        err.position = value.lineno, value.offset
-        raise err
+    def _parse_error(self, exc):
+        err = ParseError(exc)
+        err.code = exc.code
+        err.position = exc.lineno, exc.offset
+        return err
 
-    def _fixname(self, key):
-        # expat reports '{uri}local' as 'uri}local'
+    def _clark(self, name):
         try:
-            name = self._names[key]
+            return self._clark_names[name]
         except KeyError:
-            name = key
-            if "}" in name:
-                name = "{" + name
-            self._names[key] = name
-        return name
+            clark = "{" + name if "}" in name else name
+            self._clark_names[name] = clark
+            return clark
 
     def _start_ns(self, prefix, uri):
         return self.target.start_ns(prefix or '', uri or '')
@@ -1137,16 +1085,14 @@ class XMLParser:
         return self.target.end_ns(prefix or '')
 
     def _start(self, tag, attr_list):
-        fixname = self._fixname
-        tag = fixname(tag)
-        attrib = {}
-        if attr_list:
-            for i in range(0, len(attr_list), 2):
-                attrib[fixname(attr_list[i])] = attr_list[i + 1]
-        return self.target.start(tag, attrib)
+        clark = self._clark
+        # ordered_attributes: [name0, value0, name1, value1, ...]
+        attrib = {clark(attr_list[i]): attr_list[i + 1]
+                  for i in range(0, len(attr_list), 2)} if attr_list else {}
+        return self.target.start(clark(tag), attrib)
 
     def _end(self, tag):
-        return self.target.end(self._fixname(tag))
+        return self.target.end(self._clark(tag))
 
     def _start_doctype(self, name, sysid, pubid, has_internal_subset):
         if hasattr(self.target, "doctype"):
@@ -1158,56 +1104,55 @@ class XMLParser:
                 RuntimeWarning)
 
     def _default(self, text):
-        if text[:1] == "&":
-            # an entity the document does not declare
-            try:
-                data_handler = self.target.data
-            except AttributeError:
-                return
-            try:
-                data_handler(self.entity[text[1:-1]])
-            except KeyError:
-                from xml.parsers import expat
-                err = expat.error(
-                    "undefined entity %s: line %d, column %d" %
-                    (text, self.parser.ErrorLineNumber,
-                     self.parser.ErrorColumnNumber)
-                )
-                err.code = 11
-                err.lineno = self.parser.ErrorLineNumber
-                err.offset = self.parser.ErrorColumnNumber
-                raise err
+        # expat passes undeclared entity references here
+        if text[:1] != "&":
+            return
+        handler = getattr(self.target, "data", None)
+        if handler is None:
+            return
+        name = text[1:-1]
+        if name in self.entity:
+            handler(self.entity[name])
+            return
+        line = self.parser.ErrorLineNumber
+        column = self.parser.ErrorColumnNumber
+        err = _expat_module().error(
+            "undefined entity %s: line %d, column %d" % (text, line, column))
+        err.code = 11
+        err.lineno = line
+        err.offset = column
+        raise err
 
     def feed(self, data):
         """Feed encoded data to the parser."""
         try:
             self.parser.Parse(data, False)
-        except self._error as v:
-            self._raiseerror(v)
+        except self._error as exc:
+            raise self._parse_error(exc)
 
     def close(self):
         """Finish feeding data; return the target's close() result."""
         try:
             self.parser.Parse(b"", True)
-        except self._error as v:
-            self._raiseerror(v)
+        except self._error as exc:
+            raise self._parse_error(exc)
         try:
-            close_handler = self.target.close
-        except AttributeError:
-            pass
-        else:
-            return close_handler()
+            finish = getattr(self.target, "close", None)
+            if finish is not None:
+                return finish()
         finally:
+            # the parser cannot be used again
             del self.parser, self._parser
             del self.target, self._target
 
     def flush(self):
+        """Parse buffered data now (expat may defer it otherwise)."""
         was_enabled = self.parser.GetReparseDeferralEnabled()
         try:
             self.parser.SetReparseDeferralEnabled(False)
             self.parser.Parse(b"", False)
-        except self._error as v:
-            self._raiseerror(v)
+        except self._error as exc:
+            raise self._parse_error(exc)
         finally:
             self.parser.SetReparseDeferralEnabled(was_enabled)
 
@@ -1225,256 +1170,231 @@ def canonicalize(xml_data=None, *, out=None, from_file=None, **options):
     """
     if xml_data is None and from_file is None:
         raise ValueError("Either 'xml_data' or 'from_file' must be provided as input")
-    sio = None
-    if out is None:
-        sio = out = io.StringIO()
-    parser = XMLParser(target=C14NWriterTarget(out.write, **options))
+    buffer = io.StringIO() if out is None else None
+    target = C14NWriterTarget((buffer or out).write, **options)
+    parser = XMLParser(target=target)
     if xml_data is not None:
         parser.feed(xml_data)
         parser.close()
-    elif from_file is not None:
+    else:
         parse(from_file, parser=parser)
-    return sio.getvalue() if sio is not None else None
+    return buffer.getvalue() if buffer is not None else None
 
 
-_looks_like_prefix_name = re.compile(r'^\w+:\w+$', re.UNICODE).match
+# "prefix:local" text, as found in QName-valued content
+_PREFIXED_NAME = re.compile(r'^\w+:\w+$', re.UNICODE).match
+
+_XML_NAMESPACE = "http://www.w3.org/XML/1998/namespace"
 
 
 class C14NWriterTarget:
-    """A parser target writing canonical XML (C14N 2.0) via *write*."""
+    """A parser target writing canonical XML (C14N 2.0) via *write*.
+
+    with_comments: keep comments; strip_text: strip leading and trailing
+    whitespace of text (unless xml:space="preserve"); rewrite_prefixes:
+    replace namespace prefixes by n0, n1, ...; qname_aware_tags and
+    qname_aware_attrs: tags whose text and attributes whose values are
+    QNames ("prefix:name") to be rewritten with the output prefixes;
+    exclude_attrs and exclude_tags: attributes and subtrees to leave out.
+    """
 
     def __init__(self, write, *,
                  with_comments=False, strip_text=False, rewrite_prefixes=False,
                  qname_aware_tags=None, qname_aware_attrs=None,
                  exclude_attrs=None, exclude_tags=None):
         self._write = write
-        self._data = []
         self._with_comments = with_comments
         self._strip_text = strip_text
-        self._exclude_attrs = set(exclude_attrs) if exclude_attrs else None
-        self._exclude_tags = set(exclude_tags) if exclude_tags else None
         self._rewrite_prefixes = rewrite_prefixes
-        if qname_aware_tags:
-            self._qname_aware_tags = set(qname_aware_tags)
-        else:
-            self._qname_aware_tags = None
-        if qname_aware_attrs:
-            self._find_qname_aware_attrs = set(qname_aware_attrs).intersection
-        else:
-            self._find_qname_aware_attrs = None
-        self._declared_ns_stack = [[
-            ("http://www.w3.org/XML/1998/namespace", "xml"),
-        ]]
-        self._ns_stack = []
-        if not rewrite_prefixes:
-            self._ns_stack.append(list(_namespace_map.items()))
-        self._ns_stack.append([])
-        self._prefix_map = {}
-        self._preserve_space = [False]
-        self._pending_start = None
-        self._root_seen = False
-        self._root_done = False
-        self._ignored_depth = 0
+        self._qname_tags = frozenset(qname_aware_tags or ())
+        self._qname_attrs = frozenset(qname_aware_attrs or ())
+        self._skip_attrs = frozenset(exclude_attrs or ())
+        self._skip_tags = frozenset(exclude_tags or ())
+        self._text = []
+        # (uri, prefix) bindings seen in the input: a base list, then one
+        # list per open element; _announced collects start_ns() events for
+        # the element about to start
+        self._known = [[] if rewrite_prefixes else list(_namespace_map.items())]
+        self._announced = []
+        # bindings declared in the output, one list per open element
+        self._written = [[(_XML_NAMESPACE, "xml")]]
+        self._generated = {}        # uri -> n<N> prefix (rewrite_prefixes)
+        self._preserve = [False]    # xml:space="preserve" in effect
+        self._deferred = None       # qname-aware element awaiting its text
+        self._skipping = 0          # depth inside an excluded subtree
+        self._started = False       # the root element has been opened
+        self._finished = False      # the root element has been closed
 
-    def _iter_namespaces(self, ns_stack, _reversed=reversed):
-        for namespaces in _reversed(ns_stack):
-            if namespaces:
-                yield from namespaces
+    # -- namespace bookkeeping ---------------------------------------------
 
-    def _resolve_prefix_name(self, prefixed_name):
-        prefix, name = prefixed_name.split(':', 1)
-        for uri, p in self._iter_namespaces(self._ns_stack):
-            if p == prefix:
-                return f'{{{uri}}}{name}'
-        raise ValueError(f'Prefix {prefix} of QName "{prefixed_name}" is not declared in scope')
+    @staticmethod
+    def _innermost_first(frames):
+        for frame in reversed(frames):
+            yield from frame
 
-    def _qname(self, qname, uri=None):
-        if uri is None:
-            uri, tag = qname[1:].rsplit('}', 1) if qname[:1] == '{' else ('', qname)
+    def _expand_prefixed(self, text):
+        prefix, local = text.split(':', 1)
+        for uri, known_prefix in self._innermost_first(self._known):
+            if known_prefix == prefix:
+                return f'{{{uri}}}{local}'
+        raise ValueError(f'Prefix {prefix} of QName "{text}" is not declared in scope')
+
+    def _render_name(self, name):
+        """(output name, local part, namespace URI) for a Clark name,
+        declaring a prefix on the current element when needed."""
+        if name[:1] == '{':
+            uri, _, local = name[1:].rpartition('}')
         else:
-            tag = qname
-        prefixes_seen = set()
-        for u, prefix in self._iter_namespaces(self._declared_ns_stack):
-            if u == uri and prefix not in prefixes_seen:
-                return f'{prefix}:{tag}' if prefix else tag, tag, uri
-            prefixes_seen.add(prefix)
+            uri, local = '', name
+        shadowed = set()
+        for bound_uri, prefix in self._innermost_first(self._written):
+            if bound_uri == uri and prefix not in shadowed:
+                return (f'{prefix}:{local}' if prefix else local), local, uri
+            shadowed.add(prefix)
         if self._rewrite_prefixes:
-            if uri in self._prefix_map:
-                prefix = self._prefix_map[uri]
-            else:
-                prefix = self._prefix_map[uri] = f'n{len(self._prefix_map)}'
-            self._declared_ns_stack[-1].append((uri, prefix))
-            return f'{prefix}:{tag}', tag, uri
-        if not uri and '' not in prefixes_seen:
-            return tag, tag, uri
-        for u, prefix in self._iter_namespaces(self._ns_stack):
-            if u == uri:
-                self._declared_ns_stack[-1].append((uri, prefix))
-                return f'{prefix}:{tag}' if prefix else tag, tag, uri
+            prefix = self._generated.get(uri)
+            if prefix is None:
+                prefix = self._generated[uri] = f'n{len(self._generated)}'
+            self._written[-1].append((uri, prefix))
+            return f'{prefix}:{local}', local, uri
+        if not uri and '' not in shadowed:
+            return local, local, uri
+        for bound_uri, prefix in self._innermost_first(self._known):
+            if bound_uri == uri:
+                self._written[-1].append((uri, prefix))
+                return (f'{prefix}:{local}' if prefix else local), local, uri
         if not uri:
-            return tag, tag, uri
+            return local, local, uri
         raise ValueError(f'Namespace "{uri}" is not declared in scope')
 
-    def data(self, data):
-        if not self._ignored_depth:
-            self._data.append(data)
+    # -- text ---------------------------------------------------------------
 
-    def _flush(self, _join_text=''.join):
-        data = _join_text(self._data)
-        del self._data[:]
-        if self._strip_text and not self._preserve_space[-1]:
-            data = data.strip(" \t\r\n")
-        if self._pending_start is not None:
-            args, self._pending_start = self._pending_start, None
-            qname_text = data if data and _looks_like_prefix_name(data) else None
-            self._start(*args, qname_text)
+    def data(self, data):
+        if not self._skipping:
+            self._text.append(data)
+
+    def _settle(self):
+        # write pending text, opening a deferred element first
+        if not self._text and self._deferred is None:
+            return
+        text = ''.join(self._text)
+        self._text.clear()
+        if self._strip_text and not self._preserve[-1]:
+            text = text.strip(" \t\r\n")
+        if self._deferred is not None:
+            tag, attrs = self._deferred
+            self._deferred = None
+            qname_text = text if text and _PREFIXED_NAME(text) else None
+            self._open(tag, attrs, qname_text)
             if qname_text is not None:
                 return
-        if data and self._root_seen:
-            self._write(_escape_cdata_c14n(data))
+        if text and self._started:
+            self._write(_c14n_text(text))
+
+    # -- parser target interface --------------------------------------------
 
     def start_ns(self, prefix, uri):
-        if self._ignored_depth:
+        if self._skipping:
             return
-        if self._data:
-            self._flush()
-        self._ns_stack[-1].append((uri, prefix))
+        self._settle()
+        self._announced.append((uri, prefix))
 
     def start(self, tag, attrs):
-        if self._exclude_tags is not None and (
-                self._ignored_depth or tag in self._exclude_tags):
-            self._ignored_depth += 1
+        if self._skip_tags and (self._skipping or tag in self._skip_tags):
+            self._skipping += 1
             return
-        if self._data:
-            self._flush()
-        new_namespaces = []
-        self._declared_ns_stack.append(new_namespaces)
-        if self._qname_aware_tags is not None and tag in self._qname_aware_tags:
-            self._pending_start = (tag, attrs, new_namespaces)
+        self._settle()
+        self._written.append([])
+        self._known.append(self._announced)
+        self._announced = []
+        if tag in self._qname_tags:
+            # the text decides whether it is a QName to rewrite
+            self._deferred = (tag, attrs)
             return
-        self._start(tag, attrs, new_namespaces)
+        self._open(tag, attrs, None)
 
-    def _start(self, tag, attrs, new_namespaces, qname_text=None):
-        if self._exclude_attrs is not None and attrs:
-            attrs = {k: v for k, v in attrs.items() if k not in self._exclude_attrs}
-        qnames = {tag, *attrs}
-        resolved_names = {}
+    def _open(self, tag, attrs, qname_text):
+        if self._skip_attrs and attrs:
+            attrs = {k: v for k, v in attrs.items() if k not in self._skip_attrs}
+        names = {tag, *attrs}
+        expanded = {}           # "prefix:local" content -> Clark name
         if qname_text is not None:
-            qname = resolved_names[qname_text] = self._resolve_prefix_name(qname_text)
-            qnames.add(qname)
-        if self._find_qname_aware_attrs is not None and attrs:
-            qattrs = self._find_qname_aware_attrs(attrs)
-            if qattrs:
-                for attr_name in qattrs:
-                    value = attrs[attr_name]
-                    if _looks_like_prefix_name(value):
-                        qname = resolved_names[value] = self._resolve_prefix_name(value)
-                        qnames.add(qname)
-            else:
-                qattrs = None
-        else:
-            qattrs = None
-        parse_qname = self._qname
-        parsed_qnames = {n: parse_qname(n) for n in sorted(
-            qnames, key=lambda n: n.split('}', 1))}
-        if new_namespaces:
-            attr_list = [
-                ('xmlns:' + prefix if prefix else 'xmlns', uri)
-                for uri, prefix in new_namespaces
-            ]
-            attr_list.sort()
-        else:
-            attr_list = []
-        if attrs:
-            for k, v in sorted(attrs.items()):
-                if qattrs is not None and k in qattrs and v in resolved_names:
-                    v = parsed_qnames[resolved_names[v]][0]
-                attr_qname, attr_name, uri = parsed_qnames[k]
-                attr_list.append((attr_qname if uri else attr_name, v))
-        space_behaviour = attrs.get('{http://www.w3.org/XML/1998/namespace}space')
-        self._preserve_space.append(
-            space_behaviour == 'preserve' if space_behaviour
-            else self._preserve_space[-1])
-        write = self._write
-        write('<' + parsed_qnames[tag][0])
-        if attr_list:
-            write(''.join([f' {k}="{_escape_attrib_c14n(v)}"' for k, v in attr_list]))
-        write('>')
+            expanded[qname_text] = self._expand_prefixed(qname_text)
+            names.add(expanded[qname_text])
+        qname_attrs = self._qname_attrs.intersection(attrs) if attrs else ()
+        for attr in qname_attrs:
+            value = attrs[attr]
+            if _PREFIXED_NAME(value):
+                expanded[value] = self._expand_prefixed(value)
+                names.add(expanded[value])
+        # the order of resolution fixes the order of generated prefixes
+        rendered = {name: self._render_name(name)
+                    for name in sorted(names, key=lambda n: n.split('}', 1))}
+        output_attrs = sorted(('xmlns:' + prefix if prefix else 'xmlns', uri)
+                              for uri, prefix in self._written[-1])
+        for key, value in sorted(attrs.items()):
+            if key in qname_attrs and value in expanded:
+                value = rendered[expanded[value]][0]
+            text, local, uri = rendered[key]
+            output_attrs.append((text if uri else local, value))
+        space = attrs.get(f'{{{_XML_NAMESPACE}}}space')
+        self._preserve.append(space == 'preserve' if space else self._preserve[-1])
+        parts = ['<', rendered[tag][0]]
+        for name, value in output_attrs:
+            parts.append(f' {name}="{_c14n_attr(value)}"')
+        parts.append('>')
         if qname_text is not None:
-            write(_escape_cdata_c14n(parsed_qnames[resolved_names[qname_text]][0]))
-        self._root_seen = True
-        self._ns_stack.append([])
+            parts.append(_c14n_text(rendered[expanded[qname_text]][0]))
+        self._write(''.join(parts))
+        self._started = True
 
     def end(self, tag):
-        if self._ignored_depth:
-            self._ignored_depth -= 1
+        if self._skipping:
+            self._skipping -= 1
             return
-        if self._data:
-            self._flush()
-        self._write(f'</{self._qname(tag)[0]}>')
-        self._preserve_space.pop()
-        self._root_done = len(self._preserve_space) == 1
-        self._declared_ns_stack.pop()
-        self._ns_stack.pop()
+        self._settle()
+        self._write(f'</{self._render_name(tag)[0]}>')
+        self._preserve.pop()
+        self._finished = len(self._preserve) == 1
+        self._written.pop()
+        self._known.pop()
+
+    def _before_markup(self):
+        # comments and PIs outside the root go on lines of their own
+        if self._finished:
+            self._write('\n')
+        elif self._started:
+            self._settle()
 
     def comment(self, text):
-        if not self._with_comments:
+        if not self._with_comments or self._skipping:
             return
-        if self._ignored_depth:
-            return
-        if self._root_done:
-            self._write('\n')
-        elif self._root_seen and self._data:
-            self._flush()
-        self._write(f'<!--{_escape_cdata_c14n(text)}-->')
-        if not self._root_seen:
+        self._before_markup()
+        self._write(f'<!--{_c14n_text(text)}-->')
+        if not self._started:
             self._write('\n')
 
     def pi(self, target, data):
-        if self._ignored_depth:
+        if self._skipping:
             return
-        if self._root_done:
-            self._write('\n')
-        elif self._root_seen and self._data:
-            self._flush()
-        self._write(
-            f'<?{target} {_escape_cdata_c14n(data)}?>' if data else f'<?{target}?>')
-        if not self._root_seen:
+        self._before_markup()
+        self._write(f'<?{target} {_c14n_text(data)}?>' if data else f'<?{target}?>')
+        if not self._started:
             self._write('\n')
 
 
-def _escape_cdata_c14n(text):
-    try:
-        if '&' in text:
-            text = text.replace('&', '&amp;')
-        if '<' in text:
-            text = text.replace('<', '&lt;')
-        if '>' in text:
-            text = text.replace('>', '&gt;')
-        if '\r' in text:
-            text = text.replace('\r', '&#xD;')
-        return text
-    except (TypeError, AttributeError):
-        _raise_serialization_error(text)
+_C14N_TEXT_ESCAPES = (('&', '&amp;'), ('<', '&lt;'), ('>', '&gt;'),
+                      ('\r', '&#xD;'))
+_C14N_ATTR_ESCAPES = (('&', '&amp;'), ('<', '&lt;'), ('"', '&quot;'),
+                      ('\t', '&#x9;'), ('\n', '&#xA;'), ('\r', '&#xD;'))
 
 
-def _escape_attrib_c14n(text):
-    try:
-        if '&' in text:
-            text = text.replace('&', '&amp;')
-        if '<' in text:
-            text = text.replace('<', '&lt;')
-        if '"' in text:
-            text = text.replace('"', '&quot;')
-        if '\t' in text:
-            text = text.replace('\t', '&#x9;')
-        if '\n' in text:
-            text = text.replace('\n', '&#xA;')
-        if '\r' in text:
-            text = text.replace('\r', '&#xD;')
-        return text
-    except (TypeError, AttributeError):
-        _raise_serialization_error(text)
+def _c14n_text(text):
+    return _escaped(text, _C14N_TEXT_ESCAPES)
+
+
+def _c14n_attr(text):
+    return _escaped(text, _C14N_ATTR_ESCAPES)
 
 
 # --------------------------------------------------------------------

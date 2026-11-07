@@ -392,13 +392,13 @@ fn sys_intern(_m: &PyObject, s: &PyObject) -> PyResult {
     if !pystr::is_str_exact(s) {
         raise!(TypeError, "intern() argument must be str, not {}", crate::types::typeobject::tname(s));
     }
-    Ok(pystr::intern(s.to_ref()))
+    Ok(pystr::intern_requested(s.to_ref())) // (capi3)
 }
 fn sys_is_interned(_m: &PyObject, s: &PyObject) -> PyResult {
     if !pystr::is_str(s) {
         raise!(TypeError, "_is_interned() argument must be str, not {}", crate::types::typeobject::tname(s));
     }
-    Ok(bool_::new_bool(pystr::is_interned(s)))
+    Ok(bool_::new_bool(pystr::is_interned_here(s)))
 }
 fn sys_is_immortal(_m: &PyObject, o: &PyObject) -> PyResult {
     Ok(bool_::new_bool(o.is_immortal()))
@@ -425,8 +425,25 @@ fn sys_getrefcount(_m: &PyObject, o: &PyObject) -> PyResult {
         if n > 1 && parent_call_operand(o) {
             n -= 1;
         }
+    } else if n > 1 && !o.is_immortal() && crate::types::typeobject::is_type(o) && crate::types::typeobject::is_heap_type(o.as_ptr() as *mut crate::ffi::PyTypeObject) && caller_stack_holds(o) {
+        // (capi3) free-threaded CPython counts heap types lazily (deferred reference
+        // counting): the operand loaded from a global or attribute adds no reference.
+        // Ours does; leave that stack copy out.
+        n -= 1;
     }
     Ok(int::new_int(n))
+}
+
+/// (capi3) The calling frame's value stack holds `o` (the argument just pushed).
+fn caller_stack_holds(o: &PyObject) -> bool {
+    let f = crate::interp::current_frame_ptr();
+    if f.is_null() {
+        return false;
+    }
+    let f = unsafe { &*f };
+    let lo = f.nlocalsplus.min(f.slots.len());
+    let hi = f.stack_top.min(f.slots.len());
+    lo < hi && f.slots[lo..hi].iter().any(|&q| q == o.as_ptr())
 }
 
 fn parent_call_operand(o: &PyObject) -> bool {
@@ -946,7 +963,48 @@ fn sys_is_remote_debug_enabled(_m: &PyObject) -> PyResult {
 }
 fn sys_remote_exec(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     crate::args::check_pos("remote_exec", args, 2, 2)?;
-    raise!(RuntimeError, "Remote debugging is not enabled");
+    let pid = int::as_i64(args[0]).ok_or_else(|| err!(TypeError, "remote_exec() argument 1 must be int, not {}", crate::types::typeobject::tname(args[0])))? as i32;
+    // the script path: str or bytes-like (os.PathLike too, via os.fspath)
+    if !pystr::is_str(args[1]) && !crate::types::bytes::is_bytes(args[1]) {
+        // os.PathLike is accepted via fspath; a plain int/None is a TypeError
+        if ab::getattr_opt(args[1], crate::name!("__fspath__"))?.is_none() {
+            raise!(TypeError, "remote_exec() argument 2 must be a str, bytes or os.PathLike object, not {}", crate::types::typeobject::tname(args[1]));
+        }
+    }
+    let path_obj = crate::modules::posix::path::fspath(args[1])?;
+    let path_bytes: Vec<u8> = if pystr::is_str(&path_obj) {
+        crate::modules::posix::path::fs_encode_str(&path_obj)?
+    } else {
+        crate::types::bytes::bytes_data(&path_obj).to_vec()
+    };
+    crate::modules::sys_full::audit("sys.remote_exec", &[args[0], args[1]])?;
+    // the script must exist and be readable (reported now, not at the safe point)
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let os = std::ffi::OsStr::from_bytes(&path_bytes);
+        if std::fs::metadata(os).is_err() {
+            return Err(crate::types::exceptions::os_error_from_errno(libc::ENOENT, Some(&path_obj), None));
+        }
+    }
+    let self_pid = unsafe { libc::getpid() };
+    if pid == self_pid {
+        if !remote_debug_enabled() {
+            raise!(RuntimeError, "Remote debugging is not enabled");
+        }
+        crate::modules::remote_debug::queue_self_remote_exec(&path_bytes);
+        // ask the main thread to run it at its next safe point
+        if let Some(mt) = crate::threads::main_thread_state() {
+            mt.c.eval_breaker.fetch_or(crate::modules::remote_debug::EVAL_REMOTE_EXEC, std::sync::atomic::Ordering::Release);
+        }
+        return Ok(none::none_ref());
+    }
+    // another process
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::ESRCH);
+        return Err(crate::types::exceptions::os_error_from_errno(e, None, None));
+    }
+    crate::modules::remote_debug::reader::do_remote_exec(pid, &path_bytes)?;
+    Ok(none::none_ref())
 }
 fn sys_getallocatedblocks(_m: &PyObject) -> PyResult {
     Ok(int::new_int(0))
@@ -1078,6 +1136,9 @@ pub struct PathConfig {
     pub zip_path: String,
     /// `<base_exec_prefix>/lib/python3.15t/lib-dynload`
     pub platstdlib_dir: String,
+    /// (perf6) The standard library is the source tree's Lib/ (no installation found):
+    /// frozen modules default to off there, as in a CPython build directory.
+    pub source_tree: bool,
 }
 
 static PATHS: OnceLock<PathConfig> = OnceLock::new();
@@ -1239,6 +1300,7 @@ fn compute_paths() -> PathConfig {
         None => (base_prefix.clone(), base_exec_prefix.clone()),
     };
 
+    let mut source_tree = false;
     let stdlib_dir = if let Some(d) = &c.stdlib_dir {
         d.clone()
     } else if let Ok(d) = std::env::var("RPYTHON_STDLIB") {
@@ -1249,6 +1311,7 @@ fn compute_paths() -> PathConfig {
             // (an explicit PYTHONHOME is taken at its word, even when nothing is there)
             p
         } else {
+            source_tree = true;
             let dev = concat!(env!("CARGO_MANIFEST_DIR"), "/../../Lib");
             std::fs::canonicalize(dev).map(|p| path_str(&p)).unwrap_or_else(|_| dev.to_string())
         }
@@ -1256,6 +1319,7 @@ fn compute_paths() -> PathConfig {
     PathConfig {
         zip_path: format!("{}/lib/python315t.zip", base_prefix),
         platstdlib_dir: format!("{}/lib/python3.15t/lib-dynload", base_exec_prefix),
+        source_tree,
         executable,
         base_executable,
         prefix,

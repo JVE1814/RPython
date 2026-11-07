@@ -1411,6 +1411,52 @@ pub unsafe extern "C" fn h_raise(ts: *const ThreadState, f: *mut Frame, sp: *mut
     }
 }
 
+/// (perf6) PushExcInfo: [.., exc] -> [.., previous handled exception or None, exc]
+/// (`sp` = one past the top). Cannot fail.
+pub unsafe extern "C" fn h_push_exc_info(ts: *const ThreadState, sp: *mut *mut PyObject) {
+    unsafe {
+        let e = *sp.sub(1);
+        incref(e);
+        let prev = eval::set_handled_exception(&*ts, e);
+        *sp.sub(1) = if prev.is_null() { crate::types::none::none_ref().into_raw() } else { prev };
+        *sp = e;
+    }
+}
+
+/// (perf6) PopExcept: [.., previous] -> [..], the previous handled exception restored.
+pub unsafe extern "C" fn h_pop_except(ts: *const ThreadState, sp: *mut *mut PyObject) {
+    unsafe {
+        let prev = std::ptr::replace(sp.sub(1), std::ptr::null_mut());
+        let prevv = if !prev.is_null() && (*prev).is(crate::types::none::none()) {
+            decref(prev);
+            std::ptr::null_mut()
+        } else {
+            prev
+        };
+        let old = eval::set_handled_exception(&*ts, prevv);
+        xdecref(old);
+    }
+}
+
+/// (perf6) CheckExcMatch: [.., exc, type] -> [.., exc, bool]; on error the type is
+/// released and [.., exc] remains.
+pub unsafe extern "C" fn h_check_exc_match(sp: *mut *mut PyObject) -> u64 {
+    unsafe {
+        let t = take(sp.sub(1));
+        let e = &**sp.sub(2);
+        if eval::check_exc_match_type(&t, false).is_err() {
+            return ERR;
+        }
+        match eval::exception_matches(e, &t) {
+            Ok(r) => {
+                *sp.sub(1) = crate::types::bool_::new_bool(r).into_raw();
+                OK
+            }
+            Err(_) => ERR,
+        }
+    }
+}
+
 pub unsafe extern "C" fn h_misc(ts: *const ThreadState, f: *mut Frame, sp: *mut *mut PyObject, oparg: u64, err_top: u64) -> u64 {
     unsafe {
         let f = &mut *f;

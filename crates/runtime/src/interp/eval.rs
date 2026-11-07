@@ -162,7 +162,20 @@ pub fn binary_op_on_stack(op: BinOp, a: &PyObject, b: &PyObject) -> PyResult {
 /// dispatching on this thread.
 pub fn is_stack_temporary(p: *const PyObject) -> bool {
     let p = p as usize;
-    p != 0 && STACK_OPERANDS.with(|c| c.get().contains(&p))
+    p != 0 && (STACK_OPERANDS.with(|c| c.get().contains(&p)) || on_current_value_stack(p))
+}
+
+/// (capi3) Is `p` on the value stack of the innermost Python frame (e.g. an argument of
+/// the C function that frame is calling)? Popped slots are cleared, so only live
+/// operands match.
+fn on_current_value_stack(p: usize) -> bool {
+    let f = crate::interp::current_frame_ptr();
+    if f.is_null() {
+        return false;
+    }
+    let f = unsafe { &*f };
+    let top = f.stack_top.min(f.slots.len());
+    f.nlocalsplus < top && f.slots[f.nlocalsplus..top].iter().any(|&s| s as usize == p)
 }
 
 /// Find the exception handler for instruction `i` (first matching entry).
@@ -191,7 +204,7 @@ pub fn handled_exception(ts: &ThreadState) -> *mut PyObject {
     }
 }
 
-fn set_handled_exception(ts: &ThreadState, v: *mut PyObject) -> *mut PyObject {
+pub(crate) fn set_handled_exception(ts: &ThreadState, v: *mut PyObject) -> *mut PyObject {
     unsafe {
         let item = ts.c.exc_info;
         let old = (*item).exc_value;
@@ -504,7 +517,7 @@ pub(super) fn unpack_ex(seq: &PyObject, before: usize, after: usize) -> PyResult
     Ok(out)
 }
 
-fn check_exc_match_type(t: &PyObject, star: bool) -> PyResult<()> {
+pub(crate) fn check_exc_match_type(t: &PyObject, star: bool) -> PyResult<()> {
     let ok = |c: &PyObject| -> bool { exc::is_exception_class(c) };
     if tuple::is_tuple(t) {
         for c in tuple::tuple_items(t) {
@@ -791,6 +804,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
         pending_err = true;
     }
 
+    let mut unwound = false;
     'outer: loop {
         if !pending_err {
             // ---------------------------------------------------------- dispatch loop
@@ -801,6 +815,10 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                         super::jit::Run::NotRun => {}
                         super::jit::Run::Return(v) => return Ok(Some(Exit::Return(v))),
                         super::jit::Run::Error => return Err(PyErr),
+                        super::jit::Run::Propagated => {
+                            unwound = true;
+                            return Err(PyErr);
+                        }
                         super::jit::Run::Deopt(npc) => pc = npc,
                         super::jit::Run::Yield(v) => return Ok(Some(Exit::Yield(v))),
                     }
@@ -1758,6 +1776,8 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                     return Ok(exit);
                 }
                 Ok(None) => continue 'outer, // jit: re-dispatch (OSR entry)
+                // (perf6) compiled code already unwound the exception out of this frame
+                Err(_) if unwound => return Err(PyErr),
                 Err(_) => {}
             }
         }
@@ -1996,6 +2016,9 @@ pub fn handle_eval_breaker(ts: &ThreadState) -> PyResult<()> {
     }
     if eb & crate::threads::EVAL_PENDING != 0 {
         crate::capi::pystate::run_pending_calls()?;
+    }
+    if eb & crate::modules::remote_debug::EVAL_REMOTE_EXEC != 0 {
+        crate::modules::remote_debug::target::run_pending(ts)?;
     }
     Ok(())
 }

@@ -49,13 +49,9 @@ enum Src {
 
 fn source_of(o: &PyObject, fname: &str) -> PyResult<Src> {
     if pystr::is_str(o) {
-        let s = match pystr::to_string_strict(o) {
-            Some(s) => s,
-            None => {
-                // lone surrogates cannot be encoded to UTF-8
-                pystr::as_utf8(o)?.to_string()
-            }
-        };
+        // (capi3) through the str's cached UTF-8 form, which compiling creates as in
+        // CPython (sys.getsizeof counts it); lone surrogates raise here
+        let s = pystr::as_utf8(o)?.to_string();
         if s.contains('\0') {
             raise!(SyntaxError, "source code string cannot contain null bytes");
         }

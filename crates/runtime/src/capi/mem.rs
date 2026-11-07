@@ -145,12 +145,53 @@ pub unsafe extern "C" fn PyMem_SetAllocator(domain: c_int, a: *mut PyMemAllocato
     unsafe {
         if (0..3).contains(&domain) {
             (*(&raw mut ALLOCATORS))[domain as usize] = *a;
-            HOOKED.store(true, Release);
+            // (capi3) only a replaced object allocator matters to `hooked_alloc_refuses`;
+            // restoring the default (or its debug wrapper) turns the probes off again
+            HOOKED.store(!obj_is_default(&*dom(2)), Release);
         }
     }
 }
+
+/// (capi3) The default object allocator, possibly behind the debug wrapper.
+unsafe fn obj_is_default(a: &PyMemAllocatorEx) -> bool {
+    let default_malloc: unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void = obj_malloc;
+    let mut a = *a;
+    if super::memdebug::is_debug_wrapper(&a) {
+        a = unsafe { super::memdebug::wrapped(&a) };
+    }
+    a.malloc.is_some_and(|m| m as usize == default_malloc as usize)
+}
+
+/// (capi3) Put the debug wrappers (guard bytes, domain checks, thread-state checks;
+/// capi/memdebug.rs) in front of the current allocators of every domain that does not
+/// have them yet.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyMem_SetupDebugHooks() {}
+pub unsafe extern "C" fn PyMem_SetupDebugHooks() {
+    unsafe {
+        for d in 0..3 {
+            let cur = *dom(d);
+            if !super::memdebug::is_debug_wrapper(&cur) {
+                (*(&raw mut ALLOCATORS))[d] = super::memdebug::wrapper_for(d, cur);
+            }
+        }
+    }
+    super::memdebug::INSTALLED.store(true, std::sync::atomic::Ordering::SeqCst);
+    crate::alloc::refresh_slow_paths();
+}
+
+/// (capi3) Install the debug hooks at startup when PYTHONMALLOC asks for them
+/// (`debug` or `<allocator>_debug`), or in development mode unless PYTHONMALLOC names
+/// an allocator without them.
+pub fn setup_from_config(dev_mode: bool, ignore_env: bool) {
+    let req = if ignore_env { None } else { std::env::var("PYTHONMALLOC").ok().filter(|s| !s.is_empty()) };
+    let want = match req.as_deref() {
+        Some(s) => s == "debug" || s.ends_with("_debug"),
+        None => dev_mode,
+    };
+    if want {
+        unsafe { PyMem_SetupDebugHooks() };
+    }
+}
 
 /// Runtime-internal buffers (bytes payloads and the like) are not carved out of
 /// the hookable allocator domains. While a C extension has replaced the object
@@ -170,9 +211,8 @@ pub fn hooked_alloc_refuses(n: usize) -> bool {
     }
     unsafe {
         let a = *dom(2);
-        let default_malloc: unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void = obj_malloc;
         let (Some(m), Some(f)) = (a.malloc, a.free) else { return false };
-        if m as usize == default_malloc as usize {
+        if obj_is_default(&a) {
             return false;
         }
         let p = m(a.ctx, n.max(1));

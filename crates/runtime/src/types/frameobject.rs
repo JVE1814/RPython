@@ -374,8 +374,14 @@ fn frame_clear_method(o: &PyObject) -> PyResult {
     }
     Ok(none::none_ref())
 }
+/// (capi3) Sizes sys.getsizeof reports for frames and generators: those of free-threaded
+/// CPython's objects, which embed the interpreter frame and one data slot (184 bytes
+/// each on 64-bit platforms). Our frame object points to a pooled `Frame` instead, so
+/// its own struct size would understate it.
+pub const CPY_FRAME_SIZE: usize = 184;
+pub const CPY_GEN_SIZE: usize = 184;
 fn frame_sizeof(_o: &PyObject) -> PyResult {
-    Ok(int::new_int(std::mem::size_of::<PyFrameObject>() as i64))
+    Ok(int::new_int(CPY_FRAME_SIZE as i64))
 }
 
 pub fn init_types() {

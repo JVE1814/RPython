@@ -153,6 +153,10 @@ fn no_frozen(n: &PyObject) -> PyErr {
 /// is one, like the importlib bootstrap modules).
 pub fn frozen_code(e: &crate::frozen::Entry) -> PyResult {
     let display = format!("<frozen {}>", e.orig.filter(|o| !o.starts_with('<')).unwrap_or(e.name()));
+    // (perf6) compiled and translated at build time
+    if let Some(r) = crate::startup_image::load(e.file, &display) {
+        return r;
+    }
     let file = crate::frozen::stdlib_file(e).unwrap_or_default();
     crate::import::bootstrap_code(e.src, &file, &display)
 }

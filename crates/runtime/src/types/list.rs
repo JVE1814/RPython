@@ -316,10 +316,13 @@ pub fn reserve(o: &PyObject, n: usize) {
     let _g = ob_lock(o);
     unsafe {
         let l = lp(o);
-        if (*l).allocated.max(0) as usize >= n {
+        // (capi3) slots come in pairs (16-byte granules), as free-threaded CPython
+        // allocates them: list(x) of 1, 2, 3 items reports 2, 2, 4 slots (sys.getsizeof)
+        let want = (n + 1) & !1;
+        if (*l).allocated.max(0) as usize >= want {
             return;
         }
-        grow_items(l, n);
+        grow_items(l, want);
     }
 }
 

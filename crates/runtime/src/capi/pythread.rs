@@ -61,7 +61,14 @@ pub(crate) fn mutex_lock(m: &AtomicU8) {
             let prev = ts.mode.replace(crate::threads::ThreadMode::Blocked);
             let r = b.cv.wait_timeout(g, Duration::from_millis(5)).unwrap();
             drop(r);
-            ts.mode.set(prev);
+            if prev == crate::threads::ThreadMode::InVm {
+                // (capi3) back into the VM through the stop-the-world handshake: a
+                // waiter woken while the world is stopped must not take the lock
+                // (and run) until the world restarts
+                crate::gc::enter_vm(&ts.mode, crate::threads::ThreadMode::Blocked);
+            } else {
+                ts.mode.set(prev);
+            }
         }
     }
 }
@@ -91,6 +98,157 @@ pub unsafe extern "C" fn PyMutex_Unlock(m: *mut u8) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyMutex_IsLocked(m: *mut u8) -> c_int {
     unsafe { (AtomicU8::from_ptr(m).load(Acquire) & LOCKED != 0) as c_int }
+}
+
+// ---------------------------------------------------------------- more lock kinds (capi3)
+//
+// Built on the PyMutex byte above and the same parking buckets; exercised by the
+// `_testinternalcapi.test_lock_*` self-tests.
+
+/// Wait (parked, bounded) until `cond()` holds; `addr` selects the bucket.
+fn park_until(addr: usize, cond: impl Fn() -> bool) {
+    let mut spins = 0;
+    while !cond() {
+        if spins < 40 {
+            spins += 1;
+            std::thread::yield_now();
+            continue;
+        }
+        let b = bucket(addr);
+        let g = b.m.lock().unwrap();
+        if cond() {
+            return;
+        }
+        let _ = b.cv.wait_timeout(g, Duration::from_millis(5)).unwrap();
+    }
+}
+fn wake_all(addr: usize) {
+    let b = bucket(addr);
+    let _g = b.m.lock().unwrap();
+    b.cv.notify_all();
+}
+
+/// One-time initialisation that may fail: a failed attempt leaves the flag unset, so
+/// the next caller tries again; concurrent callers wait for the running attempt.
+pub struct OnceFlag {
+    state: AtomicU8, // 0 = not done, 1 = running, 2 = done
+}
+impl OnceFlag {
+    pub const fn new() -> Self {
+        OnceFlag { state: AtomicU8::new(0) }
+    }
+    pub fn is_done(&self) -> bool {
+        self.state.load(Acquire) == 2
+    }
+    pub fn call_once<E>(&self, f: impl FnOnce() -> Result<(), E>) -> Result<(), E> {
+        let addr = &self.state as *const AtomicU8 as usize;
+        loop {
+            match self.state.compare_exchange(0, 1, Acquire, Acquire) {
+                Ok(_) => {
+                    let r = f();
+                    self.state.store(if r.is_ok() { 2 } else { 0 }, Release);
+                    wake_all(addr);
+                    return r;
+                }
+                Err(2) => return Ok(()),
+                Err(_) => park_until(addr, || self.state.load(Acquire) != 1),
+            }
+        }
+    }
+}
+
+/// Reader/writer lock: any number of readers or one writer. Writers are preferred
+/// (a waiting writer holds back new readers), so a stream of readers cannot starve them.
+pub struct RwMutex {
+    /// bit 0: a writer holds the lock; bits 1..: readers holding it
+    bits: AtomicUsize,
+    writers_waiting: AtomicUsize,
+}
+impl RwMutex {
+    pub const fn new() -> Self {
+        RwMutex { bits: AtomicUsize::new(0), writers_waiting: AtomicUsize::new(0) }
+    }
+    fn addr(&self) -> usize {
+        self as *const Self as usize
+    }
+    pub fn read_lock(&self) {
+        loop {
+            let v = self.bits.load(Relaxed);
+            if v & 1 == 0 && self.writers_waiting.load(Relaxed) == 0 {
+                if self.bits.compare_exchange_weak(v, v + 2, Acquire, Relaxed).is_ok() {
+                    return;
+                }
+                continue;
+            }
+            park_until(self.addr(), || self.bits.load(Relaxed) & 1 == 0 && self.writers_waiting.load(Relaxed) == 0);
+        }
+    }
+    pub fn read_unlock(&self) {
+        if self.bits.fetch_sub(2, Release) == 2 {
+            wake_all(self.addr());
+        }
+    }
+    pub fn write_lock(&self) {
+        self.writers_waiting.fetch_add(1, Relaxed);
+        loop {
+            if self.bits.compare_exchange_weak(0, 1, Acquire, Relaxed).is_ok() {
+                self.writers_waiting.fetch_sub(1, Relaxed);
+                return;
+            }
+            park_until(self.addr(), || self.bits.load(Relaxed) == 0);
+        }
+    }
+    pub fn write_unlock(&self) {
+        self.bits.store(0, Release);
+        wake_all(self.addr());
+    }
+    /// (readers holding the lock, a writer holds it)
+    pub fn state(&self) -> (usize, bool) {
+        let v = self.bits.load(Acquire);
+        (v >> 1, v & 1 != 0)
+    }
+}
+
+/// A PyMutex that its owner thread may lock again; unlocked when the last of the
+/// owner's locks is released.
+pub struct RecursiveMutex {
+    m: AtomicU8,
+    owner: AtomicUsize,
+    depth: AtomicUsize,
+}
+impl RecursiveMutex {
+    pub const fn new() -> Self {
+        RecursiveMutex { m: AtomicU8::new(0), owner: AtomicUsize::new(0), depth: AtomicUsize::new(0) }
+    }
+    fn me() -> usize {
+        crate::object::thread_id()
+    }
+    pub fn lock(&self) {
+        if self.owner.load(Relaxed) == Self::me() {
+            self.depth.fetch_add(1, Relaxed);
+            return;
+        }
+        mutex_lock(&self.m);
+        self.owner.store(Self::me(), Relaxed);
+        self.depth.store(1, Relaxed);
+    }
+    /// False (and nothing changes) when the calling thread does not own the lock.
+    pub fn unlock(&self) -> bool {
+        if self.owner.load(Relaxed) != Self::me() {
+            return false;
+        }
+        if self.depth.fetch_sub(1, Relaxed) == 1 {
+            self.owner.store(0, Relaxed);
+            mutex_unlock(&self.m);
+        }
+        true
+    }
+    pub fn is_owned_by_me(&self) -> bool {
+        self.owner.load(Relaxed) == Self::me()
+    }
+    pub fn is_locked(&self) -> bool {
+        self.m.load(Acquire) & LOCKED != 0
+    }
 }
 
 // ---------------------------------------------------------------- critical sections
