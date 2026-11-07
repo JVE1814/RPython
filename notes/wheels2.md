@@ -79,6 +79,18 @@ the binary of a snapshot/venv; the pandas parts skip without pandas).
     "Could not determine delimiter"); when no punctuation qualifies, letters/digits are
     tried, the highest character winning a tie ("aob" splits at "o").
 16. `'x' in obj` without __contains__/__iter__: the message names tp_name.
+17. **LZMA normal mode** (crates/compress/src/lzma/enc.rs, flagged): presets 4..9 used a
+    greedy/lazy parser that compressed no better (sometimes worse) than the fast presets;
+    pandas checks `preset=1` output is larger than the default. Mode 2 now plans each
+    4096-byte window as a shortest path over positions (literal / short rep / rep0..3 of
+    every length / every match length at the nearest distance reaching it, including
+    2-byte matches closer than 128), priced from the model's probabilities, each node
+    carrying its coder state and recent distances; a match or repeat >= nice_len is taken
+    whole and ends the window. A plan always sees a full window + lookahead (or the end of
+    input), so streamed and one-shot output stay identical (test_lzma test_write_10).
+    Sizes: pandas json 1040 -> 568, csv 508 -> 400, 70 KB Python source 14628 -> 13916
+    (preset 6). Speed ~1.3 MB/s on text at preset 6 (was much faster, much worse).
+    Dev aid: `cargo run --release -p rpy-compress --example xzsize -- FILE...`.
 
 ## Left (root causes known)
 * xz presets (3 tests, io/test_compression::test_xz_compression_level_read): our LZMA encoder
