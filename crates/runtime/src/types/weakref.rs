@@ -164,6 +164,21 @@ unsafe fn get_basic_refs(slot: *mut *mut PyObject) -> (*mut PyWeakReference, *mu
     }
 }
 
+/// (hang1) A new strong reference to `p` unless its count already reached zero
+/// on some thread. Checking `refcnt() > 0` and then increfing raced with the
+/// owner's last decref (the owner frees as soon as it sees no shared count),
+/// so referents and weakref objects are marked "maybe weakly referenced" when
+/// a weakref is created (the owner then merges with a CAS) and are taken with
+/// a CAS that fails once the merged count is zero.
+unsafe fn try_ref(p: *mut PyObject) -> Option<PyRef> {
+    unsafe {
+        if crate::capi::object::PyUnstable_TryIncRef(p) == 0 {
+            return None;
+        }
+        Some(PyRef::from_raw(p))
+    }
+}
+
 /// Try to take a new strong reference to a live referent.
 fn referent(o: &PyObject) -> Option<PyRef> {
     let _g = list_lock();
@@ -171,12 +186,7 @@ fn referent(o: &PyObject) -> Option<PyRef> {
     if p.is_null() || p == none::none().as_ptr() {
         return None;
     }
-    unsafe {
-        if (*p).refcnt() <= 0 {
-            return None;
-        }
-        Some(PyRef::from_borrowed(p))
-    }
+    unsafe { try_ref(p) }
 }
 pub fn get_object(o: &PyObject) -> Option<PyRef> {
     referent(o)
@@ -223,8 +233,8 @@ pub fn weakrefs_of(o: &PyObject) -> Vec<PyRef> {
         }
         let mut r = head(slot);
         while !r.is_null() {
-            if (*(r as *mut PyObject)).refcnt() > 0 {
-                v.push(PyRef::from_borrowed(r as *mut PyObject));
+            if let Some(x) = try_ref(r as *mut PyObject) {
+                v.push(x);
             }
             r = (*r).wr_next;
         }
@@ -236,6 +246,8 @@ pub fn weakrefs_of(o: &PyObject) -> Vec<PyRef> {
 
 unsafe fn init_ref(r: *mut PyWeakReference, ob: *mut PyObject, cb: Option<&PyObject>) {
     unsafe {
+        crate::capi::object::PyUnstable_EnableTryIncRef(ob);
+        crate::capi::object::PyUnstable_EnableTryIncRef(r as *mut PyObject);
         (*r).wr_object = ob;
         (*r).wr_callback = cb.map_or(std::ptr::null_mut(), |c| c.to_ref().into_raw());
         (*r).hash = -1;
@@ -260,8 +272,8 @@ pub fn new_ref(tp: *mut PyTypeObject, ob: &PyObject, callback: Option<&PyObject>
     if tp == ref_type() && callback.is_none() {
         let _g = list_lock();
         let (basic, _) = unsafe { get_basic_refs(slot) };
-        if !basic.is_null() && unsafe { (*(basic as *mut PyObject)).refcnt() } > 0 {
-            return Ok(unsafe { PyRef::from_borrowed(basic as *mut PyObject) });
+        if let Some(b) = (!basic.is_null()).then(|| unsafe { try_ref(basic as *mut PyObject) }).flatten() {
+            return Ok(b);
         }
     }
     let op = unsafe {
@@ -293,8 +305,8 @@ pub fn new_proxy(ob: &PyObject, callback: Option<&PyObject>) -> PyResult {
     if callback.is_none() {
         let _g = list_lock();
         let (_, basic) = unsafe { get_basic_refs(slot) };
-        if !basic.is_null() && unsafe { (*(basic as *mut PyObject)).refcnt() } > 0 {
-            return Ok(unsafe { PyRef::from_borrowed(basic as *mut PyObject) });
+        if let Some(b) = (!basic.is_null()).then(|| unsafe { try_ref(basic as *mut PyObject) }).flatten() {
+            return Ok(b);
         }
     }
     let tp = if ab::is_callable(ob) { callable_proxy_type() } else { proxy_type() };
@@ -349,8 +361,8 @@ pub unsafe fn clear_weakrefs_at(o: *mut PyObject, list: *mut *mut PyObject) {
                 let cb = std::mem::replace(&mut (*r).wr_callback, std::ptr::null_mut());
                 if !cb.is_null() {
                     let ro = r as *mut PyObject;
-                    if (*ro).refcnt() > 0 {
-                        pending.push((PyRef::from_borrowed(ro), PyRef::from_raw(cb)));
+                    if let Some(x) = try_ref(ro) {
+                        pending.push((x, PyRef::from_raw(cb)));
                     } else {
                         // the weakref itself is dying: just drop the callback
                         dead_cbs.push(PyRef::from_raw(cb));
@@ -417,8 +429,8 @@ pub unsafe fn detach_weakrefs_for_gc(garbage: &[*mut PyObject], callbacks_only: 
                     let cb = std::mem::replace(&mut (*r).wr_callback, std::ptr::null_mut());
                     if !cb.is_null() {
                         let ro = r as *mut PyObject;
-                        if !set.contains(&(ro as usize)) && (*ro).refcnt() > 0 {
-                            pending.push((PyRef::from_borrowed(ro), PyRef::from_raw(cb)));
+                        if let Some(x) = (!set.contains(&(ro as usize))).then(|| try_ref(ro)).flatten() {
+                            pending.push((x, PyRef::from_raw(cb)));
                         } else {
                             dropped.push(PyRef::from_raw(cb));
                         }

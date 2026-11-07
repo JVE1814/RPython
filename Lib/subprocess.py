@@ -1033,8 +1033,16 @@ class Popen:
         pending = memoryview(self._input) if self._input else None
 
         with _PopenSelector() as sel:
-            if self.stdin and input and not self.stdin.closed:
-                sel.register(self.stdin, selectors.EVENT_WRITE)
+            # a call resumed after a timeout passes no input but still owes
+            # the child the rest of the earlier input (and the EOF after it)
+            if self.stdin and self._input and not self.stdin.closed:
+                if self._input_offset < len(self._input):
+                    sel.register(self.stdin, selectors.EVENT_WRITE)
+                else:
+                    try:
+                        self.stdin.close()
+                    except BrokenPipeError:
+                        pass
             for stream in (self.stdout, self.stderr):
                 if stream and not stream.closed:
                     sel.register(stream, selectors.EVENT_READ)

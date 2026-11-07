@@ -471,12 +471,20 @@ pub unsafe extern "C" fn PyObject_CallMethodObjArgs(o: *mut PyObject, name: *mut
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyTuple_Pack(n: Py_ssize_t, mut args: ...) -> *mut PyObject {
     unsafe {
-        let mut v = Vec::with_capacity(n.max(0) as usize);
-        for _ in 0..n {
-            let p: *mut PyObject = args.next_arg::<*mut PyObject>();
-            v.push(PyRef::from_borrowed(p));
+        // (hang1) PyTuple_New validates the size (SystemError / MemoryError)
+        // before any argument is read
+        let t = super::containers::PyTuple_New(n);
+        if t.is_null() || n == 0 {
+            return t;
         }
-        tuple::new_tuple(v).into_raw()
+        let base = tuple::item_ptr(t);
+        for i in 0..n as usize {
+            let p: *mut PyObject = args.next_arg::<*mut PyObject>();
+            incref(p);
+            *base.add(i) = p;
+        }
+        tuple::track_if_needed(t);
+        t
     }
 }
 

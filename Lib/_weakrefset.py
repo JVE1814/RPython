@@ -58,8 +58,14 @@ class WeakSet:
     def _commit_removals(self):
         pending = self._pending_removals
         discard = self.data.discard
-        while pending:
-            discard(pending.pop())
+        # (hang1) several threads may commit at once (no GIL): the list can
+        # run empty between a length check and pop()
+        while True:
+            try:
+                item = pending.pop()
+            except IndexError:
+                return
+            discard(item)
 
     def __iter__(self):
         with _IterationGuard(self):

@@ -602,15 +602,48 @@ pub(crate) fn add_pending_call_to(i: &'static Interp, f: unsafe extern "C" fn(*m
     0
 }
 /// Run queued calls this thread may run (eval breaker, Py_MakePendingCalls).
+///
+/// (hang1) Bounded and not re-entrant: a callback that queues itself again
+/// (e.g. because it wants to run on another thread) must not be popped again
+/// by the same loop forever, and Python code run by a callback must not start
+/// a nested round. At most the number of calls queued on entry are run; if
+/// some remain, every thread that may serve them is signalled again.
 pub(crate) fn run_pending_calls() -> PyResult<()> {
+    thread_local! {
+        static BUSY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
     let ts = threads::current_ptr();
     if !ts.is_null() {
         unsafe { (*ts).c.eval_breaker.fetch_and(!threads::EVAL_PENDING, std::sync::atomic::Ordering::AcqRel) };
     }
+    if BUSY.with(|b| b.replace(true)) {
+        return Ok(());
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            BUSY.with(|b| b.set(false));
+        }
+    }
+    let _reset = Reset;
     let interp = subinterp::current();
     let p = PENDING.get_in(interp);
     let main = interp.is_main() && threads::is_main_thread();
-    loop {
+    let mut budget = p.any.lock().unwrap().len() + if main { p.main.lock().unwrap().len() } else { 0 };
+    let resignal = |p: &Pending| {
+        if main && !p.main.lock().unwrap().is_empty() {
+            request_pending(ts);
+        }
+        if !p.any.lock().unwrap().is_empty() {
+            for &t in threads::ALL_THREADS.lock().unwrap().iter() {
+                if std::ptr::eq(subinterp::of_ts(t as *const ThreadState), interp) {
+                    request_pending(t as *const ThreadState);
+                }
+            }
+        }
+    };
+    while budget > 0 {
+        budget -= 1;
         let item = {
             let a = if main { p.main.lock().unwrap().pop_front() } else { None };
             match a {
@@ -622,15 +655,15 @@ pub(crate) fn run_pending_calls() -> PyResult<()> {
         let f: unsafe extern "C" fn(*mut c_void) -> c_int = unsafe { std::mem::transmute(f) };
         if unsafe { f(arg as *mut c_void) } < 0 {
             // leave the rest for the next check
-            if !p.any.lock().unwrap().is_empty() || (main && !p.main.lock().unwrap().is_empty()) {
-                request_pending(ts);
-            }
+            resignal(p);
             if !err_occurred() {
                 let _ = system_error("pending call failed without setting an exception");
             }
             return Err(PyErr);
         }
     }
+    resignal(p);
+    Ok(())
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Py_AddPendingCall(func: Option<unsafe extern "C" fn(*mut c_void) -> c_int>, arg: *mut c_void) -> c_int {

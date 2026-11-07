@@ -677,6 +677,11 @@ pub fn os_forkpty(_m: &PyObject) -> PyResult {
 fn fork_with(name: &str, f: impl FnOnce() -> (i64, libc::c_int)) -> PyResult<(i64, libc::c_int)> {
     // (interp1) isolated subinterpreters may not fork
     crate::subinterp::check_allowed(crate::subinterp::current_config().allow_fork, "fork")?;
+    // (hang1) a child forked from a finalizer would inherit a half torn-down
+    // runtime (and its parent's pipes, keeping readers waiting forever)
+    if crate::modules::sys_full::is_finalizing() {
+        raise!(PythonFinalizationError, "can't fork at interpreter shutdown");
+    }
     run_before_fork();
     let st = crate::fork::prepare();
     let others = st.other_threads;
