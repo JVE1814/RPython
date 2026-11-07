@@ -341,3 +341,25 @@ runs at build time. Frozen modules are used by default, as in CPython, except wh
 (running target/release/python3 from a checkout keeps using the files on disk). Consequence: after editing a frozen
 module's source, rebuild before snapshotting. Result (perf6): `-c pass` 64.8M → 39.2M instructions (CPython 40.5M),
 python_startup 0.88x the best CPython build.
+
+## D31 — Reported object sizes (capi3, 2026-11-07)
+`tp_basicsize` always equals what we allocate and is never smaller than our own struct (C extensions subclass and
+allocate by it). Where CPython's layout is larger we pad to CPython's size (dict iterators, enumerate, capsule, module,
+EncodingMap); where our object is internally different, `__sizeof__` (a reporting API) reports CPython's size instead
+(frame and generator 184, range, split instance dicts, heap types with inline values plus the shared-keys block).
+`list(x)` rounds capacity up to an even slot count. set's private trailing field beyond the public PySetObject layout
+was removed (a corruption risk for C subclasses).
+
+## D32 — Interning with subinterpreters (capi3)
+One shared intern table stays (shapes key on interned pointers). Strings that `sys.intern` in the main interpreter newly
+made canonical are marked dynamic and are not handed to subinterpreters, which keep their own table for those; code
+constants count as static (shared).
+
+## D33 — Code points above U+10FFFF created from C (capi3)
+Stored as given, as a CPython release build does: a single such code point is refused, iterating over such a string
+raises SystemError (the behaviour test_capi checks).
+
+## D34 — Debug allocator hooks under -X dev (capi3)
+`PYTHONMALLOC=debug`/`*_debug` and `-X dev` install guard-byte debug hooks (capi/memdebug.rs). Blocks the hooks did not
+allocate (runtime objects freed via tp_free) pass through to the wrapped allocator. With hooks, tracemalloc or a
+reference tracer installed, the allocator takes its slow paths (one combined flag, no cost otherwise).
