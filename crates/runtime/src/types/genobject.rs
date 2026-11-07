@@ -275,7 +275,15 @@ pub unsafe fn jit_send(ts: &crate::threads::ThreadState, o: *mut PyObject, v: *m
             return (JS_SLOW, std::ptr::null_mut());
         }
         let flag = &*(&raw mut gn.running as *const std::sync::atomic::AtomicBool);
-        if flag.compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire).is_err() {
+        // claim: while only one thread exists (threads set MULTI_THREADED before the
+        // second one starts) nobody can race the claim, so a plain store does (a
+        // locked compare-exchange costs ~20 cycles per resumption)
+        if crate::threads::MULTI_THREADED.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return (JS_SLOW, std::ptr::null_mut());
+            }
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        } else if flag.compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire).is_err() {
             return (JS_SLOW, std::ptr::null_mut());
         }
         if push {
