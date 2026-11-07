@@ -703,12 +703,46 @@ fn gen_throw(o: &PyObject, args: &[&PyObject]) -> PyResult {
     gen_throw_impl(o, args[0], args.get(1).copied(), args.get(2).copied(), true)
 }
 
+/// (jit5) Can closing this suspended generator skip throwing GeneratorExit into it?
+/// True when it is suspended at a plain `yield` whose only enclosing exception handler
+/// is the compiler's implicit StopIteration -> RuntimeError wrapper (the public RESUME
+/// after the yield carries the "exception depth 1" flag): nothing in the generator can
+/// observe the exception, so the effect is just finishing the frame. (An abandoned
+/// `any(x for x in ...)` closes its generator on every call.)
+fn close_without_throw(gn: &GenObject) -> bool {
+    if gn.running || crate::modules::sys::tracing_active() {
+        return false;
+    }
+    let f = unsafe { &*gn.frame };
+    if f.state != FrameState::Suspended || f.yield_from_send != -1 || !f.frame_obj.is_null() {
+        return false;
+    }
+    let co = f.code();
+    let m = crate::types::code::code_meta(co);
+    if !m.public {
+        return false;
+    }
+    let cd = crate::types::code::code_data(co);
+    let Some(&off) = cd.pub_of_internal.get(f.next_instr as usize) else { return false };
+    let code = crate::types::bytes::bytes_data(&m.co_code);
+    let k = off as usize * 2;
+    if k + 1 >= code.len() || code[k] != crate::interp::wc::op::RESUME {
+        return false;
+    }
+    let arg = code[k + 1];
+    arg & 3 == 1 && arg & 8 != 0
+}
+
 pub fn gen_close(o: &PyObject) -> PyResult {
     let gn = g(o);
     if gn.frame.is_null() {
         return Ok(none::none_ref());
     }
     if unsafe { (*gn.frame).state == FrameState::Created } {
+        finish(gn);
+        return Ok(none::none_ref());
+    }
+    if close_without_throw(gn) {
         finish(gn);
         return Ok(none::none_ref());
     }

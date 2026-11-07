@@ -1463,6 +1463,9 @@ impl<'a> B<'a> {
                 if self.try_range_iter(i, last) {
                     return Ok(true);
                 }
+                if self.try_method_builtin(i) {
+                    return Ok(false);
+                }
                 if !self.try_builtin(i) && !self.try_inline(i)? && !self.try_inline_new(i)? {
                     self.template(i);
                 }
@@ -2505,6 +2508,54 @@ impl<'a> B<'a> {
         true
     }
 
+    /// Calls of a few builtin methods found by LoadMethod (stack: [descriptor, receiver,
+    /// args...]): dict.get and list.append go straight to their implementation
+    /// instead of through the generic call (descriptor vectorcall, argument checks).
+    fn try_method_builtin(&mut self, i: usize) -> bool {
+        let n = self.u.an.instrs[i].arg as usize;
+        let d = self.st.stack.len();
+        if d < n + 2 {
+            return false;
+        }
+        let AV::Const(dp) = self.st.stack[d - n - 2] else { return false };
+        if matches!(self.st.stack[d - n - 1], AV::Null) {
+            return false;
+        }
+        let Some((tp, name)) = (unsafe { method_descr_name(dp) }) else { return false };
+        let helper = if tp == crate::types::dict::dict_type() as usize && name == "get" && (n == 1 || n == 2) {
+            h2_dict_get as usize
+        } else if tp == list_t() && name == "append" && n == 1 {
+            h2_list_append as usize
+        } else {
+            return false;
+        };
+        let esnap = self.snap(i, SnapKind::Error);
+        let recv = self.peek_ptr(n + 1);
+        let a1 = self.peek_ptr(n);
+        let a2 = if n == 2 { Opnd::V(self.peek_ptr(1)) } else { Opnd::I(0) };
+        // a key's __hash__/__eq__ may run Python code (exact str/int keys do not)
+        let key_ty = self.ty_of(&self.peek(n));
+        let safe_key = key_ty.is(crate::types::str::str_type()) || key_ty.is(int_t() as *mut PyTypeObject);
+        let r = self.v(Class::G);
+        self.emit(Inst::Call { addr: helper, args: vec![Opnd::V(recv), Opnd::V(a1), a2], fargs: vec![], ret: Some(r), fret: None });
+        self.emit(Inst::Guard(Cond::Test(r, Opnd::V(r), Cc::E), esnap));
+        for _ in 0..n + 1 {
+            let k = self.st.stack.len() - 1;
+            let a = self.pop();
+            self.discard(a, k);
+        }
+        self.pop(); // the descriptor (a constant)
+        if helper == h2_list_append as usize {
+            self.push(AV::Const(none_p()));
+        } else {
+            if !safe_key {
+                self.forget_tags();
+            }
+            self.push(AV::Obj(r, Own::Owned, Ty::Unknown));
+        }
+        true
+    }
+
     /// Calls of a few builtins compiled inline: len() of lists/tuples/dicts/strs.
     fn try_builtin(&mut self, i: usize) -> bool {
         let n = self.u.an.instrs[i].arg as usize;
@@ -3334,6 +3385,47 @@ pub unsafe extern "C" fn h_shape_lacks(sh: *const crate::shape::Shape, name: *mu
             return 0;
         }
         (*cell).store(sh as usize, std::sync::atomic::Ordering::Relaxed);
+        1
+    }
+}
+
+/// (defining type, name) of a builtin method descriptor.
+unsafe fn method_descr_name(p: usize) -> Option<(usize, &'static str)> {
+    unsafe {
+        let o = &*(p as *mut PyObject);
+        if !o.is_type(crate::types::descr::method_descr_type()) {
+            return None;
+        }
+        let md = p as *mut PyMethodDescrObject;
+        let ml = (*md).d_method;
+        if ml.is_null() || (*ml).ml_name.is_null() {
+            return None;
+        }
+        let tp = (*md).d_common.d_type as usize;
+        std::ffi::CStr::from_ptr((*ml).ml_name).to_str().ok().map(|s| (tp, s))
+    }
+}
+
+/// dict.get(key[, default]) (try_method_builtin): `d` is a dict (or subclass), the
+/// default NULL when absent. New reference, or NULL with an exception set.
+pub unsafe extern "C" fn h2_dict_get(d: *mut PyObject, key: *mut PyObject, dflt: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        match crate::types::dict::get_item(&*d, &*key) {
+            Ok(Some(v)) => v.into_raw(),
+            Ok(None) => {
+                let r = if dflt.is_null() { crate::types::none::none().as_ptr() } else { dflt };
+                crate::object::incref(r);
+                r
+            }
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+}
+
+/// list.append(x) (try_method_builtin): 1, or 0 with an exception set.
+pub unsafe extern "C" fn h2_list_append(l: *mut PyObject, x: *mut PyObject, _unused: *mut PyObject) -> u64 {
+    unsafe {
+        crate::types::list::append(&*l, (*x).to_ref());
         1
     }
 }
