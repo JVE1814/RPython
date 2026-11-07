@@ -255,7 +255,9 @@ type_refcount_drift, deque_race, weakref_race, shared_objects, join_releases).
 * QSBR still delays finalizers while several threads run (perf-runtime's design note);
   `join` now flushes, but `del x` in a threaded program can see `__del__` run a few polls
   later than CPython.
-* Not re-run after the fixes: test_multiprocessing_* manager heap corruption (coordinator
+* test_multiprocessing_forkserver.test_manager and _spawn.test_manager: 82 run, pass (the
+  coordinator's heap-corruption report); test_io *races* pass.
+* Not re-run after the fixes: test_multiprocessing_* in full (coordinator
   item 2; likely fixed by the file-object/deque locking), test_io write/readline races,
   test_ssl, test_subprocess/test_cmd_line_script timeouts.
 * Remaining Rust-state objects without locking (not seen crashing): ElementTree, pyexpat
