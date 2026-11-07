@@ -688,3 +688,9 @@ pub unsafe extern "C" fn PyCompile_OpcodeStackEffect(_opcode: c_int, _oparg: c_i
 pub unsafe extern "C" fn PyCompile_OpcodeStackEffectWithJump(opcode: c_int, oparg: c_int, _jump: c_int) -> c_int {
     unsafe { PyCompile_OpcodeStackEffect(opcode, oparg) }
 }
+
+/// Is `o` a trace function installed from C (PyEval_SetTrace)? Such functions receive the
+/// events of every frame, including frames that were already running when it was set.
+pub fn is_ctracer(o: *mut PyObject) -> bool {
+    !o.is_null() && unsafe { (*o).type_ptr() } == ctracer_type()
+}

@@ -320,6 +320,12 @@ pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
     if first_word && !is_resume && MON_ANY.load(Relaxed) & (1 << INSTRUCTION) != 0 {
         fire(ts, f, INSTRUCTION, offset(f), &[])?;
     }
+    if f.f_trace.is_null() && crate::capi::ceval::is_ctracer(ts.trace_func.get()) {
+        // a C-level tracer sees running frames too
+        let t = ts.trace_func.get();
+        unsafe { incref(t) };
+        f.f_trace = t;
+    }
     if ts.trace_func.get().is_null() || f.f_trace.is_null() {
         return Ok(());
     }
