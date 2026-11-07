@@ -517,6 +517,47 @@ yet in master when jit4 started; it was merged from there (master has it since).
 * Cache misses and compiled store-attribute slow paths refresh the adaptive view
   (`dis(adaptive=True)`); tier 1's inline instance-dict store does not, so
   test_opcache's `test_store_attr_with_hint` race variant still differs with the JIT.
+### Steady-state instructions per loop (millions, perloop.sh, final LTO build 5081fa3+)
+Same windows as the jit3 table (ours -a 2 -b 5; deltablue/hexiom 5/15; fannkuch 1/3;
+unpack_sequence 2000/6000; comprehensions 1000/3000); CPython columns from the jit3
+table (same harness). ratio = ours / best CPython.
+
+| bench | CPython default | CPython ft | jit3 | jit4 | ratio |
+|---|---|---|---|---|---|
+| richards | 461.1 | 565.8 | 353.2 | 314.3 | 0.68 |
+| nbody | 1107.5 | 1401.5 | 393.7 | 359.8 | 0.32 |
+| spectral_norm | 1207.8 | 1403.9 | 818.4 | 636.0 | 0.53 |
+| float | 778.4 | 870.1 | 865.6 | 702.2 | 0.90 |
+| richards_super | 530.4 | 639.0 | 559.4 | 484.4 | 0.91 |
+| chaos | 610.7 | 682.6 | 722.6 | 486.3 | 0.80 |
+| raytrace | 2757.1 | 3200.8 | 3640.1 | 2776.3 | 1.01 |
+| go | 1138.4 | 1259.6 | 2110.8 | 2166.9 (1511 in a 1/2 window) | 1.33-1.90 |
+| generators | 337.1 | 372.4 | 810.3 | 477.9 | 1.42 |
+| coroutines | 294.4 | 299.9 | 605.2 | 289.7 | 0.98 |
+| nqueens | 841.8 | 942.5 | 2085.9 | 1860.1 (1421.9 before D24) | 2.21 |
+| deltablue | 29.1 | 42.4 | 49.3 | 36.9 (33.6 before D24) | 1.27 |
+| hexiom | 58.1 | 65.7 | 78.2 | 82.7 (59.0 before D24) | 1.42 |
+| fannkuch | 4392.7 | 4962.9 | 8646.7 | 5779.9 | 1.32 |
+| unpack_sequence | 0.25 | 0.15 | 0.37 | 0.11 | 0.73 |
+| comprehensions | 0.19 | 0.24 | 0.42 | 0.39 | 2.1 |
+
+go's numbers swing between windows: ~1100 tier-2 deopts per run (folded globals
+rebound by `global TIMESTAMP, MOVES` assignments invalidate dependents, recompiles land
+in measured loops) - unchanged from before jit4. After the D24 merge, tier 1 cannot
+compile generator expressions ("stack depth mismatch": the handler depth of the
+translated exception table vs `analysis::effect`, likely the phantom iterator slot),
+so genexprs run in the interpreter: nqueens, hexiom and comprehensions regressed.
+This is the first thing to fix next.
+
+### Open items
+* genexpr tier-1 analysis failure after D24 (above).
+* test_opcache TestRacesDoNotCrash.test_store_attr_with_hint: compiled code records the
+  adaptive view at cache fills/misses only; for these objects the miss classifies
+  them as inline-values while tier 0 sees a dict - not resolved.
+* go: folded globals that the program rebinds constantly cause deopt/recompile churn
+  (stop folding a key after its first invalidation instead of per code object).
+* Generators: per-level resume cost is now ~70 instructions in gen_send_fast + the
+  Send helper; a machine-code Send fast path would remove most of it.
 * Not JIT bugs (reported): test_ssl `test_sni_callback_race` (bindings read
   `sni_callback` unsynchronised), test_asyncio.test_free_threading (crashes with
   the JIT off too).
