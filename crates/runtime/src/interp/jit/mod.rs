@@ -612,6 +612,42 @@ pub fn continue_in_interp(ts: &ThreadState, f: &mut Frame, st: u32) -> PyResult<
     crate::interp::eval::eval_inner(ts, f, throw)
 }
 
+/// (jit6) Drain-mode tier-1 code of a generator expression (tier1.rs YieldValue,
+/// helpers.rs `h_drain`), built on first use; None if it cannot be (or is being)
+/// built. RPYTHON_JIT_DRAIN=0 disables draining.
+pub fn drain_code(cd: &CodeData, code: &PyObject) -> Option<*const Compiled> {
+    use std::sync::atomic::AtomicPtr;
+    let cell: &AtomicPtr<Compiled> = &cd.caches.drain;
+    let p = cell.load(Acquire);
+    if p as usize == 1 {
+        return None;
+    }
+    if !p.is_null() {
+        return Some(p);
+    }
+    if cell.compare_exchange(std::ptr::null_mut(), 1 as *mut Compiled, AcqRel, Acquire).is_err() {
+        return None;
+    }
+    static DRAIN: AtomicU32 = AtomicU32::new(UNSET);
+    if !env_flag(&DRAIN, "RPYTHON_JIT_DRAIN") {
+        return None;
+    }
+    let co_ = crate::types::code::code(code);
+    let nlp = co_.obj.co_nlocalsplus as usize;
+    let tables = cd.caches.tables(&cd.code);
+    let out = tier1::compile_mode(cd, nlp, co_.flags(), tables, true).ok()?;
+    let asm = &out.asm;
+    let addr = mem::install(&asm.buf, |buf, base| {
+        let _ = asm.patch_abs(buf, base);
+    })?;
+    if DEBUG.load(Relaxed) != 0 {
+        eprintln!("[jit] tier1 drain {} ({} bytes)", crate::types::str::to_string_lossy(&cd.co_qualname), asm.buf.len());
+    }
+    let c = Box::into_raw(Box::new(Compiled { addr, len: asm.buf.len(), entries: out.entries }));
+    cell.store(c, Release);
+    Some(c)
+}
+
 /// Publish the fast-call descriptor of a code object (see CodeCaches::fast_entry).
 fn publish_fast_entry(code: &PyObject, cd: &CodeData, target: usize) {
     use rpy_compiler::bytecode::co;
@@ -667,6 +703,11 @@ fn compile(f: &Frame, cd: &CodeData) -> bool {
                             cd.code.len(),
                             code.len()
                         );
+                        if DEBUG.load(Relaxed) >= 5 {
+                            for ins in analysis::decode(&cd.code) {
+                                eprintln!("    {:4} {:?} {}", ins.pc, ins.op, ins.arg);
+                            }
+                        }
                     }
                     let entry0 = out.entries.first().copied().unwrap_or(u32::MAX);
                     let c = Box::into_raw(Box::new(Compiled { addr, len: code.len(), entries: out.entries }));

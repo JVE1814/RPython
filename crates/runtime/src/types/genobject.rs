@@ -32,6 +32,10 @@ pub struct GenObject {
     pub finalizer: *mut PyObject,
     /// object being delegated to by yield from/await (borrowed from frame stack)
     pub yieldfrom_hint: *mut PyObject,
+    /// (jit6) while a consumer drains this generator (jit/helpers.rs `h_drain`): the
+    /// container its values go to (borrowed) and the kind of consumer (DRAIN_*)
+    pub drain: *mut PyObject,
+    pub drain_kind: u64,
 }
 
 #[unsafe(no_mangle)]
@@ -473,6 +477,114 @@ unsafe fn jit_send_chain(ts: &crate::threads::ThreadState, o: *mut PyObject, v: 
         ts.recursion_depth.set(depth0);
         Some((st, val))
     }
+}
+
+/// Consumers that can drain a generator expression (`GenObject::drain_kind`).
+pub const DRAIN_LIST: u64 = 0;
+pub const DRAIN_SET: u64 = 1;
+pub const DRAIN_ANY: u64 = 2;
+pub const DRAIN_ALL: u64 = 3;
+
+/// (jit6) Run a just-created generator expression `o` in its drain-mode code (entry
+/// address `entry`) for a consumer of kind `kind` collecting into `container`: its
+/// values go straight to the consumer (`h_drain_add`) until it finishes (JS_RETURN),
+/// raises (JS_ERROR), or produces a value the consumer must see itself (JS_YIELD,
+/// an ordinary suspension). JS_SLOW: not applicable, nothing changed.
+pub unsafe fn jit_send_drain(ts: &crate::threads::ThreadState, o: *mut PyObject, container: *mut PyObject, kind: u64, entry: usize) -> (u32, *mut PyObject) {
+    unsafe {
+        let gn = &mut *(o as *mut GenObject);
+        let fp = gn.frame;
+        if fp.is_null() || (*fp).state != FrameState::Created || (*fp).resume == 0 || !gn.drain.is_null() {
+            return (JS_SLOW, std::ptr::null_mut());
+        }
+        let saved = (*fp).resume;
+        (*fp).resume = entry;
+        gn.drain = container;
+        gn.drain_kind = kind;
+        let r = jit_send_one(ts, o, std::ptr::null_mut());
+        gn.drain = std::ptr::null_mut();
+        if r.0 == JS_SLOW {
+            (*fp).resume = saved;
+        }
+        r
+    }
+}
+
+/// (jit6) Drain-mode YieldValue: hand `v` (owned) to the consumer draining the
+/// generator of `frame`. 0: taken (and consumed); 1: the consumer must see it itself
+/// (`v` untouched; the generator suspends normally). Only work that cannot run Python
+/// code is done here, so nothing is evaluated twice.
+pub unsafe extern "C" fn h_drain_add(frame: *mut Frame, v: *mut PyObject) -> u64 {
+    unsafe {
+        let g = (*frame).generator as *mut GenObject;
+        if g.is_null() || (*g).drain.is_null() {
+            return 1;
+        }
+        let c = &*(*g).drain;
+        let vo = &*v;
+        match (*g).drain_kind {
+            DRAIN_LIST => {
+                crate::types::list::append(c, PyRef::from_raw(v));
+                0
+            }
+            DRAIN_SET => {
+                // hashing a str/int/float/tuple of those runs no Python code; anything
+                // else goes through the consumer's own SetAdd
+                if !hash_is_builtin(vo) {
+                    return 1;
+                }
+                match crate::types::set::set_add(c, vo) {
+                    Ok(()) => {
+                        decref(v);
+                        0
+                    }
+                    Err(_) => {
+                        clear_exc();
+                        1
+                    }
+                }
+            }
+            kind @ (DRAIN_ANY | DRAIN_ALL) => {
+                let t = match builtin_truth(vo) {
+                    Some(t) => t,
+                    None => return 1,
+                };
+                // any(): falsy values are skipped; all(): truthy ones
+                if t == (kind == DRAIN_ALL) {
+                    decref(v);
+                    0
+                } else {
+                    1
+                }
+            }
+            _ => 1,
+        }
+    }
+}
+
+fn hash_is_builtin(o: &PyObject) -> bool {
+    let t = o.type_ptr();
+    if t == crate::types::str::str_type() || t == crate::types::int::int_type() || t == crate::types::float::float_type() || o.is(none::none()) || t == crate::types::bool_::bool_type() {
+        return true;
+    }
+    if t == tuple::tuple_type() {
+        return tuple::tuple_items(o).iter().all(|x| hash_is_builtin(x));
+    }
+    false
+}
+
+fn builtin_truth(o: &PyObject) -> Option<bool> {
+    let t = o.type_ptr();
+    if o.is(none::none()) {
+        return Some(false);
+    }
+    if t == crate::types::bool_::bool_type() {
+        return Some(o.is(crate::types::bool_::true_obj()));
+    }
+    if t == crate::types::int::int_type() || t == crate::types::str::str_type() || t == tuple::tuple_type() || t == crate::types::list::list_type() || t == crate::types::float::float_type() {
+        return crate::abstract_::is_true(o).ok();
+    }
+    None
 }
 
 /// One level of `jit_send` (the jit5 lean path).
