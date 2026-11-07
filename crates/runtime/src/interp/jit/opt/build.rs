@@ -413,7 +413,7 @@ impl<'a> B<'a> {
     fn emit(&mut self, i: Inst) {
         // a decref may free the object and run arbitrary code (__del__, weakref
         // callbacks) that mutates classes: type facts guarded earlier no longer hold
-        let forget = matches!(i, Inst::Decref(_) | Inst::XDecref(_));
+        let forget = matches!(i, Inst::Decref(_) | Inst::XDecref(_)) && !keep_facts();
         self.f.blocks[self.cur as usize].insts.push(i);
         if forget {
             self.forget_tags();
@@ -3293,6 +3293,13 @@ pub unsafe extern "C" fn h2_init_done(r: *mut PyObject) -> u64 {
         crate::object::decref(r);
         1
     }
+}
+
+/// RPYTHON_JIT2_KEEPFACTS=1: keep type facts across decrefs (measurement switch;
+/// unsafe when finalizers mutate classes).
+fn keep_facts() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("RPYTHON_JIT2_KEEPFACTS").is_ok_and(|v| v == "1"))
 }
 
 /// isinstance(o, cls) for compiled code: 1, 0, or -1 with an exception set.

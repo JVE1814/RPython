@@ -188,8 +188,10 @@ fn type_dict_written(tp: *mut PyTypeObject, key: *mut PyObject) {
     // change: cached lookups there (instance attributes shadowing it, class
     // attributes, constants folded by tier 2) must all be redone. Rare: invalidate
     // the tags of every class.
-    let descr_key = key.is_null()
-        || unsafe {
+    // (bulk updates of a type dict, key NULL, are left out: they happen as classes are
+    // set up and would invalidate every compiled unit each time)
+    let descr_key = !key.is_null()
+        && unsafe {
             let k = &*key;
             crate::types::str::is_str(k)
                 && (crate::types::str::str_eq(k, crate::name!("__get__"))
