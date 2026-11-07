@@ -78,6 +78,10 @@ pub struct ThreadState {
     pub mode: ModeCell,
     /// Objects whose shared refcount went negative and need the owner to merge.
     pub merge_queue: Mutex<Vec<usize>>,
+    /// (stability3) Set (under `merge_queue`) while the owner waits in a pure blocking
+    /// call (`blocking_pure`): it touches no object then, so other threads fold their
+    /// dropped references into its objects themselves instead of queueing them.
+    pub merge_direct: std::sync::atomic::AtomicBool,
     /// Rust-side top interpreter frame (see interp::frame).
     pub frame: Cell<*mut crate::interp::frame::Frame>,
     pub recursion_depth: Cell<i32>,
@@ -199,8 +203,9 @@ pub fn new_thread_state() -> *mut ThreadState {
         let stack_low = compute_stack_low();
         let st = ThreadState {
             c,
-            mode: ModeCell(std::sync::atomic::AtomicU8::new(ThreadMode::Blocked as u8), AtomicUsize::new(0)),
+            mode: ModeCell(std::sync::atomic::AtomicU8::new(ThreadMode::Blocked as u8)),
             merge_queue: Mutex::new(Vec::new()),
+            merge_direct: std::sync::atomic::AtomicBool::new(false),
             frame: Cell::new(std::ptr::null_mut()),
             recursion_depth: Cell::new(0),
             owner_tid: crate::object::thread_id(),
@@ -229,6 +234,10 @@ pub fn new_thread_state() -> *mut ThreadState {
             None => Box::into_raw(Box::new(st)),
         };
         (*ts).c.exc_info = &mut (*ts).c.exc_state;
+        // (tail2) C code reads `current_frame` as "a Python frame is running"; ours live
+        // on the Rust side, so the field holds a non-null stand-in (the base-frame slot)
+        // that C code may clear to simulate a call from a frameless C thread
+        (*ts).c.current_frame = (&raw mut (*ts).c.base_frame) as *mut c_void;
         {
             let mut all = ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner());
             // (jit6) the flag flipped here, not by a parent before starting the
@@ -324,6 +333,7 @@ pub fn thread_exit() {
         crate::qsbr::thread_exit();
         crate::object::thread_exit_type_counts();
         crate::interp::frame::drain_pool();
+        crate::types::asyncgen::drain_free_lists();
         crate::gc::flush_thread_counts();
         // Nobody queues objects for this owner once `alive` is false (checked under
         // the ALL_THREADS lock). Drain the queue while this thread still counts as
@@ -373,31 +383,35 @@ pub unsafe fn queue_object_for_merge(op: *mut PyObject) {
         }
         let tid = (*op).ob_tid.load(Relaxed);
         let threads = ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut folded: Option<bool> = None;
         for &t in threads.iter() {
             let ts = &*(t as *const ThreadState);
             if ts.owner_tid == tid && ts.alive.load(SeqCst) {
-                ts.merge_queue.lock().unwrap_or_else(|e| e.into_inner()).push(op as usize);
-                if ts.mode.0.load(Relaxed) != ThreadMode::InVm as u8 && same_interp(ts) && try_hold(ts) {
-                    // (scale2) the owner is blocked and would not merge until it runs
-                    // again: merge its queue on its behalf (prompt deallocation, e.g.
-                    // concurrent.futures results freed while the producer waits)
-                    let items: Vec<usize> = std::mem::take(&mut *ts.merge_queue.lock().unwrap_or_else(|e| e.into_inner()));
-                    for &q in &items {
-                        // each entry owns a reference: the merged total stays >= 1
-                        crate::object::explicit_merge(q as *mut PyObject);
-                    }
-                    release_hold(ts);
-                    drop(threads);
-                    for q in items {
-                        crate::object::decref(q as *mut PyObject);
-                    }
-                    return;
+                let mut q = ts.merge_queue.lock().unwrap_or_else(|e| e.into_inner());
+                // (scale2) only for owners of this thread's interpreter: the release can
+                // run finalizers and weakref callbacks that use that interpreter's
+                // modules, which its own finalization may be tearing down (a callback
+                // that lost `_imp` half-way leaked the import lock: InterpreterPool hang)
+                if ts.merge_direct.load(SeqCst) && same_interp(ts) {
+                    // (stability3) the owner is parked in a pure wait (and must take
+                    // this lock before touching objects again): fold here, release
+                    // after unlocking (deallocation may queue more objects)
+                    folded = Some(crate::object::merge_queued_nodealloc(op));
+                    break;
                 }
+                q.push(op as usize);
+                drop(q);
                 ts.c.eval_breaker.fetch_or(EVAL_MERGE_REFCOUNTS, Release);
                 return;
             }
         }
         drop(threads);
+        if let Some(dead) = folded {
+            if dead {
+                crate::object::dealloc(op);
+            }
+            return;
+        }
         // Owner is gone: merge right here.
         crate::object::merge_queued(op);
     }
@@ -439,10 +453,10 @@ pub fn merge_all_queues_stopped() -> Vec<crate::object::PyRef> {
     out
 }
 
-/// (scale2) The calling thread is about to block in a Python-level wait (lock acquire,
-/// sleep, join, queue get): merge what other threads queued for it and release its
-/// matured deferred items now instead of after the wait. Only call where running
-/// deallocators (finalizers, weakref callbacks) is safe, i.e. with no internal lock held.
+/// (scale2) What `blocking_pure(true, ..)` does before waiting, for waits that take a
+/// runtime lock first (thread join) and for subinterpreter finalization: merge what
+/// other threads queued for this thread and release its matured QSBR items. Only call
+/// where running deallocators (finalizers, weakref callbacks) is safe.
 pub fn before_wait() {
     let p = current_ptr();
     if p.is_null() {
@@ -581,6 +595,49 @@ pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// (stability3) `blocking` for a wait that touches no Python object while blocked
+/// (lock and queue waits, sleep): with `drain`, the thread first merges the
+/// references other threads queued for it (call it only where running finalizers is
+/// fine: no runtime lock held); then, while it waits, threads dropping references to
+/// its objects fold them in themselves (`merge_direct`), so objects owned by an idle
+/// thread (a pool worker waiting for work) are released when their last reference
+/// goes, not when that thread wakes up.
+pub fn blocking_pure<R>(drain: bool, f: impl FnOnce() -> R) -> R {
+    let p = current_ptr();
+    if p.is_null() || !crate::qsbr::multi_threaded() {
+        return blocking(f);
+    }
+    let ts = unsafe { &*p };
+    if ts.mode.get() != ThreadMode::InVm {
+        return blocking(f);
+    }
+    if drain {
+        // (scale2) also release what this thread retired through QSBR (matured
+        // items; the other threads are asked to report first), instead of keeping
+        // it for the whole wait
+        crate::qsbr::before_wait();
+    }
+    loop {
+        let mut q = ts.merge_queue.lock().unwrap_or_else(|e| e.into_inner());
+        if q.is_empty() || !drain {
+            ts.merge_direct.store(true, SeqCst);
+            break;
+        }
+        let items = std::mem::take(&mut *q);
+        drop(q);
+        for op in items {
+            unsafe { crate::object::merge_queued(op as *mut PyObject) };
+        }
+    }
+    let r = blocking(f);
+    // before this thread touches any object again
+    {
+        let _q = ts.merge_queue.lock().unwrap_or_else(|e| e.into_inner());
+        ts.merge_direct.store(false, SeqCst);
+    }
+    r
+}
+
 impl ThreadState {
     pub fn alive(&self) -> bool {
         !self.exited.load(std::sync::atomic::Ordering::Acquire)
@@ -588,28 +645,8 @@ impl ThreadState {
 }
 
 
-/// Thread mode readable from other threads (stop-the-world coordination). `.1` (scale2):
-/// non-zero while another thread works on this thread's behalf (`try_hold`); the thread
-/// cannot switch to `InVm` meanwhile.
-pub struct ModeCell(pub std::sync::atomic::AtomicU8, pub AtomicUsize);
-
-/// (scale2) Per-thread handshake executed by the requester (HotSpot style): if `ts` is
-/// not executing Python (blocked in a wait or in native code), keep it from re-entering
-/// the VM until `release_hold` and return true; the caller may then do owner-only work
-/// on its objects (merge their local reference counts). False if `ts` runs Python code
-/// (it then does the work itself at its next eval-breaker poll) or is already held.
-pub fn try_hold(ts: &ThreadState) -> bool {
-    let me = crate::object::thread_id();
-    if ts.mode.1.compare_exchange(0, me, SeqCst, Relaxed).is_err() {
-        return false;
-    }
-    // Dekker with enter_vm: it stores InVm, then reads `.1`
-    if ts.mode.0.load(SeqCst) == ThreadMode::InVm as u8 || !ts.alive.load(SeqCst) {
-        ts.mode.1.store(0, SeqCst);
-        return false;
-    }
-    true
-}
+/// Thread mode readable from other threads (stop-the-world coordination).
+pub struct ModeCell(pub std::sync::atomic::AtomicU8);
 
 /// (scale2) Does `ts` belong to the calling thread's interpreter? Objects of another
 /// interpreter are only released on behalf of their owner by threads of the same
@@ -619,9 +656,6 @@ pub fn same_interp(ts: &ThreadState) -> bool {
     std::ptr::eq(crate::subinterp::of_ts(ts), crate::subinterp::current())
 }
 
-pub fn release_hold(ts: &ThreadState) {
-    ts.mode.1.store(0, SeqCst);
-}
 impl ModeCell {
     #[inline]
     pub fn get(&self) -> ThreadMode {

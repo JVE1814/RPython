@@ -646,6 +646,7 @@ crate::locked_slot!(l_mmap_item, mmap_item, (i: Py_ssize_t) -> *mut PyObject);
 crate::locked_slot!(l_mmap_ass_item, mmap_ass_item, (i: Py_ssize_t, v: *mut PyObject) -> c_int);
 crate::locked_slot!(l_mmap_subscript, mmap_subscript, (item: *mut PyObject) -> *mut PyObject);
 crate::locked_slot!(l_mmap_ass_subscript, mmap_ass_subscript, (item: *mut PyObject, v: *mut PyObject) -> c_int);
+crate::locked_slot!(l_mmap_getbuffer, mmap_getbuffer, (view: *mut Py_buffer, flags: c_int) -> c_int);
 
 unsafe extern "C" fn mmap_len(o: *mut PyObject) -> Py_ssize_t {
     unsafe {
@@ -785,14 +786,15 @@ unsafe extern "C" fn mmap_getbuffer(o: *mut PyObject, view: *mut Py_buffer, flag
         if buffer::fill_info(view, o, m.data as *mut c_void, m.size as isize, readonly, flags).is_err() {
             return -1;
         }
-        m.exports += 1;
+        // (stability3) atomic: releases run unlocked (from any thread's dealloc)
+        std::sync::atomic::AtomicIsize::from_ptr(&raw mut m.exports).fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         0
     }
 }
 
 unsafe extern "C" fn mmap_releasebuffer(o: *mut PyObject, _view: *mut Py_buffer) {
     unsafe {
-        st(&*o).exports -= 1;
+        std::sync::atomic::AtomicIsize::from_ptr(&raw mut st(&*o).exports).fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
@@ -821,7 +823,7 @@ fn init_types() -> PyResult<()> {
         mp.mp_ass_subscript = Some(l_mmap_ass_subscript);
         (*t).tp_as_mapping = leak(mp);
         let mut bp: PyBufferProcs = std::mem::zeroed();
-        bp.bf_getbuffer = Some(mmap_getbuffer);
+        bp.bf_getbuffer = Some(l_mmap_getbuffer);
         bp.bf_releasebuffer = Some(mmap_releasebuffer);
         (*t).tp_as_buffer = leak(bp);
         (*t).tp_doc = c"mmap(fileno, length, flags=MAP_SHARED, prot=PROT_WRITE|PROT_READ,\n     access=ACCESS_DEFAULT, offset=0, *, trackfd=True)\n\nMemory-map length bytes of the file open as fileno, starting at offset\n(a multiple of ALLOCATIONGRANULARITY). A length of 0 maps the rest of the\nfile. fileno -1 creates an anonymous mapping. Use either access\n(ACCESS_READ, ACCESS_WRITE, ACCESS_COPY) or flags and prot. The object\nsupports slicing, file-like reading and writing and the buffer protocol.".as_ptr();

@@ -95,6 +95,16 @@ pub fn lookup_fast(cls: &PyObject, obj: &PyObject, nm: &PyObject, method: bool) 
     None
 }
 
+/// (stability3) The super object of the zero-argument form `super().name` (LOAD_SUPER_ATTR
+/// without the two-argument bit): a `__class__` cell that holds a non-type is reported as
+/// zero-argument super() reports it (RuntimeError), not as a bad first argument.
+pub fn new_super_zero_arg(cls: &PyObject, obj: &PyObject) -> PyResult {
+    if !is_type(cls) {
+        raise!(RuntimeError, "super(): __class__ is not a type ({})", tname(cls));
+    }
+    new_super(cls, obj)
+}
+
 pub fn new_super(typ: &PyObject, obj: &PyObject) -> PyResult {
     if !is_type(typ) {
         raise!(TypeError, "super() argument 1 must be a type, not {}", tname(typ));

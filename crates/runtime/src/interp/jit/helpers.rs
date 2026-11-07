@@ -1037,6 +1037,22 @@ unsafe fn call_builtin_fast(callable: *mut PyObject, self_or_null: *mut PyObject
     }
 }
 
+/// (perf5) Call site with a bound method and a free self slot: [method, NULL, ..] ->
+/// [im_func, im_self, ..] (both owned; the method reference is released), so the
+/// function can take the direct call path.
+pub unsafe extern "C" fn h_unpack_method(base: *mut *mut PyObject) {
+    unsafe {
+        let m = *base;
+        let pm = m as *mut crate::ffi::PyMethodObject;
+        let (f, s) = ((*pm).im_func, (*pm).im_self);
+        incref(f);
+        incref(s);
+        *base = f;
+        *base.add(1) = s;
+        decref(m);
+    }
+}
+
 /// Call / CallKw: [callable, self_or_null, args..(, kwnames)] -> [result]
 pub unsafe extern "C" fn h_call(sp: *mut *mut PyObject, n: u64, kw: u64) -> u64 {
     unsafe {
@@ -1274,7 +1290,7 @@ pub unsafe extern "C" fn h_load_super_attr(sp: *mut *mut PyObject, arg: u64, nam
                 }
             }
             let sup = if is_super {
-                st(crate::types::super_::new_super(&cls, &slf))?
+                if arg & 2 != 0 { st(crate::types::super_::new_super(&cls, &slf))? } else { st(crate::types::super_::new_super_zero_arg(&cls, &slf))? }
             } else if arg & 2 != 0 {
                 st(ab::call(&gsuper, &[&cls, &slf]))?
             } else {
@@ -1316,6 +1332,19 @@ pub unsafe extern "C" fn h_get_awaitable(sp: *mut *mut PyObject, arg: u64) -> u6
 /// value stack ends at `sp`. On error the stack is cut back to `err_top` (absolute
 /// slot index: the depth tier-1 code reports to the unwinder), releasing whatever the
 /// instruction left above it.
+/// RaiseVarargs / Reraise at instruction `this` (perf5): always raises; `f.stack_top`
+/// is left at the depth after the operands were popped (the unwinder's depth).
+pub unsafe extern "C" fn h_raise(ts: *const ThreadState, f: *mut Frame, sp: *mut *mut PyObject, oparg: u64, this: u64) -> u64 {
+    unsafe {
+        let f = &mut *f;
+        f.stack_top = sp.offset_from(f.slots.as_ptr()) as usize;
+        let op = bc::Op::from_u8((oparg & 0xff) as u8);
+        let n = crate::types::code::code_data(f.code()).code.len();
+        let _ = eval::raise_op(&*ts, f, op, (oparg >> 8) as u32, this as usize, n);
+        ERR
+    }
+}
+
 pub unsafe extern "C" fn h_misc(ts: *const ThreadState, f: *mut Frame, sp: *mut *mut PyObject, oparg: u64, err_top: u64) -> u64 {
     unsafe {
         let f = &mut *f;

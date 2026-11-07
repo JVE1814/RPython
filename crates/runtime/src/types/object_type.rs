@@ -668,7 +668,13 @@ unsafe extern "C" fn type_setattro(op: *mut PyObject, nm: *mut PyObject, v: *mut
             return -1;
         }
         let n = pystr::intern(PyRef::from_borrowed(nm));
+        // (stability3) invalidate the attribute caches before the dict changes, and
+        // let no cache be filled until it has (interp::cache::TYPE_WRITERS)
+        use std::sync::atomic::Ordering::SeqCst;
+        crate::interp::cache::TYPE_WRITERS.fetch_add(1, SeqCst);
+        crate::types::slots::type_modified(tp);
         let r = generic_setattr_with_dict(&*op, &n, if v.is_null() { None } else { Some(&*v) }, Some(&*(*tp).tp_dict));
+        crate::interp::cache::TYPE_WRITERS.fetch_sub(1, SeqCst);
         if r.is_err() {
             return -1;
         }

@@ -28,11 +28,17 @@ unsafe fn flags_of(f: *mut PyCompilerFlags) -> u32 {
 
 pub(crate) fn compile_source(src: &[u8], filename: &str, start: c_int, flags: u32, optimize: i32) -> PyResult {
     let mode = mode_of(start)?;
-    // PyCF_IGNORE_COOKIE: the bytes are UTF-8 whatever an encoding declaration says
+    // PyCF_IGNORE_COOKIE: the caller promises UTF-8 text whatever an encoding declaration
+    // says; bytes that are not UTF-8 are a decoding error of that text (tail2)
     let text: Option<String> = if flags & 0x0800 != 0 {
         match std::str::from_utf8(src) {
             Ok(s) => Some(s.to_string()),
-            Err(_) => return Err(crate::compile::decode_source(src, filename).err().unwrap_or_else(|| value_error("source is not valid UTF-8"))),
+            Err(e) => {
+                let start = e.valid_up_to();
+                let end = start + e.error_len().unwrap_or(src.len() - start);
+                let reason = if e.error_len().is_none() { "unexpected end of data" } else { "invalid start byte" };
+                return Err(crate::types::exceptions::unicode_decode_error("utf-8", src, start, end, reason));
+            }
         }
     } else {
         None

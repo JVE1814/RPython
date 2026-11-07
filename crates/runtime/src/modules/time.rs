@@ -196,7 +196,6 @@ fn time_sleep(_m: &PyObject, args: &[&PyObject]) -> PyResult {
     if secs > 9.2e9 {
         raise!(OverflowError, "sleep length is too large");
     }
-    crate::threads::before_wait(); // scale2
     sleep_secs(secs)?;
     Ok(none::none_ref())
 }
@@ -213,7 +212,7 @@ pub fn sleep_secs(secs: f64) -> PyResult<()> {
         // A signal that arrived just before the call would otherwise only be
         // handled after the whole sleep.
         crate::modules::posix::path::check_signals()?;
-        let r = crate::threads::blocking(|| unsafe {
+        let r = crate::threads::blocking_pure(true, || unsafe { // (stability3)
             libc::clock_nanosleep(libc::CLOCK_MONOTONIC, libc::TIMER_ABSTIME, &deadline, std::ptr::null_mut())
         });
         if r == 0 {

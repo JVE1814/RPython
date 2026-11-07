@@ -119,9 +119,22 @@ fn dict_getitem_knownhash(_m: &PyObject, a: &[&PyObject]) -> PyResult {
     }
 }
 
-fn has_split_table(_m: &PyObject, _o: &PyObject) -> PyResult {
-    // instance dicts are combined tables in this runtime
-    Ok(bool_::new_bool(false))
+fn has_split_table(_m: &PyObject, o: &PyObject) -> PyResult {
+    // (stability3) An instance dict built from inline values keeps the class's
+    // attribute names (CPython's split table) for as long as only string keys are added
+    // and it stays within the inline capacity; any other key makes it an ordinary table.
+    if !dict::is_dict_exact(o) || o.ob_flags.load(std::sync::atomic::Ordering::Relaxed) & dict::OBF_FROM_INSTANCE == 0 {
+        return Ok(bool_::new_bool(false));
+    }
+    let keys = dict::keys_vec(o);
+    let split = keys.len() <= INLINE_VALUES_MAX && keys.iter().all(|k| pystr::is_str_exact(k));
+    Ok(bool_::new_bool(split))
+}
+
+/// Stop every other thread and restart them (the stop-the-world handshake, gc.rs).
+fn test_stop_the_world(_m: &PyObject) -> PyResult {
+    crate::gc::test_stop_the_world();
+    Ok(none::none_ref())
 }
 
 fn get_recursion_depth(_m: &PyObject) -> PyResult {
@@ -156,6 +169,17 @@ fn get_c_recursion_remaining(_m: &PyObject) -> PyResult {
     let lim = ts.stack_soft_limit();
     let rem = if sp > lim { (sp - lim) / 1000 } else { 0 };
     Ok(int::new_int(rem as i64))
+}
+
+/// (tail2) type_assign_specific_version_unsafe(type, version): force a version tag.
+fn type_assign_specific_version_unsafe(_m: &PyObject, args: &[&PyObject]) -> PyResult {
+    crate::args::check_pos("type_assign_specific_version_unsafe", args, 2, 2)?;
+    if !crate::types::typeobject::is_type(args[0]) {
+        raise!(TypeError, "type_assign_specific_version_unsafe() argument 1 must be a type");
+    }
+    let v = ab::as_i64(args[1])? as u32;
+    crate::interp::cache::set_type_tag_unchecked(args[0].as_ptr() as *mut PyTypeObject, v);
+    Ok(none::none_ref())
 }
 
 fn get_stack_pointer(_m: &PyObject) -> PyResult {
@@ -718,10 +742,12 @@ pub fn init() -> PyResult {
             ("get_tlbc_id", O, get_tlbc_id),
             ("dict_getitem_knownhash", FAST, dict_getitem_knownhash),
             ("get_recursion_depth", NOARGS, get_recursion_depth),
+            ("test_stop_the_world", NOARGS, test_stop_the_world),
             ("get_long_lived_total", NOARGS, get_long_lived_total),
             ("pymem_getallocatorsname", NOARGS, pymem_getallocatorsname),
             ("get_c_recursion_remaining", NOARGS, get_c_recursion_remaining),
             ("get_stack_pointer", NOARGS, get_stack_pointer),
+            ("type_assign_specific_version_unsafe", FAST, type_assign_specific_version_unsafe),
             ("get_stack_margin", NOARGS, get_stack_margin),
             ("_set_interrupt", NOARGS, set_interrupt),
             ("iframe_getcode", O, iframe_getcode),

@@ -146,11 +146,16 @@ pub unsafe extern "C" fn Py_SET_SIZE(o: *mut PyVarObject, n: Py_ssize_t) {
 
 /// Abort the process with a message (Py_FatalError semantics).
 pub fn fatal(msg: &str) -> ! {
+    fatal_func(None, msg)
+}
+
+/// (tail2) Py_FatalError output as CPython prints it: message, runtime state, the
+/// Python stack, loaded extension modules and the C stack (faulthandler's dumper).
+fn fatal_func(func: Option<&str>, msg: &str) -> ! {
     use std::io::Write;
     let _ = std::io::stdout().flush();
-    let _ = writeln!(std::io::stderr(), "Fatal Python error: {}", msg);
     let _ = std::io::stderr().flush();
-    std::process::abort();
+    crate::modules::faulthandler::fatal_error(func, msg)
 }
 
 #[unsafe(no_mangle)]
@@ -159,7 +164,7 @@ pub unsafe extern "C" fn Py_FatalError(msg: *const c_char) -> ! {
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _Py_FatalErrorFunc(func: *const c_char, msg: *const c_char) -> ! {
-    unsafe { fatal(&format!("{}: {}", cs(func), cs(msg))) }
+    unsafe { fatal_func(Some(&cs(func)), &cs(msg)) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _PyObject_AssertFailed(

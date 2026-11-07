@@ -1,13 +1,13 @@
 # PROGRESS
 
 ## Status 2026-11-07 (day 7, afternoon)
-Master f66b390: core6, perf4, tail1, capi2 merged today. Smoke on snap19: test_capi 40 failures (was 433 in run 11),
+Master 0a2f1fa: core6, perf4, tail1, capi2, cleanroom1+2 (20 Lib modules rewritten clean-room), scale1 (multi-core scaling), tail2 (re.DEBUG, _zoneinfo, ssl PSK, alloc-failure injection, 22 modules) merged today; suite run 13 running; suite run 12: 367/434 modules pass, 129 failures, 70 errors. Smoke on snap19: test_capi 40 failures (was 433 in run 11),
 stable_abi_ctypes/fileutils pass, cmd_line_script 1; tail1 fixed ~60 long-tail modules (inspect, codecs, time,
-path modules, math, buffer, logging, json, ...). Suite run 12 (snap19) running. Last complete run: run 11 (pre-merges):
+path modules, math, buffer, logging, json, ...). Run 11 (pre-merges):
 294/434 modules pass, 674 failures (241 without test_capi), 616 errors. Baseline free-threaded CPython: 416/434.
-Running agents: scale1 (multi-core scaling), perf5 (remaining slow benchmarks), stability3 (test_free_threading races,
-flaky crashes, gc hang), tail2 (alloc-failure injection, re.DEBUG, _zoneinfo, pdb, tkinter, leftovers),
-cleanroom1 (D19 audit/rewrite of Lib/ files that read like recalled text).
+Running agents: scale2 (scaling round 2 + prompt-free regression in test_concurrent_futures), perf5 (remaining slow benchmarks), stability3 (test_free_threading races,
+flaky crashes), tail3 (crossinterp, getpath, nturl2path, asyncio, ast, leftovers), pdb1 (clean-room pdb, remote pdb,
+profiling.sampling).
 Earlier history (2026-11-02): agents stopped when the weekly API limit was hit; resumed Nov 5.
 
 ## RESUMED (2026-11-01, 22:15 UTC) after a pause at user request
@@ -90,6 +90,7 @@ Ours (tools/run_tests.sh, 434 modules):
 | 9 | 433df5d (jit6+interp1, pre-stability2) | 288 | 135 | 6 | 5 | 42,388 | 224 | 2,486 |
 | 10 | 55e6237 (stability2+perf3, pre-hang1) | 292 | 134 | 0 | 8 | 43,012 | 225 | 2,492 |
 | 11 | 9af79cb (hang1, pre-wheels2/core6) | 294 | 140 | 0 | 0 | 49,781 | 674 (241 excl. test_capi) | 3,200 |
+| 12 | f66b390 (core6+perf4+tail1+capi2) | 367 | 67 | 0 | 0 | 49,880 | 129 (+70 errors) | 3,202 |
 Run 7 (pre-core4): crashes = test_capi (segfault after a lone-surrogate print), test_free_threading
 (deque race, test_collections), test_itertools (flaky; passes now), test_multiprocessing_fork/spawn
 (heap corruption in test_manager); timeouts = asyncio, cmd_line_script, os, subprocess. Largest
@@ -101,6 +102,11 @@ subprocess. Largest failure counts: importlib 20, call 17, inspect 15, dict 8, c
 Run 9: crashes = test_free_threading (io heap corruption), test_functools (lru_cache race; fixed since), test_super
 (__class__ assignment race), test_multiprocessing_fork/forkserver/spawn; timeouts = asyncio, capi, cmd_line_script,
 os, subprocess. Largest failure counts: importlib 20, call 17, inspect 15, dict 8, concurrent_futures 7.
+Run 12: no crashes, no timeouts; 367/434 (baseline 416). 51 modules fail that pass on CPython: capi 40+13E, asyncio 10,
+concurrent_futures 5, re 4, faulthandler 3, collections 3, multiprocessing_* 2 each, crossinterp 30E, sys 1+3E, gc 2, ast 2,
+repl 2, ~30 modules with 1 failure; module-level errors: getpath (needs a getpath code object), nturl2path (missing),
+pdb/remote_pdb (_pyrepl_available, _PdbServer), profiling (profiling.sampling missing), type_cache, tkinter/ttk (gui
+resource: NO TESTS RAN exit status). Ours pass where the baseline fails: test_pydoc, test_site.
 Run 11: no crashes, no timeouts. The jump in failures is test_capi (433), which timed out in run 10 and now finishes in 89 s
 (capi2 is on it). Excluding it: 241 failures (225 in run 10; test_asyncio, cmd_line_script, multiprocessing_*, os were
 also timeouts before). Top remaining: importlib 20, call 17, inspect 15 (both 0 after core6), asyncio 10, dict 8.
@@ -115,7 +121,31 @@ Run 1 top blockers: py_compile (230 modules; merged since), unittest.mock (57), 
 array (24), socket (17), pathlib (16), http (14), multiprocessing, decimal, datetime, ntpath.
 
 ## Benchmarks
-### Latest (perf4, 2026-11-07; wall-clock ratio ours / best CPython, pinned to one core, one run each, loaded machine, ±10%)
+### Latest (perf5, 2026-11-07; wall ratio ours / best CPython, pinned one core, one run each, load 6–7, ±10–15%)
+| benchmark | perf4 | perf5 |
+|---|---|---|
+| xml_etree | 1.55 | 1.55 |
+| deepcopy | 1.52 | 1.36 |
+| bpe_tokeniser | 1.27 | 1.30 |
+| logging | 1.34 | 1.30 |
+| python_startup | 1.33 | 1.29 |
+| comprehensions | 1.35 | 1.27 |
+| typing_runtime_protocols | 1.37 | 1.25 |
+| mdp | 1.33 | 1.24 |
+| base64 | 1.28 | 1.18 |
+| async_generators | 1.25 | 1.17 |
+| pathlib | 1.87 | 1.16 |
+| nqueens | 1.30 | 1.14 |
+| concurrent_imap | 1.00 | 1.08 |
+| pprint | 1.11 | 1.02 |
+| go | 1.03 | 0.97 |
+| gc_traversal | 1.42 | 0.70 |
+| gc_collect | 0.66 | 0.51 |
+Instructions per call: bound method 447 (CPython 502), property read 401 (441), kw call 743 (701), raise+catch 4042
+(3686). Peak memory 35.3 MB (CPython 32.4). Startup `-c pass` 55.8M instructions (40.5M). perf6 is on startup
+(CDS-style startup image), slow call paths, xml_etree's expat engine, raise/catch, memory.
+
+### Previous (perf4, 2026-11-07; wall-clock ratio ours / best CPython, pinned to one core, one run each, loaded machine, ±10%)
 About 11 of 32 benchmarks beat or match the best CPython build (json_dumps 0.83, json_loads, raytrace, richards 0.60,
 deltablue, chaos 0.65, float, hexiom, gc_collect, coroutines 0.98, unpack_sequence); fannkuch and go within a few %.
 
@@ -139,6 +169,28 @@ deltablue, chaos 0.65, float, hexiom, gc_collect, coroutines 0.98, unpack_sequen
 Startup `-c pass`: 56.6M instructions (CPython 40.5M); `-S -c pass` 29.2M (27.7M). Peak RSS (startup_mem.sh):
 34.9 MB (CPython default 32.3, free-threaded 38.6). Instructions per call shape and per loop: notes/perf4.md.
 Multi-core scaling: being measured by scale1.
+
+### Multi-core scaling (scale1, 2026-11-07; tools/bench/scaling, loaded machine — CPU inflation at 4 threads, ideal 1.00)
+| workload | before scale1 | ours | py-ft |
+|---|---|---|---|
+| cpu_nbody | 1.48 | 1.08 | 1.07 |
+| cpu_oo | 3.23 | 1.55 | 1.07 |
+| cpu_float | 2.43 | 1.15 | 1.08 |
+| cpu_comp | 3.09 | 1.07 | 1.15 |
+| cpu_gen | 1.35 | 1.14 | 1.08 |
+| shr_dict | 1.19 | 1.02 | 1.12 |
+| shr_list | 1.36 | 0.95 | 1.33 |
+| shr_attrs | 2.08 | 1.15 | 1.00 |
+| alloc_cycles | 2.66 | 1.45 | 0.81 |
+| mut_queue | 1.78 | 1.05 | 1.78 |
+| mut_dict | 3.85 | 1.69 | 1.74 |
+| mut_list | 3.42 | 1.70 | 1.52 |
+| jit_calls | 9.16 | 2.60 | 1.03 |
+| misc_classes | 3.49 | 5.22 | 2.43 |
+| misc_cext | 1.42 | 1.08 | 1.05 |
+Wall speedup at 4 threads beats py-ft on cpu_regex, shr_dict, shr_list (2.26 vs 0.89), alloc_dicts, mut_queue,
+misc_import; behind on cpu_oo, jit_calls, shr_attrs, alloc_cycles, misc_classes, mut_list (scale2 is on these). Full
+table and causes: notes/scale1.md. Quiet-machine run still due (D22).
 
 ### Previous (jit6 + perf3, 2026-11-07; wall-clock ratio ours / best CPython, targeted runs at load ~4, not quiet-machine)
 | bench | jit5 | now | source |

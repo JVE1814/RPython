@@ -680,6 +680,15 @@ pub fn os_forkpty(_m: &PyObject) -> PyResult {
         let pid = unsafe { libc::forkpty(&mut master, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()) };
         (pid as i64, master)
     })?;
+    // (tail2) the parent's master end is not inherited by programs it runs (PEP 446)
+    if pid != 0 && fd >= 0 {
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
     Ok(tuple::new_tuple(vec![i(pid), i(fd as i64)]))
 }
 

@@ -65,36 +65,36 @@ def _fixed(f, size, what):
 
 def read_uint1(f):
     r"""
-    >>> read_uint1(io.BytesIO(b'\xff'))
-    255
+    >>> read_uint1(io.BytesIO(b'\x07rest'))
+    7
     """
     return _fixed(f, 1, "uint1")[0]
 
 def read_uint2(f):
     r"""
-    >>> read_uint2(io.BytesIO(b'\xff\xff'))
-    65535
+    >>> read_uint2(io.BytesIO(b'\x01\x02'))
+    513
     """
     return _unpack("<H", _fixed(f, 2, "uint2"))[0]
 
 def read_int4(f):
     r"""
-    >>> read_int4(io.BytesIO(b'\x00\x00\x00\x80')) == -(2**31)
-    True
+    >>> read_int4(io.BytesIO(b'\xfe\xff\xff\xff'))
+    -2
     """
     return _unpack("<i", _fixed(f, 4, "int4"))[0]
 
 def read_uint4(f):
     r"""
-    >>> read_uint4(io.BytesIO(b'\x00\x00\x00\x80')) == 2**31
-    True
+    >>> read_uint4(io.BytesIO(b'\xfe\xff\xff\xff'))
+    4294967294
     """
     return _unpack("<I", _fixed(f, 4, "uint4"))[0]
 
 def read_uint8(f):
     r"""
-    >>> read_uint8(io.BytesIO(b'\xff' * 8)) == 2**64 - 1
-    True
+    >>> read_uint8(io.BytesIO(b'\x00\x01' + bytes(6)))
+    256
     """
     return _unpack("<Q", _fixed(f, 8, "uint8"))[0]
 
@@ -105,10 +105,10 @@ def read_stringnl(f, decode=True, stripquotes=True, *, encoding='latin-1'):
     With *stripquotes* the text must be enclosed in matching quotes; with
     *decode* backslash escapes are undone and the result is a str.
 
-    >>> read_stringnl(io.BytesIO(b"'abcd'\nefg\n"))
-    'abcd'
-    >>> read_stringnl(io.BytesIO(b"\n"), stripquotes=False)
-    ''
+    >>> read_stringnl(io.BytesIO(b"'tab\\there'\nnext line\n"))
+    'tab\there'
+    >>> read_stringnl(io.BytesIO(b"plain\n"), stripquotes=False, decode=False)
+    b'plain'
     """
     line = f.readline()
     if not line.endswith(b'\n'):
@@ -131,8 +131,8 @@ def read_stringnl_noescape(f):
 
 def read_stringnl_noescape_pair(f):
     r"""
-    >>> read_stringnl_noescape_pair(io.BytesIO(b"Queue\nEmpty\njunk"))
-    'Queue Empty'
+    >>> read_stringnl_noescape_pair(io.BytesIO(b"os.path\njoin\n..."))
+    'os.path join'
     """
     first = read_stringnl_noescape(f)
     second = read_stringnl_noescape(f)
@@ -153,15 +153,15 @@ def _checked_size(n, kind):
 
 def read_string1(f):
     r"""
-    >>> read_string1(io.BytesIO(b"\x03abcdef"))
-    'abc'
+    >>> read_string1(io.BytesIO(b"\x02hi there"))
+    'hi'
     """
     return _counted(f, read_uint1(f), "string1").decode("latin-1")
 
 def read_string4(f):
     r"""
-    >>> read_string4(io.BytesIO(b"\x03\x00\x00\x00abcdef"))
-    'abc'
+    >>> read_string4(io.BytesIO(b"\x05\x00\x00\x00spam!eggs"))
+    'spam!'
     """
     n = read_int4(f)
     if n < 0:
@@ -170,36 +170,36 @@ def read_string4(f):
 
 def read_bytes1(f):
     r"""
-    >>> read_bytes1(io.BytesIO(b"\x03abcdef"))
-    b'abc'
+    >>> read_bytes1(io.BytesIO(b"\x01\x00\x01"))
+    b'\x00'
     """
     return _counted(f, read_uint1(f), "bytes1")
 
 def read_bytes4(f):
     r"""
-    >>> read_bytes4(io.BytesIO(b"\x03\x00\x00\x00abcdef"))
-    b'abc'
+    >>> read_bytes4(io.BytesIO(b"\x04\x00\x00\x00wxyz!"))
+    b'wxyz'
     """
     return _counted(f, _checked_size(read_uint4(f), "bytes4"), "bytes4")
 
 def read_bytes8(f):
     r"""
-    >>> read_bytes8(io.BytesIO(b"\x03" + b"\x00" * 7 + b"abcdef"))
-    b'abc'
+    >>> read_bytes8(io.BytesIO(b"\x02" + bytes(7) + b"ok?"))
+    b'ok'
     """
     return _counted(f, _checked_size(read_uint8(f), "bytes8"), "bytes8")
 
 def read_bytearray8(f):
     r"""
-    >>> read_bytearray8(io.BytesIO(b"\x03" + b"\x00" * 7 + b"abcdef"))
-    bytearray(b'abc')
+    >>> read_bytearray8(io.BytesIO(b"\x02" + bytes(7) + b"ok?"))
+    bytearray(b'ok')
     """
     n = _checked_size(read_uint8(f), "bytearray8")
     return bytearray(_counted(f, n, "bytearray8"))
 
 def read_unicodestringnl(f):
     r"""
-    >>> read_unicodestringnl(io.BytesIO(b"abc\\uabcd\njunk")) == 'abcꯍ'
+    >>> read_unicodestringnl(io.BytesIO(b"pi=\\u03c0\nmore")) == 'pi=\u03c0'
     True
     """
     line = f.readline()
@@ -213,33 +213,33 @@ def _utf8(data):
 
 def read_unicodestring1(f):
     r"""
-    >>> read_unicodestring1(io.BytesIO(b"\x02\xc3\xa9junk"))
-    'é'
+    >>> read_unicodestring1(io.BytesIO(b"\x03\xe2\x82\xac..."))
+    '€'
     """
     return _utf8(_counted(f, read_uint1(f), "unicodestring1"))
 
 def read_unicodestring4(f):
     r"""
-    >>> read_unicodestring4(io.BytesIO(b"\x02\x00\x00\x00\xc3\xa9junk"))
-    'é'
+    >>> read_unicodestring4(io.BytesIO(b"\x03\x00\x00\x00\xe2\x82\xac..."))
+    '€'
     """
     n = _checked_size(read_uint4(f), "unicodestring4")
     return _utf8(_counted(f, n, "unicodestring4"))
 
 def read_unicodestring8(f):
     r"""
-    >>> read_unicodestring8(io.BytesIO(b"\x02" + b"\x00" * 7 + b"\xc3\xa9"))
-    'é'
+    >>> read_unicodestring8(io.BytesIO(b"\x01" + bytes(7) + b"Z"))
+    'Z'
     """
     n = _checked_size(read_uint8(f), "unicodestring8")
     return _utf8(_counted(f, n, "unicodestring8"))
 
 def read_decimalnl_short(f):
     r"""
-    >>> read_decimalnl_short(io.BytesIO(b"1234\n56"))
-    1234
-    >>> read_decimalnl_short(io.BytesIO(b"01\n"))
-    True
+    >>> read_decimalnl_short(io.BytesIO(b"-42\n"))
+    -42
+    >>> read_decimalnl_short(io.BytesIO(b"00\n"))
+    False
     """
     text = read_stringnl(f, decode=False, stripquotes=False)
     if text == b"00":
@@ -250,8 +250,8 @@ def read_decimalnl_short(f):
 
 def read_decimalnl_long(f):
     r"""
-    >>> read_decimalnl_long(io.BytesIO(b"1234L\n56"))
-    1234
+    >>> read_decimalnl_long(io.BytesIO(b"98765432109876543210L\n"))
+    98765432109876543210
     """
     text = read_stringnl(f, decode=False, stripquotes=False)
     if text.endswith(b'L'):
@@ -260,22 +260,22 @@ def read_decimalnl_long(f):
 
 def read_floatnl(f):
     r"""
-    >>> read_floatnl(io.BytesIO(b"-1.25\n6"))
-    -1.25
+    >>> read_floatnl(io.BytesIO(b"0.5\n"))
+    0.5
     """
     return float(read_stringnl(f, decode=False, stripquotes=False))
 
 def read_float8(f):
     r"""
-    >>> read_float8(io.BytesIO(b'\xbf\xf4\x00\x00\x00\x00\x00\x00'))
-    -1.25
+    >>> read_float8(io.BytesIO(b'\x40\x00' + bytes(6)))
+    2.0
     """
     return _unpack(">d", _fixed(f, 8, "float8"))[0]
 
 def read_long1(f):
     r"""
-    >>> read_long1(io.BytesIO(b"\x02\x00\x80"))
-    -32768
+    >>> read_long1(io.BytesIO(b"\x01\xff"))
+    -1
     """
     n = read_uint1(f)
     data = f.read(n)
@@ -285,8 +285,8 @@ def read_long1(f):
 
 def read_long4(f):
     r"""
-    >>> read_long4(io.BytesIO(b"\x02\x00\x00\x00\xff\x00"))
-    255
+    >>> read_long4(io.BytesIO(b"\x02\x00\x00\x00\x00\x01"))
+    256
     """
     n = read_int4(f)
     if n < 0:
@@ -622,7 +622,12 @@ def genops(pickle):
 # Optimizer
 
 def optimize(p):
-    'Optimize a pickle string by removing unused PUT opcodes'
+    """Return *p* with the memo stores nobody reads removed.
+
+    PUT/BINPUT/LONG_BINPUT/MEMOIZE opcodes whose slot is never fetched by a
+    GET opcode are dropped and the remaining slots are renumbered densely;
+    the result is re-framed for protocol 4 and later.
+    """
     pieces = []          # ('put', old index) | ('get', old index) | (start, end)
     read_slots = set()
     proto = 0
@@ -776,21 +781,20 @@ def dis(pickle, out=None, memo=None, indentlevel=4, annotate=0):
 def _main(args=None):
     import argparse
     parser = argparse.ArgumentParser(
-        description='disassemble one or more pickle files', color=True)
-    parser.add_argument('pickle_file', nargs='+', help='the pickle file')
+        description='Show the opcodes of pickle files.', color=True)
+    parser.add_argument('pickle_file', nargs='+', help='pickle file to disassemble ("-" reads stdin)')
     parser.add_argument('-o', '--output',
-                        help='the file where the output should be written')
+                        help='write the listing to this file instead of stdout')
     parser.add_argument('-m', '--memo', action='store_true',
-                        help='preserve memo between disassemblies')
+                        help='share one memo across all the files')
     parser.add_argument('-l', '--indentlevel', default=4, type=int,
-                        help='the number of blanks by which to indent a '
-                             'new MARK level')
+                        help='indentation added for each open MARK '
+                             '(default: 4)')
     parser.add_argument('-a', '--annotate', action='store_true',
-                        help='annotate each line with a short opcode '
-                             'description')
+                        help="append each opcode's one-line summary")
     parser.add_argument('-p', '--preamble', default="==> {name} <==",
-                        help='if more than one pickle file is specified, '
-                             'print this before each disassembly')
+                        help='header printed before each listing when '
+                             'several files are given; {name} is the file')
     options = parser.parse_args(args)
     memo = {} if options.memo else None
     annotate = 30 if options.annotate else 0

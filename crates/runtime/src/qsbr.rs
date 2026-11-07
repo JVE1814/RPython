@@ -388,40 +388,8 @@ pub fn take_all_for_gc() -> Vec<ItemSendBatch> {
     // a goal that every thread has passed, since all of them are stopped right now.
     let goal = GLOBAL.fetch_add(1, SeqCst) + 1;
     let locals = LOCALS.lock().unwrap_or_else(|e| e.into_inner());
-    let me_tid = crate::object::thread_id();
     for &lp in locals.iter() {
         let l = unsafe { &mut *(lp as *mut Local) };
-        // (scale2) a thread that is not executing Python (blocked in a wait, in native
-        // code) may not poll for a long time: its items are released by the caller
-        // instead. The objects are made ownerless now, while their owners are stopped,
-        // so that the caller's decrefs release them instead of queueing them for an
-        // owner that does not run.
-        let idle = !l.ts.is_null() && unsafe { (*l.ts).mode.get() != crate::threads::ThreadMode::InVm && crate::threads::same_interp(&*l.ts) };
-        if idle {
-            let mut batches: Vec<(Vec<Item>, bool)> = Vec::new();
-            if !l.open.is_empty() {
-                batches.push((std::mem::take(&mut l.open), false));
-            }
-            for (_, items) in l.closed.drain(..) {
-                batches.push((items, true));
-            }
-            for (items, counted) in batches {
-                for it in &items {
-                    if let Item::Decref(p) = *it {
-                        unsafe {
-                            let o = &*p;
-                            let tid = o.ob_tid.load(Relaxed);
-                            if tid != 0 && tid != me_tid && !o.is_immortal() && !crate::sharded::is_sharded(o) && !crate::object::has_type_id(p) {
-                                crate::object::explicit_merge(p);
-                            }
-                        }
-                    }
-                }
-                out.push(ItemSendBatch(items, counted));
-            }
-            l.polls = 0;
-            continue;
-        }
         if !l.open.is_empty() {
             let items = std::mem::take(&mut l.open);
             PENDING_TOTAL.fetch_add(items.len(), Relaxed);
@@ -702,6 +670,55 @@ pub fn quiesce_now() {
         });
         crate::threads::blocking(|| std::thread::sleep(std::time::Duration::from_micros(200)));
         report(me as *const ThreadState);
+    }
+}
+
+/// (stability3) Retired items handed out by `take_for_gc`.
+pub struct Taken(Vec<Item>);
+
+/// Anything retired (by any thread, or orphaned) and not yet released?
+pub fn has_pending_for_gc() -> bool {
+    if PENDING_TOTAL.load(Relaxed) > 0 {
+        return true;
+    }
+    let locals = LOCALS.lock().unwrap_or_else(|e| e.into_inner());
+    locals.iter().any(|&lp| !unsafe { &*(lp as *const Local) }.open.is_empty())
+}
+
+/// (stability3) Take every retired item of every thread and every orphaned batch.
+/// Only call with the world stopped: no thread is then inside a lock-free read, so
+/// all of them are due. Unlike `take_all_for_gc` (whose items go back to their
+/// threads, or are released after the collection), the caller releases these itself
+/// with `release_taken_now` once the world runs again and *before* analysing the
+/// heap: a reference that a thread dropped while other threads existed (e.g. `del x`
+/// of a global) must not keep a cycle alive, and a thread blocked for a long time
+/// (one left over by an earlier test) would otherwise hold its items until it wakes.
+pub fn take_for_gc() -> Taken {
+    let mut out: Vec<Item> = Vec::new();
+    let locals = LOCALS.lock().unwrap_or_else(|e| e.into_inner());
+    for &lp in locals.iter() {
+        let l = unsafe { &mut *(lp as *mut Local) };
+        let open = std::mem::take(&mut l.open);
+        PENDING_TOTAL.fetch_add(open.len(), Relaxed);
+        out.extend(open);
+        for (_, items) in l.closed.drain(..) {
+            out.extend(items);
+        }
+        l.polls = 0;
+    }
+    drop(locals);
+    let mut o = ORPHANS.lock().unwrap_or_else(|e| e.into_inner());
+    for (_, items) in o.drain(..) {
+        out.extend(items.into_iter().map(|i| i.0));
+    }
+    ORPHAN_MIN.store(u64::MAX, Relaxed);
+    Taken(out)
+}
+
+/// Release what `take_for_gc` returned (world running).
+pub fn release_taken_now(t: Taken) {
+    if !t.0.is_empty() {
+        unsafe { release(t.0) };
     }
 }
 

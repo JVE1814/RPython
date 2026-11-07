@@ -52,7 +52,9 @@ run_one() {
   local fails=$(echo "$line" | sed -nE 's/.*failures=([0-9]+).*/\1/p')
   local skipped=$(echo "$line" | sed -nE 's/.*skipped=([0-9]+).*/\1/p')
   if grep -qE "^(Result: SUCCESS|Tests result: SUCCESS)" "$log" && [ $rc -ne 0 ]; then status=PASS; fi
-  if grep -qE "test_[a-z0-9_]+ skipped" "$log" && [ -z "$run" ]; then status=SKIP; fi
+  # a module whose every test was skipped (missing module, resource denied: regrtest prints
+  # "NO TESTS RAN" and exits 4) is a skip, as when the skip happens at import
+  if grep -qE "test_[a-z0-9_]+ skipped" "$log" && { [ -z "$run" ] || [ "$run" = 0 ]; }; then status=SKIP; fi
   printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$t" "$status" "${run:-0}" "${fails:-0}" "${skipped:-0}" "$secs" "$(count_errors "$log")"
 }
 export -f run_one count_errors

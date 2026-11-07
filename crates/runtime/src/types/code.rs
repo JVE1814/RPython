@@ -202,7 +202,9 @@ pub fn code_data(o: &PyObject) -> &CodeData {
 fn code_data_slow(o: &PyObject) -> &CodeData {
     let c = get(o);
     let built = build_exec(c, unsafe { &*c.meta });
-    if std::env::var_os("RPYTHON_TRANSLATE_DEBUG").is_some() {
+    // (perf5) read once (an environment scan per translated code object)
+    static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DEBUG.get_or_init(|| std::env::var_os("RPYTHON_TRANSLATE_DEBUG").is_some()) {
         let m = unsafe { &*c.meta };
         eprintln!("== translate {} ({})", pystr::to_string_lossy(&m.co_qualname), pystr::to_string_lossy(&m.filename));
         if let Some(e) = &built.invalid {

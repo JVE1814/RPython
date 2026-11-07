@@ -1038,7 +1038,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                                 None
                             };
                             let sup = if gsuper.is(type_obj(crate::types::super_::super_type())) {
-                                crate::types::super_::new_super(&cls, &slf)
+                                if two { crate::types::super_::new_super(&cls, &slf) } else { crate::types::super_::new_super_zero_arg(&cls, &slf) }
                             } else if two {
                                 ab::call(&gsuper, &[&cls, &slf])
                             } else {
@@ -1650,47 +1650,8 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             unsafe { xdecref(old) };
                             push!(f, func.into_raw());
                         }
-                        Op::RaiseVarargs => {
-                            let (e, cause) = match arg {
-                                0 => (None, None),
-                                1 => (Some(popref!(f)), None),
-                                _ => {
-                                    let c = popref!(f);
-                                    (Some(popref!(f)), Some(c))
-                                }
-                            };
-                            let r = do_raise(ts, e.as_deref(), cause.as_deref());
-                            if arg == 0 && !handled_exception(ts).is_null() {
-                                // re-raise: keep the existing traceback, don't add this frame twice
-                                let _ = r;
-                                return Err(ReraiseMarker::mark(ts));
-                            }
-                            return Err(r);
-                        }
-                        Op::Reraise => {
-                            f.unwind_pc = (pc - 1) as i32;
-                            let e = popref!(f);
-                            if arg & 0x100 != 0 {
-                                // translated RERAISE n: the n values stay on the stack; the
-                                // deepest one (n > 0) is the lasti the handler pushed
-                                let n = (arg & 0xff) as usize;
-                                if n > 0 && f.stack_top >= f.nlocalsplus + n {
-                                    let v = peek!(f, n);
-                                    if !v.is_null() && int::is_int_exact(unsafe { &*v }) && int::is_compact(unsafe { &*v }) {
-                                        let li = int::compact_value(unsafe { &*v });
-                                        if li >= 0 && (li as usize) < code.len() {
-                                            f.lasti = li as u32;
-                                        }
-                                    }
-                                }
-                            } else if arg != 0 {
-                                // CPython restores frame->instr_ptr from lasti, but the handler
-                                // lookup uses the RERAISE position: keep f.lasti (used by
-                                // find_handler) pointing at this instruction.
-                                let _lasti = popref!(f);
-                            }
-                            set_exc(e);
-                            return Err(ReraiseMarker::mark(ts));
+                        Op::RaiseVarargs | Op::Reraise => {
+                            return Err(raise_op(ts, f, op, arg, pc - 1, code.len()));
                         }
                         Op::ReturnGenerator => {
                             // end of the eager generator prologue (see interp::call_function)
@@ -1815,32 +1776,105 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
     }
 }
 
-/// (perf4) An exception raised in compiled code at `f.lasti` that no handler of the
-/// frame covers: do what `eval_inner`'s unwinding would (context chaining, traceback
-/// entry, propagation mark) without entering the interpreter. False (nothing done)
-/// when a handler exists, the raise is a bare re-raise, or tracing is active.
-pub(crate) fn unwind_compiled_error(ts: &ThreadState, f: &mut Frame) -> bool {
-    if crate::modules::sys::tracing_active() || ts.reraise_flag.get() || f.unwind_pc >= 0 {
-        return false;
+/// An exception raised in compiled code at `f.lasti` (or re-raised at `f.unwind_pc`):
+/// do what `eval_inner`'s unwinding does without entering the interpreter (perf4:
+/// propagation out of the frame; perf5: re-raises too, and unwinding to a handler of
+/// the frame, after which the activation continues in compiled code at the handler).
+pub(crate) fn unwind_compiled(ts: &ThreadState, f: &mut Frame) -> Unwound {
+    if crate::modules::sys::tracing_active() {
+        return Unwound::Interp;
     }
-    if find_handler(f.code(), f.lasti).is_some() {
-        return false;
-    }
-    let Some(e) = take_exc() else { return false };
+    let lookup_pc = if f.unwind_pc >= 0 { f.unwind_pc as u32 } else { f.lasti };
+    let handler = find_handler(f.code(), lookup_pc);
+    let Some(e) = take_exc() else { return Unwound::Interp };
+    f.unwind_pc = -1;
     let prev = ts.frame.get();
     f.prev = prev;
     ts.frame.set(f as *mut Frame);
+    let reraise = ReraiseMarker::take(ts);
     let propagated = ts.propagated_exc.replace((0, 0)) == exc_identity(&e);
-    if !propagated {
-        chain_context(ts, &e);
+    if !reraise {
+        if !propagated {
+            chain_context(ts, &e);
+        }
+        add_traceback(f, &e);
     }
-    add_traceback(f, &e);
-    f.clear_stack();
-    ts.propagated_exc.set(exc_identity(&e));
-    set_exc(e);
+    let r = match handler {
+        Some(h) => {
+            let depth = f.nlocalsplus + h.depth as usize;
+            while f.stack_top > depth {
+                let p = pop!(f);
+                unsafe { xdecref(p) };
+            }
+            if h.lasti {
+                push!(f, int::new_int(f.lasti as i64).into_raw());
+            }
+            push!(f, e.into_raw());
+            Unwound::Handler(h.target as usize)
+        }
+        None => {
+            f.clear_stack();
+            ts.propagated_exc.set(exc_identity(&e));
+            set_exc(e);
+            Unwound::Propagate
+        }
+    };
     ts.frame.set(prev);
     f.prev = std::ptr::null_mut();
-    true
+    r
+}
+
+/// Result of `unwind_compiled`.
+pub(crate) enum Unwound {
+    /// no handler: the exception is set and propagates to the caller
+    Propagate,
+    /// unwound to the handler at this pc (exception pushed)
+    Handler(usize),
+    /// nothing done: the interpreter unwinds (tracing)
+    Interp,
+}
+
+/// RaiseVarargs / Reraise at instruction `this` (shared by the interpreter and tier-1
+/// code, perf5): pops the operands, sets the exception (and, for a re-raise, the
+/// marker that suppresses a second traceback entry) and returns the error.
+pub(crate) fn raise_op(ts: &ThreadState, f: &mut Frame, op: Op, arg: u32, this: usize, code_len: usize) -> PyErr {
+    if op == Op::RaiseVarargs {
+        let (e, cause) = match arg {
+            0 => (None, None),
+            1 => (Some(popref!(f)), None),
+            _ => {
+                let c = popref!(f);
+                (Some(popref!(f)), Some(c))
+            }
+        };
+        let r = do_raise(ts, e.as_deref(), cause.as_deref());
+        if arg == 0 && !handled_exception(ts).is_null() {
+            // bare `raise` of the handled exception: its traceback already has this frame
+            return ReraiseMarker::mark(ts);
+        }
+        return r;
+    }
+    f.unwind_pc = this as i32;
+    let e = popref!(f);
+    if arg & 0x100 != 0 {
+        // translated RERAISE n: n values stay on the stack; the deepest of them (n > 0)
+        // is the lasti pushed by the handler
+        let n = (arg & 0xff) as usize;
+        if n > 0 && f.stack_top >= f.nlocalsplus + n {
+            let v = peek!(f, n);
+            if !v.is_null() && int::is_int_exact(unsafe { &*v }) && int::is_compact(unsafe { &*v }) {
+                let li = int::compact_value(unsafe { &*v });
+                if li >= 0 && (li as usize) < code_len {
+                    f.lasti = li as u32;
+                }
+            }
+        }
+    } else if arg != 0 {
+        // the handler lookup uses the RERAISE position, so f.lasti stays here
+        let _lasti = popref!(f);
+    }
+    set_exc(e);
+    ReraiseMarker::mark(ts)
 }
 
 /// Identity of an exception in flight: its address and its traceback's.

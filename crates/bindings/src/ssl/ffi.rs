@@ -108,6 +108,13 @@ crate::dyn_lib!(LibCrypto, ["libcrypto.so.3", "libcrypto.so"], {
     fn X509_get_signature_nid(x: P) -> c_int;
     fn OBJ_find_sigid_algs(sig: c_int, md: *mut c_int, pk: *mut c_int) -> c_int;
     fn EVP_MD_get_size(md: P) -> c_int;
+    // (tail2) distrusted-key check in the verify callback
+    fn X509_STORE_CTX_get_current_cert(c: P) -> P;
+    fn X509_STORE_CTX_set_error(c: P, e: c_int);
+    fn X509_get_X509_PUBKEY(x: P) -> P;
+    fn i2d_X509_PUBKEY(k: P, out: *mut *mut c_uchar) -> c_int;
+    fn EVP_Digest(d: *const c_void, n: usize, md: *mut c_uchar, len: *mut c_uint, t: P, e: P) -> c_int;
+    fn EVP_sha256() -> P;
 });
 
 crate::dyn_lib!(LibSsl, ["libssl.so.3", "libssl.so"], {
@@ -185,6 +192,10 @@ crate::dyn_lib!(LibSsl, ["libssl.so.3", "libssl.so"], {
     fn SSL_get_servername(s: P, t: c_int) -> *const c_char;
     fn SSL_set_SSL_CTX(s: P, c: P) -> P;
     fn SSL_get_SSL_CTX(s: P) -> P;
+    // (tail2) TLS-PSK
+    fn SSL_CTX_set_psk_client_callback(c: P, cb: P);
+    fn SSL_CTX_set_psk_server_callback(c: P, cb: P);
+    fn SSL_CTX_use_psk_identity_hint(c: P, hint: *const c_char) -> c_int;
     fn SSL_verify_client_post_handshake(s: P) -> c_int;
     fn SSL_get_verify_result(s: P) -> c_long;
     fn SSL_set_ex_data(s: P, i: c_int, d: P) -> c_int;

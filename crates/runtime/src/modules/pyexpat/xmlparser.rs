@@ -732,6 +732,13 @@ fn m_external_entity_parser_create(o: &PyObject, args: &[&PyObject]) -> PyResult
         Some(e) if pystr::is_str(e) => Some(pystr::to_string_lossy(e)),
         Some(e) => raise!(TypeError, "ExternalEntityParserCreate() argument 2 must be str, not {}", fc::tname(e)),
     };
+    // (tail2) the sub-parser object and its engine state are two allocations that a
+    // failure-injecting allocator hook (`_testcapi.set_nomemory`) may refuse
+    for size in [std::mem::size_of::<Parser>(), std::mem::size_of::<Engine>()] {
+        if crate::capi::mem::hooked_alloc_refuses(size) {
+            return Err(crate::errors::memory_error());
+        }
+    }
     let eng = configure(o)?;
     let sub_engine = Engine::new_external(eng, context, encoding);
     let (ns_sep, intern) = {

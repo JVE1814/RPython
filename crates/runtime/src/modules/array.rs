@@ -1128,7 +1128,7 @@ unsafe extern "C" fn array_getbuffer(o: *mut PyObject, view: *mut Py_buffer, fla
         if flags & crate::buffer::PyBUF_FORMAT == crate::buffer::PyBUF_FORMAT {
             v.format = c.format.as_ptr() as *mut _;
         }
-        arr(a).exports += 1;
+        std::sync::atomic::AtomicI32::from_ptr(&raw mut arr(a).exports).fetch_add(1, std::sync::atomic::Ordering::AcqRel); // (stability3) atomic: released from any thread
         0
     }
 }
@@ -1140,7 +1140,7 @@ static EMPTY: AlignedEmpty = AlignedEmpty([0; 16]);
 
 unsafe extern "C" fn array_releasebuffer(o: *mut PyObject, _view: *mut Py_buffer) {
     unsafe {
-        arr(&*o).exports -= 1;
+        std::sync::atomic::AtomicI32::from_ptr(&raw mut arr(&*o).exports).fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 

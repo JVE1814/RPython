@@ -27,6 +27,13 @@ pub struct ManagedBuffer {
     pub master: Py_buffer,
 }
 
+/// (stability3) The managed buffer's view count, updated atomically: views of one
+/// managed buffer are created and released on any thread.
+#[inline]
+unsafe fn mbuf_exports<'a>(mbuf: *mut ManagedBuffer) -> &'a std::sync::atomic::AtomicIsize {
+    unsafe { std::sync::atomic::AtomicIsize::from_ptr(&raw mut (*mbuf).exports) }
+}
+
 #[repr(C)]
 pub struct PyMemoryViewObject {
     pub ob_base: PyVarObject,
@@ -685,7 +692,7 @@ unsafe fn mbuf_add_view(mbuf: *mut ManagedBuffer, src: Option<&Py_buffer>) -> Py
         init_flags(&mut *m);
         (*m).mbuf = mbuf;
         incref(mbuf as *mut PyObject);
-        (*mbuf).exports += 1;
+        mbuf_exports(mbuf).fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         crate::gc::track(m as *mut PyObject);
         Ok(r)
     }
@@ -699,7 +706,7 @@ unsafe fn mbuf_add_incomplete_view(mbuf: *mut ManagedBuffer, src: &Py_buffer, nd
         init_shared_values(&mut (*m).view, src);
         (*m).mbuf = mbuf;
         incref(mbuf as *mut PyObject);
-        (*mbuf).exports += 1;
+        mbuf_exports(mbuf).fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         crate::gc::track(m as *mut PyObject);
         Ok(r)
     }
@@ -849,8 +856,8 @@ fn memory_release(o: &PyObject) -> PyResult<()> {
         m.flags |= MV_RELEASED;
         if !m.mbuf.is_null() {
             unsafe {
-                (*m.mbuf).exports -= 1;
-                if (*m.mbuf).exports == 0 {
+                // (stability3) views of one managed buffer may be released on several threads
+                if mbuf_exports(m.mbuf).fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
                     mbuf_release(m.mbuf);
                 }
             }
@@ -949,13 +956,13 @@ unsafe extern "C" fn memory_getbuf(o: *mut PyObject, view: *mut Py_buffer, flags
             v.shape = std::ptr::null_mut();
         }
         v.obj = ob.to_ref().into_raw();
-        m.exports += 1;
+        std::sync::atomic::AtomicIsize::from_ptr(&raw mut m.exports).fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         0
     }
 }
 unsafe extern "C" fn memory_releasebuf(o: *mut PyObject, _view: *mut Py_buffer) {
     unsafe {
-        mv(&*o).exports -= 1;
+        std::sync::atomic::AtomicIsize::from_ptr(&raw mut mv(&*o).exports).fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 

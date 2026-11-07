@@ -70,18 +70,6 @@ impl RawLock {
             futex_wake(&self.state, 1);
         }
     }
-    /// `acquire_timed` for Python-level callers (lock.acquire, with lock: ...): before
-    /// waiting, the thread's pending merges and deferred releases are processed
-    /// (scale2: threads::before_wait), which internal users of the lock must not do.
-    pub fn acquire_py(&self, timeout: Option<Duration>) -> PyResult<AcquireResult> {
-        if self.try_acquire() {
-            return Ok(AcquireResult::Acquired);
-        }
-        if timeout != Some(Duration::ZERO) {
-            crate::threads::before_wait();
-        }
-        self.acquire_timed(timeout)
-    }
     /// Blocking acquire. `timeout` None = forever. When called on the main thread,
     /// pending Python signal handlers are run while waiting (errors propagate).
     pub fn acquire_timed(&self, timeout: Option<Duration>) -> PyResult<AcquireResult> {
@@ -122,7 +110,7 @@ impl RawLock {
                 wait = Some(wait.map_or(cap, |w| w.min(cap)));
                 MAIN_WAIT_ADDR.store(&self.state as *const AtomicU32 as *mut AtomicU32, Release);
             }
-            crate::threads::blocking(|| futex_wait(&self.state, 2, wait));
+            crate::threads::blocking_pure(true, || futex_wait(&self.state, 2, wait)); // (stability3)
             if main {
                 MAIN_WAIT_ADDR.store(std::ptr::null_mut(), Release);
             }
@@ -159,7 +147,7 @@ fn wait_interruptible<T>(m: &Mutex<T>, cv: &Condvar, mut done: impl FnMut(&T) ->
             }
             wait = wait.min(Duration::from_millis(20));
         }
-        g = crate::threads::blocking(|| cv.wait_timeout(g, wait).unwrap().0);
+        g = crate::threads::blocking_pure(false, || cv.wait_timeout(g, wait).unwrap().0); // (stability3: a mutex is held)
     }
 }
 
@@ -260,13 +248,13 @@ unsafe extern "C" fn lock_repr(op: *mut PyObject) -> *mut PyObject {
 
 fn lock_acquire(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult {
     let t = parse_acquire_args("acquire", args, kw)?;
-    match lk(o).acquire_py(t)? {
+    match lk(o).acquire_timed(t)? {
         AcquireResult::Acquired => Ok(bool_::new_bool(true)),
         AcquireResult::TimedOut => Ok(bool_::new_bool(false)),
     }
 }
 fn lock_enter(o: &PyObject) -> PyResult {
-    lk(o).acquire_py(None)?;
+    lk(o).acquire_timed(None)?;
     Ok(bool_::new_bool(true))
 }
 fn lock_release(o: &PyObject) -> PyResult {
@@ -364,7 +352,7 @@ fn rlock_acquire_impl(o: &PyObject, t: Option<Duration>) -> PyResult {
         r.count.store(c + 1, Relaxed);
         return Ok(bool_::new_bool(true));
     }
-    match r.lock.acquire_py(t)? {
+    match r.lock.acquire_timed(t)? {
         AcquireResult::Acquired => {
             r.owner.store(me, Relaxed);
             r.count.store(1, Relaxed);

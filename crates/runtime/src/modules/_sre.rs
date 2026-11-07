@@ -440,6 +440,30 @@ fn raise_compile_error(e: rpy_sre::CompileError, pattern: &PyObject) -> PyErr {
     }
 }
 
+/// re.DEBUG (tail2): write the parse tree and code listing to sys.stdout.
+fn print_debug_dump(pattern: &PyObject, fl: u32) -> PyResult<()> {
+    use rpy_sre::PatternSource as PS;
+    let r = if pystr::is_str(pattern) {
+        match pystr::str_data(pattern) {
+            StrData::L1(s) => rpy_sre::debug_text(PS::Latin1(s), fl, &PROVIDER),
+            StrData::U2(s) => rpy_sre::debug_text(PS::Ucs2(s), fl, &PROVIDER),
+            StrData::U4(s) => rpy_sre::debug_text(PS::Ucs4(s), fl, &PROVIDER),
+        }
+    } else {
+        match tu::byte_data(pattern) {
+            Some(b) => rpy_sre::debug_text(PS::Bytes(b.as_slice()), fl, &PROVIDER),
+            None => return Ok(()),
+        }
+    };
+    let text = r.map_err(|e| raise_compile_error(e, pattern))?;
+    let out = match crate::modules::sys::get_sys_attr("stdout") {
+        Some(o) if !o.is(none::none()) => o,
+        _ => raise!(RuntimeError, "lost sys.stdout"),
+    };
+    ab::call_method_str(&out, "write", &[&pystr::new_str(&text)])?;
+    Ok(())
+}
+
 fn compile_pattern(pattern: &PyObject, flags: i64) -> PyResult {
     use rpy_sre::PatternSource as PS;
     let fl = (flags & 0xffff_ffff) as u32;
@@ -466,6 +490,9 @@ fn compile_pattern(pattern: &PyObject, flags: i64) -> PyResult {
         };
         // user -> re.compile -> re._compile -> re._compiler.compile -> _sre.compile
         tu::warn(cat, &w.message, 4)?;
+    }
+    if fl & rpy_sre::flags::DEBUG != 0 {
+        print_debug_dump(pattern, fl)?;
     }
     let groupindex = dict::new_dict();
     for (name, idx) in re.group_index() {
@@ -1429,7 +1456,7 @@ fn init_types() -> PyResult<()> {
             ("prefixmatch", FASTKW, pattern_prefixmatch, "prefixmatch($self, /, string, pos=0, endpos=sys.maxsize)\n--\n\nTry to match the pattern at the start of string[pos:endpos]; return a Match or None."),
             ("fullmatch", FASTKW, pattern_fullmatch, "fullmatch($self, /, string, pos=0, endpos=sys.maxsize)\n--\n\nMatch only if the pattern covers the whole of string[pos:endpos]."),
             ("search", FASTKW, pattern_search, "search($self, /, string, pos=0, endpos=sys.maxsize)\n--\n\nReturn a Match for the first place the pattern matches, or None."),
-            ("sub", FASTKW, pattern_sub, "sub($self, /, repl, string, count=0)\n--\n\nReturn string with up to count (0: all) non-overlapping matches replaced by repl.\n\nrepl is a string (backslash escapes are processed) or a callable that\nreceives the Match and returns the replacement."),
+            ("sub", FASTKW, pattern_sub, "sub($self, /, repl, string, count=0)\n--\n\nReturn the string obtained by replacing the leftmost non-overlapping occurrences of the pattern in string by repl (at most count of them when count is positive).\n\nrepl is a string (backslash escapes are processed) or a callable that\nreceives the Match and returns the replacement."),
             ("subn", FASTKW, pattern_subn, "subn($self, /, repl, string, count=0)\n--\n\nLike sub(), but return (new_string, number_of_substitutions)."),
             ("findall", FASTKW, pattern_findall, "findall($self, /, string, pos=0, endpos=sys.maxsize)\n--\n\nReturn a list of all non-overlapping matches (or of their groups)."),
             ("split", FASTKW, pattern_split, "split($self, /, string, maxsplit=0)\n--\n\nSplit string at the matches; captured groups are kept in the result."),

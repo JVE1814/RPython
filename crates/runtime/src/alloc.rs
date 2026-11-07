@@ -26,6 +26,20 @@ pub const GC_BIT_OLD: u8 = 0x04;
 /// The managed __dict__ was replaced or deleted (no "inline values" any more).
 pub const GC_BIT_DICT_DETACHED: u8 = 0x10;
 
+/// (perf5) Header of a block reused for a new object of the same static type (free
+/// lists): owned by this thread with one local reference, no shared count, flags
+/// and mutex clear, gc bits reduced to the allocation kind (not tracked).
+#[inline]
+pub unsafe fn reinit_header(op: *mut PyObject) {
+    unsafe {
+        let kind = (*op).ob_gc_bits.load(Relaxed) & (GC_BIT_PREHEADER | GC_BIT_MANAGED | GC_BIT_LARGE);
+        (*op).ob_tid.store(crate::object::thread_id(), Relaxed);
+        // ob_flags (u16) | ob_mutex (u8) << 16 | ob_gc_bits (u8) << 24 | ob_ref_local (u32) << 32
+        std::ptr::write((op as *mut u64).add(1), ((kind as u64) << 24) | (1u64 << 32));
+        (*op).ob_ref_shared.store(0, Relaxed);
+    }
+}
+
 #[inline]
 pub fn type_is_gc(tp: *const PyTypeObject) -> bool {
     unsafe { (*tp).tp_flags & Py_TPFLAGS_HAVE_GC != 0 }
