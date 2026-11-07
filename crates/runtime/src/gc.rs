@@ -706,6 +706,15 @@ fn collect_gen(young_only: bool) -> usize {
     let saved_exc = crate::errors::take_exc();
     let t0 = std::time::Instant::now();
     IN_COLLECTION.set(true);
+    // (stability3) references this thread dropped while other threads existed wait in
+    // its QSBR batches (and those of exited threads in the orphan list) until every
+    // thread reports; a cycle they point into would look reachable. With the world
+    // stopped all of them are due: take them, restart, release, then collect.
+    if crate::qsbr::multi_threaded() && crate::qsbr::has_own_pending() && stop_the_world(me) {
+        let taken = crate::qsbr::take_for_gc();
+        start_the_world();
+        crate::qsbr::release_taken(taken);
+    }
     let n = unsafe { collect_phases(me, young_only) };
     IN_COLLECTION.set(false);
     release_mature();

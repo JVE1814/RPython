@@ -338,6 +338,42 @@ pub fn quiesce_now() {
     }
 }
 
+/// (stability3) Retired items handed out by `take_for_gc`.
+pub struct Taken(Vec<Item>);
+
+/// Anything retired by the calling thread or orphaned, pending release?
+pub fn has_own_pending() -> bool {
+    let l = local();
+    !l.open.is_empty() || !l.closed.is_empty() || !ORPHANS.lock().unwrap().is_empty()
+}
+
+/// (stability3) Take every item retired by the calling thread and every orphaned
+/// batch. Only call with the world stopped: every other thread is then at a
+/// safepoint or outside the VM, so none is inside a lock-free read and all of these
+/// are due. The caller releases them with `release_taken` once the world runs again
+/// (deallocation can run finalizers). The garbage collector does this first, so
+/// references dropped while other threads existed do not keep cycles alive.
+pub fn take_for_gc() -> Taken {
+    let l = local();
+    let mut out: Vec<Item> = std::mem::take(&mut l.open);
+    PENDING_TOTAL.fetch_add(out.len(), Relaxed);
+    l.polls = 0;
+    for (_, items) in std::mem::take(&mut l.closed) {
+        out.extend(items);
+    }
+    for (_, items) in std::mem::take(&mut *ORPHANS.lock().unwrap()) {
+        out.extend(items.into_iter().map(|i| i.0));
+    }
+    Taken(out)
+}
+
+/// Release what `take_for_gc` returned.
+pub fn release_taken(t: Taken) {
+    if !t.0.is_empty() {
+        unsafe { release(t.0) };
+    }
+}
+
 /// Number of retired items not yet released (diagnostics/tests).
 pub fn pending() -> usize {
     PENDING_TOTAL.load(Relaxed) + local().open.len()
