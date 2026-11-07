@@ -1,5 +1,6 @@
-"""DOM Level 3 Load and Save support (the draft "LS" interfaces) for
-minidom: DOMBuilder, DOMInputSource, DOMEntityResolver and friends."""
+"""The DOM Level 3 "Load and Save" interfaces (as of the 2002 working
+draft) for minidom: DOMBuilder, DOMInputSource, DOMEntityResolver,
+DOMBuilderFilter, and the DocumentLS / DOMImplementationLS mixins."""
 
 import copy
 import xml.dom
@@ -10,11 +11,10 @@ __all__ = ["DOMBuilder", "DOMEntityResolver", "DOMInputSource"]
 
 
 class Options:
-    """Settings that control how a document is built.
+    """What a builder does; each attribute is a feature of the draft (with
+    "-" written as "_").  Defaults follow the draft."""
 
-    Each attribute corresponds to one DOMBuilder feature (with '-' replaced
-    by '_')."""
-
+    # 1 rather than True: the expat builders tell the versions apart
     namespaces = 1
     namespace_declarations = True
     validation = False
@@ -37,57 +37,43 @@ class Options:
     filter = None
 
 
-# The attribute settings implied by turning a feature on or off; a feature
-# that is absent (or lacks the requested state) cannot be set.
-_FEATURE_SETTINGS = {
-    ("validation", 0): [("validation", 0)],
-    ("external_general_entities", 0): [("external_general_entities", 0)],
-    ("external_general_entities", 1): [("external_general_entities", 1)],
-    ("external_parameter_entities", 0): [("external_parameter_entities", 0)],
-    ("external_parameter_entities", 1): [("external_parameter_entities", 1)],
-    ("validate_if_schema", 0): [("validate_if_schema", 0)],
-    ("create_entity_ref_nodes", 0): [("create_entity_ref_nodes", 0)],
-    ("create_entity_ref_nodes", 1): [("create_entity_ref_nodes", 1)],
-    ("entities", 0): [("create_entity_ref_nodes", 0), ("entities", 0)],
-    ("entities", 1): [("entities", 1)],
-    ("whitespace_in_element_content", 0):
-        [("whitespace_in_element_content", 0)],
-    ("whitespace_in_element_content", 1):
-        [("whitespace_in_element_content", 1)],
-    ("cdata_sections", 0): [("cdata_sections", 0)],
-    ("cdata_sections", 1): [("cdata_sections", 1)],
-    ("comments", 0): [("comments", 0)],
-    ("comments", 1): [("comments", 1)],
-    ("charset_overrides_xml_encoding", 0):
-        [("charset_overrides_xml_encoding", 0)],
-    ("charset_overrides_xml_encoding", 1):
-        [("charset_overrides_xml_encoding", 1)],
-    ("infoset", 0): [],
-    ("infoset", 1): [("namespace_declarations", 0),
-                     ("validate_if_schema", 0),
-                     ("create_entity_ref_nodes", 0),
-                     ("entities", 0),
-                     ("cdata_sections", 0),
-                     ("datatype_normalization", 1),
-                     ("whitespace_in_element_content", 1),
-                     ("comments", 1),
-                     ("charset_overrides_xml_encoding", 1)],
-    ("supported_mediatypes_only", 0): [("supported_mediatypes_only", 0)],
-    ("namespaces", 0): [("namespaces", 0)],
-    ("namespaces", 1): [("namespaces", 1)],
-}
+# Features that can be switched both ways and only set themselves.
+_TOGGLES = frozenset({
+    "external_general_entities", "external_parameter_entities",
+    "create_entity_ref_nodes", "entities", "whitespace_in_element_content",
+    "cdata_sections", "comments", "charset_overrides_xml_encoding",
+    "namespaces"})
 
-# For getFeature(): a feature whose value is derived from other settings.
-_DERIVED_FEATURES = {
-    "infoset": (("validate_if_schema", False),
-                ("create_entity_ref_nodes", False),
-                ("entities", False),
-                ("cdata_sections", False),
-                ("datatype_normalization", True),
-                ("whitespace_in_element_content", True),
-                ("comments", True),
-                ("charset_overrides_xml_encoding", True)),
-}
+# Features that can only be switched off (and only set themselves).
+_OFF_ONLY = frozenset({"validation", "validate_if_schema",
+                       "supported_mediatypes_only"})
+
+# The settings that make up the "infoset" feature.
+_INFOSET = (("validate_if_schema", False),
+            ("create_entity_ref_nodes", False),
+            ("entities", False),
+            ("cdata_sections", False),
+            ("datatype_normalization", True),
+            ("whitespace_in_element_content", True),
+            ("comments", True),
+            ("charset_overrides_xml_encoding", True))
+
+
+def _settings_for(key, state):
+    """The (option, value) pairs setting feature key to state (0 or 1), or
+    None if that cannot be done."""
+    if key in _TOGGLES or (key in _OFF_ONLY and not state):
+        settings = [(key, state)]
+        if key == "entities" and not state:
+            # entity reference nodes need entities
+            settings.insert(0, ("create_entity_ref_nodes", 0))
+        return settings
+    if key == "infoset":
+        if not state:
+            return []
+        return [("namespace_declarations", 0)] + [
+            (name, int(value)) for name, value in _INFOSET]
+    return None
 
 
 def _feature_key(name):
@@ -110,8 +96,6 @@ class DOMBuilder:
     def __init__(self):
         self._options = Options()
 
-    # attribute accessors in the DOM style
-
     def _get_entityResolver(self):
         return self.entityResolver
 
@@ -130,60 +114,49 @@ class DOMBuilder:
     def _set_filter(self, filter):
         self.filter = filter
 
-    # features
+    # -- features
 
     def setFeature(self, name, state):
-        if self.supportsFeature(name):
-            state = 1 if state else 0
-            try:
-                settings = _FEATURE_SETTINGS[(_feature_key(name), state)]
-            except KeyError:
-                raise xml.dom.NotSupportedErr(
-                    "unsupported feature: %r" % (name,)) from None
-            for attr, value in settings:
-                setattr(self._options, attr, value)
-        else:
+        if not self.supportsFeature(name):
             raise xml.dom.NotFoundErr("unknown feature: " + repr(name))
+        settings = _settings_for(_feature_key(name), 1 if state else 0)
+        if settings is None:
+            raise xml.dom.NotSupportedErr("unsupported feature: %r" % (name,))
+        for option, value in settings:
+            setattr(self._options, option, value)
 
     def supportsFeature(self, name):
         return hasattr(self._options, _feature_key(name))
 
     def canSetFeature(self, name, state):
-        key = (_feature_key(name), 1 if state else 0)
-        return key in _FEATURE_SETTINGS
+        return _settings_for(_feature_key(name), 1 if state else 0) is not None
 
     def getFeature(self, name):
         key = _feature_key(name)
-        derived = _DERIVED_FEATURES.get(key)
-        if derived is not None:
-            options = self._options
-            for attr, wanted in derived:
-                if bool(getattr(options, attr)) != wanted:
-                    return False
-            return True
+        if key == "infoset":
+            return all(getattr(self._options, option) == value
+                       for option, value in _INFOSET)
         try:
             return getattr(self._options, key)
         except AttributeError:
-            raise xml.dom.NotFoundErr("feature %s not known" % repr(name))
+            raise xml.dom.NotFoundErr(
+                "feature %s not known" % repr(name)) from None
 
-    # parsing
+    # -- parsing
 
     def parseURI(self, uri):
-        if self.entityResolver:
-            source = self.entityResolver.resolveEntity(None, uri)
-        else:
-            source = DOMEntityResolver().resolveEntity(None, uri)
-        return self.parse(source)
+        resolver = self.entityResolver or DOMEntityResolver()
+        return self.parse(resolver.resolveEntity(None, uri))
 
     def parse(self, input):
         options = copy.copy(self._options)
         options.filter = self.filter
         options.errorHandler = self.errorHandler
-        fp = input.byteStream
-        if fp is None and input.systemId:
+        stream = input.byteStream
+        if stream is None and input.systemId:
             import urllib.request
-            fp = urllib.request.urlopen(input.systemId)
-        return self._parse_bytestream(fp, options)
+            stream = urllib.request.urlopen(input.systemId)
+        return self._parse_bytestream(stream, options)
 
     def parseWithContext(self, input, cnode, action):
         if action not in self._legal_actions:
@@ -192,11 +165,12 @@ class DOMBuilder:
 
     def _parse_bytestream(self, stream, options):
         import xml.dom.expatbuilder
-        builder = xml.dom.expatbuilder.makeBuilder(options)
-        return builder.parseFile(stream)
+        return xml.dom.expatbuilder.makeBuilder(options).parseFile(stream)
 
 
-class DOMEntityResolver:
+class DOMEntityResolver(object):
+    """Resolves system identifiers (URLs) with urllib."""
+
     __slots__ = '_opener',
 
     def resolveEntity(self, publicId, systemId):
@@ -206,16 +180,7 @@ class DOMEntityResolver:
         source.systemId = systemId
         source.byteStream = self._get_opener().open(systemId)
         source.encoding = self._guess_media_encoding(source)
-
-        # the base URI is everything up to and including the last '/'
-        import posixpath
-        import urllib.parse
-        parts = urllib.parse.urlparse(systemId)
-        scheme, netloc, path, params, query, fragment = parts
-        if path and not path.endswith("/"):
-            path = posixpath.dirname(path) + "/"
-            parts = scheme, netloc, path, params, query, fragment
-            source.baseURI = urllib.parse.urlunparse(parts)
+        source.baseURI = _base_of(systemId)
         return source
 
     def _get_opener(self):
@@ -230,25 +195,34 @@ class DOMEntityResolver:
         return urllib.request.build_opener()
 
     def _guess_media_encoding(self, source):
-        # the charset parameter of the response's Content-Type, if any
-        info = source.byteStream.info()
-        if "Content-Type" in info:
-            return info.get_content_charset()
+        """The charset the transport announced, if any."""
+        headers = source.byteStream.info()
+        if "Content-Type" in headers:
+            charset = headers.get_content_charset()
+            if charset:
+                return charset.lower()
         return None
 
 
-class DOMInputSource:
+def _base_of(url):
+    """url with its last path segment removed (the base for relative
+    references)."""
+    import posixpath
+    import urllib.parse
+    parts = urllib.parse.urlparse(url)
+    path = parts.path
+    if path and not path.endswith("/"):
+        path = posixpath.dirname(path) + "/"
+    return urllib.parse.urlunparse(parts._replace(path=path))
+
+
+class DOMInputSource(object):
     __slots__ = ('byteStream', 'characterStream', 'stringData',
                  'encoding', 'publicId', 'systemId', 'baseURI')
 
     def __init__(self):
-        self.byteStream = None
-        self.characterStream = None
-        self.stringData = None
-        self.encoding = None
-        self.publicId = None
-        self.systemId = None
-        self.baseURI = None
+        for name in self.__slots__:
+            setattr(self, name, None)
 
     def _get_byteStream(self):
         return self.byteStream
@@ -294,11 +268,11 @@ class DOMInputSource:
 
 
 class DOMBuilderFilter:
-    """Filter consulted while a document is built.
+    """Lets the application drop or keep nodes while a document is built.
+    Override acceptNode() and startContainer(); whatToShow selects the node
+    types they see."""
 
-    acceptNode() is called for completed nodes, startContainer() when an
-    element starts; both return one of the FILTER_* constants."""
-
+    # values the two methods may return
     FILTER_ACCEPT = 1
     FILTER_REJECT = 2
     FILTER_SKIP = 3
@@ -320,7 +294,7 @@ del NodeFilter
 
 
 class DocumentLS:
-    """Mixin for Document providing the LS load/save methods."""
+    """Load and save methods of a document (only saveXML() works)."""
 
     async_ = False
 
@@ -333,6 +307,7 @@ class DocumentLS:
                 "asynchronous document loading is not supported")
 
     def abort(self):
+        # nothing is ever loading asynchronously
         raise NotImplementedError(
             "haven't figured out what this means yet")
 
@@ -343,6 +318,7 @@ class DocumentLS:
         raise NotImplementedError("haven't written this yet")
 
     def saveXML(self, snode):
+        """The XML of snode (or of the whole document if snode is None)."""
         if snode is None:
             snode = self
         elif snode.ownerDocument is not self:

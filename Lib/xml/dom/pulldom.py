@@ -1,5 +1,9 @@
-"""A "pull" DOM: iterate over (event, node) pairs produced by a SAX parser,
-expanding selected subtrees into full DOM nodes on request."""
+"""Pull-style parsing to minidom nodes.
+
+parse() and parseString() return a DOMEventStream: iterating it yields
+(event, node) pairs; expandNode() builds the whole subtree of the node a
+START_ELEMENT event returned.
+"""
 
 import collections
 import xml.sax
@@ -18,44 +22,39 @@ _XMLNS_NAMESPACE = "http://www.w3.org/2000/xmlns/"
 
 
 class PullDOM(xml.sax.ContentHandler):
-    """SAX content handler queueing (event, node) pairs.
-
-    The Document node is only created when the root element starts; events
-    seen before that are queued after the START_DOCUMENT event."""
+    """A SAX content handler queueing (event, node) pairs.  The Document is
+    created when the root element starts (its name is needed); comments
+    and processing instructions seen before are kept until then."""
 
     _locator = None
     document = None
 
     def __init__(self, documentFactory=None):
+        from xml.dom import XML_NAMESPACE
         self.documentFactory = documentFactory
-        # queued (event, node) pairs not yet handed out
-        self.events = collections.deque()
-        # events seen before the document existed, as (event, factory, args)
-        self.pending_events = []
+        self._events = collections.deque()
         self.elementStack = []
-        self._last_node = None
-        # namespace prefix bookkeeping
-        self._ns_contexts = [{_XMLNS_NAMESPACE: 'xmlns'}]
+        self.push = self.elementStack.append
+        self.pop = self.elementStack.pop
+        # namespace URI -> prefix, one dict per mapping scope
+        self._ns_contexts = [{XML_NAMESPACE: 'xml'}]
         self._current_context = self._ns_contexts[-1]
         self._xmlns_attrs = []
-
-    def pop(self):
-        result = self.elementStack[-1]
-        del self.elementStack[-1]
-        return result
+        # (kind, data...) seen before the document exists
+        self.pending_events = []
 
     def setDocumentLocator(self, locator):
         self._locator = locator
 
-    def _push(self, event, node):
-        self._last_node = node
-        self.events.append((event, node))
+    def _queue(self, event, node):
+        self._events.append((event, node))
 
-    # namespaces
+    def _take(self):
+        return self._events.popleft() if self._events else None
+
+    # -- namespaces
 
     def startPrefixMapping(self, prefix, uri):
-        if not hasattr(self, '_xmlns_attrs'):
-            self._xmlns_attrs = []
         self._xmlns_attrs.append((prefix or 'xmlns', uri))
         self._ns_contexts.append(self._current_context.copy())
         self._current_context[uri] = prefix or None
@@ -63,103 +62,94 @@ class PullDOM(xml.sax.ContentHandler):
     def endPrefixMapping(self, prefix):
         self._current_context = self._ns_contexts.pop()
 
-    def _qualify(self, uri, localname):
+    def _qualified(self, uri, local):
+        """A qualified name for (uri, local) from the prefixes in scope."""
         prefix = self._current_context.get(uri)
-        if prefix:
-            return "%s:%s" % (prefix, localname)
-        return localname
+        return prefix + ":" + local if prefix else local
 
-    # elements
+    # -- elements
+
+    def _new_element(self, uri, qname):
+        if self.document:
+            if uri:
+                return self.document.createElementNS(uri, qname)
+            return self.document.createElement(qname)
+        return self.buildDocument(uri, qname)
 
     def startElementNS(self, name, tagName, attrs):
-        uri, localname = name
-        if uri:
-            if tagName is None:
-                tagName = self._qualify(uri, localname)
-            if self.document is not None:
-                node = self.document.createElementNS(uri, tagName)
-            else:
-                node = self.buildDocument(uri, tagName)
-        else:
-            if self.document is not None:
-                node = self.document.createElement(localname)
-            else:
-                node = self.buildDocument(None, localname)
+        declarations, self._xmlns_attrs = self._xmlns_attrs, []
 
-        # namespace declarations become xmlns attributes
-        for aname, value in self._xmlns_attrs:
-            if aname == 'xmlns':
-                qname = aname
-            else:
-                qname = 'xmlns:' + aname
-            attr = self.document.createAttributeNS(_XMLNS_NAMESPACE, qname)
+        uri, local = name
+        if uri:
+            # the reader may not give the original qualified name
+            if tagName is None:
+                tagName = self._qualified(uri, local)
+            node = self._new_element(uri, tagName)
+        else:
+            node = self._new_element(None, local)
+
+        doc = self.document
+        # the prefix mappings that started here become xmlns attributes,
+        # ahead of the others
+        for aname, value in declarations:
+            qname = aname if aname == 'xmlns' else 'xmlns:' + aname
+            attr = doc.createAttributeNS(_XMLNS_NAMESPACE, qname)
             attr.value = value
             node.setAttributeNodeNS(attr)
-        self._xmlns_attrs = []
-
-        for aname, value in attrs.items():
-            a_uri, a_localname = aname
+        for (a_uri, a_local), value in attrs.items():
             if a_uri == _XMLNS_NAMESPACE:
-                if a_localname == 'xmlns':
-                    qname = a_localname
-                else:
-                    qname = 'xmlns:' + a_localname
-                attr = self.document.createAttributeNS(a_uri, qname)
+                qname = a_local if a_local == 'xmlns' else 'xmlns:' + a_local
+                attr = doc.createAttributeNS(a_uri, qname)
                 node.setAttributeNodeNS(attr)
             elif a_uri:
-                qname = self._qualify(a_uri, a_localname)
-                attr = self.document.createAttributeNS(a_uri, qname)
+                attr = doc.createAttributeNS(a_uri,
+                                             self._qualified(a_uri, a_local))
                 node.setAttributeNodeNS(attr)
             else:
-                attr = self.document.createAttribute(a_localname)
+                attr = doc.createAttribute(a_local)
                 node.setAttributeNode(attr)
             attr.value = value
 
-        self._push(START_ELEMENT, node)
-        self.elementStack.append(node)
+        self._queue(START_ELEMENT, node)
+        self.push(node)
 
     def endElementNS(self, name, tagName):
-        self._push(END_ELEMENT, self.pop())
+        self._queue(END_ELEMENT, self.pop())
 
     def startElement(self, name, attrs):
-        if self.document is not None:
-            node = self.document.createElement(name)
-        else:
-            node = self.buildDocument(None, name)
+        node = self._new_element(None, name)
         for aname, value in attrs.items():
             attr = self.document.createAttribute(aname)
             attr.value = value
             node.setAttributeNode(attr)
-        self._push(START_ELEMENT, node)
-        self.elementStack.append(node)
+        self._queue(START_ELEMENT, node)
+        self.push(node)
 
     def endElement(self, name):
-        self._push(END_ELEMENT, self.pop())
+        self._queue(END_ELEMENT, self.pop())
 
-    # other content
+    # -- other content
 
     def comment(self, s):
-        if self.document is not None:
-            self._push(COMMENT, self.document.createComment(s))
+        if self.document:
+            self._queue(COMMENT, self.document.createComment(s))
         else:
-            self.pending_events.append((COMMENT, 'createComment', (s,)))
+            self.pending_events.append((COMMENT, s))
 
     def processingInstruction(self, target, data):
-        if self.document is not None:
+        if self.document:
             node = self.document.createProcessingInstruction(target, data)
-            self._push(PROCESSING_INSTRUCTION, node)
+            self._queue(PROCESSING_INSTRUCTION, node)
         else:
-            self.pending_events.append(
-                (PROCESSING_INSTRUCTION, 'createProcessingInstruction',
-                 (target, data)))
+            self.pending_events.append((PROCESSING_INSTRUCTION, target, data))
 
     def ignorableWhitespace(self, chars):
-        self._push(IGNORABLE_WHITESPACE, self.document.createTextNode(chars))
+        self._queue(IGNORABLE_WHITESPACE, self.document.createTextNode(chars))
 
     def characters(self, chars):
-        self._push(CHARACTERS, self.document.createTextNode(chars))
+        self._queue(CHARACTERS, self.document.createTextNode(chars))
 
-    # the document
+    # -- the document
 
     def startDocument(self):
         if self.documentFactory is None:
@@ -167,23 +157,29 @@ class PullDOM(xml.sax.ContentHandler):
             self.documentFactory = xml.dom.minidom.Document.implementation
 
     def buildDocument(self, uri, tagname):
-        """Create the Document (with *tagname* as its root element) and
-        return the root element."""
+        """Create the document (with its root element, which is returned)
+        when the root element starts."""
         doc = self.documentFactory.createDocument(uri, tagname, None)
         self.document = doc
-        self._push(START_DOCUMENT, doc)
-        self.elementStack.append(doc)
-        for event, factory, args in self.pending_events:
-            self._push(event, getattr(doc, factory)(*args))
+        self._queue(START_DOCUMENT, doc)
+        self.push(doc)
+        for pending in self.pending_events:
+            if pending[0] == PROCESSING_INSTRUCTION:
+                node = doc.createProcessingInstruction(pending[1], pending[2])
+            elif pending[0] == COMMENT:
+                node = doc.createComment(pending[1])
+            else:
+                raise AssertionError("Unknown pending event ", pending[0])
+            self._queue(pending[0], node)
         self.pending_events = None
-        return doc.documentElement
+        return doc.firstChild
 
     def endDocument(self):
-        self._push(END_DOCUMENT, self.document)
+        self._queue(END_DOCUMENT, self.document)
         self.pop()
 
     def clear(self):
-        """Drop all references so the DOM can be collected."""
+        """Drop the document."""
         self.document = None
 
 
@@ -199,72 +195,73 @@ class ErrorHandler:
 
 
 class DOMEventStream:
-    """Iterator over the (event, node) pairs of a document read from
-    *stream* through the SAX *parser*, *bufsize* bytes at a time."""
+    """Iterator over the (event, node) pairs of a document, parsed a
+    buffer at a time as the events are consumed."""
 
     def __init__(self, stream, parser, bufsize):
         self.stream = stream
         self.parser = parser
         self.bufsize = bufsize
         if not hasattr(self.parser, 'feed'):
-            # a parser that can only parse whole documents
+            # not incremental: parse everything at the first request
             self.getEvent = self._slurp
         self.reset()
 
     def reset(self):
         self.pulldom = PullDOM()
+        # PullDOM needs the namespace events
         self.parser.setFeature(xml.sax.handler.feature_namespaces, 1)
         self.parser.setContentHandler(self.pulldom)
 
     def __next__(self):
-        rc = self.getEvent()
-        if rc:
-            return rc
+        event = self.getEvent()
+        if event:
+            return event
         raise StopIteration
 
     def __iter__(self):
         return self
 
     def expandNode(self, node):
-        """Consume events up to the end of *node*, building its subtree."""
-        parents = [node]
+        """Attach to node everything up to its END_ELEMENT event."""
+        open_nodes = [node]
         event = self.getEvent()
         while event:
-            token, cur_node = event
-            if cur_node is node:
+            kind, current = event
+            if current is node:
                 return
-            if token != END_ELEMENT:
-                parents[-1].appendChild(cur_node)
-            if token == START_ELEMENT:
-                parents.append(cur_node)
-            elif token == END_ELEMENT:
-                del parents[-1]
+            if kind == START_ELEMENT:
+                open_nodes[-1].appendChild(current)
+                open_nodes.append(current)
+            elif kind == END_ELEMENT:
+                del open_nodes[-1]
+            else:
+                open_nodes[-1].appendChild(current)
             event = self.getEvent()
 
     def getEvent(self):
-        events = self.pulldom.events
-        while not events:
-            buf = self.stream.read(self.bufsize)
-            if not buf:
+        """The next (event, node) pair, or None at the end of the input."""
+        handler = self.pulldom
+        while not handler._events:
+            data = self.stream.read(self.bufsize)
+            if not data:
+                # the events closing the parse are not reported
                 self.parser.close()
                 return None
-            self.parser.feed(buf)
-        return events.popleft()
+            self.parser.feed(data)
+        return handler._take()
 
     def _slurp(self):
-        """Parse everything at once, then hand out the queued events."""
+        # for parsers without the incremental interface
         self.parser.parse(self.stream)
         self.getEvent = self._emit
         return self._emit()
 
     def _emit(self):
-        events = self.pulldom.events
-        if events:
-            return events.popleft()
-        return None
+        return self.pulldom._take()
 
     def clear(self):
-        """Release the parser, the stream and the partial document."""
+        """Release the handler, the parser and the stream."""
         self.pulldom.clear()
         del self.pulldom
         self.parser = None
@@ -272,7 +269,12 @@ class DOMEventStream:
 
 
 class SAX2DOM(PullDOM):
-    """A PullDOM that also links every node into the document tree."""
+    """A PullDOM that also links every node into the document as it is
+    created, so that the document is complete at the end."""
+
+    def _attach_last(self):
+        # the node of the event just queued goes into the open element
+        self.elementStack[-1].appendChild(self._events[-1][1])
 
     def startElementNS(self, name, tagName, attrs):
         PullDOM.startElementNS(self, name, tagName, attrs)
@@ -284,25 +286,22 @@ class SAX2DOM(PullDOM):
 
     def processingInstruction(self, target, data):
         PullDOM.processingInstruction(self, target, data)
-        self.elementStack[-1].appendChild(self._last_node)
-
-    def comment(self, s):
-        PullDOM.comment(self, s)
-        self.elementStack[-1].appendChild(self._last_node)
+        self._attach_last()
 
     def ignorableWhitespace(self, chars):
         PullDOM.ignorableWhitespace(self, chars)
-        self.elementStack[-1].appendChild(self._last_node)
+        self._attach_last()
 
     def characters(self, chars):
         PullDOM.characters(self, chars)
-        self.elementStack[-1].appendChild(self._last_node)
+        self._attach_last()
 
 
 default_bufsize = (2 ** 14) - 20
 
 
 def parse(stream_or_string, parser=None, bufsize=None):
+    """Events of the document in a file (a name or an open file)."""
     if bufsize is None:
         bufsize = default_bufsize
     if isinstance(stream_or_string, str):
@@ -315,12 +314,8 @@ def parse(stream_or_string, parser=None, bufsize=None):
 
 
 def parseString(string, parser=None):
-    import io
-    bufsize = len(string)
-    if isinstance(string, str):
-        buf = io.StringIO(string)
-    else:
-        buf = io.BytesIO(string)
+    """Events of the document in a string."""
+    from io import StringIO
     if not parser:
         parser = xml.sax.make_parser()
-    return DOMEventStream(buf, parser, bufsize)
+    return DOMEventStream(StringIO(string), parser, len(string))
