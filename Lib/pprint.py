@@ -532,8 +532,8 @@ class PrettyPrinter:
         flat = _lookup(_FLAT, cls)
         if flat is not None:
             return flat(self, object, context, maxlevels, level)
-        text = repr(object)
-        return text, bool(text) and not text.startswith('<'), False
+        rep = repr(object)
+        return rep, bool(rep) and not rep.startswith('<'), False
 
     # -- layout -------------------------------------------------------------
     #
@@ -546,7 +546,8 @@ class PrettyPrinter:
 
     def _repr(self, obj, context, level):
         if _stock_hooks(self):
-            return self._safe_repr(obj, context, self._depth, level)[0]
+            # through format(), as debuggers stepping out of a __repr__ expect
+            return self.format(obj, context, self._depth, level)[0]
         return self.format(obj, context.copy(), self._depth, level)[0]
 
     def _emit(self, obj, write, col, tail, context, level, lead=0,
