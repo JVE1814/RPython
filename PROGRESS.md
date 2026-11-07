@@ -1,11 +1,11 @@
 # PROGRESS
 
 ## Status 2026-11-07 (day 7, afternoon)
-Master 24d1c6a: core6, perf4, tail1, capi2, cleanroom1+2 (20 Lib modules rewritten clean-room), scale1 (multi-core scaling), tail2 (re.DEBUG, _zoneinfo, ssl PSK, alloc-failure injection, 22 modules), perf5, stability3 (test_free_threading passes), scale2 checkpoint (concurrent_futures + multiprocessing pass), pdb1 (clean-room pdb: test_pdb, test_remote_pdb pass), tail3 (crossinterp, getpath, nturl2path, ast, multiprocessing, httpservers, asyncio 10→2) merged today; suite run 14 running; suite run 13: 396/434 pass or whole-module skip; suite run 12: 367/434 modules pass, 129 failures, 70 errors. Smoke on snap19: test_capi 40 failures (was 433 in run 11),
+Master 24d1c6a: core6, perf4, tail1, capi2, cleanroom1+2 (20 Lib modules rewritten clean-room), scale1 (multi-core scaling), tail2 (re.DEBUG, _zoneinfo, ssl PSK, alloc-failure injection, 22 modules), perf5, stability3 (test_free_threading passes), scale2 checkpoint (concurrent_futures + multiprocessing pass), pdb1 (clean-room pdb: test_pdb, test_remote_pdb pass), tail3 (crossinterp, getpath, nturl2path, ast, multiprocessing, httpservers, asyncio 10→2), cleanroom3, scale2 merged today; suite run 14 running; suite run 13: 396/434 pass or whole-module skip; suite run 12: 367/434 modules pass, 129 failures, 70 errors. Smoke on snap19: test_capi 40 failures (was 433 in run 11),
 stable_abi_ctypes/fileutils pass, cmd_line_script 1; tail1 fixed ~60 long-tail modules (inspect, codecs, time,
 path modules, math, buffer, logging, json, ...). Run 11 (pre-merges):
 294/434 modules pass, 674 failures (241 without test_capi), 616 errors. Baseline free-threaded CPython: 416/434.
-Running agents: scale2 (scaling round 2), perf6 (startup image, slow call paths, xml engine, memory), cleanroom3 (D19 Lib audit, round 3),
+Running agents: refs1 (borrowed stack references), perf6 (startup image, slow call paths, xml engine, memory), cleanroom4 (D19 Lib audit, round 4),
 capi3 (remaining test_capi, test_sys sizes, per-interpreter interning), remote1 (_remote_debugging, sys.remote_exec,
 profiling.sampling, pyrepl).
 Earlier history (2026-11-02): agents stopped when the weekly API limit was hit; resumed Nov 5.
@@ -176,7 +176,37 @@ Startup `-c pass`: 56.6M instructions (CPython 40.5M); `-S -c pass` 29.2M (27.7M
 34.9 MB (CPython default 32.3, free-threaded 38.6). Instructions per call shape and per loop: notes/perf4.md.
 Multi-core scaling: being measured by scale1.
 
-### Multi-core scaling (scale1, 2026-11-07; tools/bench/scaling, loaded machine — CPU inflation at 4 threads, ideal 1.00)
+### Multi-core scaling (scale2, 2026-11-07; cpu-infl@4 = CPU per unit at 4 threads / at 1 thread, ideal 1.00; load 7–9)
+| workload | ours | py-ft |
+|---|---|---|
+| cpu_nbody | 1.01 | 1.01 |
+| cpu_oo | 1.07 | 1.09 |
+| cpu_float | 1.27 | 1.03 |
+| cpu_gen | 1.06 | 1.05 |
+| cpu_comp | 1.29 | 1.06 |
+| cpu_regex | 1.11 | 1.19 |
+| cpu_json | 0.98 | 1.08 |
+| shr_dict | 2.02 | 1.37 |
+| shr_list | 0.94 | 1.44 |
+| shr_globals | 1.07 | 1.02 |
+| shr_attrs | 2.05 | 1.00 |
+| alloc_small | 1.06 | 1.05 |
+| alloc_cycles | 1.72 | 0.82 |
+| alloc_dicts | 1.05 | 1.00 |
+| mut_queue | 1.09 | 2.22 |
+| mut_dict | 3.10 | 1.98 |
+| mut_lock | 1.58 | 1.34 |
+| mut_list | 2.54 | 1.55 |
+| jit_loop | 1.04 | 1.03 |
+| jit_calls | 1.10 | 1.02 |
+| misc_classes | 1.62 | 1.49 |
+| misc_import | 1.33 | 1.30 |
+| misc_cext | 1.07 | 1.03 |
+Old/new interleaved under equal load: jit_calls 2.19→1.00, cpu_oo 2.97→1.05, mut_list 6.08→1.88, shr_dict 5.84→1.94.
+Remaining causes: refcount writes from every thread on LOAD_FAST of shared objects (refs1: borrowed stack refs),
+serial stop-the-world GC (alloc_cycles, misc_classes, cpu_float), cpu_comp not investigated. notes/scale2.md.
+
+### Previous multi-core scaling (scale1, 2026-11-07; tools/bench/scaling, loaded machine — CPU inflation at 4 threads, ideal 1.00)
 | workload | before scale1 | ours | py-ft |
 |---|---|---|---|
 | cpu_nbody | 1.48 | 1.08 | 1.07 |
