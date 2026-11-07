@@ -74,7 +74,7 @@ pub fn so(o: &PyObject) -> &mut PySetObject {
     unsafe { &mut *(o.as_ptr() as *mut PySetObject) }
 }
 
-static DUMMY_CELL: u64 = 0;
+pub(crate) static DUMMY_CELL: u64 = 0; // (remote1) address published in the debug table
 #[inline(always)]
 fn dummy() -> *mut PyObject {
     &DUMMY_CELL as *const u64 as *mut PyObject

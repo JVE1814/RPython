@@ -99,6 +99,7 @@ pub mod _csv;
 pub mod _multiprocessing;
 pub mod testinternalcapi;
 pub mod compiler_hooks;
+pub mod remote_debug;
 
 /// Register all builtin (Rust-implemented) modules with the import system.
 pub fn register_all() {
@@ -120,6 +121,7 @@ pub fn register_all() {
     crate::import::register_builtin("_typing", crate::types::typevar::make_typing_module);
     crate::import::register_builtin("_socket", _socket::init);
     crate::import::register_builtin("_asyncio", _asyncio::init_module);
+    crate::import::register_builtin("_remote_debugging", remote_debug::reader::init_module);
     crate::import::register_builtin("_posixsubprocess", _posixsubprocess::init);
     devtools::register();
     crate::import::register_builtin("_json", _json::init_module);

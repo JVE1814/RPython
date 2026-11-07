@@ -125,6 +125,8 @@ pub fn initialize(cfg: &Config) -> PyResult<()> {
             errors::clear_exc();
         }
     }
+    // (remote1) publish the debug table (its run-time fields) once config is known
+    modules::remote_debug::init_table();
     let r = modules::sys_full::import_site();
     // (perf4) automatic collections start with the program (see gc::startup_complete)
     gc::startup_complete();

@@ -1955,6 +1955,9 @@ pub fn handle_eval_breaker(ts: &ThreadState) -> PyResult<()> {
     if eb & crate::threads::EVAL_PENDING != 0 {
         crate::capi::pystate::run_pending_calls()?;
     }
+    if eb & crate::modules::remote_debug::EVAL_REMOTE_EXEC != 0 {
+        crate::modules::remote_debug::target::run_pending(ts)?;
+    }
     Ok(())
 }
 

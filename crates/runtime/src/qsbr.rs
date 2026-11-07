@@ -52,11 +52,11 @@ pub fn multi_threaded() -> bool {
 
 // ---------------------------------------------------------------- thread-state mirror
 
-const CAP: usize = 2048;
-static LIST: [AtomicUsize; CAP] = [const { AtomicUsize::new(0) }; CAP];
-static LIST_LEN: AtomicUsize = AtomicUsize::new(0);
+pub(crate) const CAP: usize = 2048;
+pub(crate) static LIST: [AtomicUsize; CAP] = [const { AtomicUsize::new(0) }; CAP];
+pub(crate) static LIST_LEN: AtomicUsize = AtomicUsize::new(0);
 /// Sequence lock over LIST/LIST_LEN: odd while being rewritten.
-static LIST_VER: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LIST_VER: AtomicU64 = AtomicU64::new(0);
 /// More thread states than CAP: scans fall back to the locked `ALL_THREADS` list.
 static OVERFLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
