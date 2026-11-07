@@ -1,212 +1,205 @@
-"""Utility code for constructing importers and working with modules."""
+"""Helpers for working with the import system: resolving relative names,
+finding specs, cache file names, and loading modules lazily."""
+
 from ._abc import Loader
 from ._bootstrap import module_from_spec
 from ._bootstrap import _resolve_name
 from ._bootstrap import spec_from_loader
 from ._bootstrap import _find_spec
 from ._bootstrap_external import MAGIC_NUMBER
+from ._bootstrap_external import _RAW_MAGIC_NUMBER
 from ._bootstrap_external import cache_from_source
 from ._bootstrap_external import decode_source
 from ._bootstrap_external import source_from_cache
 from ._bootstrap_external import spec_from_file_location
 
 import _imp
+import _thread
 import sys
 import types
 
+__all__ = [
+    'LazyLoader', 'Loader', 'MAGIC_NUMBER', 'cache_from_source',
+    'decode_source', 'find_spec', 'module_from_spec', 'resolve_name',
+    'source_from_cache', 'source_hash', 'spec_from_file_location',
+    'spec_from_loader',
+]
+
 
 def source_hash(source_bytes):
-    "Return the hash of *source_bytes* as used in hash-based pyc files."
-    return _imp.source_hash(_imp.pyc_magic_number_token, source_bytes)
+    """The hash of *source_bytes* that hash-based .pyc files record."""
+    return _imp.source_hash(_RAW_MAGIC_NUMBER, source_bytes)
 
 
 def resolve_name(name, package):
-    """Resolve a relative module name to an absolute one."""
+    """The absolute module name for *name*, which may be relative (leading
+    dots) to the package named *package*."""
     if not name.startswith('.'):
         return name
-    elif not package:
-        raise ImportError(f'no package specified for {repr(name)} '
-                          '(required for relative module names)')
-    level = 0
-    for character in name:
-        if character != '.':
-            break
-        level += 1
-    return _resolve_name(name[level:], package, level)
+    if not package:
+        raise ImportError(f'cannot resolve the relative name {name!r} '
+                          f'without a package')
+    stripped = name.lstrip('.')
+    return _resolve_name(stripped, package, len(name) - len(stripped))
+
+
+def _spec_of_loaded(module, name):
+    # the spec recorded on a module that is already in sys.modules
+    if module is None:
+        return None
+    try:
+        spec = module.__spec__
+    except AttributeError:
+        raise ValueError(f'{name}.__spec__ is not set') from None
+    if spec is None:
+        raise ValueError(f'{name}.__spec__ is None')
+    return spec
 
 
 def _find_spec_from_path(name, path=None):
-    """Return the spec for the specified module.
-
-    The module itself is looked at first (sys.modules); otherwise the
-    finders are searched along *path* (sys.path when None).
-    """
-    if name not in sys.modules:
-        return _find_spec(name, path)
-    else:
-        module = sys.modules[name]
-        if module is None:
-            return None
-        try:
-            spec = module.__spec__
-        except AttributeError:
-            raise ValueError(f'{name}.__spec__ is not set') from None
-        else:
-            if spec is None:
-                raise ValueError(f'{name}.__spec__ is None')
-            return spec
+    """The spec of the module *name*, searched for on *path* (sys.path when
+    None) unless the module is imported already. Parents are not imported:
+    *name* must be a top-level name or *path* the parent's __path__."""
+    if name in sys.modules:
+        return _spec_of_loaded(sys.modules[name], name)
+    return _find_spec(name, path)
 
 
 def find_spec(name, package=None):
-    """Return the spec for the specified module.
+    """The spec of the module *name* (relative names are resolved against
+    *package*), or None if no finder knows it.
 
-    If the module is in sys.modules its __spec__ is returned; otherwise the
-    finders are searched (importing parent packages as needed).  A relative
-    *name* is resolved against *package*.
+    A module that is imported already answers with its __spec__. Otherwise
+    the parent package is imported so that its __path__ can be searched.
     """
     fullname = resolve_name(name, package) if name.startswith('.') else name
-    if fullname not in sys.modules:
-        parent_name = fullname.rpartition('.')[0]
-        if parent_name:
-            parent = __import__(parent_name, fromlist=['__path__'])
-            try:
-                parent_path = parent.__path__
-            except AttributeError as e:
-                raise ModuleNotFoundError(
-                    f"__path__ attribute not found on {parent_name!r} "
-                    f"while trying to find {fullname!r}", name=fullname) from e
-        else:
-            parent_path = None
-        return _find_spec(fullname, parent_path)
-    else:
-        module = sys.modules[fullname]
-        if module is None:
-            return None
+    if fullname in sys.modules:
+        return _spec_of_loaded(sys.modules[fullname], name)
+    parent_name = fullname.rpartition('.')[0]
+    search_path = None
+    if parent_name:
+        parent = __import__(parent_name, fromlist=['__path__'])
         try:
-            spec = module.__spec__
-        except AttributeError:
-            raise ValueError(f'{name}.__spec__ is not set') from None
-        else:
-            if spec is None:
-                raise ValueError(f'{name}.__spec__ is None')
-            return spec
+            search_path = parent.__path__
+        except AttributeError as exc:
+            raise ModuleNotFoundError(
+                f'__path__ attribute not found on {parent_name!r} '
+                f'while trying to find {fullname!r}', name=fullname) from exc
+    return _find_spec(fullname, search_path)
 
 
 class _incompatible_extension_module_restrictions:
-    """Context manager to disable (or enable) the check that extension
-    modules support multiple interpreters / free-threading.
-
-    Usage: ``with _incompatible_extension_module_restrictions(disable_check=True): ...``
-    """
+    """Context manager that turns the check for extension modules that do not
+    support multiple interpreters off (disable_check=True) or on, restoring
+    the previous setting on exit."""
 
     def __init__(self, *, disable_check):
         self.disable_check = bool(disable_check)
 
-    def __enter__(self):
-        self.old = _imp._override_multi_interp_extensions_check(self.override)
-        return self
-
-    def __exit__(self, *args):
-        old = self.old
-        del self.old
-        _imp._override_multi_interp_extensions_check(old)
-
     @property
     def override(self):
+        # -1: check disabled, 1: check enforced (0 would mean "default")
         return -1 if self.disable_check else 1
+
+    def __enter__(self):
+        self._previous = _imp._override_multi_interp_extensions_check(self.override)
+        return self
+
+    def __exit__(self, *exc_info):
+        previous, self._previous = self._previous, None
+        _imp._override_multi_interp_extensions_check(previous)
+
+
+# ---------------------------------------------------------------- lazy loading
+#
+# LazyLoader.exec_module() does not execute the module: it records what the
+# module looks like (its namespace and class) in spec.loader_state and turns
+# the module into a _LazyModule. The first attribute read or deletion runs the
+# real loader; afterwards the attributes the caller set in the meantime are
+# put back on top of what the module's code produced, and the module gets its
+# own class back (unless its code chose another class itself).
+
+def _complete_lazy_load(module, spec, state):
+    namespace = object.__getattribute__(module, '__dict__')
+    recorded = state['namespace']
+    # what was assigned while the module was still lazy wins over its code
+    assigned = {key: value for key, value in namespace.items()
+                if key not in recorded or recorded[key] is not value}
+    name = spec.name
+    spec.loader.exec_module(module)
+    if name in sys.modules and sys.modules[name] is not module:
+        raise ValueError(f'module object for {name!r} substituted in '
+                         f'sys.modules during a lazy load')
+    namespace.update(assigned)
+    if type(module) is _LazyModule:
+        object.__setattr__(module, '__class__', state['class'])
+
+
+def _ensure_loaded(module):
+    spec = object.__getattribute__(module, '__spec__')
+    state = spec.loader_state
+    with state['lock']:
+        # another thread may have finished the load while this one waited,
+        # and code run by the load may read attributes of the module again
+        if type(module) is not _LazyModule or state['loading']:
+            return False
+        state['loading'] = True
+        try:
+            _complete_lazy_load(module, spec, state)
+        finally:
+            state['loading'] = False
+    return True
 
 
 class _LazyModule(types.ModuleType):
 
-    """A module whose loading is deferred until an attribute is accessed."""
+    """A module whose code runs when one of its attributes is first used."""
 
     def __getattribute__(self, attr):
-        """Load the module on first attribute access, then return the
-        attribute."""
-        __spec__ = object.__getattribute__(self, '__spec__')
-        loader_state = __spec__.loader_state
-        with loader_state['lock']:
-            # Only the first thread to arrive loads; others wait on the lock.
-            if object.__getattribute__(self, '__class__') is _LazyModule:
-                __class__ = loader_state['__class__']
-
-                # Reentrant access from the loading thread itself.
-                if loader_state['is_loading']:
-                    return __class__.__getattribute__(self, attr)
-                loader_state['is_loading'] = True
-
-                __dict__ = __class__.__getattribute__(self, '__dict__')
-
-                original_name = __spec__.name
-                attrs_then = loader_state['__dict__']
-                attrs_now = __dict__
-                attrs_updated = {}
-                for key, value in attrs_now.items():
-                    # Remember attributes changed since the module object
-                    # was created, to re-apply them after execution.
-                    if key not in attrs_then:
-                        attrs_updated[key] = value
-                    elif id(attrs_now[key]) != id(attrs_then[key]):
-                        attrs_updated[key] = value
-                __spec__.loader.exec_module(self)
-                # The module may have been replaced in sys.modules.
-                if original_name in sys.modules:
-                    if id(self) != id(sys.modules[original_name]):
-                        raise ValueError(f"module object for {original_name!r} "
-                                          "substituted in sys.modules during a lazy "
-                                          "load")
-                __dict__.update(attrs_updated)
-                # Finally stop being lazy.
-                self.__class__ = __class__
-
+        if not _ensure_loaded(self) and type(self) is _LazyModule:
+            # still lazy: the load is running on this thread
+            return object.__getattribute__(self, attr)
         return getattr(self, attr)
 
     def __delattr__(self, attr):
-        """Trigger the load and then perform the deletion."""
-        self.__getattribute__(attr)
+        _ensure_loaded(self)
         delattr(self, attr)
 
 
 class LazyLoader(Loader):
 
-    """A loader that creates a module which defers loading until first
-    attribute access."""
+    """Wraps a loader so that a module's code runs on first attribute
+    access instead of at import time."""
 
     @staticmethod
-    def __check_eager_loader(loader):
+    def _require_exec_module(loader):
         if not hasattr(loader, 'exec_module'):
             raise TypeError('loader must define exec_module()')
 
     @classmethod
     def factory(cls, loader):
-        """Construct a callable which returns the eager loader made lazy."""
-        cls.__check_eager_loader(loader)
-        return lambda *args, **kwargs: cls(loader(*args, **kwargs))
+        """A callable that builds the wrapped loader from its arguments and
+        returns it wrapped in a LazyLoader."""
+        cls._require_exec_module(loader)
+        def make(*args, **kwargs):
+            return cls(loader(*args, **kwargs))
+        return make
 
     def __init__(self, loader):
-        self.__check_eager_loader(loader)
+        self._require_exec_module(loader)
         self.loader = loader
 
     def create_module(self, spec):
         return self.loader.create_module(spec)
 
     def exec_module(self, module):
-        """Make the module load lazily."""
-        # Threading is only needed for lazy loading, and importlib.util can
-        # be pulled in at interpreter startup.
-        import threading
+        """Make *module* lazy: its code runs when it is first used."""
         module.__spec__.loader = self.loader
         module.__loader__ = self.loader
-        loader_state = {}
-        loader_state['__dict__'] = module.__dict__.copy()
-        loader_state['__class__'] = module.__class__
-        loader_state['lock'] = threading.RLock()
-        loader_state['is_loading'] = False
-        module.__spec__.loader_state = loader_state
+        module.__spec__.loader_state = {
+            'namespace': module.__dict__.copy(),
+            'class': type(module),
+            'lock': _thread.RLock(),
+            'loading': False,
+        }
         module.__class__ = _LazyModule
-
-
-__all__ = ['LazyLoader', 'Loader', 'MAGIC_NUMBER',
-           'cache_from_source', 'decode_source', 'find_spec',
-           'module_from_spec', 'resolve_name', 'source_from_cache',
-           'source_hash', 'spec_from_file_location', 'spec_from_loader']
