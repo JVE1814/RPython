@@ -1142,3 +1142,30 @@ pub fn table_sizeof(d: &PyObject) -> usize {
     let t = table(d);
     t.data_bytes + std::mem::size_of::<DictTable>()
 }
+
+/// (core6) `dict.__sizeof__` beyond the object itself, in the terms of CPython's keys
+/// object for a table of this size (sys.getsizeof is compared with those layouts): none
+/// for a dict that never held a key, else the keys header (`n2BI2n`, 32 bytes), one index
+/// per slot (1/2/4/8 bytes wide by table size) and the usable entries (16 bytes when every
+/// key is an exact str, 24 otherwise).
+pub fn model_table_sizeof(d: &PyObject) -> usize {
+    let _g = ob_lock(d);
+    let t = table(d);
+    if t.used == 0 && t.nentries == 0 {
+        return 0;
+    }
+    // the size CPython would have grown to for these entries (our growth policy differs)
+    let size = t.size.min(size_for(t.nentries.max(1)));
+    let width = if size <= 1 << 7 {
+        1
+    } else if size <= 1 << 15 {
+        2
+    } else if size <= 1 << 31 {
+        4
+    } else {
+        8
+    };
+    let entries = unsafe { std::slice::from_raw_parts(t.entries_p, t.nentries) };
+    let unicode = entries.iter().all(|e| e.key.is_null() || unsafe { crate::types::str::is_str_exact(&*e.key) });
+    32 + size * width + usable_for(size) * if unicode { 16 } else { 24 }
+}

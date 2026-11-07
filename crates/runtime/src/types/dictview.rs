@@ -454,7 +454,7 @@ fn iter_length_hint(o: &PyObject) -> PyResult {
     Ok(int::new_int(n as i64))
 }
 fn iter_reduce(o: &PyObject) -> PyResult {
-    let iter_fn = crate::builtins::builtin("iter")?;
+    let iter_fn = crate::builtins::eval_builtin("iter")?;
     let it = unsafe { &*(o.as_ptr() as *mut DictIter) };
     // Drain a copy of the iterator.
     let items = if it.dict.is_null() {

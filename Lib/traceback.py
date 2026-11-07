@@ -1578,6 +1578,9 @@ def _cross_language_hint(obj, wrong_name):
 def _nested_attribute(obj, wrong_name):
     """'name.wrong_name' if one of the first public attributes of *obj*
     has the wanted attribute (found without running any code of it)."""
+    if isinstance(obj, type(sys)):
+        # reading a module's attributes could resolve lazy imports
+        return None
     try:
         names = sorted(x for x in dir(obj) if isinstance(x, str))
     except Exception:

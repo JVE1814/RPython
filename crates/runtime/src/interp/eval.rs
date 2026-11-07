@@ -717,6 +717,9 @@ pub fn eval_frame(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyRe
     f.prev = prev;
     ts.frame.set(f as *mut Frame);
     f.state = FrameState::Executing;
+    if crate::modules::testinternalcapi::eval_hook_active() {
+        crate::modules::testinternalcapi::record_frame(f.code());
+    }
     // jit workstream: compiled code runs the activation directly when it can
     let r = match super::jit::resume(ts, f, throw) {
         Ok(r) => r,
@@ -738,17 +741,19 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
     let caches = cd.caches.tables(code); // jit workstream: inline caches / profiles
     // bc-vm: specialisation view of public code (interp/adaptive.rs); `adapt_once` for
     // classifications too costly to repeat
+    // (core6: this thread's view, see adaptive::view)
+    let spec = super::adaptive::view(cd);
     macro_rules! adapt {
         ($e:expr) => {
-            if super::adaptive::active(cd) {
-                super::adaptive::note(cd, f.lasti as usize, $e);
+            if !spec.is_empty() {
+                super::adaptive::note_in(spec, f.lasti as usize, $e);
             }
         };
     }
     macro_rules! adapt_once {
         ($e:expr) => {
-            if super::adaptive::active(cd) && !super::adaptive::seen(cd, f.lasti as usize) {
-                super::adaptive::note(cd, f.lasti as usize, $e);
+            if !spec.is_empty() && !super::adaptive::seen_in(spec, f.lasti as usize) {
+                super::adaptive::note_in(spec, f.lasti as usize, $e);
             }
         };
     }
@@ -1023,6 +1028,9 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             if let Some(info) = call_info {
                                 crate::modules::sys_trace::after_call(ts, f, info, sup.is_ok())?;
                             }
+                            if crate::modules::sys::tracing_active() {
+                                crate::modules::sys_trace::fire_deferred_line(ts, f, sup.is_ok())?;
+                            }
                             let sup = sup?;
                             if is_method {
                                 let v = ab::getattr(&sup, nm)?;
@@ -1179,6 +1187,11 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                                 .map(|i| unsafe { PyRef::from_raw(std::mem::replace(&mut f.slots[base + i], std::ptr::null_mut())) })
                                 .collect();
                             f.stack_top = base;
+                            // (a failure-injecting allocator hook refuses the list too)
+                            if crate::capi::mem::hooked_alloc_refuses(std::mem::size_of::<PyListObject>()) {
+                                drop(items);
+                                return Err(crate::errors::memory_error());
+                            }
                             push!(f, list::new_list(items).into_raw());
                         }
                         Op::BuildSet => {
@@ -1419,6 +1432,9 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                                     unsafe { decref(pop!(f)) };
                                     push!(f, r.into_raw());
                                     pc = arg as usize;
+                                    if crate::modules::sys::tracing_active() {
+                                        crate::modules::sys_trace::async_for_item(ts, f, pc)?;
+                                    }
                                 }
                             }
                         }
@@ -1439,7 +1455,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             return Ok(Some(Exit::Return(v)));
                         }
                         Op::Call | Op::CallKw => {
-                            if super::adaptive::active(cd) {
+                            if !spec.is_empty() {
                                 let nk = if op == Op::CallKw { 1 } else { 0 };
                                 let n = arg as usize;
                                 let base = f.stack_top - n - 2 - nk;
@@ -1550,8 +1566,13 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                                 Some(k) => Some(k.clone()),
                                 None => None,
                             };
+                            // a callable without vectorcall gets the argument tuple itself (no copy) and the
+                            // keyword dict as is (its keys are the callee's business, as in CPython)
+                            let direct = self_or_null.is_none() && callable.ty().tp_call.is_some() && ab::vectorcall_func(&callable).is_none();
                             if let Some(d) = &kwd {
-                                check_kwargs_keys(d)?;
+                                if !direct || is_type(&callable) {
+                                    check_kwargs_keys(d)?;
+                                }
                             }
                             let call_info = if crate::modules::sys::tracing_active() {
                                 let first = self_or_null.as_deref().or_else(|| tuple::tuple_items(&args).first().copied());
@@ -1851,6 +1872,7 @@ pub fn match_class(subject: &PyObject, cls: &PyObject, nargs: usize, names: &PyO
             crate::types::bytearray::bytearray_type(),
             crate::types::bytes::bytes_type(),
             dict::dict_type(),
+            crate::types::frozendict::frozendict_type(),
             float::float_type(),
             crate::types::set::frozenset_type(),
             int::int_type(),
@@ -2114,6 +2136,9 @@ pub(crate) fn exec_misc(ts: &ThreadState, f: &mut Frame, cd: &crate::types::code
             drop(aiter);
             if is_subtype(e.type_ptr(), exc::StopAsyncIteration()) {
                 // done
+                if crate::modules::sys::tracing_active() {
+                    crate::modules::sys_trace::async_for_exit(ts, f, f.lasti as usize + 1)?;
+                }
             } else {
                 set_exc(e);
                 return Err(PyErr);

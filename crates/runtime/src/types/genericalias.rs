@@ -471,7 +471,7 @@ unsafe extern "C" fn gaiter_next(it: *mut PyObject) -> *mut PyObject {
 }
 
 fn gaiter_reduce(it: &PyObject) -> PyResult {
-    let iter = crate::builtins::builtin("iter")?;
+    let iter = crate::builtins::eval_builtin("iter")?;
     match lu::field_ref(it, 0) {
         Some(o) => Ok(tuple::new_tuple(vec![iter, tuple::new_tuple(vec![o])])),
         None => Ok(tuple::new_tuple(vec![iter, tuple::new_tuple(vec![tuple::empty_tuple()])])),

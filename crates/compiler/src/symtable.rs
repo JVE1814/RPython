@@ -1437,7 +1437,10 @@ impl<'a> Analyzer<'a> {
             }
             return Ok(());
         }
-        if let Some(ce) = class_entry {
+        // (the implicit class cells are always reached through the closure, even when the
+        // class body also binds the name, e.g. `__classdict__: int`)
+        let implicit_cell = matches!(name, "__classdict__" | "__class__" | "__conditional_annotations__");
+        if let Some(ce) = class_entry.filter(|_| !implicit_cell) {
             let cf = self.scopes[ce].flags(name);
             if cf & DEF_GLOBAL != 0 {
                 scopes.insert(name.to_string(), SymScope::GlobalExplicit);

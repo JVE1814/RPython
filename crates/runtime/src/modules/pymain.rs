@@ -466,7 +466,8 @@ fn repl(quiet: bool) -> i32 {
         return code;
     }
     let tty = unsafe { libc::isatty(0) } != 0;
-    if !quiet && tty {
+    // (the plain REPL runs for a terminal or with -i: CPython prints the banner in both cases)
+    if !quiet {
         let v = crate::modules::sys::get_sys_attr("version").map(|v| pystr::to_string_lossy(&v)).unwrap_or_default();
         crate::modules::sys::write_stderr(&format!(
             "Python {} on linux\nType \"help\", \"copyright\", \"credits\" or \"license\" for more information.\n",
@@ -491,6 +492,14 @@ fn repl(quiet: bool) -> i32 {
     let stdin = std::io::stdin();
     let mut buf = String::new();
     loop {
+        // what the last statement printed is visible before the next prompt (pipes are buffered)
+        for name in ["stderr", "stdout"] {
+            if let Some(s) = crate::modules::sys::get_sys_attr(name).filter(|s| !s.is(none::none())) {
+                if ab::call_method_str(&s, "flush", &[]).is_err() {
+                    clear_exc();
+                }
+            }
+        }
         let prompt = if buf.is_empty() { get_prompt("ps1", ">>> ") } else { get_prompt("ps2", "... ") };
         let mut line = String::new();
         let n = match if use_readline { readline_line(&prompt) } else { None } {
@@ -528,10 +537,14 @@ fn repl(quiet: bool) -> i32 {
         }
         match n {
             Ok(0) | Err(_) => {
-                if tty {
-                    crate::modules::sys::write_stderr("\n");
+                if buf.is_empty() {
+                    if tty {
+                        crate::modules::sys::write_stderr("\n");
+                    }
+                    break;
                 }
-                break;
+                // end of input finishes a pending statement as a blank line would
+                line.clear();
             }
             Ok(_) => {}
         }
@@ -547,7 +560,7 @@ fn repl(quiet: bool) -> i32 {
             Ok(code) => {
                 // multi-line compound statements continue until a blank line
                 let first = src.lines().next().unwrap_or("");
-                if src.lines().count() >= 1 && first.trim_end().ends_with(':') && !blank {
+                if src.lines().count() >= 1 && (first.trim_end().ends_with(':') || starts_compound(first)) && !blank {
                     continue;
                 }
                 buf.clear();
@@ -571,16 +584,60 @@ fn repl(quiet: bool) -> i32 {
                 crate::modules::sys_full::flush_std("stderr");
             }
             Err(_) => {
-                if is_incomplete_error() && !blank {
+                // a compound statement is complete only after a blank line (its error, too)
+                let first = src.lines().next().unwrap_or("");
+                if (is_incomplete_error() || starts_compound(first)) && !blank {
                     clear_exc();
                     continue;
                 }
                 buf.clear();
+                fill_syntax_error_text(&src);
                 crate::print_exception_and_clear();
             }
         }
     }
     0
+}
+
+/// Does this line start a compound statement (which the prompt keeps open until a blank
+/// line, even when its body is on the same line)?
+fn starts_compound(line: &str) -> bool {
+    let t = line.trim_start();
+    if t.starts_with('@') {
+        return true;
+    }
+    let word: String = t.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+    let rest = t[word.len()..].trim_start();
+    match word.as_str() {
+        "def" | "class" | "if" | "for" | "while" | "with" | "try" => !rest.starts_with('=') && !rest.starts_with('.'),
+        "async" => rest.starts_with("def") || rest.starts_with("for") || rest.starts_with("with"),
+        _ => false,
+    }
+}
+
+/// A SyntaxError found after parsing (symtable, code generation) has no source text for
+/// a string; at the prompt the statement just typed is that text.
+fn fill_syntax_error_text(src: &str) {
+    let Some(e) = take_exc() else { return };
+    let _ = (|| -> PyResult<()> {
+        if !ab::isinstance(&e, &crate::types::typeobject::type_ref(crate::types::exceptions::SyntaxError()))? {
+            return Ok(());
+        }
+        if !ab::getattr_str(&e, "text")?.is(crate::types::none::none()) {
+            return Ok(());
+        }
+        let ln = ab::getattr_str(&e, "lineno")?;
+        if !crate::types::int::is_int(&ln) {
+            return Ok(());
+        }
+        let n = ab::as_i64(&ln)?;
+        if let Some(line) = src.split_inclusive('\n').nth((n - 1).max(0) as usize).filter(|_| n >= 1) {
+            ab::setattr(&e, crate::name!("text"), &pystr::new_str(line))?;
+        }
+        Ok(())
+    })();
+    clear_exc();
+    set_exc(e);
 }
 
 fn outcome_code(o: Outcome) -> i32 {

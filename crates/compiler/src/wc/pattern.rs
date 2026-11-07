@@ -45,8 +45,8 @@ impl<'a> Compiler<'a> {
                 self.compile_jump_if(g, false, t)?;
             }
             if i != n - 1 {
-                self.set_loc(m.pattern.loc);
-                self.emit(O::POP_TOP, 0);
+                // located at the body, so that the branch into the case reports its line
+                self.emit_loc(O::POP_TOP, 0, super::ir::NEXT_POS);
             }
             for st in &m.body {
                 self.compile_stmt(st)?;

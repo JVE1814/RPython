@@ -468,6 +468,15 @@ pub unsafe extern "C" fn generic_alloc(tp: *mut PyTypeObject, nitems: Py_ssize_t
     unsafe {
         let size = (*tp).tp_basicsize as usize + ((nitems + 1) as usize) * (*tp).tp_itemsize as usize;
         let size = (size + 7) & !7;
+        // (core6) instances of Python classes honour a failure-injecting allocator hook
+        // (`_testcapi.set_nomemory`); exceptions are exempt so MemoryError stays raisable
+        if (*tp).tp_flags & Py_TPFLAGS_HEAPTYPE != 0
+            && (*tp).tp_flags & Py_TPFLAGS_BASE_EXC_SUBCLASS == 0
+            && crate::capi::mem::hooked_alloc_refuses(size)
+        {
+            let _ = memory_error();
+            return std::ptr::null_mut();
+        }
         let (extra, cap) = crate::shape::alloc_extra(tp);
         let op = alloc::alloc_object(tp, size + extra);
         if op.is_null() {
@@ -827,6 +836,17 @@ pub fn type_ready(tp: *mut PyTypeObject) -> PyResult<()> {
         for b in tuple::tuple_items(&*mro).iter().skip(1) {
             inherit_slots(tp, as_type(b));
         }
+        // `match` collection kind: a class without its own SEQUENCE/MAPPING flag takes it from the
+        // nearest class in its MRO that has one (so a mixin listed first does not hide it)
+        if (*tp).tp_flags & (Py_TPFLAGS_SEQUENCE | Py_TPFLAGS_MAPPING) == 0 {
+            for b in tuple::tuple_items(&*mro).iter().skip(1) {
+                let f = (*as_type(b)).tp_flags & (Py_TPFLAGS_SEQUENCE | Py_TPFLAGS_MAPPING);
+                if f != 0 {
+                    (*tp).tp_flags |= f;
+                    break;
+                }
+            }
+        }
         if (*tp).tp_flags & Py_TPFLAGS_DISALLOW_INSTANTIATION != 0 {
             (*tp).tp_new = None;
         }
@@ -1024,10 +1044,6 @@ unsafe fn inherit_special(tp: *mut PyTypeObject, base: *mut PyTypeObject) {
             | Py_TPFLAGS_BASE_EXC_SUBCLASS
             | Py_TPFLAGS_TYPE_SUBCLASS;
         t.tp_flags |= b.tp_flags & subs;
-        if t.tp_flags & Py_TPFLAGS_IMMUTABLETYPE == 0 || !is_heap_type(tp) {
-            // SEQUENCE / MAPPING flags are inherited
-        }
-        t.tp_flags |= b.tp_flags & (Py_TPFLAGS_SEQUENCE | Py_TPFLAGS_MAPPING) & if t.tp_flags & (Py_TPFLAGS_SEQUENCE | Py_TPFLAGS_MAPPING) == 0 { !0 } else { 0 };
     }
 }
 
@@ -1154,13 +1170,19 @@ unsafe fn inherit_slots(tp: *mut PyTypeObject, base: *mut PyTypeObject) {
         copyslot!(t, b, tp_repr);
         copyslot!(t, b, tp_call);
         copyslot!(t, b, tp_str);
-        if t.tp_vectorcall_offset == 0 && t.tp_call == b.tp_call && b.tp_flags & Py_TPFLAGS_HAVE_VECTORCALL != 0 {
-            // the offset is inherited with tp_call (PyVectorcall_Call as tp_call reads it); heap
-            // types do not get the flag, so a later `__call__` assignment still takes effect
+        // the offset is always inherited (PyVectorcall_Call reads it even without the flag);
+        // the flag only goes with an inherited tp_call. A heap class defining `__call__` in its
+        // body does not get it (its tp_call is recomputed from the dict after type_ready), and
+        // assigning `__call__` later clears it (slots::update_slot).
+        if t.tp_vectorcall_offset == 0 {
             t.tp_vectorcall_offset = b.tp_vectorcall_offset;
-            if !is_heap_type(tp) {
-                t.tp_flags |= Py_TPFLAGS_HAVE_VECTORCALL;
-            }
+        }
+        if t.tp_call == b.tp_call
+            && b.tp_flags & Py_TPFLAGS_HAVE_VECTORCALL != 0
+            && t.tp_vectorcall_offset == b.tp_vectorcall_offset
+            && !(is_heap_type(tp) && !t.tp_dict.is_null() && dict::get_item_str(&*t.tp_dict, name!("__call__")).is_some())
+        {
+            t.tp_flags |= Py_TPFLAGS_HAVE_VECTORCALL;
         }
         if t.tp_richcompare.is_none() && t.tp_hash.is_none() {
             let d = &*t.tp_dict;
@@ -1173,6 +1195,14 @@ unsafe fn inherit_slots(tp: *mut PyTypeObject, base: *mut PyTypeObject) {
         }
         copyslot!(t, b, tp_iter);
         copyslot!(t, b, tp_iternext);
+        if t.tp_descr_get.is_none()
+            && b.tp_descr_get.is_some()
+            && b.tp_flags & Py_TPFLAGS_METHOD_DESCRIPTOR != 0
+            && t.tp_flags & Py_TPFLAGS_IMMUTABLETYPE != 0
+        {
+            // only immutable types: a mutable class could later get its own __get__
+            t.tp_flags |= Py_TPFLAGS_METHOD_DESCRIPTOR;
+        }
         copyslot!(t, b, tp_descr_get);
         if t.tp_descr_set.is_none() && t.tp_descr_get == b.tp_descr_get {
             t.tp_descr_set = b.tp_descr_set;

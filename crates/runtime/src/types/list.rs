@@ -289,6 +289,27 @@ pub fn reserve(o: &PyObject, n: usize) {
     }
 }
 
+/// (core6) `list.append`: like `append`, but false (item dropped) when the growth the list needs
+/// is refused (by a failure-injecting allocator hook (`_testcapi.set_nomemory`) or the system).
+pub fn try_append(o: &PyObject, item: PyRef) -> bool {
+    let _g = ob_lock(o);
+    unsafe {
+        let l = lp(o);
+        let n = (*l).ob_base.ob_size as usize;
+        if (n as isize) < (*l).allocated {
+            *(*l).ob_item.add(n) = item.into_raw();
+            publish_size(l, n + 1);
+            return true;
+        }
+        if crate::capi::mem::hooked_alloc_refuses((n + 1) * 8) || !reserve_locked(l, n + 1) {
+            return false;
+        }
+        *(*l).ob_item.add(n) = item.into_raw();
+        publish_size(l, n + 1);
+        true
+    }
+}
+
 #[inline]
 pub fn append(o: &PyObject, item: PyRef) {
     let _g = ob_lock(o);
@@ -1128,6 +1149,9 @@ unsafe extern "C" fn list_new(tp: *mut PyTypeObject, _args: *mut PyObject, kw: *
         if tp == list_type() && !kw.is_null() && crate::types::dict::dict_len(&*kw) > 0 {
             return into_c(Err(err!(TypeError, "list() takes no keyword arguments")));
         }
+        if crate::capi::mem::hooked_alloc_refuses((*tp).tp_basicsize as usize) {
+            return into_c(Err(crate::errors::memory_error()));
+        }
         let alloc = (*tp).tp_alloc.unwrap_or(generic_alloc);
         alloc(tp, 0)
     }
@@ -1225,7 +1249,7 @@ fn listreviter_len(o: &PyObject) -> PyResult {
     Ok(int::new_int(n as i64))
 }
 fn builtin_fn(name: &str) -> PyResult {
-    crate::builtins::builtin(name)
+    crate::builtins::eval_builtin(name)
 }
 fn listiter_reduce(o: &PyObject) -> PyResult {
     let iter_fn = builtin_fn("iter")?;

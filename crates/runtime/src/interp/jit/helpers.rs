@@ -1060,8 +1060,13 @@ pub unsafe extern "C" fn h_call_ex(sp: *mut *mut PyObject) -> u64 {
                 Some(k) => Some(k.clone()),
                 None => None,
             };
+            // core6: like the interpreter, a callable without vectorcall gets the tuple and the
+            // keyword dict as they are
+            let direct = self_or_null.is_none() && callable.ty().tp_call.is_some() && ab::vectorcall_func(&callable).is_none();
             if let Some(d) = &kwd {
-                st(eval::check_kwargs_keys(d))?;
+                if !direct || crate::types::typeobject::is_type(&callable) {
+                    st(eval::check_kwargs_keys(d))?;
+                }
             }
             // perf3: tuple passed through to tp_call callables, no heap vector
             let r = st(ab::call_ex_tuple(&callable, self_or_null.as_deref(), &args, kwd.as_deref()))?;
