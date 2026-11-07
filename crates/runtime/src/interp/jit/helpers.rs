@@ -1303,6 +1303,19 @@ pub unsafe extern "C" fn h_get_awaitable(sp: *mut *mut PyObject, arg: u64) -> u6
 /// value stack ends at `sp`. On error the stack is cut back to `err_top` (absolute
 /// slot index: the depth tier-1 code reports to the unwinder), releasing whatever the
 /// instruction left above it.
+/// RaiseVarargs / Reraise at instruction `this` (perf5): always raises; `f.stack_top`
+/// is left at the depth after the operands were popped (the unwinder's depth).
+pub unsafe extern "C" fn h_raise(ts: *const ThreadState, f: *mut Frame, sp: *mut *mut PyObject, oparg: u64, this: u64) -> u64 {
+    unsafe {
+        let f = &mut *f;
+        f.stack_top = sp.offset_from(f.slots.as_ptr()) as usize;
+        let op = bc::Op::from_u8((oparg & 0xff) as u8);
+        let n = crate::types::code::code_data(f.code()).code.len();
+        let _ = eval::raise_op(&*ts, f, op, (oparg >> 8) as u32, this as usize, n);
+        ERR
+    }
+}
+
 pub unsafe extern "C" fn h_misc(ts: *const ThreadState, f: *mut Frame, sp: *mut *mut PyObject, oparg: u64, err_top: u64) -> u64 {
     unsafe {
         let f = &mut *f;

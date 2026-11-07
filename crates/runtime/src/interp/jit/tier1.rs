@@ -930,6 +930,20 @@ impl<'a> Gen<'a> {
                 self.helper_sp(&ins, d, addr!(h::h_load_super_attr), Some(arg as i64), Some(name), d - 3);
             }
             Op::GetAwaitable => self.helper_sp(&ins, d, addr!(h::h_get_awaitable), Some(arg as i64), None, d - 1),
+            // (perf5) raise / re-raise without leaving compiled code: the helper sets the
+            // exception, lasti/unwind_pc and stack_top; the caller unwinds (and continues
+            // at a handler of this frame in compiled code, jit::finish_in_interp)
+            Op::RaiseVarargs | Op::Reraise if super::raise_enabled() => {
+                self.set_lasti(pc);
+                self.a.mov_rr(Rdi, R13);
+                self.a.mov_rr(Rsi, Rbx);
+                self.lea_sp(Rdx, d);
+                self.a.mov_ri(Rcx, ins.op as i64 | (arg as i64) << 8);
+                self.a.mov_ri(R8, pc as i64);
+                self.call(addr!(h::h_raise));
+                self.a.mov_ri(Rax, ST_ERROR as i64);
+                self.a.jmp(self.exit);
+            }
             // instructions shared with the interpreter (eval::exec_misc)
             op if crate::interp::eval::is_misc(op) && super::misc_enabled() => {
                 let pops = match op {

@@ -368,21 +368,46 @@ fn run_call_frame(ts: &ThreadState, mut frame: Box<Frame>, tramp: usize, target:
 
 #[cold]
 #[inline(never)]
-pub(crate) fn finish_in_interp(ts: &ThreadState, mut frame: Box<Frame>, st: u32) -> PyResult {
-    if st == tier1::ST_DEOPT {
-        opt::note_deopt(&crate::types::code::code_data(frame.code()).caches, &frame);
-    } else if st == tier1::ST_ERROR && crate::interp::eval::unwind_compiled_error(ts, &mut frame) {
-        // (perf4) no handler in this frame: propagate without the interpreter
-        crate::interp::frame_finished(frame);
-        return Err(crate::errors::PyErr);
+pub(crate) fn finish_in_interp(ts: &ThreadState, mut frame: Box<Frame>, mut st: u32) -> PyResult {
+    use crate::interp::eval::Unwound;
+    let mut throw = None;
+    loop {
+        if st == tier1::ST_DEOPT {
+            opt::note_deopt(&crate::types::code::code_data(frame.code()).caches, &frame);
+            break;
+        }
+        if st != tier1::ST_ERROR {
+            break;
+        }
+        match crate::interp::eval::unwind_compiled(ts, &mut frame) {
+            Unwound::Propagate => {
+                // (perf4) no handler in this frame: propagate without the interpreter
+                crate::interp::frame_finished(frame);
+                return Err(crate::errors::PyErr);
+            }
+            Unwound::Handler(pc) => {
+                // (perf5) continue at the handler in compiled code when it is an entry
+                let mut out: *mut PyObject = std::ptr::null_mut();
+                match reenter(ts, &mut frame, pc, &mut out) {
+                    Some(tier1::ST_RETURN) => {
+                        crate::interp::frame::recycle_call(frame);
+                        return Ok(unsafe { PyRef::from_raw(out) });
+                    }
+                    Some(s) => st = s,
+                    None => {
+                        frame.next_instr = pc as u32;
+                        break;
+                    }
+                }
+            }
+            Unwound::Interp => {
+                frame.next_instr = frame.lasti + 1;
+                throw = crate::errors::take_exc();
+                break;
+            }
+        }
     }
     // let the interpreter finish this activation (unwinding or deopt)
-    let throw = if st == tier1::ST_ERROR {
-        frame.next_instr = frame.lasti + 1;
-        crate::errors::take_exc()
-    } else {
-        None
-    };
     let r = match crate::interp::eval::eval_frame(ts, &mut frame, throw) {
         Ok(crate::interp::Exit::Return(v)) => Ok(v),
         Ok(crate::interp::Exit::Yield(_)) => Err(crate::errors::system_error("yield from a non-generator frame")),
@@ -390,6 +415,35 @@ pub(crate) fn finish_in_interp(ts: &ThreadState, mut frame: Box<Frame>, st: u32)
     };
     crate::interp::frame_finished(frame);
     r
+}
+
+/// Continue the call frame `frame` (not executing) in compiled code at `pc`: the
+/// status, or None when `pc` is not an entry point.
+fn reenter(ts: &ThreadState, frame: &mut Frame, pc: usize, out: &mut *mut PyObject) -> Option<u32> {
+    use crate::interp::frame::FrameState;
+    let cd: &CodeData = unsafe { &*(crate::types::code::code_data(frame.code()) as *const CodeData) };
+    let c = cd.caches.jit.load(Acquire);
+    if c.is_null() {
+        return None;
+    }
+    let c = unsafe { &*c };
+    let target = match opt_entry(cd, pc) {
+        Some(t) => t,
+        None => match c.entries.get(pc) {
+            Some(&o) if o != u32::MAX => c.addr + o as usize,
+            _ => return None,
+        },
+    };
+    let prev = ts.frame.get();
+    frame.prev = prev;
+    let fp: *mut Frame = frame;
+    ts.frame.set(fp);
+    frame.state = FrameState::Executing;
+    let entry: EntryFn = unsafe { std::mem::transmute(c.addr) };
+    let st = unsafe { entry(fp, frame.slots.as_mut_ptr(), ts, target, out) };
+    ts.frame.set(prev);
+    frame.prev = std::ptr::null_mut();
+    Some(st)
 }
 
 /// Deoptimisation inside a callee inlined by tier 2 (opt/build.rs `try_inline`):
@@ -575,6 +629,12 @@ fn env_flag(cell: &AtomicU32, var: &str) -> bool {
 
 /// Tier 1 compiles the instructions shared with the interpreter through
 /// `eval::exec_misc` (RPYTHON_JIT1_MISC=0: they deoptimise instead).
+/// RaiseVarargs / Reraise compiled in tier 1 (RPYTHON_JIT1_RAISE=0: they deoptimise).
+pub fn raise_enabled() -> bool {
+    static F: AtomicU32 = AtomicU32::new(UNSET);
+    env_flag(&F, "RPYTHON_JIT1_RAISE")
+}
+
 pub fn misc_enabled() -> bool {
     static F: AtomicU32 = AtomicU32::new(UNSET);
     env_flag(&F, "RPYTHON_JIT1_MISC")
