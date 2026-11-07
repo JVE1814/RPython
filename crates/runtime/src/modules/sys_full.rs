@@ -420,8 +420,25 @@ fn sys_getrefcount(_m: &PyObject, o: &PyObject) -> PyResult {
         if n > 1 && parent_call_operand(o) {
             n -= 1;
         }
+    } else if n > 1 && !o.is_immortal() && crate::types::typeobject::is_type(o) && crate::types::typeobject::is_heap_type(o.as_ptr() as *mut crate::ffi::PyTypeObject) && caller_stack_holds(o) {
+        // (capi3) free-threaded CPython counts heap types lazily (deferred reference
+        // counting): the operand loaded from a global or attribute adds no reference.
+        // Ours does; leave that stack copy out.
+        n -= 1;
     }
     Ok(int::new_int(n))
+}
+
+/// (capi3) The calling frame's value stack holds `o` (the argument just pushed).
+fn caller_stack_holds(o: &PyObject) -> bool {
+    let f = crate::interp::current_frame_ptr();
+    if f.is_null() {
+        return false;
+    }
+    let f = unsafe { &*f };
+    let lo = f.nlocalsplus.min(f.slots.len());
+    let hi = f.stack_top.min(f.slots.len());
+    lo < hi && f.slots[lo..hi].iter().any(|&q| q == o.as_ptr())
 }
 
 fn parent_call_operand(o: &PyObject) -> bool {

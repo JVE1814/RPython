@@ -279,11 +279,13 @@ pub fn start(nframe: i64) -> PyResult<()> {
     }
     state().max_nframe = nframe as usize;
     TRACING.store(true, SeqCst);
+    crate::alloc::refresh_slow_paths(); // (capi3)
     Ok(())
 }
 
 pub fn stop() {
     TRACING.store(false, SeqCst);
+    crate::alloc::refresh_slow_paths(); // (capi3)
     guarded(|| state().clear());
 }
 

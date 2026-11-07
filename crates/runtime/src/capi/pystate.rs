@@ -87,6 +87,16 @@ fn new_tstate(interp: *mut c_void) -> *mut ThreadState {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyThreadState_Get() -> *mut c_void {
+    // (capi3) no attached thread state (e.g. inside Py_BEGIN_ALLOW_THREADS): a fatal
+    // error, not a thread state created behind the caller's back
+    if threads::current_ptr().is_null() && !crate::modules::sys_full::is_finalizing() {
+        super::refcount::fatal_with_func(
+            "PyThreadState_Get",
+            "the function must be called with an active thread state, after Python initialization \
+             and before Python finalization, but it was called without an active thread state. \
+             Are you trying to call the C API inside of a Py_BEGIN_ALLOW_THREADS block?",
+        );
+    }
     ts_ptr() as *mut c_void
 }
 #[unsafe(no_mangle)]
@@ -767,11 +777,36 @@ pub unsafe extern "C" fn _PyTrash_thread_destroy_chain(_ts: *mut c_void) {}
 
 // ---------------------------------------------------------------- ref tracer
 
+// (capi3) The tracer is called with CREATE when the object allocator hands out an object
+// and with DESTROY when an object's memory is released (alloc.rs, slow paths: installing
+// a tracer turns the allocator's fast paths off through `alloc::refresh_slow_paths`).
+// A tracer that is replaced receives TRACKER_REMOVED. Objects the JIT boxes inline
+// (ints, floats) are not reported.
 static REF_TRACER: Mutex<(usize, usize)> = Mutex::new((0, 0));
+/// Fast check for the allocator: a tracer is installed.
+pub static REF_TRACING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+type RefTracer = unsafe extern "C" fn(*mut PyObject, c_int, *mut c_void) -> c_int;
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyRefTracer_SetTracer(f: *mut c_void, data: *mut c_void) -> c_int {
-    *REF_TRACER.lock().unwrap() = (f as usize, data as usize);
+    let old = std::mem::replace(&mut *REF_TRACER.lock().unwrap(), (f as usize, data as usize));
+    REF_TRACING.store(!f.is_null(), std::sync::atomic::Ordering::SeqCst);
+    crate::alloc::refresh_slow_paths();
+    if old.0 != 0 && old != (f as usize, data as usize) {
+        let t: RefTracer = unsafe { std::mem::transmute(old.0) };
+        unsafe { t(std::ptr::null_mut(), 2, old.1 as *mut c_void) };
+    }
     0
+}
+
+/// Report `op` to the installed reference tracer (event 0 = created, 1 = destroyed).
+#[cold]
+pub fn ref_trace(op: *mut PyObject, event: c_int) {
+    let (f, d) = *REF_TRACER.lock().unwrap_or_else(|e| e.into_inner());
+    if f != 0 {
+        let t: RefTracer = unsafe { std::mem::transmute(f) };
+        unsafe { t(op, event, d as *mut c_void) };
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyRefTracer_GetTracer(data: *mut *mut c_void) -> *mut c_void {
