@@ -633,6 +633,17 @@ fn plain_eq_depth(a: &PyObject, b: &PyObject, depth: u32) -> Option<bool> {
             return Some(false);
         }
         for (p, q) in x.iter().zip(y.iter()) {
+            // (perf5) identical items and compact ints without the recursive call
+            if p.is(q) {
+                continue;
+            }
+            let tp = p.type_ptr();
+            if tp == q.type_ptr() && tp as *mut crate::ffi::PyTypeObject == int::int_type() && int::is_compact(p) && int::is_compact(q) {
+                if int::compact_value(p) != int::compact_value(q) {
+                    return Some(false);
+                }
+                continue;
+            }
             if !plain_eq_depth(p, q, depth + 1)? {
                 return Some(false);
             }
