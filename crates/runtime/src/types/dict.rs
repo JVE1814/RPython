@@ -1060,6 +1060,25 @@ pub fn set_item(d: &PyObject, key: &PyObject, value: &PyObject) -> PyResult<()> 
     set_item_hash(d, key, h, value)
 }
 
+/// Release a key or value just removed from a table (after the lock was dropped).
+/// `shared`: the table's `shared_read`, read while the lock was held. A table never
+/// marked shared has only been read by its owner (the caller, since non-owners mark it
+/// under the lock before reading), so nobody can hold the pointer without a reference:
+/// release now, as CPython does, so that finalizers and weakref callbacks run at once
+/// (cleanroom6: an instance attribute set to None in a program that has a second thread
+/// used to keep the old value alive until the next QSBR grace period). Otherwise lock-free
+/// readers on other threads may still be loading it (perf-runtime, D6).
+#[inline]
+unsafe fn release_replaced(shared: bool, old: *mut PyObject) {
+    unsafe {
+        if !shared || !crate::qsbr::multi_threaded() {
+            decref(old);
+        } else {
+            crate::qsbr::decref_deferred(old);
+        }
+    }
+}
+
 pub fn set_item_hash(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) -> PyResult<()> {
     let wm = crate::capi::dict::watched_mask(d.as_ptr());
     if wm != 0 {
@@ -1076,9 +1095,11 @@ pub fn set_item_hash(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) -
             unsafe { std::sync::atomic::AtomicPtr::from_ptr(&raw mut t.entries_mut()[ix].value).store(value.as_ptr(), Release) };
             t.version = next_version();
             crate::interp::cache::on_dict_write(d, key.as_ptr()); // jit
+            // read under the lock: a non-owner marks the table before its first
+            // lock-free read, and it does so holding this lock
+            let shared = t.shared_read.load(Relaxed);
             drop(g);
-            // perf-runtime (D6): lock-free readers may still hold `old`
-            unsafe { crate::qsbr::decref_deferred(old) };
+            unsafe { release_replaced(shared, old) };
         }
         Found::Missing => {
             unsafe { incref(key.as_ptr()) };
@@ -1175,10 +1196,11 @@ pub fn pop_item_hash(d: &PyObject, key: &PyObject, h: isize) -> PyResult<Option<
             let t = table(d);
             let (k, v) = t.remove(ix);
             set_used(d, t.used, key.as_ptr());
+            let shared = t.shared_read.load(Relaxed);
             drop(g);
             unsafe {
-                crate::qsbr::decref_deferred(k);
-                if crate::qsbr::multi_threaded() {
+                release_replaced(shared, k);
+                if shared && crate::qsbr::multi_threaded() {
                     // keep the value alive until racing lock-free readers are done
                     incref(v);
                     crate::qsbr::decref_deferred(v);
