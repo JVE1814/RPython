@@ -132,7 +132,8 @@ fn set_slot(f: &mut Frame, i: usize, v: PyRef) {
         return;
     }
     let old = std::mem::replace(&mut f.slots[i], v.into_raw());
-    unsafe { xdecref(old) };
+    // (refs1) borrowed stack copies of the old value may exist: release it with the frame
+    crate::interp::borrow::keep_alive(f, old);
 }
 
 /// (key, value) pairs in CPython's order: fast locals, then extra locals.

@@ -500,7 +500,7 @@ impl<'a> Gen<'a> {
                 let m = self.slot(d);
                 self.a.store(m, Rax);
             }
-            Op::LoadFast | Op::LoadFastCheck => {
+            Op::LoadFast | Op::LoadFastBorrow | Op::LoadFastCheck => {
                 let l = self.local(arg);
                 self.a.load(Rax, l);
                 let unbound = self.a.label();

@@ -1229,7 +1229,7 @@ impl<'a> B<'a> {
                 let s = self.snap(i, SnapKind::Poll);
                 self.emit(Inst::Poll(s));
             }
-            Op::LoadFast | Op::LoadFastCheck => {
+            Op::LoadFast | Op::LoadFastBorrow | Op::LoadFastCheck => {
                 if ins.op == Op::LoadFastCheck {
                     if let LS::Frame(_) = self.st.locals[arg as usize] {
                         let a = self.load_local(arg);
@@ -2834,7 +2834,7 @@ impl<'a> B<'a> {
                     Op::PopJumpIfFalse | Op::PopJumpIfTrue | Op::PopJumpIfNone | Op::PopJumpIfNotNone | Op::Jump => {
                         an.index_of[ins.arg as usize] as usize > k
                     }
-                    Op::Nop | Op::ExtendedArg | Op::LoadFast | Op::LoadFastCheck | Op::StoreFast | Op::LoadConst | Op::PopTop | Op::PushNull | Op::Copy | Op::Swap => true,
+                    Op::Nop | Op::ExtendedArg | Op::LoadFast | Op::LoadFastBorrow | Op::LoadFastCheck | Op::StoreFast | Op::LoadConst | Op::PopTop | Op::PushNull | Op::Copy | Op::Swap => true,
                     Op::LoadGlobal | Op::LoadAttr | Op::StoreAttr | Op::BinaryOp | Op::CompareOp | Op::IsOp | Op::UnaryNegative | Op::UnaryNot | Op::ToBool => true,
                     Op::BinarySubscr | Op::StoreSubscr | Op::UnpackSequence | Op::Call | Op::LoadMethod => true,
                     _ => ins.op == Op::Resume,
@@ -2988,7 +2988,7 @@ impl<'a> B<'a> {
             let ci = an_ref.instrs[j];
             match ci.op {
                 Op::Resume | Op::Nop | Op::ExtendedArg => {}
-                Op::LoadFast | Op::LoadFastCheck => {
+                Op::LoadFast | Op::LoadFastBorrow | Op::LoadFastCheck => {
                     let k = ci.arg as usize;
                     let a = self.inl.as_ref().unwrap().locals[k];
                     let pushed = match a {
@@ -3794,7 +3794,7 @@ fn unbox_candidates(u: &Unit) -> Vec<bool> {
     }
     for ins in &u.an.instrs {
         match ins.op {
-            Op::LoadFast | Op::LoadFastCheck | Op::StoreFast => {}
+            Op::LoadFast | Op::LoadFastBorrow | Op::LoadFastCheck | Op::StoreFast => {}
             Op::DeleteFast | Op::LoadFastAndClear | Op::MakeCell | Op::LoadDeref | Op::StoreDeref | Op::DeleteDeref | Op::LoadFromDictOrDeref => {
                 if (ins.arg as usize) < n {
                     ok[ins.arg as usize] = false;

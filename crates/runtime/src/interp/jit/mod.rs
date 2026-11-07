@@ -194,6 +194,9 @@ fn run(ts: &ThreadState, f: &mut Frame, c: &Compiled, pc: usize) -> Run {
             _ => return Run::NotRun,
         },
     };
+    // (refs1) compiled code is entered at block starts, where the borrow analysis
+    // leaves no borrowed stack entries; normalise anyway (stack usually empty here)
+    crate::interp::borrow::own_stack(f);
     crate::tlab::ensure_registered();
     let entry: EntryFn = unsafe { std::mem::transmute(c.addr) };
     let mut out: *mut PyObject = std::ptr::null_mut();
