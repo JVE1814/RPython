@@ -143,14 +143,14 @@ fn bootstrap_code_with<'a>(src: impl FnOnce() -> PyResult<std::borrow::Cow<'a, [
     Ok(c.code)
 }
 
-fn exec_bootstrap_module(name: &str, file: &str, display: &str) -> PyResult {
+fn exec_bootstrap_module(name: &str, file: &str, display: &str, image: Option<&str>) -> PyResult {
     let read_src = || -> PyResult<std::borrow::Cow<'static, [u8]>> {
         match std::fs::read(file) {
             Ok(s) => Ok(std::borrow::Cow::Owned(s)),
             Err(e) => Err(crate::types::exceptions::os_error_from_errno(e.raw_os_error().unwrap_or(0), Some(&pystr::new_str(file)), None)),
         }
     };
-    if !std::path::Path::new(file).is_file() {
+    if image.is_none() && !std::path::Path::new(file).is_file() {
         read_src()?;
     }
     let m = module::new_module(name)?;
@@ -163,7 +163,10 @@ fn exec_bootstrap_module(name: &str, file: &str, display: &str) -> PyResult {
     }
     dict::set_item_str(&crate::modules::sys::modules_dict(), name, &m)?;
     let r = (|| -> PyResult<()> {
-        let code = bootstrap_code_with(read_src, file, display)?;
+        let code = match image.and_then(|p| crate::startup_image::load(p, display)) {
+            Some(c) => c?,
+            None => bootstrap_code_with(read_src, file, display)?,
+        };
         crate::interp::eval_code(&code, &d, Some(&d))?;
         Ok(())
     })();
@@ -181,17 +184,23 @@ pub fn install_importlib(stdlib: &str) -> PyResult<()> {
         return Ok(());
     }
     let bs_file = format!("{}/importlib/_bootstrap.py", stdlib);
-    if !std::path::Path::new(&bs_file).is_file() {
+    // (perf6) with frozen modules in use, the bootstrap comes from the start-up image (no
+    // file access); otherwise from the files on disk (source tree, frozen_modules=off)
+    let frozen = crate::frozen::use_frozen()
+        && crate::startup_image::has("importlib/_bootstrap.py")
+        && crate::startup_image::has("importlib/_bootstrap_external.py");
+    let (bs_img, ext_img) = if frozen { (Some("importlib/_bootstrap.py"), Some("importlib/_bootstrap_external.py")) } else { (None, None) };
+    if !frozen && !std::path::Path::new(&bs_file).is_file() {
         return Ok(());
     }
     let imp = import_absolute("_imp")?;
-    let bs = exec_bootstrap_module("_frozen_importlib", &bs_file, "<frozen importlib._bootstrap>")?;
+    let bs = exec_bootstrap_module("_frozen_importlib", &bs_file, "<frozen importlib._bootstrap>", bs_img)?;
     let sys = crate::modules::sys::sys_module();
     ab::call(&*ab::getattr_str(&bs, "_install")?, &[&sys, &imp])?;
     crate::subinterp::current().bootstrap.store(bs.clone().into_raw(), std::sync::atomic::Ordering::Release);
     let ext_file = format!("{}/importlib/_bootstrap_external.py", stdlib);
     let r = (|| -> PyResult<()> {
-        exec_bootstrap_module("_frozen_importlib_external", &ext_file, "<frozen importlib._bootstrap_external>")?;
+        exec_bootstrap_module("_frozen_importlib_external", &ext_file, "<frozen importlib._bootstrap_external>", ext_img)?;
         ab::call(&*ab::getattr_str(&bs, "_install_external_importers")?, &[])?;
         Ok(())
     })();

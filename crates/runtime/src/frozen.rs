@@ -3,15 +3,16 @@
 //! The three tables mirror the groups CPython exports (`_PyImport_FrozenBootstrap`,
 //! `_PyImport_FrozenStdlib`, `_PyImport_FrozenTest`); each C table is an array of
 //! the public 24-byte `struct _frozen` ending with a NULL name. Our "code" bytes
-//! are the module's source (our bytecode format is not CPython's marshal format);
-//! `_imp.get_frozen_object` compiles it, caching the result next to the stdlib
-//! file like the importlib bootstrap modules.
+//! are the module's source; `_imp.get_frozen_object` builds the code object from the
+//! start-up image (`startup_image`: compiled and translated at build time) and only
+//! compiles the source when the image has no record for it.
 //!
 //! Whether the frozen copies are used for normal imports is decided by
-//! `-X frozen_modules=on|off` / `PYTHON_FROZEN_MODULES` (default: off, so the
-//! stdlib on disk is authoritative and start-up stays on the pyc fast path), and
-//! by `_imp._override_frozen_modules_for_tests`. The importlib bootstrap modules
-//! are always reported as frozen: they are loaded before any finder exists.
+//! `-X frozen_modules=on|off` / `PYTHON_FROZEN_MODULES` (default, as in CPython: on for
+//! an installation, off when the standard library is the source tree's Lib/, where the
+//! files on disk are authoritative), and by `_imp._override_frozen_modules_for_tests`.
+//! The importlib bootstrap modules are always reported as frozen: they are loaded before
+//! any finder exists.
 
 use crate::capi::import::Frozen;
 use std::ffi::{CStr, c_char, c_int};
@@ -23,6 +24,8 @@ pub struct Entry {
     /// listed under its own name, None if there is no stdlib file behind it.
     pub orig: Option<&'static str>,
     pub src: &'static [u8],
+    /// (perf6) Source path below Lib/ ("" if none): the key of its start-up image record.
+    pub file: &'static str,
     pub is_package: bool,
     /// Available even when frozen modules are switched off.
     pub essential: bool,
@@ -41,11 +44,14 @@ macro_rules! lib {
 }
 
 macro_rules! entry {
-    ($name:literal, $orig:expr, $src:expr, $pkg:expr) => {
-        Entry { name: $name, orig: $orig, src: $src, is_package: $pkg, essential: false }
+    ($name:literal, $orig:expr, lib!($p:literal), $pkg:expr) => {
+        Entry { name: $name, orig: $orig, src: lib!($p), file: $p, is_package: $pkg, essential: false }
     };
-    ($name:literal, $orig:expr, $src:expr, $pkg:expr, essential) => {
-        Entry { name: $name, orig: $orig, src: $src, is_package: $pkg, essential: true }
+    ($name:literal, $orig:expr, lib!($p:literal), $pkg:expr, essential) => {
+        Entry { name: $name, orig: $orig, src: lib!($p), file: $p, is_package: $pkg, essential: true }
+    };
+    ($name:literal, $orig:expr, $src:expr, $pkg:expr) => {
+        Entry { name: $name, orig: $orig, src: $src, file: "", is_package: $pkg, essential: false }
     };
 }
 
@@ -143,7 +149,9 @@ fn configured() -> bool {
         return c > 0;
     }
     let cfg = crate::modules::sys_full::config();
-    let mut on = false;
+    // (perf6) default like CPython: on for an installation, off when the standard library
+    // is the source tree (there the files on disk are authoritative)
+    let mut on = !crate::modules::sys_full::paths().source_tree;
     if cfg.ignore_environment == 0 {
         if let Ok(v) = std::env::var("PYTHON_FROZEN_MODULES") {
             on = v == "on";

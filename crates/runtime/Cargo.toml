@@ -2,6 +2,8 @@
 name = "rpy-runtime"
 version = "0.1.0"
 edition = "2024"
+# (perf6) writes the start-up image (compiled + translated frozen modules)
+build = "build/main.rs"
 
 [lib]
 crate-type = ["rlib"]
@@ -15,3 +17,7 @@ rpy-unicode = { path = "../unicode" }
 rpy-sre = { path = "../sre" }
 rpy-compiler = { path = "../compiler" }
 rpy-compress = { path = "../compress" }
+
+[build-dependencies]
+rpy-parser = { path = "../parser" }
+rpy-compiler = { path = "../compiler" }
