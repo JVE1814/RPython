@@ -1,4 +1,10 @@
-"""Redo the builtin repr() (representation) but with limits on most sizes."""
+"""repr() with size limits, and a guard for recursive __repr__ methods.
+
+Repr objects produce abbreviated representations: long strings and numbers
+are cut in the middle, containers show only their first few items and
+nesting is limited, the omitted parts being replaced by a fill value.
+``reprlib.repr`` uses a shared default instance.
+"""
 
 __all__ = ["Repr", "repr", "recursive_repr"]
 
@@ -8,64 +14,68 @@ from _thread import get_ident
 
 
 def recursive_repr(fillvalue='...'):
-    'Decorator to make a repr function return fillvalue for a recursive call'
+    """Decorator for __repr__ methods: a call that recurses into the same
+    object (in the same thread) returns fillvalue instead."""
 
-    def decorating_function(user_function):
-        active = set()
+    def decorate(method):
+        running = set()
 
         def wrapper(self):
-            key = id(self), get_ident()
-            if key in active:
+            token = (id(self), get_ident())
+            if token in running:
                 return fillvalue
-            active.add(key)
+            running.add(token)
             try:
-                return user_function(self)
+                return method(self)
             finally:
-                active.discard(key)
+                running.discard(token)
 
-        # Copy the metadata functools.update_wrapper() would copy (functools
-        # itself depends on this module, so it cannot be used here).
-        for attr in ('__module__', '__doc__', '__name__', '__qualname__',
+        # what functools.update_wrapper would copy (functools imports this
+        # module, so it cannot be used here)
+        for name in ('__module__', '__name__', '__qualname__', '__doc__',
                      '__annotate__', '__type_params__'):
             try:
-                value = getattr(user_function, attr)
+                setattr(wrapper, name, getattr(method, name))
             except AttributeError:
-                continue
-            setattr(wrapper, attr, value)
-        wrapper.__wrapped__ = user_function
+                pass
+        wrapper.__wrapped__ = method
         return wrapper
 
-    return decorating_function
+    return decorate
 
 
-def _possibly_sorted(x):
-    # Sorting gives reproducible output, but not everything is orderable.
+def _ordered(items):
+    # sorted when possible, so that sets and dicts give stable output
     try:
-        return sorted(x)
+        return sorted(items)
     except Exception:
-        return list(x)
+        return list(items)
+
+
+# For these type names the repr_<name> method is used only for the genuine
+# type (from this module), not for unrelated classes with the same name.
+_GENUINE = {
+    'tuple': 'builtins', 'list': 'builtins', 'set': 'builtins',
+    'frozenset': 'builtins', 'dict': 'builtins', 'str': 'builtins',
+    'int': 'builtins', 'array': 'array', 'deque': 'collections',
+}
 
 
 class Repr:
-    # Types whose specialised repr_<typename> method only applies to the
-    # genuine type from the given module (not to look-alike classes).
-    _lookup = {
-        'tuple': 'builtins',
-        'list': 'builtins',
-        'array': 'array',
-        'set': 'builtins',
-        'frozenset': 'builtins',
-        'deque': 'collections',
-        'dict': 'builtins',
-        'str': 'builtins',
-        'int': 'builtins',
-    }
+    """Configurable abbreviated repr().
 
-    def __init__(
-        self, *, maxlevel=6, maxtuple=6, maxlist=6, maxarray=5, maxdict=4,
-        maxset=6, maxfrozenset=6, maxdeque=6, maxstring=30, maxlong=40,
-        maxother=30, fillvalue='...', indent=None,
-    ):
+    The max* attributes bound the number of items shown per container type,
+    the length of strings (maxstring), ints (maxlong) and other reprs
+    (maxother), and the nesting depth (maxlevel).  indent, when not None,
+    puts each container item on its own line, indented by that string (or
+    that many spaces).  Subclasses can add repr_<typename>(obj, level)
+    methods.
+    """
+
+    def __init__(self, *, maxlevel=6, maxtuple=6, maxlist=6, maxarray=5,
+                 maxdict=4, maxset=6, maxfrozenset=6, maxdeque=6,
+                 maxstring=30, maxlong=40, maxother=30, fillvalue='...',
+                 indent=None):
         self.maxlevel = maxlevel
         self.maxtuple = maxtuple
         self.maxlist = maxlist
@@ -85,131 +95,129 @@ class Repr:
 
     def repr1(self, x, level):
         cls = type(x)
-        typename = cls.__name__
-        if ' ' in typename:
-            typename = '_'.join(typename.split())
-        method = getattr(self, 'repr_' + typename, None)
-        if method is not None:
-            module = self._lookup.get(typename)
-            if module is None or module == cls.__module__:
-                return method(x, level)
+        name = '_'.join(cls.__name__.split())
+        handler = getattr(self, 'repr_' + name, None)
+        if handler is not None and _GENUINE.get(name, cls.__module__) == cls.__module__:
+            return handler(x, level)
         return self.repr_instance(x, level)
 
-    def _check_indent(self):
-        indent = self.indent
-        if isinstance(indent, int):
-            if indent < 0:
+    # -- helpers ---------------------------------------------------------------
+
+    def _indent_unit(self):
+        unit = self.indent
+        if isinstance(unit, str):
+            return unit
+        if isinstance(unit, int):
+            if unit < 0:
                 raise ValueError(
-                    f'Repr.indent cannot be negative int (was {indent!r})')
-            return indent * ' '
-        if isinstance(indent, str):
-            return indent
+                    f'Repr.indent cannot be negative int (was {unit!r})')
+            return ' ' * unit
         raise TypeError(
-            f'Repr.indent must be a str, int or None, not {type(indent)}')
+            f'Repr.indent must be a str, int or None, not {type(unit)}')
 
-    def _join(self, pieces, level):
+    def _layout(self, parts, level):
+        """Join item reprs, on one line or one per line (with indent)."""
         if self.indent is None:
-            return ', '.join(pieces)
-        if not pieces:
+            return ', '.join(parts)
+        if not parts:
             return ''
-        indent = self._check_indent()
-        sep = ',\n' + (self.maxlevel - level + 1) * indent
-        joined = sep.join(('', *pieces, ''))
-        return joined[1:-len(indent) or None]
+        unit = self._indent_unit()
+        depth = self.maxlevel - level + 1
+        inner = unit * depth
+        return ('\n' + ''.join(f'{inner}{part},\n' for part in parts)
+                + unit * (depth - 1))
 
-    def _repr_iterable(self, x, level, left, right, maxiter, trail=''):
-        n = len(x)
-        if level <= 0 and n:
-            body = self.fillvalue
-        else:
-            sub = level - 1
-            pieces = [self.repr1(item, sub) for item in islice(x, maxiter)]
-            if n > maxiter:
-                pieces.append(self.fillvalue)
-            body = self._join(pieces, level)
-            if n == 1 and trail and self.indent is None:
-                right = trail + right
-        return f'{left}{body}{right}'
+    def _sequence(self, x, level, opening, closing, limit, single=''):
+        size = len(x)
+        if size and level <= 0:
+            return opening + self.fillvalue + closing
+        parts = [self.repr1(item, level - 1) for item in islice(x, limit)]
+        if size > limit:
+            parts.append(self.fillvalue)
+        if size == 1 and single and self.indent is None:
+            closing = single + closing      # the comma of a 1-tuple
+        return opening + self._layout(parts, level) + closing
 
-    def repr_tuple(self, x, level):
-        return self._repr_iterable(x, level, '(', ')', self.maxtuple, ',')
-
-    def repr_list(self, x, level):
-        return self._repr_iterable(x, level, '[', ']', self.maxlist)
-
-    def repr_array(self, x, level):
-        if not x:
-            return f"array('{x.typecode}')"
-        return self._repr_iterable(x, level, f"array('{x.typecode}', [",
-                                   '])', self.maxarray)
-
-    def repr_set(self, x, level):
-        if not x:
-            return 'set()'
-        return self._repr_iterable(_possibly_sorted(x), level, '{', '}',
-                                   self.maxset)
-
-    def repr_frozenset(self, x, level):
-        if not x:
-            return 'frozenset()'
-        return self._repr_iterable(_possibly_sorted(x), level, 'frozenset({',
-                                   '})', self.maxfrozenset)
-
-    def repr_deque(self, x, level):
-        return self._repr_iterable(x, level, 'deque([', '])', self.maxdeque)
-
-    def repr_dict(self, x, level):
-        n = len(x)
-        if n == 0:
-            return '{}'
-        if level <= 0:
-            return '{' + self.fillvalue + '}'
-        sub = level - 1
-        pieces = []
-        for key in islice(_possibly_sorted(x), self.maxdict):
-            pieces.append(f'{self.repr1(key, sub)}: {self.repr1(x[key], sub)}')
-        if n > self.maxdict:
-            pieces.append(self.fillvalue)
-        return '{' + self._join(pieces, level) + '}'
-
-    def _shorten(self, s, limit):
+    def _cut(self, text, limit):
+        """Keep the start and end of text, joined by the fill value."""
         head = max(0, (limit - 3) // 2)
         tail = max(0, limit - 3 - head)
         return head, tail
 
+    # -- per-type methods ----------------------------------------------------------
+
+    def repr_tuple(self, x, level):
+        return self._sequence(x, level, '(', ')', self.maxtuple, ',')
+
+    def repr_list(self, x, level):
+        return self._sequence(x, level, '[', ']', self.maxlist)
+
+    def repr_array(self, x, level):
+        if not x:
+            return f"array('{x.typecode}')"
+        return self._sequence(x, level, f"array('{x.typecode}', [", '])',
+                              self.maxarray)
+
+    def repr_set(self, x, level):
+        if not x:
+            return 'set()'
+        return self._sequence(_ordered(x), level, '{', '}', self.maxset)
+
+    def repr_frozenset(self, x, level):
+        if not x:
+            return 'frozenset()'
+        return self._sequence(_ordered(x), level, 'frozenset({', '})',
+                              self.maxfrozenset)
+
+    def repr_deque(self, x, level):
+        return self._sequence(x, level, 'deque([', '])', self.maxdeque)
+
+    def repr_dict(self, x, level):
+        if not x:
+            return '{}'
+        if level <= 0:
+            return '{' + self.fillvalue + '}'
+        below = level - 1
+        parts = [f'{self.repr1(key, below)}: {self.repr1(x[key], below)}'
+                 for key in islice(_ordered(x), self.maxdict)]
+        if len(x) > self.maxdict:
+            parts.append(self.fillvalue)
+        return '{' + self._layout(parts, level) + '}'
+
     def repr_str(self, x, level):
-        s = builtins.repr(x[:self.maxstring])
-        if len(s) > self.maxstring:
-            i, j = self._shorten(s, self.maxstring)
-            s = builtins.repr(x[:i] + x[len(x) - j:])
-            s = s[:i] + self.fillvalue + s[len(s) - j:]
-        return s
+        text = builtins.repr(x[:self.maxstring])
+        if len(text) > self.maxstring:
+            head, tail = self._cut(text, self.maxstring)
+            # quote the shortened string, then cut its repr again
+            text = builtins.repr(x[:head] + x[len(x) - tail:])
+            text = text[:head] + self.fillvalue + text[len(text) - tail:]
+        return text
 
     def repr_int(self, x, level):
         try:
-            s = builtins.repr(x)
-        except ValueError as exc:
-            assert 'sys.set_int_max_str_digits()' in str(exc)
-            # Too many digits to convert: describe the number instead.
-            import math, sys
-            k = 1 + int(math.log10(abs(x)))
-            limit = sys.get_int_max_str_digits()
-            return (f'<{x.__class__.__name__} instance with roughly {k} '
-                    f'digits (limit at {limit}) at 0x{id(x):x}>')
-        if len(s) > self.maxlong:
-            i, j = self._shorten(s, self.maxlong)
-            s = s[:i] + self.fillvalue + s[len(s) - j:]
-        return s
+            text = builtins.repr(x)
+        except ValueError:
+            # more digits than int->str conversion allows
+            import math
+            import sys
+            digits = 1 + int(math.log10(abs(x)))
+            return (f'<{x.__class__.__name__} instance with roughly {digits} '
+                    f'digits (limit at {sys.get_int_max_str_digits()}) '
+                    f'at 0x{id(x):x}>')
+        if len(text) > self.maxlong:
+            head, tail = self._cut(text, self.maxlong)
+            text = text[:head] + self.fillvalue + text[len(text) - tail:]
+        return text
 
     def repr_instance(self, x, level):
         try:
-            s = builtins.repr(x)
+            text = builtins.repr(x)
         except Exception:
             return f'<{x.__class__.__name__} instance at {id(x):#x}>'
-        if len(s) > self.maxother:
-            i, j = self._shorten(s, self.maxother)
-            s = s[:i] + self.fillvalue + s[len(s) - j:]
-        return s
+        if len(text) > self.maxother:
+            head, tail = self._cut(text, self.maxother)
+            text = text[:head] + self.fillvalue + text[len(text) - tail:]
+        return text
 
 
 aRepr = Repr()
