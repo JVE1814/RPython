@@ -198,7 +198,7 @@ pub unsafe extern "C" fn PyImport_GetImporter(path: *mut PyObject) -> *mut PyObj
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyImport_GetMagicNumber() -> std::ffi::c_long {
-    3700 // our bytecode is not CPython's; any stable value works
+    crate::modules::_imp::MAGIC as std::ffi::c_long
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyImport_GetMagicTag() -> *const c_char {

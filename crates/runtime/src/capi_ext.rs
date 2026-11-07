@@ -406,7 +406,7 @@ pub fn init_imp_module() -> PyResult {
         Some(&m),
     )?;
     dict::set_item_str(&d, "check_hash_based_pycs", &pystr::new_str("never"))?;
-    dict::set_item_str(&d, "pyc_magic_number_token", &crate::types::int::new_int(3700 | (b'\r' as i64) << 16 | (b'\n' as i64) << 24))?;
+    dict::set_item_str(&d, "pyc_magic_number_token", &crate::types::int::new_int(crate::modules::_imp::MAGIC as i64))?;
     let _ = tuple::empty_tuple();
     Ok(m)
 }

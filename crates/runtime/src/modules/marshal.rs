@@ -3,18 +3,12 @@
 //! Type codes, FLAG_REF back-references, ints with 15-bit digits, float/complex in text
 //! (version < 2) or binary form, compact ASCII strings (version >= 4), small tuples
 //! (version >= 4), slices (version >= 5) and frozendicts (version >= 6) follow CPython
-//! byte for byte. Code objects are written in CPython's field order but with OUR code
-//! units (see notes/devtools.md, "marshal code objects"):
+//! byte for byte. Code objects use CPython 3.15's layout as well (D24/D25: the public form of
+//! a code object is CPython wordcode), so .pyc files are interchangeable with CPython's:
 //!   'c' argcount posonlyargcount kwonlyargcount stacksize flags     (5 x int32)
-//!       co_code         bytes: 32-bit little-endian instruction words
-//!       co_consts       tuple
-//!       co_names        tuple of str
-//!       co_localsplusnames tuple of str
-//!       co_localspluskinds bytes (one CO_FAST_* byte per name)
-//!       co_filename co_name co_qualname   str
-//!       co_firstlineno  int32
-//!       co_linetable    bytes: per instruction lineno, end_lineno, col, end_col (u32 LE)
-//!       co_exceptiontable bytes: per entry start, end, target, depth, lasti (u32 LE)
+//!       co_code (bytes: wordcode, caches zeroed), co_consts, co_names, co_localsplusnames,
+//!       co_localspluskinds (bytes, CO_FAST_* per name), co_filename, co_name, co_qualname,
+//!       co_firstlineno (int32), co_linetable, co_exceptiontable (both bytes)
 
 use crate::abstract_ as ab;
 use crate::args::Params;
@@ -31,9 +25,6 @@ use rpy_compiler::bytecode as bc;
 use std::collections::HashMap;
 
 pub const VERSION: i32 = 6;
-/// Layout generation of serialized code objects (part of the pyc magic): 4 = D24 public
-/// wordcode objects (bc-vm).
-pub const CODE_FORMAT: u32 = 4;
 const MAX_DEPTH: usize = 2000;
 const SIZE32_MAX: i64 = 0x7fff_ffff;
 

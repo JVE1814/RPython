@@ -324,7 +324,9 @@ static CONST_TUPLES: std::sync::LazyLock<std::sync::Mutex<std::collections::Hash
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Type-tagged rendering of a constant (equal keys = same type and value, so the objects
-/// are interchangeable); None for constants that are never merged (code objects).
+/// are interchangeable); None for constants that are never merged: code objects, and NaNs
+/// (two NaN objects are distinct set members and unequal dict keys, so a constant
+/// `{nan1, nan2}` must keep both).
 fn const_key(c: &rpy_compiler::wordcode::Constant) -> Option<String> {
     use rpy_compiler::wordcode::Constant as C;
     use std::fmt::Write;
@@ -343,9 +345,15 @@ fn const_key(c: &rpy_compiler::wordcode::Constant) -> Option<String> {
                 let _ = write!(out, "I{}{};", if *neg { "-" } else { "" }, decimal);
             }
             C::Float(f) => {
+                if f.is_nan() {
+                    return false;
+                }
                 let _ = write!(out, "f{:x};", f.to_bits());
             }
             C::Complex { real, imag } => {
+                if real.is_nan() || imag.is_nan() {
+                    return false;
+                }
                 let _ = write!(out, "c{:x},{:x};", real.to_bits(), imag.to_bits());
             }
             C::Str(cps) => {

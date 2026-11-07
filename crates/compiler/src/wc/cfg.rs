@@ -780,9 +780,10 @@ fn const_of(i: &Instr, consts: &[Constant]) -> Option<Constant> {
 
 fn same_const(a: &Constant, b: &Constant) -> bool {
     match (a, b) {
-        (Constant::Float(x), Constant::Float(y)) => x.to_bits() == y.to_bits(),
+        // NaNs are never merged: two NaN objects are distinct (unequal) constants
+        (Constant::Float(x), Constant::Float(y)) => !x.is_nan() && x.to_bits() == y.to_bits(),
         (Constant::Complex { real: a1, imag: b1 }, Constant::Complex { real: a2, imag: b2 }) => {
-            a1.to_bits() == a2.to_bits() && b1.to_bits() == b2.to_bits()
+            !(a1.is_nan() || b1.is_nan()) && a1.to_bits() == a2.to_bits() && b1.to_bits() == b2.to_bits()
         }
         (Constant::Tuple(x), Constant::Tuple(y)) | (Constant::FrozenSet(x), Constant::FrozenSet(y)) => {
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| same_const(p, q))

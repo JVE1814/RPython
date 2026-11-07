@@ -571,9 +571,16 @@ class SourceLoader(_LoaderBasics):
             options['module'] = fullname
         return _bootstrap._call_with_frames_removed(compile, data, path, 'exec', **options)
 
+    def _cache_predates_compiler(self, bytecode_path):
+        """Whether the cache file was written by an older build of our compiler
+        (only file-system loaders can tell; see SourceFileLoader)."""
+        return False
+
     def _cached_code(self, fullname, source_path, bytecode_path, stats, state):
         """The code from a valid cache file, or None.  *state* collects what
         get_code() needs to write a new cache file."""
+        if self._cache_predates_compiler(bytecode_path):
+            return None
         try:
             data = self.get_data(bytecode_path)
         except OSError:
@@ -691,6 +698,18 @@ class FileLoader:
 
 class SourceFileLoader(FileLoader, SourceLoader):
     """Loader for .py files, caching bytecode in __pycache__."""
+
+    def _cache_predates_compiler(self, bytecode_path):
+        # Cache files use CPython's magic number, so the header cannot tell a file
+        # written by an older build of our compiler from a current one; such a file
+        # is older than the moment the compiler sources last changed.
+        epoch = getattr(_imp, '_rpy_compiler_epoch', None)
+        if epoch is None:
+            return False
+        try:
+            return _path_stat(bytecode_path).st_mtime < epoch
+        except (OSError, AttributeError, TypeError):
+            return False
 
     def path_stats(self, path):
         st = _path_stat(path)

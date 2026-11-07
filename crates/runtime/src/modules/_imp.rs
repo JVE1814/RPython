@@ -385,11 +385,11 @@ fn imp_rpy_read_file(_m: &PyObject, p: &PyObject) -> PyResult {
     Ok(bytes::new_bytes(&data))
 }
 
-/// pyc magic: 3690..3699 (the top of the 3.15 range, 2900+50*15, unlikely to collide
-/// with CPython's own) selected by a hash of the compiler sources (stale caches written
-/// by an older compiler are never reused) and by the marshal layout of code objects
-/// (`marshal::CODE_FORMAT`), then "\r\n".
-pub const MAGIC: u32 = (3690 + (rpy_compiler::BYTECODE_HASH % 10 + crate::modules::marshal::CODE_FORMAT) % 10) | ((b'\r' as u32) << 16) | ((b'\n' as u32) << 24);
+/// pyc magic number: CPython 3.15's own (3666, then "\r\n"; D25). Our code objects marshal to
+/// CPython 3.15's format (public wordcode, same field layout), so cache files are
+/// interchangeable with CPython's. Our own stale caches (written by an older compiler) are
+/// detected by `_rpy_compiler_epoch`, see SourceFileLoader in importlib.
+pub const MAGIC: u32 = 3666 | ((b'\r' as u32) << 16) | ((b'\n' as u32) << 24);
 
 pub fn init_module() -> PyResult {
     let m = crate::types::module::new_module("_imp")?;
@@ -425,6 +425,7 @@ pub fn init_module() -> PyResult {
     )?;
     let chk = crate::modules::sys_full::config().check_hash_based_pycs.clone();
     dict::set_item_str(&d, "check_hash_based_pycs", &pystr::new_str(&chk))?;
-    dict::set_item_str(&d, "pyc_magic_number_token", &int::new_int((MAGIC + 50) as i64))?;
+    dict::set_item_str(&d, "pyc_magic_number_token", &int::new_int(MAGIC as i64))?;
+    dict::set_item_str(&d, "_rpy_compiler_epoch", &crate::types::float::new_float(rpy_compiler::COMPILER_EPOCH))?;
     Ok(m)
 }

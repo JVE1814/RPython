@@ -118,6 +118,15 @@ fn ckey(c: &Constant, code_ctr: &mut usize) -> CKey {
         Constant::Ellipsis => CKey::Ellipsis,
         Constant::Int(i) => CKey::Int(*i),
         Constant::BigInt { neg, decimal } => CKey::Big(*neg, decimal.clone()),
+        // a NaN is only ever equal to itself: each occurrence is its own constant
+        Constant::Float(f) if f.is_nan() => {
+            *code_ctr += 1;
+            CKey::Code(*code_ctr)
+        }
+        Constant::Complex { real, imag } if real.is_nan() || imag.is_nan() => {
+            *code_ctr += 1;
+            CKey::Code(*code_ctr)
+        }
         Constant::Float(f) => CKey::Float(f.to_bits()),
         Constant::Complex { real, imag } => CKey::Complex(real.to_bits(), imag.to_bits()),
         Constant::Str(s) => CKey::Str(s.clone()),
