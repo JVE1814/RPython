@@ -48,7 +48,7 @@ RUSTFLAGS="$USE" cargo build --release -j "$JOBS" --target "$TRIPLE" --target-di
 # (only the launcher's link step runs again)
 if [ -z "${PGO_NO_ORDER:-}" ] && command -v valgrind >/dev/null; then
   echo "== start-up order of the optimized executable"
-  ORDER_STARTUP_ONLY=1 bash "$ROOT/tools/bench/perf/gen_order.sh" "$T/pgo/$TRIPLE/release/python3" "$T/pgo-startup.ld"
+  bash "$ROOT/tools/bench/perf/gen_order.sh" "$T/pgo/$TRIPLE/release/python3" "$T/pgo-startup.ld"
   RPY_ORDER_FILE="$T/pgo-startup.ld" RUSTFLAGS="$USE" cargo build --release -j "$JOBS" --target "$TRIPLE" \
     --target-dir "$T/pgo" -p python
 fi
