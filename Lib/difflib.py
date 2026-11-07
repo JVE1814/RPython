@@ -1,221 +1,259 @@
-"""Helpers for computing deltas between sequences.
+"""Compare sequences and report the differences.
 
-SequenceMatcher   compare pairs of sequences of hashable elements
-Differ            human-readable line-by-line deltas of text
-HtmlDiff          side-by-side HTML tables of differences
-unified_diff, context_diff, ndiff, diff_bytes, restore,
-get_close_matches, IS_LINE_JUNK, IS_CHARACTER_JUNK
+Classes:
+
+    SequenceMatcher -- finds the matching parts of two sequences of
+                       hashable elements and turns them into edit operations
+    Differ          -- line-by-line comparison of two lists of text lines,
+                       with intraline hints (the format ndiff() produces)
+    HtmlDiff        -- side-by-side comparison rendered as an HTML table
+
+Functions:
+
+    get_close_matches() -- the best "good enough" matches for a word
+    ndiff()             -- Differ-style delta of two lists of lines
+    restore()           -- recover one of the inputs from an ndiff() delta
+    unified_diff()      -- delta in the unified diff format
+    context_diff()      -- delta in the context diff format
+    diff_bytes()        -- run unified_diff()/context_diff() on bytes
+    IS_LINE_JUNK(), IS_CHARACTER_JUNK() -- ready-made junk predicates
 """
 
 __all__ = ['get_close_matches', 'ndiff', 'restore', 'SequenceMatcher',
            'Differ', 'IS_CHARACTER_JUNK', 'IS_LINE_JUNK', 'context_diff',
            'unified_diff', 'diff_bytes', 'HtmlDiff', 'Match']
 
-from heapq import nlargest as _nlargest
 from collections import namedtuple as _namedtuple
+from heapq import nlargest as _nlargest
 from types import GenericAlias
 
 Match = _namedtuple('Match', 'a b size')
 
 
-def _calculate_ratio(matches, length):
-    if length:
-        return 2.0 * matches / length
+def _similarity(matches, total):
+    """2*M/T, the similarity measure of all the *ratio() methods."""
+    if total:
+        return 2.0 * matches / total
     return 1.0
 
 
-class SequenceMatcher:
-    """Find the longest matching blocks of two sequences (Ratcliff and
-    Obershelp's "gestalt pattern matching", with junk elements).
+# ---------------------------------------------------------------------------
+# SequenceMatcher
 
-    Elements must be hashable.  `isjunk(elt)` marks elements of b to
-    ignore when searching for matches; with autojunk (default) elements
-    of b making up more than 1% of a sequence of 200+ items are treated as
-    "popular" and ignored as match seeds too.
+class SequenceMatcher:
+    """Find the longest contiguous matching blocks of two sequences.
+
+    The elements must be hashable.  The search is the Ratcliff/Obershelp
+    "gestalt" idea: take the longest matching block, then do the same on the
+    pieces to its left and to its right.  Elements the optional isjunk
+    predicate accepts never start a match (they can only extend one), and
+    with autojunk enabled, elements making up more than 1% of a second
+    sequence of at least 200 items are treated the same way.  The result is
+    meant to look natural to people; it is not a minimal edit script.
+
+    The second sequence is indexed once, so to compare one sequence with
+    many others, set it with set_seq2() and vary the first with set_seq1().
+
+    >>> m = SequenceMatcher(None, "tram line", "tramline 9")
+    >>> m.get_matching_blocks()
+    [Match(a=0, b=0, size=4), Match(a=5, b=4, size=4), Match(a=9, b=10, size=0)]
+    >>> for op in m.get_opcodes():
+    ...     print(op)
+    ('equal', 0, 4, 0, 4)
+    ('delete', 4, 5, 4, 4)
+    ('equal', 5, 9, 4, 8)
+    ('insert', 9, 9, 8, 10)
+    >>> round(m.ratio(), 3)
+    0.842
+
+    Attributes set by set_seq2() that may be inspected: b2j (each indexed
+    element of b mapped to the ascending list of its positions), bjunk (the
+    elements isjunk rejected) and bpopular (the elements autojunk dropped).
     """
 
     def __init__(self, isjunk=None, a='', b='', autojunk=True):
+        """isjunk is None or a one-argument predicate telling whether an
+        element of b is junk; a and b are the sequences to compare;
+        autojunk=False disables the popular-element heuristic."""
         self.isjunk = isjunk
-        self.a = self.b = None
         self.autojunk = autojunk
+        self.a = self.b = None
         self.set_seqs(a, b)
 
     def set_seqs(self, a, b):
-        """Set both sequences to be compared."""
+        """Set both sequences to compare."""
         self.set_seq1(a)
         self.set_seq2(b)
 
     def set_seq1(self, a):
-        """Set the first sequence to be compared."""
+        """Set the first sequence (the cheap one to change)."""
         if a is self.a:
             return
         self.a = a
-        self.matching_blocks = self.opcodes = None
+        self._blocks = self._codes = None
 
     def set_seq2(self, b):
-        """Set the second sequence to be compared (the expensive one to
-        change: b is indexed)."""
+        """Set the second sequence and index it."""
         if b is self.b:
             return
         self.b = b
-        self.matching_blocks = self.opcodes = None
-        self.fullbcount = None
-        self.__chain_b()
+        self._blocks = self._codes = None
+        self._b_counts = None
+        self._index_b()
 
-    def __chain_b(self):
-        # b2j maps each element of b to the sorted list of its indices,
-        # leaving out junk and popular elements.
+    def _index_b(self):
         b = self.b
-        self.b2j = b2j = {}
-        for i, elt in enumerate(b):
-            b2j.setdefault(elt, []).append(i)
-
-        self.bjunk = junk = set()
-        isjunk = self.isjunk
-        if isjunk:
-            for elt in b2j.keys():
-                if isjunk(elt):
-                    junk.add(elt)
-            for elt in junk:
-                del b2j[elt]
-
-        self.bpopular = popular = set()
-        n = len(b)
-        if self.autojunk and n >= 200:
-            ntest = n // 100 + 1
-            for elt, idxs in b2j.items():
-                if len(idxs) > ntest:
-                    popular.add(elt)
-            for elt in popular:
-                del b2j[elt]
+        positions = {}
+        for index, element in enumerate(b):
+            where = positions.get(element)
+            if where is None:
+                positions[element] = [index]
+            else:
+                where.append(index)
+        junk = set()
+        if self.isjunk is not None:
+            isjunk = self.isjunk
+            junk = {element for element in positions if isjunk(element)}
+            for element in junk:
+                del positions[element]
+        popular = set()
+        size = len(b)
+        if self.autojunk and size >= 200:
+            limit = size // 100 + 1
+            popular = {element for element, where in positions.items()
+                       if len(where) > limit}
+            for element in popular:
+                del positions[element]
+        self.b2j = positions
+        self.bjunk = junk
+        self.bpopular = popular
 
     def find_longest_match(self, alo=0, ahi=None, blo=0, bhi=None):
-        """Return Match(i, j, k) with a[i:i+k] == b[j:j+k] the longest
-        matching block in a[alo:ahi] and b[blo:bhi] (earliest i, then
-        earliest j), extended by adjacent junk/popular equal elements."""
-        a, b, b2j, isbjunk = self.a, self.b, self.b2j, self.bjunk.__contains__
+        """Return the longest matching block in a[alo:ahi] and b[blo:bhi].
+
+        Ties go to the block starting earliest in a, then earliest in b.
+        The block is grown on both sides over equal elements that the index
+        leaves out (popular ones first, then junk).  Without any match the
+        result has size 0.
+
+        >>> SequenceMatcher(None, "a lot of", "lots of").find_longest_match()
+        Match(a=2, b=0, size=3)
+        """
+        a, b, positions, junk = self.a, self.b, self.b2j, self.bjunk
         if ahi is None:
             ahi = len(a)
         if bhi is None:
             bhi = len(b)
-        besti, bestj, bestsize = alo, blo, 0
-        # j2len[j] = length of the longest match ending with a[i-1], b[j]
-        j2len = {}
-        nothing = []
+        best_i, best_j, best = alo, blo, 0
+        # ending[j]: length of the common run that ends at a[i-1] and b[j]
+        ending = {}
+        nothing = ()
         for i in range(alo, ahi):
-            j2lenget = j2len.get
-            newj2len = {}
-            for j in b2j.get(a[i], nothing):
+            current = {}
+            for j in positions.get(a[i], nothing):
                 if j < blo:
                     continue
                 if j >= bhi:
                     break
-                k = newj2len[j] = j2lenget(j - 1, 0) + 1
-                if k > bestsize:
-                    besti, bestj, bestsize = i - k + 1, j - k + 1, k
-            j2len = newj2len
-
-        # Extend the match with equal non-junk elements that were excluded
-        # (popular ones), then with equal junk elements.
-        while besti > alo and bestj > blo and \
-              not isbjunk(b[bestj - 1]) and \
-              a[besti - 1] == b[bestj - 1]:
-            besti, bestj, bestsize = besti - 1, bestj - 1, bestsize + 1
-        while besti + bestsize < ahi and bestj + bestsize < bhi and \
-              not isbjunk(b[bestj + bestsize]) and \
-              a[besti + bestsize] == b[bestj + bestsize]:
-            bestsize += 1
-
-        while besti > alo and bestj > blo and \
-              isbjunk(b[bestj - 1]) and \
-              a[besti - 1] == b[bestj - 1]:
-            besti, bestj, bestsize = besti - 1, bestj - 1, bestsize + 1
-        while besti + bestsize < ahi and bestj + bestsize < bhi and \
-              isbjunk(b[bestj + bestsize]) and \
-              a[besti + bestsize] == b[bestj + bestsize]:
-            bestsize = bestsize + 1
-
-        return Match(besti, bestj, bestsize)
+                run = current[j] = ending.get(j - 1, 0) + 1
+                if run > best:
+                    best_i, best_j, best = i - run + 1, j - run + 1, run
+            ending = current
+        for wanted in (False, True):
+            while (best_i > alo and best_j > blo and
+                   (b[best_j - 1] in junk) is wanted and
+                   a[best_i - 1] == b[best_j - 1]):
+                best_i -= 1
+                best_j -= 1
+                best += 1
+            while (best_i + best < ahi and best_j + best < bhi and
+                   (b[best_j + best] in junk) is wanted and
+                   a[best_i + best] == b[best_j + best]):
+                best += 1
+        return Match(best_i, best_j, best)
 
     def get_matching_blocks(self):
-        """Return the list of matching blocks (i, j, n), monotonically
-        increasing in i and j, ending with the dummy (len(a), len(b), 0)."""
-        if self.matching_blocks is not None:
-            return self.matching_blocks
-        la, lb = len(self.a), len(self.b)
+        """Return the matching blocks as a list of Match triples (i, j, n),
+        meaning a[i:i+n] == b[j:j+n], increasing in i and j.  Adjacent
+        blocks are merged; a final Match(len(a), len(b), 0) closes the list.
 
-        # Explicit stack instead of recursion.
-        queue = [(0, la, 0, lb)]
-        matching_blocks = []
-        while queue:
-            alo, ahi, blo, bhi = queue.pop()
-            i, j, k = x = self.find_longest_match(alo, ahi, blo, bhi)
-            if k:
-                matching_blocks.append(x)
-                if alo < i and blo < j:
-                    queue.append((alo, i, blo, j))
-                if i + k < ahi and j + k < bhi:
-                    queue.append((i + k, ahi, j + k, bhi))
-        matching_blocks.sort()
-
-        # Merge adjacent blocks.
-        i1 = j1 = k1 = 0
-        non_adjacent = []
-        for i2, j2, k2 in matching_blocks:
-            if i1 + k1 == i2 and j1 + k1 == j2:
-                k1 += k2
-            else:
-                if k1:
-                    non_adjacent.append((i1, j1, k1))
-                i1, j1, k1 = i2, j2, k2
-        if k1:
-            non_adjacent.append((i1, j1, k1))
-
-        non_adjacent.append((la, lb, 0))
-        self.matching_blocks = list(map(Match._make, non_adjacent))
-        return self.matching_blocks
+        >>> SequenceMatcher(None, "abxcd", "abcd").get_matching_blocks()
+        [Match(a=0, b=0, size=2), Match(a=3, b=2, size=2), Match(a=5, b=4, size=0)]
+        """
+        if self._blocks is not None:
+            return self._blocks
+        len_a, len_b = len(self.a), len(self.b)
+        found = []
+        pending = [(0, len_a, 0, len_b)]
+        while pending:
+            alo, ahi, blo, bhi = pending.pop()
+            i, j, size = match = self.find_longest_match(alo, ahi, blo, bhi)
+            if not size:
+                continue
+            found.append(match)
+            if alo < i and blo < j:
+                pending.append((alo, i, blo, j))
+            if i + size < ahi and j + size < bhi:
+                pending.append((i + size, ahi, j + size, bhi))
+        found.sort()
+        merged = []
+        for i, j, size in found:
+            if merged:
+                pi, pj, psize = merged[-1]
+                if pi + psize == i and pj + psize == j:
+                    merged[-1] = (pi, pj, psize + size)
+                    continue
+            merged.append((i, j, size))
+        merged.append((len_a, len_b, 0))
+        self._blocks = [Match._make(block) for block in merged]
+        return self._blocks
 
     def get_opcodes(self):
-        """Return the list of 5-tuples (tag, i1, i2, j1, j2) describing how
-        to turn a into b; tag is 'replace', 'delete', 'insert' or 'equal'."""
-        if self.opcodes is not None:
-            return self.opcodes
+        """Return the edit operations turning a into b, as a list of
+        (tag, i1, i2, j1, j2) tuples covering both sequences in order.
+
+        tag is 'replace' (a[i1:i2] becomes b[j1:j2]), 'delete' (a[i1:i2]
+        goes, j1 == j2), 'insert' (b[j1:j2] arrives, i1 == i2) or 'equal'.
+
+        >>> SequenceMatcher(None, "spam", "slam").get_opcodes()
+        [('equal', 0, 1, 0, 1), ('replace', 1, 2, 1, 2), ('equal', 2, 4, 2, 4)]
+        """
+        if self._codes is not None:
+            return self._codes
+        codes = []
         i = j = 0
-        self.opcodes = answer = []
         for ai, bj, size in self.get_matching_blocks():
-            tag = ''
-            if i < ai and j < bj:
-                tag = 'replace'
-            elif i < ai:
-                tag = 'delete'
+            if i < ai:
+                codes.append(('replace' if j < bj else 'delete', i, ai, j, bj))
             elif j < bj:
-                tag = 'insert'
-            if tag:
-                answer.append((tag, i, ai, j, bj))
+                codes.append(('insert', i, ai, j, bj))
             i, j = ai + size, bj + size
             if size:
-                answer.append(('equal', ai, i, bj, j))
-        return answer
+                codes.append(('equal', ai, i, bj, j))
+        self._codes = codes
+        return codes
 
     def get_grouped_opcodes(self, n=3):
-        """Isolate change clusters by eliminating ranges with no changes,
-        keeping n lines of context; yields lists of opcodes."""
-        codes = self.get_opcodes()
-        if not codes:
-            codes = [("equal", 0, 1, 0, 1)]
-        # Trim the leading and trailing context.
-        if codes[0][0] == 'equal':
-            tag, i1, i2, j1, j2 = codes[0]
-            codes[0] = tag, max(i1, i2 - n), i2, max(j1, j2 - n), j2
-        if codes[-1][0] == 'equal':
-            tag, i1, i2, j1, j2 = codes[-1]
-            codes[-1] = tag, i1, min(i2, i1 + n), j1, min(j2, j1 + n)
+        """Yield the opcodes in groups ("hunks") with at most n elements of
+        unchanged context around each change; long unchanged stretches
+        separate groups.
 
-        nn = n + n
+        >>> sm = SequenceMatcher(None, list("abcdefghij"), list("abXdefghiY"))
+        >>> for group in sm.get_grouped_opcodes(1):
+        ...     print(group)
+        [('equal', 1, 2, 1, 2), ('replace', 2, 3, 2, 3), ('equal', 3, 4, 3, 4)]
+        [('equal', 8, 9, 8, 9), ('replace', 9, 10, 9, 10)]
+        """
+        codes = list(self.get_opcodes()) or [('equal', 0, 1, 0, 1)]
+        tag, i1, i2, j1, j2 = codes[0]
+        if tag == 'equal':
+            codes[0] = (tag, max(i1, i2 - n), i2, max(j1, j2 - n), j2)
+        tag, i1, i2, j1, j2 = codes[-1]
+        if tag == 'equal':
+            codes[-1] = (tag, i1, min(i2, i1 + n), j1, min(j2, j1 + n))
         group = []
         for tag, i1, i2, j1, j2 in codes:
-            # Split long equal ranges between groups.
-            if tag == 'equal' and i2 - i1 > nn:
+            if tag == 'equal' and i2 - i1 > 2 * n:
                 group.append((tag, i1, min(i2, i1 + n), j1, min(j2, j1 + n)))
                 yield group
                 group = []
@@ -225,523 +263,652 @@ class SequenceMatcher:
             yield group
 
     def ratio(self):
-        """Similarity in [0, 1]: 2.0*M / T (M matches, T total elements)."""
-        matches = sum(triple[-1] for triple in self.get_matching_blocks())
-        return _calculate_ratio(matches, len(self.a) + len(self.b))
+        """Similarity in [0, 1]: twice the number of matched elements over
+        the total number of elements (1.0 for two empty sequences)."""
+        matched = sum(block.size for block in self.get_matching_blocks())
+        return _similarity(matched, len(self.a) + len(self.b))
 
     def quick_ratio(self):
-        """Upper bound on ratio(), computed from element counts."""
-        if self.fullbcount is None:
-            self.fullbcount = fullbcount = {}
-            for elt in self.b:
-                fullbcount[elt] = fullbcount.get(elt, 0) + 1
-        fullbcount = self.fullbcount
-        avail = {}
-        availhas, matches = avail.__contains__, 0
-        for elt in self.a:
-            if availhas(elt):
-                numb = avail[elt]
-            else:
-                numb = fullbcount.get(elt, 0)
-            avail[elt] = numb - 1
-            if numb > 0:
-                matches = matches + 1
-        return _calculate_ratio(matches, len(self.a) + len(self.b))
+        """An upper bound on ratio(), cheaper to compute: elements are
+        matched regardless of their order."""
+        counts = self._b_counts
+        if counts is None:
+            counts = self._b_counts = {}
+            for element in self.b:
+                counts[element] = counts.get(element, 0) + 1
+        left = {}
+        matched = 0
+        for element in self.a:
+            have = left[element] if element in left else counts.get(element, 0)
+            left[element] = have - 1
+            if have > 0:
+                matched += 1
+        return _similarity(matched, len(self.a) + len(self.b))
 
     def real_quick_ratio(self):
-        """Upper bound on ratio(), computed from the lengths only."""
-        la, lb = len(self.a), len(self.b)
-        return _calculate_ratio(min(la, lb), la + lb)
+        """An even cheaper upper bound on ratio(), from the lengths only."""
+        len_a, len_b = len(self.a), len(self.b)
+        return _similarity(min(len_a, len_b), len_a + len_b)
 
     __class_getitem__ = classmethod(GenericAlias)
 
 
 def get_close_matches(word, possibilities, n=3, cutoff=0.6):
-    """Return a list of the best "good enough" matches of word among
-    possibilities (at most n, with a similarity of at least cutoff),
-    best first."""
+    """Return up to n of the possibilities that resemble word best.
+
+    Only candidates whose SequenceMatcher ratio against word is at least
+    cutoff (a float in [0, 1]) are considered; the best come first.
+
+    >>> get_close_matches("pyton", ["python", "pylon", "piston", "cython"])
+    ['python', 'pylon', 'piston']
+    >>> get_close_matches("lettuce", ["lattice", "letter", "salad"], n=1)
+    ['letter']
+    >>> get_close_matches("zebra", ["apple", "melon"])
+    []
+    """
     if not n > 0:
         raise ValueError("n must be > 0: %r" % (n,))
     if not 0.0 <= cutoff <= 1.0:
         raise ValueError("cutoff must be in [0.0, 1.0]: %r" % (cutoff,))
-    result = []
-    s = SequenceMatcher()
-    s.set_seq2(word)
-    for x in possibilities:
-        s.set_seq1(x)
-        if s.real_quick_ratio() >= cutoff and \
-           s.quick_ratio() >= cutoff and \
-           s.ratio() >= cutoff:
-            result.append((s.ratio(), x))
-    result = _nlargest(n, result)
-    return [x for score, x in result]
+    scored = []
+    matcher = SequenceMatcher()
+    matcher.set_seq2(word)
+    for candidate in possibilities:
+        matcher.set_seq1(candidate)
+        if (matcher.real_quick_ratio() >= cutoff and
+                matcher.quick_ratio() >= cutoff):
+            score = matcher.ratio()
+            if score >= cutoff:
+                scored.append((score, candidate))
+    return [candidate for score, candidate in _nlargest(n, scored)]
 
 
-def _keep_original_ws(s, tag_s):
-    """Copy whitespace characters of s into the blank positions of tag_s."""
-    return ''.join(
-        c if tag_c == " " and c.isspace() else tag_c
-        for c, tag_c in zip(s, tag_s)
-    )
+# ---------------------------------------------------------------------------
+# Differ
+
+def _guide_whitespace(line, marks):
+    """Copy the tabs and other whitespace of line into the positions of a
+    hint line that are unmarked, so the hint stays aligned on screen."""
+    return ''.join(char if mark == ' ' and char.isspace() else mark
+                   for char, mark in zip(line, marks))
 
 
 class Differ:
-    """Produce human-readable deltas of sequences of text lines.
+    """Compare two sequences of lines of text and produce a human-readable
+    delta.
 
-    Each output line starts with a two-letter code: '- ' (only in the
-    first sequence), '+ ' (only in the second), '  ' (common) or '? '
-    (a guide line marking intraline differences).
+    Every line of the result starts with a two-letter code:
+
+        '- '  the line is only in the first sequence
+        '+ '  the line is only in the second sequence
+        '  '  the line is in both
+        '? '  a hint line pointing at the changed characters of the line
+              above it ('^' changed, '-' removed, '+' added); it is absent
+              from both inputs
+
+    Lines are compared with a SequenceMatcher; inside a block of replaced
+    lines, pairs that are similar enough are compared character by
+    character, which is where the hint lines come from.  The input lines
+    should end with newlines (as readlines() returns them); otherwise the
+    hint lines are hard to read.
+
+    >>> first = ['one\\n', 'two\\n', 'three\\n']
+    >>> second = ['one\\n', 'tree\\n', 'emu\\n']
+    >>> print(''.join(Differ().compare(first, second)), end='')
+      one
+    - two
+    - three
+    ?  -
+    + tree
+    + emu
     """
 
     def __init__(self, linejunk=None, charjunk=None):
+        """linejunk and charjunk are optional junk predicates for lines and
+        for characters, passed on to the SequenceMatchers used."""
         self.linejunk = linejunk
         self.charjunk = charjunk
 
     def compare(self, a, b):
-        """Compare two sequences of lines; yield the delta lines."""
-        cruncher = SequenceMatcher(self.linejunk, a, b)
-        for tag, alo, ahi, blo, bhi in cruncher.get_opcodes():
+        """Yield the delta lines between the line sequences a and b."""
+        matcher = SequenceMatcher(self.linejunk, a, b)
+        for tag, alo, ahi, blo, bhi in matcher.get_opcodes():
             if tag == 'replace':
-                g = self._fancy_replace(a, alo, ahi, b, blo, bhi)
+                pieces = self._similar_replace(a, alo, ahi, b, blo, bhi)
             elif tag == 'delete':
-                g = self._dump('-', a, alo, ahi)
+                pieces = self._prefixed('-', a, alo, ahi)
             elif tag == 'insert':
-                g = self._dump('+', b, blo, bhi)
+                pieces = self._prefixed('+', b, blo, bhi)
             elif tag == 'equal':
-                g = self._dump(' ', a, alo, ahi)
+                pieces = self._prefixed(' ', a, alo, ahi)
             else:
                 raise ValueError('unknown tag %r' % (tag,))
-            yield from g
+            yield from pieces
 
-    def _dump(self, tag, x, lo, hi):
-        """Generate comparison results for a same-tagged range."""
-        for i in range(lo, hi):
-            yield '%s %s' % (tag, x[i])
+    def _prefixed(self, code, lines, lo, hi):
+        for index in range(lo, hi):
+            yield f'{code} {lines[index]}'
 
-    def _plain_replace(self, a, alo, ahi, b, blo, bhi):
-        assert alo < ahi and blo < bhi
-        # Dump the shorter block first: fewer lines to read before seeing
-        # the context of the change.
+    def _block_replace(self, a, alo, ahi, b, blo, bhi):
+        # Show the smaller side first: easier to read.
         if bhi - blo < ahi - alo:
-            first = self._dump('+', b, blo, bhi)
-            second = self._dump('-', a, alo, ahi)
+            yield from self._prefixed('+', b, blo, bhi)
+            yield from self._prefixed('-', a, alo, ahi)
         else:
-            first = self._dump('-', a, alo, ahi)
-            second = self._dump('+', b, blo, bhi)
-        for g in first, second:
-            yield from g
+            yield from self._prefixed('-', a, alo, ahi)
+            yield from self._prefixed('+', b, blo, bhi)
 
-    def _fancy_replace(self, a, alo, ahi, b, blo, bhi):
-        """Replace a block of lines, synching up similar line pairs (with a
-        similarity above the cutoff) and marking their differences."""
-        cutoff = 0.74999
-        cruncher = SequenceMatcher(self.charjunk)
-        crqr = cruncher.real_quick_ratio
-        cqr = cruncher.quick_ratio
-        cr = cruncher.ratio
-
-        WINDOW = 10
-        best_i = best_j = None
-        dump_i, dump_j = alo, blo   # smallest unresolved indices
-        for j in range(blo, bhi):
-            cruncher.set_seq2(b[j])
-            # Only look for partners of b[j] near the corresponding position
-            # in a, to keep this linear.
-            aequiv = alo + (j - blo)
-            arange = range(max(aequiv - WINDOW, dump_i),
-                           min(aequiv + WINDOW + 1, ahi))
-            if not arange:
-                break
-            best_ratio = cutoff
-            for i in arange:
-                cruncher.set_seq1(a[i])
-                if (crqr() > best_ratio
-                        and cqr() > best_ratio
-                        and cr() > best_ratio):
-                    best_i, best_j, best_ratio = i, j, cr()
-
-            if best_i is None:
-                continue
-
-            # Lines before the synch pair are a plain replacement.
-            yield from self._fancy_helper(a, dump_i, best_i,
-                                          b, dump_j, best_j)
-            aelt, belt = a[best_i], b[best_j]
-            if aelt != belt:
-                atags = btags = ""
-                cruncher.set_seqs(aelt, belt)
-                for tag, ai1, ai2, bj1, bj2 in cruncher.get_opcodes():
-                    la, lb = ai2 - ai1, bj2 - bj1
-                    if tag == 'replace':
-                        atags += '^' * la
-                        btags += '^' * lb
-                    elif tag == 'delete':
-                        atags += '-' * la
-                    elif tag == 'insert':
-                        btags += '+' * lb
-                    elif tag == 'equal':
-                        atags += ' ' * la
-                        btags += ' ' * lb
-                    else:
-                        raise ValueError('unknown tag %r' % (tag,))
-                yield from self._qformat(aelt, belt, atags, btags)
-            else:
-                yield '  ' + aelt
-            dump_i, dump_j = best_i + 1, best_j + 1
-            best_i = best_j = None
-
-        yield from self._fancy_helper(a, dump_i, ahi, b, dump_j, bhi)
-
-    def _fancy_helper(self, a, alo, ahi, b, blo, bhi):
-        g = []
+    def _leftover(self, a, alo, ahi, b, blo, bhi):
         if alo < ahi:
             if blo < bhi:
-                g = self._plain_replace(a, alo, ahi, b, blo, bhi)
+                yield from self._block_replace(a, alo, ahi, b, blo, bhi)
             else:
-                g = self._dump('-', a, alo, ahi)
+                yield from self._prefixed('-', a, alo, ahi)
         elif blo < bhi:
-            g = self._dump('+', b, blo, bhi)
-        yield from g
+            yield from self._prefixed('+', b, blo, bhi)
 
-    def _qformat(self, aline, bline, atags, btags):
-        """Format the '-', '?', '+', '?' quad for a changed line pair."""
-        atags = _keep_original_ws(aline, atags).rstrip()
-        btags = _keep_original_ws(bline, btags).rstrip()
+    # Lines must be at least this similar to be shown as a changed pair.
+    _PAIR_CUTOFF = 0.74999
+    # How far from the "diagonal" a partner line is looked for.
+    _PAIR_WINDOW = 10
 
-        yield "- " + aline
-        if atags:
-            yield f"? {atags}\n"
+    def _similar_replace(self, a, alo, ahi, b, blo, bhi):
+        """Replace a[alo:ahi] by b[blo:bhi], pairing up similar lines.
 
-        yield "+ " + bline
-        if btags:
-            yield f"? {btags}\n"
+        The lines of b are taken in order; for each, the most similar line
+        of a not yet used, near the corresponding position, becomes its
+        partner if it is similar enough.  Lines between partners are shown
+        as plain deletions and insertions.
+        """
+        chars = SequenceMatcher(self.charjunk)
+        cutoff = self._PAIR_CUTOFF
+        window = self._PAIR_WINDOW
+        next_a, next_b = alo, blo         # first lines not yet shown
+        for j in range(blo, bhi):
+            chars.set_seq2(b[j])
+            middle = alo + (j - blo)
+            candidates = range(max(middle - window, next_a),
+                               min(middle + window + 1, ahi))
+            if not candidates:
+                break
+            partner = None
+            best = cutoff
+            for i in candidates:
+                chars.set_seq1(a[i])
+                if (chars.real_quick_ratio() > best and
+                        chars.quick_ratio() > best):
+                    score = chars.ratio()
+                    if score > best:
+                        partner, best = i, score
+            if partner is None:
+                continue
+            yield from self._leftover(a, next_a, partner, b, next_b, j)
+            old, new = a[partner], b[j]
+            if old == new:
+                yield '  ' + old
+            else:
+                old_marks = []
+                new_marks = []
+                chars.set_seqs(old, new)
+                for tag, i1, i2, j1, j2 in chars.get_opcodes():
+                    width_a, width_b = i2 - i1, j2 - j1
+                    if tag == 'equal':
+                        old_marks.append(' ' * width_a)
+                        new_marks.append(' ' * width_b)
+                    elif tag == 'replace':
+                        old_marks.append('^' * width_a)
+                        new_marks.append('^' * width_b)
+                    elif tag == 'delete':
+                        old_marks.append('-' * width_a)
+                    elif tag == 'insert':
+                        new_marks.append('+' * width_b)
+                    else:
+                        raise ValueError('unknown tag %r' % (tag,))
+                yield from self._hinted(old, new, ''.join(old_marks),
+                                        ''.join(new_marks))
+            next_a, next_b = partner + 1, j + 1
+        yield from self._leftover(a, next_a, ahi, b, next_b, bhi)
+
+    def _hinted(self, old, new, old_marks, new_marks):
+        old_marks = _guide_whitespace(old, old_marks).rstrip()
+        new_marks = _guide_whitespace(new, new_marks).rstrip()
+        yield '- ' + old
+        if old_marks:
+            yield f'? {old_marks}\n'
+        yield '+ ' + new
+        if new_marks:
+            yield f'? {new_marks}\n'
 
 
 def IS_LINE_JUNK(line, pat=None):
-    """Return True for ignorable lines: blank or containing only '#'
-    (or, with pat, lines matched by pat)."""
+    """Return True for a line that is blank or holds a single '#' (with
+    optional surrounding whitespace).  With pat given, return whether
+    pat(line) matched (is not None) instead.
+
+    >>> IS_LINE_JUNK('   \\n'), IS_LINE_JUNK('  # \\n'), IS_LINE_JUNK('x = 1\\n')
+    (True, True, False)
+    """
     if pat is None:
-        return line.strip() in '#'
+        return line.strip() in ('', '#')
     return pat(line) is not None
 
 
 def IS_CHARACTER_JUNK(ch, ws=" \t"):
-    """Return True for ignorable characters: space or tab."""
+    """Return True for a blank or a tab (the characters in ws).
+
+    >>> IS_CHARACTER_JUNK('\\t'), IS_CHARACTER_JUNK('\\n'), IS_CHARACTER_JUNK('x')
+    (True, False, False)
+    """
     return ch in ws
 
 
-########################################################################
-###  Unified Diff
-########################################################################
+# ---------------------------------------------------------------------------
+# unified and context diffs
 
 def _format_range_unified(start, stop):
-    'Convert range to the "ed" format'
-    beginning = start + 1
-    length = stop - start
-    if length == 1:
-        return '{}'.format(beginning)
-    if not length:
-        beginning -= 1
-    return '{},{}'.format(beginning, length)
+    """The "line[,count]" range of a unified diff hunk header (1-based;
+    an empty range names the line before it)."""
+    first = start + 1
+    count = stop - start
+    if count == 1:
+        return str(first)
+    if not count:
+        first -= 1
+    return f'{first},{count}'
+
+
+def _format_range_context(start, stop):
+    """The "first[,last]" range of a context diff hunk header."""
+    first = start + 1
+    count = stop - start
+    if not count:
+        first -= 1
+    if count <= 1:
+        return str(first)
+    return f'{first},{first + count - 1}'
+
+
+def _header_dates(fromfiledate, tofiledate):
+    return (f'\t{fromfiledate}' if fromfiledate else '',
+            f'\t{tofiledate}' if tofiledate else '')
 
 
 def unified_diff(a, b, fromfile='', tofile='', fromfiledate='',
                  tofiledate='', n=3, lineterm='\n', *, color=False):
-    """Compare two sequences of lines; generate the delta as a unified
-    diff with n lines of context.  With color=True the output is colored
-    with ANSI escapes (if colors are enabled)."""
-    from _colorize import can_colorize, get_theme
+    """Yield the differences between the line lists a and b in the
+    unified diff format, with n lines of context around changes.
 
-    if color and can_colorize():
-        t = get_theme(force_color=True).difflib
-    else:
-        t = get_theme(force_no_color=True).difflib
+    The file names and dates go into the "---"/"+++" header lines (a date
+    is joined to its name with a tab).  Header and hunk lines end with
+    lineterm; the content lines are passed on as they are, so for inputs
+    without line endings use lineterm=''.  color=True adds ANSI colors.
 
+    >>> old = ['alpha\\n', 'beta\\n', 'gamma\\n', 'delta\\n']
+    >>> new = ['alpha\\n', 'BETA\\n', 'gamma\\n', 'delta\\n', 'epsilon\\n']
+    >>> print(''.join(unified_diff(old, new, 'v1', 'v2', n=1)), end='')
+    --- v1
+    +++ v2
+    @@ -1,4 +1,5 @@
+     alpha
+    -beta
+    +BETA
+     gamma
+     delta
+    +epsilon
+    """
     _check_types(a, b, fromfile, tofile, fromfiledate, tofiledate, lineterm)
+    if color:
+        from _colorize import get_theme
+        theme = get_theme(force_color=True).difflib
+        header, hunk, reset = theme.header, theme.hunk, theme.reset
+        kept, removed, added = theme.context, theme.removed, theme.added
+    else:
+        header = hunk = reset = kept = removed = added = ''
     started = False
     for group in SequenceMatcher(None, a, b).get_grouped_opcodes(n):
         if not started:
             started = True
-            fromdate = '\t{}'.format(fromfiledate) if fromfiledate else ''
-            todate = '\t{}'.format(tofiledate) if tofiledate else ''
-            yield '{}--- {}{}{}{}'.format(t.header, fromfile, fromdate, lineterm, t.reset)
-            yield '{}+++ {}{}{}{}'.format(t.header, tofile, todate, lineterm, t.reset)
-
+            fromdate, todate = _header_dates(fromfiledate, tofiledate)
+            yield f'{header}--- {fromfile}{fromdate}{reset}{lineterm}'
+            yield f'{header}+++ {tofile}{todate}{reset}{lineterm}'
         first, last = group[0], group[-1]
-        file1_range = _format_range_unified(first[1], last[2])
-        file2_range = _format_range_unified(first[3], last[4])
-        yield '{}@@ -{} +{} @@{}{}'.format(t.hunk, file1_range, file2_range, lineterm, t.reset)
-
+        old_range = _format_range_unified(first[1], last[2])
+        new_range = _format_range_unified(first[3], last[4])
+        yield f'{hunk}@@ -{old_range} +{new_range} @@{reset}{lineterm}'
         for tag, i1, i2, j1, j2 in group:
             if tag == 'equal':
                 for line in a[i1:i2]:
-                    yield f'{t.context} {line}{t.reset}'
+                    yield f'{kept} {line}{reset}'
                 continue
-            if tag in {'replace', 'delete'}:
+            if tag != 'insert':
                 for line in a[i1:i2]:
-                    yield f'{t.removed}-{line}{t.reset}'
-            if tag in {'replace', 'insert'}:
+                    yield f'{removed}-{line}{reset}'
+            if tag != 'delete':
                 for line in b[j1:j2]:
-                    yield f'{t.added}+{line}{t.reset}'
+                    yield f'{added}+{line}{reset}'
 
 
-########################################################################
-###  Context Diff
-########################################################################
-
-def _format_range_context(start, stop):
-    'Convert range to the "ed" format'
-    beginning = start + 1
-    length = stop - start
-    if not length:
-        beginning -= 1
-    if length <= 1:
-        return '{}'.format(beginning)
-    return '{},{}'.format(beginning, beginning + length - 1)
+_CONTEXT_MARK = {'insert': '+ ', 'delete': '- ', 'replace': '! ',
+                 'equal': '  '}
 
 
-def context_diff(a, b, fromfile='', tofile='',
-                 fromfiledate='', tofiledate='', n=3, lineterm='\n'):
-    """Compare two sequences of lines; generate the delta as a context
-    diff with n lines of context."""
+def context_diff(a, b, fromfile='', tofile='', fromfiledate='',
+                 tofiledate='', n=3, lineterm='\n'):
+    """Yield the differences between the line lists a and b in the
+    context diff format, with n lines of context around changes.
+
+    Each hunk shows the old lines, then the new lines, marked '! '
+    (changed), '- ' (removed), '+ ' (added) or '  ' (context); a side
+    without changes is left out.  Names, dates and lineterm work as for
+    unified_diff().
+
+    >>> old = ['red\\n', 'green\\n', 'blue\\n']
+    >>> new = ['red\\n', 'teal\\n', 'blue\\n', 'pink\\n']
+    >>> print(''.join(context_diff(old, new, 'before', 'after')), end='')
+    *** before
+    --- after
+    ***************
+    *** 1,3 ****
+      red
+    ! green
+      blue
+    --- 1,4 ----
+      red
+    ! teal
+      blue
+    + pink
+    """
     _check_types(a, b, fromfile, tofile, fromfiledate, tofiledate, lineterm)
-    prefix = dict(insert='+ ', delete='- ', replace='! ', equal='  ')
     started = False
     for group in SequenceMatcher(None, a, b).get_grouped_opcodes(n):
         if not started:
             started = True
-            fromdate = '\t{}'.format(fromfiledate) if fromfiledate else ''
-            todate = '\t{}'.format(tofiledate) if tofiledate else ''
-            yield '*** {}{}{}'.format(fromfile, fromdate, lineterm)
-            yield '--- {}{}{}'.format(tofile, todate, lineterm)
-
+            fromdate, todate = _header_dates(fromfiledate, tofiledate)
+            yield f'*** {fromfile}{fromdate}{lineterm}'
+            yield f'--- {tofile}{todate}{lineterm}'
         first, last = group[0], group[-1]
         yield '***************' + lineterm
-
-        file1_range = _format_range_context(first[1], last[2])
-        yield '*** {} ****{}'.format(file1_range, lineterm)
-
-        if any(tag in {'replace', 'delete'} for tag, _, _, _, _ in group):
+        yield f'*** {_format_range_context(first[1], last[2])} ****{lineterm}'
+        if any(code[0] in ('replace', 'delete') for code in group):
             for tag, i1, i2, _, _ in group:
                 if tag != 'insert':
+                    mark = _CONTEXT_MARK[tag]
                     for line in a[i1:i2]:
-                        yield prefix[tag] + line
-
-        file2_range = _format_range_context(first[3], last[4])
-        yield '--- {} ----{}'.format(file2_range, lineterm)
-
-        if any(tag in {'replace', 'insert'} for tag, _, _, _, _ in group):
+                        yield mark + line
+        yield f'--- {_format_range_context(first[3], last[4])} ----{lineterm}'
+        if any(code[0] in ('replace', 'insert') for code in group):
             for tag, _, _, j1, j2 in group:
                 if tag != 'delete':
+                    mark = _CONTEXT_MARK[tag]
                     for line in b[j1:j2]:
-                        yield prefix[tag] + line
+                        yield mark + line
 
 
 def _check_types(a, b, *args):
-    # Check the inputs early instead of failing deep inside the diff.
-    if a and not isinstance(a[0], str):
-        raise TypeError('lines to compare must be str, not %s (%r)' %
-                        (type(a[0]).__name__, a[0]))
-    if b and not isinstance(b[0], str):
-        raise TypeError('lines to compare must be str, not %s (%r)' %
-                        (type(b[0]).__name__, b[0]))
-    if isinstance(a, str):
-        raise TypeError('input must be a sequence of strings, not %s' %
-                        type(a).__name__)
-    if isinstance(b, str):
-        raise TypeError('input must be a sequence of strings, not %s' %
-                        type(b).__name__)
+    # Mixing str and bytes would produce a garbled diff (or fail deep down);
+    # refuse it up front with a precise message.
+    for lines in (a, b):
+        if lines and not isinstance(lines[0], str):
+            raise TypeError('lines to compare must be str, not %s (%r)'
+                            % (type(lines[0]).__name__, lines[0]))
+    for lines in (a, b):
+        if isinstance(lines, str):
+            raise TypeError('input must be a sequence of strings, not %s'
+                            % type(lines).__name__)
     for arg in args:
         if not isinstance(arg, str):
             raise TypeError('all arguments must be str, not: %r' % (arg,))
 
 
-def diff_bytes(dfunc, a, b, fromfile=b'', tofile=b'',
-               fromfiledate=b'', tofiledate=b'', n=3, lineterm=b'\n'):
-    """Apply a str diff function (unified_diff or context_diff) to bytes
-    inputs, transparently (via ASCII + surrogateescape)."""
-    def decode(s):
-        try:
-            return s.decode('ascii', 'surrogateescape')
-        except AttributeError as err:
-            msg = ('all arguments must be bytes, not %s (%r)' %
-                   (type(s).__name__, s))
-            raise TypeError(msg) from err
-    a = list(map(decode, a))
-    b = list(map(decode, b))
-    fromfile = decode(fromfile)
-    tofile = decode(tofile)
-    fromfiledate = decode(fromfiledate)
-    tofiledate = decode(tofiledate)
-    lineterm = decode(lineterm)
+def diff_bytes(dfunc, a, b, fromfile=b'', tofile=b'', fromfiledate=b'',
+               tofiledate=b'', n=3, lineterm=b'\n'):
+    """Run dfunc (unified_diff or context_diff) on bytes.
 
-    lines = dfunc(a, b, fromfile, tofile, fromfiledate, tofiledate, n, lineterm)
+    All inputs (lines, names, dates, lineterm) must be bytes; they are
+    passed through losslessly (decoded as ASCII with surrogateescape and
+    encoded back), so the output is bytes in the inputs' encodings.
+    """
+    def as_text(value):
+        try:
+            return value.decode('ascii', 'surrogateescape')
+        except AttributeError as exc:
+            raise TypeError('all arguments must be bytes, not %s (%r)'
+                            % (type(value).__name__, value)) from exc
+
+    a = [as_text(line) for line in a]
+    b = [as_text(line) for line in b]
+    lines = dfunc(a, b, as_text(fromfile), as_text(tofile),
+                  as_text(fromfiledate), as_text(tofiledate), n,
+                  as_text(lineterm))
     for line in lines:
         yield line.encode('ascii', 'surrogateescape')
 
 
 def ndiff(a, b, linejunk=None, charjunk=IS_CHARACTER_JUNK):
-    """Compare a and b (lists of strings); return a Differ-style delta."""
+    """Return a Differ-style delta of the line lists a and b (a generator).
+
+    linejunk and charjunk are the junk predicates for lines and characters;
+    by default no line is junk and blanks and tabs are character junk.
+
+    >>> delta = ndiff(['one\\n', 'two\\n'], ['one\\n', 'too\\n'])
+    >>> print(''.join(delta), end='')
+      one
+    - two
+    ?  ^
+    + too
+    ?  ^
+    """
     return Differ(linejunk, charjunk).compare(a, b)
+
+
+def restore(delta, which):
+    """Recover one of the two line sequences an ndiff()/Differ delta was
+    made from: which=1 for the first, which=2 for the second.
+
+    >>> delta = list(ndiff(['ham\\n', 'eggs\\n'], ['ham\\n', 'spam\\n']))
+    >>> print(''.join(restore(delta, 1)), end='')
+    ham
+    eggs
+    >>> print(''.join(restore(delta, 2)), end='')
+    ham
+    spam
+    """
+    codes = {1: '- ', 2: '+ '}
+    try:
+        own = codes[int(which)]
+    except (KeyError, ValueError, TypeError):
+        raise ValueError('unknown delta choice (must be 1 or 2): %r'
+                         % (which,)) from None
+    for line in delta:
+        if line[:2] in ('  ', own):
+            yield line[2:]
+
+
+# ---------------------------------------------------------------------------
+# Side-by-side rows (used by HtmlDiff)
+#
+# A row is ((number, text), (number, text), changed).  Inside the texts,
+# "\0+", "\0-" and "\0^" open an added/removed/changed span and "\1" closes
+# it.  A filler cell is ('', '\n').  With context, rows far from changes
+# are dropped and (None, None, None) marks each gap.
+
+def _marked(text, code):
+    return '\0' + code + (text or ' ') + '\1'
+
+
+def _apply_hints(text, hints):
+    # Wrap each run of '+', '-' or '^' in the hint line around the same
+    # columns of text (the two-character prefixes line up).
+    spans = []
+    index, size = 0, len(hints)
+    while index < size:
+        code = hints[index]
+        if code in '+-^':
+            end = index + 1
+            while end < size and hints[end] == code:
+                end += 1
+            spans.append((index, end, code))
+            index = end
+        else:
+            index += 1
+    for start, end, code in reversed(spans):
+        text = (text[:start] + '\0' + code + text[start:end] + '\1' +
+                text[end:])
+    return text[2:]
+
+
+class _RowBuilder:
+    """Turn an ndiff delta into side-by-side rows.
+
+    The delta is read with a lookahead of four lines, classified by their
+    two-letter codes.  Old and new cells are queued separately and paired
+    up in order; filler cells are queued to realign both sides at the
+    points where a run of changes meets unchanged text.
+    """
+
+    _FILLER = ('', '\n')
+
+    # (code prefix of the lookahead, action), tried in order.
+    #   pair:     a changed pair, (old, new) cell styles; '?' consumes a
+    #             hint line, None is plain text
+    #   old/new:  a lone removed/added line; "sync" first realigns the
+    #             sides (counting this line), otherwise the imbalance is
+    #             only recorded
+    _RULES = (
+        ('-?+?', ('pair', '?', '?')),
+        ('--++', ('old', False)),
+        ('--?+', ('old', True)),
+        ('--+', ('old', True)),
+        ('- ', ('old', True)),
+        ('-+?', ('pair', None, '?')),
+        ('-?+', ('pair', '?', None)),
+        ('-', ('old', False)),
+        ('+--', ('new', False)),
+        ('+ ', ('new', True)),
+        ('+-', ('new', True)),
+        ('+', ('new', False)),
+        (' ', ('same',)),
+    )
+
+    def __init__(self, delta):
+        self._delta = iter(delta)
+        self._ahead = []
+        self._numbers = [0, 0]
+        self._old = []
+        self._new = []
+        self._balance = 0      # new cells minus old cells since last sync
+
+    def _cell(self, side, style):
+        self._numbers[side] += 1
+        line = self._ahead.pop(0)
+        if style is None:
+            text = line[2:]
+        elif style == '?':
+            text = _apply_hints(line, self._ahead.pop(0))
+        else:
+            text = _marked(line[2:], style)
+        return (self._numbers[side], text)
+
+    def _realign(self, extra):
+        missing = self._balance + extra
+        if missing < 0:
+            self._new.extend([(self._FILLER, True)] * -missing)
+        elif missing > 0:
+            self._old.extend([(self._FILLER, True)] * missing)
+        self._balance = 0
+
+    def rows(self):
+        ahead = self._ahead
+        old, new = self._old, self._new
+        while True:
+            while len(ahead) < 4:
+                ahead.append(next(self._delta, 'X'))
+            codes = ''.join(line[0] for line in ahead)
+            if codes[0] == 'X':
+                self._realign(0)
+            else:
+                for prefix, action in self._RULES:
+                    if codes.startswith(prefix):
+                        break
+                else:
+                    raise ValueError('unexpected delta line %r' % (ahead[0],))
+                kind = action[0]
+                if kind == 'pair':
+                    old.append((self._cell(0, action[1]), True))
+                    new.append((self._cell(1, action[2]), True))
+                elif kind == 'same':
+                    # one delta line provides both cells
+                    ahead.insert(0, ahead[0])
+                    old.append((self._cell(0, None), False))
+                    new.append((self._cell(1, None), False))
+                elif kind == 'old':
+                    if action[1]:
+                        self._realign(-1)
+                    else:
+                        self._balance -= 1
+                    old.append((self._cell(0, '-'), True))
+                else:
+                    if action[1]:
+                        self._realign(1)
+                    else:
+                        self._balance += 1
+                    new.append((self._cell(1, '+'), True))
+            while old and new:
+                (left, left_changed) = old.pop(0)
+                (right, right_changed) = new.pop(0)
+                yield left, right, left_changed or right_changed
+            if codes[0] == 'X':
+                return
+
+
+def _context_rows(rows, context):
+    # Keep the changed rows plus up to `context` rows before and after
+    # each; a (None, None, None) row stands for every gap.
+    rows = iter(rows)
+    before = []
+    skipped = False
+    for row in rows:
+        if not row[2]:
+            before.append(row)
+            if len(before) > context:
+                del before[0]
+                skipped = True
+            continue
+        if skipped:
+            yield None, None, None
+        yield from before
+        yield row
+        before = []
+        skipped = False
+        remaining = context
+        while remaining:
+            row = next(rows, None)
+            if row is None:
+                return
+            yield row
+            remaining = context if row[2] else remaining - 1
 
 
 def _mdiff(fromlines, tolines, context=None, linejunk=None,
            charjunk=IS_CHARACTER_JUNK):
-    """Yield ((from_lineno, from_text), (to_lineno, to_text), has_change)
-    triples for side-by-side display.  Changed text is bracketed with
-    '\\0+', '\\0-' or '\\0^' and '\\1'.  With context=n, only n lines of
-    context around changes are produced; None separates the hunks."""
-    import re
+    """Yield side-by-side rows for HtmlDiff (see the format above).
 
-    change_re = re.compile(r'(\++|\-+|\^+)')
-
-    diff_lines_iterator = ndiff(fromlines, tolines, linejunk, charjunk)
-
-    def _make_line(lines, format_key, side, num_lines=[0, 0]):
-        num_lines[side] += 1
-        if format_key is None:
-            return (num_lines[side], lines.pop(0)[2:])
-        if format_key == '?':
-            text, markers = lines.pop(0), lines.pop(0)
-            sub_info = []
-
-            def record_sub_info(match_object, sub_info=sub_info):
-                sub_info.append([match_object.group(1)[0], match_object.span()])
-                return match_object.group(1)
-            change_re.sub(record_sub_info, markers)
-            # Insert the markers from the end so that earlier spans stay
-            # valid.
-            for key, (begin, end) in reversed(sub_info):
-                text = text[0:begin] + '\0' + key + text[begin:end] + '\1' + text[end:]
-            text = text[2:]
-        else:
-            text = lines.pop(0)[2:]
-            if not text:
-                text = ' '
-            text = '\0' + format_key + text + '\1'
-        return (num_lines[side], text)
-
-    def _line_iterator():
-        """Yield (from_line, to_line, has_change) from the ndiff output."""
-        lines = []
-        num_blanks_pending, num_blanks_to_yield = 0, 0
-        while True:
-            # Look ahead far enough to recognise the ndiff patterns.
-            while len(lines) < 4:
-                lines.append(next(diff_lines_iterator, 'X'))
-            s = ''.join([line[0] for line in lines])
-            if s.startswith('X'):
-                # End of the diff: flush pending blanks.
-                num_blanks_to_yield = num_blanks_pending
-            elif s.startswith('-?+?'):
-                yield _make_line(lines, '?', 0), _make_line(lines, '?', 1), True
-                continue
-            elif s.startswith('--++'):
-                num_blanks_pending -= 1
-                yield _make_line(lines, '-', 0), None, True
-                continue
-            elif s.startswith(('--?+', '--+', '- ')):
-                from_line, to_line = _make_line(lines, '-', 0), None
-                num_blanks_to_yield, num_blanks_pending = num_blanks_pending - 1, 0
-            elif s.startswith('-+?'):
-                yield _make_line(lines, None, 0), _make_line(lines, '?', 1), True
-                continue
-            elif s.startswith('-?+'):
-                yield _make_line(lines, '?', 0), _make_line(lines, None, 1), True
-                continue
-            elif s.startswith('-'):
-                num_blanks_pending -= 1
-                yield _make_line(lines, '-', 0), None, True
-                continue
-            elif s.startswith('+--'):
-                num_blanks_pending += 1
-                yield None, _make_line(lines, '+', 1), True
-                continue
-            elif s.startswith(('+ ', '+-')):
-                from_line, to_line = None, _make_line(lines, '+', 1)
-                num_blanks_to_yield, num_blanks_pending = num_blanks_pending + 1, 0
-            elif s.startswith('+'):
-                num_blanks_pending += 1
-                yield None, _make_line(lines, '+', 1), True
-                continue
-            elif s.startswith(' '):
-                yield _make_line(lines[:], None, 0), _make_line(lines, None, 1), False
-                continue
-            # Balance additions/deletions with blank lines on the other side.
-            while num_blanks_to_yield < 0:
-                num_blanks_to_yield += 1
-                yield None, ('', '\n'), True
-            while num_blanks_to_yield > 0:
-                num_blanks_to_yield -= 1
-                yield ('', '\n'), None, True
-            if s.startswith('X'):
-                return
-            else:
-                yield from_line, to_line, True
-
-    def _line_pair_iterator():
-        """Pair up from/to lines (sides can lag behind each other)."""
-        line_iterator = _line_iterator()
-        fromlines, tolines = [], []
-        while True:
-            while (len(fromlines) == 0 or len(tolines) == 0):
-                try:
-                    from_line, to_line, found_diff = next(line_iterator)
-                except StopIteration:
-                    return
-                if from_line is not None:
-                    fromlines.append((from_line, found_diff))
-                if to_line is not None:
-                    tolines.append((to_line, found_diff))
-            from_line, fromDiff = fromlines.pop(0)
-            to_line, to_diff = tolines.pop(0)
-            yield (from_line, to_line, fromDiff or to_diff)
-
-    line_pair_iterator = _line_pair_iterator()
+    context is None for all rows, or the number of unchanged rows to keep
+    around each change.
+    """
+    rows = _RowBuilder(ndiff(fromlines, tolines, linejunk, charjunk)).rows()
     if context is None:
-        yield from line_pair_iterator
+        yield from rows
     else:
-        context += 1
-        lines_to_write = 0
-        while True:
-            # Keep the last `context` unchanged lines in a ring buffer.
-            index, contextLines = 0, [None] * context
-            found_diff = False
-            while found_diff is False:
-                try:
-                    from_line, to_line, found_diff = next(line_pair_iterator)
-                except StopIteration:
-                    return
-                i = index % context
-                contextLines[i] = (from_line, to_line, found_diff)
-                index += 1
-            if index > context:
-                # More context than wanted: separator, then the context.
-                yield None, None, None
-                lines_to_write = context
-            else:
-                lines_to_write = index
-                index = 0
-            while lines_to_write:
-                i = index % context
-                index += 1
-                yield contextLines[i]
-                lines_to_write -= 1
-            # Lines after the change, until enough unchanged ones followed.
-            lines_to_write = context - 1
-            try:
-                while lines_to_write:
-                    from_line, to_line, found_diff = next(line_pair_iterator)
-                    if found_diff:
-                        lines_to_write = context - 1
-                    else:
-                        lines_to_write -= 1
-                    yield from_line, to_line, found_diff
-            except StopIteration:
-                return
+        yield from _context_rows(rows, context)
 
 
-_file_template = """
+# ---------------------------------------------------------------------------
+# HtmlDiff
+#
+# The page, table and legend markup below is the documented output format.
+
+_PAGE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -758,7 +925,7 @@ _file_template = """
 
 </html>"""
 
-_styles = """
+_CSS = """
         :root {color-scheme: light dark}
         table.diff {
             font-family: Menlo, Consolas, Monaco, Liberation Mono, Lucida Console, monospace;
@@ -801,7 +968,7 @@ _styles = """
             table.diff[summary="Legends"] th{background-color:#666}
         }"""
 
-_table_template = """
+_TABLE = """
     <table class="diff" id="difflib_chg_%(prefix)s_top"
            cellspacing="0" cellpadding="0" rules="groups" >
         <colgroup></colgroup> <colgroup></colgroup> <colgroup></colgroup>
@@ -811,7 +978,7 @@ _table_template = """
 %(data_rows)s        </tbody>
     </table>"""
 
-_legend = """
+_LEGEND = """
     <table class="diff" summary="Legends">
         <tr> <th colspan="2"> Legends </th> </tr>
         <tr> <td> <table border="" summary="Colors">
@@ -828,21 +995,60 @@ _legend = """
                   </table></td> </tr>
     </table>"""
 
+_ROW = ('            <tr><td class="diff_next"%s>%s</td>%s'
+        '<td class="diff_next">%s</td>%s</tr>\n')
+_GAP = '        </tbody>        \n        <tbody>\n'
+_SPANS = (('\0+', '<span class="diff_add">'),
+          ('\0-', '<span class="diff_sub">'),
+          ('\0^', '<span class="diff_chg">'),
+          ('\1', '</span>'),
+          ('\t', '&nbsp;'))
 
-class HtmlDiff(object):
-    """Side-by-side HTML table (or complete file) of line differences
-    with intraline change highlights."""
 
-    _file_template = _file_template
-    _styles = _styles
-    _table_template = _table_template
-    _legend = _legend
+def _wrap_point(text, limit):
+    """Return (index, open_code): where to cut text so that at most limit
+    visible characters come before the cut (the span markers take no
+    room), and the code of the span still open there ('' if none)."""
+    index = shown = 0
+    size = len(text)
+    open_code = ''
+    while shown < limit and index < size:
+        char = text[index]
+        if char == '\0':
+            open_code = text[index + 1]
+            index += 2
+        elif char == '\1':
+            open_code = ''
+            index += 1
+        else:
+            index += 1
+            shown += 1
+    return index, open_code
+
+
+class HtmlDiff:
+    """Render a side-by-side comparison of two lists of lines as HTML.
+
+    make_table() returns a table, make_file() a complete page that includes
+    the table and a legend.  Changed lines are highlighted with intraline
+    markup; each table carries anchors and links to jump between changes.
+
+    The class attributes _file_template, _styles, _table_template and
+    _legend hold the markup and may be replaced in a subclass.
+    """
+
+    _file_template = _PAGE
+    _styles = _CSS
+    _table_template = _TABLE
+    _legend = _LEGEND
+    # Counter that makes the anchors of every table unique.
     _default_prefix = 0
 
     def __init__(self, tabsize=8, wrapcolumn=None, linejunk=None,
                  charjunk=IS_CHARACTER_JUNK):
-        """tabsize: tab stop spacing; wrapcolumn: column at which to wrap
-        lines (None: no wrapping); linejunk/charjunk: passed to ndiff."""
+        """tabsize: columns per tab stop for tab expansion;
+        wrapcolumn: wrap lines longer than this (None: no wrapping);
+        linejunk, charjunk: junk predicates passed on to ndiff()."""
         self._tabsize = tabsize
         self._wrapcolumn = wrapcolumn
         self._linejunk = linejunk
@@ -850,224 +1056,155 @@ class HtmlDiff(object):
 
     def make_file(self, fromlines, tolines, fromdesc='', todesc='',
                   context=False, numlines=5, *, charset='utf-8'):
-        """Return a complete HTML file comparing fromlines and tolines."""
-        return (self._file_template % dict(
-            styles=self._styles,
-            legend=self._legend,
+        """Return a complete HTML page comparing fromlines with tolines.
+
+        fromdesc/todesc are the column headings; with context=True only
+        changes and numlines lines around them are shown (numlines also
+        places the targets of the "next change" links); characters the
+        charset cannot encode become character references.
+        """
+        page = self._file_template % dict(
+            styles=self._styles, legend=self._legend, charset=charset,
             table=self.make_table(fromlines, tolines, fromdesc, todesc,
-                                  context=context, numlines=numlines),
-            charset=charset
-        )).encode(charset, 'xmlcharrefreplace').decode(charset)
-
-    def _tab_newline_replace(self, fromlines, tolines):
-        """Expand tabs and remove newlines (keeping the change markers)."""
-        def expand_tabs(line):
-            # Protect spaces from expandtabs with \0 placeholders.
-            line = line.replace(' ', '\0')
-            line = line.expandtabs(self._tabsize)
-            line = line.replace(' ', '\t')
-            return line.replace('\0', ' ').rstrip('\n')
-        fromlines = [expand_tabs(line) for line in fromlines]
-        tolines = [expand_tabs(line) for line in tolines]
-        return fromlines, tolines
-
-    def _split_line(self, data_list, line_num, text):
-        """Split text into pieces of at most wrapcolumn characters (not
-        counting markers), re-opening the markers on each piece."""
-        if not line_num:
-            data_list.append((line_num, text))
-            return
-
-        size = len(text)
-        max = self._wrapcolumn
-        if (size <= max) or ((size - (text.count('\0') * 3)) <= max):
-            data_list.append((line_num, text))
-            return
-
-        i = 0
-        n = 0
-        mark = ''
-        while n < max and i < size:
-            if text[i] == '\0':
-                i += 1
-                mark = text[i]
-                i += 1
-            elif text[i] == '\1':
-                i += 1
-                mark = ''
-            else:
-                i += 1
-                n += 1
-
-        line1 = text[:i]
-        line2 = text[i:]
-
-        if mark:
-            line1 = line1 + '\1'
-            line2 = '\0' + mark + line2
-
-        data_list.append((line_num, line1))
-        self._split_line(data_list, '>', line2)
-
-    def _line_wrapper(self, diffs):
-        """Wrap long lines of the (from, to, flag) triples."""
-        for fromdata, todata, flag in diffs:
-            if flag is None:
-                yield fromdata, todata, flag
-                continue
-            (fromline, fromtext), (toline, totext) = fromdata, todata
-            fromlist, tolist = [], []
-            self._split_line(fromlist, fromline, fromtext)
-            self._split_line(tolist, toline, totext)
-            while fromlist or tolist:
-                if fromlist:
-                    fromdata = fromlist.pop(0)
-                else:
-                    fromdata = ('', ' ')
-                if tolist:
-                    todata = tolist.pop(0)
-                else:
-                    todata = ('', ' ')
-                yield fromdata, todata, flag
-
-    def _collect_lines(self, diffs):
-        """Collect the formatted from/to rows and the change flags."""
-        fromlist, tolist, flaglist = [], [], []
-        for fromdata, todata, flag in diffs:
-            try:
-                fromlist.append(self._format_line(0, flag, *fromdata))
-                tolist.append(self._format_line(1, flag, *todata))
-            except TypeError:
-                # A hunk separator.
-                fromlist.append(None)
-                tolist.append(None)
-            flaglist.append(flag)
-        return fromlist, tolist, flaglist
-
-    def _format_line(self, side, flag, linenum, text):
-        """Return the line number and text cells of one row side."""
-        try:
-            linenum = '%d' % linenum
-            id = ' id="%s%s"' % (self._prefix[side], linenum)
-        except TypeError:
-            # Continuation lines ('>') and blank fillers have no id.
-            id = ''
-        text = text.replace("&", "&amp;").replace(">", "&gt;").replace("<", "&lt;")
-        text = text.replace(' ', '&nbsp;').rstrip()
-        if flag:
-            return ('<td class="diff_header"%s>%s</td><td class="diff_changed" nowrap="nowrap">%s</td>'
-                    % (id, linenum, text))
-        return ('<td class="diff_header"%s>%s</td><td nowrap="nowrap">%s</td>'
-                % (id, linenum, text))
-
-    def _make_prefix(self):
-        """Create the unique anchor prefixes of one table."""
-        fromprefix = "from%d_" % HtmlDiff._default_prefix
-        toprefix = "to%d_" % HtmlDiff._default_prefix
-        HtmlDiff._default_prefix += 1
-        self._prefix = [fromprefix, toprefix]
-
-    def _convert_flags(self, fromlist, tolist, flaglist, context, numlines):
-        """Build the 'next change' navigation column."""
-        toprefix = self._prefix[1]
-
-        next_id = [''] * len(flaglist)
-        next_href = [''] * len(flaglist)
-        num_chg, in_change = 0, False
-        last = 0
-        for i, flag in enumerate(flaglist):
-            if flag:
-                if not in_change:
-                    in_change = True
-                    last = i
-                    # Anchor a few lines before the change.
-                    i = max([0, i - numlines])
-                    next_id[i] = ' id="difflib_chg_%s_%d"' % (toprefix, num_chg)
-                    num_chg += 1
-                    next_href[last] = '<a href="#difflib_chg_%s_%d">n</a>' % (
-                        toprefix, num_chg)
-            else:
-                in_change = False
-        if not flaglist:
-            flaglist = [False]
-            next_id = ['']
-            next_href = ['']
-            last = 0
-            if context:
-                fromlist = ['<td></td><td>&nbsp;No Differences Found&nbsp;</td>']
-                tolist = fromlist
-            else:
-                fromlist = tolist = ['<td></td><td>&nbsp;Empty File&nbsp;</td>']
-        if not flaglist[0]:
-            next_href[0] = '<a href="#difflib_chg_%s_0">f</a>' % toprefix
-        next_href[last] = '<a href="#difflib_chg_%s_top">t</a>' % (toprefix)
-
-        return fromlist, tolist, flaglist, next_href, next_id
+                                  context=context, numlines=numlines))
+        return page.encode(charset, 'xmlcharrefreplace').decode(charset)
 
     def make_table(self, fromlines, tolines, fromdesc='', todesc='',
                    context=False, numlines=5):
-        """Return an HTML table comparing fromlines and tolines; with
-        context=True only numlines lines of context around changes."""
-        self._make_prefix()
-
-        fromlines, tolines = self._tab_newline_replace(fromlines, tolines)
-
-        if context:
-            context_lines = numlines
-        else:
-            context_lines = None
-        diffs = _mdiff(fromlines, tolines, context_lines, linejunk=self._linejunk,
-                       charjunk=self._charjunk)
-
+        """Return an HTML table comparing fromlines with tolines (see
+        make_file() for the arguments)."""
+        self._next_prefix()
+        old = [self._visible_tabs(line) for line in fromlines]
+        new = [self._visible_tabs(line) for line in tolines]
+        rows = _mdiff(old, new, numlines if context else None,
+                      linejunk=self._linejunk, charjunk=self._charjunk)
         if self._wrapcolumn:
-            diffs = self._line_wrapper(diffs)
-
-        fromlist, tolist, flaglist = self._collect_lines(diffs)
-
-        fromlist, tolist, flaglist, next_href, next_id = self._convert_flags(
-            fromlist, tolist, flaglist, context, numlines)
-
-        s = []
-        fmt = ('            <tr><td class="diff_next"%s>%s</td>%s' +
-               '<td class="diff_next">%s</td>%s</tr>\n')
-        for i in range(len(flaglist)):
-            if flaglist[i] is None:
-                # Hunk separator (only produced in context mode).
-                if i > 0:
-                    s.append('        </tbody>        \n        <tbody>\n')
+            rows = self._wrapped(rows)
+        cells_old, cells_new, flags = self._cells(rows)
+        ids, links, cells_old, cells_new, flags = self._navigation(
+            cells_old, cells_new, flags, context, numlines)
+        body = []
+        for index, flag in enumerate(flags):
+            if flag is None:
+                if index:
+                    body.append(_GAP)
             else:
-                s.append(fmt % (next_id[i], next_href[i], fromlist[i],
-                                next_href[i], tolist[i]))
+                body.append(_ROW % (ids[index], links[index],
+                                    cells_old[index], links[index],
+                                    cells_new[index]))
         if fromdesc or todesc:
-            header_row = '<thead><tr>%s%s%s%s</tr></thead>' % (
-                '<th class="diff_next"><br /></th>',
-                '<th colspan="2" class="diff_header">%s</th>' % fromdesc,
-                '<th class="diff_next"><br /></th>',
-                '<th colspan="2" class="diff_header">%s</th>' % todesc)
+            header_row = (
+                '<thead><tr><th class="diff_next"><br /></th>'
+                f'<th colspan="2" class="diff_header">{fromdesc}</th>'
+                '<th class="diff_next"><br /></th>'
+                f'<th colspan="2" class="diff_header">{todesc}</th>'
+                '</tr></thead>')
         else:
             header_row = ''
-
         table = self._table_template % dict(
-            data_rows=''.join(s),
-            header_row=header_row,
+            data_rows=''.join(body), header_row=header_row,
             prefix=self._prefix[1])
+        for marker, markup in _SPANS:
+            table = table.replace(marker, markup)
+        return table
 
-        return table.replace('\0+', '<span class="diff_add">'). \
-                     replace('\0-', '<span class="diff_sub">'). \
-                     replace('\0^', '<span class="diff_chg">'). \
-                     replace('\1', '</span>'). \
-                     replace('\t', '&nbsp;')
+    def _next_prefix(self):
+        number = HtmlDiff._default_prefix
+        HtmlDiff._default_prefix += 1
+        self._prefix = ['from%d_' % number, 'to%d_' % number]
 
+    def _visible_tabs(self, line):
+        # Expand tabs, keeping the expansion distinguishable from real
+        # blanks (as '\t', rendered as &nbsp; at the very end) so that a
+        # tab/space change shows up; drop trailing newlines.
+        line = line.replace(' ', '\0').expandtabs(self._tabsize)
+        return line.replace(' ', '\t').replace('\0', ' ').rstrip('\n')
 
-def restore(delta, which):
-    """Return one of the two sequences that produced a Differ/ndiff delta
-    (which=1: the first, which=2: the second)."""
-    try:
-        tag = {1: "- ", 2: "+ "}[int(which)]
-    except KeyError:
-        raise ValueError('unknown delta choice (must be 1 or 2): %r'
-                         % which) from None
-    prefixes = ("  ", tag)
-    for line in delta:
-        if line[:2] in prefixes:
-            yield line[2:]
+    def _wrapped(self, rows):
+        filler = ('', ' ')
+        for old, new, flag in rows:
+            if flag is None:
+                yield old, new, flag
+                continue
+            old_parts = self._split(*old)
+            new_parts = self._split(*new)
+            for index in range(max(len(old_parts), len(new_parts))):
+                yield (old_parts[index] if index < len(old_parts) else filler,
+                       new_parts[index] if index < len(new_parts) else filler,
+                       flag)
+
+    def _split(self, number, text):
+        limit = self._wrapcolumn
+        if not number:
+            return [(number, text)]
+        parts = []
+        while (len(text) > limit and
+               len(text) - 3 * text.count('\0') > limit):
+            cut, open_code = _wrap_point(text, limit)
+            head, text = text[:cut], text[cut:]
+            if open_code:
+                head += '\1'
+                text = '\0' + open_code + text
+            parts.append((number, head))
+            number = '>'
+        parts.append((number, text))
+        return parts
+
+    def _cells(self, rows):
+        cells_old, cells_new, flags = [], [], []
+        for old, new, flag in rows:
+            if flag is None:
+                cells_old.append(None)
+                cells_new.append(None)
+            else:
+                cells_old.append(self._cell(0, flag, *old))
+                cells_new.append(self._cell(1, flag, *new))
+            flags.append(flag)
+        return cells_old, cells_new, flags
+
+    def _cell(self, side, changed, number, text):
+        if isinstance(number, int):
+            number = '%d' % number
+            anchor = f' id="{self._prefix[side]}{number}"'
+        else:
+            anchor = ''
+        text = text.replace('&', '&amp;').replace('>', '&gt;')
+        text = text.replace('<', '&lt;').replace(' ', '&nbsp;').rstrip()
+        style = ' class="diff_changed"' if changed else ''
+        return (f'<td class="diff_header"{anchor}>{number}</td>'
+                f'<td{style} nowrap="nowrap">{text}</td>')
+
+    def _navigation(self, cells_old, cells_new, flags, context, numlines):
+        # Each block of changed rows gets an anchor numlines rows above it,
+        # and its first row links to the next block ("n"); the first row
+        # links to the first block ("f") unless a block starts there, and
+        # the last block links back to the top of the table ("t").
+        target = self._prefix[1]
+        ids = [''] * len(flags)
+        links = [''] * len(flags)
+        blocks = 0
+        last_start = 0
+        inside = False
+        for index, flag in enumerate(flags):
+            if not flag:
+                inside = False
+                continue
+            if inside:
+                continue
+            inside = True
+            last_start = index
+            ids[max(0, index - numlines)] = (
+                f' id="difflib_chg_{target}_{blocks}"')
+            blocks += 1
+            links[index] = f'<a href="#difflib_chg_{target}_{blocks}">n</a>'
+        if not flags:
+            note = 'No Differences Found' if context else 'Empty File'
+            cells_old = cells_new = [f'<td></td><td>&nbsp;{note}&nbsp;</td>']
+            flags = [False]
+            ids = ['']
+            links = ['']
+            last_start = 0
+        if not flags[0]:
+            links[0] = f'<a href="#difflib_chg_{target}_0">f</a>'
+        links[last_start] = f'<a href="#difflib_chg_{target}_top">t</a>'
+        return ids, links, cells_old, cells_new, flags

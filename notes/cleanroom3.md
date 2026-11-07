@@ -56,6 +56,31 @@
     `_pprint_*`, `_format*`) no longer exist (nothing in Lib, crates or spec uses them).
   - Validation messages are own wording (no test asserts them).
 
+### difflib.py (rewritten)
+- test_difflib 41 ok -> 54 ok (13 more own doctest examples; the byte-exact
+  test_difflib_expect.html comparison passes); test_unittest, test_doctest, test_argparse,
+  test_genericalias, test___all__, test_pydoc, test_inspect, test_traceback = (all pass).
+- Kept (pinned): `_mdiff(fromlines, tolines, context=None, linejunk=None, charjunk=...)` and
+  its row format, `_format_range_unified`, `_format_range_context`, `HtmlDiff._default_prefix`
+  (test sets it), every message test_difflib asserts, the HTML markup (taken from the expected
+  file), the SequenceMatcher attributes `a b isjunk autojunk b2j bjunk bpopular`, and the
+  HtmlDiff class attributes `_file_template _styles _table_template _legend` (the known way to
+  restyle the output).  Dropped: `__chain_b`, `_fancy_replace/_fancy_helper/_plain_replace/
+  _qformat/_dump`, `_keep_original_ws`, `_calculate_ratio`, `_check_types` stays (own body),
+  `HtmlDiff._split_line/_line_wrapper/_collect_lines/_format_line/_make_prefix/
+  _convert_flags/_tab_newline_replace`, `fullbcount`, `matching_blocks`/`opcodes` attributes.
+- New structure: `_RowBuilder` turns the ndiff delta into side-by-side rows with an ordered
+  rule table (lookahead code prefix -> action) and two cell queues; `_context_rows` keeps
+  `context` rows around changes; `_wrap_point`/`HtmlDiff._split` wrap marked-up text;
+  `HtmlDiff._navigation` builds the anchors/links.  Differ pairs similar lines by scanning the
+  b lines in order with a +-10 line window (`_similar_replace`), no recursion.
+- Differential fuzzing against the old file (1500 random line/character inputs x
+  SequenceMatcher opcodes/grouped/ratios, ndiff, unified, context, get_close_matches, HtmlDiff
+  with/without context and wrapping): 0 differences.
+- Behaviour change: get_grouped_opcodes() no longer rewrites the first/last entries of the
+  cached get_opcodes() list (it works on a copy).  Timing ~equal (opcodes/ndiff/unified on a
+  1000-line file, char ratio, HtmlDiff).
+
 ## Reviewed: own text and structure, no action needed
 (none yet)
 
