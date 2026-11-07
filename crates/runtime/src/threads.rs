@@ -156,6 +156,12 @@ thread_local! {
     static AUTO_ATTACHED: AutoAttached = const { AutoAttached(Cell::new(std::ptr::null_mut())) };
 }
 
+/// Retire `ts` when the calling OS thread exits, unless it was retired before
+/// (states created for foreign threads by PyGILState_Ensure).
+pub fn retire_at_thread_exit(ts: *mut ThreadState) {
+    let _ = AUTO_ATTACHED.try_with(|g| g.0.set(ts));
+}
+
 #[cold]
 fn attach_new() -> &'static ThreadState {
     let ts = new_thread_state();
