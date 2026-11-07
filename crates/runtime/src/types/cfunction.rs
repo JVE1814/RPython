@@ -199,7 +199,8 @@ fn raw_doc(o: &PyObject) -> Option<String> {
     }
 }
 fn get_doc(o: &PyObject) -> PyResult {
-    match raw_doc(o).and_then(|d| crate::types::descr::doc_without_signature(&d)) {
+    // an empty docstring reads as no docstring
+    match raw_doc(o).filter(|d| !d.is_empty()).and_then(|d| crate::types::descr::doc_without_signature(&d)) {
         Some(s) => Ok(pystr::new_str(&s)),
         None => Ok(none::none_ref()),
     }

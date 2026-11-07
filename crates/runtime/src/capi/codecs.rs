@@ -36,28 +36,57 @@ pub unsafe extern "C" fn PyCodec_KnownEncoding(enc: *const c_char) -> c_int {
         }
     }
 }
+/// The encoding name argument (NULL is a bad argument).
+unsafe fn enc_name(enc: *const c_char) -> PyResult {
+    unsafe {
+        if enc.is_null() {
+            return Err(type_error("bad argument type for built-in operation"));
+        }
+        cstr_obj(enc)
+    }
+}
+/// The errors argument (NULL means strict).
+unsafe fn errors_name(errors: *const c_char) -> PyResult {
+    unsafe { if errors.is_null() { Ok(pystr::new_str("strict")) } else { cstr_obj(errors) } }
+}
 unsafe fn lookup(enc: *const c_char) -> PyResult {
     unsafe {
-        let e = cstr_obj(enc)?;
+        let e = enc_name(enc)?;
         call_codecs("lookup", &[&e])
     }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyCodec_Encode(o: *mut PyObject, enc: *const c_char, errors: *const c_char) -> *mut PyObject {
-    unsafe { ret((|| call_codecs("encode", &[&*o, &*opt_str(enc)?, &*opt_str(errors)?]))()) }
+    unsafe {
+        ret((|| {
+            let o = super::nn(o).map_err(|_| { clear_exc(); type_error("bad argument type for built-in operation") })?;
+            call_codecs("encode", &[o, &*enc_name(enc)?, &*errors_name(errors)?])
+        })())
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyCodec_Decode(o: *mut PyObject, enc: *const c_char, errors: *const c_char) -> *mut PyObject {
-    unsafe { ret((|| call_codecs("decode", &[&*o, &*opt_str(enc)?, &*opt_str(errors)?]))()) }
+    unsafe {
+        ret((|| {
+            let o = super::nn(o).map_err(|_| { clear_exc(); type_error("bad argument type for built-in operation") })?;
+            call_codecs("decode", &[o, &*enc_name(enc)?, &*errors_name(errors)?])
+        })())
+    }
 }
 unsafe fn codec_item(enc: *const c_char, idx: usize) -> *mut PyObject {
     unsafe {
         ret((|| {
             let ci = lookup(enc)?;
-            if tuple::is_tuple(&ci) {
-                return Ok(tuple::tuple_get(&ci, idx).to_ref());
+            // a CodecInfo is a 4-tuple (encode, decode, reader, writer) with attributes
+            let attr = ["encode", "decode", "incrementalencoder", "incrementaldecoder", "streamreader", "streamwriter"][idx];
+            if !tuple::is_tuple(&ci) || crate::types::typeobject::is_heap_type(ci.type_ptr()) {
+                return ab::getattr_str(&ci, attr);
             }
-            ab::getattr_str(&ci, ["encode", "decode", "incrementalencoder", "incrementaldecoder", "streamreader", "streamwriter"][idx])
+            let ti = [0usize, 1, usize::MAX, usize::MAX, 2, 3][idx];
+            if ti < tuple::tuple_len(&ci) {
+                return Ok(tuple::tuple_get(&ci, ti).to_ref());
+            }
+            Err(crate::err!(AttributeError, "codec has no {}", attr))
         })())
     }
 }

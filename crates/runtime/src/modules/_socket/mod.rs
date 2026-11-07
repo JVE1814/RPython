@@ -1466,6 +1466,23 @@ pub fn init() -> PyResult {
     let oserr = type_ref(crate::types::exceptions::OSError());
     dict::set_item_str(&d, "error", &oserr)?;
     dict::set_item_str(&d, "timeout", &type_ref(crate::types::exceptions::TimeoutError()))?;
+    // C API capsule: { socket type, socket.error, socket.timeout } (capi2)
+    {
+        struct SockCapi([*mut std::ffi::c_void; 3]);
+        unsafe impl Sync for SockCapi {}
+        unsafe impl Send for SockCapi {}
+        static CAPI: std::sync::OnceLock<SockCapi> = std::sync::OnceLock::new();
+        let t = CAPI.get_or_init(|| {
+            SockCapi([
+                sock_type() as *mut std::ffi::c_void,
+                crate::types::exceptions::OSError() as *mut std::ffi::c_void,
+                crate::types::exceptions::TimeoutError() as *mut std::ffi::c_void,
+            ])
+        });
+        let cap = unsafe { crate::capi::capsule::PyCapsule_New(t.0.as_ptr() as *mut std::ffi::c_void, c"_socket.CAPI".as_ptr(), None) };
+        let cap = unsafe { crate::errors::from_c(cap) }?;
+        dict::set_item_str(&d, "CAPI", &cap)?;
+    }
     let h = new_exc("herror", &oserr, &d)?;
     HERROR.store(h.into_raw(), Ordering::Release);
     let g = new_exc("gaierror", &oserr, &d)?;

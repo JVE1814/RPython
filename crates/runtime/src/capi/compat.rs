@@ -18,7 +18,13 @@ pub unsafe extern "C" fn PyCFunction_Call(f: *mut PyObject, args: *mut PyObject,
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyImport_ImportModuleNoBlock(name: *const c_char) -> *mut PyObject {
-    unsafe { super::import::PyImport_ImportModule(name) }
+    unsafe {
+        // deprecated alias of PyImport_ImportModule (capi2)
+        if crate::modules::warnings::warn(crate::types::exceptions::DeprecationWarning(), "PyImport_ImportModuleNoBlock() is deprecated; use PyImport_ImportModule()", 1).is_err() {
+            return std::ptr::null_mut();
+        }
+        super::import::PyImport_ImportModule(name)
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyWeakref_GetObject(r: *mut PyObject) -> *mut PyObject {

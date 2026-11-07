@@ -76,7 +76,8 @@ pub static MON_ANY: AtomicU32 = AtomicU32::new(0);
 pub static TRACERS: AtomicUsize = AtomicUsize::new(0);
 
 pub fn recompute_tracing() {
-    let any = MON_ANY.load(Acquire) != 0 || TRACERS.load(Acquire) > 0;
+    // (capi2) an observe-every-frame PEP 523 hook needs the same "no compiled code" mode
+    let any = MON_ANY.load(Acquire) != 0 || TRACERS.load(Acquire) > 0 || crate::interp::pep523::forces_interpreter();
     crate::modules::sys::TRACING.store(any, Release);
 }
 

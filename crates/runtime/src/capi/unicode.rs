@@ -685,7 +685,21 @@ pub unsafe extern "C" fn PyUnicode_DecodeUTF7(s: *const c_char, size: Py_ssize_t
 unsafe fn decode_utf_16_32(name: &str, s: *const c_char, size: Py_ssize_t, errors: *const c_char, byteorder: *mut c_int, consumed: *mut Py_ssize_t) -> *mut PyObject {
     unsafe {
         let bo = if byteorder.is_null() { 0 } else { *byteorder };
-        let r = decode_stateful_via_codecs(&format!("{}_ex_decode", name), raw(s, size), errors, &[int::new_int(bo as i64)], consumed);
+        let data = raw(s, size);
+        let r = decode_stateful_via_codecs(&format!("{}_ex_decode", name), data, errors, &[int::new_int(bo as i64)], consumed);
+        // with native order requested, a byte order mark tells the caller which order it was
+        if !r.is_null() && !byteorder.is_null() && bo == 0 {
+            let found = if name == "utf_16" {
+                if data.starts_with(b"\xff\xfe") { -1 } else if data.starts_with(b"\xfe\xff") { 1 } else { 0 }
+            } else if data.starts_with(b"\xff\xfe\0\0") {
+                -1
+            } else if data.starts_with(b"\0\0\xfe\xff") {
+                1
+            } else {
+                0
+            };
+            *byteorder = found;
+        }
         r
     }
 }
@@ -726,7 +740,9 @@ pub unsafe extern "C" fn PyUnicode_AsCharmapString(o: *mut PyObject, mapping: *m
     unsafe {
         let Ok(s) = ustr(o) else { return std::ptr::null_mut() };
         if mapping.is_null() {
-            return encode_impl(s, "latin-1", std::ptr::null());
+            let _ = s;
+            let _ = type_error("bad argument type for built-in operation");
+            return std::ptr::null_mut();
         }
         ret((|| -> PyResult {
             let codecs = crate::import::import_absolute("_codecs")?;

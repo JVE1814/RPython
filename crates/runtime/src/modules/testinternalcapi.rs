@@ -203,7 +203,28 @@ fn get_static_builtin_types(_m: &PyObject) -> PyResult {
 }
 
 fn is_specialization_enabled(_m: &PyObject) -> PyResult {
-    Ok(bool_::new_bool(false))
+    Ok(bool_::new_bool(crate::interp::pep523::specialization_enabled()))
+}
+
+/// set_eval_frame_record(list) / set_eval_frame_interp(list) / set_eval_frame_default():
+/// PEP 523 frame-evaluation hooks recording code names (interp/pep523.rs). (capi2)
+fn set_eval_frame_record(_m: &PyObject, l: &PyObject) -> PyResult {
+    if !list::is_list(l) {
+        raise!(TypeError, "argument must be a list");
+    }
+    crate::interp::pep523::install(crate::interp::pep523::ALL, Some(l));
+    Ok(none::none_ref())
+}
+fn set_eval_frame_interp(_m: &PyObject, l: &PyObject) -> PyResult {
+    if !list::is_list(l) {
+        raise!(TypeError, "argument must be a list");
+    }
+    crate::interp::pep523::install(crate::interp::pep523::OUTER, Some(l));
+    Ok(none::none_ref())
+}
+fn set_eval_frame_default(_m: &PyObject) -> PyResult {
+    crate::interp::pep523::install(crate::interp::pep523::NONE, None);
+    Ok(none::none_ref())
 }
 
 fn get_rare_event_counters(_m: &PyObject) -> PyResult {
@@ -425,6 +446,41 @@ fn transform_decimal_and_space(_m: &PyObject, s: &PyObject) -> PyResult {
     Ok(pystr::new_str(&out))
 }
 
+/// normalize_path(path): lexical normalisation of a path (dot segments, repeated
+/// separators; a leading "//" but not "///" is kept). (capi2)
+fn normalize_path(_m: &PyObject, p: &PyObject) -> PyResult {
+    let s: Vec<u32> = if pystr::is_str(p) { pystr::str_data(p).iter().collect() } else { raise!(TypeError, "normalize_path() argument must be str") };
+    let slash = '/' as u32;
+    let lead = if s.len() >= 2 && s[0] == slash && s[1] == slash && s.get(2) != Some(&slash) { 2 } else if s.first() == Some(&slash) { 1 } else { 0 };
+    let mut parts: Vec<&[u32]> = Vec::new();
+    for comp in s[lead..].split(|&c| c == slash) {
+        if comp.is_empty() || comp == ['.' as u32] {
+            continue;
+        }
+        if comp == ['.' as u32, '.' as u32] {
+            if parts.last().is_some_and(|l| *l != ['.' as u32, '.' as u32]) {
+                parts.pop();
+                continue;
+            }
+            if lead > 0 {
+                continue;
+            }
+        }
+        parts.push(comp);
+    }
+    let mut out: Vec<u32> = vec![slash; lead];
+    for (i, comp) in parts.iter().enumerate() {
+        if i > 0 {
+            out.push(slash);
+        }
+        out.extend_from_slice(comp);
+    }
+    if out.is_empty() {
+        out.push('.' as u32);
+    }
+    Ok(pystr::from_codepoints(&out))
+}
+
 pub fn init() -> PyResult {
     let m = crate::types::module::new_module("_testinternalcapi")?;
     let d = crate::types::module::module_dict(&m);
@@ -435,6 +491,10 @@ pub fn init() -> PyResult {
             ("module_get_gc_hooks", O, module_get_gc_hooks),
             ("get_configs", NOARGS, get_configs),
             ("_pyerr_setkeyerror", O, pyerr_setkeyerror),
+            ("normalize_path", O, normalize_path),
+            ("set_eval_frame_record", O, set_eval_frame_record),
+            ("set_eval_frame_interp", O, set_eval_frame_interp),
+            ("set_eval_frame_default", NOARGS, set_eval_frame_default),
             ("_PyUnicode_TransformDecimalAndSpaceToASCII", O, transform_decimal_and_space),
             ("gh_119213_getargs", FASTKW, gh_119213_getargs),
             ("_py_cr_sum", FAST, py_cr_sum),

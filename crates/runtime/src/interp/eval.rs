@@ -717,11 +717,16 @@ pub fn eval_frame(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyRe
     f.prev = prev;
     ts.frame.set(f as *mut Frame);
     f.state = FrameState::Executing;
+    // (capi2) PEP 523 frame-evaluation hook
+    let hooked = super::pep523::enter(f.code());
     // jit workstream: compiled code runs the activation directly when it can
     let r = match super::jit::resume(ts, f, throw) {
         Ok(r) => r,
         Err(throw) => eval_inner(ts, f, throw),
     };
+    if hooked {
+        super::pep523::leave();
+    }
     ts.frame.set(prev);
     f.prev = std::ptr::null_mut();
     match &r {

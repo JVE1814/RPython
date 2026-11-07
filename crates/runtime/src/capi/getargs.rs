@@ -1090,6 +1090,28 @@ pub unsafe extern "C" fn _PyArg_ParseTuple_SizeT(args: *mut PyObject, fmt: *cons
         parse_positional(a, fmt, &mut ap, None)
     }
 }
+// stable-ABI-only "_SizeT" variants (Py_ssize_t lengths are the only kind now) (capi2)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _PyArg_VaParse_SizeT(args: *mut PyObject, fmt: *const c_char, mut ap: VaList) -> c_int {
+    unsafe {
+        let Some(a) = tuple_args(args) else { return 0 };
+        parse_positional(a, fmt, &mut ap, None)
+    }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _PyArg_Parse_SizeT(arg: *mut PyObject, fmt: *const c_char, mut ap: ...) -> c_int {
+    unsafe {
+        if arg.is_null() {
+            let _ = bad_internal();
+            return 0;
+        }
+        parse_positional(&[arg], fmt, &mut ap, Some(&*arg))
+    }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _PyArg_VaParseTupleAndKeywords_SizeT(args: *mut PyObject, kw: *mut PyObject, fmt: *const c_char, kwlist: *const *const c_char, ap: VaList) -> c_int {
+    unsafe { PyArg_VaParseTupleAndKeywords(args, kw, fmt, kwlist, ap) }
+}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyArg_VaParse(args: *mut PyObject, fmt: *const c_char, mut ap: VaList) -> c_int {
     unsafe {

@@ -568,6 +568,14 @@ pub(crate) unsafe fn type_from_desc(desc: TypeDesc, token: *mut c_void) -> PyRes
             if (*bt).tp_flags & Py_TPFLAGS_BASETYPE == 0 {
                 return Err(type_error(&format!("type '{}' is not an acceptable base type", to::type_fqname(bt))));
             }
+            // an immutable type cannot extend a mutable one (capi2)
+            if desc.flags & Py_TPFLAGS_IMMUTABLETYPE != 0 && (*bt).tp_flags & Py_TPFLAGS_IMMUTABLETYPE == 0 {
+                return Err(type_error(&format!(
+                    "Creating immutable type {} from mutable base {} is not allowed",
+                    desc.name,
+                    to::type_fqname(bt)
+                )));
+            }
             if base.is_null() || to::is_subtype(to::solid_base(bt), to::solid_base(base)) {
                 base = bt;
             }
