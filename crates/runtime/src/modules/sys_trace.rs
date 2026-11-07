@@ -76,7 +76,9 @@ pub static MON_ANY: AtomicU32 = AtomicU32::new(0);
 pub static TRACERS: AtomicUsize = AtomicUsize::new(0);
 
 pub fn recompute_tracing() {
-    let any = MON_ANY.load(Acquire) != 0 || TRACERS.load(Acquire) > 0;
+    // (core6) the PEP 523 test hook must see every frame: like tracing, it keeps
+    // execution out of compiled code
+    let any = MON_ANY.load(Acquire) != 0 || TRACERS.load(Acquire) > 0 || crate::modules::testinternalcapi::eval_hook_active();
     crate::modules::sys::TRACING.store(any, Release);
 }
 
@@ -134,12 +136,14 @@ fn fire(ts: &ThreadState, f: &mut Frame, ev: usize, loc: u32, extra: &[&PyObject
         return Ok(());
     }
     let code = f.code().as_ptr() as usize;
+    // DISABLE from a branch callback turns off both directions of that instruction
+    let kev = if ev == BRANCH_RIGHT { BRANCH_LEFT } else { ev };
     let calls: Vec<(usize, PyRef)> = {
         let m = MON.lock().unwrap();
         let tools = events_for(&m, code, ev);
         (0..NTOOLS)
             .filter(|t| tools & (1 << t) != 0)
-            .filter(|t| !m.disabled.contains(&(*t, code, loc, ev)) && !m.disabled.contains(&(*t, code, u32::MAX, ev)))
+            .filter(|t| !m.disabled.contains(&(*t, code, loc, kev)) && !m.disabled.contains(&(*t, code, u32::MAX, kev)))
             .map(|t| (t, unsafe { PyRef::from_borrowed(m.callbacks[t][ev] as *mut PyObject) }))
             .collect()
     };
@@ -167,7 +171,7 @@ fn fire(ts: &ThreadState, f: &mut Frame, ev: usize, loc: u32, extra: &[&PyObject
             }
             // exception events are disabled for the whole code object (location u32::MAX)
             let at = if ev >= 11 && ev <= 15 { u32::MAX } else { loc };
-            MON.lock().unwrap().disabled.insert((tool, code, at, ev));
+            MON.lock().unwrap().disabled.insert((tool, code, at, kev));
         }
     }
     Ok(())
@@ -283,6 +287,21 @@ fn is_line_start(code: &PyObject, i: usize, line: i32) -> bool {
     crate::types::code::frame_line(code, i - 1).map(|l| l as i32) != Some(line)
 }
 
+thread_local! {
+    /// LINE event of a LOAD_SUPER_ATTR waiting for its super() call events (-1: none).
+    static DEFERRED_LINE: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
+}
+
+/// After LOAD_SUPER_ATTR's super() call: fire its deferred LINE event (if the call
+/// succeeded) or drop it.
+pub fn fire_deferred_line(ts: &ThreadState, f: &mut Frame, ok: bool) -> PyResult<()> {
+    let line = DEFERRED_LINE.replace(-1);
+    if ok && line >= 0 {
+        fire(ts, f, LINE, line as u32, &[])?;
+    }
+    Ok(())
+}
+
 pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
     if ts.tracing_depth.get() > 0 {
         return Ok(());
@@ -322,7 +341,14 @@ pub fn trace_instr(ts: &ThreadState, f: &mut Frame) -> PyResult<()> {
             new_line && (start || from != Some(line))
         };
         if mon_line {
-            fire(ts, f, LINE, line as u32, &[])?;
+            if op == Some(rpy_compiler::bytecode::Op::LoadSuperAttr as u8) {
+                // the instruction stands for `super()` (reported as a call on the
+                // preceding line) followed by the attribute load on this line: its LINE
+                // event comes after the call's events (fire_deferred_line)
+                DEFERRED_LINE.set(line);
+            } else {
+                fire(ts, f, LINE, line as u32, &[])?;
+            }
         }
     }
     if new_line {
@@ -581,6 +607,51 @@ pub fn fire_branch(ts: &ThreadState, f: &mut Frame, ev: usize, dest: usize) -> P
     let d = int::new_int(crate::types::code::lasti_bytes(f.code(), dest));
     let off = offset(f);
     fire(ts, f, ev, off, &[&d])
+}
+
+/// Public opcode at code unit `cu` of the frame's code (None past the end).
+fn public_op(f: &Frame, cu: usize) -> Option<u8> {
+    let meta = crate::types::code::code(f.code()).d;
+    crate::types::bytes::bytes_data(&meta.co_code).get(cu * 2).copied()
+}
+
+/// SEND finished at internal pc `target` (its END_SEND). In an `async for` the compiler
+/// puts NOT_TAKEN after that END_SEND: an item arrived, which is the loop's left branch.
+pub fn async_for_item(ts: &ThreadState, f: &mut Frame, target: usize) -> PyResult<()> {
+    if !wants(BRANCH_LEFT) {
+        return Ok(());
+    }
+    use crate::interp::wc::op;
+    let cd = crate::types::code::code_data(f.code());
+    let mut cu = cd.pub_offset(target) as usize;
+    // END_SEND may have been translated to no internal word: then `target` is past it
+    if public_op(f, cu) != Some(op::END_SEND) && cu >= 2 && public_op(f, cu - 2) == Some(op::END_SEND) {
+        cu -= 2;
+    }
+    if public_op(f, cu) == Some(op::END_SEND) && public_op(f, cu + 1) == Some(op::NOT_TAKEN) {
+        // reported like co_branches() describes the loop header: from the SEND to the
+        // instruction after it (SEND + its inline cache)
+        let send_cu = cd.pub_offset(f.lasti as usize) as usize;
+        let dest = cd.internal_pc(send_cu + 2) as usize;
+        return fire_branch(ts, f, BRANCH_LEFT, dest);
+    }
+    Ok(())
+}
+
+/// END_ASYNC_FOR ended the loop (StopAsyncIteration): the right branch, to the next
+/// instruction (internal pc `next`).
+pub fn async_for_exit(ts: &ThreadState, f: &mut Frame, next: usize) -> PyResult<()> {
+    if ts.tracing_depth.get() > 0 || !wants(BRANCH_RIGHT) {
+        return Ok(());
+    }
+    // the source is the loop header's SEND, which END_ASYNC_FOR's argument points back at
+    let cd = crate::types::code::code_data(f.code());
+    let cu = cd.pub_offset(f.lasti as usize) as usize;
+    let meta = crate::types::code::code(f.code()).d;
+    let arg = crate::types::bytes::bytes_data(&meta.co_code).get(cu * 2 + 1).copied().unwrap_or(0) as usize;
+    let send_cu = (cu + 1).saturating_sub(arg);
+    let d = int::new_int(crate::types::code::lasti_bytes(f.code(), next));
+    fire(ts, f, BRANCH_RIGHT, (send_cu * 2) as u32, &[&d])
 }
 
 #[inline]

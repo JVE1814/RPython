@@ -266,18 +266,94 @@ fn get_static_builtin_types(_m: &PyObject) -> PyResult {
     Ok(out)
 }
 
+// ---- PEP 523 frame-evaluation hook (test form) and rare-event counters
+
+/// While set, the list every evaluated Python frame's code name is appended to
+/// (`set_eval_frame_record`); compiled code is bypassed so that every frame is seen.
+pub static EVAL_RECORD: std::sync::atomic::AtomicPtr<PyObject> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static EVAL_ALLOWS_SPECIALIZATION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[inline(always)]
+pub fn eval_hook_active() -> bool {
+    !EVAL_RECORD.load(std::sync::atomic::Ordering::Relaxed).is_null()
+}
+
+/// Called by the interpreter when it starts or resumes a frame while the hook is set.
+#[cold]
+pub fn record_frame(code: &PyObject) {
+    let l = EVAL_RECORD.load(std::sync::atomic::Ordering::Acquire);
+    if !l.is_null() {
+        list::append(unsafe { &*l }, crate::types::code::code_name(code));
+    }
+}
+
+fn set_eval_hook(l: Option<&PyObject>, allow_specialization: bool) {
+    let new = l.map_or(std::ptr::null_mut(), |l| l.to_ref().into_raw());
+    EVAL_ALLOWS_SPECIALIZATION.store(allow_specialization, std::sync::atomic::Ordering::Relaxed);
+    let old = EVAL_RECORD.swap(new, std::sync::atomic::Ordering::AcqRel);
+    crate::modules::sys_trace::recompute_tracing();
+    if !old.is_null() {
+        unsafe { decref(old) };
+    }
+}
+
+fn set_eval_frame_record(_m: &PyObject, l: &PyObject) -> PyResult {
+    if !list::is_list(l) {
+        raise!(TypeError, "argument must be a list");
+    }
+    set_eval_hook(Some(l), false);
+    rare_event(RareEvent::SetEvalFrameFunc);
+    Ok(none::none_ref())
+}
+fn set_eval_frame_interp(_m: &PyObject, l: &PyObject) -> PyResult {
+    if !list::is_list(l) {
+        raise!(TypeError, "argument must be a list");
+    }
+    set_eval_hook(Some(l), true);
+    rare_event(RareEvent::SetEvalFrameFunc);
+    Ok(none::none_ref())
+}
+fn set_eval_frame_default(_m: &PyObject) -> PyResult {
+    if eval_hook_active() {
+        rare_event(RareEvent::SetEvalFrameFunc);
+    }
+    set_eval_hook(None, false);
+    Ok(none::none_ref())
+}
+
 fn is_specialization_enabled(_m: &PyObject) -> PyResult {
-    Ok(bool_::new_bool(false))
+    Ok(bool_::new_bool(!eval_hook_active() || EVAL_ALLOWS_SPECIALIZATION.load(std::sync::atomic::Ordering::Relaxed)))
+}
+
+/// Events that invalidate optimistic assumptions of the specializer/JIT, counted as
+/// CPython counts them for `_testinternalcapi.get_rare_event_counters()`.
+#[derive(Clone, Copy)]
+pub enum RareEvent {
+    SetClass = 0,
+    SetBases = 1,
+    SetEvalFrameFunc = 2,
+    BuiltinDict = 3,
+    FuncModification = 4,
+}
+const RARE_NAMES: [&str; 5] = ["set_class", "set_bases", "set_eval_frame_func", "builtin_dict", "func_modification"];
+static RARE: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+#[inline]
+pub fn rare_event(e: RareEvent) {
+    RARE[e as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn get_rare_event_counters(_m: &PyObject) -> PyResult {
     let d = dict::new_dict();
-    for k in ["set_class", "set_bases", "set_eval_frame_func", "builtin_dict", "func_modification"] {
-        dict::set_item_str(&d, k, &int::new_int(0))?;
+    for (i, k) in RARE_NAMES.iter().enumerate() {
+        dict::set_item_str(&d, k, &int::new_int(RARE[i].load(std::sync::atomic::Ordering::Relaxed) as i64))?;
     }
     Ok(d)
 }
 fn reset_rare_event_counters(_m: &PyObject) -> PyResult {
+    for c in RARE.iter() {
+        c.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(none::none_ref())
 }
 
@@ -353,6 +429,9 @@ pub fn init() -> PyResult {
             ("py_thread_id", NOARGS, py_thread_id),
             ("get_static_builtin_types", NOARGS, get_static_builtin_types),
             ("is_specialization_enabled", NOARGS, is_specialization_enabled),
+            ("set_eval_frame_record", O, set_eval_frame_record),
+            ("set_eval_frame_interp", O, set_eval_frame_interp),
+            ("set_eval_frame_default", NOARGS, set_eval_frame_default),
             ("get_rare_event_counters", NOARGS, get_rare_event_counters),
             ("reset_rare_event_counters", NOARGS, reset_rare_event_counters),
             ("get_co_localskinds", O, crate::types::code_introspect::get_co_localskinds),

@@ -717,6 +717,9 @@ pub fn eval_frame(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) -> PyRe
     f.prev = prev;
     ts.frame.set(f as *mut Frame);
     f.state = FrameState::Executing;
+    if crate::modules::testinternalcapi::eval_hook_active() {
+        crate::modules::testinternalcapi::record_frame(f.code());
+    }
     // jit workstream: compiled code runs the activation directly when it can
     let r = match super::jit::resume(ts, f, throw) {
         Ok(r) => r,
@@ -1022,6 +1025,9 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                             };
                             if let Some(info) = call_info {
                                 crate::modules::sys_trace::after_call(ts, f, info, sup.is_ok())?;
+                            }
+                            if crate::modules::sys::tracing_active() {
+                                crate::modules::sys_trace::fire_deferred_line(ts, f, sup.is_ok())?;
                             }
                             let sup = sup?;
                             if is_method {
@@ -1422,6 +1428,9 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                                     unsafe { decref(pop!(f)) };
                                     push!(f, r.into_raw());
                                     pc = arg as usize;
+                                    if crate::modules::sys::tracing_active() {
+                                        crate::modules::sys_trace::async_for_item(ts, f, pc)?;
+                                    }
                                 }
                             }
                         }
@@ -2126,6 +2135,9 @@ pub(crate) fn exec_misc(ts: &ThreadState, f: &mut Frame, cd: &crate::types::code
             drop(aiter);
             if is_subtype(e.type_ptr(), exc::StopAsyncIteration()) {
                 // done
+                if crate::modules::sys::tracing_active() {
+                    crate::modules::sys_trace::async_for_exit(ts, f, f.lasti as usize + 1)?;
+                }
             } else {
                 set_exc(e);
                 return Err(PyErr);

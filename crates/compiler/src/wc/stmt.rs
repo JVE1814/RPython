@@ -424,6 +424,8 @@ impl<'a> Compiler<'a> {
         self.load_none();
         let send = self.compile_yield_from_loop(true)?;
         self.pop_block();
+        // the left branch of the loop (an item arrived; END_ASYNC_FOR is the right one)
+        self.emit(O::NOT_TAKEN, 0);
         self.compile_store(&f.target)?;
         self.compile_stmts(&f.body)?;
         self.u().loc = NO_LOC;

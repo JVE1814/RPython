@@ -299,6 +299,7 @@ fn f_set_code(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         static RETIRED_CODE: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
         RETIRED_CODE.lock().unwrap().push(old as usize);
     }
+    crate::modules::testinternalcapi::rare_event(crate::modules::testinternalcapi::RareEvent::FuncModification);
     func(o).func_version = FUNC_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
@@ -314,6 +315,7 @@ fn f_set_defaults(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     };
     replace(&mut func(o).func_defaults, v);
     func(o).func_version = FUNC_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::modules::testinternalcapi::rare_event(crate::modules::testinternalcapi::RareEvent::FuncModification);
     Ok(())
 }
 fn f_kwdefaults(o: &PyObject) -> PyResult {
@@ -327,6 +329,8 @@ fn f_set_kwdefaults(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
         Some(_) => raise!(TypeError, "__kwdefaults__ must be set to a dict object"),
     };
     replace(&mut func(o).func_kwdefaults, v);
+    func(o).func_version = FUNC_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::modules::testinternalcapi::rare_event(crate::modules::testinternalcapi::RareEvent::FuncModification);
     Ok(())
 }
 fn f_globals(o: &PyObject) -> PyResult {
@@ -418,7 +422,7 @@ fn f_annotations(o: &PyObject) -> PyResult {
             let one = crate::types::int::new_int(1);
             let r = ab::call(unsafe { &*f.func_annotate }, &[&one])?;
             if !dict::is_dict(&r) {
-                raise!(TypeError, "__annotate__ returned non-dict of type '{}'", tname(&r));
+                raise!(TypeError, "__annotate__() must return a dict, not {}", tname(&r));
             }
             f.func_annotations = r.into_raw();
         } else {

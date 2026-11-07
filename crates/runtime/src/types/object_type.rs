@@ -243,6 +243,7 @@ fn object_set_class(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
             type_name(unsafe { &*old })
         );
     }
+    crate::modules::testinternalcapi::rare_event(crate::modules::testinternalcapi::RareEvent::SetClass);
     // shapes belong to the old type: move inline values into a real dict first
     crate::interp::cache::TYPE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     crate::shape::materialize(o);
@@ -703,6 +704,7 @@ fn type_get_bases(o: &PyObject) -> PyResult {
 }
 fn type_set_bases(o: &PyObject, v: Option<&PyObject>) -> PyResult<()> {
     check_set_special(o, v, "__bases__")?;
+    crate::modules::testinternalcapi::rare_event(crate::modules::testinternalcapi::RareEvent::SetBases);
     let v = v.unwrap();
     let tp = t(o);
     if !tuple::is_tuple(v) {

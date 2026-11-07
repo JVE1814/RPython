@@ -296,6 +296,7 @@ pub(crate) fn optimize_cfg(cfg: &mut Cfg, consts: &mut Vec<Constant>, nlocals: u
     if cfg.order.is_empty() {
         return Ok(());
     }
+    resolve_next_positions(cfg);
     skip_empty_targets(cfg);
     mark_handlers(cfg);
     label_exception_targets(cfg);
@@ -660,6 +661,24 @@ fn remove_redundant_nops(cfg: &mut Cfg) {
             i += 1;
         }
         cfg.blocks[b as usize].instrs = out;
+    }
+}
+
+/// Instructions placed at NEXT_POS take the location of the next located instruction in
+/// layout order (within the block, then the following blocks); none left: no location.
+pub(crate) fn resolve_next_positions(cfg: &mut Cfg) {
+    let order = cfg.order.clone();
+    // walk backwards remembering the nearest following location
+    let mut following: Option<Pos> = None;
+    for &b in order.iter().rev() {
+        for i in cfg.blocks[b as usize].instrs.iter_mut().rev() {
+            if i.loc == NEXT_POS {
+                i.loc = following.unwrap_or(NO_POS);
+            }
+            if i.loc.is_some() {
+                following = Some(i.loc);
+            }
+        }
     }
 }
 
@@ -2158,6 +2177,7 @@ fn stack_depth(cfg: &mut Cfg) -> R<u32> {
 // ============================================================================ final assembly
 
 fn finish(mut cfg: Cfg, info: UnitInfo, layout: Layout) -> R<CodeObject> {
+    resolve_next_positions(&mut cfg);
     push_cold_blocks_to_end(&mut cfg);
     duplicate_exits_without_lineno(&mut cfg);
     propagate_line_numbers(&mut cfg);

@@ -1139,7 +1139,13 @@ impl<'a> Compiler<'a> {
             let first = self.ur().varnames[0].clone();
             self.nameop(&first, ExprContext::Load)?;
         }
-        self.set_loc(attr_expr.loc);
+        // the super() call itself has the call's location: if its arguments ended on
+        // another line, line events return to the call's line before it (a NOP the
+        // optimiser drops when the line does not change)
+        self.set_loc(value.loc);
+        self.emit(O::NOP, 0);
+        // located at the attribute when it is on a later line (as LOAD_ATTR is)
+        self.set_loc(attr_loc(attr_expr.loc, attr_expr, attr));
         let m = self.mangle(attr);
         let ni = self.u().add_name(&m);
         let arg = (ni << 2) | if method { 1 } else { 0 } | if two { 2 } else { 0 };
@@ -1485,6 +1491,7 @@ impl<'a> Compiler<'a> {
         self.emit_await_noloop_prefix();
         let send = self.compile_yield_from_loop(true)?;
         self.pop_block();
+        self.emit(O::NOT_TAKEN, 0);
         self.compile_store(&g.target)?;
         for cond in &g.ifs {
             self.compile_jump_if(cond, false, if_cleanup)?;

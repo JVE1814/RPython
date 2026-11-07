@@ -131,6 +131,10 @@ pub fn call_function(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwna
                 frame.slots[i] = a;
             }
             frame.make_owned();
+            copy_free_vars(&mut frame, f);
+            if crate::modules::testinternalcapi::eval_hook_active() {
+                crate::modules::testinternalcapi::record_frame(co); // the creating call evaluates the frame too
+            }
             return crate::types::genobject::new_generator_for(frame, func, flags);
         }
         if kwnames.is_none() && nargs == 1 {
@@ -164,6 +168,9 @@ pub fn call_function(func: &PyObject, args: &[*mut PyObject], nargs: usize, kwna
             // RETURN_GENERATOR), so f_locals of a not yet started frame shows them; the
             // CopyFreeVars at the first resume stores the same cells again
             copy_free_vars(&mut frame, f);
+            if crate::modules::testinternalcapi::eval_hook_active() {
+                crate::modules::testinternalcapi::record_frame(co); // the creating call evaluates the frame too
+            }
         }
         return crate::types::genobject::new_generator_for(frame, func, flags);
     }
@@ -262,6 +269,9 @@ fn new_genexpr(func: &PyObject, f: &PyFunctionObject, co: &PyObject, arg: *mut P
     frame.lasti = cd.gen_start - 1;
     frame.next_instr = cd.gen_start;
     frame.make_owned();
+    if crate::modules::testinternalcapi::eval_hook_active() {
+        crate::modules::testinternalcapi::record_frame(co);
+    }
     Some(crate::types::genobject::new_generator_for(frame, func, flags))
 }
 
