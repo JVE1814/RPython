@@ -1,7 +1,7 @@
 # PROGRESS
 
 ## Status 2026-11-07 (day 7, afternoon)
-Master d620c3b: core6, perf4, tail1, capi2, cleanroom1+2 (20 Lib modules rewritten clean-room), scale1 (multi-core scaling), tail2 (re.DEBUG, _zoneinfo, ssl PSK, alloc-failure injection, 22 modules), perf5, stability3 (test_free_threading passes), scale2 checkpoint (concurrent_futures + multiprocessing pass), pdb1 (clean-room pdb: test_pdb, test_remote_pdb pass), tail3 (crossinterp, getpath, nturl2path, ast, multiprocessing, httpservers, asyncio 10→2), cleanroom3, scale2, perf6 (startup image: python_startup 0.88x), remote1 (_remote_debugging, sys.remote_exec: test_external_inspection passes), capi3 (test_capi and test_sys: 0 failures), cleanroom4 (typing rewritten clean-room, _pydatetime, ElementTree, urllib.request), refs1 (borrowed stack references, D35), cleanroom5 (asyncio base_events/sslproto/streams, mailbox, zipfile), perf7 (PGO build D36, JIT jump relaxation), cleanroom6 (multiprocessing pool/connection/managers/queues, xml.dom, xml.sax, email grammar; test_asyncio 0 failures), tail4 (profiling.sampling, _remote_debugging binary format and GC stats; gc, descr, opcache, repl, sys_settrace, thread_local_bytecode, pyrepl, gc_stats pass) merged today; suite run 17 running; suite run 16: 418/434 (no refs1 regressions); suite run 14: 417/434 pass or whole-module skip, 10 modules fail that pass on CPython, fewer skips than CPython; suite run 13: 396/434 pass or whole-module skip; suite run 12: 367/434 modules pass, 129 failures, 70 errors. Smoke on snap19: test_capi 40 failures (was 433 in run 11),
+Master d620c3b: core6, perf4, tail1, capi2, cleanroom1+2 (20 Lib modules rewritten clean-room), scale1 (multi-core scaling), tail2 (re.DEBUG, _zoneinfo, ssl PSK, alloc-failure injection, 22 modules), perf5, stability3 (test_free_threading passes), scale2 checkpoint (concurrent_futures + multiprocessing pass), pdb1 (clean-room pdb: test_pdb, test_remote_pdb pass), tail3 (crossinterp, getpath, nturl2path, ast, multiprocessing, httpservers, asyncio 10→2), cleanroom3, scale2, perf6 (startup image: python_startup 0.88x), remote1 (_remote_debugging, sys.remote_exec: test_external_inspection passes), capi3 (test_capi and test_sys: 0 failures), cleanroom4 (typing rewritten clean-room, _pydatetime, ElementTree, urllib.request), refs1 (borrowed stack references, D35), cleanroom5 (asyncio base_events/sslproto/streams, mailbox, zipfile), perf7 (PGO build D36, JIT jump relaxation), cleanroom6 (multiprocessing pool/connection/managers/queues, xml.dom, xml.sax, email grammar; test_asyncio 0 failures), tail4 (profiling.sampling, _remote_debugging binary format and GC stats; gc, descr, opcache, repl, sys_settrace, thread_local_bytecode, pyrepl, gc_stats pass) , scale3 (parallel GC) merged today; suite run 17 running; suite run 16: 418/434 (no refs1 regressions); suite run 14: 417/434 pass or whole-module skip, 10 modules fail that pass on CPython, fewer skips than CPython; suite run 13: 396/434 pass or whole-module skip; suite run 12: 367/434 modules pass, 129 failures, 70 errors. Smoke on snap19: test_capi 40 failures (was 433 in run 11),
 stable_abi_ctypes/fileutils pass, cmd_line_script 1; tail1 fixed ~60 long-tail modules (inspect, codecs, time,
 path modules, math, buffer, logging, json, ...). Run 11 (pre-merges):
 294/434 modules pass, 674 failures (241 without test_capi), 616 errors. Baseline free-threaded CPython: 416/434.
@@ -226,7 +226,23 @@ Startup `-c pass`: 56.6M instructions (CPython 40.5M); `-S -c pass` 29.2M (27.7M
 34.9 MB (CPython default 32.3, free-threaded 38.6). Instructions per call shape and per loop: notes/perf4.md.
 Multi-core scaling: being measured by scale1.
 
-### Multi-core scaling (scale2, 2026-11-07; cpu-infl@4 = CPU per unit at 4 threads / at 1 thread, ideal 1.00; load 7–9)
+### Multi-core scaling (scale3 + refs1, 2026-11-08; cpu-infl@4, best runs, load 6–11, approximate)
+| workload | before scale3 | after scale3 | py-ft |
+|---|---|---|---|
+| alloc_cycles | 0.95–5.6 | 1.00–1.06 | 0.76–0.94 |
+| misc_classes | 1.64–1.76 | 1.92–2.11 (1-thread got faster; 4-thread CPU lower) | 1.24–1.57 |
+| cpu_float | 1.13–1.18 | 1.05–1.07 | 0.99–1.04 |
+| misc_import | 1.11–1.25 | 1.06–1.11 | 1.26–1.28 |
+| cpu_comp | 1.11–1.36 | 0.99–1.03 | 0.98–1.06 |
+| mut_lock | 0.94–1.10 | 1.00–1.02 | 0.92–0.97 |
+| alloc_small | 0.96–0.98 | 1.12–1.14 | 1.01–1.07 |
+refs1 (D35): shr_dict 1.48 → 1.02, shr_attrs 1.78 → 1.11, mut_list 2.38 → 1.25, cpu_comp 1.33 → 1.07. scale3: per-thread young
+buffers, parallel GC by stopped threads, owner-side clearing, futex parking. GC pause on alloc_cycles 15 ms → 0.5–0.7 ms; wall at 4
+threads vs py-ft: alloc_cycles 0.56x, misc_classes 0.54x. At or below py-ft: shr_dict, shr_list, shr_globals, mut_queue, nbody, oo,
+gen, regex, json, misc_cext, misc_import, cpu_comp. Still above: misc_classes, mut_dict, mut_list, jit_calls, shr_attrs, alloc_small,
+alloc_cycles, cpu_float, mut_lock (scale4).
+
+### Previous multi-core scaling (scale2, 2026-11-07; cpu-infl@4 = CPU per unit at 4 threads / at 1 thread, ideal 1.00; load 7–9)
 | workload | ours | py-ft |
 |---|---|---|
 | cpu_nbody | 1.01 | 1.01 |
@@ -256,7 +272,7 @@ Old/new interleaved under equal load: jit_calls 2.19→1.00, cpu_oo 2.97→1.05,
 Remaining causes: refcount writes from every thread on LOAD_FAST of shared objects (refs1: borrowed stack refs),
 serial stop-the-world GC (alloc_cycles, misc_classes, cpu_float), cpu_comp not investigated. notes/scale2.md.
 
-### Previous multi-core scaling (scale1, 2026-11-07; tools/bench/scaling, loaded machine — CPU inflation at 4 threads, ideal 1.00)
+### Older multi-core scaling (scale1, 2026-11-07; tools/bench/scaling, loaded machine — CPU inflation at 4 threads, ideal 1.00)
 | workload | before scale1 | ours | py-ft |
 |---|---|---|---|
 | cpu_nbody | 1.48 | 1.08 | 1.07 |
