@@ -95,6 +95,10 @@ touched.
   after them: about 10 minutes instead of 30+. Use it after every merge. Each renamed or
   re-inlined start-up function costs a 64-128 KB window until the list is refreshed.
 * The list is compared and written with the crate hashes masked (`Cs*_`), as before.
+* `tools/pgo/reorder.sh` does the same for an existing profile-guided build (refreshes
+  `$CARGO_TARGET_DIR/pgo-startup.ld` on the PGO executable, then relinks with the profile).
+  tools/pgo/build.sh's step 5 is unchanged: a full gen_order run, now with the native
+  start-up runs, so it takes about 10 minutes longer.
 
 ### Peak
 * Dict resize (`types/dict.rs`): a data block of at least 512 KB, when no other thread has
