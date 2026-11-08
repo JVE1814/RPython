@@ -120,14 +120,14 @@ pub(crate) fn iter_layout_ok() -> bool {
 
 /// Layout facts about Rust-owned structures, probed at run time (Vec field order is
 /// not specified by Rust).
-struct Layout {
+pub(crate) struct Layout {
     /// DictTable: entries.ptr / entries.len / version
-    entries_ptr: i32,
-    entries_len: i32,
+    pub(crate) entries_ptr: i32,
+    pub(crate) entries_len: i32,
     version: i32,
-    entry_size: i32,
-    entry_key: i32,
-    entry_value: i32,
+    pub(crate) entry_size: i32,
+    pub(crate) entry_key: i32,
+    pub(crate) entry_value: i32,
 }
 
 /// (perf5) C getter and closure of an exact getset descriptor, if readable.
@@ -144,7 +144,7 @@ unsafe fn getset_getter(d: *mut PyObject) -> Option<(usize, usize)> {
     }
 }
 
-fn layout() -> &'static Layout {
+pub(crate) fn layout() -> &'static Layout {
     static L: std::sync::OnceLock<Layout> = std::sync::OnceLock::new();
     L.get_or_init(|| {
         Layout {
@@ -258,16 +258,11 @@ impl<'a> Gen<'a> {
         self.a.jmp(self.exit);
     }
 
-    /// incref of the object in `r` (non-null). Clobbers r11.
+    /// incref of the object in `r` (non-null). Clobbers r11 (on the slow path).
     fn incref(&mut self, r: R) {
         let done = self.a.label();
         let slow = self.a.label();
-        self.a.load32(R11, M(r, OB_REF_LOCAL));
-        self.a.add32_ri(R11, 1);
-        self.a.jcc_short(Cc::E, done);
-        self.a.cmp_rm(R15, M(r, OB_TID));
-        self.a.jcc(Cc::NE, slow);
-        self.a.store32(M(r, OB_REF_LOCAL), R11);
+        emit_incref_fast(&mut self.a, r, done, slow);
         self.a.bind(done);
         self.stubs.push(Box::new(move |a: &mut Asm, _exit, _nlp| {
             a.bind(slow);
@@ -287,14 +282,7 @@ impl<'a> Gen<'a> {
         let done = self.a.label();
         let shared = self.a.label();
         let zero = self.a.label();
-        self.a.load32(R11, M(r, OB_REF_LOCAL));
-        self.a.cmp32_ri(R11, -1);
-        self.a.jcc_short(Cc::E, done);
-        self.a.cmp_rm(R15, M(r, OB_TID));
-        self.a.jcc(Cc::NE, shared);
-        self.a.sub32_ri(R11, 1);
-        self.a.store32(M(r, OB_REF_LOCAL), R11);
-        self.a.jcc(Cc::E, zero);
+        emit_decref_fast(&mut self.a, r, done, shared, zero);
         self.a.bind(done);
         let free_num = self.rt_free_num;
         self.stubs.push(Box::new(move |a: &mut Asm, _exit, _nlp| {
@@ -2747,6 +2735,10 @@ pub fn compile_mode(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crat
     let mut entries = vec![u32::MAX; cd.code.len() + 1];
     let mut prev_yield = false;
     let mut skip_next = false;
+    // (perf8) RPYTHON_JIT_OPSTATS=1: code bytes per instruction kind (inline, stubs)
+    let stats = opstats_enabled();
+    let (mut counts, mut inline_bytes, mut stub_bytes) = (vec![0u64; 256], vec![0u64; 256], vec![0u64; 256]);
+    let mut stub_owner: Vec<u8> = Vec::new();
     for i in 0..an.instrs.len() {
         let ins = an.instrs[i];
         let l = g.ilabel[i];
@@ -2770,7 +2762,15 @@ pub fn compile_mode(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crat
             }
         }
         g.tagm = masks[i];
+        let (p0, s0) = (g.a.pos(), g.stubs.len());
         g.emit(i)?;
+        if stats {
+            let (p1, s1) = (g.a.pos(), g.stubs.len());
+            inline_bytes[ins.op as usize] += (p1 - p0) as u64;
+            counts[ins.op as usize] += 1;
+            stub_owner.resize(s1, ins.op as u8);
+            let _ = s0;
+        }
         // fall off the end of a non-terminating instruction into the next one is implicit
     }
     // a trailing reachable fallthrough should not exist (code ends with a terminator);
@@ -2778,7 +2778,15 @@ pub fn compile_mode(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crat
     g.a.ud2();
     let nlp = g.nlp;
     while let Some(s) = g.stubs.pop() {
+        let p0 = g.a.pos();
         s(&mut g.a, exit, nlp);
+        if stats {
+            let k = g.stubs.len();
+            stub_bytes[stub_owner.get(k).copied().unwrap_or(0) as usize] += (g.a.pos() - p0) as u64;
+        }
+    }
+    if stats {
+        record_opstats(&counts, &inline_bytes, &stub_bytes);
     }
     emit_routines(&mut g.a, rt_box_int, rt_box_float, rt_free_num);
     g.a.resolve()?;
@@ -2789,6 +2797,32 @@ pub fn compile_mode(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crat
         }
     }
     Ok(Output { asm: g.a, entries })
+}
+
+fn opstats_enabled() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| matches!(std::env::var("RPYTHON_JIT_OPSTATS").as_deref(), Ok("1")))
+}
+
+/// (perf8) Accumulate tier-1 code bytes per instruction kind over the process and
+/// print the running totals (the last table printed covers every compilation).
+fn record_opstats(counts: &[u64], inline: &[u64], stubs: &[u64]) {
+    static T: std::sync::Mutex<Vec<(u64, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+    let mut t = T.lock().unwrap_or_else(|e| e.into_inner());
+    t.resize(256, (0, 0, 0));
+    for k in 0..256 {
+        t[k].0 += counts[k];
+        t[k].1 += inline[k];
+        t[k].2 += stubs[k];
+    }
+    let mut rows: Vec<(usize, (u64, u64, u64))> = t.iter().copied().enumerate().filter(|r| r.1.0 > 0).collect();
+    rows.sort_by_key(|r| std::cmp::Reverse(r.1.1 + r.1.2));
+    let (ti, ts): (u64, u64) = rows.iter().fold((0, 0), |a, r| (a.0 + r.1.1, a.1 + r.1.2));
+    eprintln!("[jit] opstats: inline {} stubs {}", ti, ts);
+    for (op, (n, i, s)) in rows.into_iter().take(30) {
+        let name = format!("{:?}", Op::from_u8(op as u8));
+        eprintln!("[jit]   {:<22} n {:6} inline {:8} ({:5.1}/op) stubs {:8} ({:5.1}/op)", name, n, i, i as f64 / n as f64, s, s as f64 / n as f64);
+    }
 }
 
 // ---------------------------------------------------------------- sharded increfs (scale1)
@@ -2860,6 +2894,30 @@ pub(crate) fn emit_note_attr_read(a: &mut Asm, r: R) {
     a.jcc(Cc::NE, done);
     a.lock_or16_mi(M(r, OB_FLAGS), crate::qsbr::XREAD);
     a.bind(done);
+}
+
+/// (perf8) Inline part of an incref of the object in `r`: immortal objects skip to
+/// `done`, objects of other threads go to `slow` (`emit_nonowner_incref`), the owner
+/// adds to its local count in memory. 19 bytes with disp8 forms (was 23 through r11).
+pub(crate) fn emit_incref_fast(a: &mut Asm, r: R, done: Label, slow: Label) {
+    a.cmp32_mi(M(r, OB_REF_LOCAL), -1);
+    a.jcc_short(Cc::E, done);
+    a.cmp_rm(R15, M(r, OB_TID));
+    a.jcc(Cc::NE, slow);
+    a.add32_mi(M(r, OB_REF_LOCAL), 1);
+}
+
+/// (perf8) Inline part of a decref of the object in `r`: immortal objects skip to
+/// `done`, objects of other threads go to `shared`, the owner subtracts in memory and
+/// goes to `zero` when the count reaches 0 (the stored count is then 0). 22 bytes
+/// (was 30 through r11); clobbers nothing.
+pub(crate) fn emit_decref_fast(a: &mut Asm, r: R, done: Label, shared: Label, zero: Label) {
+    a.cmp32_mi(M(r, OB_REF_LOCAL), -1);
+    a.jcc_short(Cc::E, done);
+    a.cmp_rm(R15, M(r, OB_TID));
+    a.jcc(Cc::NE, shared);
+    a.sub32_mi(M(r, OB_REF_LOCAL), 1);
+    a.jcc(Cc::E, zero);
 }
 
 /// Out-of-line part of an inline incref when the object in `r` (not r11) is owned by
