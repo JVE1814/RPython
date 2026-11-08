@@ -768,6 +768,8 @@ fn build_dispatch(kind: Dispatch) -> Option<usize> {
         a.load(Rax, M(Rsp, 0));
         a.load(Rcx, M(Rsp, 8));
         a.store(M(Rcx, 0), Rax);
+        // the poll path restores stack_top from r14 (the loop used it as the cursor)
+        a.load(R14, M(Rbx, stack_top));
         a.jmp(after_ok);
         // NULL result: SystemError unless an exception is set; entries released
         a.bind(c_err);
