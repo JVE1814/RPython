@@ -1104,7 +1104,9 @@ unsafe fn untagged_args(base: *mut *mut PyObject, n: usize, tmp: &mut std::mem::
 /// Call / CallKw: [callable, self_or_null, args..(, kwnames)] -> [result]. No entry
 /// may be borrowed (refs1: compiled code calls `h_call_t` when one may be).
 pub unsafe extern "C" fn h_call(sp: *mut *mut PyObject, n: u64, kw: u64) -> u64 {
-    unsafe { call_impl::<false>(sp, n, kw) }
+    // (perf8) one copy of the generic call path for both entry points (the tag-aware
+    // one accepts owned entries too): half the code in the instruction cache
+    unsafe { call_impl::<true>(sp, n, kw) }
 }
 
 /// (refs1) `h_call` where entries may be borrowed (tagged).
