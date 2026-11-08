@@ -2647,106 +2647,148 @@ class _Refolder:
         return self.policy.linesep.join(lines) + self.policy.linesep
 
 
-def _fold_as_ew(to_encode, lines, maxlen, last_ew, ew_combine_allowed,
-                charset, leading_whitespace):
-    """Append *to_encode* to *lines* as encoded words, wrapping as needed.
+def _ew_charset(charset):
+    # Plain ASCII text never needs an encoded word; text that does is
+    # written as UTF-8.
+    return 'utf-8' if charset == 'us-ascii' else charset
 
-    If *last_ew* is the start of an encoded word at the end of the last
-    line and combining is allowed, the text is merged into it.  Returns the
-    position of the last encoded word for further combining (or None).
-    """
+
+def _start_ew_run(to_encode, lines, maxlen, last_ew, ew_combine_allowed):
+    # Prepare *to_encode* for encoding.  Text that may join the encoded
+    # word ending the last line is merged with it (that word is taken off
+    # the line and re-encoded); otherwise a leading blank stays plain.
+    # Returns (text, trailing blank, column where the run starts).
     if last_ew is not None and ew_combine_allowed:
         to_encode = str(get_unstructured(lines[-1][last_ew:] + to_encode))
         lines[-1] = lines[-1][:last_ew]
     elif to_encode[0] in WSP:
-        # keep a leading blank unencoded
-        blank = to_encode[0]
-        to_encode = to_encode[1:]
         if len(lines[-1]) == maxlen:
             lines.append(_steal_trailing_WSP_if_exists(lines))
-        lines[-1] += blank
+        lines[-1] += to_encode[0]
+        to_encode = to_encode[1:]
     trailing = ''
     if to_encode[-1] in WSP:
-        trailing = to_encode[-1]
-        to_encode = to_encode[:-1]
-    new_last_ew = len(lines[-1]) if last_ew is None else last_ew
-    encode_as = 'utf-8' if charset == 'us-ascii' else charset
-    chrome_len = len(encode_as) + 7
-    if chrome_len + 1 >= maxlen:
+        to_encode, trailing = to_encode[:-1], to_encode[-1]
+    start = len(lines[-1]) if last_ew is None else last_ew
+    return to_encode, trailing, start
+
+
+def _longest_ew(text, room, charset):
+    # The encoded word for the longest prefix of *text* that fits in
+    # *room* columns: (prefix length, encoded word).
+    take = len(text)
+    word = _ew.encode(text, charset=charset)
+    while len(word) > room:
+        take -= 1
+        word = _ew.encode(text[:take], charset=charset)
+    return take, word
+
+
+def _fold_as_ew(to_encode, lines, maxlen, last_ew, ew_combine_allowed,
+                charset, leading_whitespace):
+    """Write *to_encode* to *lines* as RFC 2047 encoded words, starting new
+    lines as needed.
+
+    *last_ew* is the column of an encoded word ending the last line, which
+    the new text joins when *ew_combine_allowed*.  *leading_whitespace* is
+    whitespace that belonged before the text; at the start of a
+    continuation line after an encoded word it is encoded too (a bare blank
+    there would be swallowed by the decoder).  Returns the column of the
+    last encoded word if later text may join it, else None.
+    """
+    to_encode, trailing, run_start = _start_ew_run(
+        to_encode, lines, maxlen, last_ew, ew_combine_allowed)
+    charset = _ew_charset(charset)
+    # "=?" charset "?q?" ... "?=" : everything but the payload.
+    overhead = len(charset) + 7
+    if overhead + 1 >= maxlen:
         raise errors.HeaderParseError(
             "max_line_length is too small to fit an encoded word")
     while to_encode:
         room = maxlen - len(lines[-1])
-        text_room = room - chrome_len - len(leading_whitespace)
-        if text_room <= 0:
+        if room - overhead - len(leading_whitespace) <= 0:
             lines.append(_steal_trailing_WSP_if_exists(lines) or ' ')
-            new_last_ew = len(lines[-1])
+            run_start = len(lines[-1])
             continue
-        if (len(lines) > 1 and len(lines[-1]) == 1 and leading_whitespace
+        if (leading_whitespace and len(lines) > 1 and len(lines[-1]) == 1
                 and lines[-2].rstrip(" \t").endswith("?=")):
-            lines[-1] += _ew.encode(leading_whitespace, charset=encode_as)
-            leading_whitespace = ''
-        chunk = to_encode[:text_room]
-        word = _ew.encode(chunk, charset=encode_as)
-        while len(word) > room:
-            chunk = chunk[:-1]
-            word = _ew.encode(chunk, charset=encode_as)
-        lines[-1] += word
-        to_encode = to_encode[len(chunk):]
+            lines[-1] += _ew.encode(leading_whitespace, charset=charset)
+        payload_room = room - overhead - len(leading_whitespace)
         leading_whitespace = ''
+        taken, word = _longest_ew(to_encode[:payload_room], room, charset)
+        lines[-1] += word
+        to_encode = to_encode[taken:]
         if to_encode:
             lines.append(' ')
-            new_last_ew = len(lines[-1])
+            run_start = len(lines[-1])
     lines[-1] += trailing
-    return new_last_ew if ew_combine_allowed else None
+    return run_start if ew_combine_allowed else None
+
+
+def _parameter_spelling(name, value, encoding):
+    # How a parameter is written when it fits on a line: name="value", or
+    # in RFC 2231 form when the value cannot be represented in *encoding*.
+    # Also returns the charset and error handler a split value is encoded
+    # with.
+    try:
+        value.encode(encoding)
+    except UnicodeEncodeError:
+        pass
+    else:
+        return '{}={}'.format(name, quote_string(value)), encoding, 'strict'
+    if utils._has_surrogates(value):
+        charset, handler = 'unknown-8bit', 'surrogateescape'
+    else:
+        charset, handler = 'utf-8', 'strict'
+    encoded = utils._percent_encode(value, "utf-8", handler)
+    return "{}*={}''{}".format(name, charset, encoded), charset, handler
+
+
+def _rfc2231_continuations(name, value, charset, handler, maxlen):
+    # Split a value too long for any line into numbered, percent-encoded
+    # sections ( name*0*=charset''..., name*1*=... ), one per line.
+    # Returns the lines and the width used, which grows to 78 if *maxlen*
+    # leaves no room for the value at all.
+    pieces = []
+    prefix = charset + "''"
+    number = 0
+    while value:
+        # " name*N*=" + prefix, and the ';' that ends all but the last line
+        overhead = len(name) + len(str(number)) + 3 + len(prefix)
+        if maxlen <= overhead + 3:
+            maxlen = 78
+        room = maxlen - overhead - 2
+        take = room
+        encoded = utils._percent_encode(value[:take], "utf-8", handler)
+        while len(encoded) > room and take > 0:
+            take -= 1
+            encoded = utils._percent_encode(value[:take], "utf-8", handler)
+        if take == 0 and not prefix:
+            # Not even one character fits and nothing will shrink: force
+            # progress with an over-long line rather than loop forever.
+            take = 1
+            encoded = utils._percent_encode(value[:take], "utf-8", handler)
+        # (An empty first section can happen: it only carries the prefix.)
+        pieces.append(" {}*{}*={}{}".format(name, number, prefix, encoded))
+        prefix = ''
+        number += 1
+        value = value[take:]
+    return [piece + ';' for piece in pieces[:-1]] + pieces[-1:], maxlen
 
 
 def _fold_mime_parameters(part, lines, maxlen, encoding):
-    """Fold MIME parameters, using RFC 2231 encoding (and continuations)
-    where the value needs it."""
+    """Append the parameters of *part* to *lines*: on the current line if
+    they fit, else on a line of their own, else split in RFC 2231
+    sections."""
     for name, value in part.params:
         if not lines[-1].rstrip().endswith(';'):
             lines[-1] += ';'
-        charset = encoding
-        errors_handler = 'strict'
-        try:
-            value.encode(encoding)
-            needs_encoding = False
-        except UnicodeEncodeError:
-            needs_encoding = True
-            if utils._has_surrogates(value):
-                charset = 'unknown-8bit'
-                errors_handler = 'surrogateescape'
-            else:
-                charset = 'utf-8'
-        if needs_encoding:
-            encoded = utils._percent_encode(value, "utf-8", errors_handler)
-            text = "{}*={}''{}".format(name, charset, encoded)
-        else:
-            text = '{}={}'.format(name, quote_string(value))
+        text, charset, handler = _parameter_spelling(name, value, encoding)
         if len(lines[-1]) + len(text) + 1 < maxlen:
-            lines[-1] = lines[-1] + ' ' + text
-            continue
-        if len(text) + 2 <= maxlen:
+            lines[-1] += ' ' + text
+        elif len(text) + 2 <= maxlen:
             lines.append(' ' + text)
-            continue
-        # Split into RFC 2231 sections, all of them encoded.
-        section = 0
-        prefix = charset + "''"
-        while value:
-            chrome_len = len(name) + len(str(section)) + 3 + len(prefix)
-            if maxlen <= chrome_len + 3:
-                maxlen = 78
-            limit = maxlen - chrome_len - 2
-            split = limit
-            while True:
-                encoded = utils._percent_encode(value[:split], "utf-8", errors_handler)
-                if len(encoded) <= limit:
-                    break
-                split -= 1
-            lines.append(" {}*{}*={}{}".format(name, section, prefix, encoded))
-            prefix = ''
-            section += 1
-            value = value[split:]
-            if value:
-                lines[-1] += ';'
+        else:
+            sections, maxlen = _rfc2231_continuations(name, value, charset,
+                                                       handler, maxlen)
+            lines.extend(sections)
