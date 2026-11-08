@@ -1,7 +1,7 @@
 # perf8 workstream: JIT code size, shared call routines, deopt storm in logging
 
 Branch: the perf8 worktree (based on `core` b9124d2 + perf7 merged; `core` merged again at
-the end, b23a559). Everything written from scratch. Method as perf3-perf7: callgrind and
+the end, b23a559, and once more before hand-off, 934419d (mem1): rebuilt, jit tests, stress, startup_order and test_call/sys/dict/free_threading/generators/logging/copy/capi re-run and passing). Everything written from scratch. Method as perf3-perf7: callgrind and
 cachegrind counts decide (tools/bench/perloop.sh, cachestat.sh, micro/percall.sh), wall
 clock is indicative only (load 7-9 from other agents during this work).
 
