@@ -164,10 +164,10 @@ is the start of mem1 (core merged, snapshot of that build); "mem1" is the final 
 
 | build | start-up VmRSS | RssAnon | RssFile | peak VmHWM |
 |---|---|---|---|---|
-| CPython py-default | 9.07-9.43 MB | 3.28 MB | 5.79-6.15 MB | 32.26-32.37 MB |
-| CPython py-ft | 10.68-10.76 MB | 4.83-4.85 MB | 5.84-5.92 MB | 38.71-38.78 MB |
-| base (normal build) | 11.57-11.65 MB | 3.88 MB | 7.68-7.77 MB | 36.22-36.36 MB |
-| **mem1 (normal build)** | **9.64-9.71 MB** | 3.96 MB | **5.68-5.75 MB** | **32.99-33.38 MB** |
+| CPython py-default | 9.07-9.43 MB | 3.28 MB | 5.79-6.15 MB | 32.26-32.55 MB |
+| CPython py-ft | 10.56-10.78 MB | 4.80-4.85 MB | 5.72-5.96 MB | 37.12-38.82 MB |
+| base (normal build) | 11.53-11.70 MB | 3.88 MB | 7.65-7.82 MB | 36.22-36.44 MB |
+| **mem1 (normal build)** | **9.64-9.87 MB** | 3.95-3.96 MB | **5.68-5.92 MB** | **32.99-33.38 MB** |
 | mem1 (PGO build) | PGO_START | PGO_ANON | PGO_FILE | PGO_PEAK |
 
 The executable's own resident pages right after start-up (resident_syms.sh): 6.3 MB at
@@ -184,6 +184,21 @@ Instruction counts (callgrind) are unchanged by mem1's changes: `-c pass` 40.11M
 micro benchmarks, comparing pre-merge builds: listdict 148.58M → 148.59M, attr 78.08M →
 78.08M. In the merged head listdict is 155.6M: that +5% comes with core's merge (scale3/tail4
 dict and GC changes), not with mem1's changes; the other micro benchmarks are within +0.6%.
+
+## Correctness
+On snapshots of the final head (tools/snapshot.sh): tools/jit_tests/run.sh (27/27),
+tools/stress/run.sh (21/21), `cargo test --release -p python` (including the startup_order
+test), and the 16 gate modules: all pass except test_importlib, which has 20 failures. They
+are all `frozen.test_finder` loader-state checks: the test expects the frozen modules'
+filenames under `test.support.STDLIB_DIR`, which is spec/Lib when run_tests.sh puts spec/Lib
+on PYTHONPATH, while the snapshot's stdlib is elsewhere. The start-of-mem1 build fails the
+same 20 on the same snapshot layout, so this comes from the harness, not from mem1.
+test_gc passes now (core's scale3), and test_asyncio has 0 failures. Extra modules run
+because of the changes: test_frozen, test_zipimport, test_runpy, test_codecs,
+test_multibytecodec, test_zlib, test_binascii, test_datetime, test_set, test_str, test_bytes,
+test_pickle, test_json, test_re, test_types, test_descr, test_builtin, test_collections,
+test_mmap, test_site, test_os, test_import, test_exceptions, test_generators, test_ucn: all
+pass.
 
 ## What is still behind, and why
 * **Anonymous memory at start-up: +0.68 MB compared with py-default.** The objects carry
