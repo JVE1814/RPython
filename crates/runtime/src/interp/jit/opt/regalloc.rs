@@ -96,26 +96,61 @@ pub fn allocate(f: &Func) -> Alloc {
     let mut live_out = vec![vec![0u64; words]; nb];
     let succs: Vec<Vec<BlockId>> = f.blocks.iter().map(|b| b.term.succs().into_iter().chain(b.tsuccs.iter().copied()).collect()).collect();
     let mut changed = true;
-    while changed {
-        changed = false;
-        for &b in f.order.iter().rev() {
-            let b = b as usize;
-            let mut out = vec![0u64; words];
-            for &s in &succs[b] {
-                for w in 0..words {
-                    out[w] |= live_in[s as usize][w];
+    // (perf8) scratch sets reused across blocks and passes (two allocations per block
+    // per pass made malloc a third of the allocator's time on big units)
+    let mut out = vec![0u64; words];
+    let mut inn = vec![0u64; words];
+    // (perf8) visit blocks in postorder of the IR's own CFG (successors before
+    // predecessors: a backward problem then settles in a few passes; creation order
+    // put the synthetic blocks of every bytecode block at the end)
+    let post = {
+        let mut seen = vec![false; nb];
+        let mut post: Vec<usize> = Vec::with_capacity(nb);
+        let mut stack: Vec<(usize, usize)> = Vec::new();
+        let roots = f.entries.iter().map(|e| e.1 as usize).chain(f.order.iter().map(|&b| b as usize));
+        for r in roots {
+            if seen[r] {
+                continue;
+            }
+            seen[r] = true;
+            stack.push((r, 0));
+            while let Some(&mut (b, ref mut k)) = stack.last_mut() {
+                if let Some(&s) = succs[b].get(*k) {
+                    *k += 1;
+                    let s = s as usize;
+                    if !seen[s] {
+                        seen[s] = true;
+                        stack.push((s, 0));
+                    }
+                } else {
+                    post.push(b);
+                    stack.pop();
                 }
             }
-            let mut inn = out.clone();
-            for w in 0..words {
-                inn[w] &= !defs_b[b][w];
+        }
+        post
+    };
+    while changed {
+        changed = false;
+        for &b in &post {
+            out.fill(0);
+            for &s in &succs[b] {
+                for (o, &l) in out.iter_mut().zip(live_in[s as usize].iter()) {
+                    *o |= l;
+                }
+            }
+            for ((i, &o), &d) in inn.iter_mut().zip(out.iter()).zip(defs_b[b].iter()) {
+                *i = o & !d;
             }
             for &x in &uses_b[b] {
                 inn[x as usize / 64] |= 1 << (x % 64);
             }
-            if inn != live_in[b] || out != live_out[b] {
-                live_in[b] = inn;
-                live_out[b] = out;
+            if inn != live_in[b] {
+                live_in[b].copy_from_slice(&inn);
+                changed = true;
+            }
+            if out != live_out[b] {
+                live_out[b].copy_from_slice(&out);
                 changed = true;
             }
         }
@@ -229,24 +264,29 @@ pub fn allocate(f: &Func) -> Alloc {
             loc[x] = spill(&mut nslots);
             continue;
         }
-        let used: Vec<Loc> = active.iter().map(|&(_, v)| loc[v]).collect();
+        // (perf8) registers in use as a bit set (gprs 0-15, xmm 16-31), no allocation
+        let mut used = 0u32;
+        for &(_, v) in &active {
+            match loc[v] {
+                Loc::Reg(r) => used |= 1 << (r as u32),
+                Loc::Xmm(k) => used |= 1 << (16 + k as u32),
+                _ => {}
+            }
+        }
+        let free_gpr = |r: R| used & (1 << (r as u32)) == 0;
         let pick = match f.classes[x] {
             Class::G => {
-                let mut cands: Vec<R> = Vec::new();
-                if !cross {
-                    cands.extend_from_slice(&GPR_CALLER);
-                }
-                if !cross_tpl {
-                    cands.push(R::R14);
-                }
-                cands.push(R::Rbp);
-                cands.into_iter().map(Loc::Reg).find(|l| !used.contains(l))
+                let caller = if cross { None } else { GPR_CALLER.iter().copied().find(|&r| free_gpr(r)) };
+                caller
+                    .or_else(|| if !cross_tpl && free_gpr(R::R14) { Some(R::R14) } else { None })
+                    .or_else(|| if free_gpr(R::Rbp) { Some(R::Rbp) } else { None })
+                    .map(Loc::Reg)
             }
             Class::F => {
                 if cross {
                     None
                 } else {
-                    XMM_ALLOC.map(Loc::Xmm).find(|l| !used.contains(l))
+                    XMM_ALLOC.find(|&k| used & (1 << (16 + k as u32)) == 0).map(Loc::Xmm)
                 }
             }
         };
