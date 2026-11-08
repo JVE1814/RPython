@@ -95,10 +95,68 @@ extern "C" fn report() {
         STW_COUNT.load(Relaxed), STW_WAIT_NS.load(Relaxed) as f64 / 1e6, PARKED_NS.load(Relaxed) as f64 / 1e6);
     let _ = writeln!(e, "collections {}  pause {:.3} ms", GC_COUNT.load(Relaxed), GC_NS.load(Relaxed) as f64 / 1e6);
     let _ = writeln!(e, "qsbr batches {}  items {}", QSBR_BATCHES.load(Relaxed), QSBR_ITEMS.load(Relaxed));
+    report_phases(&mut e);
     let _ = writeln!(e, "non-owner refcount ops by type (incref / decref):");
     for (i, d, n) in rows.iter().take(25) {
         let _ = writeln!(e, "  {:>12} {:>12}  {}", i, d, n);
     }
+}
+
+// ---------------------------------------------------------------- (scale3) collector phases
+//
+// Thread CPU time and wall time of the collecting thread per collection phase, plus the
+// time the world stayed stopped for collections and the number of objects examined /
+// found unreachable. Printed with the report above.
+
+pub const PHASES: [&str; 8] = ["pre-stop", "prepare", "snapshot", "analyse", "stopped-rest", "clear", "post", "helpers"];
+pub static PHASE_CPU_NS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+pub static PHASE_WALL_NS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+pub static GC_STOPPED_NS: AtomicU64 = AtomicU64::new(0);
+/// Allocator depot traffic: batches spilled by thread caches / taken back.
+pub static DEPOT_SPILLS: AtomicU64 = AtomicU64::new(0);
+pub static DEPOT_REFILLS: AtomicU64 = AtomicU64::new(0);
+pub static GC_EXAMINED: AtomicU64 = AtomicU64::new(0);
+pub static GC_GARBAGE: AtomicU64 = AtomicU64::new(0);
+
+/// (scale3) `RPY_GCDEBUG` set: print one line per collection to stderr (diagnostics).
+pub fn gc_debug() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("RPY_GCDEBUG").is_some())
+}
+
+/// CPU time of the calling thread in nanoseconds.
+pub fn thread_cpu_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// Phase timer: `lap(i)` charges the time since the previous lap to phase `i`.
+pub struct PhaseClock(Option<(u64, std::time::Instant)>);
+impl PhaseClock {
+    pub fn start() -> Self {
+        PhaseClock(if on() { Some((thread_cpu_ns(), std::time::Instant::now())) } else { None })
+    }
+    pub fn lap(&mut self, i: usize) {
+        if let Some((c, w)) = self.0 {
+            let c2 = thread_cpu_ns();
+            let w2 = std::time::Instant::now();
+            PHASE_CPU_NS[i].fetch_add(c2.saturating_sub(c), Relaxed);
+            PHASE_WALL_NS[i].fetch_add((w2 - w).as_nanos() as u64, Relaxed);
+            self.0 = Some((c2, w2));
+        }
+    }
+}
+
+fn report_phases(e: &mut impl std::io::Write) {
+    let _ = writeln!(e, "gcphase stopped {:.3} ms  examined {}  unreachable {}  parallel jobs {} helps {} (serial: {} no helper, {} small) handed {}", GC_STOPPED_NS.load(Relaxed) as f64 / 1e6,
+        GC_EXAMINED.load(Relaxed), GC_GARBAGE.load(Relaxed), crate::gcpar::JOBS.load(Relaxed), crate::gcpar::HELPS.load(Relaxed), crate::gcpar::NO_HELPERS.load(Relaxed), crate::gcpar::TOO_SMALL.load(Relaxed), crate::gc::HANDED.load(Relaxed));
+    let _ = writeln!(e, "allocator depot: {} batches spilled, {} taken", DEPOT_SPILLS.load(Relaxed), DEPOT_REFILLS.load(Relaxed));
+    let mut s = String::from("gcphase cpu/wall ms:");
+    for (i, n) in PHASES.iter().enumerate() {
+        s.push_str(&format!(" {}={:.1}/{:.1}", n, PHASE_CPU_NS[i].load(Relaxed) as f64 / 1e6, PHASE_WALL_NS[i].load(Relaxed) as f64 / 1e6));
+    }
+    let _ = writeln!(e, "{}", s);
 }
 
 /// Called once at runtime start-up.

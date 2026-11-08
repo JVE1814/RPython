@@ -374,3 +374,13 @@ releases the old value only when the frame ends. `sys.getrefcount` reports real 
 emulation is retired; only its part about arguments copied into callees remains. HotSpot comparison: the JIT knows
 which values are live in which slots without paying a refcount for each one. `RPYTHON_BORROW=0` turns it off.
 Details: notes/refs1.md.
+
+## D36 — Profile-guided build for installs and benchmarks (perf7)
+The installed and benchmark build is the profile-guided one (`tools/install.sh <prefix> pgo`, tools/pgo/): an
+instrumented build is trained on start-up, the micro benchmarks, every pyperformance benchmark that needs no extra
+packages, and about 55 test modules. Its profile then drives the final build and the start-up function order. CPython's
+release builds are profile-guided too, so the comparison is like for like; final measurements (D22) use the PGO
+build. Agents and the test suite keep using plain `cargo build --release`. The reason: the remaining single-thread gap is
+mostly L1 instruction-cache misses (5–8x CPython's), and laying out hot code together roughly halves them. The PGO build
+must also pass the smoke gate before its numbers are recorded. The JIT emits short jumps wherever they fit
+(`RPYTHON_JIT_NORELAX=1` turns that off).

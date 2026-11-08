@@ -1,14 +1,15 @@
 #
-# multiprocessing.spawn: starting a fresh interpreter as a child.
+# multiprocessing.spawn -- children that are brand-new interpreters.
 #
-# The parent pickles "preparation data" (sys.path, cwd, how to import the
-# main module, ...) and the Process object into a pipe; the child runs
-# spawn_main(), which restores that state and calls Process._bootstrap().
+# The parent writes two pickles into a pipe: a dict of "preparation data"
+# (process name, authkey, sys.path, sys.argv, working directory, how to
+# re-import the main module, ...) and the Process object itself.  The child
+# is started with a command line that calls spawn_main(), which reads both,
+# makes the interpreter look like the parent's and runs the process.
 #
 
 import os
 import sys
-import runpy
 import types
 
 from . import get_start_method, set_start_method
@@ -19,16 +20,20 @@ from . import util
 __all__ = ['_main', 'freeze_support', 'set_executable', 'get_executable',
            'get_preparation_data', 'get_command_line', 'import_main_path']
 
+# Windows frozen-executable / service flags (always false here).
 WINEXE = False
 WINSERVICE = False
 
 _python_exe = sys.executable
 
+_FORK_FLAG = '--multiprocessing-fork'
+
 
 def set_executable(exe):
-    """Interpreter used for spawned children (str, bytes or path-like)."""
+    """Use *exe* (str, bytes or path-like) as the interpreter of spawned
+    children."""
     global _python_exe
-    _python_exe = os.fsdecode(exe) if exe is not None else None
+    _python_exe = None if exe is None else os.fsdecode(exe)
 
 
 def get_executable():
@@ -36,190 +41,221 @@ def get_executable():
 
 
 def is_forking(argv):
-    """True if *argv* is the command line of a spawned child."""
-    return len(argv) >= 2 and argv[1] == '--multiprocessing-fork'
+    """Whether *argv* is the command line of a spawned child."""
+    return len(argv) >= 2 and argv[1] == _FORK_FLAG
 
 
 def freeze_support():
-    """In a frozen executable started as a child, run the child code and
-    exit; otherwise do nothing."""
-    if is_forking(sys.argv):
-        kwds = {}
-        for arg in sys.argv[2:]:
-            name, value = arg.split('=')
-            kwds[name] = None if value == 'None' else int(value)
-        spawn_main(**kwds)
-        sys.exit()
+    """When a frozen program is started as a spawned child, run the child
+    and exit; return normally otherwise."""
+    if not is_forking(sys.argv):
+        return
+    options = {}
+    for arg in sys.argv[2:]:
+        key, value = arg.split('=')
+        options[key] = None if value == 'None' else int(value)
+    spawn_main(**options)
+    sys.exit()
 
 
 def get_command_line(**kwds):
-    """argv starting a child that runs spawn_main(**kwds)."""
+    """The argv that starts a child running spawn_main(**kwds)."""
+    settings = ['%s=%r' % pair for pair in kwds.items()]
     if getattr(sys, 'frozen', False):
-        return ([sys.executable, '--multiprocessing-fork'] +
-                ['%s=%r' % item for item in kwds.items()])
-    args = ', '.join('%s=%r' % item for item in kwds.items())
-    prog = 'from multiprocessing.spawn import spawn_main; spawn_main(%s)' % args
-    opts = util._args_from_interpreter_flags()
-    return [get_executable()] + opts + ['-c', prog, '--multiprocessing-fork']
+        return [sys.executable, _FORK_FLAG] + settings
+    code = ('from multiprocessing.spawn import spawn_main; spawn_main(%s)'
+            % ', '.join(settings))
+    return ([get_executable()] + util._args_from_interpreter_flags()
+            + ['-c', code, _FORK_FLAG])
 
 
 def spawn_main(pipe_handle, parent_pid=None, tracker_fd=None):
-    """Entry point of a spawned child."""
+    """What a spawned child runs first."""
     assert is_forking(sys.argv), "Not forking"
     if tracker_fd is not None:
         from . import resource_tracker
         resource_tracker._resource_tracker._fd = tracker_fd
-    # The read end of the pipe doubles as the "parent died" sentinel.
-    parent_sentinel = os.dup(pipe_handle)
-    exitcode = _main(pipe_handle, parent_sentinel)
-    sys.exit(exitcode)
+    # The pipe's read end also tells the child when the parent has gone
+    # (EOF), so keep a second descriptor for that.
+    sentinel = os.dup(pipe_handle)
+    sys.exit(_main(pipe_handle, sentinel))
 
 
 def _main(fd, parent_sentinel):
-    with os.fdopen(fd, 'rb', closefd=True) as from_parent:
-        process.current_process()._inheriting = True
+    me = process.current_process()
+    with os.fdopen(fd, 'rb', closefd=True) as source:
+        # While the main module is re-imported, starting processes is an
+        # error (see _check_not_importing_main()).
+        me._inheriting = True
         try:
-            preparation_data = reduction.pickle.load(from_parent)
-            prepare(preparation_data)
-            self = reduction.pickle.load(from_parent)
+            prepare(reduction.pickle.load(source))
+            child = reduction.pickle.load(source)
         finally:
-            del process.current_process()._inheriting
-    return self._bootstrap(parent_sentinel)
+            del me._inheriting
+    return child._bootstrap(parent_sentinel)
 
 
 def _check_not_importing_main():
     if getattr(process.current_process(), '_inheriting', False):
         raise RuntimeError(
-            "A new process was started while the current process was still "
-            "bootstrapping (importing its main module).\n\n"
-            "This usually means the main module starts processes at import "
-            "time.  Protect that code with\n\n"
+            "A child process tried to start another process while it was "
+            "still re-importing its parent's main module.\n\n"
+            "With the spawn and forkserver start methods every child imports "
+            "the main module again, so code that starts processes must not "
+            "run at import time.  Put it under a guard:\n\n"
             "    if __name__ == '__main__':\n"
-            "        ...\n\n"
-            "(and call freeze_support() first in frozen programs).")
+            "        multiprocessing.freeze_support()   # frozen programs only\n"
+            "        ...\n")
+
+
+def _path_for_child(path_list):
+    # '' in sys.path means "the current directory", which the child may not
+    # share: replace it by the directory we started in.
+    return [process.ORIGINAL_DIR if entry == '' else entry
+            for entry in path_list]
+
+
+def _how_to_load_main():
+    # -> ('init_main_from_name', module name) for "python -m ...",
+    #    ('init_main_from_path', path) for a script, or None.
+    main = sys.modules['__main__']
+    spec_name = getattr(main.__spec__, 'name', None)
+    if spec_name is not None:
+        return 'init_main_from_name', spec_name
+    if sys.platform == 'win32' and (WINEXE or WINSERVICE):
+        return None
+    path = getattr(main, '__file__', None)
+    if path is None:
+        return None
+    if not os.path.isabs(path) and process.ORIGINAL_DIR is not None:
+        path = os.path.join(process.ORIGINAL_DIR, path)
+    return 'init_main_from_path', os.path.normpath(path)
 
 
 def get_preparation_data(name):
-    """State a spawned child needs to look like its parent."""
+    """Collect what a spawned child needs in order to resemble us."""
     _check_not_importing_main()
-    d = dict(
-        log_to_stderr=util._log_to_stderr,
-        authkey=process.current_process().authkey,
-        )
-
+    data = {
+        'log_to_stderr': util._log_to_stderr,
+        'authkey': process.current_process().authkey,
+        'name': name,
+        'sys_path': _path_for_child(sys.path),
+        'sys_argv': sys.argv,
+        'orig_dir': process.ORIGINAL_DIR,
+        'dir': os.getcwd(),
+        'start_method': get_start_method(allow_none=True),
+    }
     if util._logger is not None:
-        d['log_level'] = util._logger.getEffectiveLevel()
-
-    sys_path = sys.path.copy()
-    try:
-        i = sys_path.index('')
-    except ValueError:
-        pass
-    else:
-        sys_path[i] = process.ORIGINAL_DIR
-
-    d.update(
-        name=name,
-        sys_path=sys_path,
-        sys_argv=sys.argv,
-        orig_dir=process.ORIGINAL_DIR,
-        dir=os.getcwd(),
-        start_method=get_start_method(allow_none=True),
-        )
-
-    # How should the child recreate the main module?
-    main_module = sys.modules['__main__']
-    main_mod_name = getattr(main_module.__spec__, "name", None)
-    if main_mod_name is not None:
-        d['init_main_from_name'] = main_mod_name
-    elif sys.platform != 'win32' or (not WINEXE and not WINSERVICE):
-        main_path = getattr(main_module, '__file__', None)
-        if main_path is not None:
-            if (not os.path.isabs(main_path) and
-                        process.ORIGINAL_DIR is not None):
-                main_path = os.path.join(process.ORIGINAL_DIR, main_path)
-            d['init_main_from_path'] = os.path.normpath(main_path)
-
-    return d
+        data['log_level'] = util._logger.getEffectiveLevel()
+    main = _how_to_load_main()
+    if main is not None:
+        data[main[0]] = main[1]
+    return data
 
 
-# Main modules replaced by prepare() (kept alive: their globals may still
-# be referenced).
+# --- applying preparation data in the child ---------------------------------
+
+# Main modules replaced by prepare(); kept so that their globals stay alive
+# for code that still refers to them.
 old_main_modules = []
 
 
-def prepare(data):
-    """Apply the preparation data in the child."""
-    if 'name' in data:
-        process.current_process().name = data['name']
+def _set_name(value):
+    process.current_process().name = value
 
-    if 'authkey' in data:
-        process.current_process().authkey = data['authkey']
 
-    if 'log_to_stderr' in data and data['log_to_stderr']:
+def _set_authkey(value):
+    process.current_process().authkey = value
+
+
+def _set_log_to_stderr(value):
+    if value:
         util.log_to_stderr()
 
-    if 'log_level' in data:
-        util.get_logger().setLevel(data['log_level'])
 
-    if 'sys_path' in data:
-        sys.path = data['sys_path']
+def _set_log_level(value):
+    util.get_logger().setLevel(value)
 
-    if 'sys_argv' in data:
-        sys.argv = data['sys_argv']
 
-    if 'dir' in data:
-        os.chdir(data['dir'])
+def _set_sys_path(value):
+    sys.path = value
 
-    if 'orig_dir' in data:
-        process.ORIGINAL_DIR = data['orig_dir']
 
-    if 'start_method' in data:
-        set_start_method(data['start_method'], force=True)
+def _set_sys_argv(value):
+    sys.argv = value
 
+
+def _set_orig_dir(value):
+    process.ORIGINAL_DIR = value
+
+
+def _set_start_method(value):
+    set_start_method(value, force=True)
+
+
+# Applied in this order; the main module is handled last, once sys.path and
+# the working directory are right.
+_PREPARE_STEPS = (
+    ('name', _set_name),
+    ('authkey', _set_authkey),
+    ('log_to_stderr', _set_log_to_stderr),
+    ('log_level', _set_log_level),
+    ('sys_path', _set_sys_path),
+    ('sys_argv', _set_sys_argv),
+    ('dir', os.chdir),
+    ('orig_dir', _set_orig_dir),
+    ('start_method', _set_start_method),
+)
+
+
+def prepare(data):
+    """Make this (child) interpreter match the parent's preparation data."""
+    for key, apply in _PREPARE_STEPS:
+        if key in data:
+            apply(data[key])
     if 'init_main_from_name' in data:
         _fixup_main_from_name(data['init_main_from_name'])
     elif 'init_main_from_path' in data:
         _fixup_main_from_path(data['init_main_from_path'])
 
 
-def _install_main(namespace):
-    main_module = types.ModuleType("__mp_main__")
-    main_module.__dict__.update(namespace)
-    sys.modules['__main__'] = sys.modules['__mp_main__'] = main_module
+def _install_as_main(namespace):
+    # Objects pickled by the parent refer to "__main__"; make both that and
+    # "__mp_main__" resolve to the re-imported module.
+    module = types.ModuleType("__mp_main__")
+    module.__dict__.update(namespace)
+    sys.modules['__main__'] = sys.modules['__mp_main__'] = module
 
 
 def _fixup_main_from_name(mod_name):
-    # Re-import the parent's main module (run with -m) as __mp_main__ so
-    # that objects pickled by reference to it can be found.
-    current_main = sys.modules['__main__']
-    if mod_name == "__main__" or mod_name.endswith(".__main__"):
-        # package __main__ modules only run when executed: skip
+    # The parent was started with "-m mod_name".  A package's __main__ only
+    # makes sense when run as a program, so it is not re-imported.
+    if mod_name == '__main__' or mod_name.endswith('.__main__'):
         return
-    if getattr(current_main.__spec__, "name", None) == mod_name:
+    current = sys.modules['__main__']
+    if getattr(current.__spec__, 'name', None) == mod_name:
         return
-
-    old_main_modules.append(current_main)
-    namespace = runpy.run_module(mod_name, run_name="__mp_main__",
-                                 alter_sys=True)
-    _install_main(namespace)
+    import runpy
+    old_main_modules.append(current)
+    _install_as_main(runpy.run_module(mod_name, run_name='__mp_main__',
+                                      alter_sys=True))
 
 
 def _fixup_main_from_path(main_path):
-    # Run the parent's main script as __mp_main__ (its "__main__" guard
-    # keeps the program itself from running again).
-    current_main = sys.modules['__main__']
-    main_name = os.path.splitext(os.path.basename(main_path))[0]
-    if main_name == 'ipython':
+    # The parent ran a script.  Running it again as "__mp_main__" defines its
+    # functions and classes while the "if __name__ == '__main__'" block
+    # stays inactive.
+    current = sys.modules['__main__']
+    stem = os.path.splitext(os.path.basename(main_path))[0]
+    if stem == 'ipython':
         return
-    if getattr(current_main, '__file__', None) == main_path:
+    if getattr(current, '__file__', None) == main_path:
         return
-
-    old_main_modules.append(current_main)
-    namespace = runpy.run_path(main_path, run_name="__mp_main__")
-    _install_main(namespace)
+    import runpy
+    old_main_modules.append(current)
+    _install_as_main(runpy.run_path(main_path, run_name='__mp_main__'))
 
 
 def import_main_path(main_path):
-    """Set sys.modules['__main__'] to the module at *main_path*."""
+    """Make the module at *main_path* this process's __main__."""
     _fixup_main_from_path(main_path)

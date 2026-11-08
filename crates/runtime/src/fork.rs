@@ -20,6 +20,7 @@ pub struct ForkState {
     stopped: bool,
     import_lock: bool,
     depot: Option<crate::tlab::DepotForkGuard>,
+    young: Option<crate::young::ForkGuard>,
     all_threads: Option<MutexGuard<'static, Vec<usize>>>,
     free_states: Option<MutexGuard<'static, Vec<usize>>>,
     /// Number of other live Python threads when fork() was called.
@@ -32,15 +33,17 @@ pub fn prepare() -> ForkState {
     let other_threads = count_other_threads();
     let stopped = crate::gc::fork_prepare();
     let depot = Some(crate::tlab::lock_depot_for_fork());
+    let young = Some(crate::young::lock_for_fork());
     let all_threads = Some(crate::threads::ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner()));
     let free_states = Some(crate::threads::FREE_STATES.lock().unwrap_or_else(|e| e.into_inner()));
-    ForkState { stopped, import_lock, depot, all_threads, free_states, other_threads }
+    ForkState { stopped, import_lock, depot, young, all_threads, free_states, other_threads }
 }
 
 fn release_locks(st: &mut ForkState) {
     drop(st.free_states.take());
     drop(st.all_threads.take());
     drop(st.depot.take());
+    drop(st.young.take());
 }
 
 /// In the parent after fork() (also when fork() failed).

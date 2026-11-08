@@ -1,13 +1,20 @@
-"""Interfaces of SAX parser drivers: XMLReader, IncrementalParser,
-Locator, InputSource and the attribute containers."""
+"""The SAX 2 driver interfaces: XMLReader and IncrementalParser (what a
+parser implements), Locator, InputSource, and the attribute containers
+handed to startElement()/startElementNS()."""
 
 from . import handler
 
 from ._exceptions import SAXNotSupportedException, SAXNotRecognizedException
 
 
+def _abstract(what):
+    raise NotImplementedError(f"{what} has to be provided by the parser driver")
+
+
 class XMLReader:
-    """Base class of SAX parsers."""
+    """Base class of SAX parsers: holds the four handlers (each starts as
+    the do-nothing default from xml.sax.handler) and rejects every feature
+    and property it does not know."""
 
     def __init__(self):
         self._cont_handler = handler.ContentHandler()
@@ -16,8 +23,9 @@ class XMLReader:
         self._err_handler = handler.ErrorHandler()
 
     def parse(self, source):
-        """Parse an XML document (system id or InputSource)."""
-        raise NotImplementedError("This method must be implemented!")
+        """Parse a document given as a system id (URL or file name), a
+        file object or an InputSource."""
+        _abstract("parse()")
 
     def getContentHandler(self):
         return self._cont_handler
@@ -44,7 +52,7 @@ class XMLReader:
         self._err_handler = handler
 
     def setLocale(self, locale):
-        """Allow the application to set the locale for errors."""
+        """Choose the language of error messages; not supported here."""
         raise SAXNotSupportedException("Locale support not implemented")
 
     def getFeature(self, name):
@@ -61,8 +69,10 @@ class XMLReader:
 
 
 class IncrementalParser(XMLReader):
-    """A reader that can be fed data in pieces (feed/close/reset);
-    parse() is implemented on top of that."""
+    """A parser that accepts the document in pieces: prepareParser(),
+    then feed() any number of times, then close(); reset() makes it ready
+    for the next document.  parse() is built from these, reading the input
+    *bufsize* characters or bytes at a time."""
 
     def __init__(self, bufsize=2**16):
         self._bufsize = bufsize
@@ -71,32 +81,33 @@ class IncrementalParser(XMLReader):
     def parse(self, source):
         from . import saxutils
         source = saxutils.prepare_input_source(source)
-
         self.prepareParser(source)
-        file = source.getCharacterStream()
-        if file is None:
-            file = source.getByteStream()
-        buffer = file.read(self._bufsize)
-        while buffer:
-            self.feed(buffer)
-            buffer = file.read(self._bufsize)
+        stream = source.getCharacterStream()
+        if stream is None:
+            stream = source.getByteStream()
+        while True:
+            chunk = stream.read(self._bufsize)
+            if not chunk:
+                break
+            self.feed(chunk)
         self.close()
 
     def feed(self, data):
-        raise NotImplementedError("This method must be implemented!")
+        _abstract("feed()")
 
     def prepareParser(self, source):
-        raise NotImplementedError("prepareParser must be overridden!")
+        _abstract("prepareParser()")
 
     def close(self):
-        raise NotImplementedError("This method must be implemented!")
+        _abstract("close()")
 
     def reset(self):
-        raise NotImplementedError("This method must be implemented!")
+        _abstract("reset()")
 
 
 class Locator:
-    """Gives the location of the current event (defaults: unknown)."""
+    """Where in the document the current event comes from.  This base
+    class knows nothing: line and column are -1, the ids None."""
 
     def getColumnNumber(self):
         return -1
@@ -112,52 +123,60 @@ class Locator:
 
 
 class InputSource:
-    """An input for a parser: ids, encoding and a byte or character
-    stream."""
+    """Everything a parser needs to read one document: its public and
+    system ids, an encoding hint, and a byte stream or a character stream
+    (the character stream wins when both are set)."""
 
     def __init__(self, system_id=None):
-        self.__system_id = system_id
-        self.__public_id = None
-        self.__encoding = None
-        self.__bytefile = None
-        self.__charfile = None
+        self._system_id = system_id
+        self._public_id = None
+        self._encoding = None
+        self._byte_stream = None
+        self._char_stream = None
 
     def setPublicId(self, public_id):
-        self.__public_id = public_id
+        self._public_id = public_id
 
     def getPublicId(self):
-        return self.__public_id
+        return self._public_id
 
     def setSystemId(self, system_id):
-        self.__system_id = system_id
+        self._system_id = system_id
 
     def getSystemId(self):
-        return self.__system_id
+        return self._system_id
 
     def setEncoding(self, encoding):
-        self.__encoding = encoding
+        self._encoding = encoding
 
     def getEncoding(self):
-        return self.__encoding
+        return self._encoding
 
     def setByteStream(self, bytefile):
-        self.__bytefile = bytefile
+        self._byte_stream = bytefile
 
     def getByteStream(self):
-        return self.__bytefile
+        return self._byte_stream
 
     def setCharacterStream(self, charfile):
-        self.__charfile = charfile
+        self._char_stream = charfile
 
     def getCharacterStream(self):
-        return self.__charfile
+        return self._char_stream
 
 
 class AttributesImpl:
-    """Attributes of an element (name -> value)."""
+    """The attributes of an element, as a read-only mapping from name to
+    value.  Without namespaces a name is also its qualified name, and
+    every attribute has type CDATA."""
 
     def __init__(self, attrs):
         self._attrs = attrs
+
+    def _known(self, name):
+        if name not in self._attrs:
+            raise KeyError(name)
+        return name
 
     def getLength(self):
         return len(self._attrs)
@@ -172,20 +191,16 @@ class AttributesImpl:
         return self._attrs[name]
 
     def getNameByQName(self, name):
-        if name not in self._attrs:
-            raise KeyError(name)
-        return name
+        return self._known(name)
 
     def getQNameByName(self, name):
-        if name not in self._attrs:
-            raise KeyError(name)
-        return name
+        return self._known(name)
 
     def getNames(self):
-        return list(self._attrs.keys())
+        return list(self._attrs)
 
     def getQNames(self):
-        return list(self._attrs.keys())
+        return list(self._attrs)
 
     def __len__(self):
         return len(self._attrs)
@@ -193,17 +208,14 @@ class AttributesImpl:
     def __getitem__(self, name):
         return self._attrs[name]
 
-    def keys(self):
-        return list(self._attrs.keys())
-
     def __contains__(self, name):
         return name in self._attrs
 
+    def keys(self):
+        return list(self._attrs)
+
     def get(self, name, alternative=None):
         return self._attrs.get(name, alternative)
-
-    def copy(self):
-        return self.__class__(self._attrs)
 
     def items(self):
         return list(self._attrs.items())
@@ -211,26 +223,29 @@ class AttributesImpl:
     def values(self):
         return list(self._attrs.values())
 
+    def copy(self):
+        return self.__class__(self._attrs)
+
 
 class AttributesNSImpl(AttributesImpl):
-    """Attributes keyed by (uri, localname), with their qualified
-    names."""
+    """Attributes keyed by (namespace URI, local name) pairs; *qnames* maps
+    the same keys to the qualified names used in the document."""
 
     def __init__(self, attrs, qnames):
         self._attrs = attrs
         self._qnames = qnames
 
+    def _name_for_qname(self, qname):
+        for name, candidate in self._qnames.items():
+            if candidate == qname:
+                return name
+        raise KeyError(qname)
+
     def getValueByQName(self, name):
-        for nsname, qname in self._qnames.items():
-            if qname == name:
-                return self._attrs[nsname]
-        raise KeyError(name)
+        return self._attrs[self._name_for_qname(name)]
 
     def getNameByQName(self, name):
-        for nsname, qname in self._qnames.items():
-            if qname == name:
-                return nsname
-        raise KeyError(name)
+        return self._name_for_qname(name)
 
     def getQNameByName(self, name):
         return self._qnames[name]

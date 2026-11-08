@@ -87,6 +87,18 @@ pub fn lock_held(o: &PyObject) -> ObjGuard {
     lock_impl(o, true)
 }
 
+/// (scale3) `lock_held` for iterator slots: no lock when the caller's reference is the
+/// only one and belongs to this thread (`object::exclusively_owned`, e.g. the iterator of
+/// a running `for` loop): no other thread can reach the object then, and the slot
+/// does not hand it to Python code. Shared iterators are locked as before.
+#[inline]
+pub fn lock_held_unless_exclusive(o: &PyObject) -> ObjGuard {
+    if crate::object::exclusively_owned(o) {
+        return ObjGuard { key: 0 };
+    }
+    lock_impl(o, true)
+}
+
 fn lock_impl(o: &PyObject, hold: bool) -> ObjGuard {
     if !crate::threads::multi_threaded() {
         return ObjGuard { key: 0 };
@@ -195,6 +207,19 @@ macro_rules! locked_slot {
         unsafe extern "C" fn $name(o: *mut $crate::ffi::PyObject $(, $arg: $t)*) -> $ret {
             unsafe {
                 let _g = $crate::objlock::lock_held(&*o);
+                $f(o $(, $arg)*)
+            }
+        }
+    };
+}
+
+/// (scale3) `locked_slot!` with `lock_held_unless_exclusive` (iterator slots).
+#[macro_export]
+macro_rules! locked_iter_slot {
+    ($name:ident, $f:path, ($($arg:ident: $t:ty),*) -> $ret:ty) => {
+        unsafe extern "C" fn $name(o: *mut $crate::ffi::PyObject $(, $arg: $t)*) -> $ret {
+            unsafe {
+                let _g = $crate::objlock::lock_held_unless_exclusive(&*o);
                 $f(o $(, $arg)*)
             }
         }

@@ -265,6 +265,15 @@ unsafe extern "C" fn method_descr_get(d: *mut PyObject, obj: *mut PyObject, _tp:
         let md = d as *mut PyMethodDescrObject;
         let owner = (*md).d_common.d_type;
         let cls = if (*(*md).d_method).ml_flags & METH_METHOD != 0 { Some(owner) } else { None };
+        // (tail4) a method that receives its defining class takes the owner from a
+        // type argument: anything else as arg 2 is an error
+        if cls.is_some() && !_tp.is_null() && !(*_tp).is(none::none()) && !is_type(&*_tp) {
+            let _ = crate::errors::new_err(
+                crate::types::exceptions::TypeError(),
+                &format!("descriptor '{}' needs a type, not '{}', as arg 2", descr_name(dd), type_name((*_tp).ty())),
+            );
+            return std::ptr::null_mut();
+        }
         cfunction::new_cfunction(
             (*md).d_method,
             Some(PyRef::from_borrowed(obj)),

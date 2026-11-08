@@ -1,13 +1,22 @@
 #
-# multiprocessing.forkserver: a single-threaded server process (started
-# fresh, optionally with some modules preloaded) that forks the children.
+# multiprocessing.forkserver -- the fork server.
 #
-# Protocol for one child: the parent connects to the server's Unix socket,
-# both sides authenticate with a per-server random key, and the parent
-# sends file descriptors: [child_r, child_w, alive fd, tracker fd, *extra].
-# The server forks; it writes the child's pid and later its exit code to
-# child_w.  The parent writes the pickled preparation data and Process
-# object into the pipe read by the child (child_r).
+# A fresh, single-threaded interpreter (optionally with some modules already
+# imported) listens on a Unix socket and forks a child whenever a client
+# asks.  Forking from it is safe even when the client has threads.
+#
+# One request: the client connects, both sides prove they know the server's
+# random key (the connection module's challenge/response), and the client
+# sends descriptors over the socket:
+#     [child_r, child_w, server-alive fd, resource-tracker fd, *extra fds]
+# The server forks; the child reads its preparation data and Process object
+# from child_r, and the server writes the child's pid, later its exit
+# status, to child_w.  The server exits when the write end of its "alive"
+# pipe closes, i.e. when the process that started it goes away.
+#
+# Start-up settings travel through a pipe as well: first the key, then,
+# optionally, a JSON object with the main module path, sys.path and
+# sys.argv (too big for a command-line argument in general).
 #
 
 import atexit
@@ -33,12 +42,36 @@ __all__ = ['ensure_running', 'get_inherited_fds', 'connect_to_new_process',
            'set_forkserver_preload']
 
 MAXFDS_TO_SEND = 256
-SIGNED_STRUCT = struct.Struct('q')     # large enough for pid_t
+SIGNED_STRUCT = struct.Struct('q')     # wide enough for a pid or a status
 _AUTHKEY_LEN = 32
 _ON_ERROR_CHOICES = ('ignore', 'warn', 'fail')
+# Descriptors every request carries besides the caller's own.
+_FIXED_FDS = 4
+
+
+def _check_on_error(on_error):
+    if on_error not in _ON_ERROR_CHOICES:
+        raise ValueError(
+            f"on_error must be 'ignore', 'warn', or 'fail', not {on_error!r}")
+
+
+def _authenticate(sock, authkey, server_side):
+    # Run the mutual challenge over a borrowed Connection without letting it
+    # own (and close) the socket's descriptor.
+    conn = connection.Connection(sock.fileno())
+    try:
+        if server_side:
+            connection.deliver_challenge(conn, authkey)
+            connection.answer_challenge(conn, authkey)
+        else:
+            connection.answer_challenge(conn, authkey)
+            connection.deliver_challenge(conn, authkey)
+    finally:
+        conn._detach()
 
 
 class ForkServer(object):
+    """Client-side handle on this process's fork server."""
 
     def __init__(self):
         self._forkserver_authkey = None
@@ -50,6 +83,31 @@ class ForkServer(object):
         self._preload_modules = ['__main__']
         self._preload_on_error = 'ignore'
 
+    # -- configuration -------------------------------------------------------
+
+    def set_forkserver_preload(self, modules_names, on_error='ignore'):
+        """Modules the server imports before forking any child.
+
+        *on_error* chooses what a failing import does: 'ignore' it, 'warn'
+        (an ImportWarning in the server) or 'fail' (the server exits)."""
+        if not all(type(name) is str for name in modules_names):
+            raise TypeError('module_names must be a list of strings')
+        _check_on_error(on_error)
+        self._preload_modules = modules_names
+        self._preload_on_error = on_error
+
+    def get_inherited_fds(self):
+        """In a child of the server: the extra descriptors sent along."""
+        return self._inherited_fds
+
+    # -- starting and stopping the server ------------------------------------
+
+    def _forget_server(self):
+        self._forkserver_address = None
+        self._forkserver_alive_fd = None
+        self._forkserver_authkey = None
+        self._forkserver_pid = None
+
     def _stop(self):
         with self._lock:
             self._stop_unlocked()
@@ -57,377 +115,348 @@ class ForkServer(object):
     def _stop_unlocked(self):
         if self._forkserver_pid is None:
             return
-
-        # closing the "alive" pipe makes the server exit
+        # Closing our end of the alive pipe tells the server to exit.
         os.close(self._forkserver_alive_fd)
-        self._forkserver_alive_fd = None
-
         os.waitpid(self._forkserver_pid, 0)
-        self._forkserver_pid = None
-
-        if not util.is_abstract_socket_namespace(self._forkserver_address):
+        address = self._forkserver_address
+        if not util.is_abstract_socket_namespace(address):
             try:
-                os.unlink(self._forkserver_address)
+                os.unlink(address)
             except FileNotFoundError:
                 pass
-        self._forkserver_address = None
-        self._forkserver_authkey = None
+        self._forget_server()
 
-    def set_forkserver_preload(self, modules_names, on_error='ignore'):
-        """Modules the server imports before it forks any child.
+    def _server_died(self):
+        # True (after cleaning up) if a previously started server has exited.
+        pid, _status = os.waitpid(self._forkserver_pid, os.WNOHANG)
+        if not pid:
+            return False
+        os.close(self._forkserver_alive_fd)
+        self._forget_server()
+        return True
 
-        *on_error* says what a failing import does: 'ignore' it, 'warn'
-        (ImportWarning in the server) or 'fail' (the server exits)."""
-        if not all(type(mod) is str for mod in modules_names):
-            raise TypeError('module_names must be a list of strings')
-        if on_error not in _ON_ERROR_CHOICES:
-            raise ValueError(
-                f"on_error must be 'ignore', 'warn', or 'fail', not {on_error!r}")
-        self._preload_modules = modules_names
-        self._preload_on_error = on_error
-
-    def get_inherited_fds(self):
-        """The extra fds received from the parent (in a forkserver child)."""
-        return self._inherited_fds
-
-    def connect_to_new_process(self, fds):
-        """Ask the server for a new child; returns (sentinel, write end of
-        the pipe the child reads its pickled state from)."""
-        self.ensure_running()
-        assert self._forkserver_authkey
-        if len(fds) + 4 >= MAXFDS_TO_SEND:
-            raise ValueError('too many fds')
-        try:
-            with socket.socket(socket.AF_UNIX) as client:
-                client.connect(self._forkserver_address)
-                parent_r, child_w = os.pipe()
-                child_r, parent_w = os.pipe()
-                allfds = [child_r, child_w, self._forkserver_alive_fd,
-                          resource_tracker.getfd()]
-                allfds += fds
-                try:
-                    client.setblocking(True)
-                    wrapped = connection.Connection(client.fileno())
-                    try:
-                        connection.answer_challenge(wrapped,
-                                                    self._forkserver_authkey)
-                        connection.deliver_challenge(wrapped,
-                                                     self._forkserver_authkey)
-                    finally:
-                        wrapped._detach()
-                        del wrapped
-                    reduction.sendfds(client, allfds)
-                    return parent_r, parent_w
-                except:
-                    os.close(parent_r)
-                    os.close(parent_w)
-                    raise
-                finally:
-                    os.close(child_r)
-                    os.close(child_w)
-        except (EOFError, ConnectionError) as exc:
-            exc.add_note('Forkserver process may have crashed during '
-                         'startup (e.g. a preloaded module failed to import '
-                         'with on_error="fail"); check its stderr.')
-            raise
+    def _startup_extras(self):
+        # Settings the server needs to preload __main__ like a spawned child
+        # would import it.
+        if not self._preload_modules:
+            return {}
+        data = spawn.get_preparation_data('ignore')
+        extras = {}
+        for ours, theirs in (('sys_path', 'sys_path'),
+                             ('sys_argv', 'sys_argv'),
+                             ('init_main_from_path', 'main_path')):
+            if ours in data:
+                extras[theirs] = data[ours]
+        return extras
 
     def ensure_running(self):
-        """Start the server if it is not running."""
+        """Start the server unless it is already running."""
         with self._lock:
             resource_tracker.ensure_running()
-            if self._forkserver_pid is not None:
-                pid, status = os.waitpid(self._forkserver_pid, os.WNOHANG)
-                if not pid:
-                    return
-                # the server died: start a new one
-                os.close(self._forkserver_alive_fd)
-                self._forkserver_address = None
-                self._forkserver_alive_fd = None
-                self._forkserver_authkey = None
-                self._forkserver_pid = None
-
-            kwargs = {'on_error': self._preload_on_error}
-            # (hang1) sent through the key pipe, not the command line: a
-            # large sys.argv would exceed the per-argument length limit
-            extra = {}
-            if self._preload_modules:
-                data = spawn.get_preparation_data('ignore')
-                if 'sys_path' in data:
-                    extra['sys_path'] = data['sys_path']
-                if 'sys_argv' in data:
-                    extra['sys_argv'] = data['sys_argv']
-                if 'init_main_from_path' in data:
-                    extra['main_path'] = data['init_main_from_path']
-
+            if self._forkserver_pid is not None and not self._server_died():
+                return
+            extras = self._startup_extras()
             with socket.socket(socket.AF_UNIX) as listener:
                 address = connection.arbitrary_address('AF_UNIX')
                 listener.bind(address)
                 if not util.is_abstract_socket_namespace(address):
                     os.chmod(address, 0o600)
                 listener.listen()
-
-                # The server exits when the write end of "alive" closes.
+                authkey = os.urandom(_AUTHKEY_LEN)
                 alive_r, alive_w = os.pipe()
-                authkey_r, authkey_w = os.pipe()
-                self._forkserver_authkey = os.urandom(_AUTHKEY_LEN)
-                kwargs['authkey_r'] = authkey_r
+                settings_r, settings_w = os.pipe()
                 try:
-                    fds_to_pass = [listener.fileno(), alive_r, authkey_r]
-                    cmd = ('from multiprocessing.forkserver import main; '
-                           'main(%d, %d, %r, **%r)'
-                           % (listener.fileno(), alive_r,
-                              self._preload_modules, kwargs))
-                    exe = spawn.get_executable()
-                    args = [exe] + util._args_from_interpreter_flags()
-                    args += ['-c', cmd]
-                    pid = util.spawnv_passfds(exe, args, fds_to_pass)
-                except:
+                    pid = self._spawn_server(listener.fileno(), alive_r,
+                                             settings_r)
+                except BaseException:
                     os.close(alive_w)
-                    os.close(authkey_w)
+                    os.close(settings_w)
                     raise
                 finally:
                     os.close(alive_r)
-                    os.close(authkey_r)
+                    os.close(settings_r)
+                payload = authkey
+                if extras:
+                    import json
+                    payload += json.dumps(extras).encode('ascii')
                 try:
-                    payload = self._forkserver_authkey
-                    if extra:
-                        import json
-                        payload += json.dumps(extra).encode('ascii')
-                    write_all(authkey_w, payload)
+                    write_all(settings_w, payload)
                 finally:
-                    os.close(authkey_w)
+                    os.close(settings_w)
+                self._forkserver_authkey = authkey
                 self._forkserver_address = address
                 self._forkserver_alive_fd = alive_w
                 self._forkserver_pid = pid
 
+    def _spawn_server(self, listener_fd, alive_r, settings_r):
+        options = {'on_error': self._preload_on_error,
+                   'authkey_r': settings_r}
+        code = ('from multiprocessing.forkserver import main; '
+                'main(%d, %d, %r, **%r)'
+                % (listener_fd, alive_r, self._preload_modules, options))
+        exe = spawn.get_executable()
+        argv = [exe] + util._args_from_interpreter_flags() + ['-c', code]
+        return util.spawnv_passfds(exe, argv,
+                                   [listener_fd, alive_r, settings_r])
+
+    # -- asking for a child --------------------------------------------------
+
+    def connect_to_new_process(self, fds):
+        """Have the server fork a child.  Returns (sentinel, w): the read
+        end the server reports the pid and status on, and the write end of
+        the pipe the child reads its pickled state from."""
+        self.ensure_running()
+        assert self._forkserver_authkey
+        if len(fds) + _FIXED_FDS >= MAXFDS_TO_SEND:
+            raise ValueError('too many fds')
+        try:
+            with socket.socket(socket.AF_UNIX) as client:
+                client.connect(self._forkserver_address)
+                return self._send_request(client, fds)
+        except (EOFError, ConnectionError) as exc:
+            exc.add_note('Forkserver process may have crashed during '
+                         'startup (e.g. a preloaded module failed to import '
+                         'with on_error="fail"); check its stderr.')
+            raise
+
+    def _send_request(self, client, fds):
+        status_r, status_w = os.pipe()
+        child_r, to_child = os.pipe()
+        try:
+            client.setblocking(True)
+            _authenticate(client, self._forkserver_authkey, server_side=False)
+            reduction.sendfds(client, [child_r, status_w,
+                                       self._forkserver_alive_fd,
+                                       resource_tracker.getfd(), *fds])
+        except BaseException:
+            os.close(status_r)
+            os.close(to_child)
+            raise
+        finally:
+            # The server holds its own copies now.
+            os.close(child_r)
+            os.close(status_w)
+        return status_r, to_child
+
+
+# --- inside the server ------------------------------------------------------
 
 def _handle_preload(preload, main_path=None, sys_path=None, on_error='ignore',
                     sys_argv=None):
-    """Import the modules to preload in the server."""
+    """Import the modules listed in *preload* in the server process."""
     if not preload:
         return
-    if on_error not in _ON_ERROR_CHOICES:
-        raise ValueError(
-            f"on_error must be 'ignore', 'warn', or 'fail', not {on_error!r}")
+    _check_on_error(on_error)
     if sys_path is not None:
         sys.path[:] = sys_path
     if sys_argv is not None:
-        # the main module sees the parent's arguments while it is preloaded
+        # While being preloaded the main module sees the parent's arguments.
         sys.argv[:] = sys_argv
-
     if '__main__' in preload and main_path is not None:
-        process.current_process()._inheriting = True
+        me = process.current_process()
+        me._inheriting = True
         try:
             spawn.import_main_path(main_path)
-        except Exception as e:
-            if on_error == 'fail':
-                raise
-            if on_error == 'warn':
-                warnings.warn(
-                    f"Failed to preload __main__ from {main_path!r}: {e}",
-                    ImportWarning, stacklevel=2)
+        except Exception as exc:
+            _preload_failed(on_error, exc,
+                            f"Failed to preload __main__ from {main_path!r}: {exc}")
         finally:
-            del process.current_process()._inheriting
-
-    for modname in preload:
-        if modname == '__main__':
+            del me._inheriting
+    for name in preload:
+        if name == '__main__':
             continue
         try:
-            __import__(modname)
-        except ImportError as e:
-            if on_error == 'fail':
-                raise
-            if on_error == 'warn':
-                warnings.warn(
-                    f"Failed to preload module {modname!r}: {e}",
-                    ImportWarning, stacklevel=2)
-
-    # output of the preloaded modules must reach the parent's streams now
+            __import__(name)
+        except ImportError as exc:
+            _preload_failed(on_error, exc,
+                            f"Failed to preload module {name!r}: {exc}")
+    # Anything the preloaded code printed must reach the parent's streams
+    # before the first fork duplicates the buffers.
     util._flush_std_streams()
+
+
+def _preload_failed(on_error, exc, message):
+    if on_error == 'fail':
+        raise exc
+    if on_error == 'warn':
+        warnings.warn(message, ImportWarning, stacklevel=3)
+
+
+def _read_settings(settings_fd):
+    # -> (authkey, extras dict) from the settings pipe.
+    try:
+        authkey = read_all(settings_fd, _AUTHKEY_LEN)
+        chunks = []
+        while True:
+            chunk = os.read(settings_fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(settings_fd)
+    extras = {}
+    if chunks:
+        import json
+        extras = json.loads(b''.join(chunks))
+    return authkey, extras
+
+
+def _receive_request(sock, authkey):
+    # -> the descriptors of one request, or None for a client that went away
+    # or failed to authenticate.
+    try:
+        if authkey:
+            _authenticate(sock, authkey, server_side=True)
+        fds = reduction.recvfds(sock, MAXFDS_TO_SEND + 1)
+    except (EOFError, BrokenPipeError, AuthenticationError):
+        return None
+    if len(fds) > MAXFDS_TO_SEND:
+        raise RuntimeError("Too many ({0:n}) fds to send".format(len(fds)))
+    return fds
 
 
 def main(listener_fd, alive_r, preload, main_path=None, sys_path=None,
          *, authkey_r=None, on_error='ignore', sys_argv=None):
-    """The server's main loop."""
+    """The fork server's main loop (run in the server process)."""
+    authkey = b''
     if authkey_r is not None:
-        try:
-            authkey = read_all(authkey_r, _AUTHKEY_LEN)
-            # the preload settings follow the key on the same pipe (JSON):
-            # they can be far larger than one command-line argument may be
-            rest = []
-            while chunk := os.read(authkey_r, 65536):
-                rest.append(chunk)
-        finally:
-            os.close(authkey_r)
-        if rest:
-            import json
-            extra = json.loads(b''.join(rest))
-            main_path = extra.get('main_path', main_path)
-            sys_path = extra.get('sys_path', sys_path)
-            sys_argv = extra.get('sys_argv', sys_argv)
-    else:
-        authkey = b''
-
+        authkey, extras = _read_settings(authkey_r)
+        main_path = extras.get('main_path', main_path)
+        sys_path = extras.get('sys_path', sys_path)
+        sys_argv = extras.get('sys_argv', sys_argv)
     _handle_preload(preload, main_path, sys_path, on_error, sys_argv)
-
     util._close_stdin()
 
-    # SIGCHLD only needs to wake the select() below (via the wakeup fd).
+    # SIGCHLD only has to interrupt the select() below: the wakeup fd makes
+    # sig_r readable.  Ctrl-C reaches the whole process group; the client
+    # handles it, not us.
     sig_r, sig_w = os.pipe()
     os.set_blocking(sig_r, False)
     os.set_blocking(sig_w, False)
-
-    def sigchld_handler(*_unused):
-        pass
-
-    handlers = {
-        signal.SIGCHLD: sigchld_handler,
-        # Ctrl-C goes to the whole process group: the parent handles it
-        signal.SIGINT: signal.SIG_IGN,
-        }
-    old_handlers = {sig: signal.signal(sig, val)
-                    for (sig, val) in handlers.items()}
-
+    previous_handlers = {
+        signal.SIGCHLD: signal.signal(signal.SIGCHLD, lambda *args: None),
+        signal.SIGINT: signal.signal(signal.SIGINT, signal.SIG_IGN),
+    }
     signal.set_wakeup_fd(sig_w)
 
-    # child pid -> fd where its exit code is reported
-    pid_to_fd = {}
-
+    status_fds = {}     # child pid -> descriptor its status is reported on
     with socket.socket(socket.AF_UNIX, fileno=listener_fd) as listener, \
-         selectors.DefaultSelector() as selector:
+            selectors.DefaultSelector() as selector:
         _forkserver._forkserver_address = listener.getsockname()
-
-        selector.register(listener, selectors.EVENT_READ)
-        selector.register(alive_r, selectors.EVENT_READ)
-        selector.register(sig_r, selectors.EVENT_READ)
-
+        for source in (listener, alive_r, sig_r):
+            selector.register(source, selectors.EVENT_READ)
         while True:
             try:
-                while True:
-                    rfds = [key.fileobj for (key, events) in selector.select()]
-                    if rfds:
-                        break
-
-                if alive_r in rfds:
-                    # the parent is gone (or stopped us)
+                ready = []
+                while not ready:
+                    ready = [key.fileobj for key, _ in selector.select()]
+                if alive_r in ready:
+                    # The client is gone or asked us to stop.
                     assert os.read(alive_r, 1) == b'', "Not at EOF?"
                     raise SystemExit
-
-                if sig_r in rfds:
+                if sig_r in ready:
                     os.read(sig_r, 65536)
-                    _reap_children(pid_to_fd)
-
-                if listener in rfds:
-                    with listener.accept()[0] as s:
-                        try:
-                            if authkey:
-                                wrapped = connection.Connection(s.fileno())
-                                try:
-                                    connection.deliver_challenge(wrapped, authkey)
-                                    connection.answer_challenge(wrapped, authkey)
-                                finally:
-                                    wrapped._detach()
-                                    del wrapped
-                            fds = reduction.recvfds(s, MAXFDS_TO_SEND + 1)
-                        except (EOFError, BrokenPipeError, AuthenticationError):
-                            s.close()
-                            continue
-                        if len(fds) > MAXFDS_TO_SEND:
-                            raise RuntimeError(
-                                "Too many ({0:n}) fds to send".format(len(fds)))
-                        child_r, child_w, *fds = fds
-                        s.close()
-                        pid = os.fork()
-                        if pid == 0:
-                            code = 1
-                            try:
-                                listener.close()
-                                selector.close()
-                                unused_fds = [alive_r, child_w, sig_r, sig_w]
-                                unused_fds.extend(pid_to_fd.values())
-                                atexit._clear()
-                                atexit.register(util._exit_function)
-                                code = _serve_one(child_r, fds, unused_fds,
-                                                  old_handlers)
-                            except Exception:
-                                sys.excepthook(*sys.exc_info())
-                                sys.stderr.flush()
-                            finally:
-                                atexit._run_exitfuncs()
-                                os._exit(code)
-                        else:
-                            try:
-                                write_signed(child_w, pid)
-                            except BrokenPipeError:
-                                # the parent went away
-                                pass
-                            pid_to_fd[pid] = child_w
-                            os.close(child_r)
-                            for fd in fds:
-                                os.close(fd)
-
-            except OSError as e:
-                if e.errno != errno.ECONNABORTED:
+                    _reap_children(status_fds)
+                if listener in ready:
+                    _serve_request(listener, selector, authkey, status_fds,
+                                   (alive_r, sig_r, sig_w), previous_handlers)
+            except OSError as exc:
+                if exc.errno != errno.ECONNABORTED:
                     raise
 
 
-def _reap_children(pid_to_fd):
-    while True:
+def _serve_request(listener, selector, authkey, status_fds, server_fds,
+                   previous_handlers):
+    sock = listener.accept()[0]
+    with sock:
+        fds = _receive_request(sock, authkey)
+    if fds is None:
+        return
+    child_r, status_w, *inherited = fds
+    pid = os.fork()
+    if pid == 0:
+        # The child: drop everything that belongs to the server, then become
+        # the requested process.  Never returns.
+        exitcode = 1
         try:
-            pid, sts = os.waitpid(-1, os.WNOHANG)
-        except ChildProcessError:
-            break
-        if pid == 0:
-            break
-        child_w = pid_to_fd.pop(pid, None)
-        if child_w is not None:
-            returncode = os.waitstatus_to_exitcode(sts)
-            try:
-                write_signed(child_w, returncode)
-            except BrokenPipeError:
-                pass
-            os.close(child_w)
-        else:
-            warnings.warn('forkserver: waitpid returned '
-                          'unexpected pid %d' % pid)
-
-
-def _serve_one(child_r, fds, unused_fds, handlers):
-    # back to the default signal handling in the child
-    signal.set_wakeup_fd(-1)
-    for sig, val in handlers.items():
-        signal.signal(sig, val)
-
-    for fd in unused_fds:
+            listener.close()
+            selector.close()
+            for fd in (*server_fds, status_w, *status_fds.values()):
+                os.close(fd)
+            atexit._clear()
+            atexit.register(util._exit_function)
+            exitcode = _serve_one(child_r, inherited, previous_handlers)
+        except Exception:
+            sys.excepthook(*sys.exc_info())
+            sys.stderr.flush()
+        finally:
+            atexit._run_exitfuncs()
+            os._exit(exitcode)
+    try:
+        write_signed(status_w, pid)
+    except BrokenPipeError:
+        pass        # the client already went away
+    status_fds[pid] = status_w
+    os.close(child_r)
+    for fd in inherited:
         os.close(fd)
 
+
+def _reap_children(status_fds):
+    # Collect every exited child and report its status to its client.
+    while True:
+        try:
+            pid, status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            return
+        status_w = status_fds.pop(pid, None)
+        if status_w is None:
+            warnings.warn('forkserver: waitpid returned '
+                          'unexpected pid %d' % pid)
+            continue
+        try:
+            write_signed(status_w, os.waitstatus_to_exitcode(status))
+        except BrokenPipeError:
+            pass
+        os.close(status_w)
+
+
+def _serve_one(child_r, fds, handlers):
+    # In a freshly forked child of the server.
+    signal.set_wakeup_fd(-1)
+    for signum, handler in handlers.items():
+        signal.signal(signum, handler)
     (_forkserver._forkserver_alive_fd,
      resource_tracker._resource_tracker._fd,
      *_forkserver._inherited_fds) = fds
-
-    parent_sentinel = os.dup(child_r)
-    return spawn._main(child_r, parent_sentinel)
+    return spawn._main(child_r, os.dup(child_r))
 
 
-# ---------------------------------------------------------------- helpers
+# --- small pipe helpers -----------------------------------------------------
 
 def read_all(fd, size):
-    data = b''
-    while len(data) < size:
-        chunk = os.read(fd, size - len(data))
+    """Read exactly *size* bytes from *fd*."""
+    parts = []
+    missing = size
+    while missing:
+        chunk = os.read(fd, missing)
         if not chunk:
             raise EOFError('unexpected EOF')
-        data += chunk
-    return data
+        parts.append(chunk)
+        missing -= len(chunk)
+    return b''.join(parts)
 
 
 def write_all(fd, data):
+    """Write all of *data* to *fd*."""
     view = memoryview(data)
     while view:
-        n = os.write(fd, view)
-        if n == 0:
+        written = os.write(fd, view)
+        if written == 0:
             raise RuntimeError('short write')
-        view = view[n:]
+        view = view[written:]
 
 
 def read_signed(fd):
