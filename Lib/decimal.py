@@ -17,6 +17,8 @@ try:
 except ImportError:
     import _pydecimal
     import sys
+    # as `decimal`, construction keeps the accelerator's input limits
+    _pydecimal._EXACT_LIMITS = True
     _pydecimal.__doc__ = __doc__
     sys.modules[__name__] = _pydecimal
 else:
