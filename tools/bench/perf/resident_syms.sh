@@ -8,6 +8,8 @@
 #   With a section regex, the symbols of matching sections are listed by resident bytes
 #   (a symbol counts as resident on the pages it overlaps that are present).
 #   RESIDENT_PAGES=<file> also writes the resident file offsets there.
+#   The process blocks in `open(fifo).read()` after CODE: that read and its import add a
+#   few code windows of their own (text I/O) that startup_mem.sh's probe does not have.
 #   PAGES_FROM=<file>: take the page list from that file (e.g. touched_pages.sh output)
 #   instead of running PY (PY then only names the executable).
 PY="$1"; CODE="${2:-}"; SECRE="${3:-}"; MINKB="${4:-8}"; FLAGS="${5:-}"
