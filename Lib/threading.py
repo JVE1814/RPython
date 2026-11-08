@@ -666,7 +666,12 @@ class Thread:
                 self._set_native_id()
             self._handle = _make_thread_handle(new_ident)
         else:
-            self._handle._set_done()
+            try:
+                self._handle._set_done()
+            except RuntimeError:
+                # never started (created, or being started by another thread at the
+                # fork): nothing ran, the object stays as it was
+                pass
 
     def __repr__(self):
         assert self._initialized, 'Thread.__init__() was not called'
