@@ -249,7 +249,9 @@
 - os.py (fwalk), codecs.py (stream classes) — both frozen; locale.py (partly);
   imaplib.py, optparse.py, dis.py, gettext.py, ast.py unreviewed.
 
-## Final check (after `git merge core`, rebuilt, installed snapshot target/cleanroom8/final)
+## Final check (after `git merge core` at 5348975, rebuilt, installed snapshot target/cleanroom8/final)
+(Run twice: at the first merge 41f6ba0 and again after core moved on; same results both
+times, except that test_asyncio.test_events' known "env changed" did not recur.)
 - tools/jit_tests/run.sh: all ok.  tools/stress/run.sh: 21/21 PASS.
 - 230 test files (`.scratch8/final_tests.txt`: the subprocess and threading sets above plus
   test_httplib, test_urllib*, test_ftplib, test_smtplib, test_uuid, test_email, test_mailbox,
