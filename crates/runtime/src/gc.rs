@@ -27,15 +27,22 @@ use crate::object::*;
 use crate::threads::ThreadState;
 use std::ffi::{c_int, c_void};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicUsize, Ordering::*};
 
 static TRACKED: AtomicIsize = AtomicIsize::new(0);
 static ALLOCS_SINCE: AtomicUsize = AtomicUsize::new(0);
+/// (scale3) Tracked allocations, never decremented, and its value when the current
+/// collection stopped the world.
+static ALLOCS_GROSS: AtomicUsize = AtomicUsize::new(0);
+static GROSS_AT_STOP: AtomicUsize = AtomicUsize::new(0);
 pub static ENABLED: AtomicBool = AtomicBool::new(true);
 pub static THRESHOLD: AtomicUsize = AtomicUsize::new(2000);
 static COLLECTING: AtomicBool = AtomicBool::new(false);
 /// (scale1) Thread id of the thread running `collect_gen` (0: none).
 static COLLECTOR: AtomicUsize = AtomicUsize::new(0);
+/// (tail4) Thread state of the thread running a collection (0: none); published in the
+/// remote-debugging table so a sampling profiler can show a "<GC>" frame.
+pub static GC_COLLECTOR_TS: AtomicUsize = AtomicUsize::new(0);
 pub static COLLECTIONS: AtomicUsize = AtomicUsize::new(0);
 pub static COLLECTED: AtomicUsize = AtomicUsize::new(0);
 pub static UNCOLLECTABLE: AtomicUsize = AtomicUsize::new(0);
@@ -54,7 +61,13 @@ pub unsafe fn track(op: *mut PyObject) {
             return;
         }
         // (re)tracked objects start young
-        o.ob_gc_bits.store((bits | GC_BIT_TRACKED) & !GC_BIT_OLD, Relaxed);
+        if crate::young::wants_push(bits) {
+            // (scale3) and go to this thread's young buffer
+            o.ob_gc_bits.store((bits | GC_BIT_TRACKED | crate::young::GC_BIT_YOUNG_BUF) & !GC_BIT_OLD, Relaxed);
+            crate::young::push(op);
+        } else {
+            o.ob_gc_bits.store((bits | GC_BIT_TRACKED) & !GC_BIT_OLD, Relaxed);
+        }
         note_tracked(1);
     }
 }
@@ -83,6 +96,7 @@ fn note_tracked(d: isize) {
 fn publish_delta(v: isize) {
     TRACKED.fetch_add(v, Relaxed);
     if v > 0 {
+        ALLOCS_GROSS.fetch_add(v as usize, Relaxed);
         let n = ALLOCS_SINCE.fetch_add(v as usize, Relaxed) + v as usize;
         if n >= trigger_threshold() && ENABLED.load(Relaxed) && !COLLECTING.load(Relaxed) {
             request_collection();
@@ -129,7 +143,33 @@ fn trigger_threshold() -> usize {
     }
     match THRESHOLD.load(Relaxed) {
         0 => usize::MAX,
-        t => t.max(LAST_LIVE.load(Relaxed) / 4),
+        t if crate::gc_support::USER_THRESHOLD.load(Relaxed) => t.max(LAST_LIVE.load(Relaxed) / 4),
+        t => (t * YOUNG_SCALE.load(Relaxed)).max(LAST_LIVE.load(Relaxed) / 4),
+    }
+}
+
+/// (scale3) Multiplier of the young-collection interval (1..=YOUNG_SCALE_MAX), adapted
+/// to what automatic young collections find (HotSpot-style ergonomics): an interval
+/// whose collections find (almost) no garbage doubles, one that finds plenty returns
+/// to the configured threshold. Not applied when the program set a threshold itself.
+static YOUNG_SCALE: AtomicUsize = AtomicUsize::new(1);
+const YOUNG_SCALE_MAX: usize = 16;
+/// (scale3) Tracked objects at the last collection's stop minus the unreachable ones.
+static LIVE_AT_STOP: AtomicUsize = AtomicUsize::new(0);
+/// Objects examined by the last collection.
+static LAST_EXAMINED: AtomicUsize = AtomicUsize::new(0);
+
+fn adapt_young_scale(examined: usize, unreachable: usize) {
+    let s = YOUNG_SCALE.load(Relaxed);
+    let s2 = if unreachable * 4 >= examined {
+        1
+    } else if unreachable * 64 < examined && examined >= THRESHOLD.load(Relaxed) / 2 {
+        (s * 2).min(YOUNG_SCALE_MAX)
+    } else {
+        s
+    };
+    if s2 != s {
+        YOUNG_SCALE.store(s2, Relaxed);
     }
 }
 
@@ -141,7 +181,8 @@ pub unsafe fn untrack(op: *mut PyObject) {
         if bits & GC_BIT_TRACKED == 0 {
             return;
         }
-        o.ob_gc_bits.store(bits & !(GC_BIT_TRACKED | GC_BIT_OLD), Relaxed);
+        // (scale3) the young-buffer bit goes too: re-tracking appends the object again
+        o.ob_gc_bits.store(bits & !(GC_BIT_TRACKED | GC_BIT_OLD | crate::young::GC_BIT_YOUNG_BUF), Relaxed);
         note_tracked(-1);
     }
 }
@@ -164,6 +205,11 @@ pub unsafe fn set_finalized(op: *mut PyObject) {
         (*op).ob_gc_bits.fetch_or(GC_BIT_FINALIZED, Relaxed);
     }
 }
+/// (scale3) Tracked objects as last published (no flush; any thread, any time).
+pub fn tracked_estimate() -> usize {
+    TRACKED.load(Relaxed).max(0) as usize
+}
+
 pub fn tracked_count() -> isize {
     flush_thread_counts();
     TRACKED.load(Relaxed)
@@ -218,17 +264,89 @@ fn request_collection() {
 fn wait_for_release() {
     let t0 = if crate::scalestats::on() { Some(std::time::Instant::now()) } else { None };
     let _stats = StatGuard(t0, &crate::scalestats::PARKED_NS);
-    PARKED.fetch_add(1, AcqRel);
+    PARKED.fetch_add(1, SeqCst);
+    // (scale3) sleep on the restart counter instead of yield/sleep polling: parked
+    // threads cost no CPU and wake as soon as the world restarts
     let mut i = 0u32;
-    while !RELEASE.load(SeqCst) {
-        if i < 64 {
-            std::thread::yield_now();
+    loop {
+        let e = RESTARTS.load(SeqCst);
+        if RELEASE.load(SeqCst) {
+            break;
+        }
+        // (scale3) a parallel collection job: take part (gcpar.rs)
+        if crate::gcpar::open() {
+            crate::gcpar::help();
+        }
+        if i < 16 {
+            std::hint::spin_loop();
         } else {
-            std::thread::sleep(std::time::Duration::from_micros(if i < 512 { 20 } else { 200 }));
+            futex_wait(&RESTARTS, e, 2_000_000);
         }
         i += 1;
     }
-    PARKED.fetch_sub(1, AcqRel);
+    PARKED.fetch_sub(1, SeqCst);
+}
+
+/// (scale3) Threads that were running Python code when the last stop began.
+static STOPPED_RUNNING: AtomicUsize = AtomicUsize::new(0);
+
+/// (scale3) Threads that may help with work while the world is stopped: parked ones
+/// and those that were running when the stop began (they are on their way to park).
+pub fn helper_candidates() -> usize {
+    PARKED.load(SeqCst).max(STOPPED_RUNNING.load(Relaxed))
+}
+
+/// (scale3) Threads parked in `wait_for_release` right now.
+pub fn parked_count() -> usize {
+    PARKED.load(SeqCst)
+}
+
+/// (scale3) Wake the parked threads (they look for a parallel collection job).
+pub fn wake_parked() {
+    RESTARTS.fetch_add(1, SeqCst);
+    futex_wake_all(&RESTARTS);
+}
+
+/// (scale3) Incremented by every restart of the world; parked threads sleep on it.
+static RESTARTS: AtomicU32 = AtomicU32::new(0);
+/// (scale3) Incremented whenever a thread becomes safe while a stop is pending; the
+/// stopping thread sleeps on it.
+static ARRIVALS: AtomicU32 = AtomicU32::new(0);
+static STOPPER_WAITING: AtomicBool = AtomicBool::new(false);
+
+const FUTEX_WAIT_PRIVATE: i32 = 128;
+const FUTEX_WAKE_PRIVATE: i32 = 129;
+
+/// Sleep until `word` changes from `expected` (or `timeout_ns` passes, or a spurious
+/// wake-up).
+fn futex_wait(word: &AtomicU32, expected: u32, timeout_ns: u64) {
+    let ts = libc::timespec { tv_sec: (timeout_ns / 1_000_000_000) as _, tv_nsec: (timeout_ns % 1_000_000_000) as _ };
+    unsafe {
+        libc::syscall(libc::SYS_futex, word.as_ptr(), FUTEX_WAIT_PRIVATE, expected, &ts as *const libc::timespec, 0usize, 0u32);
+    }
+}
+
+fn futex_wake_all(word: &AtomicU32) {
+    unsafe {
+        libc::syscall(libc::SYS_futex, word.as_ptr(), FUTEX_WAKE_PRIVATE, i32::MAX, 0usize, 0usize, 0u32);
+    }
+}
+
+/// (scale3) A thread just switched to a safe mode: if a stop is pending, tell the
+/// stopping thread (it sleeps until every thread is safe).
+#[inline]
+pub fn note_safe() {
+    if !RELEASE.load(SeqCst) {
+        note_safe_slow();
+    }
+}
+
+#[cold]
+fn note_safe_slow() {
+    ARRIVALS.fetch_add(1, SeqCst);
+    if STOPPER_WAITING.load(SeqCst) {
+        futex_wake_all(&ARRIVALS);
+    }
 }
 
 /// Adds the time since `.0` (when counting is on) to the counter `.1` when dropped.
@@ -266,6 +384,7 @@ pub fn enter_vm(cell: &crate::threads::ModeCell, safe: crate::threads::ThreadMod
             park_forever();
         }
         cell.0.store(safe as u8, SeqCst);
+        note_safe();
         if !waited {
             waited = true;
             ENTERING.fetch_add(1, SeqCst);
@@ -388,6 +507,54 @@ pub fn safepoint_poll(ts: &ThreadState) {
     enter_vm(&ts.mode, crate::threads::ThreadMode::Blocked);
 }
 
+/// (scale3) `safepoint_poll` from the eval breaker: the thread returns to the eval
+/// breaker right after the restart, so a collection may hand it its own garbage to
+/// clear there (`clear_handed`).
+pub fn safepoint_poll_eval(ts: &ThreadState) {
+    ts.at_safepoint.store(true, SeqCst);
+    safepoint_poll(ts);
+    ts.at_safepoint.store(false, SeqCst);
+}
+
+/// (scale3) Clear the garbage a collection handed to this thread (eval breaker,
+/// thread exit). Each entry holds a reference.
+pub fn clear_handed(ts: &ThreadState) {
+    ts.c.eval_breaker.fetch_and(!crate::threads::EVAL_GC_CLEAR, AcqRel);
+    let v = std::mem::take(&mut *ts.gc_clear.lock().unwrap_or_else(|e| e.into_inner()));
+    if v.is_empty() {
+        return;
+    }
+    let saved_exc = crate::errors::take_exc();
+    unsafe { clear_garbage(v, &mut crate::scalestats::PhaseClock::start()) };
+    if let Some(e) = saved_exc {
+        crate::errors::set_exc(e);
+    }
+}
+
+/// Break the cycles of `garbage` (entries hold a reference each) with tp_clear, then
+/// release the references (world running).
+unsafe fn clear_garbage(garbage: Vec<usize>, clock: &mut crate::scalestats::PhaseClock) {
+    unsafe {
+        for &p in &garbage {
+            let op = p as *mut PyObject;
+            if !is_tracked(&*op) {
+                continue;
+            }
+            if let Some(clear) = (*(*op).type_ptr()).tp_clear {
+                clear(op);
+                if crate::errors::err_occurred() {
+                    let g = PyRef::from_borrowed(op);
+                    crate::modules::sys::write_unraisable_with_obj("Exception ignored in tp_clear", Some(&g));
+                }
+            }
+        }
+        for p in garbage {
+            decref(p as *mut PyObject);
+        }
+        clock.lap(5);
+    }
+}
+
 /// `_testinternalcapi.test_stop_the_world()`: stop every other thread and restart
 /// them at once (stability3).
 pub fn test_stop_the_world() {
@@ -431,29 +598,56 @@ fn stop_the_world(me: *mut ThreadState) -> bool {
     for t in &others {
         t.c.eval_breaker.fetch_or(crate::threads::EVAL_SAFEPOINT, SeqCst);
     }
+    // (scale3) threads that were running: they park at a safepoint and can help
+    STOPPED_RUNNING.store(others.iter().filter(|t| t.alive() && t.mode.0.load(SeqCst) == crate::threads::ThreadMode::InVm as u8).count(), Relaxed);
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
     let mut i = 0u32;
     loop {
+        // (scale3) read the arrival counter first: a thread that becomes safe after the
+        // scan below bumps it, so the futex wait returns at once
+        let seen = ARRIVALS.load(SeqCst);
         let running = others.iter().any(|t| t.alive() && t.mode.0.load(SeqCst) == crate::threads::ThreadMode::InVm as u8);
         if !running {
+            if t0.is_some() {
+                STOPPED_AT.store(stat_now_ns(), Relaxed);
+            }
             return true;
         }
         if std::time::Instant::now() > deadline {
             start_the_world();
             return false;
         }
-        if i < 64 {
-            std::thread::yield_now();
+        if i < 8 {
+            std::hint::spin_loop();
         } else {
-            std::thread::sleep(std::time::Duration::from_micros(20));
+            STOPPER_WAITING.store(true, SeqCst);
+            if ARRIVALS.load(SeqCst) == seen {
+                futex_wait(&ARRIVALS, seen, 200_000);
+            }
+            STOPPER_WAITING.store(false, SeqCst);
         }
         i += 1;
     }
 }
 
+/// (scale3, diagnostics) When the current stop began (ns since `stat_now_ns`'s epoch; 0: none).
+static STOPPED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn stat_now_ns() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64 + 1
+}
+
 fn start_the_world() {
+    let t = STOPPED_AT.swap(0, Relaxed);
+    if t != 0 {
+        crate::scalestats::GC_STOPPED_NS.fetch_add(stat_now_ns() - t, Relaxed);
+    }
     STW_OWNER.store(0, SeqCst);
     RELEASE.store(true, SeqCst);
+    RESTARTS.fetch_add(1, SeqCst);
+    if PARKED.load(SeqCst) != 0 {
+        futex_wake_all(&RESTARTS);
+    }
 }
 
 // ---------------------------------------------------------------- deferred release
@@ -506,7 +700,7 @@ fn release_mature() {
 
 // ---------------------------------------------------------------- collection
 
-fn total_refcnt(o: &PyObject) -> isize {
+pub(crate) fn total_refcnt(o: &PyObject) -> isize {
     let local = o.ob_ref_local.load(Relaxed);
     if local == IMMORTAL_REFCNT_LOCAL {
         return isize::MAX / 2;
@@ -547,9 +741,9 @@ struct Graph {
     stack: Vec<*mut PyObject>,
 }
 
-const GRAPH_TAG: usize = 3;
-const REACHABLE: usize = 4;
-const REFS_SHIFT: u32 = 3;
+pub(crate) const GRAPH_TAG: usize = 3;
+pub(crate) const REACHABLE: usize = 4;
+pub(crate) const REFS_SHIFT: u32 = 3;
 
 /// The collection state word of `op` if it is under examination.
 #[inline(always)]
@@ -612,7 +806,7 @@ unsafe fn traverse(op: *mut PyObject, visit: visitproc, arg: *mut c_void) {
 /// of a heap (exact lists and tuples: their slots are exactly their items); other
 /// types go through their tp_traverse with the C visitor. The world is stopped.
 #[inline(always)]
-unsafe fn traverse_inline(op: *mut PyObject, visit: visitproc, arg: *mut c_void, mut f: impl FnMut(*mut PyObject)) {
+pub(crate) unsafe fn traverse_inline(op: *mut PyObject, visit: visitproc, arg: *mut c_void, mut f: impl FnMut(*mut PyObject)) {
     unsafe {
         let tp = (*op).type_ptr();
         if tp == crate::types::list::list_type() {
@@ -645,38 +839,47 @@ unsafe fn traverse_inline(op: *mut PyObject, visit: visitproc, arg: *mut c_void,
 /// current, while local slots always hold owned references or NULL.
 unsafe fn mark_from_frames(stack: &mut Vec<*mut PyObject>) {
     unsafe {
-        // the current interpreter's sys.modules and sys (raw pointers: reference
-        // counts must not change while owner words hold collection state)
-        let it = crate::subinterp::current();
-        for p in [it.modules.load(Acquire), it.sys.load(Acquire)] {
-            if !p.is_null() {
-                mark_visit(p, stack);
-            }
+        for p in sys_roots() {
+            mark_visit(p, stack);
         }
         let threads: Vec<usize> = crate::threads::ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner()).clone();
         for t in threads {
-            let ts = &*(t as *const ThreadState);
-            if !ts.alive() {
-                continue;
-            }
-            let mut f = ts.frame.get();
-            let mut guard = 0usize;
-            while !f.is_null() && guard < 1 << 20 {
-                let fr = &*f;
-                let n = fr.nlocalsplus.min(fr.slots.len());
-                for &p in &fr.slots[..n] {
-                    if !p.is_null() {
-                        mark_visit(p, stack);
-                    }
+            thread_roots(&*(t as *const ThreadState), |p| mark_visit(p, stack));
+        }
+    }
+}
+
+/// The current interpreter's sys.modules and sys (raw pointers: reference counts must
+/// not change while owner words hold collection state). Null entries are dropped.
+pub(crate) fn sys_roots() -> impl Iterator<Item = *mut PyObject> {
+    let it = crate::subinterp::current();
+    [it.modules.load(Acquire), it.sys.load(Acquire)].into_iter().filter(|p| !p.is_null())
+}
+
+/// (scale3, split out of `mark_from_frames`) Call `f` with every non-null root held by
+/// the frames of thread `ts` (world stopped).
+pub(crate) unsafe fn thread_roots(ts: &ThreadState, mut f: impl FnMut(*mut PyObject)) {
+    unsafe {
+        if !ts.alive() {
+            return;
+        }
+        let mut fp = ts.frame.get();
+        let mut guard = 0usize;
+        while !fp.is_null() && guard < 1 << 20 {
+            let fr = &*fp;
+            let n = fr.nlocalsplus.min(fr.slots.len());
+            for &p in &fr.slots[..n] {
+                if !p.is_null() {
+                    f(p);
                 }
-                for p in [fr.func, fr.globals, fr.builtins, fr.locals] {
-                    if !p.is_null() {
-                        mark_visit(p, stack);
-                    }
-                }
-                f = fr.prev;
-                guard += 1;
             }
+            for p in [fr.func, fr.globals, fr.builtins, fr.locals] {
+                if !p.is_null() {
+                    f(p);
+                }
+            }
+            fp = fr.prev;
+            guard += 1;
         }
     }
 }
@@ -735,22 +938,65 @@ unsafe fn find_unreachable(objs: Vec<*mut PyObject>) -> Vec<*mut PyObject> {
 }
 
 fn snapshot() -> Vec<*mut PyObject> {
-    snapshot_gen(false)
+    snapshot_gen(false, false)
 }
 
 /// Tracked objects of the young generation (young_only) or of both generations, found
 /// by walking the GC pages and the large-object registry. The world must be stopped
 /// (or the process single-threaded).
-fn snapshot_gen(young_only: bool) -> Vec<*mut PyObject> {
+fn snapshot_gen(young_only: bool, count_tuples: bool) -> Vec<*mut PyObject> {
     let mut v = Vec::with_capacity(if young_only { 1024 } else { TRACKED.load(Relaxed).max(0) as usize });
     let mask = if young_only { GC_BIT_TRACKED | GC_BIT_OLD } else { GC_BIT_TRACKED };
+    // (tail4) tuples of atomic values are never tracked here (CPython tracks them
+    // and untracks them at the next collection): a full collection counts the
+    // live ones for the long-lived total
+    let tuple_tp = crate::types::tuple::tuple_type();
+    let mut untracked_tuples = 0usize;
     let mut take = |op: *mut PyObject| unsafe {
-        if (*op).ob_gc_bits.load(Relaxed) & mask == GC_BIT_TRACKED {
+        let bits = (*op).ob_gc_bits.load(Relaxed);
+        if bits & mask == GC_BIT_TRACKED {
             v.push(op);
+        } else if count_tuples && !young_only && bits & GC_BIT_TRACKED == 0 && (*op).type_ptr() == tuple_tp {
+            untracked_tuples += 1;
         }
     };
     unsafe { crate::tlab::for_each_gc_block(&mut take) };
     crate::alloc::for_each_large_gc(&mut take);
+    crate::gc_support::UNTRACKED_TUPLES.fetch_add(untracked_tuples, Relaxed);
+    v
+}
+
+/// (scale3) Tracked young objects (promoted to old here), taken from the per-thread young buffers (young.rs)
+/// and the large-object registry; the buffers are emptied (every entry kept here
+/// is claimed, the others were stale). The world must be stopped.
+fn snapshot_young() -> Vec<*mut PyObject> {
+    let mut bs = crate::young::take_buffers();
+    let n: usize = bs.orphans.len() + bs.bufs().iter().map(|&b| unsafe { (*(b as *mut crate::young::YoungBuf)).entries.len() }).sum::<usize>();
+    let mut v = Vec::with_capacity(n);
+    unsafe {
+        for &p in &bs.orphans {
+            if crate::young::claim(p, true, false) {
+                v.push(p as *mut PyObject);
+            }
+        }
+        bs.orphans.clear();
+        for &bp in bs.bufs() {
+            let b = &mut *(bp as *mut crate::young::YoungBuf);
+            for &p in &b.entries {
+                if crate::young::claim(p, true, false) {
+                    v.push(p as *mut PyObject);
+                }
+            }
+            b.entries.clear();
+        }
+    }
+    drop(bs);
+    crate::alloc::for_each_large_gc(|op| unsafe {
+        if (*op).ob_gc_bits.load(Relaxed) & (GC_BIT_TRACKED | GC_BIT_OLD) == GC_BIT_TRACKED {
+            (*op).ob_gc_bits.fetch_or(GC_BIT_OLD, Relaxed); // promoted like the claimed ones
+            v.push(op);
+        }
+    });
     v
 }
 
@@ -769,27 +1015,43 @@ static QSBR_TAKEN: Mutex<Vec<crate::qsbr::ItemSendBatch>> = Mutex::new(Vec::new(
 
 /// Run a full collection; returns the number of unreachable objects found.
 pub fn collect() -> usize {
-    collect_gen(false)
+    // (scale3) an explicit collection restarts the young-interval ergonomics
+    YOUNG_SCALE.store(1, Relaxed);
+    collect_gen(false, true)
 }
 
-fn collect_gen(young_only: bool) -> usize {
+/// `explicit`: gc.collect() and other callers that expect every cycle unreachable at the
+/// time of the call to be found; automatic collections (`maybe_collect`) are not.
+fn collect_gen(young_only: bool, explicit: bool) -> usize {
     if COLLECTING.swap(true, AcqRel) {
         return 0;
     }
     COLLECTOR.store(crate::object::thread_id(), Release);
     let me = crate::threads::current_mut();
+    if crate::scalestats::gc_debug() {
+        eprintln!("collect {:?} young={} nthreads={} thr={} since={} tracked={} lastlive={} scale={} t={:?}", me, young_only, crate::threads::ALL_THREADS.lock().unwrap().len(), trigger_threshold(), ALLOCS_SINCE.load(Relaxed), TRACKED.load(Relaxed), LAST_LIVE.load(Relaxed), YOUNG_SCALE.load(Relaxed), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() % 100000000);
+    }
+    GC_COLLECTOR_TS.store(me as usize, Release);
     let saved_exc = crate::errors::take_exc();
+    let mut clock = crate::scalestats::PhaseClock::start();
     let t0 = std::time::Instant::now();
     // (stability3) references dropped while other threads existed wait in QSBR batches
     // until every thread reports (a blocked thread's batches until it wakes); a cycle
     // they point into would look reachable to this collection. With the world stopped
     // all of them are due: take them, restart, release, then collect.
-    if crate::qsbr::multi_threaded() && crate::qsbr::has_pending_for_gc() && stop_the_world(me) {
+    // (scale3) Only for explicit collections: an automatic one finds such a cycle the
+    // next time (its items are released after this collection, `take_all_for_gc`),
+    // and the extra stop doubled the stop-the-world count of collection-heavy runs.
+    if explicit && crate::qsbr::multi_threaded() && crate::qsbr::has_pending_for_gc() && stop_the_world(me) {
         let taken = crate::qsbr::take_for_gc();
         start_the_world();
         crate::qsbr::release_taken_now(taken);
     }
-    let n = unsafe { collect_phases(me, young_only) };
+    clock.lap(0);
+    let n = unsafe { collect_phases(me, young_only, explicit, &mut clock) };
+    if crate::scalestats::gc_debug() {
+        eprintln!("  done n={:?} in {:?} handed={}", n, t0.elapsed(), HANDED.load(Relaxed));
+    }
     if crate::scalestats::on() {
         crate::scalestats::GC_COUNT.fetch_add(1, Relaxed);
         crate::scalestats::add_ns(&crate::scalestats::GC_NS, t0);
@@ -800,14 +1062,30 @@ fn collect_gen(young_only: bool) -> usize {
     }
     if n.is_some() {
         crate::gc_support::DURATION_NS.fetch_add((t0.elapsed().as_nanos() as usize).max(1), Relaxed);
-        ALLOCS_SINCE.store(0, Relaxed);
-        LAST_LIVE.store(TRACKED.load(Relaxed).max(0) as usize, Relaxed);
+        if crate::threads::multi_threaded() {
+            // (scale3) what other threads allocated while this collection ran counts
+            // towards the next one (gross: the garbage freed here must not cancel it).
+            // Dropping it let garbage pile up during long collections, which made the
+            // next collection longer still.
+            let during = ALLOCS_GROSS.load(Relaxed).wrapping_sub(GROSS_AT_STOP.load(Relaxed));
+            ALLOCS_SINCE.store(during.min(usize::MAX / 4), Relaxed);
+        } else {
+            ALLOCS_SINCE.store(0, Relaxed);
+        }
+        // (scale3) the survivors as counted at the stop: TRACKED now also counts what
+        // other threads allocated while this collection ran (with several threads a
+        // long collection inflated the next interval, which made collections rarer
+        // and larger, which made them longer...)
+        LAST_LIVE.store(LIVE_AT_STOP.load(Relaxed), Relaxed);
         crate::gc_support::LONG_LIVED_TOTAL.store(TRACKED.load(Relaxed).max(0) as usize + crate::gc_support::UNTRACKED_TUPLES.swap(0, Relaxed), Relaxed);
         if young_only {
             YOUNG_COLLECTIONS.fetch_add(1, Relaxed);
+            if !explicit {
+                adapt_young_scale(LAST_EXAMINED.load(Relaxed), n.unwrap_or(0));
+            }
         } else {
             YOUNG_COLLECTIONS.store(0, Relaxed);
-            LAST_FULL_LIVE.store(TRACKED.load(Relaxed).max(0) as usize, Relaxed);
+            LAST_FULL_LIVE.store(LIVE_AT_STOP.load(Relaxed), Relaxed);
         }
         COLLECTIONS.fetch_add(1, Relaxed);
     } else {
@@ -817,17 +1095,27 @@ fn collect_gen(young_only: bool) -> usize {
     }
     COLLECTOR.store(0, Release);
     COLLECTING.store(false, Release);
+    if ENABLED.load(Relaxed) && ALLOCS_SINCE.load(Relaxed) >= trigger_threshold() {
+        // (scale3) requests made while this collection ran were dropped
+        request_collection();
+    }
     // (scale1) sharded objects found dead and orphaned QSBR items, released only now:
     // their deallocation can run finalizers and weakref callbacks, which may use the
     // gc module (gc.get_objects waits for COLLECTING: a self-deadlock before)
     let saved_exc = crate::errors::take_exc();
     let dead = std::mem::take(&mut *DEAD_SHARDED.lock().unwrap_or_else(|e| e.into_inner()));
+    if crate::scalestats::gc_debug() {
+        let tk = QSBR_TAKEN.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|b| b.len()).sum::<usize>();
+        eprintln!("  post: dead={} qsbr_taken={}", dead.len(), tk);
+    }
     drop(dead);
     let taken = std::mem::take(&mut *QSBR_TAKEN.lock().unwrap_or_else(|e| e.into_inner()));
     crate::qsbr::release_taken(taken);
     if let Some(e) = saved_exc {
         crate::errors::set_exc(e);
     }
+    clock.lap(6);
+    GC_COLLECTOR_TS.store(0, Release);
     n.unwrap_or(0)
 }
 
@@ -837,11 +1125,12 @@ fn collect_gen(young_only: bool) -> usize {
 /// threads) run with the world restarted. Garbage stays alive through the
 /// references held here, and a second stopped phase re-checks it after
 /// finalizers for resurrection. None if the world could not be stopped.
-unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize> {
+unsafe fn collect_phases(me: *mut ThreadState, young_only: bool, explicit: bool, clock: &mut crate::scalestats::PhaseClock) -> Option<usize> {
     unsafe {
         if !stop_the_world(me) {
             return None;
         }
+        GROSS_AT_STOP.store(ALLOCS_GROSS.load(Relaxed), Relaxed);
         // every thread is at a safepoint: references deferred before now can go
         mature_deferred();
         crate::object::merge_type_counts();
@@ -851,12 +1140,67 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
         // (scale2) objects waiting in the merge queues of owners that do not poll
         // (blocked threads) are merged now and released after the collection
         DEAD_SHARDED.lock().unwrap_or_else(|e| e.into_inner()).extend(crate::threads::merge_all_queues_stopped());
+        clock.lap(1);
         // ---- phase 1 (stopped): find the unreachable objects
-        let mut objs = snapshot_gen(young_only);
-        crate::gc_support::untrack_atomic_tuples(&mut objs);
-        crate::gc_support::CANDIDATES.fetch_add(objs.len(), Relaxed);
-        promote(&objs);
-        let mut unreachable = find_unreachable(objs);
+        // (scale3) young collections with threads parked at safepoints analyse in
+        // parallel, each thread mostly its own young objects (gcpar.rs)
+        let mut held: Vec<PyRef> = Vec::new();
+        let par = if young_only { crate::gcpar::analyse_young(me) } else { crate::gcpar::analyse_full(me) };
+        let mut unreachable = if let Some(a) = par {
+            crate::gc_support::CANDIDATES.fetch_add(a.examined, Relaxed);
+            LAST_EXAMINED.store(a.examined, Relaxed);
+            if crate::scalestats::on() {
+                crate::scalestats::GC_EXAMINED.fetch_add(a.examined as u64, Relaxed);
+            }
+            clock.lap(3);
+            if crate::scalestats::gc_debug() {
+                eprintln!("  par: examined={} garbage={} flags={} explicit={}", a.examined, a.unreachable_count(), a.flags, explicit);
+            }
+            if !explicit && a.flags == 0 && !crate::gc_support::save_all_on() {
+                // (scale3) the common case: only tp_clear is needed; each thread
+                // parked at a safepoint clears its own garbage when it resumes
+                return Some(owner_clear(me, a, clock));
+            }
+            // general path: the references the analysis took are released once the
+            // garbage is ownerless (below: no merge-queue traffic while stopped)
+            let mut u = Vec::with_capacity(a.unreachable_count());
+            for p in a.parts {
+                let special: PtrSet = p.special.iter().map(|&o| o as usize).collect();
+                for o in p.garbage {
+                    if !special.contains(&(o as usize)) {
+                        held.push(PyRef::from_raw(o));
+                    }
+                    u.push(o);
+                }
+            }
+            u
+        } else {
+            let mut objs = if young_only {
+                snapshot_young()
+            } else {
+                let v = snapshot_gen(false, true);
+                // everything tracked is examined (and promoted) now
+                crate::young::clear_all();
+                v
+            };
+            crate::gc_support::untrack_atomic_tuples(&mut objs);
+            crate::gc_support::CANDIDATES.fetch_add(objs.len(), Relaxed);
+            LAST_EXAMINED.store(objs.len(), Relaxed);
+            if !young_only {
+                promote(&objs); // (claimed young objects are promoted already)
+            }
+            clock.lap(2);
+            if crate::scalestats::on() {
+                crate::scalestats::GC_EXAMINED.fetch_add(objs.len() as u64, Relaxed);
+            }
+            let u = find_unreachable(objs);
+            clock.lap(3);
+            u
+        };
+        LIVE_AT_STOP.store((TRACKED.load(Relaxed).max(0) as usize).saturating_sub(unreachable.len()), Relaxed);
+        if crate::scalestats::on() {
+            crate::scalestats::GC_GARBAGE.fetch_add(unreachable.len() as u64, Relaxed);
+        }
         // cycles with legacy finalizers (tp_del) are left alone and reported
         let legacy = crate::gc_support::split_legacy_finalizers(&mut unreachable);
         if unreachable.is_empty() {
@@ -886,6 +1230,7 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
             // go to the shared field instead of the owners' merge queues
             crate::object::explicit_merge(o);
         }
+        drop(std::mem::take(&mut held));
         // (after the unsharding above: the registry must not keep entries for objects
         // that are about to be freed)
         DEAD_SHARDED.lock().unwrap_or_else(|e| e.into_inner()).extend(crate::sharded::dead_untracked());
@@ -939,6 +1284,7 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
             late.finish();
             v
         };
+        clock.lap(4);
         // ---- phase 4 (running): break the cycles (gc.DEBUG_SAVEALL keeps them)
         if let Some(l) = legacy.take().filter(|l| !l.is_empty()) {
             UNCOLLECTABLE.fetch_add(crate::gc_support::report_uncollectable(l), Relaxed);
@@ -966,10 +1312,88 @@ unsafe fn collect_phases(me: *mut ThreadState, young_only: bool) -> Option<usize
         }
         drop(to_clear);
         drop(garbage);
+        clock.lap(5);
         COLLECTED.fetch_add(n, Relaxed);
         Some(n + n_legacy)
     }
 }
+
+/// (scale3) World stopped, after a parallel analysis whose garbage needs nothing
+/// but tp_clear (no finalizers, no legacy finalizers, no weakref callbacks; automatic
+/// collection). Garbage owned by a thread parked at an eval-breaker
+/// safepoint goes back to that thread, which clears it when it resumes (its own
+/// objects, still in its cache; the frees go to its own allocator cache; and threads
+/// that make garbage pay for clearing it, so the collector cannot fall behind several
+/// allocating threads). The rest is cleared here once the world runs again.
+/// Returns the number of objects collected (CPython count).
+unsafe fn owner_clear(me: *mut ThreadState, a: crate::gcpar::Analysis, clock: &mut crate::scalestats::PhaseClock) -> usize {
+    unsafe {
+        let n = a.unreachable_count().saturating_sub(a.dicts);
+        LIVE_AT_STOP.store((TRACKED.load(Relaxed).max(0) as usize).saturating_sub(a.unreachable_count()), Relaxed);
+        if crate::scalestats::on() {
+            crate::scalestats::GC_GARBAGE.fetch_add(a.unreachable_count() as u64, Relaxed);
+        }
+        for p in &a.parts {
+            for &o in &p.special {
+                // the reference the analysis left to this thread (before the type id /
+                // sharded count goes: its own table entry is folded in by that)
+                crate::object::incref(o);
+                if crate::object::has_type_id(o) {
+                    crate::object::release_type_id(o as *mut PyTypeObject, true);
+                } else if crate::sharded::is_sharded(&*o) {
+                    crate::sharded::unshard(o);
+                }
+            }
+        }
+        DEAD_SHARDED.lock().unwrap_or_else(|e| e.into_inner()).extend(crate::sharded::dead_untracked());
+        let weak: Vec<*mut PyObject> = a.parts.iter().flat_map(|p| p.weak.iter().copied()).collect();
+        let late = if weak.is_empty() { None } else { Some(crate::types::weakref::detach_weakrefs_for_gc(&weak, false)) };
+        // threads that can take garbage, by the owner id their objects carry
+        let mut takers: Vec<(usize, *const ThreadState, Vec<usize>)> = Vec::new();
+        for &t in crate::threads::ALL_THREADS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            let ts = t as *const ThreadState;
+            if t != me as usize && (*ts).at_safepoint.load(SeqCst) && (*ts).alive() {
+                takers.push(((*ts).owner_tid, ts, Vec::new()));
+            }
+        }
+        let my_id = crate::object::thread_id();
+        let mut mine: Vec<usize> = Vec::new();
+        let mut handed = 0usize;
+        for p in a.parts {
+            for o in p.garbage {
+                let owner = (*o).ob_tid.load(Relaxed);
+                if let Some(t) = takers.iter_mut().find(|t| t.0 == owner) {
+                    t.2.push(o as usize);
+                    handed += 1;
+                } else {
+                    if owner != my_id {
+                        // cleared here on behalf of its owner (see collect_phases)
+                        crate::object::explicit_merge(o);
+                    }
+                    mine.push(o as usize);
+                }
+            }
+        }
+        for (_, ts, v) in takers {
+            if !v.is_empty() {
+                (*ts).gc_clear.lock().unwrap_or_else(|e| e.into_inner()).extend(v);
+                (*ts).c.eval_breaker.fetch_or(crate::threads::EVAL_GC_CLEAR, Release);
+            }
+        }
+        HANDED.fetch_add(handed, Relaxed);
+        clock.lap(4);
+        start_the_world();
+        if let Some(l) = late {
+            l.finish();
+        }
+        clear_garbage(mine, clock);
+        COLLECTED.fetch_add(n, Relaxed);
+        n
+    }
+}
+
+/// (scale3) Garbage objects handed to their threads for clearing (diagnostics).
+pub static HANDED: AtomicUsize = AtomicUsize::new(0);
 
 /// Temporarily adjust a refcount without triggering deallocation.
 unsafe fn adjust(op: *mut PyObject, delta: isize) {
@@ -990,7 +1414,7 @@ pub fn maybe_collect(ts: &ThreadState) {
         // the last full collection (cyclic garbage that reached the old generation)
         let tracked = TRACKED.load(Relaxed).max(0) as usize;
         let full = YOUNG_COLLECTIONS.load(Relaxed) >= 10 && tracked > LAST_FULL_LIVE.load(Relaxed) + LAST_FULL_LIVE.load(Relaxed) / 2;
-        collect_gen(!full);
+        collect_gen(!full, false);
     } else if !DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
         // collections are disabled (or not due): still release deferred storage
         flush_deferred();
@@ -1101,7 +1525,7 @@ pub fn with_world_stopped_external<R>(f: impl FnOnce() -> R) -> R {
         std::thread::sleep(std::time::Duration::from_micros(50));
     }
     let r = f();
-    RELEASE.store(true, SeqCst);
+    start_the_world();
     COLLECTING.store(false, Release);
     r
 }

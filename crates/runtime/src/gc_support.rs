@@ -47,6 +47,11 @@ pub fn countable(garbage: &[PyRef]) -> Vec<*mut PyObject> {
     garbage.iter().map(|g| g.as_ptr()).filter(|p| !owned.contains(&(*p as usize))).collect()
 }
 
+/// (scale3) Is gc.DEBUG_SAVEALL set?
+pub fn save_all_on() -> bool {
+    crate::modules::gc_mod::debug_flags() & crate::modules::gc_mod::DEBUG_SAVEALL != 0
+}
+
 /// gc.DEBUG_SAVEALL: append the garbage to gc.garbage instead of freeing it.
 /// Returns true if the garbage was saved (the caller must not clear it).
 pub fn save_all(countable: &[*mut PyObject]) -> bool {

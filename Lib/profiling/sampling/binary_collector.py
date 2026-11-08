@@ -1,89 +1,86 @@
-"""Compact binary recorder of raw samples, replayable later by ``BinaryReader``.
+"""Record raw samples in the compact binary format (``--binary``).
 
-Samples are stored run-length encoded (identical consecutive samples are kept
-once with a repeat count); the body is marshalled and may be zstd-compressed.
-The header records the sampling interval, mode and capture configuration so a
-replay can restore the measured statistics.
+The encoding itself lives in ``_remote_debugging.BinaryWriter``; this
+collector adapts it to the collector protocol: it supplies timestamps,
+stops cleanly when a sample does not fit the format, and records the
+measured run statistics so a later ``replay`` can report them.
 """
 
-import marshal
-import struct
+import sys
+import time
+
+import _remote_debugging
 
 from .collector import Collector
 
 __all__ = ('BinaryCollector',)
 
-MAGIC = b"TACHYON1"
+_COMPRESSION = {"none": 0, "zstd": 1}
 
 
-def _frame_tuple(frame):
-    loc = frame[1]
-    if loc is None:
-        location = None
-    elif isinstance(loc, int):
-        location = (loc, loc, -1, -1)
-    else:
-        location = (loc[0], loc[1], loc[2], loc[3])
-    return (frame[0], location, frame[2], frame[3])
-
-
-def _sample_repr(stack_frames):
-    out = []
-    for interp in stack_frames or ():
-        threads = []
-        for thread in getattr(interp, "threads", ()) or ():
-            frames = [_frame_tuple(f) for f in getattr(thread, "frame_info", ()) or ()]
-            threads.append((getattr(thread, "thread_id", None),
-                            getattr(thread, "status", 0) or 0,
-                            frames))
-        out.append((getattr(interp, "interpreter_id", 0), threads))
-    return out
+def _compression_code(compression):
+    if compression in (None, "auto"):
+        return 1 if _remote_debugging.zstd_available() else 0
+    if isinstance(compression, int):
+        return compression
+    try:
+        return _COMPRESSION[compression]
+    except KeyError:
+        raise ValueError(f"unknown compression {compression!r}") from None
 
 
 class BinaryCollector(Collector):
-    def __init__(self, filename, sample_interval_usec=1000, *, compression="none",
-                 mode=None, capture_config=None, skip_idle=False, opcodes=False, **kwargs):
+    """Stream every sample to *filename*; ``export()`` completes the file."""
+
+    def __init__(self, filename, sample_interval_usec=1000, *, skip_idle=False,
+                 compression="auto", mode=None, capture_config=None, **kwargs):
         super().__init__(sample_interval_usec, skip_idle=skip_idle)
         self.filename = filename
-        self.compression = compression or "none"
         self.mode = mode
         self.capture_config = capture_config
-        self._runs = []           # list of [sample_repr, count]
-        self.sample_count = 0
-        self.stats = {}
+        self.compression = compression
+        self.running = True
+        self._writer = _remote_debugging.BinaryWriter(
+            filename, int(sample_interval_usec), 0,
+            compression=_compression_code(compression),
+            mode=mode, capture_config=capture_config,
+        )
 
-    def collect(self, stack_frames, timestamps_us=None):
-        n = len(timestamps_us) if timestamps_us else 1
-        rep = _sample_repr(stack_frames)
-        if self._runs and self._runs[-1][0] == rep:
-            self._runs[-1][1] += n
-        else:
-            self._runs.append([rep, n])
-        self.sample_count += n
+    @property
+    def total_samples(self):
+        return self._writer.total_samples
 
-    def set_stats(self, **kwargs):
-        self.stats.update(kwargs)
+    def collect(self, stack_frames, timestamp_us=None):
+        if not self.running:
+            return
+        if timestamp_us is None:
+            timestamp_us = time.monotonic_ns() // 1000
+        try:
+            self._writer.write_sample(stack_frames, timestamp_us)
+        except OverflowError as exc:
+            if not self._writer.limit_reached:
+                raise
+            # A value outside the format's range: keep what was recorded so far.
+            self.running = False
+            print(f"Warning: {exc}; binary recording stopped, "
+                  f"{self._writer.total_samples} samples kept", file=sys.stderr)
+
+    def set_stats(self, sample_interval_usec=None, duration_sec=None,
+                  sample_rate=None, error_rate=None, missed_samples=None,
+                  **kwargs):
+        if duration_sec is None or sample_rate is None:
+            return
+        self._writer.set_stats(duration_sec, sample_rate, error_rate,
+                               missed_samples)
 
     def export(self, filename=None):
-        path = filename or self.filename
-        header = {
-            "interval": self.sample_interval_usec,
-            "mode": self.mode,
-            "capture_config": self.capture_config,
-            "compression": self.compression,
-            "stats": self.stats,
-        }
-        body = marshal.dumps(self._runs)
-        if self.compression == "zstd":
-            try:
-                from compression import zstd
-                body = zstd.compress(body)
-            except Exception:
-                header["compression"] = "none"
-        header_bytes = marshal.dumps(header)
-        with open(path, "wb") as f:
-            f.write(MAGIC)
-            f.write(struct.pack("<I", len(header_bytes)))
-            f.write(header_bytes)
-            f.write(struct.pack("<I", len(body)))
-            f.write(body)
+        self._writer.finalize()
+
+    def get_stats(self):
+        return self._writer.get_stats()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._writer.__exit__(exc_type, exc, tb)

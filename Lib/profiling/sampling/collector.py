@@ -52,6 +52,25 @@ def extract_lineno(location):
     return location[0]
 
 
+try:
+    from _remote_debugging import FrameInfo as _FrameInfo
+except ImportError:
+    from collections import namedtuple as _namedtuple
+    _FrameInfo = _namedtuple('FrameInfo', 'filename location funcname opcode')
+    _FrameInfo = (lambda make: (lambda values: make(*values)))(_FrameInfo)
+
+
+def _task_marker(name):
+    """The synthetic frame separating the frames of one asyncio task from the
+    task awaiting it."""
+    return _FrameInfo(("<task>", None, name, None))
+
+
+def _task_order(task_id):
+    # awaiting tasks are referred to by id; order ids before anything else
+    return (0, task_id, "") if isinstance(task_id, int) else (1, 0, str(task_id))
+
+
 def is_idle(thread):
     """Whether a sampled thread was neither running nor holding the GIL."""
     status = getattr(thread, 'status', 0) or 0
@@ -88,37 +107,42 @@ class Collector(ABC):
     def _iter_async_frames(self, awaited_info_list):
         """Reconstruct linear call stacks from an asyncio task graph.
 
-        For every thread's set of tasks, find the leaf tasks (those no other task
-        awaits) and, from each, walk up the ``awaited_by`` links to the root,
-        concatenating the coroutine frames.  Yields ``(frames, thread_id, leaf_task_id)``.
+        For every thread's tasks, the leaves are the tasks no other task waits
+        for.  From each leaf the stack is built innermost first: the task's
+        coroutine frames, then a ``<task>`` marker frame naming it, then the
+        same for the task awaiting it, up to a task nobody awaits.  A task
+        awaited by several tasks follows the one with the lowest id (its marker
+        says how many there are); a missing or already visited awaiter ends the
+        walk.  Yields ``(frames, thread_id, leaf_task_id)``.
         """
         for info in awaited_info_list or ():
-            tasks = {t.task_id: t for t in getattr(info, 'awaited_by', ()) or ()}
-            awaiters = set()
-            for t in tasks.values():
-                for coro in getattr(t, 'awaited_by', ()) or ():
-                    awaiters.add(coro.task_name)
+            tasks = {}
+            for task in getattr(info, 'awaited_by', ()) or ():
+                tasks[task.task_id] = task
+            awaited = set()
+            for task in tasks.values():
+                for waiter in getattr(task, 'awaited_by', ()) or ():
+                    awaited.add(waiter.task_name)
             thread_id = getattr(info, 'thread_id', None)
-            for leaf in tasks.values():
-                if leaf.task_id in awaiters:
+            for leaf_id, leaf in tasks.items():
+                if leaf_id in awaited:
                     continue
                 frames = []
-                for coro in getattr(leaf, 'coroutine_stack', ()) or ():
-                    frames.extend(coro.call_stack)
-                cur = leaf
-                seen = {cur.task_id}
-                while True:
-                    parents = getattr(cur, 'awaited_by', ()) or ()
-                    if not parents:
-                        break
-                    coro = parents[0]
-                    frames.extend(coro.call_stack)
-                    parent = tasks.get(coro.task_name)
-                    if parent is None or parent.task_id in seen:
-                        break
-                    seen.add(parent.task_id)
-                    cur = parent
-                yield frames, thread_id, leaf.task_id
+                visited = set()
+                task = leaf
+                while task is not None and task.task_id not in visited:
+                    visited.add(task.task_id)
+                    for coro in getattr(task, 'coroutine_stack', ()) or ():
+                        frames.extend(coro.call_stack or ())
+                    waiters = sorted(
+                        (w.task_name for w in getattr(task, 'awaited_by', ()) or ()),
+                        key=_task_order)
+                    name = str(task.task_name)
+                    if len(waiters) > 1:
+                        name = f"{name} ({len(waiters)} parents)"
+                    frames.append(_task_marker(name))
+                    task = tasks.get(waiters[0]) if waiters else None
+                yield frames, thread_id, leaf_id
 
     def print_stats(self, *, show_summary=True, sort=None, limit=None, mode=None, **kwargs):
         """Default textual summary (overridden by collectors with richer output)."""

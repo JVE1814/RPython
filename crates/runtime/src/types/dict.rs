@@ -890,6 +890,16 @@ fn get_lockfree(d: &PyObject, key: &PyObject, hash: isize) -> Option<Option<PyRe
     }
 }
 
+/// (tail4) Like `lookup_index`, but never runs Python code: None when deciding would
+/// need a key comparison through `__eq__` (a non-str key with the same hash).
+pub fn lookup_index_no_eq(d: &PyObject, key: &PyObject, hash: isize) -> Option<Option<usize>> {
+    match lookup_lockfree_raw(d, key, hash) {
+        LfRead::Hit(ix, _) => Some(Some(ix)),
+        LfRead::Miss => Some(None),
+        LfRead::Undecided => None,
+    }
+}
+
 pub fn lookup_index(d: &PyObject, key: &PyObject, hash: isize) -> PyResult<Option<usize>> {
     match lookup_lockfree_raw(d, key, hash) {
         LfRead::Hit(ix, _) => return Ok(Some(ix)),
@@ -1134,6 +1144,8 @@ pub fn set_item_hash(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) -
             unsafe { std::sync::atomic::AtomicPtr::from_ptr(&raw mut t.entries_mut()[ix].value).store(value.as_ptr(), Release) };
             t.version = next_version();
             crate::interp::cache::on_dict_write(d, key.as_ptr()); // jit
+            // read under the lock: a non-owner marks the table before its first
+            // lock-free read, and it does so holding this lock
             let grace = removal_needs_grace(d, t);
             drop(g);
             // perf-runtime (D6): lock-free readers may still hold `old`
@@ -1232,11 +1244,16 @@ fn removal_needs_grace(d: &PyObject, t: &DictTable) -> bool {
     crate::qsbr::multi_threaded() && (t.shared_read.load(Relaxed) || d.ob_tid.load(Relaxed) != thread_id())
 }
 
+/// Release a key or value just removed from a table (after the lock was dropped);
+/// `grace` from `removal_needs_grace`. (cleanroom6 made the same change for tables never
+/// marked shared; the owner check covers a non-owner writer racing the owner's
+/// unmarked lock-free reads.)
 #[inline]
 unsafe fn release_removed(grace: bool, p: *mut PyObject) {
     unsafe {
         if grace {
-            crate::qsbr::decref_deferred(p);
+            // (tail4) at once if every other thread is quiescent right now
+            crate::qsbr::release_unpublished(p);
         } else {
             decref(p);
         }

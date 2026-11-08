@@ -126,17 +126,18 @@ fn instance_get_hinted(o: &PyObject, nm: &PyObject, hint: u64, e: &Entry) -> Opt
 }
 
 /// Index of `nm` in the inline values or the dict of `o` (fill-time hint).
-fn instance_index(o: &PyObject, nm: &PyObject) -> Option<usize> {
+/// Where `nm` is in `o`'s instance dict: Some(None) if absent, None if that cannot be
+/// decided without running Python code (tail4: a key with the same hash whose
+/// `__eq__` would have to be called; filling a cache must not run code).
+fn instance_index(o: &PyObject, nm: &PyObject) -> Option<Option<usize>> {
     if let Some(r) = crate::shape::get_hinted(o, nm.as_ptr(), u64::MAX) {
-        return r.map(|(_, i)| i);
+        return Some(r.map(|(_, i)| i));
     }
     let dp = instance_dict_ptr(o);
     if !dp.is_null() && dict::is_dict_exact(unsafe { &*dp }) {
-        if let Ok(Some(ix)) = dict::lookup_index(unsafe { &*dp }, nm, pystr::str_hash(nm)) {
-            return Some(ix);
-        }
+        return dict::lookup_index_no_eq(unsafe { &*dp }, nm, pystr::str_hash(nm));
     }
-    None
+    Some(None)
 }
 
 /// Look `nm` up in dict `d` using (and refreshing) the entry-index hint.
@@ -419,7 +420,7 @@ fn fill_load_attr(o: &PyObject, nm: &PyObject, method: bool) -> Option<Fill> {
         }
         if has_dict {
             // instance dict first, then the (non-data) class attribute if any
-            let ix = instance_index(o, nm);
+            let ix = instance_index(o, nm)?;
             return match (&descr, ix) {
                 (Some(d), None) => Some((kind::CLASS_ATTR_SHADOWABLE, tag as u64, 0, d.as_ptr() as usize)),
                 _ => Some((
@@ -651,7 +652,7 @@ fn fill_store_attr(o: &PyObject, nm: &PyObject) -> Option<Fill> {
         return None;
     }
     // hint: where the attribute now lives in the instance dict
-    let hint = || instance_index(o, nm).map_or(u64::MAX, |i| i as u64);
+    let hint = || instance_index(o, nm).flatten().map_or(u64::MAX, |i| i as u64);
     match lookup(tp, nm) {
         Some(d) => {
             if d.ty().tp_descr_set.is_some() {

@@ -380,7 +380,14 @@ unsafe fn realloc_object_impl(op: *mut PyObject, new_size: usize) -> *mut PyObje
         (*op).ob_gc_bits.store(0, Relaxed);
         crate::tlab::free_small(start);
         let nop = raw.add(pre) as *mut PyObject;
-        (*nop).ob_gc_bits.store((bits & !GC_BIT_LARGE) | large, Relaxed);
+        // (scale3) the young-buffer entry names the old address: a tracked young object
+        // that moved to another small block gets a new entry
+        let yb = crate::young::GC_BIT_YOUNG_BUF;
+        (*nop).ob_gc_bits.store((bits & !(GC_BIT_LARGE | yb)) | large, Relaxed);
+        if bits & yb != 0 && large == 0 {
+            (*nop).ob_gc_bits.store((bits & !GC_BIT_LARGE) | large, Relaxed);
+            crate::young::push(nop);
+        }
         if gc && large != 0 {
             large_register(nop);
         }

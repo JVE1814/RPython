@@ -72,6 +72,23 @@ pub struct Asm {
     fixups: Vec<(usize, Label)>,
     /// (position of imm64 field, label): absolute address of label, patched at finalize
     abs_fixups: Vec<(usize, Label)>,
+    /// (position of rel8 field, label): `jcc_short`
+    short_fixups: Vec<(usize, Label)>,
+    /// (perf7) jumps emitted in the rel32 form: (opcode position, label, condition code
+    /// or JMP_OP); `resolve` turns those whose final distance fits into rel8 forms
+    relax: Vec<(usize, Label, u8)>,
+    /// (perf7) after relaxation: (old position of a shortened jump, bytes removed up to
+    /// and including it), for `map_pos`
+    moved: Vec<(usize, usize)>,
+}
+
+/// `relax` marker of an unconditional jump
+const JMP_OP: u8 = 0xff;
+
+/// RPYTHON_JIT_NORELAX=1 keeps every jump in the form it was emitted in (debugging).
+fn relax_disabled() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var_os("RPYTHON_JIT_NORELAX").is_some_and(|v| v != "0"))
 }
 
 impl Default for Asm {
@@ -82,7 +99,21 @@ impl Default for Asm {
 
 impl Asm {
     pub fn new() -> Asm {
-        Asm { buf: Vec::with_capacity(4096), labels: Vec::new(), fixups: Vec::new(), abs_fixups: Vec::new() }
+        Asm {
+            buf: Vec::with_capacity(4096),
+            labels: Vec::new(),
+            fixups: Vec::new(),
+            abs_fixups: Vec::new(),
+            short_fixups: Vec::new(),
+            relax: Vec::new(),
+            moved: Vec::new(),
+        }
+    }
+    /// (perf7) Position after `resolve` of an instruction boundary that was at `old`
+    /// before (jump relaxation moves code); identity before `resolve`.
+    pub fn map_pos(&self, old: usize) -> usize {
+        let k = self.moved.partition_point(|m| m.0 < old);
+        if k == 0 { old } else { old - self.moved[k - 1].1 }
     }
     #[inline]
     pub fn pos(&self) -> usize {
@@ -419,22 +450,27 @@ impl Asm {
     }
     /// add r32, imm (32-bit op)
     pub fn add32_ri(&mut self, d: R, imm: i32) {
-        self.rex(false, 0, 0, d as u8, false);
-        self.b(0x81);
-        self.modrm_reg(0, d as u8);
-        self.d32(imm);
+        self.alu32_ri(0, d, imm)
     }
     pub fn sub32_ri(&mut self, d: R, imm: i32) {
-        self.rex(false, 0, 0, d as u8, false);
-        self.b(0x81);
-        self.modrm_reg(5, d as u8);
-        self.d32(imm);
+        self.alu32_ri(5, d, imm)
     }
     pub fn cmp32_ri(&mut self, d: R, imm: i32) {
+        self.alu32_ri(7, d, imm)
+    }
+    /// (perf7) 32-bit ALU op with an immediate, in the sign-extended imm8 form when it
+    /// fits (the refcount sequences inlined everywhere use +1/-1: 3 bytes shorter each)
+    fn alu32_ri(&mut self, ext: u8, d: R, imm: i32) {
         self.rex(false, 0, 0, d as u8, false);
-        self.b(0x81);
-        self.modrm_reg(7, d as u8);
-        self.d32(imm);
+        if (-128..=127).contains(&imm) {
+            self.b(0x83);
+            self.modrm_reg(ext, d as u8);
+            self.b(imm as i8 as u8);
+        } else {
+            self.b(0x81);
+            self.modrm_reg(ext, d as u8);
+            self.d32(imm);
+        }
     }
     pub fn imul_rr(&mut self, d: R, s: R) {
         self.rex(true, d as u8, 0, s as u8, false);
@@ -691,10 +727,12 @@ impl Asm {
             let rel = p as isize - (self.pos() as isize + 2);
             if (-128..=127).contains(&rel) {
                 self.b(0xeb);
+                self.short_fixups.push((self.pos(), l)); // (perf7) recomputed after relaxation
                 self.b(rel as i8 as u8);
                 return;
             }
         }
+        self.relax.push((self.pos(), l, JMP_OP));
         self.b(0xe9);
         self.fixups.push((self.pos(), l));
         self.d32(0);
@@ -704,14 +742,27 @@ impl Asm {
             let rel = p as isize - (self.pos() as isize + 2);
             if (-128..=127).contains(&rel) {
                 self.b(0x70 | cc as u8);
+                self.short_fixups.push((self.pos(), l)); // (perf7) recomputed after relaxation
                 self.b(rel as i8 as u8);
                 return;
             }
         }
+        self.relax.push((self.pos(), l, cc as u8));
         self.b(0x0f);
         self.b(0x80 | cc as u8);
         self.fixups.push((self.pos(), l));
         self.d32(0);
+    }
+    /// (perf7) Forward conditional jump known to stay within 127 bytes (a skip over a
+    /// short fixed sequence, such as the owner check of an inline incref): the 2-byte
+    /// form instead of the 6-byte one. `resolve` fails if the target ends up farther.
+    pub fn jcc_short(&mut self, cc: Cc, l: Label) {
+        if self.labels[l.0 as usize].is_some() {
+            return self.jcc(cc, l);
+        }
+        self.b(0x70 | cc as u8);
+        self.short_fixups.push((self.pos(), l));
+        self.b(0);
     }
     pub fn int3(&mut self) {
         self.b(0xcc);
@@ -720,18 +771,162 @@ impl Asm {
         self.b(0x0f);
         self.b(0x0b);
     }
+    /// (alignment is not preserved by the jump relaxation in `resolve`)
     pub fn align(&mut self, n: usize) {
         while self.buf.len() % n != 0 {
             self.b(0x90);
         }
     }
 
-    /// Resolve relative fixups. Returns Err if a label is unbound.
+    /// (perf7) Branch relaxation: jumps were emitted in the rel32 form whenever their
+    /// target was not bound yet (every forward jump); a third of the JIT's code bytes
+    /// were jumps, most of them to nearby targets. Shorten every jump whose final
+    /// distance fits into rel8, then move the code and every recorded position.
+    /// Shortening only brings code closer together, so the set of short jumps grows
+    /// monotonically and the iteration ends.
+    fn relax_jumps(&mut self) {
+        let n = self.relax.len();
+        if n == 0 || relax_disabled() {
+            self.relax.clear();
+            return;
+        }
+        let save = |cc: u8| if cc == JMP_OP { 3usize } else { 4 };
+        // candidates: (jump index, index of the first jump at or after the target), only
+        // jumps that could come within reach if every jump in between shrank (most jumps
+        // to the out-of-line stubs at the end cannot)
+        let mut short = vec![false; n];
+        let mut unsure: Vec<(usize, usize)> = Vec::new();
+        for i in 0..n {
+            let (p, l, cc) = self.relax[i];
+            let Some(t) = self.labels[l.0 as usize] else { continue };
+            // fits even if no other jump shrinks: short for good (the common case, skips
+            // over a few instructions)
+            let own = if t > p { save(cc) } else { 0 };
+            let rel0 = (t - own) as isize - (p as isize + 2);
+            if (-128..=127).contains(&rel0) {
+                short[i] = true;
+                continue;
+            }
+            // a jump in between saves at most 4 of its 5-6 bytes: beyond 5 x the reach
+            // nothing can bring the target close enough (most jumps to the stubs)
+            if t.abs_diff(p) > 5 * 136 {
+                continue;
+            }
+            let k = self.relax.partition_point(|r| r.0 < t);
+            let between = if k > i { k - i - 1 } else { i - k };
+            if t.abs_diff(p) <= 127 + 6 + 4 * between {
+                unsure.push((i, k));
+                short[i] = true;
+            }
+        }
+        // optimistic start (every candidate short), then lengthen the unsure ones out of
+        // reach until none is: lengthening only moves targets away, so this ends, and the
+        // last pass checked every unsure short jump against the final layout (the sure
+        // ones fit in any layout)
+        let mut cum = vec![0usize; n + 1];
+        loop {
+            for i in 0..n {
+                cum[i + 1] = cum[i] + if short[i] { save(self.relax[i].2) } else { 0 };
+            }
+            let mut changed = false;
+            for &(i, k) in &unsure {
+                if !short[i] {
+                    continue;
+                }
+                let (p, l, _) = self.relax[i];
+                let t = self.labels[l.0 as usize].unwrap();
+                // (cum[k] includes this jump's own saving when the target is after it)
+                let rel = (t - cum[k]) as isize - ((p - cum[i]) as isize + 2);
+                if !(-128..=127).contains(&rel) {
+                    short[i] = false;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        if !short.iter().any(|&s| s) {
+            self.relax.clear();
+            return;
+        }
+        // rebuild the buffer
+        let old = std::mem::take(&mut self.buf);
+        let mut out = Vec::with_capacity(old.len());
+        let mut dropped: Vec<usize> = Vec::new(); // (ascending)
+        let mut new_short = Vec::new();
+        let (mut last, mut removed) = (0usize, 0usize);
+        for i in 0..n {
+            if !short[i] {
+                continue;
+            }
+            let (p, l, cc) = self.relax[i];
+            out.extend_from_slice(&old[last..p]);
+            if cc == JMP_OP {
+                out.push(0xeb);
+                dropped.push(p + 1);
+            } else {
+                out.push(0x70 | cc);
+                dropped.push(p + 2);
+            }
+            new_short.push((out.len(), l));
+            out.push(0);
+            let len = if cc == JMP_OP { 5 } else { 6 };
+            last = p + len;
+            removed += len - 2;
+            self.moved.push((p, removed));
+        }
+        out.extend_from_slice(&old[last..]);
+        self.buf = out;
+        self.relax.clear();
+        // positions: labels sit on instruction boundaries; fixup fields inside kept
+        // instructions move with them
+        for i in 0..self.labels.len() {
+            if let Some(p) = self.labels[i] {
+                self.labels[i] = Some(self.map_pos(p));
+            }
+        }
+        // fixups are in code order: one merged walk over them, `dropped` and `moved`
+        let fixups = std::mem::take(&mut self.fixups);
+        let mut kept = Vec::with_capacity(fixups.len());
+        let (mut di, mut mi, mut shift) = (0usize, 0usize, 0usize);
+        for (at, l) in fixups {
+            while di < dropped.len() && dropped[di] < at {
+                di += 1;
+            }
+            if di < dropped.len() && dropped[di] == at {
+                continue;
+            }
+            while mi < self.moved.len() && self.moved[mi].0 < at {
+                shift = self.moved[mi].1;
+                mi += 1;
+            }
+            kept.push((at - shift, l));
+        }
+        self.fixups = kept;
+        let abs = std::mem::take(&mut self.abs_fixups);
+        self.abs_fixups = abs.into_iter().map(|(at, l)| (self.map_pos(at), l)).collect();
+        let sh = std::mem::take(&mut self.short_fixups);
+        self.short_fixups = sh.into_iter().map(|(at, l)| (self.map_pos(at), l)).chain(new_short).collect();
+    }
+
+    /// Resolve relative fixups (after shortening jumps, see `relax_jumps`; positions
+    /// taken with `pos()` before must be translated with `map_pos`). Returns Err if a
+    /// label is unbound.
     pub fn resolve(&mut self) -> Result<(), String> {
+        self.relax_jumps();
         for &(at, l) in &self.fixups {
             let target = self.labels[l.0 as usize].ok_or_else(|| format!("unbound label {}", l.0))?;
             let rel = target as i64 - (at as i64 + 4);
             self.buf[at..at + 4].copy_from_slice(&(rel as i32).to_le_bytes());
+        }
+        for &(at, l) in &self.short_fixups {
+            let target = self.labels[l.0 as usize].ok_or_else(|| format!("unbound label {}", l.0))?;
+            let rel = target as i64 - (at as i64 + 1);
+            if !(-128..=127).contains(&rel) {
+                return Err(format!("short jump out of range ({})", rel));
+            }
+            self.buf[at] = rel as i8 as u8;
         }
         Ok(())
     }
@@ -775,5 +970,37 @@ mod tests {
         a.buf.clear();
         a.load_idx(R9, R13, R10, 4, 0);
         assert_eq!(a.buf, [0x4f, 0x8b, 0x8c, 0x95, 0, 0, 0, 0]);
+    }
+
+    /// (perf7) jump relaxation: forward jumps shrink when their target ends up close,
+    /// a backward short jump emitted before them is re-aimed, far jumps stay rel32,
+    /// recorded positions follow the code.
+    #[test]
+    fn relaxation() {
+        let mut a = Asm::new();
+        let (top, near, far) = (a.label(), a.label(), a.label());
+        a.bind(top); // 0
+        a.int3();
+        a.jcc(Cc::E, near); // 1: 6 -> 2 bytes
+        a.jmp(far); // 7: stays 5 (200 bytes away)
+        a.int3(); // 12
+        let mark = a.pos(); // 13
+        a.jmp(top); // 13: backward short, emitted directly
+        a.bind(near); // 15
+        for _ in 0..200 {
+            a.int3();
+        }
+        a.bind(far); // 215
+        a.ret();
+        a.resolve().unwrap();
+        // jcc shrank by 4 bytes: everything after it moves
+        assert_eq!(&a.buf[..3], &[0xcc, 0x74, 0x08]); // je +8 -> old 15 (new 11)
+        assert_eq!(a.buf[3], 0xe9); // jmp far stays rel32
+        assert_eq!(i32::from_le_bytes(a.buf[4..8].try_into().unwrap()), 211 - 8);
+        assert_eq!(a.map_pos(mark), 9);
+        assert_eq!(&a.buf[9..11], &[0xeb, 0xf5]); // jmp -11 -> 0
+        assert_eq!(a.label_pos(near), Some(11));
+        assert_eq!(a.label_pos(far), Some(211));
+        assert_eq!(a.buf.len(), 212);
     }
 }

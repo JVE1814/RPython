@@ -1537,10 +1537,11 @@ pub fn isinstance(inst: &PyObject, cls: &PyObject) -> PyResult<bool> {
         crate::interp::leave_recursive_call(ts);
         return r;
     }
-    if let Some(chk) = lookup_special(cls, name!("__instancecheck__"))? {
+    // (perf7) the hook is called unbound: no bound method object per check
+    if let Some(chk) = lookup(cls.type_ptr(), name!("__instancecheck__")) {
         let ts = crate::threads::current();
         crate::interp::enter_recursive_call(ts, " in __instancecheck__")?;
-        let r = call(&chk, &[inst]);
+        let r = call_unbound(&chk, cls, &[inst]);
         crate::interp::leave_recursive_call(ts);
         return is_true(&*r?);
     }
@@ -1584,10 +1585,10 @@ pub fn issubclass(derived: &PyObject, cls: &PyObject) -> PyResult<bool> {
         crate::interp::leave_recursive_call(ts);
         return r;
     }
-    if let Some(chk) = lookup_special(cls, name!("__subclasscheck__"))? {
+    if let Some(chk) = lookup(cls.type_ptr(), name!("__subclasscheck__")) {
         let ts = crate::threads::current();
         crate::interp::enter_recursive_call(ts, " in __subclasscheck__")?;
-        let r = call(&chk, &[derived]);
+        let r = call_unbound(&chk, cls, &[derived]);
         crate::interp::leave_recursive_call(ts);
         return is_true(&*r?);
     }

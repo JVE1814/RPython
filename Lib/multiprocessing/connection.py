@@ -1,20 +1,18 @@
 #
-# multiprocessing.connection: message-oriented connections over pipes and
-# sockets, listeners/clients with HMAC challenge authentication, and wait().
+# multiprocessing.connection -- message channels between processes.
 #
-# Wire format: every message is a 4-byte big-endian signed length followed
-# by the payload; payloads of 2 GiB or more use the length -1 followed by
-# an 8-byte unsigned length.  Objects are sent pickled (ForkingPickler);
-# only connect to peers that know the authkey, unpickling runs code.
+# A Connection sends length-prefixed messages over a file descriptor (one
+# end of a pipe or a connected socket).  Listener/Client build connections
+# over sockets and can authenticate both ends with an HMAC handshake over a
+# shared key.  wait() blocks until one of several objects is readable.
 #
 
 __all__ = ['Client', 'Listener', 'Pipe', 'wait']
 
-import errno
-import io
 import itertools
+import math
 import os
-import sys
+import select
 import socket
 import struct
 import time
@@ -26,75 +24,87 @@ from .context import reduction
 _ForkingPickler = reduction.ForkingPickler
 
 BUFSIZE = 8192
-# seconds a Client keeps retrying while the listener is not ready yet
+
+# seconds a Client keeps retrying a refused connection
 CONNECTION_TIMEOUT = 20.
 
 _mmap_counter = itertools.count()
 
-default_family = 'AF_INET'
 families = ['AF_INET']
-
+default_family = 'AF_INET'
 if hasattr(socket, 'AF_UNIX'):
+    families.append('AF_UNIX')
     default_family = 'AF_UNIX'
-    families += ['AF_UNIX']
-
-if sys.platform == 'win32':
-    default_family = 'AF_PIPE'
-    families += ['AF_PIPE']
 
 
-def _init_timeout(timeout=CONNECTION_TIMEOUT):
-    return time.monotonic() + timeout
-
-
-def _check_timeout(t):
-    return time.monotonic() > t
-
+#
+# Addresses
+#
 
 def arbitrary_address(family):
-    """Return an unused address of the given family."""
+    """An address of the given family that nothing is listening on yet."""
     if family == 'AF_INET':
         return ('localhost', 0)
-    elif family == 'AF_UNIX':
+    if family == 'AF_UNIX':
         import tempfile
         return tempfile.mktemp(prefix='listener-', dir=util.get_temp_dir())
-    elif family == 'AF_PIPE':
+    if family == 'AF_PIPE':
         import tempfile
-        return tempfile.mktemp(prefix=r'\\.\pipe\pyc-%d-%d-' %
-                               (os.getpid(), next(_mmap_counter)), dir="")
-    else:
-        raise ValueError('unrecognized family')
+        prefix = r'\\.\pipe\pyc-%d-%d-' % (os.getpid(), next(_mmap_counter))
+        return tempfile.mktemp(prefix=prefix, dir='')
+    raise ValueError('unrecognized family')
 
 
 def _check_family(family):
-    if family != 'AF_PIPE' and not hasattr(socket, family):
-        raise ValueError('Family %s is not recognized.' % family)
-    if family == 'AF_PIPE' and sys.platform != 'win32':
+    """Reject families this platform cannot provide."""
+    usable = (family != 'AF_PIPE' and hasattr(socket, family))
+    if not usable:
         raise ValueError('Family %s is not recognized.' % family)
 
 
 def address_type(address):
-    """Guess the family of an address."""
+    """The family an address belongs to."""
     if type(address) == tuple:
         return 'AF_INET'
-    elif type(address) is str and address.startswith('\\\\'):
+    if type(address) is str and address.startswith('\\\\'):
         return 'AF_PIPE'
-    elif type(address) is str or util.is_abstract_socket_namespace(address):
+    if type(address) is str or util.is_abstract_socket_namespace(address):
         return 'AF_UNIX'
-    else:
-        raise ValueError('address type of %r unrecognized' % address)
+    raise ValueError('address type of %r unrecognized' % address)
 
 
-# ---------------------------------------------------------------- connections
+#
+# Connection
+#
 
-class _ConnectionBase:
+# message header: a signed 32-bit big-endian length; -1 announces that an
+# unsigned 64-bit length follows (messages of 2 GiB or more)
+_SHORT_HEADER = struct.Struct('!i')
+_LONG_HEADER = struct.Struct('!Q')
+_LONG_MARK = -1
+_SHORT_LIMIT = 0x7fffffff
+# messages up to this size are written in one call together with the header
+_COALESCE_LIMIT = 16384
+
+
+def _as_bytes_view(buf):
+    """A flat memoryview of buf's bytes."""
+    view = memoryview(buf)
+    if view.ndim != 1 or view.itemsize != 1:
+        view = view.cast('B')
+    return view
+
+
+class Connection:
+    """One end of a channel built on a file descriptor."""
+
     _handle = None
 
     def __init__(self, handle, readable=True, writable=True):
         handle = handle.__index__()
         if handle < 0:
             raise ValueError("invalid handle")
-        if not readable and not writable:
+        if not (readable or writable):
             raise ValueError(
                 "at least one of `readable` and `writable` must be True")
         self._handle = handle
@@ -105,130 +115,9 @@ class _ConnectionBase:
         if self._handle is not None:
             self._close()
 
-    def _check_closed(self):
-        if self._handle is None:
-            raise OSError("handle is closed")
-
-    def _check_readable(self):
-        if not self._readable:
-            raise OSError("connection is write-only")
-
-    def _check_writable(self):
-        if not self._writable:
-            raise OSError("connection is read-only")
-
-    def _bad_message_length(self):
-        if self._writable:
-            self._readable = False
-        else:
-            self.close()
-        raise OSError("bad message length")
-
-    @property
-    def closed(self):
-        """True if the connection is closed."""
-        return self._handle is None
-
-    @property
-    def readable(self):
-        """True if the connection can receive."""
-        return self._readable
-
-    @property
-    def writable(self):
-        """True if the connection can send."""
-        return self._writable
-
-    def fileno(self):
-        """The file descriptor of the connection."""
-        self._check_closed()
-        return self._handle
-
-    def close(self):
-        """Close the connection."""
-        if self._handle is not None:
-            try:
-                self._close()
-            finally:
-                self._handle = None
-
-    def _detach(self):
-        self._handle = None
-
-    def send_bytes(self, buf, offset=0, size=None):
-        """Send the bytes of a bytes-like object (or a slice of it)."""
-        self._check_closed()
-        self._check_writable()
-        m = memoryview(buf)
-        try:
-            if m.itemsize > 1:
-                m = m.cast('B')
-            n = m.nbytes
-            if offset < 0:
-                raise ValueError("offset is negative")
-            if n < offset:
-                raise ValueError("buffer length < offset")
-            if size is None:
-                size = n - offset
-            elif size < 0:
-                raise ValueError("size is negative")
-            elif offset + size > n:
-                raise ValueError("buffer length < offset + size")
-            self._send_bytes(m[offset:offset + size])
-        finally:
-            m.release()
-
-    def send(self, obj):
-        """Send a picklable object."""
-        self._check_closed()
-        self._check_writable()
-        self._send_bytes(_ForkingPickler.dumps(obj))
-
-    def recv_bytes(self, maxlength=None):
-        """Receive one message as bytes."""
-        self._check_closed()
-        self._check_readable()
-        if maxlength is not None and maxlength < 0:
-            raise ValueError("negative maxlength")
-        buf = self._recv_bytes(maxlength)
-        if buf is None:
-            self._bad_message_length()
-        return buf.getvalue()
-
-    def recv_bytes_into(self, buf, offset=0):
-        """Receive one message into the writable buffer *buf* (starting at
-        byte *offset*); returns the message size."""
-        self._check_closed()
-        self._check_readable()
-        with memoryview(buf) as m:
-            itemsize = m.itemsize
-            bytesize = itemsize * len(m)
-            if offset < 0:
-                raise ValueError("negative offset")
-            elif offset > bytesize:
-                raise ValueError("offset too large")
-            result = self._recv_bytes()
-            size = result.tell()
-            if bytesize < offset + size:
-                raise BufferTooShort(result.getvalue())
-            result.seek(0)
-            with m.cast('B') as flat:
-                result.readinto(flat[offset:offset + size])
-            return size
-
-    def recv(self):
-        """Receive a pickled object."""
-        self._check_closed()
-        self._check_readable()
-        buf = self._recv_bytes()
-        return _ForkingPickler.loads(buf.getbuffer())
-
-    def poll(self, timeout=0.0):
-        """True if there is data to read (waits up to *timeout* seconds;
-        forever if None)."""
-        self._check_closed()
-        self._check_readable()
-        return self._poll(timeout)
+    def __repr__(self):
+        state = 'closed' if self._handle is None else 'fd=%d' % self._handle
+        return '<%s %s>' % (type(self).__qualname__, state)
 
     def __enter__(self):
         return self
@@ -236,106 +125,276 @@ class _ConnectionBase:
     def __exit__(self, exc_type, exc_value, exc_tb):
         self.close()
 
+    # -- state
 
-class Connection(_ConnectionBase):
-    """A connection over a file descriptor (pipe end or socket)."""
+    @property
+    def closed(self):
+        """True once close() was called."""
+        return self._handle is None
 
-    _write = os.write
-    _read = os.read
+    @property
+    def readable(self):
+        """True if this end can receive."""
+        return self._readable
+
+    @property
+    def writable(self):
+        """True if this end can send."""
+        return self._writable
+
+    def _require(self, direction=None):
+        if self._handle is None:
+            raise OSError("handle is closed")
+        if direction == 'r' and not self._readable:
+            raise OSError("connection is write-only")
+        if direction == 'w' and not self._writable:
+            raise OSError("connection is read-only")
+
+    def fileno(self):
+        """The underlying file descriptor."""
+        self._require()
+        return self._handle
+
+    def close(self):
+        """Close the connection (a no-op when already closed)."""
+        if self._handle is not None:
+            try:
+                self._close()
+            finally:
+                self._handle = None
 
     def _close(self, _close=os.close):
         _close(self._handle)
 
-    def _send(self, buf, write=_write):
-        remaining = len(buf)
-        while True:
-            n = write(self._handle, buf)
-            remaining -= n
-            if remaining == 0:
-                break
-            buf = buf[n:]
+    def _detach(self):
+        """Forget the descriptor without closing it."""
+        self._handle = None
 
-    def _recv(self, size, read=_read):
-        buf = io.BytesIO()
-        handle = self._handle
-        remaining = size
-        while remaining > 0:
-            chunk = read(handle, remaining)
-            n = len(chunk)
+    # -- low-level I/O
+
+    def _write_all(self, data, write=os.write):
+        view = memoryview(data)
+        while view:
+            done = write(self._handle, view)
+            view = view[done:]
+
+    def _read_exact(self, target, at_start=False, readinto=os.readinto):
+        """Fill the writable buffer target (a byte view) completely.  An end
+        of file before the first byte is EOFError when at_start (nothing of a
+        message was read yet), any other one OSError."""
+        filled = 0
+        wanted = len(target)
+        while filled < wanted:
+            n = readinto(self._handle, target[filled:])
             if n == 0:
-                if remaining == size:
+                if filled == 0 and at_start:
                     raise EOFError
-                else:
-                    raise OSError("got end of file during message")
-            buf.write(chunk)
-            remaining -= n
-        return buf
+                raise OSError("got end of file during message")
+            filled += n
 
-    def _send_bytes(self, buf):
-        n = len(buf)
-        if n > 0x7fffffff:
-            self._send(struct.pack("!i", -1))
-            self._send(struct.pack("!Q", n))
-            self._send(buf)
+    def _send_message(self, view):
+        size = len(view)
+        if size > _SHORT_LIMIT:
+            self._write_all(_SHORT_HEADER.pack(_LONG_MARK) +
+                            _LONG_HEADER.pack(size))
+            self._write_all(view)
+        elif size > _COALESCE_LIMIT:
+            self._write_all(_SHORT_HEADER.pack(size))
+            self._write_all(view)
         else:
-            header = struct.pack("!i", n)
-            if n > 16384:
-                # avoid copying a big payload just to prepend the header
-                self._send(header)
-                self._send(buf)
-            else:
-                self._send(header + bytes(buf))
+            self._write_all(_SHORT_HEADER.pack(size) + view)
 
-    def _recv_bytes(self, maxsize=None):
-        buf = self._recv(4)
-        size, = struct.unpack("!i", buf.getvalue())
-        if size == -1:
-            buf = self._recv(8)
-            size, = struct.unpack("!Q", buf.getvalue())
-        if maxsize is not None and size > maxsize:
-            return None
-        return self._recv(size)
+    def _read_size(self):
+        head = bytearray(_SHORT_HEADER.size)
+        self._read_exact(memoryview(head), at_start=True)
+        size, = _SHORT_HEADER.unpack(head)
+        if size == _LONG_MARK:
+            head = bytearray(_LONG_HEADER.size)
+            self._read_exact(memoryview(head))
+            size, = _LONG_HEADER.unpack(head)
+        return size
+
+    def _read_body(self, size):
+        body = bytearray(size)
+        if size:
+            self._read_exact(memoryview(body))
+        return body
+
+    def _message_too_long(self):
+        # the rest of the message is still in the channel: this end can no
+        # longer be read from (and is useless if it cannot send either)
+        self._readable = False
+        if not self._writable:
+            self.close()
+        raise OSError("bad message length")
+
+    # -- public API
+
+    def send_bytes(self, buf, offset=0, size=None):
+        """Send the bytes of buf[offset:offset + size] as one message."""
+        self._require('w')
+        view = _as_bytes_view(buf)
+        total = len(view)
+        if offset < 0:
+            raise ValueError("offset is negative")
+        if total < offset:
+            raise ValueError("buffer length < offset")
+        if size is None:
+            size = total - offset
+        elif size < 0:
+            raise ValueError("size is negative")
+        elif offset + size > total:
+            raise ValueError("buffer length < offset + size")
+        self._send_message(view[offset:offset + size])
+
+    def send(self, obj):
+        """Send a picklable object."""
+        self._require('w')
+        self._send_message(memoryview(_ForkingPickler.dumps(obj)))
+
+    def recv_bytes(self, maxlength=None):
+        """Receive one message as bytes.  A message longer than maxlength
+        closes the connection and raises OSError."""
+        self._require('r')
+        if maxlength is not None and maxlength < 0:
+            raise ValueError("negative maxlength")
+        size = self._read_size()
+        if maxlength is not None and size > maxlength:
+            self._message_too_long()
+        return bytes(self._read_body(size))
+
+    def recv_bytes_into(self, buf, offset=0):
+        """Receive one message into the writable buffer buf, starting at byte
+        offset; return its size.  If it does not fit, BufferTooShort carries
+        the whole message."""
+        self._require('r')
+        with memoryview(buf) as outer:
+            view = _as_bytes_view(outer)
+            if offset < 0:
+                raise ValueError("negative offset")
+            if offset > len(view):
+                raise ValueError("offset too large")
+            size = self._read_size()
+            if offset + size > len(view):
+                raise BufferTooShort(bytes(self._read_body(size)))
+            if size:
+                self._read_exact(view[offset:offset + size])
+            return size
+
+    def recv(self):
+        """Receive one pickled object."""
+        self._require('r')
+        return _ForkingPickler.loads(self._read_body(self._read_size()))
+
+    def poll(self, timeout=0.0):
+        """Whether data can be read, waiting up to timeout seconds (None:
+        without limit)."""
+        self._require('r')
+        return self._poll(timeout)
 
     def _poll(self, timeout):
-        return bool(wait([self], timeout))
+        return _fd_readable(self._handle, timeout)
 
 
-# ---------------------------------------------------------------- listeners
+#
+# Pipe, Listener, Client
+#
+
+def Pipe(duplex=True):
+    """A pair of connected Connections: (reader, writer) when duplex is
+    false, else two ends that can both send and receive."""
+    if duplex:
+        left, right = socket.socketpair()
+        # a default socket timeout would make the descriptors non-blocking
+        left.setblocking(True)
+        right.setblocking(True)
+        return Connection(left.detach()), Connection(right.detach())
+    rfd, wfd = os.pipe()
+    return Connection(rfd, writable=False), Connection(wfd, readable=False)
+
+
+class SocketListener(object):
+    """A listening socket producing Connections."""
+
+    def __init__(self, address, family, backlog=1):
+        self._socket = socket.socket(getattr(socket, family))
+        try:
+            if os.name == 'posix':
+                self._socket.setsockopt(socket.SOL_SOCKET,
+                                        socket.SO_REUSEADDR, 1)
+            self._socket.setblocking(True)
+            self._socket.bind(address)
+            self._socket.listen(backlog)
+            self._address = self._socket.getsockname()
+        except OSError:
+            self._socket.close()
+            raise
+        self._family = family
+        self._last_accepted = None
+        self._unlink = None
+        if family == 'AF_UNIX' and not util.is_abstract_socket_namespace(address):
+            # remove the socket file at the latest when the process exits
+            self._unlink = util.Finalize(self, os.unlink, args=(address,),
+                                         exitpriority=0)
+
+    def accept(self):
+        sock, self._last_accepted = self._socket.accept()
+        sock.setblocking(True)
+        return Connection(sock.detach())
+
+    def close(self):
+        try:
+            self._socket.close()
+        finally:
+            unlink, self._unlink = self._unlink, None
+            if unlink is not None:
+                unlink()
+
+
+def SocketClient(address):
+    """A Connection to a listening socket."""
+    family = getattr(socket, address_type(address))
+    with socket.socket(family) as sock:
+        sock.setblocking(True)
+        sock.connect(address)
+        return Connection(sock.detach())
+
+
+def _check_authkey(authkey):
+    if authkey is not None and not isinstance(authkey, bytes):
+        raise TypeError('authkey should be a byte string')
+
 
 class Listener(object):
-    """A bound socket accepting authenticated connections."""
+    """Accepts connections at an address; with an authkey, every accepted
+    connection must pass the HMAC handshake (both directions)."""
 
     def __init__(self, address=None, family=None, backlog=1, authkey=None):
-        family = family or (address and address_type(address)) \
-                 or default_family
-        address = address or arbitrary_address(family)
-
+        if family is None:
+            family = address_type(address) if address else default_family
+        if address is None:
+            address = arbitrary_address(family)
         _check_family(family)
         if family == 'AF_PIPE':
             raise ValueError('Family AF_PIPE is not supported')
+        _check_authkey(authkey)
         self._listener = SocketListener(address, family, backlog)
-
-        if authkey is not None and not isinstance(authkey, bytes):
-            raise TypeError('authkey should be a byte string')
-
         self._authkey = authkey
 
     def accept(self):
-        """Accept a connection (authenticating it if an authkey is set)."""
+        """Wait for, authenticate and return the next connection."""
         if self._listener is None:
             raise OSError('listener is closed')
-
-        c = self._listener.accept()
+        conn = self._listener.accept()
         if self._authkey is not None:
-            deliver_challenge(c, self._authkey)
-            answer_challenge(c, self._authkey)
-        return c
+            deliver_challenge(conn, self._authkey)
+            answer_challenge(conn, self._authkey)
+        return conn
 
     def close(self):
-        """Close the listening socket."""
-        listener = self._listener
+        """Stop listening."""
+        listener, self._listener = self._listener, None
         if listener is not None:
-            self._listener = None
             listener.close()
 
     @property
@@ -354,97 +413,33 @@ class Listener(object):
 
 
 def Client(address, family=None, authkey=None):
-    """Connect to a Listener at *address*."""
-    family = family or address_type(address)
+    """Connect to a Listener at address (authenticating with authkey)."""
+    if family is None:
+        family = address_type(address)
     _check_family(family)
-    c = SocketClient(address)
-
-    if authkey is not None and not isinstance(authkey, bytes):
-        raise TypeError('authkey should be a byte string')
-
+    _check_authkey(authkey)
+    conn = SocketClient(address)
     if authkey is not None:
-        answer_challenge(c, authkey)
-        deliver_challenge(c, authkey)
-
-    return c
-
-
-def Pipe(duplex=True):
-    """Return a pair of connected Connection objects."""
-    if duplex:
-        s1, s2 = socket.socketpair()
-        s1.setblocking(True)
-        s2.setblocking(True)
-        c1 = Connection(s1.detach())
-        c2 = Connection(s2.detach())
-    else:
-        fd1, fd2 = os.pipe()
-        c1 = Connection(fd1, writable=False)
-        c2 = Connection(fd2, readable=False)
-    return c1, c2
+        answer_challenge(conn, authkey)
+        deliver_challenge(conn, authkey)
+    return conn
 
 
-class SocketListener(object):
-    """Listening socket wrapper used by Listener."""
-
-    def __init__(self, address, family, backlog=1):
-        self._socket = socket.socket(getattr(socket, family))
-        try:
-            if os.name == 'posix':
-                self._socket.setsockopt(socket.SOL_SOCKET,
-                                        socket.SO_REUSEADDR, 1)
-            self._socket.setblocking(True)
-            self._socket.bind(address)
-            self._socket.listen(backlog)
-            self._address = self._socket.getsockname()
-        except OSError:
-            self._socket.close()
-            raise
-        self._family = family
-        self._last_accepted = None
-
-        if family == 'AF_UNIX' and not util.is_abstract_socket_namespace(address):
-            # remove the socket file when the listener goes away
-            self._unlink = util.Finalize(
-                self, os.unlink, args=(address,), exitpriority=0
-            )
-        else:
-            self._unlink = None
-
-    def accept(self):
-        s, self._last_accepted = self._socket.accept()
-        s.setblocking(True)
-        return Connection(s.detach())
-
-    def close(self):
-        try:
-            self._socket.close()
-        finally:
-            unlink = self._unlink
-            if unlink is not None:
-                self._unlink = None
-                unlink()
-
-
-def SocketClient(address):
-    """Connect a socket to *address* and wrap it in a Connection."""
-    family = address_type(address)
-    with socket.socket(getattr(socket, family)) as s:
-        s.setblocking(True)
-        s.connect(address)
-        return Connection(s.detach())
-
-
-# ---------------------------------------------------------------- authentication
 #
-# Both sides prove knowledge of the shared authkey: one sends a random
-# challenge "{digest}<random bytes>", the other answers with
-# "{digest}" + HMAC(authkey, challenge).  Peers from before digest
-# negotiation send a bare 20-byte challenge and expect a bare MD5 HMAC.
+# Authentication
+#
+# The side that delivers a challenge sends
+#     _CHALLENGE + b'{' + digest name + b'}' + random bytes
+# and expects back  b'{' + digest name + b'}' + HMAC(key, challenge), where
+# the challenge is everything after _CHALLENGE (so the digest name is
+# authenticated too).  It answers _WELCOME or _FAILURE.  Peers from before
+# digest names were introduced send 20 random bytes and answer with a bare
+# 16-byte HMAC-MD5; both forms are understood.
+#
 
-MESSAGE_LENGTH = 40  # random bytes per challenge
-_MD5ONLY_MESSAGE_LENGTH = 20
-_MD5_DIGEST_LEN = 16
+MESSAGE_LENGTH = 40               # random bytes in a challenge
+_MD5ONLY_MESSAGE_LENGTH = 20      # random bytes in a legacy challenge
+_MD5_DIGEST_LEN = 16              # a legacy (bare HMAC-MD5) response
 _LEGACY_LENGTHS = (_MD5ONLY_MESSAGE_LENGTH, _MD5_DIGEST_LEN)
 
 _CHALLENGE = b'#CHALLENGE#'
@@ -452,99 +447,107 @@ _WELCOME = b'#WELCOME#'
 _FAILURE = b'#FAILURE#'
 
 _ALLOWED_DIGESTS = frozenset(
-        {b'md5', b'sha256', b'sha384', b'sha3_256', b'sha3_384'})
-_MAX_DIGEST_LEN = max(len(_) for _ in _ALLOWED_DIGESTS)
+    {b'md5', b'sha256', b'sha384', b'sha3_256', b'sha3_384'})
+_MAX_DIGEST_LEN = max(len(name) for name in _ALLOWED_DIGESTS)
 
-# upper bound for any message of the handshake
+# upper bound for every handshake message we accept
 _MAX_HANDSHAKE_LEN = 256
 
 
 def _get_digest_name_and_payload(message):
-    """Split "{digest}payload"; bare legacy messages imply md5."""
+    """Split a challenge or response into (digest name, rest).  For the
+    legacy untagged form the rest is the message object itself."""
+    if message[:1] == b'{':
+        close = message.find(b'}', 1, _MAX_DIGEST_LEN + 2)
+        if close > 0:
+            name = message[1:close]
+            if name in _ALLOWED_DIGESTS:
+                return name.decode('ascii'), message[close + 1:]
     if len(message) in _LEGACY_LENGTHS:
         return 'md5', message
-    if message.startswith(b'{'):
-        end = message.find(b'}', 1, _MAX_DIGEST_LEN + 2)
-        if end > 0:
-            digest = message[1:end]
-            if digest in _ALLOWED_DIGESTS:
-                return digest.decode('ascii'), message[end + 1:]
     raise AuthenticationError(
-            f'unsupported message length={len(message)}')
+        'unsupported message length or digest: %r' % message[:40])
+
+
+def _mac(authkey, message, digest_name):
+    import hmac
+    return hmac.new(authkey, message, digest_name).digest()
 
 
 def _create_response(authkey, message):
-    """The answer to the challenge *message*."""
-    import hmac
-    digest_name = _get_digest_name_and_payload(message)[0]
-    mac = hmac.new(authkey, message, digest_name).digest()
-    if len(message) in _LEGACY_LENGTHS:
-        # a legacy peer expects the bare digest
-        return mac
-    return b'{' + digest_name.encode('ascii') + b'}' + mac
+    """The answer to the challenge message."""
+    digest_name, rest = _get_digest_name_and_payload(message)
+    mac = _mac(authkey, message, digest_name)
+    if rest is message:
+        return mac                               # legacy peer: bare MAC
+    return b'{%s}%s' % (digest_name.encode('ascii'), mac)
 
 
 def _verify_challenge(authkey, message, response):
-    """Check that *response* answers the challenge *message*."""
+    """Raise AuthenticationError unless response answers message."""
+    digest_name, mac = _get_digest_name_and_payload(response)
     import hmac
-    digest_name, response_mac = _get_digest_name_and_payload(response)
-    expected = hmac.new(authkey, message, digest_name).digest()
-    if len(expected) != len(response_mac):
+    expected = _mac(authkey, message, digest_name)
+    if len(mac) != len(expected):
         raise AuthenticationError(
-                f'expected {digest_name!r} of length {len(expected)} '
-                f'got {len(response_mac)}')
-    if not hmac.compare_digest(expected, response_mac):
+            f'expected {digest_name!r} of length {len(expected)} '
+            f'got {len(mac)}')
+    if not hmac.compare_digest(mac, expected):
         raise AuthenticationError('digest received was wrong')
 
 
 def deliver_challenge(connection, authkey, digest_name='sha256'):
-    """Challenge the peer and check its answer."""
+    """Challenge the peer to prove it knows authkey."""
     if not isinstance(authkey, bytes):
         raise ValueError(
             "Authkey must be bytes, not {0!s}".format(type(authkey)))
-    message = (b'{' + digest_name.encode('ascii') + b'}' +
-               os.urandom(MESSAGE_LENGTH))
-    connection.send_bytes(_CHALLENGE + message)
+    if digest_name.encode('ascii') not in _ALLOWED_DIGESTS:
+        raise ValueError(f'digest {digest_name!r} is not allowed')
+    challenge = b'{%s}%s' % (digest_name.encode('ascii'),
+                             os.urandom(MESSAGE_LENGTH))
+    connection.send_bytes(_CHALLENGE + challenge)
     response = connection.recv_bytes(_MAX_HANDSHAKE_LEN)
     try:
-        _verify_challenge(authkey, message, response)
+        _verify_challenge(authkey, challenge, response)
     except AuthenticationError:
         connection.send_bytes(_FAILURE)
         raise
-    else:
-        connection.send_bytes(_WELCOME)
+    connection.send_bytes(_WELCOME)
 
 
 def answer_challenge(connection, authkey):
-    """Answer the peer's challenge."""
+    """Prove to the peer that we know authkey."""
     if not isinstance(authkey, bytes):
         raise ValueError(
             "Authkey must be bytes, not {0!s}".format(type(authkey)))
     message = connection.recv_bytes(_MAX_HANDSHAKE_LEN)
     if not message.startswith(_CHALLENGE):
         raise AuthenticationError(
-                f'Protocol error, expected challenge: {message=}')
-    message = message[len(_CHALLENGE):]
-    if len(message) < _MD5ONLY_MESSAGE_LENGTH:
-        raise AuthenticationError(f'challenge too short: {len(message)} bytes')
-    connection.send_bytes(_create_response(authkey, message))
-    response = connection.recv_bytes(_MAX_HANDSHAKE_LEN)
-    if response != _WELCOME:
+            f'Protocol error, expected challenge: {message=}')
+    challenge = message[len(_CHALLENGE):]
+    if len(challenge) < _MD5ONLY_MESSAGE_LENGTH:
+        raise AuthenticationError(
+            f'challenge too short: {len(challenge)} bytes')
+    connection.send_bytes(_create_response(authkey, challenge))
+    verdict = connection.recv_bytes(_MAX_HANDSHAKE_LEN)
+    if verdict != _WELCOME:
         raise AuthenticationError('digest sent was rejected')
 
 
-# ---------------------------------------------------------------- xmlrpc flavour
+#
+# Connections that exchange XML-RPC encoded values (managers' 'xmlrpclib'
+# serializer)
+#
 
 class ConnectionWrapper(object):
-    """Adapts a connection to send/receive objects with custom dumps/loads."""
+    """A connection whose send()/recv() use other (de)serializers."""
 
     def __init__(self, conn, dumps, loads):
         self._conn = conn
         self._dumps = dumps
         self._loads = loads
-        for attr in ('fileno', 'close', 'poll', 'recv_bytes', 'send_bytes'):
-            obj = getattr(conn, attr)
-            setattr(self, attr, obj)
+        for name in ('fileno', 'close', 'poll', 'recv_bytes', 'send_bytes'):
+            setattr(self, name, getattr(conn, name))
 
     def send(self, obj):
         self._conn.send_bytes(self._dumps(obj))
@@ -560,63 +563,86 @@ def _xml_dumps(obj):
 
 def _xml_loads(s):
     import xmlrpc.client
-    (obj,), method = xmlrpc.client.loads(s.decode('utf-8'))
+    (obj,), _method = xmlrpc.client.loads(s.decode('utf-8'))
     return obj
 
 
 class XmlListener(Listener):
     def accept(self):
-        obj = Listener.accept(self)
-        return ConnectionWrapper(obj, _xml_dumps, _xml_loads)
+        return ConnectionWrapper(Listener.accept(self), _xml_dumps, _xml_loads)
 
 
 def XmlClient(*args, **kwds):
     return ConnectionWrapper(Client(*args, **kwds), _xml_dumps, _xml_loads)
 
 
-# ---------------------------------------------------------------- wait()
+#
+# wait()
+#
 
-import selectors
+_READY_EVENTS = select.POLLIN | select.POLLHUP | select.POLLERR | select.POLLNVAL
 
-if hasattr(selectors, 'PollSelector'):
-    _WaitSelector = selectors.PollSelector
-else:
-    _WaitSelector = selectors.SelectSelector
+
+def _poll_timeout(timeout):
+    """Seconds -> poll()'s milliseconds (None: no limit), rounded up so that
+    a short wait does not turn into a busy loop."""
+    if timeout is None:
+        return None
+    if timeout <= 0:
+        return 0
+    return math.ceil(timeout * 1000)
+
+
+def _fd_readable(fd, timeout):
+    poller = select.poll()
+    poller.register(fd, select.POLLIN)
+    if timeout is not None:
+        deadline = time.monotonic() + timeout
+    while True:
+        if poller.poll(_poll_timeout(timeout)):
+            return True
+        if timeout is None:
+            continue
+        timeout = deadline - time.monotonic()
+        if timeout <= 0:
+            return False
 
 
 def wait(object_list, timeout=None):
-    """Wait until an object of *object_list* is ready.
-
-    Objects are file descriptors or have a fileno() method (connections,
-    sockets, process sentinels).  Returns the list of ready objects (empty
-    on timeout)."""
-    with _WaitSelector() as selector:
-        for obj in object_list:
-            selector.register(obj, selectors.EVENT_READ)
-
+    """Wait until at least one object of object_list (connections, sockets,
+    file descriptors, process sentinels...) is readable or timeout seconds
+    passed; return the readable ones (an empty list on timeout)."""
+    by_fd = {}
+    for obj in object_list:
+        fd = obj if isinstance(obj, int) else obj.fileno()
+        by_fd.setdefault(fd, []).append(obj)
+    poller = select.poll()
+    for fd in by_fd:
+        poller.register(fd, select.POLLIN)
+    if timeout is not None:
+        deadline = time.monotonic() + timeout
+    while True:
+        events = poller.poll(_poll_timeout(timeout))
+        ready = [fd for fd, ev in events if ev & _READY_EVENTS]
+        if ready:
+            return [obj for fd in ready for obj in by_fd[fd]]
         if timeout is not None:
-            deadline = time.monotonic() + timeout
-
-        while True:
-            ready = selector.select(timeout)
-            if ready:
-                return [key.fileobj for (key, events) in ready]
-            if timeout is not None:
-                timeout = deadline - time.monotonic()
-                if timeout < 0:
-                    return ready
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                return []
 
 
-# ---------------------------------------------------------------- pickling
+#
+# Pickling connections (they are passed by duplicating the descriptor)
+#
 
 def reduce_connection(conn):
-    df = reduction.DupFd(conn.fileno())
-    return rebuild_connection, (df, conn.readable, conn.writable)
+    dup = reduction.DupFd(conn.fileno())
+    return rebuild_connection, (dup, conn.readable, conn.writable)
 
 
-def rebuild_connection(df, readable, writable):
-    fd = df.detach()
-    return Connection(fd, readable, writable)
+def rebuild_connection(dup, readable, writable):
+    return Connection(dup.detach(), readable, writable)
 
 
 reduction.register(Connection, reduce_connection)

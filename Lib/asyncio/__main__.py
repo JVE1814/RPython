@@ -277,6 +277,57 @@ def _pyrepl_usable():
     return CAN_USE_PYREPL
 
 
+def _piped_pyrepl_rules():
+    """Input that is not a terminal still follows the new REPL's rules for
+    when a statement is complete (unless the basic REPL was asked for)."""
+    if os.environ.get("PYTHON_BASIC_REPL"):
+        return False
+    try:
+        if sys.stdin.isatty():
+            return False
+        import _pyrepl.simple_interact  # noqa: F401
+    except (ImportError, OSError, ValueError, AttributeError):
+        return False
+    return True
+
+
+def _interact_piped(console):
+    """Read statements line by line from non-terminal input.  As in the new
+    REPL, a statement typed on one line runs as soon as it is entered (even a
+    compound one such as ``async def f(): ...``); a block spanning several
+    lines ends with a blank line."""
+    from _pyrepl.simple_interact import _more_lines
+    lines = []
+    while True:
+        try:
+            prompt = getattr(sys, "ps2" if lines else "ps1",
+                             "... " if lines else ">>> ")
+            try:
+                line = console.raw_input(str(prompt))
+            except EOFError:
+                if lines:
+                    console.runsource("\n".join(lines) + "\n", "<stdin>")
+                console.write("\n")
+                break
+            lines.append(line)
+            source = "\n".join(lines)
+            if len(lines) == 1:
+                if not line.strip():
+                    lines = []
+                    continue
+                more = _more_lines(console, source + "\n")
+            else:
+                more = bool(line.strip()) and _more_lines(console, source)
+            if more:
+                continue
+            lines = []
+            console.runsource(source + "\n", "<stdin>")
+        except KeyboardInterrupt:
+            console.write("\nKeyboardInterrupt\n")
+            console.resetbuffer()
+            lines = []
+
+
 class REPLThread(threading.Thread):
 
     def run(self):
@@ -292,6 +343,8 @@ class REPLThread(threading.Thread):
                 from _pyrepl.simple_interact import (
                     run_multiline_interactive_console)
                 run_multiline_interactive_console(console)
+            elif _piped_pyrepl_rules():
+                _interact_piped(console)
             else:
                 console.interact(banner="", exitmsg="")
         except SystemExit as exc:
