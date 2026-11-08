@@ -43,13 +43,14 @@ statistics. The baselines only through tools/bench scripts.
   free-threaded layout the object header is 32 bytes (16 in the default build), so an int is
   48 bytes (32 in the default build) and `str(i)` is 64 bytes (48 in the default build). That
   is +3.2 MB against py-default for the 100k ints and strs. Our dict touches only the entries
-  it uses (CPython zeroes the whole entry array), which saves 1.8 MB. The lists come out even
+  it uses (in CPython the whole 5.1 MB keys block is resident at the end), which saves
+  1.8 MB. The lists come out even
   (800-byte item arrays, which took an 832-byte class before).
 * **Anonymous memory at start-up** (3.9 MB against 3.3 MB): allocator pages 1.9 MB (CPython's
   arenas: 1.5 MB, with smaller headers), malloc heap 1.05 MB (0.8 MB), .bss 0.29 MB (the method
   cache, 96 KB, plus static type objects), and .data.rel.ro 0.32 MB. .data.rel.ro is all
   relocated, so all of it is dirty (CPython's is 0.17 MB, plus 0.55 MB of .data).
-* We import fewer modules at start-up (27) than CPython.
+* Start-up imports 27 modules (sys.modules after `-c pass`); nothing to cut there.
 * About 130 KB of `.gcc_except_table`/`.eh_frame_hdr` becomes resident during start-up
   without any user-space read (a PROT_NONE mprotect of the range raised no fault, and no
   syscall touches it). The cause is not found; it is not ours to fix by layout.
