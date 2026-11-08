@@ -73,6 +73,11 @@ fn wlock(o: &PyObject) -> Option<crate::types::dict::ObGuard> {
 
 pub fn bytearray_data(o: &PyObject) -> &[u8] {
     let _g = wlock(o);
+    // the slice outlives the lock: a thread other than the owner announces itself, so
+    // that a replaced storage is released only after a grace period (set_storage)
+    if _g.is_some() {
+        crate::qsbr::note_attr_read(o);
+    }
     data_unlocked(o)
 }
 
@@ -157,9 +162,30 @@ unsafe fn set_storage(o: &PyObject, storage: Option<PyRef>, start: usize, size: 
                 b.ob_bytes_object = s.into_raw();
             }
         }
-        // a concurrent reader may still hold a slice of the old storage
-        crate::gc::defer_decref(old);
+        // a concurrent reader may still hold a slice of the old storage. (wheels3) Only
+        // a reader in another thread can (the owner's own readers finish before it
+        // mutates, as with a single thread), and such readers mark the object first
+        // (`bytearray_data`, under this same lock): without that mark the owner
+        // releases at once. Deferring every replaced storage until the next collection
+        // kept all the intermediate buffers of a growing bytearray alive (tornado's
+        // decompression-bomb test: ~8x the final size).
+        if !old.is_null() {
+            if owner_only_reader(o) {
+                decref(old);
+            } else {
+                crate::gc::defer_decref(old);
+            }
+        }
     }
+}
+
+/// (wheels3) The calling thread owns `o` and no other thread has read its storage
+/// (the mark `bytearray_data` sets): replaced storage may be released at once.
+/// Call with the object lock held.
+#[inline]
+fn owner_only_reader(o: &PyObject) -> bool {
+    o.ob_tid.load(std::sync::atomic::Ordering::Relaxed) == crate::object::thread_id()
+        && o.ob_flags.load(std::sync::atomic::Ordering::Relaxed) & crate::qsbr::XREAD == 0
 }
 
 /// Change the logical size, keeping the data at the logical start; new bytes
@@ -205,8 +231,9 @@ fn raw_resize_z(o: &PyObject, newsize: usize, zero: bool) -> PyResult<()> {
             new_alloc = newsize;
         }
         let keep = size.min(newsize);
-        let storage = if offset == 0 && !(*ba(o)).ob_bytes_object.is_null() && !crate::threads::multi_threaded() {
-            // realloc in place (single-threaded only: realloc frees the old block)
+        let storage = if offset == 0 && !(*ba(o)).ob_bytes_object.is_null() && (!crate::threads::multi_threaded() || owner_only_reader(o)) {
+            // realloc in place (realloc frees the old block: only when no other thread
+            // can hold a slice of it, see set_storage)
             let old = PyRef::from_raw(std::mem::replace(&mut (*ba(o)).ob_bytes_object, std::ptr::null_mut()));
             match bytes::resize_unique(old, new_alloc) {
                 Ok(s) => {
