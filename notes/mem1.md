@@ -172,7 +172,7 @@ is the start of mem1 (core merged, snapshot of that build); "mem1" is the final 
 | CPython py-ft | 10.56-10.78 MB | 4.80-4.85 MB | 5.72-5.96 MB | 37.12-38.82 MB |
 | base (normal build) | 11.53-11.70 MB | 3.88 MB | 7.65-7.82 MB | 36.22-36.44 MB |
 | **mem1 (normal build)** | **9.64-9.87 MB** | 3.95-3.96 MB | **5.68-5.92 MB** | **32.99-33.38 MB** |
-| mem1 (PGO build) | PGO_START | PGO_ANON | PGO_FILE | PGO_PEAK |
+| mem1 (PGO build, order refreshed) | 10.46-10.62 MB | 3.97 MB | 6.49-6.65 MB | 33.89-33.98 MB |
 
 The executable's own resident pages right after start-up (resident_syms.sh): 6.3 MB at
 base, 3.98 MB at the end (CPython: 4.19 MB):
@@ -186,7 +186,8 @@ base, 3.98 MB at the end (CPython: 4.19 MB):
 Instruction counts (callgrind) are unchanged by mem1's changes: `-c pass` 40.11M → 40.15M,
 `-S -c pass` 19.74M → 19.72M; the peak workload 411.99M (base) → 408.93M (head);
 micro benchmarks, comparing pre-merge builds: listdict 148.58M → 148.59M, attr 78.08M →
-78.08M. In the merged head listdict is 155.6M: that +5% comes with core's merge (scale3/tail4
+78.08M; after the last merges `-c pass` is 39.71M (PGO build: 34.69M, perf7: 34.8M). In the
+merged head listdict is 155.6M: that +5% comes with core's merge (scale3/tail4
 dict and GC changes), not with mem1's changes; the other micro benchmarks are within +0.6%.
 
 ## Correctness
@@ -212,7 +213,7 @@ pass.
   resident). .data.rel.ro is fully relocated (0.32 MB dirty). Ideas not done: pointer-free
   Unicode alias/named-sequence tables (34 KB of relocated data), a smaller carve batch in the
   allocator (≤ 50 KB), lazy type `__doc__` strings (CPython creates them eagerly too).
-* **Peak: +0.7-1.0 MB compared with py-default** (and 5.4 MB below py-ft). The workload's
+* **Peak: +0.7-1.0 MB compared with py-default** (and 4-5 MB below py-ft). The workload's
   objects alone are 1.4 MB bigger than CPython's default build: +3.2 MB from the
   free-threaded int and str sizes, −1.8 MB because our dict does not zero its entry array.
   On top of that come the start-up difference and ~0.5 MB of code that the workload adds
@@ -223,5 +224,10 @@ pass.
 * The start-up order decays with every merge that renames start-up functions: the core
   merge in the middle of this work cost 1.3 MB of start-up RSS until the list was refreshed.
 * The ~130 KB `.gcc_except_table`/`.eh_frame_hdr` window of unknown origin (see Findings).
-
-TODO
+* **The PGO build is ~0.8 MB above the normal build at start-up** (perf7 measured +0.5 MB).
+  Its start-up code is 3.0 MB against 2.06 MB, because the profile inlines the hot runtime
+  paths into the start-up functions as well. After a merge that recompiles part of it,
+  refresh its order with tools/pgo/reorder.sh: that took 0.35 MB off here. Splitting the
+  PGO build's start-up functions by a start-up-weighted profile would be the next step;
+  perf7 found that machine function splitting by the benchmark profile moves start-up code
+  away.
