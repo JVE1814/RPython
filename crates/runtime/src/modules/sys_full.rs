@@ -634,7 +634,12 @@ fn sys_unraisablehook(_m: &PyObject, a: &PyObject) -> PyResult {
     } else if !msg.is(none::none()) {
         out.push_str(&format!("{}:\n", pystr::to_string_lossy(&msg)));
     }
-    let file = crate::modules::sys::get_sys_attr("stderr").filter(|e| !e.is(none::none()));
+    let file = crate::modules::sys::get_sys_attr("stderr");
+    // (wheels3) sys.stderr set to None (also at the end of shutdown): nothing is reported,
+    // as in CPython; without any sys.stderr yet (early startup) fd 2 is used
+    if file.as_ref().is_some_and(|f| f.is(none::none())) {
+        return Ok(none::none_ref());
+    }
     let write = |s: &str| {
         if s.is_empty() {
             return;

@@ -50,6 +50,20 @@ pub fn finalize() -> bool {
     collect();
     crate::gc_support::dump_shutdown_stats();
     finalize_modules();
+    // (wheels3) CPython clears the sys module's dict at this point: what runs after the
+    // modules are gone (finalizers of objects only the main thread's context or
+    // thread-local data kept, e.g. an asyncio loop that was set but never closed) finds
+    // no sys.stderr, and the default unraisable hook then reports nothing
+    super::sys_full::flush_std("stdout");
+    super::sys_full::flush_std("stderr");
+    clear_exc();
+    {
+        let sysd = super::sys::sys_dict();
+        for k in ["stdin", "stdout", "stderr", "__stdin__", "__stdout__", "__stderr__"] {
+            set_none(&sysd, k);
+        }
+        clear_exc();
+    }
     // the main thread's state goes last: its contextvars context
     super::_contextvars::clear_thread_context();
     clear_exc();
