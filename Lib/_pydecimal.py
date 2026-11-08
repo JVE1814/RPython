@@ -1906,9 +1906,15 @@ def _from_tuple(v):
         raise OverflowError('exponent must be an integer')
     return _mk(sign, coef, exp)
 
+# Decimal(...) of a value beyond the accelerator's limits (MAX_PREC digits, exponents
+# within MIN_EMIN..MAX_EMAX) is an InvalidOperation in the `decimal` module, which this
+# module serves when there is no _decimal (decimal.py sets this); imported as
+# `_pydecimal` itself, exponents and coefficients are unbounded.
+_EXACT_LIMITS = False
+
 def _exact(d, env):
     """Decimal(...) result: the value unchanged, or NaN if it exceeds the limits."""
-    if d._is_special:
+    if d._is_special or not _EXACT_LIMITS:
         return d
     m = _max_env()
     r = _finalize(d._sign, d._int, d._exp, m)

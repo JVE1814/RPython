@@ -476,7 +476,11 @@ def _qualified_names(root, default_namespace=None):
             raise ValueError(f"malformed qualified name {name!r}")
         prefix = namespaces.get(uri)
         if prefix is None:
-            prefix = _namespace_map.get(uri) or "ns%d" % len(namespaces)
+            # a URI registered with the empty prefix is written as the default
+            # namespace (xmlns="uri")
+            prefix = _namespace_map.get(uri)
+            if prefix is None:
+                prefix = "ns%d" % len(namespaces)
             if prefix != "xml":
                 namespaces[uri] = prefix
         qnames[name] = "%s:%s" % (prefix, local) if prefix else local

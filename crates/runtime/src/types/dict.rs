@@ -1085,6 +1085,64 @@ pub fn value_at_if(d: &PyObject, keys_version: u64, ix: usize) -> Option<PyRef> 
     r
 }
 
+/// (wheels3) The value (borrowed) at entry `ix` of exact dict `d` if that entry holds
+/// the key object `kp`, read without the lock and validated by the sequence lock (see
+/// lookup_lockfree_raw). None: not there, or undecided (a writer was active). The value
+/// stays alive until this thread's next quiescent point (removed and replaced values are
+/// released through QSBR), so the caller takes its reference before that.
+pub fn value_at_if_key(d: &PyObject, ix: usize, kp: *mut PyObject) -> Option<*mut PyObject> {
+    unsafe {
+        use std::sync::atomic::AtomicPtr;
+        let tp = AtomicPtr::from_ptr(&raw mut (*(d.as_ptr() as *mut PyDictObject)).ma_keys).load(Acquire) as *mut DictTable;
+        if tp.is_null() {
+            return None;
+        }
+        mark_shared_read(d, tp);
+        let s1 = (*tp).wseq.load(Acquire);
+        if s1 & 1 != 0 {
+            return None;
+        }
+        let (_, ep, _, cap) = block_layout(tp)?;
+        if ix >= cap {
+            return None;
+        }
+        let e = ep.add(ix);
+        if AtomicPtr::from_ptr(&raw mut (*e).key).load(Relaxed) != kp {
+            return None;
+        }
+        let v = AtomicPtr::from_ptr(&raw mut (*e).value).load(Acquire);
+        std::sync::atomic::fence(Acquire);
+        if (*tp).wseq.load(Relaxed) != s1 || v.is_null() {
+            return None;
+        }
+        if AtomicPtr::from_ptr(&raw mut (*(d.as_ptr() as *mut PyDictObject)).ma_keys).load(Acquire) as *mut DictTable != tp {
+            return None;
+        }
+        Some(v)
+    }
+}
+
+/// (wheels3) Entry index and value (borrowed, alive until this thread's next quiescent
+/// point, as for `value_at_if_key`) of `key` in exact dict `d`: lock-free when that can
+/// be decided, else under the lock.
+pub fn lookup_index_value(d: &PyObject, key: &PyObject, hash: isize) -> PyResult<Option<(usize, *mut PyObject)>> {
+    match lookup_lockfree_raw(d, key, hash) {
+        LfRead::Hit(ix, v) => return Ok(Some((ix, v))),
+        LfRead::Miss => return Ok(None),
+        LfRead::Undecided => {}
+    }
+    let (g, f) = find(d, key, hash)?;
+    let r = match f {
+        Found::At(ix) => {
+            let v = table(d).entries()[ix].value;
+            if v.is_null() { None } else { Some((ix, v)) }
+        }
+        Found::Missing => None,
+    };
+    drop(g);
+    Ok(r)
+}
+
 /// Fast lookup by an exact str key; errors from Python `__eq__` are swallowed.
 pub fn get_item_str(d: &PyObject, key: &PyObject) -> Option<PyRef> {
     let h = crate::types::str::str_hash(key);
@@ -1107,26 +1165,6 @@ pub fn set_item(d: &PyObject, key: &PyObject, value: &PyObject) -> PyResult<()> 
     set_item_hash(d, key, h, value)
 }
 
-/// Release a key or value just removed from a table (after the lock was dropped).
-/// `shared`: the table's `shared_read`, read while the lock was held. A table never
-/// marked shared has only been read by its owner (the caller, since non-owners mark it
-/// under the lock before reading), so nobody can hold the pointer without a reference:
-/// release now, as CPython does, so that finalizers and weakref callbacks run at once
-/// (cleanroom6: an instance attribute set to None in a program that has a second thread
-/// used to keep the old value alive until the next QSBR grace period). Otherwise lock-free
-/// readers on other threads may still be loading it (perf-runtime, D6).
-#[inline]
-unsafe fn release_replaced(shared: bool, old: *mut PyObject) {
-    unsafe {
-        if !shared || !crate::qsbr::multi_threaded() {
-            decref(old);
-        } else {
-            // (tail4) at once if every other thread is quiescent right now
-            crate::qsbr::release_unpublished(old);
-        }
-    }
-}
-
 pub fn set_item_hash(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) -> PyResult<()> {
     let wm = crate::capi::dict::watched_mask(d.as_ptr());
     if wm != 0 {
@@ -1145,9 +1183,10 @@ pub fn set_item_hash(d: &PyObject, key: &PyObject, h: isize, value: &PyObject) -
             crate::interp::cache::on_dict_write(d, key.as_ptr()); // jit
             // read under the lock: a non-owner marks the table before its first
             // lock-free read, and it does so holding this lock
-            let shared = t.shared_read.load(Relaxed);
+            let grace = removal_needs_grace(d, t);
             drop(g);
-            unsafe { release_replaced(shared, old) };
+            // perf-runtime (D6): lock-free readers may still hold `old`
+            unsafe { release_removed(grace, old) };
         }
         Found::Missing => {
             unsafe { incref(key.as_ptr()) };
@@ -1230,6 +1269,34 @@ pub fn del_item_hash(d: &PyObject, key: &PyObject, h: isize) -> PyResult<bool> {
 }
 
 /// Remove `key` and return its value (None if missing).
+/// (wheels3) Must keys/values removed from `d`'s table `t` now be released through QSBR?
+/// Only if a lock-free reader may be looking at them: a thread other than the owner
+/// that read the table lock-free (it set `shared_read`, under the lock, before its first
+/// such read), or the owner itself when the caller is not the owner (the owner reads
+/// without marking). Call with the lock held. Otherwise the release is immediate, so a
+/// removed object's finalizer and weakref callbacks run at once as in CPython, also
+/// while other threads exist (multidict's finalizer tests under pytest-run-parallel).
+#[inline]
+fn removal_needs_grace(d: &PyObject, t: &DictTable) -> bool {
+    crate::qsbr::multi_threaded() && (t.shared_read.load(Relaxed) || d.ob_tid.load(Relaxed) != thread_id())
+}
+
+/// Release a key or value just removed from a table (after the lock was dropped);
+/// `grace` from `removal_needs_grace`. (cleanroom6 made the same change for tables never
+/// marked shared; the owner check covers a non-owner writer racing the owner's
+/// unmarked lock-free reads.)
+#[inline]
+unsafe fn release_removed(grace: bool, p: *mut PyObject) {
+    unsafe {
+        if grace {
+            // (tail4) at once if every other thread is quiescent right now
+            crate::qsbr::release_unpublished(p);
+        } else {
+            decref(p);
+        }
+    }
+}
+
 pub fn pop_item_hash(d: &PyObject, key: &PyObject, h: isize) -> PyResult<Option<PyRef>> {
     if dict_len(d) == 0 {
         return Ok(None);
@@ -1244,11 +1311,11 @@ pub fn pop_item_hash(d: &PyObject, key: &PyObject, h: isize) -> PyResult<Option<
             let t = table(d);
             let (k, v) = t.remove(ix);
             set_used(d, t.used, key.as_ptr());
-            let shared = t.shared_read.load(Relaxed);
+            let grace = removal_needs_grace(d, t);
             drop(g);
             unsafe {
-                release_replaced(shared, k);
-                if shared && crate::qsbr::multi_threaded() {
+                release_removed(grace, k);
+                if grace {
                     // keep the value alive until racing lock-free readers are done
                     incref(v);
                     crate::qsbr::decref_deferred(v);
@@ -1321,12 +1388,13 @@ pub fn clear(d: &PyObject) {
     drop(fresh);
     t.wend();
     set_used(d, 0, std::ptr::null_mut());
+    let grace = removal_needs_grace(d, t);
     drop(g);
     for e in old.entries().iter() {
         if !e.key.is_null() {
             unsafe {
-                crate::qsbr::decref_deferred(e.key);
-                crate::qsbr::decref_deferred(e.value);
+                release_removed(grace, e.key);
+                release_removed(grace, e.value);
             }
         }
     }
@@ -1519,8 +1587,9 @@ pub fn pop_last(d: &PyObject) -> Option<(PyRef, PyRef)> {
             let (k, v) = t.remove(ix);
             t.nentries = ix;
             set_used(d, t.used, k);
+            let grace = removal_needs_grace(d, t);
             drop(g);
-            if crate::qsbr::multi_threaded() {
+            if grace {
                 // (scale1) lock-free readers may still be looking at both
                 unsafe {
                     incref(k);

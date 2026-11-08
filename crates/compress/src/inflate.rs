@@ -980,6 +980,20 @@ impl Inflater {
             }
             // Slow path: one symbol at a time with explicit availability checks.
             if self.win.len() >= limit_end {
+                // An end-of-block code needs no output room: it is still consumed, as
+                // zlib does, so input that holds nothing but block ends (and empty
+                // blocks, e.g. a sync-flush marker) is not left over as an unconsumed tail.
+                let save = (*pos, self.bitbuf, self.bitcnt);
+                if let Some(e) = decode_slow(&self.lit, LBITS, &mut self.bitbuf, &mut self.bitcnt, buf, pos) {
+                    if e_kind(e) == K_EOB {
+                        self.drop_bits(e_len(e));
+                        self.state = self.after_block();
+                        return Ok(Flow::Next);
+                    }
+                }
+                *pos = save.0;
+                self.bitbuf = save.1;
+                self.bitcnt = save.2;
                 return Ok(Flow::OutputFull);
             }
             let save = (*pos, self.bitbuf, self.bitcnt);

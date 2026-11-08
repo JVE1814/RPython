@@ -118,39 +118,6 @@ impl RawLock {
     }
 }
 
-/// Wait on a condition with periodic signal checks on the main thread.
-fn wait_interruptible<T>(m: &Mutex<T>, cv: &Condvar, mut done: impl FnMut(&T) -> bool, timeout: Option<Duration>) -> PyResult<bool> {
-    let deadline = timeout.map(|t| Instant::now().checked_add(t).unwrap_or_else(|| Instant::now() + Duration::from_secs(1 << 40)));
-    let main = crate::threads::is_main_thread();
-    let ts = crate::threads::current();
-    let mut g = m.lock().unwrap();
-    loop {
-        if done(&g) {
-            return Ok(true);
-        }
-        let mut wait = match deadline {
-            Some(d) => {
-                let now = Instant::now();
-                if now >= d {
-                    return Ok(false);
-                }
-                d - now
-            }
-            None => Duration::from_secs(3600),
-        };
-        if main {
-            if crate::modules::signal::signals_pending() {
-                drop(g);
-                crate::modules::signal::check_signals()?;
-                g = m.lock().unwrap();
-                continue;
-            }
-            wait = wait.min(Duration::from_millis(20));
-        }
-        g = crate::threads::blocking_pure(false, || cv.wait_timeout(g, wait).unwrap().0); // (stability3: a mutex is held)
-    }
-}
-
 /// Parse (blocking, timeout) arguments of acquire(); returns None for "wait forever".
 fn parse_acquire_args(fname: &str, args: &[&PyObject], kw: Option<&PyObject>) -> PyResult<Option<Duration>> {
     let p = crate::args::Params::new(fname, &["blocking", "timeout"], 0, 0);
@@ -429,17 +396,16 @@ fn rlock_at_fork_reinit(o: &PyObject) -> PyResult {
 
 // ===================================================================== thread handles
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum HState {
-    NotStarted,
-    Starting,
-    Running,
-    Done,
-}
+// Handle states. The state word is a futex: joiners sleep on it and `set_done` wakes them.
+// No mutex is involved, so a thread that finishes (after leaving the stop-the-world
+// protocol) while another thread forks cannot leave a lock held in the child.
+const H_NOT_STARTED: u32 = 0;
+const H_STARTING: u32 = 1;
+const H_RUNNING: u32 = 2;
+const H_DONE: u32 = 3;
 
 pub struct HandleInner {
-    state: Mutex<HState>,
-    cv: Condvar,
+    state: AtomicU32,
     ident: AtomicU64,
     generation: AtomicU64,
     daemon: AtomicBool,
@@ -450,19 +416,18 @@ pub struct HandleInner {
 impl HandleInner {
     fn new() -> Arc<HandleInner> {
         Arc::new(HandleInner {
-            state: Mutex::new(HState::NotStarted),
-            cv: Condvar::new(),
+            state: AtomicU32::new(H_NOT_STARTED),
             ident: AtomicU64::new(0),
             generation: AtomicU64::new(FORK_GENERATION.load(Relaxed)),
             daemon: AtomicBool::new(true),
             interp: std::sync::atomic::AtomicUsize::new(0),
         })
     }
-    fn effective_state(&self) -> HState {
-        let s = *self.state.lock().unwrap();
-        if s == HState::Running && self.lost_by_fork(self.generation.load(Relaxed)) {
+    fn effective_state(&self) -> u32 {
+        let s = self.state.load(Acquire);
+        if s == H_RUNNING && self.lost_by_fork(self.generation.load(Relaxed)) {
             // the OS thread does not exist in this (forked) process
-            return HState::Done;
+            return H_DONE;
         }
         s
     }
@@ -472,8 +437,43 @@ impl HandleInner {
         created_generation != FORK_GENERATION.load(Relaxed) && self.ident.load(Relaxed) != FORK_SURVIVOR.load(Relaxed)
     }
     fn set_done(&self) {
-        *self.state.lock().unwrap() = HState::Done;
-        self.cv.notify_all();
+        self.state.store(H_DONE, Release);
+        futex_wake(&self.state, i32::MAX);
+    }
+    /// Wait until the thread is done (or was lost by a fork); false on timeout.
+    /// The main thread wakes up for signals and runs their handlers.
+    fn wait_done(&self, timeout: Option<Duration>) -> PyResult<bool> {
+        let fgen = self.generation.load(Relaxed);
+        let deadline = timeout.map(|t| Instant::now().checked_add(t).unwrap_or_else(|| Instant::now() + Duration::from_secs(1 << 40)));
+        let main = crate::threads::is_main_thread();
+        loop {
+            let s = self.state.load(Acquire);
+            if s == H_DONE || self.lost_by_fork(fgen) {
+                return Ok(true);
+            }
+            let mut wait = match deadline {
+                Some(d) => {
+                    let now = Instant::now();
+                    if now >= d {
+                        return Ok(false);
+                    }
+                    d - now
+                }
+                None => Duration::from_secs(3600),
+            };
+            if main {
+                if crate::modules::signal::signals_pending() {
+                    crate::modules::signal::check_signals()?;
+                    continue;
+                }
+                wait = wait.min(Duration::from_millis(20));
+                MAIN_WAIT_ADDR.store(&self.state as *const AtomicU32 as *mut AtomicU32, Release);
+            }
+            crate::threads::blocking_pure(true, || futex_wait(&self.state, s, Some(wait)));
+            if main {
+                MAIN_WAIT_ADDR.store(std::ptr::null_mut(), Release);
+            }
+        }
     }
 }
 
@@ -556,8 +556,8 @@ fn handle_join(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRes
     };
     let h = handle_arc(o);
     match h.effective_state() {
-        HState::NotStarted => raise!(RuntimeError, "thread not started"),
-        HState::Done => {
+        H_NOT_STARTED => raise!(RuntimeError, "thread not started"),
+        H_DONE => {
             after_join();
             return Ok(none::none_ref());
         }
@@ -570,25 +570,19 @@ fn handle_join(o: &PyObject, args: &[&PyObject], kw: Option<&PyObject>) -> PyRes
         // the thread is stopped for good and will never finish
         raise!(PythonFinalizationError, "cannot join thread at interpreter shutdown");
     }
-    let fgen = h.generation.load(Relaxed);
     crate::threads::before_wait(); // scale2
-    wait_interruptible(
-        &h.state,
-        &h.cv,
-        |s| *s == HState::Done || h.lost_by_fork(fgen),
-        timeout,
-    )?;
-    if h.effective_state() == HState::Done {
+    h.wait_done(timeout)?;
+    if h.effective_state() == H_DONE {
         after_join();
     }
     Ok(none::none_ref())
 }
 fn handle_is_done(o: &PyObject) -> PyResult {
-    Ok(bool_::new_bool(hinner(o).effective_state() == HState::Done))
+    Ok(bool_::new_bool(hinner(o).effective_state() == H_DONE))
 }
 fn handle_set_done(o: &PyObject) -> PyResult {
     let h = hinner(o);
-    if *h.state.lock().unwrap() == HState::NotStarted {
+    if h.state.load(Acquire) == H_NOT_STARTED {
         raise!(RuntimeError, "thread not started");
     }
     h.set_done();
@@ -602,15 +596,14 @@ struct SendPtr(*mut PyObject);
 unsafe impl Send for SendPtr {}
 
 fn spawn_thread(func: PyRef, args: PyRef, kwargs: Option<PyRef>, handle: Arc<HandleInner>, report_unraisable: bool) -> PyResult<u64> {
-    {
-        let mut st = handle.state.lock().unwrap();
-        if *st != HState::NotStarted {
-            raise!(RuntimeError, "thread already started");
-        }
-        if crate::modules::sys_full::is_finalizing() {
-            raise!(PythonFinalizationError, "can't create new thread at interpreter shutdown");
-        }
-        *st = HState::Starting;
+    if handle.state.load(Acquire) != H_NOT_STARTED {
+        raise!(RuntimeError, "thread already started");
+    }
+    if crate::modules::sys_full::is_finalizing() {
+        raise!(PythonFinalizationError, "can't create new thread at interpreter shutdown");
+    }
+    if handle.state.compare_exchange(H_NOT_STARTED, H_STARTING, AcqRel, Acquire).is_err() {
+        raise!(RuntimeError, "thread already started");
     }
     // (interp1) the new thread runs in the interpreter of the thread starting it
     let cur_ts = crate::threads::current_ptr();
@@ -633,7 +626,7 @@ fn spawn_thread(func: PyRef, args: PyRef, kwargs: Option<PyRef>, handle: Arc<Han
         unsafe { (*(ts as *const crate::threads::ThreadState as *mut crate::threads::ThreadState)).c.interp = pi.0 as *mut std::ffi::c_void };
         h2.ident.store(ts.c.thread_id as u64, Release);
         h2.generation.store(FORK_GENERATION.load(Relaxed), Relaxed);
-        *h2.state.lock().unwrap() = HState::Running;
+        h2.state.store(H_RUNNING, Release);
         {
             let (m, cv) = &*started2;
             *m.lock().unwrap() = true;
@@ -698,7 +691,7 @@ fn spawn_thread(func: PyRef, args: PyRef, kwargs: Option<PyRef>, handle: Arc<Han
         }
         Err(_) => {
             THREAD_COUNT.fetch_sub(1, Relaxed);
-            *handle.state.lock().unwrap() = HState::NotStarted;
+            handle.state.store(H_NOT_STARTED, Release);
             unsafe {
                 xdecref(f.0);
                 xdecref(a.0);
@@ -808,12 +801,11 @@ pub fn thread_shutdown(_m: &PyObject) -> PyResult {
                     Arc::increment_strong_count(p as *const HandleInner);
                     Arc::from_raw(p as *const HandleInner)
                 })
-                .find(|h| h.ident.load(Relaxed) != me && h.effective_state() != HState::Done && h.interp.load(Relaxed) == mine)
+                .find(|h| h.ident.load(Relaxed) != me && h.effective_state() != H_DONE && h.interp.load(Relaxed) == mine)
         };
         match next {
             Some(h) => {
-                let fgen = h.generation.load(Relaxed);
-                wait_interruptible(&h.state, &h.cv, |s| *s == HState::Done || h.lost_by_fork(fgen), None)?;
+                h.wait_done(None)?;
                 let mut nd = NON_DAEMON.lock().unwrap();
                 let me = Arc::as_ptr(&h) as usize;
                 if let Some(i) = nd.iter().position(|&p| p == me) {
@@ -833,7 +825,7 @@ fn make_thread_handle(_m: &PyObject, ident: &PyObject) -> PyResult {
     let id = ab::as_i128_index(ident)? as u64;
     let h = HandleInner::new();
     h.ident.store(id, Relaxed);
-    *h.state.lock().unwrap() = HState::Running;
+    h.state.store(H_RUNNING, Release);
     Ok(new_handle_object(h))
 }
 fn get_main_thread_ident(_m: &PyObject) -> PyResult {
@@ -1260,9 +1252,18 @@ extern "C" fn atfork_child() {
     }
     crate::threads::after_fork_child();
     THREAD_COUNT.store(0, Relaxed);
+    // os.fork() holds the list's lock across fork() (fork_lock_non_daemon) and clears it
+    // in fork::child; this covers a fork() made by other code
     if let Ok(mut nd) = NON_DAEMON.try_lock() {
         nd.clear();
     }
+}
+
+/// For os.fork(): the non-daemon thread list, locked across fork() so that a thread
+/// leaving it at that moment (it no longer takes part in stop-the-world) cannot leave
+/// it locked in the child. Take it after the other threads are stopped.
+pub fn fork_lock_non_daemon() -> std::sync::MutexGuard<'static, Vec<usize>> {
+    NON_DAEMON.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 // ===================================================================== module

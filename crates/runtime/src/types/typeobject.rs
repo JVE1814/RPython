@@ -547,9 +547,36 @@ pub unsafe fn generic_free_and_type_decref(op: *mut PyObject, tp: *mut PyTypeObj
             Some(f) => f(op as *mut c_void),
             None => alloc::free_object(op),
         }
-        if is_heap_type(tp) {
+        if is_heap_type(tp) && !extension_drops_type_ref(tp) {
             crate::object::decref_type(tp);
         }
+    }
+}
+
+/// (wheels3) Is an extension's dealloc between the instance's type `tp` and the builtin
+/// dealloc running now? Then the builtin must not drop the instance's reference to its
+/// heap type: an extension *heap* type's dealloc calls the builtin base's tp_dealloc
+/// directly and drops the reference itself (Py_DECREF(Py_TYPE(self)), the C-API contract
+/// for heap types), and below an extension *static* type (which knows nothing of heap
+/// types) `subtype_dealloc` drops it. The builtin deallocs drop it only when the chain
+/// from `tp` reaches them through `subtype_dealloc` alone. (multidict's istr, a str
+/// subclass with its own dealloc, lost one type reference per instance; a Python
+/// subclass of lxml's static exception classes lost one too: the type was freed twice.)
+#[inline]
+pub(crate) unsafe fn extension_drops_type_ref(tp: *mut PyTypeObject) -> bool {
+    unsafe {
+        let mut t = tp;
+        while !t.is_null() {
+            match (*t).tp_dealloc {
+                Some(f) if f as usize == subtype_dealloc as usize => {}
+                // a builtin dealloc: the one running now (nothing of interest above it)
+                Some(f) if is_own_code(f as usize) => return false,
+                Some(_) => return true,
+                None => {}
+            }
+            t = (*t).tp_base;
+        }
+        false
     }
 }
 

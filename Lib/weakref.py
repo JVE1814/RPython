@@ -131,14 +131,16 @@ class KeyedRef(ref):
 # The removal callbacks are plain functions whose only link to the
 # dictionary is a weak reference passed as a default argument: no closure,
 # so a dictionary never ends up in a reference cycle with its callback.
+# What a callback calls is bound the same way: at interpreter shutdown the
+# module's globals may already be cleared when the last values die.
 
 def _value_remover(owner_ref):
-    def remove(dead, owner_ref=owner_ref):
+    def remove(dead, owner_ref=owner_ref, _remove_entry=_remove_dead_weakref):
         owner = owner_ref()
         if owner is not None:
             # Deletes the entry only if it still holds this dead reference:
             # the key may meanwhile have been given a new value.
-            _remove_dead_weakref(owner.data, dead.key)
+            _remove_entry(owner.data, dead.key)
     return remove
 
 

@@ -133,6 +133,24 @@ impl SRef {
         std::mem::forget(self);
         p
     }
+    /// (wheels3) The container operand of STORE_SUBSCR. CPython keeps a counted reference
+    /// to it on the caller's stack while a class's `__setitem__` runs (measured with
+    /// sys.getrefcount: a named object is seen 3 times there, a temporary twice), and
+    /// pandas' chained-assignment check depends on that count. A borrowed entry is
+    /// therefore owned when the container is an instance of a heap type (where Python
+    /// code can run); builtin containers stay borrowed.
+    #[inline(always)]
+    pub fn owned_for_setitem(self) -> SRef {
+        if is_borrowed(self.0) {
+            let q = untag(self.0);
+            if unsafe { (*(*q).type_ptr()).tp_flags } & crate::ffi::Py_TPFLAGS_HEAPTYPE != 0 {
+                std::mem::forget(self);
+                unsafe { incref(q) };
+                return SRef(q);
+            }
+        }
+        self
+    }
     /// An owned reference to the object.
     #[inline(always)]
     pub fn into_ref(self) -> PyRef {

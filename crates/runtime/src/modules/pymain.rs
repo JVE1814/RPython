@@ -718,9 +718,9 @@ fn repl(quiet: bool) -> i32 {
         match n {
             Ok(0) | Err(_) => {
                 if buf.is_empty() {
-                    if tty {
-                        crate::modules::sys::write_stderr("\n");
-                    }
+                    // end the prompt line, also when stdin is not a terminal (tornado's
+                    // test_close_stdin reads ">>> \n" from a `-i` child on a pipe)
+                    crate::modules::sys::write_stderr("\n");
                     break;
                 }
                 // end of input finishes a pending statement as a blank line would

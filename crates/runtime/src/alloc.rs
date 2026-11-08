@@ -411,7 +411,9 @@ pub unsafe extern "C" fn free_object_c(op: *mut PyObject) {
     unsafe {
         let tp = (*op).type_ptr();
         free_object(op);
-        if (*tp).tp_flags & Py_TPFLAGS_HEAPTYPE != 0 {
+        // (wheels3) not when an extension's heap-type dealloc called object's tp_dealloc
+        // and drops the type reference itself
+        if (*tp).tp_flags & Py_TPFLAGS_HEAPTYPE != 0 && !crate::types::typeobject::extension_drops_type_ref(tp) {
             crate::object::decref_type(tp);
         }
     }

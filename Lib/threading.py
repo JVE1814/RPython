@@ -809,7 +809,12 @@ class Thread:
         # thread is gone.
         self._started._at_fork_reinit()
         if ident is None:
-            self._handle._set_done()
+            try:
+                self._handle._set_done()
+            except RuntimeError:
+                # it never started (or another thread was starting it at the
+                # fork): nothing ran, so there is nothing to mark as finished
+                pass
             return
         self._ident = ident
         if _HAVE_THREAD_NATIVE_ID:

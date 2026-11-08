@@ -42,7 +42,9 @@ unsafe fn dlopen(path: &str) -> PyResult<*mut c_void> {
             return Ok(l.handle as *mut c_void);
         }
         let c = CString::new(path).map_err(|_| value_error("embedded null byte"))?;
-        let h = libc::dlopen(c.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+        // (wheels3) with the flags sys.setdlopenflags() chose (default RTLD_NOW): cffi's
+        // verify() loads a library RTLD_GLOBAL so that later modules can use its symbols
+        let h = libc::dlopen(c.as_ptr(), crate::modules::sys_full::dlopenflags());
         if h.is_null() {
             let e = libc::dlerror();
             let msg = if e.is_null() { "dlopen failed".to_string() } else { std::ffi::CStr::from_ptr(e).to_string_lossy().into_owned() };

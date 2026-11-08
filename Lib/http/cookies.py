@@ -52,7 +52,8 @@ def _escape_char(ch):
 
 def _quote_value(text):
     """Quote *text* for use as a cookie value if it needs quoting."""
-    if text is None or all(ch in _TOKEN_CHARS for ch in text):
+    # an empty value is written as "" (a bare `name=` is not a quoted-string)
+    if text is None or (text and all(ch in _TOKEN_CHARS for ch in text)):
         return text
     return '"' + ''.join(map(_escape_char, text)) + '"'
 

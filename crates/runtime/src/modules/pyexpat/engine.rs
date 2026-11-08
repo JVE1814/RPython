@@ -421,6 +421,9 @@ pub struct Engine {
     started: bool,
     finished: bool,
     errored: bool,
+    /// (wheels3) the error that stopped parsing (code, line, col, byte): reported again by
+    /// every later feed, as expat does (ElementTree's close() after a failed feed raises)
+    last_error: Option<(u32, u64, u64, i64)>,
     awaiting_encoding: bool,
     seen_doctype: bool,
     doctype_extid: Option<(Option<String>, Option<String>)>,
@@ -482,6 +485,7 @@ impl Engine {
             started: false,
             finished: false,
             errored: false,
+            last_error: None,
             awaiting_encoding: false,
             seen_doctype: false,
             doctype_extid: None,
@@ -592,6 +596,7 @@ impl Engine {
             None => self.position_at(idx),
         };
         self.errored = true;
+        self.last_error = Some((code, line, col, byte));
         self.events.push(Event { ev: Ev::Error(code), line, col, byte });
     }
 
@@ -602,6 +607,9 @@ impl Engine {
     pub fn feed(&mut self, data: &[u8], final_: bool) -> Vec<Event> {
         self.events.clear();
         if self.errored {
+            if let Some((code, line, col, byte)) = self.last_error {
+                self.events.push(Event { ev: Ev::Error(code), line, col, byte });
+            }
             return std::mem::take(&mut self.events);
         }
         if self.finished {

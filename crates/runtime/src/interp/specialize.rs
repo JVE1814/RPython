@@ -152,19 +152,19 @@ fn dict_get_hinted(d: *mut PyObject, nm: &PyObject, hint: u64, e: &Entry) -> Opt
                 p
             });
         }
-        dict::prepare_unlocked_read(d); // (scale1) entries are read without the lock
-        let t = dict::table(d);
-        if let Some(en) = t.entries().get(hint as usize) {
-            if en.key == nm.as_ptr() {
-                return Some(en.value);
+        // (wheels3) entries are read without the lock, validated by the dict's sequence
+        // lock: another thread may be removing this very entry (its value is null then,
+        // or about to be released through QSBR)
+        if hint != u64::MAX {
+            if let Some(v) = dict::value_at_if_key(d, hint as usize, nm.as_ptr()) {
+                return Some(v);
             }
         }
         if dict::dict_len(d) == 0 {
             return None;
         }
-        match dict::lookup_index(d, nm, pystr::str_hash(nm)) {
-            Ok(Some(ix)) => {
-                let v = dict::table(d).entries()[ix].value;
+        match dict::lookup_index_value(d, nm, pystr::str_hash(nm)) {
+            Ok(Some((ix, v))) => {
                 e.set_hint(ix as u64);
                 Some(v)
             }

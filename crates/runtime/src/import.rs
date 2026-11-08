@@ -320,9 +320,11 @@ pub fn cannot_import_name(module: &PyObject, pkgname: &PyObject, nm: &PyObject) 
     let file = ab::getattr_opt(module, name!("__file__")).ok().flatten();
     let n = pystr::to_string_lossy(nm);
     let p = pystr::to_string_lossy(pkgname);
-    let d = crate::types::module::module_dict(module);
-    let initializing = module_is_initializing(&d);
+    // (wheels3) `from X import name` also reads from objects that are not modules (cffi's
+    // `lib`): only a module has a module dict; for others the spec is an attribute
+    let initializing = spec_initializing(module);
     if module::is_module(module) {
+        let d = crate::types::module::module_dict(module);
         let modname = dict::get_item_str(&d, name!("__name__")).filter(|n| pystr::is_str(n));
         if let Some(mn) = modname {
             if let Some(h) = shadowing_hint(&d, &mn, initializing)? {

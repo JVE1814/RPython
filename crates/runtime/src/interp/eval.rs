@@ -1196,7 +1196,7 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                         Op::StoreSubscr => {
                             adapt!(super::adaptive::store_subscr(unsafe { &*peek!(f, 2) }, unsafe { &*peek!(f, 1) }));
                             let k = popsr!(f);
-                            let c = popsr!(f);
+                            let c = popsr!(f).owned_for_setitem();
                             let v = popsr!(f);
                             if dict::is_dict_exact(&c) {
                                 dict::set_item(&c, &k, &v)?;
@@ -1551,6 +1551,15 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                                 (arg as usize, None)
                             };
                             let base = f.stack_top - n - 2;
+                            // (wheels3) a bound method with a free self slot is unpacked into
+                            // (function, self) and dropped before the call, as the JIT tiers
+                            // and CPython's CALL do: a temporary bound method then holds no
+                            // reference to self while the callee runs (pandas compares
+                            // sys.getrefcount(self) in inplace methods of a temporary; its
+                            // classes define __getattr__, so method loads give bound methods)
+                            if f.slots[base + 1].is_null() && funcobject::is_method(unsafe { &*super::borrow::untag(f.slots[base]) }) {
+                                unsafe { crate::interp::jit::helpers::h_unpack_method(f.slots.as_mut_ptr().add(base)) };
+                            }
                             // (refs1) callees see plain pointers: borrowed entries are passed
                             // through a copy (the frame keeps the slots tagged, so the GC and
                             // the unwinding below still know they are borrowed)
