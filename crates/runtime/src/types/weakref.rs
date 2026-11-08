@@ -101,6 +101,34 @@ pub fn supports_weakrefs(o: &PyObject) -> bool {
     unsafe { !weaklist_slot(o.as_ptr()).is_null() }
 }
 
+/// (scale3) World stopped, for the collector: 0 if garbage object `o` takes no part in
+/// weak referencing, 1 if `o` is a live weakref or is weakly referenced without
+/// callbacks (cleared by `detach_weakrefs_for_gc(.., false)`), 2 if a weakref to `o`
+/// has a callback (the collection must then run callbacks: the general path).
+pub unsafe fn gc_weak_state(o: *mut PyObject) -> u8 {
+    unsafe {
+        let mut st = 0u8;
+        let slot = weaklist_slot(o);
+        if !slot.is_null() {
+            let mut r = head(slot);
+            while !r.is_null() {
+                if !(*r).wr_callback.is_null() {
+                    return 2;
+                }
+                st = 1;
+                r = (*r).wr_next;
+            }
+        }
+        if st == 0 && is_weakref(&*o) {
+            let r = o as *mut PyWeakReference;
+            if !(*r).wr_object.is_null() && (*r).wr_object != none::none().as_ptr() {
+                st = 1;
+            }
+        }
+        st
+    }
+}
+
 unsafe fn head(slot: *mut *mut PyObject) -> *mut PyWeakReference {
     unsafe { *slot as *mut PyWeakReference }
 }

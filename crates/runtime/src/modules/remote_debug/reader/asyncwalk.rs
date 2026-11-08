@@ -71,7 +71,8 @@ fn frame_delegate(st: &RdState, frame: u64) -> PyResult<u64> {
     if slots == 0 {
         return Ok(0);
     }
-    ptr(st, slots + ((stack_top - 1) as u64) * 8)
+    // (tail4) value-stack slots may hold borrowed references tagged in bit 0 (refs1)
+    Ok(ptr(st, slots + ((stack_top - 1) as u64) * 8)? & !1)
 }
 
 /// Does `obj` have one of the generator/coroutine/asend/athrow types (something whose
@@ -282,8 +283,43 @@ pub(crate) fn get_all_awaited_by(o: &PyObject) -> PyResult {
     Ok(list::new_list(out))
 }
 
+/// (tail4) The task each thread is running and the tasks waiting for it (directly or
+/// through other waiting tasks); tasks that are merely suspended elsewhere are left
+/// out. Same shape as `get_all_awaited_by`.
 pub(crate) fn get_async_stack_trace(o: &PyObject) -> PyResult {
-    // Same shape as get_all_awaited_by for our purposes: tests read
-    // stack_trace[0].awaited_by.
-    get_all_awaited_by(o)
+    let st = rd_us(o);
+    if !st.proc.alive() {
+        raise!(ProcessLookupError, "process {} is not running", st.proc.pid);
+    }
+    let t = &st.table;
+    let recs = task_list(st)?;
+    let mut by_thread: Vec<(u64, Vec<PyRef>)> = Vec::new();
+    let mut seen: HashSet<u64> = HashSet::new();
+    for r in recs.iter().filter(|r| r.running) {
+        let mut queue = vec![r.task];
+        let mut tasks = Vec::new();
+        while let Some(task) = queue.pop() {
+            if !seen.insert(task) {
+                continue;
+            }
+            if tasks.len() >= MAX_TASK_WAITERS {
+                raise!(RuntimeError, "Too many task waiters while reading the task graph");
+            }
+            tasks.push(task_info(st, &recs, task, 0)?);
+            if t.a_awaited_by != 0 {
+                let set_obj = ptr(st, task + t.a_awaited_by)?;
+                queue.extend(read_set_members(st, set_obj)?);
+            }
+        }
+        match by_thread.iter_mut().find(|(tid, _)| *tid == r.native_id) {
+            Some((_, v)) => v.extend(tasks),
+            None => by_thread.push((r.native_id, tasks)),
+        }
+    }
+    let mut out: Vec<PyRef> = by_thread
+        .into_iter()
+        .map(|(tid, tasks)| rd_ss(super::awaited_info_type(), vec![int::new_int(tid as i64), list::new_list(tasks)]))
+        .collect();
+    out.push(rd_ss(super::awaited_info_type(), vec![int::new_int(0), list::new_list(vec![])]));
+    Ok(list::new_list(out))
 }

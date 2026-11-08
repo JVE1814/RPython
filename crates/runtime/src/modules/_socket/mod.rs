@@ -1497,6 +1497,20 @@ pub fn init() -> PyResult {
         });
         let cap = unsafe { crate::capi::capsule::PyCapsule_New(t.0.as_ptr() as *mut std::ffi::c_void, c"_socket.CAPI".as_ptr(), None) };
         let cap = unsafe { crate::errors::from_c(cap) }?;
+        // (tail4) the capsule refers to the three types: GC-visible as in CPython
+        unsafe extern "C" fn capi_traverse(_cap: *mut PyObject, visit: crate::ffi::visitproc, arg: *mut std::ffi::c_void) -> std::ffi::c_int {
+            unsafe {
+                let Some(visit) = visit else { return 0 };
+                for tp in [sock_type(), crate::types::exceptions::OSError(), crate::types::exceptions::TimeoutError()] {
+                    let r = visit(tp as *mut PyObject, arg);
+                    if r != 0 {
+                        return r;
+                    }
+                }
+                0
+            }
+        }
+        unsafe { crate::capi::capsule::_PyCapsule_SetTraverse(cap.as_ptr(), Some(capi_traverse), None) };
         dict::set_item_str(&d, "CAPI", &cap)?;
     }
     let h = new_exc("herror", &oserr, &d)?;

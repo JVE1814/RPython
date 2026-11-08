@@ -94,7 +94,7 @@ fn binop_slot(op: BinOp) -> (ab::NbSlot, bool) {
     }
 }
 
-const BINOPS: [BinOp; 26] = [
+pub(crate) const BINOPS: [BinOp; 26] = [
     BinOp::Add,
     BinOp::And,
     BinOp::FloorDivide,
@@ -1770,6 +1770,17 @@ pub(crate) fn eval_inner(ts: &ThreadState, f: &mut Frame, throw: Option<PyRef>) 
                 Ok(Some(exit)) => {
                     if crate::modules::sys::tracing_active() {
                         crate::modules::sys::trace_exit(ts, f, &exit)?;
+                        if f.jump_to >= 0 && matches!(exit, Exit::Yield(_)) {
+                            // (tail4) the trace function assigned f_lineno at the
+                            // yield's 'return' event: drop the value, do not suspend,
+                            // continue at the target line
+                            drop(exit);
+                            pc = f.jump_to as usize;
+                            f.jump_to = -1;
+                            f.trace_last = (pc as u32).wrapping_sub(1);
+                            f.trace_line = crate::types::code::frame_line(f.code(), pc).map_or(-1, |l| l as i32);
+                            continue 'outer;
+                        }
                     }
                     if let Exit::Return(_) = exit {
                         f.clear_stack();
@@ -2001,7 +2012,12 @@ pub fn handle_eval_breaker(ts: &ThreadState) -> PyResult<()> {
         crate::threads::process_merge_queue(ts);
     }
     if eb & crate::threads::EVAL_SAFEPOINT != 0 {
-        crate::gc::safepoint_poll(ts);
+        crate::gc::safepoint_poll_eval(ts);
+    }
+    // (scale3) garbage a collection handed to this thread (possibly while it was
+    // parked just now)
+    if ts.c.eval_breaker.load(std::sync::atomic::Ordering::Acquire) & crate::threads::EVAL_GC_CLEAR != 0 {
+        crate::gc::clear_handed(ts);
     }
     if eb & crate::threads::EVAL_GC != 0 {
         crate::gc::maybe_collect(ts);

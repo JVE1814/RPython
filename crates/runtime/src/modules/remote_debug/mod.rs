@@ -5,6 +5,7 @@
 
 pub mod offsets;
 pub mod procmem;
+pub mod binfmt;
 pub mod reader;
 pub mod target;
 

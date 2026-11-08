@@ -43,6 +43,10 @@ pub struct Table {
     pub thread_list_seq: u64,
     pub thread_list_cap: u64,
     pub main_thread: u64,
+    pub gc_collector: u64,
+    pub gc_stats: u64,
+    pub gc_stat_slots: u64,
+    pub gc_stat_words: u64,
     pub task_list_head: u64,
     pub set_dummy: u64,
     pub code_type: u64,
@@ -173,6 +177,10 @@ impl Table {
             thread_list_seq: u64at!(fo!(t.thread_list_seq)),
             thread_list_cap: u64at!(fo!(t.thread_list_cap)),
             main_thread: u64at!(fo!(t.main_thread)),
+            gc_collector: u64at!(fo!(t.gc_collector)),
+            gc_stats: u64at!(fo!(t.gc_stats)),
+            gc_stat_slots: u64at!(fo!(t.gc_stat_slots)),
+            gc_stat_words: u64at!(fo!(t.gc_stat_words)),
             task_list_head: u64at!(fo!(t.task_list_head)),
             set_dummy: u64at!(fo!(t.set_dummy)),
             code_type: u64at!(fo!(t.code_type)),
@@ -329,6 +337,8 @@ struct UnwinderState {
     opcodes: bool,
     stats_on: bool,
     stats: RefCell<Stats>,
+    paused: std::cell::Cell<bool>,
+    gc: bool,
     /// cached FrameInfo per (thread native id, frame address)
     frame_cache: RefCell<HashMap<(u64, u64), (u64, u32, PyRef)>>,
     /// cached (filename, qualname, linetable bytes, firstlineno, pub_of_internal) per code addr
@@ -342,6 +352,10 @@ struct CodeCache {
     firstlineno: u32,
     pub_of_internal: Vec<u32>,
     co_code: Vec<u8>,
+    /// (tail4) pointers the entry was built from: (filename, qualname, linetable,
+    /// code data); a code object freed and another allocated at the same address
+    /// is recognised by a change of these.
+    stamp: (u64, u64, u64, u64),
 }
 
 #[derive(Default)]
@@ -368,6 +382,9 @@ unsafe extern "C" fn unwinder_dealloc(op: *mut PyObject) {
         crate::gc::untrack(op);
         let u = op as *mut Unwinder;
         if !(*u).inner.is_null() {
+            if (*(*u).inner).paused.get() {
+                libc::kill((*(*u).inner).proc.pid, libc::SIGCONT);
+            }
             drop(Box::from_raw((*u).inner));
         }
         crate::types::typeobject::generic_free_and_type_decref(op, (*op).type_ptr());
@@ -381,12 +398,12 @@ unsafe extern "C" fn unwinder_new(tp: *mut PyTypeObject, args: *mut PyObject, kw
             let refs: Vec<&PyObject> = vals.iter().map(|x| &**x).collect();
             static P: crate::args::Params = crate::args::Params::new(
                 "RemoteUnwinder",
-                &["pid", "all_threads", "only_active_thread", "debug", "cache_frames", "mode", "native", "skip_non_matching_threads", "opcodes", "stats"],
+                &["pid", "all_threads", "only_active_thread", "debug", "cache_frames", "mode", "native", "skip_non_matching_threads", "opcodes", "stats", "gc"],
                 0,
                 1,
             )
-            .kwonly(9);
-            let parsed = crate::args::parse::<10>(&P, &refs, kws.as_deref())?;
+            .kwonly(10);
+            let parsed = crate::args::parse::<11>(&P, &refs, kws.as_deref())?;
             let pid = int::as_i64(parsed[0].unwrap()).ok_or_else(|| err!(TypeError, "pid must be an int"))? as i32;
             let getb = |i: usize, d: bool| parsed[i].map(|v| ab::is_true(v).unwrap_or(d)).unwrap_or(d);
             let mode = parsed[5].and_then(int::as_i64).unwrap_or(0);
@@ -403,6 +420,8 @@ unsafe extern "C" fn unwinder_new(tp: *mut PyTypeObject, args: *mut PyObject, kw
                 opcodes: getb(8, false),
                 stats_on: getb(9, false),
                 stats: RefCell::new(Stats::default()),
+                paused: std::cell::Cell::new(false),
+                gc: getb(10, true),
                 frame_cache: RefCell::new(HashMap::new()),
                 code_cache: RefCell::new(HashMap::new()),
             };
@@ -489,17 +508,23 @@ pub(crate) fn read_frame_pub(st: &UnwinderState, frame_addr: u64) -> PyResult<Op
 // --- the code object
 
 fn code_cache_get<'a>(st: &'a UnwinderState, code: u64) -> PyResult<()> {
-    if st.code_cache.borrow().contains_key(&code) {
-        return Ok(());
-    }
     let t = &st.table;
-    let filename = st.read_str(st.ptr(code + t.c_filename)?, MAX_NAME)?;
-    let funcname = st.read_str(st.ptr(code + t.c_qualname)?, MAX_NAME)?;
-    let firstlineno = st.u32(code + t.c_firstlineno)?;
+    let fn_obj = st.ptr(code + t.c_filename)?;
+    let qn_obj = st.ptr(code + t.c_qualname)?;
     let lt_obj = st.ptr(code + t.c_linetable)?;
+    let data = st.ptr(code + t.c_data)?;
+    let stamp = (fn_obj, qn_obj, lt_obj, data);
+    if let Some(c) = st.code_cache.borrow().get(&code) {
+        // still the same code object (and its translation has not appeared since)
+        if c.stamp == stamp {
+            return Ok(());
+        }
+    }
+    let filename = st.read_str(fn_obj, MAX_NAME)?;
+    let funcname = st.read_str(qn_obj, MAX_NAME)?;
+    let firstlineno = st.u32(code + t.c_firstlineno)?;
     let linetable = st.read_bytes(lt_obj, MAX_LINETABLE)?;
     // pub_of_internal from CodeData (may be absent if the code never ran)
-    let data = st.ptr(code + t.c_data)?;
     let mut pub_of_internal = Vec::new();
     if data != 0 {
         let vp = st.ptr(data + t.c_pub_of_internal + t.vec_ptr)?;
@@ -524,6 +549,7 @@ fn code_cache_get<'a>(st: &'a UnwinderState, code: u64) -> PyResult<()> {
         firstlineno,
         pub_of_internal,
         co_code,
+        stamp,
     });
     Ok(())
 }
@@ -579,7 +605,7 @@ fn read_frame(st: &UnwinderState, frame_addr: u64) -> PyResult<Option<PyRef>> {
 /// relies on this identity); the innermost frame is always re-read so its line number is
 /// current. A cached entry whose code/lasti no longer match (a frame-pool address reused
 /// by a different call) is rebuilt.
-fn walk_frames(st: &UnwinderState, native_id: u64, top: u64) -> PyResult<Vec<PyRef>> {
+fn walk_frames(st: &UnwinderState, native_id: u64, top: u64) -> PyResult<Option<Vec<PyRef>>> {
     let t = &st.table;
     let mut out = Vec::new();
     let mut addr = top;
@@ -589,36 +615,58 @@ fn walk_frames(st: &UnwinderState, native_id: u64, top: u64) -> PyResult<Vec<PyR
         if depth > MAX_FRAME_CHAIN {
             raise!(RuntimeError, "Too many stack frames while unwinding");
         }
+        // (tail4) the target keeps running while its frames are read: a frame that
+        // was released meanwhile (no code object any more) or a generator frame that
+        // lost its caller link (the generator suspended) means a torn read, which
+        // the caller retries
         let code = st.ptr(addr + t.f_code)?;
-        let lasti = if code != 0 { st.u32(addr + t.f_lasti)? } else { 0 };
-        let cacheable = st.cache_frames && depth > 1 && code != 0;
+        if code == 0 || st.type_of(code)? != t.code_type {
+            return Ok(None);
+        }
+        let generator = st.ptr(addr + t.f_generator)?;
+        let lasti = st.u32(addr + t.f_lasti)?;
+        let cacheable = st.cache_frames && depth > 1;
+        let mut cached = None;
         if cacheable {
             if let Some((c, l, fi)) = st.frame_cache.borrow().get(&(native_id, addr)) {
                 if *c == code && *l == lasti {
-                    if st.stats_on {
-                        st.stats.borrow_mut().frames_from_cache += 1;
-                        st.stats.borrow_mut().cache_hits += 1;
-                    }
-                    out.push(fi.clone());
-                    addr = st.ptr(addr + t.f_prev)?;
-                    continue;
+                    cached = Some(fi.clone());
                 }
             }
         }
-        if let Some(fi) = read_frame(st, addr)? {
-            if st.stats_on {
-                let mut s = st.stats.borrow_mut();
-                s.frames_from_memory += 1;
-                s.cache_misses += 1;
+        match cached {
+            Some(fi) => {
+                if st.stats_on {
+                    let mut s = st.stats.borrow_mut();
+                    s.frames_from_cache += 1;
+                    s.cache_hits += 1;
+                }
+                out.push(fi);
             }
-            if cacheable {
-                st.frame_cache.borrow_mut().insert((native_id, addr), (code, lasti, fi.clone()));
+            None => {
+                let Some(fi) = read_frame(st, addr)? else { return Ok(None) };
+                if st.stats_on {
+                    let mut s = st.stats.borrow_mut();
+                    s.frames_from_memory += 1;
+                    s.cache_misses += 1;
+                }
+                if cacheable {
+                    st.frame_cache.borrow_mut().insert((native_id, addr), (code, lasti, fi.clone()));
+                }
+                out.push(fi);
             }
-            out.push(fi);
         }
-        addr = st.ptr(addr + t.f_prev)?;
+        let prev = st.ptr(addr + t.f_prev)?;
+        if prev == 0 {
+            // the outermost frame: never a generator's (generators always have a
+            // caller), and still the same live frame
+            if generator != 0 || st.ptr(addr + t.f_generator)? != 0 || st.ptr(addr + t.f_code)? != code {
+                return Ok(None);
+            }
+        }
+        addr = prev;
     }
-    Ok(out)
+    Ok(Some(out))
 }
 
 // --- threads
@@ -739,7 +787,25 @@ fn get_stack_trace(o: &PyObject) -> PyResult {
         if !mode_keeps(st, rec.status) {
             continue;
         }
-        let frames = walk_frames(st, rec.native_id, rec.frame)?;
+        // (tail4) a generator frame whose caller link vanished while it was read
+        // (the generator suspended mid-walk) gives a truncated stack: read again
+        let mut frames = None;
+        let mut top = rec.frame;
+        for _ in 0..16 {
+            if let Some(f) = walk_frames(st, rec.native_id, top)? {
+                frames = Some(f);
+                break;
+            }
+            top = st.ptr(ts + st.table.t_frame)?;
+        }
+        let Some(mut frames) = frames else {
+            raise!(RuntimeError, "could not read a consistent stack of thread {}", rec.native_id);
+        };
+        // (tail4) a thread running the garbage collector gets a synthetic "<GC>" frame
+        if st.gc && st.table.gc_collector != 0 && st.ptr(st.table.gc_collector)? == ts {
+            let gc_frame = ss(frame_info_type(), vec![pystr::new_str("~"), none::none_ref(), pystr::new_str("<GC>"), none::none_ref()]);
+            frames.insert(0, gc_frame);
+        }
         let ti = ss(thread_info_type(), vec![int::new_int(rec.native_id as i64), int::new_int(rec.status), list::new_list(frames)]);
         match by_interp.iter_mut().find(|(id, _)| *id == rec.interp_id) {
             Some((_, v)) => v.push(ti),
@@ -778,9 +844,53 @@ fn get_stats(o: &PyObject) -> PyResult {
     Ok(d)
 }
 
+// --- stopping the target (tail4): job-control stop of the whole process, then wait
+// until every thread reports the stopped state so no memory changes while it is read.
+
+fn all_threads_stopped(pid: i32) -> bool {
+    let Ok(rd) = std::fs::read_dir(format!("/proc/{}/task", pid)) else { return true };
+    for e in rd.flatten() {
+        let Ok(tid) = e.file_name().to_string_lossy().parse::<u64>() else { continue };
+        match thread_state(pid, tid) {
+            Some('T') | Some('t') | Some('Z') | Some('X') | None => {}
+            Some(_) => return false,
+        }
+    }
+    true
+}
+
+fn pause_threads(o: &PyObject) -> PyResult {
+    let st = us(o);
+    if st.paused.get() {
+        return Ok(bool_::new_bool(false));
+    }
+    let pid = st.proc.pid;
+    if unsafe { libc::kill(pid, libc::SIGSTOP) } != 0 {
+        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        return Err(crate::types::exceptions::os_error_from_errno(e, None, None));
+    }
+    st.paused.set(true);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !all_threads_stopped(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_micros(50));
+    }
+    Ok(bool_::new_bool(true))
+}
+
+fn resume_threads(o: &PyObject) -> PyResult {
+    let st = us(o);
+    if !st.paused.get() {
+        return Ok(bool_::new_bool(false));
+    }
+    st.paused.set(false);
+    unsafe { libc::kill(st.proc.pid, libc::SIGCONT) };
+    Ok(bool_::new_bool(true))
+}
+
 // --- async (best effort)
 
 mod asyncwalk;
+mod gcstats; // tail4
 
 // --- module-level functions
 
@@ -847,6 +957,8 @@ pub fn init_module() -> PyResult {
             ("get_all_awaited_by", NOARGS, asyncwalk::get_all_awaited_by, "get_all_awaited_by($self, /)\n--\n\nAll asyncio tasks and what awaits them."),
             ("get_async_stack_trace", NOARGS, asyncwalk::get_async_stack_trace, "get_async_stack_trace($self, /)\n--\n\nThe async stack trace of the running tasks."),
             ("get_stats", NOARGS, get_stats, "get_stats($self, /)\n--\n\nSampling statistics (stats=True only)."),
+            ("pause_threads", NOARGS, pause_threads, "pause_threads($self, /)\n--\n\nStop every thread of the target; False if already paused."),
+            ("resume_threads", NOARGS, resume_threads, "resume_threads($self, /)\n--\n\nLet the target's threads run again; False if not paused."),
         ];
         crate::types::typeobject::type_ready(unwinder_type())?;
     }
@@ -854,6 +966,7 @@ pub fn init_module() -> PyResult {
         ("is_python_process", O, is_python_process, "is_python_process($module, pid, /)\n--\n\nIs the process a compatible Python process?"),
         ("get_child_pids", O, get_child_pids, "get_child_pids($module, pid, /)\n--\n\nDescendant process ids of pid."),
         ("zstd_available", NOARGS, zstd_available, "zstd_available($module, /)\n--\n\nWhether zstd compression is available."),
+        ("get_gc_stats", FASTKW, gcstats::module_get_gc_stats, "get_gc_stats($module, /, pid, *, all_interpreters=False)\n--\n\nGarbage collection statistics of process pid."),
     ];
     let (m, d) = crate::modules::fncommon::new_module("_remote_debugging", methods, Some("Inspect another Python process's interpreter state."))?;
     dict::set_item_str(&d, "RemoteUnwinder", &crate::types::typeobject::type_ref(unwinder_type()))?;
@@ -864,6 +977,8 @@ pub fn init_module() -> PyResult {
     dict::set_item_str(&d, "CoroInfo", &crate::types::typeobject::type_ref(coro_info_type()))?;
     dict::set_item_str(&d, "TaskInfo", &crate::types::typeobject::type_ref(task_info_type()))?;
     dict::set_item_str(&d, "AwaitedInfo", &crate::types::typeobject::type_ref(awaited_info_type()))?;
+    super::binfmt::init(&d)?; // tail4
+    gcstats::init(&d)?; // tail4
     dict::set_item_str(&d, "PROCESS_VM_READV_SUPPORTED", &bool_::new_bool(true))?;
     for (k, v) in [
         ("THREAD_STATUS_HAS_GIL", super::THREAD_STATUS_HAS_GIL),
