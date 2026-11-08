@@ -2052,6 +2052,35 @@ impl<'a> Gen<'a> {
         use crate::interp::cache::kind;
         let e = self.tables.entry(ins.pc as usize) as *const _ as i64;
         let name = self.cd.names[ins.arg as usize].as_ptr() as i64;
+        // (perf8) the cached lookup is one shared routine (`load_global_routine`); the
+        // site keeps the call, the store and an out-of-line slow path
+        let rt = if shared_calls() { load_global_routine() } else { 0 };
+        if rt != 0 {
+            let slow = self.a.label();
+            let done = self.a.label();
+            self.a.mov_ri(Rcx, e);
+            self.call(rt);
+            self.a.test_rr(Rax, Rax);
+            self.a.jcc(Cc::E, slow);
+            let m = self.slot(d);
+            self.a.store(m, Rax);
+            self.a.bind(done);
+            let err = self.error_label(ins.pc, d);
+            let (pc, nlp) = (ins.pc, self.nlp);
+            self.stubs.push(Box::new(move |a: &mut Asm, _exit, _n| {
+                a.bind(slow);
+                a.store32_i(M(Rbx, LASTI), pc as i32);
+                a.mov_rr(Rdi, Rbx);
+                a.lea(Rsi, M(R12, 8 * (nlp + d)));
+                a.mov_ri(Rdx, name);
+                a.mov_ri(Rcx, e);
+                a.call_abs(addr!(h::h_load_global));
+                a.test_rr(Rax, Rax);
+                a.jcc(Cc::NE, err);
+                a.jmp(done);
+            }));
+            return;
+        }
         let slow = self.a.label();
         let done = self.a.label();
         let have = self.a.label();
@@ -2816,6 +2845,112 @@ pub fn compile_mode(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crat
         }
     }
     Ok(Output { asm: g.a, entries })
+}
+
+/// (perf8) Process-wide routine of the cached LoadGlobal lookup (the inline sequence
+/// of `Gen::load_global` was ~380 bytes at every site): rcx = the site's cache entry,
+/// rbx = frame, r15 = thread pointer. Returns rax = a new reference to the value, or 0
+/// when the cache does not apply (the site calls `h_load_global`). Clobbers the
+/// caller-saved registers.
+pub(crate) fn load_global_routine() -> usize {
+    static R: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *R.get_or_init(|| build_load_global_routine().unwrap_or(0))
+}
+
+fn build_load_global_routine() -> Option<usize> {
+    use crate::interp::cache::kind;
+    let mut a = Asm::new();
+    let slow = a.label();
+    let have = a.label();
+    let in_builtins = a.label();
+    let inc_done = a.label();
+    let inc_slow = a.label();
+    let dict_t = crate::types::dict::dict_type() as i64;
+    let kv = std::mem::offset_of!(crate::types::dict::DictTable, keys_version) as i32;
+    let lay = layout();
+    let (ep, esz, evalue) = (lay.entries_ptr, lay.entry_size, lay.entry_value);
+    a.load32(R8, M(Rcx, E_SEQ));
+    a.test_ri(R8, 1);
+    a.jcc(Cc::NE, slow);
+    a.cmp32_mi(M(Rcx, E_KIND), kind::GLOBAL as i32);
+    a.jcc(Cc::NE, slow);
+    // globals: exact dict with the recorded key layout
+    a.load(Rax, M(Rbx, FRAME_GLOBALS));
+    a.mov_ri(Rdi, dict_t);
+    a.cmp_rm(Rdi, M(Rax, OB_TYPE));
+    a.jcc(Cc::NE, slow);
+    a.mov_rr(Rdi, Rax);
+    a.load(Rax, M(Rax, MA_KEYS));
+    a.test_rr(Rax, Rax);
+    a.jcc(Cc::E, slow);
+    a.load(Rdx, M(Rax, kv));
+    a.cmp_rm(Rdx, M(Rcx, E_A));
+    a.jcc(Cc::NE, slow);
+    a.load(R9, M(Rcx, E_C));
+    a.test_ri(R9, 1);
+    a.jcc(Cc::NE, in_builtins);
+    a.bind(have);
+    // rax = table, rdi = its dict, rdx = its keys version (checked), r9 = ix << 1 | flag.
+    // (scale2) also with threads: the entry is read without the dict lock, validated by
+    // the table's sequence lock (see `Gen::load_global` before perf8)
+    {
+        let ok = a.label();
+        a.mov_rr(R10, Rdx);
+        a.load(R11, M(Rax, WSEQ));
+        a.test_ri(R11, 1);
+        a.jcc(Cc::NE, slow);
+        a.cmp_rm(R10, M(Rax, kv));
+        a.jcc(Cc::NE, slow);
+        a.mov_ri(Rdx, (&raw const crate::threads::MULTI_THREADED) as i64);
+        a.cmp_mi(M(Rdx, 0), 0);
+        a.jcc(Cc::E, ok);
+        a.cmp8_mi(M(Rax, SHARED_READ), 0);
+        a.jcc(Cc::NE, ok);
+        a.cmp_rm(R15, M(Rdi, OB_TID));
+        a.jcc(Cc::NE, slow);
+        a.bind(ok);
+    }
+    a.shr_ri(R9, 1);
+    a.cmp_rm(R9, M(Rax, NENTRIES));
+    a.jcc(Cc::AE, slow);
+    a.imul_rri(R9, R9, esz);
+    a.load(Rdx, M(Rax, ep));
+    a.add_rr(Rdx, R9);
+    a.load(Rsi, M(Rdx, evalue));
+    a.test_rr(Rsi, Rsi);
+    a.jcc(Cc::E, slow);
+    a.cmp_rm(R11, M(Rax, WSEQ));
+    a.jcc(Cc::NE, slow);
+    a.mov_ri(Rdx, crate::types::lazyimport::lazy_import_type() as i64);
+    a.cmp_rm(Rdx, M(Rsi, OB_TYPE));
+    a.jcc(Cc::E, slow);
+    a.cmp32_rm(R8, M(Rcx, E_SEQ));
+    a.jcc(Cc::NE, slow);
+    emit_incref_fast(&mut a, Rsi, inc_done, inc_slow);
+    a.bind(inc_done);
+    a.mov_rr(Rax, Rsi);
+    a.ret();
+    // builtins: exact dict with the recorded key layout (globals checked above)
+    a.bind(in_builtins);
+    a.load(Rax, M(Rbx, FRAME_BUILTINS));
+    a.mov_ri(Rdi, dict_t);
+    a.cmp_rm(Rdi, M(Rax, OB_TYPE));
+    a.jcc(Cc::NE, slow);
+    a.mov_rr(Rdi, Rax);
+    a.load(Rax, M(Rax, MA_KEYS));
+    a.test_rr(Rax, Rax);
+    a.jcc(Cc::E, slow);
+    a.load(Rdx, M(Rax, kv));
+    a.cmp_rm(Rdx, M(Rcx, E_B));
+    a.jcc(Cc::NE, slow);
+    a.jmp(have);
+    a.bind(slow);
+    a.xor_rr(Rax, Rax);
+    a.ret();
+    a.bind(inc_slow);
+    emit_nonowner_incref(&mut a, Rsi, inc_done);
+    a.resolve().ok()?;
+    crate::interp::jit::mem::install_asm(&a)
 }
 
 fn opstats_enabled() -> bool {
