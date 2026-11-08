@@ -216,3 +216,13 @@ core files, xml.dom, the rest of multiprocessing.
 - Leftovers: my first broken multiprocessing draft left ~240 `psm_*`/`sem.mp-*` entries
   in /dev/shm (23:32-23:33, harmless random names; removing them in bulk was refused);
   the one that broke a test for everybody (`/dev/shm/a:b`) was removed.
+
+## Final check (after `git merge core`, rebuilt, installed snapshot target/cleanroom7/snap)
+- tools/jit_tests/run.sh: all ok.  tools/stress/run.sh: 21/21 PASS.
+- 141 test files (multiprocessing x3, concurrent_futures, main_handling, genericalias,
+  free_threading, email & friends, xml/sax/dom/etree/xmlrpc/plistlib/pyexpat, asyncio,
+  compileall, __all__, fcntl, socket, audit, venv, profiling): 10,666 tests; failures
+  test_concurrent_futures.test_init (above), test_socket, test_audit (test_open) and
+  test_profiling (test_native_frames_enabled) — the last three fail identically with
+  core's own binary (target/core) on the same snapshot; test_asyncio.test_events "env
+  changed" (the known test_utils HTTP-server race).
