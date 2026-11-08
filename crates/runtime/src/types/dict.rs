@@ -353,36 +353,32 @@ impl DictTable {
             // while it is copied: the old index array at once (the copy walks the
             // entries), then the entries already copied, chunk by chunk. Both blocks
             // fully resident at once were the peak of a growing dict.
-            let mut release = if self.data_bytes >= RELEASE_MIN && !self.shared_read.load(Relaxed) {
-                let block = unsafe { (self.indices_p as *mut u8).sub(BLOCK_HDR) };
+            let release = self.data_bytes >= RELEASE_MIN && !self.shared_read.load(Relaxed);
+            let block = unsafe { (self.indices_p as *mut u8).sub(BLOCK_HDR) };
+            if release {
                 release_pages(block, self.indices_p as usize, self.entries_p as usize);
-                Some(self.entries_p as usize)
-            } else {
-                None
-            };
+            }
             let old = self.entries();
-            for (k, e) in old.iter().enumerate() {
-                if e.key.is_null() {
-                    continue;
+            // chunks of RELEASE_STEP entries (the whole array when nothing is released),
+            // so that the copy loop itself stays as it was
+            let step = if release { RELEASE_STEP } else { old.len().max(1) };
+            for chunk in old.chunks(step) {
+                for e in chunk.iter().filter(|e| !e.key.is_null()) {
+                    unsafe { *fresh.entries_p.add(n) = *e };
+                    let mut perturb = e.hash as usize;
+                    let mut i = (e.hash as usize) & mask;
+                    let idx = fresh.indices_mut();
+                    while idx[i] != EMPTY {
+                        perturb >>= 5;
+                        i = (i.wrapping_mul(5).wrapping_add(perturb).wrapping_add(1)) & mask;
+                    }
+                    idx[i] = n as i32;
+                    n += 1;
                 }
-                if let Some(from) = release.as_mut()
-                    && k % RELEASE_STEP == RELEASE_STEP - 1
-                {
-                    let upto = old.as_ptr() as usize + (k + 1) * std::mem::size_of::<Entry>();
-                    let block = unsafe { (self.indices_p as *mut u8).sub(BLOCK_HDR) };
-                    release_pages(block, *from, upto);
-                    *from = upto;
+                if release {
+                    let end = chunk.as_ptr_range().end as usize;
+                    release_pages(block, chunk.as_ptr() as usize, end);
                 }
-                unsafe { *fresh.entries_p.add(n) = *e };
-                let mut perturb = e.hash as usize;
-                let mut i = (e.hash as usize) & mask;
-                let idx = fresh.indices_mut();
-                while idx[i] != EMPTY {
-                    perturb >>= 5;
-                    i = (i.wrapping_mul(5).wrapping_add(perturb).wrapping_add(1)) & mask;
-                }
-                idx[i] = n as i32;
-                n += 1;
             }
             fresh.nentries = n;
             fresh.used = n;
