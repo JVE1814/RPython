@@ -415,6 +415,25 @@ fn bio_readinto1(o: &PyObject, b: &PyObject) -> PyResult {
 fn tio_read(_o: &PyObject, _args: &[&PyObject]) -> PyResult {
     Err(unsupported("read"))
 }
+unsafe extern "C" fn tio_read_method(
+    slf: *mut PyObject,
+    _cls: *mut PyTypeObject,
+    args: *const *mut PyObject,
+    nargsf: usize,
+    kwnames: *mut PyObject,
+) -> *mut PyObject {
+    unsafe {
+        let n = nargsf & !crate::ffi::PY_VECTORCALL_ARGUMENTS_OFFSET;
+        if !kwnames.is_null() && crate::object::var_size(&*kwnames) > 0 {
+            return into_c(Err(crate::err!(TypeError, "read() takes no keyword arguments")));
+        }
+        let refs: Vec<&PyObject> = (0..n).map(|i| &**args.add(i)).collect();
+        into_c((|| {
+            crate::args::check_pos("read", &refs, 0, 1)?;
+            tio_read(&*slf, &refs)
+        })())
+    }
+}
 fn tio_readline(_o: &PyObject, _args: &[&PyObject]) -> PyResult {
     Err(unsupported("readline"))
 }
@@ -487,12 +506,29 @@ pub fn init_types() -> PyResult<()> {
 
         setup_type(textiobase_type(), c"_io._TextIOBase", size, iobase_type(), "_TextIOBase()\n--\n\nBase class for text streams.");
         let t = &mut *textiobase_type();
-        t.tp_methods = crate::mdefs![
-            ("detach", NOARGS, bio_detach),
-            ("read", FAST, tio_read, "read($self, size=-1, /)\n--\n\nRead up to size characters (unsupported in the base class)."),
-            ("readline", FAST, tio_readline, "readline($self, size=-1, /)\n--\n\nRead one line (unsupported in the base class)."),
-            ("write", FAST, tio_write, "write($self, s, /)\n--\n\nWrite a string (unsupported in the base class)."),
-        ];
+        // (tail4) read() receives its defining class (METH_METHOD), as in CPython: its
+        // __get__ then insists on a type as second argument
+        t.tp_methods = crate::methods::table(vec![
+            crate::methods::def_static("detach\0", crate::methods::noargs(bio_detach), METH_NOARGS, ""),
+            crate::methods::def_static(
+                "read\0",
+                tio_read_method as *const c_void,
+                METH_METHOD | METH_FASTCALL | METH_KEYWORDS,
+                "read($self, size=-1, /)\n--\n\nRead up to size characters (unsupported in the base class).\0",
+            ),
+            crate::methods::def_static(
+                "readline\0",
+                crate::methods::fast(tio_readline),
+                METH_FASTCALL,
+                "readline($self, size=-1, /)\n--\n\nRead one line (unsupported in the base class).\0",
+            ),
+            crate::methods::def_static(
+                "write\0",
+                crate::methods::fast(tio_write),
+                METH_FASTCALL,
+                "write($self, s, /)\n--\n\nWrite a string (unsupported in the base class).\0",
+            ),
+        ]);
         t.tp_getset = crate::getset_table![("encoding", tio_none), ("newlines", tio_none), ("errors", tio_none)];
         crate::types::typeobject::type_ready(textiobase_type())?;
     }

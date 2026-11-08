@@ -53,6 +53,9 @@ pub const MAX_INLINE: u32 = 30;
 /// Maximum number of shapes per type (polymorphic insertion orders); beyond this new
 /// transitions materialise the dict ("megamorphic").
 const MAX_SHAPES: u32 = 256;
+/// (tail4) Distinct attribute names a type can hold inline over all its instances
+/// (two thirds of a 32-slot key table).
+const CLASS_KEYS_MAX: usize = 21;
 /// Capacity of the values area for types without `__static_attributes__` hints.
 const DEFAULT_CAP: u32 = 4;
 /// `ob_flags` bits holding the inline capacity of an instance.
@@ -94,6 +97,10 @@ struct TreeInner {
     shapes: Vec<*mut Shape>,
     keys: Vec<Box<[*mut PyObject]>>,
     retired: Vec<*mut TransList>,
+    /// (tail4) every attribute name some shape of the type stores inline: the
+    /// type's key space, limited to CLASS_KEYS_MAX names (CPython's per-class
+    /// shared keys); a name beyond it makes the instance materialise its dict
+    names: Vec<*mut PyObject>,
 }
 unsafe impl Send for TreeInner {}
 
@@ -117,6 +124,13 @@ impl Shape {
         }
         unsafe { (*t).items.iter().find(|&&(n, _)| n == k as usize).map(|&(_, s)| s) }
     }
+    /// (tail4) Whether `k` is a new name the type's key space has no room for.
+    fn key_space_rejects(&self, k: *mut PyObject) -> bool {
+        let tree = unsafe { &*self.tree };
+        let g = tree.inner.lock().unwrap_or_else(|e| e.into_inner());
+        !g.names.contains(&k) && g.names.len() >= CLASS_KEYS_MAX
+    }
+
     /// The shape with `k` appended (created on first use). None if the tree is full.
     fn add(&self, k: *mut PyObject) -> Option<*const Shape> {
         if let Some(s) = self.find_transition(k) {
@@ -129,6 +143,12 @@ impl Shape {
         }
         if tree.nshapes.load(Relaxed) >= MAX_SHAPES || self.len >= MAX_INLINE {
             return None;
+        }
+        if !g.names.contains(&k) {
+            if g.names.len() >= CLASS_KEYS_MAX {
+                return None;
+            }
+            g.names.push(k);
         }
         let mut keys: Vec<*mut PyObject> = self.keys().to_vec();
         keys.push(k);
@@ -220,7 +240,7 @@ pub unsafe fn type_enable(tp: *mut PyTypeObject, hint: usize) {
             root: std::ptr::null(),
             cap: AtomicU32::new(cap),
             nshapes: AtomicU32::new(1),
-            inner: Mutex::new(TreeInner { shapes: Vec::new(), keys: Vec::new(), retired: Vec::new() }),
+            inner: Mutex::new(TreeInner { shapes: Vec::new(), keys: Vec::new(), retired: Vec::new(), names: Vec::new() }),
         }));
         let root = Box::into_raw(Box::new(Shape {
             id: NEXT_SHAPE_ID.fetch_add(1, Relaxed),
@@ -501,6 +521,11 @@ pub fn set_ix(o: &PyObject, name: &PyObject, value: Option<&PyObject>) -> (Set, 
                         slot(op, shr, len as usize).store(val.as_ptr(), Release);
                         w.store((next as usize | 1) as *mut PyObject, Release);
                         return (Set::Done, len as usize);
+                    }
+                    if shr.key_space_rejects(k) {
+                        // (tail4) a name the type's key space cannot take: from now on
+                        // the instance keeps its attributes in its own dict only
+                        o.ob_gc_bits.fetch_or(crate::alloc::GC_BIT_DICT_DETACHED, Relaxed);
                     }
                 } else {
                     // learn: future instances get room for more attributes

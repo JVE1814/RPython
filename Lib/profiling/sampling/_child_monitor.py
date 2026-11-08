@@ -127,36 +127,46 @@ class ChildProcessMonitor:
             if child in self._known_pids:
                 continue
             self._known_pids.add(child)
-            if len(self._spawned_profilers) >= _MAX_CHILD_PROFILERS:
-                continue
             if not is_python_process(child):
                 continue
-            self._spawn_for(child)
+            self._spawn_profiler_for_child(child)
 
-    def _spawn_for(self, pid):
-        args = [sys.executable, "-m", "profiling.sampling"]
+    def _running_profilers(self):
+        return [proc for proc in self._spawned_profilers if proc.poll() is None]
+
+    def _spawn_profiler_for_child(self, pid):
+        """Start ``python -m profiling.sampling attach PID`` for a new child."""
+        if len(self._running_profilers()) >= _MAX_CHILD_PROFILERS:
+            print(f"Warning: Max child profilers ({_MAX_CHILD_PROFILERS}) "
+                  f"reached; not profiling child process {pid}",
+                  file=sys.stderr)
+            return None
+        args = [sys.executable, "-m", "profiling.sampling", "attach", str(pid)]
         args += list(self.cli_args)
         if self.output_pattern:
             args += ["-o", self.output_pattern.format(pid=pid)]
-        args += ["-p", str(pid)]
         try:
-            proc = subprocess.Popen(args)
-            self._spawned_profilers.append(proc)
-        except OSError:
-            pass
+            proc = subprocess.Popen(args, stdin=subprocess.DEVNULL)
+        except OSError as exc:
+            print(f"Warning: could not start a profiler for child {pid}: {exc}",
+                  file=sys.stderr)
+            return None
+        self._spawned_profilers.append(proc)
+        return proc
 
     def _reap(self):
-        still = []
-        for proc in self._spawned_profilers:
-            if proc.poll() is None:
-                still.append(proc)
-        self._spawned_profilers = still
+        self._spawned_profilers = self._running_profilers()
 
     def wait_for_profilers(self, timeout=None):
-        """Wait for all spawned child profilers to finish (up to *timeout* seconds)."""
-        import time
+        """Wait (at most *timeout* seconds) for the child profilers to finish."""
+        pending = list(self._spawned_profilers)
+        if not pending:
+            return
+        count = len(pending)
+        print(f"Waiting for {count} child profiler{'s' if count != 1 else ''} "
+              f"to finish...", file=sys.stderr)
         deadline = None if timeout is None else time.monotonic() + timeout
-        for proc in list(self._spawned_profilers):
+        for proc in pending:
             remaining = None
             if deadline is not None:
                 remaining = max(0.0, deadline - time.monotonic())

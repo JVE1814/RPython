@@ -931,6 +931,16 @@ fn get_lockfree(d: &PyObject, key: &PyObject, hash: isize) -> Option<Option<PyRe
     }
 }
 
+/// (tail4) Like `lookup_index`, but never runs Python code: None when deciding would
+/// need a key comparison through `__eq__` (a non-str key with the same hash).
+pub fn lookup_index_no_eq(d: &PyObject, key: &PyObject, hash: isize) -> Option<Option<usize>> {
+    match lookup_lockfree_raw(d, key, hash) {
+        LfRead::Hit(ix, _) => Some(Some(ix)),
+        LfRead::Miss => Some(None),
+        LfRead::Undecided => None,
+    }
+}
+
 pub fn lookup_index(d: &PyObject, key: &PyObject, hash: isize) -> PyResult<Option<usize>> {
     match lookup_lockfree_raw(d, key, hash) {
         LfRead::Hit(ix, _) => return Ok(Some(ix)),
@@ -1115,7 +1125,8 @@ unsafe fn release_replaced(shared: bool, old: *mut PyObject) {
         if !shared || !crate::qsbr::multi_threaded() {
             decref(old);
         } else {
-            crate::qsbr::decref_deferred(old);
+            // (tail4) at once if every other thread is quiescent right now
+            crate::qsbr::release_unpublished(old);
         }
     }
 }

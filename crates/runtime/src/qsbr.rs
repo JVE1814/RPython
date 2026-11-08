@@ -258,6 +258,25 @@ pub unsafe fn decref_deferred(p: *mut PyObject) {
     retire(Item::Decref(p));
 }
 
+/// (tail4) Release `p` (an owned reference), just unpublished from a structure other
+/// threads read lock-free (with a store at least Release-ordered, before this call):
+/// at once when every other thread is quiescent (see `others_quiescent`), else
+/// through QSBR. Must not be called with a leaf lock held (may run a deallocator).
+pub unsafe fn release_unpublished(p: *mut PyObject) {
+    unsafe {
+        if !multi_threaded() || (*p).is_immortal() {
+            crate::object::decref(p);
+            return;
+        }
+        std::sync::atomic::fence(SeqCst);
+        if others_quiescent() {
+            crate::object::decref(p);
+            return;
+        }
+        decref_deferred(p);
+    }
+}
+
 /// Store `new` (an owned reference or null) into an object field that other threads
 /// read without a lock (getters taking a new reference to the current value), and
 /// release the previous value once no such reader can still hold the old pointer.
@@ -330,15 +349,50 @@ pub unsafe fn release_attr(o: *mut PyObject, old: *mut PyObject) {
 /// (SeqCst) before reading anything, so it sees the new value (Dekker with
 /// `gc::enter_vm`). The common case of a writer whose helper threads are idle (an event
 /// loop next to blocked executor threads) then finalizes values promptly.
+///
+/// (scale3) Cheap when the answer is no (the common case on a hot path while other
+/// threads run): the scan stops at the first running thread, starting with the one
+/// found running last time (thread-local hint), and needs no snapshot of the list; a
+/// yes is only given for a version-consistent scan of the whole list.
 pub fn others_quiescent() -> bool {
+    #[thread_local]
+    static mut HINT: usize = 0;
     let me = me() as usize;
-    let mut quiet = true;
-    for_each_thread(|ts| {
-        if quiet && ts as *const ThreadState as usize != me && ts.alive() && ts.mode.0.load(SeqCst) == crate::threads::ThreadMode::InVm as u8 {
-            quiet = false;
+    let running = |t: usize| -> bool {
+        let ts = unsafe { &*(t as *const ThreadState) };
+        t != me && t != 0 && ts.alive() && ts.mode.0.load(SeqCst) == crate::threads::ThreadMode::InVm as u8
+    };
+    loop {
+        let v0 = LIST_VER.load(SeqCst);
+        if v0 & 1 == 1 {
+            std::hint::spin_loop();
+            continue;
         }
-    });
-    quiet
+        if OVERFLOW.load(SeqCst) {
+            let mut quiet = true;
+            for_each_thread(|ts| {
+                if quiet && running(ts as *const ThreadState as usize) {
+                    quiet = false;
+                }
+            });
+            return quiet;
+        }
+        // (thread-state memory is never freed: reading a stale entry is harmless)
+        let n = LIST_LEN.load(Relaxed).min(CAP);
+        let h = unsafe { HINT };
+        if h < n && running(LIST[h].load(Relaxed)) {
+            return false;
+        }
+        for i in 0..n {
+            if i != h && running(LIST[i].load(Relaxed)) {
+                unsafe { HINT = i };
+                return false;
+            }
+        }
+        if LIST_VER.load(SeqCst) == v0 {
+            return true;
+        }
+    }
 }
 
 /// As `swap_field`, for callers that hold no lock (the old value may be released at
@@ -487,6 +541,12 @@ pub fn take_all_for_gc() -> Vec<ItemSendBatch> {
 
 /// Items taken by `take_all_for_gc` (`.1`: counted in PENDING_TOTAL).
 pub struct ItemSendBatch(Vec<Item>, bool);
+impl ItemSendBatch {
+    /// (scale3, diagnostics) Number of items.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
 unsafe impl Send for ItemSendBatch {}
 
 /// Release what `take_all_for_gc` took (world running).
@@ -652,6 +712,25 @@ pub fn before_wait(spin: bool) {
 pub fn on_eval_breaker(ts: &ThreadState) {
     ts.c.eval_breaker.fetch_and(!EVAL_QSBR, AcqRel);
     report(ts);
+    let l = local();
+    // (tail4) everything retired so far was unpublished before now: if no other
+    // thread is executing Python at this moment, none is in the middle of a
+    // lock-free read of it, so it can go at once (finalizers then run close to
+    // where CPython runs them, instead of after a batch interval)
+    if (!l.open.is_empty() || !l.closed.is_empty()) && multi_threaded() && others_quiescent() {
+        let open = std::mem::take(&mut l.open);
+        let closed: Vec<(u64, Vec<Item>)> = l.closed.drain(..).collect();
+        l.polls = 0;
+        for it in open {
+            match it {
+                Item::Decref(p) => unsafe { crate::object::decref(p) },
+                Item::Free(p, f) => unsafe { f(p) },
+            }
+        }
+        for (_, items) in closed {
+            unsafe { release(items) };
+        }
+    }
     let l = local();
     if !l.open.is_empty() {
         l.polls += 1;

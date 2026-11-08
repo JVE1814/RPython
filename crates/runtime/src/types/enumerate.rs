@@ -241,8 +241,8 @@ unsafe extern "C" fn reversed_traverse(o: *mut PyObject, visit: visitproc, arg: 
 }
 // enumerate and reversed objects shared between threads (test_free_threading.test_reversed):
 // their counters and sequence reference change under the object lock
-crate::locked_slot!(l_enum_next, enum_next, () -> *mut PyObject);
-crate::locked_slot!(l_reversed_next, reversed_next, () -> *mut PyObject);
+crate::locked_iter_slot!(l_enum_next, enum_next, () -> *mut PyObject); // (scale3)
+crate::locked_iter_slot!(l_reversed_next, reversed_next, () -> *mut PyObject); // (scale3)
 
 unsafe extern "C" fn reversed_next(o: *mut PyObject) -> *mut PyObject {
     unsafe {

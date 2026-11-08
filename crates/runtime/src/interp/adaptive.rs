@@ -566,7 +566,11 @@ fn instance_has_attr(owner: &PyObject, name: &PyObject) -> Option<bool> {
         crate::shape::Get::Missing => None,
         crate::shape::Get::NotValues => {
             let d = instance_dict_existing(owner)?;
-            dict::get_item_str(&d, name).map(|_| false)
+            // (tail4) no key comparison through __eq__ here: recording must not run code
+            if !dict::is_dict_exact(&d) {
+                return None;
+            }
+            dict::lookup_index_no_eq(&d, name, crate::types::str::str_hash(name)).flatten().map(|_| false)
         }
     }
 }
