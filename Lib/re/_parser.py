@@ -34,3 +34,24 @@ GLOBAL_FLAGS = SRE_FLAG_DEBUG
 
 class Verbose(Exception):
     pass
+
+
+# The parse-tree API (re._parse_tree), loaded on first use: `re` itself never
+# needs it.
+from . import _constants as _c
+globals().update({_k: _v for _k, _v in vars(_c).items()
+                  if _k.isupper() and not _k.startswith("_")})
+del _c
+
+
+def parse(str, flags=0, state=None):
+    """Parse tree of the pattern `str` (see re._parse_tree)."""
+    from ._parse_tree import parse as _parse
+    return _parse(str, flags, state)
+
+
+def __getattr__(name):
+    if name in ("SubPattern", "State"):
+        from . import _parse_tree
+        return getattr(_parse_tree, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
