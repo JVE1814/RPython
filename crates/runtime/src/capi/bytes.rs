@@ -499,11 +499,28 @@ pub struct BytesWriter {
 /// Make room for `n` bytes in total. Growing past the capacity is an allocation: a
 /// failure-injecting allocator hook may refuse it (capi3), as may the system.
 fn bw_reserve(buf: &mut Vec<u8>, n: usize) -> PyResult<()> {
-    if n > buf.capacity() && (crate::capi::mem::hooked_alloc_refuses(n) || buf.try_reserve(n - buf.len()).is_err()) {
+    if n > buf.capacity() && crate::capi::mem::hooked_alloc_refuses(n) {
+        return Err(crate::errors::memory_error());
+    }
+    if n > BW_SMALL && buf.capacity() <= BW_SMALL {
+        // (wheels3) leaving the "small buffer" always moves the data (as CPython's writer
+        // moves from its inline buffer to a bytes object; _testcapi asserts that the
+        // pointer changes). A realloc could otherwise extend the block in place.
+        let mut fresh: Vec<u8> = Vec::new();
+        if fresh.try_reserve(n).is_err() {
+            return Err(crate::errors::memory_error());
+        }
+        fresh.extend_from_slice(buf);
+        *buf = fresh;
+        return Ok(());
+    }
+    if n > buf.capacity() && buf.try_reserve(n - buf.len()).is_err() {
         return Err(crate::errors::memory_error());
     }
     Ok(())
 }
+/// The inline buffer size the C API reports for a writer (tools/capi_shim/pycore_bytesobject.h).
+const BW_SMALL: usize = 256;
 /// Set `buf` to `n` bytes (new bytes zeroed); MemoryError instead of an abort.
 fn bw_set_len(buf: &mut Vec<u8>, n: usize) -> PyResult<()> {
     bw_reserve(buf, n)?;
