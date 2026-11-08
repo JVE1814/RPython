@@ -122,19 +122,23 @@ unsafe fn push_slow(op: *mut PyObject) {
 
 /// Drop the stale entries of the calling thread's own buffer. Writes no object (other
 /// threads may own the objects behind stale entries); duplicates of a reused address are
-/// dropped by sorting the addresses.
+/// dropped by sorting the addresses when dropping stale entries freed too little.
 fn compact(b: &mut YoungBuf) {
-    // (wheels3) duplicates first: a block freed and reused for a new tracked object is
-    // appended again while its old entry still matches the new object's bits, so a
-    // thread that keeps allocating and freeing (without a collection in between: pandas'
-    // test suite) grew its buffer by one entry per allocation, up to an 8 GB reserve.
-    // Entries are addresses; one per address is enough (the order is not significant).
-    b.entries.sort_unstable();
-    b.entries.dedup();
+    let before = b.entries.len();
     b.entries.retain(|&p| unsafe {
         let bits = (*(p as *mut PyObject)).ob_gc_bits.load(Relaxed);
         bits & (GC_BIT_YOUNG_BUF | GC_BIT_TRACKED | GC_BIT_OLD) == GC_BIT_YOUNG_BUF | GC_BIT_TRACKED
     });
+    // (wheels3) a block freed and reused for a new tracked object is appended again
+    // while its old entry still matches the new object's bits, so a thread that keeps
+    // allocating and freeing (without a collection in between: pandas' test suite) grew
+    // its buffer by one entry per allocation, up to an 8 GB reserve. When the stale
+    // entries were few, drop duplicate addresses (one entry per address is enough; the
+    // order is not significant).
+    if b.entries.len() > before / 2 {
+        b.entries.sort_unstable();
+        b.entries.dedup();
+    }
     b.limit = (b.entries.len() * 2).max(MIN_LIMIT);
     let need = b.limit - b.entries.len();
     b.entries.reserve(need);
