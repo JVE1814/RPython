@@ -1,18 +1,21 @@
-"""Run child processes and talk to them through pipes.
+"""Start programs as child processes, connect to their standard streams and
+collect their exit status.
 
-High-level helpers: run(), call(), check_call(), check_output(),
-getstatusoutput(), getoutput().  The Popen class gives full control.
-PIPE, STDOUT and DEVNULL are special values for the stdin/stdout/stderr
-arguments.  Errors: SubprocessError and its subclasses CalledProcessError
-and TimeoutExpired.
+Convenience functions: run() (the general one, returning a
+CompletedProcess), call(), check_call(), check_output(), getstatusoutput()
+and getoutput().  Popen is the underlying class.  PIPE, STDOUT and DEVNULL
+are the special values accepted for stdin/stdout/stderr.  Failures are
+reported as SubprocessError, or as its subclasses CalledProcessError (a
+checked command failed) and TimeoutExpired.
 """
 
 import builtins
-import contextlib
 import errno
 import io
 import locale
 import os
+import select
+import selectors
 import signal
 import sys
 import threading
@@ -30,78 +33,78 @@ __all__ = ["Popen", "PIPE", "STDOUT", "call", "check_call", "getstatusoutput",
            "getoutput", "check_output", "run", "CalledProcessError", "DEVNULL",
            "SubprocessError", "TimeoutExpired", "CompletedProcess"]
 
-_mswindows = sys.platform == "win32"
-_can_fork_exec = sys.platform not in {"emscripten", "wasi", "ios", "tvos",
-                                      "watchos"}
+PIPE = -1
+STDOUT = -2
+DEVNULL = -3
 
-if _can_fork_exec:
+# Platforms where a process cannot start another one at all.
+_NO_PROCESSES = {"emscripten", "wasi", "ios", "tvos", "watchos"}
+_can_spawn = sys.platform not in _NO_PROCESSES
+
+if _can_spawn:
     try:
         from _posixsubprocess import fork_exec as _fork_exec
     except ImportError:
         _fork_exec = None
 else:
     _fork_exec = None
-# fork_exec() decides itself how to create the child; the flag is kept for
-# code that inspects it.
-_USE_VFORK = _fork_exec is not None
 
-import select
-import selectors
+# Children are always started through fork_exec(), never posix_spawn():
+# fork_exec() reports exactly which step failed in the child.
+_USE_POSIX_SPAWN = False
 
-PIPE = -1
-STDOUT = -2
-DEVNULL = -3
-
+# Writes of at most this size to a pipe are atomic and, once select() says
+# the pipe is writable, do not block.
 _PIPE_BUF = getattr(select, 'PIPE_BUF', 512)
+
+# The selector communicate() multiplexes the pipes with (tests swap it).
 _PopenSelector = getattr(selectors, 'PollSelector', selectors.SelectSelector)
 
 
-def _probe_pidfd():
-    if not hasattr(os, 'pidfd_open') or not hasattr(select, 'poll'):
+def _pidfd_works():
+    # pidfd_open() can exist in os but be refused by the kernel or a
+    # seccomp filter, so try it once on ourselves.
+    if not (hasattr(os, 'pidfd_open') and hasattr(select, 'poll')):
         return False
     try:
-        fd = os.pidfd_open(os.getpid())
+        os.close(os.pidfd_open(os.getpid()))
     except OSError:
         return False
-    os.close(fd)
     return True
 
 
-_CAN_USE_PIDFD_OPEN = _probe_pidfd()
-# Longest single kernel wait for a child (seconds); longer timeouts are
-# waited for in slices of this size.
+_CAN_USE_PIDFD_OPEN = _pidfd_works()
+_CAN_USE_KQUEUE = hasattr(select, 'kqueue') and hasattr(select, 'KQ_FILTER_PROC')
+
+# Upper bound for a single sleep in the kernel while waiting for a child;
+# longer timeouts are covered by repeating it.
 _MAXIMUM_WAIT_TIMEOUT = 86400.0
-_CAN_USE_KQUEUE = (hasattr(select, 'kqueue')
-                   and hasattr(select, 'KQ_FILTER_PROC'))
-
-# posix_spawn() is not used: fork_exec() reports every failure precisely.
-_USE_POSIX_SPAWN = False
-_HAVE_POSIX_SPAWN_CLOSEFROM = hasattr(os, 'POSIX_SPAWN_CLOSEFROM')
 
 
-# ---------------------------------------------------------------- errors
+# ---------------------------------------------------------------- exceptions
 
 class SubprocessError(Exception):
-    pass
+    """Base class for the exceptions raised by this module."""
 
 
-class _OutputAlias:
-    """Mixin: 'stdout' is another name for the 'output' attribute."""
-
-    @property
-    def stdout(self):
-        """Alias for output attribute, to match stderr"""
+def _output_alias():
+    # `stdout` is another name for `output` on the exceptions below, so that
+    # they read like CompletedProcess (stdout/stderr).
+    def get(self):
         return self.output
 
-    @stdout.setter
-    def stdout(self, value):
+    def put(self, value):
         self.output = value
 
+    return property(get, put, doc="Same as output: the captured standard output.")
 
-class CalledProcessError(_OutputAlias, SubprocessError):
-    """A checked command exited with a non-zero status.
 
-    Attributes: returncode, cmd, output (= stdout), stderr.
+class CalledProcessError(SubprocessError):
+    """A command run by check_call(), check_output() or run(check=True)
+    exited with a non-zero status.
+
+    Attributes: returncode, cmd, output (alias stdout) and stderr; the last
+    two are None unless the stream was captured.
     """
 
     def __init__(self, returncode, cmd, output=None, stderr=None):
@@ -110,27 +113,27 @@ class CalledProcessError(_OutputAlias, SubprocessError):
         self.output = output
         self.stderr = stderr
 
+    stdout = _output_alias()
+
     def __str__(self):
-        code = self.returncode
-        if not isinstance(code, int):
-            # e.g. a mocked Popen: describe whatever value is there
-            return "Command '%s' returned non-zero exit status %s." % (
-                self.cmd, code)
-        if code < 0:
+        status = self.returncode
+        if isinstance(status, int) and status < 0:
+            # A negative status is the number of the signal that ended it.
             try:
-                return "Command '%s' died with %r." % (self.cmd,
-                                                       signal.Signals(-code))
+                cause = repr(signal.Signals(-status))
             except ValueError:
-                return "Command '%s' died with unknown signal %d." % (self.cmd,
-                                                                      -code)
-        return "Command '%s' returned non-zero exit status %d." % (self.cmd,
-                                                                   code)
+                cause = "unknown signal %d" % -status
+            return "Command '%s' died with %s." % (self.cmd, cause)
+        # Anything that is not an int (a mock, say) is shown as it is.
+        shown = "%d" % status if isinstance(status, int) else "%s" % (status,)
+        return "Command '%s' returned non-zero exit status %s." % (self.cmd, shown)
 
 
-class TimeoutExpired(_OutputAlias, SubprocessError):
-    """Waiting for a child process timed out.
+class TimeoutExpired(SubprocessError):
+    """A timeout passed before the child process finished.
 
-    Attributes: cmd, timeout, output (= stdout), stderr.
+    Attributes: cmd, timeout, output (alias stdout) and stderr, the latter
+    holding whatever was captured before the timeout (or None).
     """
 
     def __init__(self, cmd, timeout, output=None, stderr=None):
@@ -139,137 +142,159 @@ class TimeoutExpired(_OutputAlias, SubprocessError):
         self.output = output
         self.stderr = stderr
 
+    stdout = _output_alias()
+
     def __str__(self):
-        return "Command '%s' timed out after %s seconds" % (self.cmd,
-                                                            self.timeout)
+        return "Command '%s' timed out after %s seconds" % (self.cmd, self.timeout)
 
 
-# ---------------------------------------------------------------- bookkeeping
+# ------------------------------------------------- abandoned Popen objects
 
-# Popen objects garbage-collected while their child was still running; they
-# are reaped opportunistically by _cleanup() to avoid zombies.
+# Popen objects that were garbage collected while their child still ran.
+# They stay here until a later Popen() or _cleanup() manages to reap them,
+# so that no zombie is left behind.
 _active = []
 
 
 def _cleanup():
     if _active is None:
         return
-    for proc in list(_active):
-        if proc._internal_poll(_deadstate=sys.maxsize) is not None:
-            try:
-                _active.remove(proc)
-            except ValueError:
-                pass  # removed concurrently
+    for proc in _active[:]:
+        if proc._poll_nowait(lost_status=sys.maxsize) is None:
+            continue
+        try:
+            _active.remove(proc)
+        except ValueError:
+            pass        # another thread got there first
 
+
+# ------------------------------------------- reproducing interpreter flags
 
 def _optim_args_from_interpreter_flags():
-    """-O options matching sys.flags.optimize."""
+    """The -O option equivalent to the current optimization level."""
     level = sys.flags.optimize
-    return ['-' + 'O' * level] if level > 0 else []
+    return ['-' + 'O' * level] if level else []
+
+
+# sys.flags fields that map to a (repeatable) single-letter option.
+_COUNTED_FLAGS = (('debug', 'd'), ('dont_write_bytecode', 'B'),
+                  ('no_site', 'S'), ('verbose', 'v'), ('bytes_warning', 'b'),
+                  ('quiet', 'q'))
+# Options implied by -I, given separately only when -I is not.
+_ISOLATION_PARTS = (('ignore_environment', '-E'), ('no_user_site', '-s'),
+                    ('safe_path', '-P'))
+
+
+def _implied_warning_filters(flags):
+    # Filters that -b/-bb and -X dev add to sys.warnoptions by themselves.
+    implied = []
+    if flags.bytes_warning:
+        implied.append("error::BytesWarning" if flags.bytes_warning > 1
+                       else "default::BytesWarning")
+    if flags.dev_mode:
+        implied.append("default")
+    return implied
 
 
 def _args_from_interpreter_flags():
-    """Command line options reproducing this interpreter's settings."""
+    """Command line options that start a new interpreter with the settings
+    of this one (as given by sys.flags, sys.warnoptions and -X options)."""
     flags = sys.flags
     args = _optim_args_from_interpreter_flags()
-    for attr, letter in (('debug', 'd'), ('dont_write_bytecode', 'B'),
-                         ('no_site', 'S'), ('verbose', 'v'),
-                         ('bytes_warning', 'b'), ('quiet', 'q')):
-        count = getattr(flags, attr)
-        if count > 0:
-            args.append('-' + letter * count)
+    args += ['-' + letter * getattr(flags, name)
+             for name, letter in _COUNTED_FLAGS if getattr(flags, name) > 0]
     if flags.isolated:
         args.append('-I')
     else:
-        for attr, opt in (('ignore_environment', '-E'),
-                          ('no_user_site', '-s'), ('safe_path', '-P')):
-            if getattr(flags, attr):
-                args.append(opt)
+        args += [opt for name, opt in _ISOLATION_PARTS if getattr(flags, name)]
 
-    # -W options, minus those implied by -b/-bb and -X dev
-    implied = set()
-    if flags.bytes_warning > 1:
-        implied.add("error::BytesWarning")
-    elif flags.bytes_warning:
-        implied.add("default::BytesWarning")
-    if flags.dev_mode:
-        implied.add('default')
-    for opt in sys.warnoptions:
-        if opt in implied:
-            implied.discard(opt)
-            continue
-        args.append('-W' + opt)
+    implied = _implied_warning_filters(flags)
+    for spec in sys.warnoptions:
+        if spec in implied:
+            implied.remove(spec)
+        else:
+            args.append('-W' + spec)
 
-    xoptions = getattr(sys, '_xoptions', {})
     if flags.dev_mode:
         args += ['-X', 'dev']
-    for name in ('faulthandler', 'tracemalloc', 'importtime',
-                 'frozen_modules', 'showrefcount', 'utf8', 'gil'):
-        if name in xoptions:
-            value = xoptions[name]
-            args += ['-X', name if value is True else f'{name}={value}']
+    for name, value in getattr(sys, '_xoptions', {}).items():
+        if name == 'dev':
+            continue
+        args += ['-X', name if value is True else '%s=%s' % (name, value)]
     return args
 
 
 def _text_encoding():
-    # Same default as open() without encoding (EncodingWarning aware).
+    # The encoding text mode uses when none was given: the one open() would
+    # pick, including the EncodingWarning of -X warn_default_encoding,
+    # attributed to the first caller outside this module.
     if sys.flags.warn_default_encoding:
+        level = 1
         frame = sys._getframe()
-        here = frame.f_code.co_filename
-        level = 2
-        while (frame := frame.f_back) is not None:
-            if frame.f_code.co_filename != here:
-                break
+        while frame is not None and frame.f_globals is globals():
             level += 1
+            frame = frame.f_back
         warnings.warn("'encoding' argument not specified.",
                       EncodingWarning, level)
-    if sys.flags.utf8_mode:
-        return "utf-8"
-    return locale.getencoding()
+    return "utf-8" if sys.flags.utf8_mode else locale.getencoding()
 
 
-# ---------------------------------------------------------------- functions
+# ------------------------------------------------------- convenience API
 
 def call(*popenargs, timeout=None, **kwargs):
-    """Run a command and return its exit status (Popen arguments)."""
+    """Run a command, wait for it and return its exit status.
+
+    Takes Popen's arguments, plus a timeout after which the child is killed
+    and TimeoutExpired raised.
+    """
     with Popen(*popenargs, **kwargs) as proc:
         try:
             return proc.wait(timeout=timeout)
         except:
-            proc.kill()   # __exit__ then reaps it
+            # Timeout, ^C or anything else: do not leave it running.  The
+            # with statement reaps it.
+            proc.kill()
             raise
 
 
 def check_call(*popenargs, **kwargs):
-    """Run a command; raise CalledProcessError if it fails, else return 0."""
+    """Like call(), but raise CalledProcessError for a non-zero status.
+
+    Returns 0 otherwise.
+    """
     status = call(*popenargs, **kwargs)
-    if status:
-        cmd = kwargs.get("args")
-        raise CalledProcessError(status, popenargs[0] if cmd is None else cmd)
-    return 0
+    if status == 0:
+        return 0
+    cmd = kwargs.get("args")
+    raise CalledProcessError(status, cmd if cmd is not None else popenargs[0])
+
+
+def _empty_input_for(kwargs):
+    # check_output(input=None) means "an empty stdin", in the stream's mode.
+    textual = any(kwargs.get(key) for key in
+                  ('universal_newlines', 'text', 'encoding', 'errors'))
+    return '' if textual else b''
 
 
 def check_output(*popenargs, timeout=None, **kwargs):
-    """Run a command and return its standard output.
+    """Run a command and return what it wrote to standard output.
 
-    CalledProcessError is raised on a non-zero exit status.  Takes the
-    arguments of run() except stdout and check.
+    A non-zero exit status raises CalledProcessError (with the output
+    attached).  Accepts run()'s arguments except stdout and check, which it
+    sets itself.
     """
-    for forbidden in ('stdout', 'check'):
-        if forbidden in kwargs:
-            raise ValueError(f'{forbidden} argument not allowed, it will be '
-                             f'overridden.')
+    for taken in ('stdout', 'check'):
+        if taken in kwargs:
+            raise ValueError(f'{taken} argument not allowed, it will be overridden.')
     if 'input' in kwargs and kwargs['input'] is None:
-        # explicit input=None means empty input
-        textual = any(kwargs.get(k) for k in
-                      ('universal_newlines', 'text', 'encoding', 'errors'))
-        kwargs['input'] = '' if textual else b''
+        kwargs['input'] = _empty_input_for(kwargs)
     return run(*popenargs, stdout=PIPE, timeout=timeout, check=True,
                **kwargs).stdout
 
 
 class CompletedProcess(object):
-    """Outcome of run(): args, returncode, stdout, stderr."""
+    """What run() returns: the args, returncode, stdout and stderr of a
+    finished process (the streams are None unless captured)."""
 
     def __init__(self, args, returncode, stdout=None, stderr=None):
         self.args = args
@@ -278,29 +303,31 @@ class CompletedProcess(object):
         self.stderr = stderr
 
     def __repr__(self):
-        fields = [f'args={self.args!r}', f'returncode={self.returncode!r}']
-        for name in ('stdout', 'stderr'):
-            value = getattr(self, name)
-            if value is not None:
-                fields.append(f'{name}={value!r}')
-        return f"{type(self).__name__}({', '.join(fields)})"
+        shown = ['args={!r}'.format(self.args),
+                 'returncode={!r}'.format(self.returncode)]
+        shown += ['{}={!r}'.format(name, getattr(self, name))
+                  for name in ('stdout', 'stderr')
+                  if getattr(self, name) is not None]
+        return '{}({})'.format(type(self).__name__, ', '.join(shown))
 
     __class_getitem__ = classmethod(types.GenericAlias)
 
     def check_returncode(self):
-        """Raise CalledProcessError if returncode is non-zero."""
+        """Raise CalledProcessError if the process failed."""
         if self.returncode:
-            raise CalledProcessError(self.returncode, self.args,
-                                     self.stdout, self.stderr)
+            raise CalledProcessError(self.returncode, self.args, self.stdout,
+                                     self.stderr)
 
 
 def run(*popenargs, input=None, capture_output=False, timeout=None,
         check=False, **kwargs):
-    """Run a command, wait for it, and return a CompletedProcess.
+    """Run a command to completion and return a CompletedProcess.
 
-    input: data for stdin; capture_output: capture stdout and stderr;
-    timeout: kill the child and raise TimeoutExpired; check: raise
-    CalledProcessError on failure.  Other arguments go to Popen.
+    input is written to the child's stdin (bytes, or str in text mode);
+    capture_output=True captures both stdout and stderr; when timeout
+    expires the child is killed and TimeoutExpired raised; check=True turns
+    a non-zero exit status into CalledProcessError.  Everything else is
+    passed to Popen.
     """
     if input is not None:
         if kwargs.get('stdin') is not None:
@@ -317,115 +344,336 @@ def run(*popenargs, input=None, capture_output=False, timeout=None,
             out, err = proc.communicate(input, timeout=timeout)
         except TimeoutExpired:
             proc.kill()
-            proc.wait()   # the partial output is attached to the exception
+            # Reap it now; communicate() already put the partial output on
+            # the exception.
+            proc.wait()
             raise
         except:
-            proc.kill()
+            proc.kill()     # the with statement waits for it
             raise
         status = proc.poll()
-        if check and status:
-            raise CalledProcessError(status, proc.args, output=out, stderr=err)
+    if check and status:
+        raise CalledProcessError(status, proc.args, output=out, stderr=err)
     return CompletedProcess(proc.args, status, out, err)
 
 
 def list2cmdline(seq):
-    """Quote a sequence of arguments the way the MS C runtime parses them."""
-    pieces = []
-    for arg in map(os.fsdecode, seq):
-        quote = not arg or ' ' in arg or '\t' in arg
+    """Join arguments into one command line, quoted so that the Microsoft
+    C runtime splits it back into the same arguments.
+
+    An argument is put in double quotes when it is empty or contains a
+    space or tab.  A literal double quote is escaped with a backslash;
+    backslashes are literal except in front of a double quote (escaped or
+    closing), where each one is doubled.
+    """
+    def quote(arg):
+        enclose = arg == '' or ' ' in arg or '\t' in arg
         out = []
-        slashes = 0
+        run_of_backslashes = 0
         for ch in arg:
             if ch == '\\':
-                slashes += 1
+                run_of_backslashes += 1
                 continue
             if ch == '"':
-                out.append('\\' * (2 * slashes) + '\\"')
+                out.append('\\' * (2 * run_of_backslashes + 1) + '"')
             else:
-                out.append('\\' * slashes + ch)
-            slashes = 0
-        # trailing backslashes are doubled only before the closing quote
-        out.append('\\' * (slashes * 2 if quote else slashes))
-        body = ''.join(out)
-        pieces.append(f'"{body}"' if quote else body)
-    return ' '.join(pieces)
+                out.append('\\' * run_of_backslashes + ch)
+            run_of_backslashes = 0
+        # Trailing backslashes only matter if a closing quote follows them.
+        out.append('\\' * (run_of_backslashes * (2 if enclose else 1)))
+        text = ''.join(out)
+        return '"' + text + '"' if enclose else text
+
+    return ' '.join(quote(arg) for arg in map(os.fsdecode, seq))
 
 
 def getstatusoutput(cmd, *, encoding=None, errors=None):
-    """Run *cmd* through the shell; return (exitcode, combined output)
-    with one trailing newline stripped."""
+    """Run cmd in a shell and return (exit status, output).
+
+    stdout and stderr are combined; one trailing newline is removed.
+    """
     try:
-        output = check_output(cmd, shell=True, text=True, stderr=STDOUT,
-                              encoding=encoding, errors=errors)
+        text = check_output(cmd, shell=True, text=True, stderr=STDOUT,
+                            encoding=encoding, errors=errors)
         status = 0
-    except CalledProcessError as exc:
-        output, status = exc.output, exc.returncode
-    if output.endswith('\n'):
-        output = output[:-1]
-    return status, output
+    except CalledProcessError as failure:
+        text, status = failure.output, failure.returncode
+    return status, text[:-1] if text.endswith('\n') else text
 
 
 def getoutput(cmd, *, encoding=None, errors=None):
-    """Output of getstatusoutput(cmd) without the status."""
+    """Like getstatusoutput(), returning the output only."""
     return getstatusoutput(cmd, encoding=encoding, errors=errors)[1]
 
 
-def _decode_child_error(data, cwd, executable):
-    """Exception for the b"Name:hexerrno:message" report of a failed child."""
+# --------------------------------------------------- spawning helpers
+
+def _child_failure(report, cwd, executable):
+    """Turn the failure report a child wrote before exec() into an exception.
+
+    The report reads b"ExceptionName:hex errno:detail".  The detail
+    "noexec:chdir" means chdir(cwd) failed and "noexec" another step before
+    exec(); otherwise exec() of the executable failed.
+    """
+    def garbled():
+        return SubprocessError(
+            'Bad exception data from child: {!r}'.format(bytes(report)))
+
     try:
-        name, code, message = data.split(b':', 2)
-        message = message.decode()
+        name, number, detail = report.split(b':', 2)
+        name, detail = name.decode('ascii'), detail.decode()
     except ValueError:
-        name, code = b'SubprocessError', b'0'
-        message = 'Bad exception data from child: {!r}'.format(bytes(data))
-    exc_type = getattr(builtins, name.decode('ascii'), SubprocessError)
+        return garbled()
+    exc_type = getattr(builtins, name, None)
     if not (isinstance(exc_type, type) and issubclass(exc_type, BaseException)):
         exc_type = SubprocessError
-    if issubclass(exc_type, OSError) and code:
-        number = int(code, 16)
-        if message == "noexec:chdir":
-            filename = cwd          # chdir(cwd) failed
-        elif message == "noexec":
-            filename = None         # failure before exec()
-        else:
-            filename = executable   # exec() itself failed
-        text = os.strerror(number) if number else ""
-        if filename is None:
-            return exc_type(number, text)
-        return exc_type(number, text, filename)
-    return exc_type(message)
+    if not (issubclass(exc_type, OSError) and number):
+        return exc_type(detail)
+    try:
+        number = int(number, 16)
+    except ValueError:
+        return garbled()
+    text = os.strerror(number) if number else ""
+    if detail == "noexec":
+        return exc_type(number, text)
+    return exc_type(number, text, cwd if detail == "noexec:chdir" else executable)
 
 
-# Names Popen.__del__ and _internal_poll need even during interpreter
-# shutdown, when module globals may already be gone.
-_reap = types.SimpleNamespace(
-    waitpid=getattr(os, 'waitpid', None),
-    WNOHANG=getattr(os, 'WNOHANG', 0),
-    ECHILD=errno.ECHILD,
-    WIFSTOPPED=getattr(os, 'WIFSTOPPED', None),
-    WSTOPSIG=getattr(os, 'WSTOPSIG', None),
-    waitstatus_to_exitcode=getattr(os, 'waitstatus_to_exitcode', None),
-)
-
-
-def _as_id(value, lookup, kind):
-    """Resolve a user/group given as name or number."""
+def _checked_id(value, kind, by_name, overflow=OverflowError):
+    """A user or group id given as a name or an integer, validated."""
     if isinstance(value, str):
-        return lookup(value)
-    if isinstance(value, int):
-        if value < 0:
-            raise ValueError(f"{kind} ID cannot be negative, got {value}")
-        if value >= 1 << 32:
-            raise OverflowError(f"{kind} ID is too large: {value}")
-        return value
-    return None
+        return by_name(value)
+    if not isinstance(value, int):
+        return None
+    if value < 0:
+        raise ValueError(f"{kind} ID cannot be negative, got {value}")
+    if value >= 2 ** 32:
+        raise overflow(f"{kind} ID is too large: {value}")
+    return value
 
+
+def _gid_by_name(name):
+    try:
+        import grp
+    except ImportError:
+        raise ValueError("The group parameter cannot be a string "
+                         "on systems without the grp module")
+    return grp.getgrnam(name).gr_gid
+
+
+def _uid_by_name(name):
+    try:
+        import pwd
+    except ImportError:
+        raise ValueError("The user parameter cannot be a string "
+                         "on systems without the pwd module")
+    return pwd.getpwnam(name).pw_uid
+
+
+def _identity(user, group, extra_groups):
+    """Resolve user=, group= and extra_groups= to (uid, gid, gids)."""
+    uid = gid = gids = None
+    if group is not None:
+        if not hasattr(os, 'setregid'):
+            raise ValueError("The 'group' parameter is not supported on the "
+                             "current platform")
+        gid = _checked_id(group, "Group", _gid_by_name)
+        if gid is None:
+            raise TypeError("Group must be a string or an integer, not {}"
+                            .format(type(group)))
+    if extra_groups is not None:
+        if not hasattr(os, 'setgroups'):
+            raise ValueError("The 'extra_groups' parameter is not supported "
+                             "on the current platform")
+        if isinstance(extra_groups, str):
+            raise ValueError("Groups must be a list, not a string")
+        gids = []
+        for item in extra_groups:
+            # Unlike group=, an out-of-range list item is a ValueError.
+            value = _checked_id(item, "Group", _gid_by_name, overflow=ValueError)
+            if value is None:
+                raise TypeError("Items in extra_groups must be a string or "
+                                "integer, not {}".format(type(item)))
+            gids.append(value)
+    if user is not None:
+        if not hasattr(os, 'setreuid'):
+            raise ValueError("The 'user' parameter is not supported on the "
+                             "current platform")
+        uid = _checked_id(user, "User", _uid_by_name)
+        if uid is None:
+            raise TypeError("User must be a string or an integer")
+    return uid, gid, gids
+
+
+def _environment_block(env):
+    # fork_exec() wants "NAME=value" byte strings.
+    block = []
+    for name, value in env.items():
+        name = os.fsencode(name)
+        if b'=' in name:
+            raise ValueError("illegal environment variable name")
+        block.append(name + b'=' + os.fsencode(value))
+    return block
+
+
+def _executable_candidates(executable, env):
+    # A bare program name is looked up along PATH (of the child's
+    # environment); fork_exec() tries each candidate in turn.
+    program = os.fsencode(executable)
+    if os.path.dirname(program):
+        return (program,)
+    return tuple(os.path.join(os.fsencode(folder), program)
+                 for folder in os.get_exec_path(env))
+
+
+def _fd_above_stdio(fd):
+    # Move fd to a number above 2, where the child's stdio set-up cannot
+    # clobber it.
+    low = []
+    while fd < 3:
+        low.append(fd)
+        fd = os.dup(fd)
+    for spare in low:
+        os.close(spare)
+    return fd
+
+
+def _read_all(fd, limit):
+    data = bytearray()
+    while len(data) <= limit:
+        chunk = os.read(fd, limit)
+        if not chunk:
+            break
+        data += chunk
+    return bytes(data)
+
+
+def _ignoring_broken_pipe(action, *args):
+    """Run action(*args), treating "the reader went away" as success."""
+    try:
+        action(*args)
+    except BrokenPipeError:
+        pass
+    except OSError as exc:
+        # Writing to a pipe whose reader exited can also give EINVAL.
+        if exc.errno != errno.EINVAL:
+            raise
+
+
+class _StdioPlan:
+    """The descriptors arranged for the child's stdin, stdout and stderr.
+
+    child[i] is what the child gets as descriptor i (-1: inherit ours);
+    parent[i] is the end of a pipe this process keeps (-1: no pipe).
+    `opened` lists the descriptors created here for the child's sake (pipe
+    ends, /dev/null), which this process must close once the child has them.
+    """
+
+    def __init__(self, pipesize):
+        self.child = [-1, -1, -1]
+        self.parent = [-1, -1, -1]
+        self.opened = []
+        self._pipesize = pipesize
+        self._devnull = None
+
+    def _new_pipe(self):
+        read_end, write_end = os.pipe()
+        if (self._pipesize > 0 and fcntl is not None
+                and hasattr(fcntl, "F_SETPIPE_SZ")):
+            fcntl.fcntl(write_end, fcntl.F_SETPIPE_SZ, self._pipesize)
+        return read_end, write_end
+
+    def _target(self, spec):
+        if spec == DEVNULL:
+            if self._devnull is None:
+                self._devnull = os.open(os.devnull, os.O_RDWR)
+                self.opened.append(self._devnull)
+            return self._devnull
+        return spec if isinstance(spec, int) else spec.fileno()
+
+    def arrange(self, stdin, stdout, stderr):
+        if stdin == PIPE:
+            self.child[0], self.parent[0] = self._new_pipe()
+            self.opened.append(self.child[0])
+        elif stdin is not None:
+            self.child[0] = self._target(stdin)
+        if stdout == PIPE:
+            self.parent[1], self.child[1] = self._new_pipe()
+            self.opened.append(self.child[1])
+        elif stdout is not None:
+            self.child[1] = self._target(stdout)
+        if stderr == PIPE:
+            self.parent[2], self.child[2] = self._new_pipe()
+            self.opened.append(self.child[2])
+        elif stderr == STDOUT:
+            if self.child[1] != -1:
+                self.child[2] = self.child[1]
+            else:
+                ours = sys.__stdout__
+                self.child[2] = ours.fileno() if ours is not None else 1
+        elif stderr is not None:
+            self.child[2] = self._target(stderr)
+
+    def release_child_side(self):
+        """Close what was opened for the child (safe to call twice)."""
+        pending, self.opened = self.opened, []
+        failure = None
+        for fd in pending:
+            try:
+                os.close(fd)
+            except OSError as exc:
+                failure = failure or exc
+        if failure is not None:
+            raise failure
+
+    def fork_exec_fds(self):
+        # The order fork_exec() takes them in.
+        return (self.child[0], self.parent[0], self.parent[1], self.child[1],
+                self.parent[2], self.child[2])
+
+
+class _SpawnOptions(types.SimpleNamespace):
+    """The Popen arguments that only matter while starting the child."""
+
+
+class _Exchange:
+    """communicate() state that survives a TimeoutExpired: the encoded
+    input and how much of it was written, and the output read so far."""
+
+    def __init__(self, outgoing, readers):
+        self.outgoing = outgoing
+        self.written = 0
+        self.received = {stream: [] for stream in readers}
+
+    def unsent(self):
+        return self.outgoing is not None and self.written < len(self.outgoing)
+
+    def collected(self, stream):
+        if stream is None or stream not in self.received:
+            return None
+        return b''.join(self.received[stream])
+
+    def partial(self, stream):
+        # On timeout: what arrived so far, or None if nothing did.
+        chunks = self.received.get(stream) if stream is not None else None
+        return b''.join(chunks) if chunks else None
+
+
+# --------------------------------------------------------------- Popen
 
 class Popen:
-    """Execute a program in a child process (see the module documentation
-    for the arguments)."""
+    """A child process.
+
+    The constructor starts the program; see the module documentation for
+    its many arguments.  Attributes: args, pid, returncode (None while the
+    child runs, negative for "killed by that signal"), and stdin, stdout
+    and stderr (file objects for streams that are PIPEs, else None).
+    """
 
     _child_created = False
+    # Kept on the class so that a finalizer still finds it while the
+    # module is being torn down.
+    _os = os
 
     def __init__(self, args, bufsize=-1, executable=None,
                  stdin=None, stdout=None, stderr=None,
@@ -437,51 +685,51 @@ class Popen:
                  encoding=None, errors=None, text=None, umask=-1, pipesize=-1,
                  process_group=None):
         _cleanup()
-        if not _can_fork_exec:
+        if not _can_spawn:
             raise OSError(errno.ENOTSUP,
                           f"{sys.platform} does not support processes.")
 
-        self._waitpid_lock = threading.Lock()
-        self._input = None
+        # Serializes waitpid() between threads that wait or poll at once.
+        self._reap_lock = threading.Lock()
+        self._exchange = None
         self._communication_started = False
+        # After ^C the child (in the same process group) most likely got
+        # SIGINT too: give it this long to exit before re-raising.
+        self._ctrl_c_grace = 0.25
 
-        bufsize = -1 if bufsize is None else bufsize
+        if bufsize is None:
+            bufsize = -1
+        if pipesize is None:
+            pipesize = -1
         if not isinstance(bufsize, int):
             raise TypeError("bufsize must be an integer")
-        if stdout is STDOUT:
-            raise ValueError("STDOUT can only be used for stderr")
-        pipesize = -1 if pipesize is None else pipesize
         if not isinstance(pipesize, int):
             raise TypeError("pipesize must be an integer")
+        if stdout is STDOUT:
+            raise ValueError("STDOUT can only be used for stderr")
+        if startupinfo is not None:
+            raise ValueError("startupinfo is only supported on Windows platforms")
+        if creationflags != 0:
+            raise ValueError("creationflags is only supported on Windows platforms")
         if pass_fds and not close_fds:
             warnings.warn("pass_fds overriding close_fds.", RuntimeWarning)
             close_fds = True
-        if startupinfo is not None:
-            raise ValueError("startupinfo is only supported on Windows "
-                             "platforms")
-        if creationflags != 0:
-            raise ValueError("creationflags is only supported on Windows "
-                             "platforms")
-
-        self.args = args
-        self.stdin = self.stdout = self.stderr = None
-        self.pid = None
-        self.returncode = None
-        self.encoding = encoding
-        self.errors = errors
-        self.pipesize = pipesize
-
         if (text is not None and universal_newlines is not None
-                and bool(universal_newlines) != bool(text)):
+                and bool(text) != bool(universal_newlines)):
             raise SubprocessError('Cannot disambiguate when both text '
                                   'and universal_newlines are supplied but '
                                   'different. Pass one or the other.')
+
+        self.args = args
+        self.pid = None
+        self.returncode = None
+        self.stdin = self.stdout = self.stderr = None
+        self.pipesize = pipesize
         self.text_mode = encoding or errors or text or universal_newlines
         if self.text_mode and encoding is None:
-            self.encoding = encoding = _text_encoding()
-
-        # grace period granted to the child after a KeyboardInterrupt
-        self._sigint_wait_secs = 0.25
+            encoding = _text_encoding()
+        self.encoding = encoding
+        self.errors = errors
 
         line_buffering = False
         if bufsize == 1:
@@ -492,132 +740,69 @@ class Popen:
                               "in binary mode, the default buffer size will "
                               "be used", RuntimeWarning)
 
-        if process_group is None:
-            process_group = -1
-        gid, gids, uid = self._resolve_ids(user, group, extra_groups)
+        uid, gid, gids = _identity(user, group, extra_groups)
+        options = _SpawnOptions(
+            preexec_fn=preexec_fn, close_fds=close_fds, pass_fds=pass_fds,
+            restore_signals=restore_signals,
+            start_new_session=start_new_session,
+            process_group=-1 if process_group is None else process_group,
+            uid=uid, gid=gid, gids=gids, umask=umask)
 
-        fds = self._get_handles(stdin, stdout, stderr)
-        p2cread, p2cwrite, c2pread, c2pwrite, errread, errwrite = fds
-        if p2cwrite != -1:
-            self.stdin = io.open(p2cwrite, 'wb', bufsize)
-            if self.text_mode:
-                self.stdin = io.TextIOWrapper(
-                    self.stdin, write_through=True,
-                    line_buffering=line_buffering,
-                    encoding=encoding, errors=errors)
-        for attr, fd in (('stdout', c2pread), ('stderr', errread)):
-            if fd != -1:
-                stream = io.open(fd, 'rb', bufsize)
-                if self.text_mode:
-                    stream = io.TextIOWrapper(stream, encoding=encoding,
-                                              errors=errors)
-                setattr(self, attr, stream)
-
-        self._closed_child_pipe_fds = False
+        plan = _StdioPlan(pipesize)
         try:
-            self._execute_child(args, executable, preexec_fn, close_fds,
-                                pass_fds, cwd, env,
-                                startupinfo, creationflags, shell,
-                                p2cread, p2cwrite, c2pread, c2pwrite,
-                                errread, errwrite, restore_signals,
-                                gid, gids, uid, umask,
-                                start_new_session, process_group)
+            plan.arrange(stdin, stdout, stderr)
+            self._open_streams(plan, bufsize, line_buffering)
+            self._execute_child(args, executable, shell, cwd, env, plan, options)
         except:
-            self._abandon_streams()
-            if not self._closed_child_pipe_fds:
-                leftovers = [fd for wanted, fd in ((stdin, p2cread),
-                                                   (stdout, c2pwrite),
-                                                   (stderr, errwrite))
-                             if wanted == PIPE]
-                if hasattr(self, '_devnull'):
-                    leftovers.append(self._devnull)
-                for fd in leftovers:
+            for stream in (self.stdin, self.stdout, self.stderr):
+                if stream is not None:
                     try:
-                        os.close(fd)
+                        stream.close()
                     except OSError:
                         pass
+            try:
+                plan.release_child_side()
+            except OSError:
+                pass
             raise
 
-    def _abandon_streams(self):
-        for stream in (self.stdin, self.stdout, self.stderr):
-            if stream is not None:
-                try:
-                    stream.close()
-                except OSError:
-                    pass
-
-    @staticmethod
-    def _resolve_ids(user, group, extra_groups):
-        def by_group_name(name):
-            try:
-                import grp
-            except ImportError:
-                raise ValueError("The group parameter cannot be a string "
-                                 "on systems without the grp module")
-            return grp.getgrnam(name).gr_gid
-
-        gid = gids = uid = None
-        if group is not None:
-            if not hasattr(os, 'setregid'):
-                raise ValueError("The 'group' parameter is not supported on "
-                                 "the current platform")
-            gid = _as_id(group, by_group_name, "Group")
-            if gid is None:
-                raise TypeError("Group must be a string or an integer, not {}"
-                                .format(type(group)))
-        if extra_groups is not None:
-            if not hasattr(os, 'setgroups'):
-                raise ValueError("The 'extra_groups' parameter is not "
-                                 "supported on the current platform")
-            if isinstance(extra_groups, str):
-                raise ValueError("Groups must be a list, not a string")
-            gids = []
-            for item in extra_groups:
-                try:
-                    value = _as_id(item, by_group_name, "Group")
-                except OverflowError as exc:
-                    # an invalid list item is a ValueError, unlike group=
-                    raise ValueError(str(exc)) from None
-                if value is None:
-                    raise TypeError("Items in extra_groups must be a string "
-                                    "or integer, not {}".format(type(item)))
-                gids.append(value)
-        if user is not None:
-            if not hasattr(os, 'setreuid'):
-                raise ValueError("The 'user' parameter is not supported on "
-                                 "the current platform")
-
-            def by_user_name(name):
-                try:
-                    import pwd
-                except ImportError:
-                    raise ValueError("The user parameter cannot be a string "
-                                     "on systems without the pwd module")
-                return pwd.getpwnam(name).pw_uid
-
-            uid = _as_id(user, by_user_name, "User")
-            if uid is None:
-                raise TypeError("User must be a string or an integer")
-        return gid, gids, uid
+    def _open_streams(self, plan, bufsize, line_buffering):
+        # File objects for the ends of the pipes this process keeps.
+        wrap = io.TextIOWrapper
+        if plan.parent[0] != -1:
+            self.stdin = io.open(plan.parent[0], 'wb', bufsize)
+            if self.text_mode:
+                self.stdin = wrap(self.stdin, write_through=True,
+                                  line_buffering=line_buffering,
+                                  encoding=self.encoding, errors=self.errors)
+        if plan.parent[1] != -1:
+            self.stdout = io.open(plan.parent[1], 'rb', bufsize)
+            if self.text_mode:
+                self.stdout = wrap(self.stdout, encoding=self.encoding,
+                                   errors=self.errors)
+        if plan.parent[2] != -1:
+            self.stderr = io.open(plan.parent[2], 'rb', bufsize)
+            if self.text_mode:
+                self.stderr = wrap(self.stderr, encoding=self.encoding,
+                                   errors=self.errors)
 
     def __repr__(self):
-        text = (f"<{self.__class__.__name__}: returncode: {self.returncode} "
-                f"args: {self.args!r}>")
-        return text if len(text) <= 80 else text[:76] + "...>"
+        text = "<{}: returncode: {} args: {!r}>".format(
+            type(self).__name__, self.returncode, self.args)
+        if len(text) > 80:
+            text = text[:76] + "...>"
+        return text
 
     __class_getitem__ = classmethod(types.GenericAlias)
 
     @property
     def universal_newlines(self):
+        # Older name of text_mode, kept for compatibility.
         return self.text_mode
 
     @universal_newlines.setter
     def universal_newlines(self, universal_newlines):
         self.text_mode = bool(universal_newlines)
-
-    def _translate_newlines(self, data, encoding, errors):
-        text = data.decode(encoding, errors)
-        return text.replace("\r\n", "\n").replace("\r", "\n")
 
     def __enter__(self):
         return self
@@ -628,362 +813,273 @@ class Popen:
                 stream.close()
         try:
             if self.stdin:
-                self.stdin.close()
+                self.stdin.close()      # may fail flushing into a dead pipe
         finally:
             if exc_type is KeyboardInterrupt:
-                # The child probably got SIGINT too; give it a short grace
-                # period unless an interrupted wait() already did.
-                if self._sigint_wait_secs > 0:
+                # No open-ended wait after ^C: only what is left of the
+                # grace period, if an interrupted wait() did not use it.
+                if self._ctrl_c_grace > 0:
                     try:
-                        self._wait(timeout=self._sigint_wait_secs)
+                        self._wait(timeout=self._ctrl_c_grace)
                     except TimeoutExpired:
                         pass
-                self._sigint_wait_secs = 0
+                self._ctrl_c_grace = 0
             else:
                 self.wait()
 
-    def __del__(self, _maxsize=sys.maxsize, _warn=warnings.warn):
+    def __del__(self, _warn=warnings.warn, _lost=sys.maxsize):
         if not self._child_created:
-            return
+            return      # the constructor failed, or never got that far
         if self.returncode is None:
             _warn("subprocess %s is still running" % self.pid,
                   ResourceWarning, source=self)
-        self._internal_poll(_deadstate=_maxsize)
+        self._poll_nowait(lost_status=_lost)
         if self.returncode is None and _active is not None:
-            _active.append(self)   # reaped later by _cleanup()
+            _active.append(self)
 
-    # ------------------------------------------------------------ pipes
+    # -- starting the child
 
-    def _get_devnull(self):
-        if not hasattr(self, '_devnull'):
-            self._devnull = os.open(os.devnull, os.O_RDWR)
-        return self._devnull
-
-    def _new_pipe(self):
-        r, w = os.pipe()
-        if self.pipesize > 0 and fcntl is not None and \
-                hasattr(fcntl, "F_SETPIPE_SZ"):
-            fcntl.fcntl(w, fcntl.F_SETPIPE_SZ, self.pipesize)
-        return r, w
-
-    def _target_fd(self, spec):
-        if spec == DEVNULL:
-            return self._get_devnull()
-        if isinstance(spec, int):
-            return spec
-        return spec.fileno()
-
-    def _get_handles(self, stdin, stdout, stderr):
-        """Descriptors (p2cread, p2cwrite, c2pread, c2pwrite, errread,
-        errwrite); -1 where nothing is redirected."""
-        p2cread = p2cwrite = c2pread = c2pwrite = errread = errwrite = -1
-        if stdin == PIPE:
-            p2cread, p2cwrite = self._new_pipe()
-        elif stdin is not None:
-            p2cread = self._target_fd(stdin)
-        if stdout == PIPE:
-            c2pread, c2pwrite = self._new_pipe()
-        elif stdout is not None:
-            c2pwrite = self._target_fd(stdout)
-        if stderr == PIPE:
-            errread, errwrite = self._new_pipe()
-        elif stderr == STDOUT:
-            errwrite = c2pwrite if c2pwrite != -1 else sys.__stdout__.fileno()
-        elif stderr is not None:
-            errwrite = self._target_fd(stderr)
-        return p2cread, p2cwrite, c2pread, c2pwrite, errread, errwrite
-
-    def _close_pipe_fds(self, p2cread, p2cwrite, c2pread, c2pwrite,
-                        errread, errwrite):
-        # the parent no longer needs the child's ends
-        devnull = getattr(self, '_devnull', None)
-        pending = [child for child, parent in ((p2cread, p2cwrite),
-                                               (c2pwrite, c2pread),
-                                               (errwrite, errread))
-                   if child != -1 and parent != -1 and child != devnull]
-        if devnull is not None:
-            pending.append(devnull)
-        with contextlib.ExitStack() as stack:
-            for fd in pending:
-                stack.callback(os.close, fd)
-        self._closed_child_pipe_fds = True
-
-    # ------------------------------------------------------------ spawning
-
-    def _execute_child(self, args, executable, preexec_fn, close_fds,
-                       pass_fds, cwd, env,
-                       startupinfo, creationflags, shell,
-                       p2cread, p2cwrite, c2pread, c2pwrite,
-                       errread, errwrite, restore_signals,
-                       gid, gids, uid, umask,
-                       start_new_session, process_group):
-        """Start the child process (POSIX)."""
+    def _execute_child(self, args, executable, shell, cwd, env, plan, options):
+        """Start the program in a new process (with fork_exec())."""
         if isinstance(args, (str, bytes)):
-            args = [args]
+            argv = [args]
         elif isinstance(args, os.PathLike):
             if shell:
                 raise TypeError('path-like args is not allowed when '
                                 'shell is true')
-            args = [args]
+            argv = [args]
         else:
-            args = list(args)
+            argv = list(args)
         if shell:
             sh = ('/system/bin/sh' if hasattr(sys, 'getandroidapilevel')
                   else '/bin/sh')
-            args = [executable or sh, "-c", *args]
+            argv = [executable or sh, "-c", *argv]
         if executable is None:
-            executable = args[0]
+            executable = argv[0]
 
-        sys.audit("subprocess.Popen", executable, args, cwd, env)
-
+        sys.audit("subprocess.Popen", executable, argv, cwd, env)
         if _fork_exec is None:
             raise OSError(errno.ENOTSUP, "fork_exec() is not available")
 
-        # Everything is converted before forking: the child must not
-        # allocate or run Python code (except preexec_fn).
-        env_list = None
-        if env is not None:
-            env_list = []
-            for key, value in env.items():
-                key = os.fsencode(key)
-                if b'=' in key:
-                    raise ValueError("illegal environment variable name")
-                env_list.append(key + b'=' + os.fsencode(value))
-        program = os.fsencode(executable)
-        if os.path.dirname(program):
-            candidates = (program,)
-        else:
-            candidates = tuple(os.path.join(os.fsencode(d), program)
-                               for d in os.get_exec_path(env))
+        # Convert everything first: between fork and exec the child runs no
+        # Python code (preexec_fn aside).
+        env_block = None if env is None else _environment_block(env)
+        candidates = _executable_candidates(executable, env)
 
+        # The child writes a failure report into this pipe; its write end is
+        # close-on-exec, so EOF without data means exec() succeeded.
         report_r, report_w = os.pipe()
-        # keep the report pipe above 0-2, which the child overwrites
-        spares = []
-        while report_w < 3:
-            spares.append(report_w)
-            report_w = os.dup(report_w)
-        for fd in spares:
-            os.close(fd)
-
         try:
+            report_w = _fd_above_stdio(report_w)
             try:
-                keep = sorted({*map(int, pass_fds), report_w})
+                keep = tuple(sorted({*map(int, options.pass_fds), report_w}))
                 self.pid = _fork_exec(
-                    args, candidates, close_fds, tuple(keep), cwd, env_list,
-                    p2cread, p2cwrite, c2pread, c2pwrite, errread, errwrite,
-                    report_r, report_w, restore_signals, start_new_session,
-                    process_group, gid, gids, uid, umask, preexec_fn)
+                    argv, candidates, options.close_fds, keep, cwd, env_block,
+                    *plan.fork_exec_fds(), report_r, report_w,
+                    options.restore_signals, options.start_new_session,
+                    options.process_group, options.gid, options.gids,
+                    options.uid, options.umask, options.preexec_fn)
                 self._child_created = True
             finally:
                 os.close(report_w)
-            self._close_pipe_fds(p2cread, p2cwrite, c2pread, c2pwrite,
-                                 errread, errwrite)
-            # The report pipe is close-on-exec: EOF without data means the
-            # exec succeeded.
-            report = bytearray()
-            while len(report) <= 50000:
-                chunk = os.read(report_r, 50000)
-                if not chunk:
-                    break
-                report += chunk
+            plan.release_child_side()
+            report = _read_all(report_r, 50000)
         finally:
             os.close(report_r)
 
         if report:
-            try:
-                pid, status = os.waitpid(self.pid, 0)
-            except ChildProcessError:
-                pass
-            else:
-                if pid == self.pid:
-                    self._handle_exitstatus(status)
-                else:
-                    self.returncode = sys.maxsize
-            raise _decode_child_error(report, cwd, executable)
+            self._reap_failed_child()
+            raise _child_failure(report, cwd, executable)
 
-    # ------------------------------------------------------------ waiting
-
-    def _handle_exitstatus(self, sts, _reap=_reap):
-        if _reap.WIFSTOPPED(sts):
-            self.returncode = -_reap.WSTOPSIG(sts)
+    def _reap_failed_child(self):
+        # The child exits right after reporting; collect it so it does not
+        # linger as a zombie.
+        try:
+            pid, status = os.waitpid(self.pid, 0)
+        except ChildProcessError:
+            return
+        if pid == self.pid:
+            self._record_status(status)
         else:
-            self.returncode = _reap.waitstatus_to_exitcode(sts)
+            self.returncode = sys.maxsize
 
-    def _internal_poll(self, _deadstate=None, _reap=_reap):
-        """Non-blocking reap attempt (usable from __del__ at shutdown)."""
+    # -- exit status
+
+    def _record_status(self, status):
+        tools = self._os
+        if tools.WIFSTOPPED(status):
+            self.returncode = -tools.WSTOPSIG(status)
+        else:
+            self.returncode = tools.waitstatus_to_exitcode(status)
+
+    def _reap_locked(self, flags):
+        """One waitpid() call; the caller holds _reap_lock.
+
+        True when the child has been collected.
+        """
+        if self.returncode is not None:
+            return True
+        try:
+            pid, status = self._os.waitpid(self.pid, flags)
+        except ChildProcessError:
+            # Somebody else reaped it (or SIGCHLD is ignored): it is gone
+            # and its status is lost.
+            self.returncode = 0
+            return True
+        if pid == self.pid:
+            self._record_status(status)
+            return True
+        return False    # still running (or a spurious wake-up)
+
+    def _poll_nowait(self, lost_status=None):
+        """Collect the child if it has exited, without blocking.
+
+        Returns the returncode, or None.  If another thread is reaping it
+        right now, gives up at once.  lost_status is recorded when
+        waitpid() fails for another reason (used while finalizing).
+        """
         if self.returncode is not None:
             return self.returncode
-        if not self._waitpid_lock.acquire(False):
-            return None   # someone else is waiting on the child right now
+        if not self._reap_lock.acquire(False):
+            return None
         try:
-            if self.returncode is None:
-                pid, sts = _reap.waitpid(self.pid, _reap.WNOHANG)
-                if pid == self.pid:
-                    self._handle_exitstatus(sts)
-        except OSError as exc:
-            if _deadstate is not None:
-                self.returncode = _deadstate
-            elif exc.errno == _reap.ECHILD:
-                # reaped behind our back (e.g. SIGCHLD ignored): status lost
-                self.returncode = 0
+            self._reap_locked(self._os.WNOHANG)
+        except OSError:
+            if lost_status is not None:
+                self.returncode = lost_status
         finally:
-            self._waitpid_lock.release()
+            self._reap_lock.release()
         return self.returncode
 
     def poll(self):
-        """Return the returncode if the child has exited, else None."""
-        return self._internal_poll()
+        """Return the returncode if the child has finished, else None."""
+        return self._poll_nowait()
 
-    def _try_wait(self, wait_flags):
+    def _try_reap(self):
+        # A non-blocking attempt that skips (False) if another thread holds
+        # the lock; unlike poll() it lets unexpected errors through.
+        if not self._reap_lock.acquire(False):
+            return self.returncode is not None
         try:
-            return os.waitpid(self.pid, wait_flags)
-        except ChildProcessError:
-            return self.pid, 0   # already reaped elsewhere
-
-    def _reap_nowait(self):
-        """One WNOHANG reap attempt under the lock; True when done."""
-        if not self._waitpid_lock.acquire(False):
-            return False
-        try:
-            if self.returncode is not None:
-                return True
-            pid, sts = self._try_wait(os.WNOHANG)
-            if pid == self.pid:
-                self._handle_exitstatus(sts)
-                return True
-            return False
+            return self._reap_locked(os.WNOHANG)
         finally:
-            self._waitpid_lock.release()
+            self._reap_lock.release()
 
     def _wait_pidfd(self, timeout):
-        """Block until the child exits or *timeout* expires, using a pidfd.
-
-        Returns True if the child (probably) exited, False on timeout.
-        Raises OSError if pidfds cannot be used.
-        """
+        """Sleep until the child exits or timeout seconds pass, watching a
+        pidfd.  True if it (probably) exited; OSError if pidfds fail."""
         pidfd = os.pidfd_open(self.pid)
         try:
-            poller = select.poll()
-            poller.register(pidfd, select.POLLIN)
-            # poll() takes an int of milliseconds: clamp huge timeouts
-            ms = min(max(timeout, 0) * 1000, 2 ** 31 - 1)
-            return bool(poller.poll(int(-(-ms // 1))))
+            watcher = select.poll()
+            watcher.register(pidfd, select.POLLIN)
+            millis = -(-max(timeout, 0) * 1000 // 1)       # rounded up
+            return bool(watcher.poll(int(min(millis, 2 ** 31 - 1))))
         finally:
             os.close(pidfd)
 
     def _wait_kqueue(self, timeout):
-        """Like _wait_pidfd(), with a kqueue process filter (BSD)."""
-        kq = select.kqueue()
+        """Like _wait_pidfd(), with a kqueue process-exit filter."""
+        queue = select.kqueue()
         try:
-            ev = select.kevent(self.pid, filter=select.KQ_FILTER_PROC,
-                               flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
-                               fflags=select.KQ_NOTE_EXIT)
-            timeout = min(max(timeout, 0), 1e8)
-            return bool(kq.control([ev], 1, timeout))
+            event = select.kevent(self.pid, filter=select.KQ_FILTER_PROC,
+                                  flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                                  fflags=select.KQ_NOTE_EXIT)
+            return bool(queue.control([event], 1, min(max(timeout, 0), 1e8)))
         finally:
-            kq.close()
+            queue.close()
+
+    def _kernel_waiter(self):
+        if _CAN_USE_PIDFD_OPEN:
+            return self._wait_pidfd
+        if _CAN_USE_KQUEUE:
+            return self._wait_kqueue
+        return None
 
     def _wait(self, timeout):
-        """wait() without KeyboardInterrupt handling."""
+        """wait() without the KeyboardInterrupt handling."""
         if self.returncode is not None:
             return self.returncode
         if timeout is None:
-            while self.returncode is None:
-                with self._waitpid_lock:
-                    if self.returncode is not None:
-                        break
-                    pid, sts = self._try_wait(0)
-                    # waitpid() may spuriously return another value: retry
-                    if pid == self.pid:
-                        self._handle_exitstatus(sts)
-            return self.returncode
+            while True:
+                with self._reap_lock:
+                    if self._reap_locked(0):
+                        return self.returncode
 
         deadline = _time() + timeout
-        if self._reap_nowait():
+        if self._try_reap():
             return self.returncode
-        # Fast path: sleep in the kernel until the child exits.
-        fast = None
-        if _CAN_USE_PIDFD_OPEN:
-            fast = self._wait_pidfd
-        elif _CAN_USE_KQUEUE:
-            fast = self._wait_kqueue
-        if fast is not None:
+        # Sleep in the kernel until the child exits, if the platform can
+        # tell us; if it cannot (or it fails), poll with growing pauses.
+        waiter = self._kernel_waiter()
+        while waiter is not None:
+            left = deadline - _time()
             try:
-                # one kernel wait is at most _MAXIMUM_WAIT_TIMEOUT long; only
-                # the real deadline ends the wait
-                while True:
-                    remaining = deadline - _time()
-                    if fast(max(min(remaining, _MAXIMUM_WAIT_TIMEOUT), 0)):
-                        break
-                    if deadline - _time() <= 0:
-                        raise TimeoutExpired(self.args, timeout)
+                exited = waiter(min(max(left, 0), _MAXIMUM_WAIT_TIMEOUT))
             except OSError:
-                pass   # fall back to polling below
-            else:
-                if self._reap_nowait():
+                break
+            if exited:
+                if self._try_reap():
                     return self.returncode
-        # Polling with an increasing delay (capped at 50 ms).
-        delay = 0.0005
-        while not self._reap_nowait():
-            remaining = deadline - _time()
-            if remaining <= 0:
+                break       # notified, but not reapable yet: poll
+            if deadline - _time() <= 0:
                 raise TimeoutExpired(self.args, timeout)
-            delay = min(delay * 2, remaining, 0.05)
-            time.sleep(delay)
+        pause = 0.0005
+        while not self._try_reap():
+            left = deadline - _time()
+            if left <= 0:
+                raise TimeoutExpired(self.args, timeout)
+            pause = min(pause * 2, left, 0.05)
+            time.sleep(pause)
         return self.returncode
 
-    def _remaining_time(self, endtime):
-        return None if endtime is None else endtime - _time()
-
-    def _interrupted_wait(self, endtime):
-        # After Ctrl-C give the child a short chance to exit, then re-raise.
-        grace = self._sigint_wait_secs
-        if endtime is not None:
-            grace = min(grace, self._remaining_time(endtime))
-        self._sigint_wait_secs = 0
+    def _grace_after_interrupt(self, deadline):
+        # ^C arrived while we were waiting: allow the child the grace period
+        # (bounded by the caller's own deadline) once, then let it go.
+        grace = self._ctrl_c_grace
+        if deadline is not None:
+            grace = min(grace, deadline - _time())
+        self._ctrl_c_grace = 0
         try:
             self._wait(timeout=grace)
         except TimeoutExpired:
             pass
 
     def wait(self, timeout=None):
-        """Wait for the child to exit and return its returncode."""
-        endtime = None if timeout is None else _time() + timeout
+        """Wait for the child to finish and return its returncode.
+
+        Raises TimeoutExpired if timeout seconds pass first.
+        """
+        deadline = None if timeout is None else _time() + timeout
         try:
             return self._wait(timeout=timeout)
         except KeyboardInterrupt:
-            self._interrupted_wait(endtime)
+            self._grace_after_interrupt(deadline)
             raise
 
-    # ------------------------------------------------------------ communicate
+    # -- talking to the child
 
     def _stdin_write(self, input):
-        def tolerant(action):
-            try:
-                action()
-            except BrokenPipeError:
-                pass   # the child stopped reading
-            except OSError as exc:
-                if exc.errno != errno.EINVAL:
-                    raise
+        # Blocking write of the whole input, then EOF; a child that stops
+        # reading early is not an error.
         if input:
-            tolerant(lambda: self.stdin.write(input))
-        tolerant(self.stdin.close)
+            _ignoring_broken_pipe(self.stdin.write, input)
+        _ignoring_broken_pipe(self.stdin.close)
 
     def communicate(self, input=None, timeout=None):
-        """Feed *input* to stdin, collect stdout/stderr until EOF and wait
-        for the child.  Returns (stdout_data, stderr_data).
+        """Send input to the child, read its output until EOF and wait for
+        it to exit.  Returns (stdout data, stderr data); an element is None
+        when that stream is not a PIPE.
 
-        On timeout TimeoutExpired is raised; the child keeps running and
-        communicate() can be called again.
+        If timeout seconds pass first, TimeoutExpired is raised; the child
+        keeps running and communicate() can be called again (without input)
+        to carry on where this call stopped.
         """
         if self._communication_started and input:
             raise ValueError("Cannot send input after starting communication")
 
-        streams = [s for s in (self.stdin, self.stdout, self.stderr) if s]
-        if timeout is None and not self._communication_started \
-                and len(streams) <= 1:
-            # a single (or no) pipe: plain blocking I/O is enough
+        pipes = [s for s in (self.stdin, self.stdout, self.stderr) if s]
+        if timeout is None and not self._communication_started and len(pipes) < 2:
+            # At most one pipe: simple blocking I/O cannot deadlock.
             out = err = None
             if self.stdin:
                 self._stdin_write(input)
@@ -996,142 +1092,129 @@ class Popen:
             self.wait()
             return out, err
 
-        endtime = None if timeout is None else _time() + timeout
+        deadline = None if timeout is None else _time() + timeout
         try:
-            out, err = self._communicate(input, endtime, timeout)
+            out, err = self._communicate(input, deadline, timeout)
         except KeyboardInterrupt:
-            self._interrupted_wait(endtime)
+            self._grace_after_interrupt(deadline)
             raise
         finally:
             self._communication_started = True
-        self.wait(timeout=self._remaining_time(endtime))
-        return out, err
+        try:
+            self.wait(timeout=None if deadline is None else deadline - _time())
+        except TimeoutExpired as exc:
+            exc.timeout = timeout
+            raise
+        return self._decoded(out, self.stdout), self._decoded(err, self.stderr)
 
-    def _save_input(self, input):
-        # The encoded input and the write offset survive a timeout so that
-        # a later communicate() resumes where the previous one stopped.
-        if self.stdin and self._input is None:
-            self._input_offset = 0
-            self._input = input
-            if input is not None and self.text_mode:
-                self._input = input.encode(self.stdin.encoding,
-                                           self.stdin.errors)
-            elif input is not None and not isinstance(input, bytes):
-                # offsets count bytes, whatever the buffer's item size
-                try:
-                    self._input = memoryview(input).cast('B')
-                except TypeError:
-                    self._input = bytes(memoryview(input))
+    def _decoded(self, data, stream):
+        if data is None or not self.text_mode:
+            return data
+        text = data.decode(stream.encoding, stream.errors)
+        return text.replace("\r\n", "\n").replace("\r", "\n")
 
-    def _check_timeout(self, endtime, orig_timeout, stdout_seq, stderr_seq,
-                       skip_check_and_raise=False):
-        if endtime is None:
-            return
-        if skip_check_and_raise or _time() > endtime:
-            raise TimeoutExpired(
-                self.args, orig_timeout,
-                output=b''.join(stdout_seq) if stdout_seq else None,
-                stderr=b''.join(stderr_seq) if stderr_seq else None)
+    def _outgoing(self, input):
+        # The input as a flat byte buffer whose offsets count bytes.
+        if input is None:
+            return None
+        if self.text_mode:
+            return memoryview(input.encode(self.stdin.encoding,
+                                           self.stdin.errors))
+        try:
+            return memoryview(input).cast('B')
+        except TypeError:
+            return memoryview(bytes(memoryview(input)))
 
-    def _communicate(self, input, endtime, orig_timeout):
-        if self.stdin and not self._communication_started:
+    def _start_exchange(self, input):
+        stdin = self.stdin
+        if stdin:
+            # Push out whatever the caller wrote before; a closed or broken
+            # pipe here is not an error.
             try:
-                self.stdin.flush()
+                stdin.flush()
             except BrokenPipeError:
                 pass
             except ValueError:
-                if not self.stdin.closed:
+                if not stdin.closed:
                     raise
             if not input:
-                try:
-                    self.stdin.close()
-                except BrokenPipeError:
-                    pass
+                _ignoring_broken_pipe(stdin.close)
+        outgoing = self._outgoing(input) if stdin else None
+        readers = [s for s in (self.stdout, self.stderr) if s]
+        return _Exchange(outgoing, readers)
 
-        if not self._communication_started:
-            self._chunks = {s: [] for s in (self.stdout, self.stderr) if s}
-        out_chunks = self._chunks.get(self.stdout) if self.stdout else None
-        err_chunks = self._chunks.get(self.stderr) if self.stderr else None
+    def _communicate(self, input, deadline, timeout):
+        """Multiplex the pipes until every one is closed or the deadline
+        passes; returns the raw (stdout, stderr) bytes."""
+        if self._exchange is None or not self._communication_started:
+            self._exchange = self._start_exchange(input)
+        exchange = self._exchange
+        stdin = self.stdin
 
-        self._save_input(input)
-        pending = memoryview(self._input) if self._input else None
-
-        with _PopenSelector() as sel:
-            # a call resumed after a timeout passes no input but still owes
-            # the child the rest of the earlier input (and the EOF after it)
-            if self.stdin and self._input and not self.stdin.closed:
-                if self._input_offset < len(self._input):
-                    sel.register(self.stdin, selectors.EVENT_WRITE)
+        with _PopenSelector() as selector:
+            if exchange.outgoing is not None and stdin and not stdin.closed:
+                if exchange.unsent():
+                    selector.register(stdin, selectors.EVENT_WRITE)
                 else:
-                    try:
-                        self.stdin.close()
-                    except BrokenPipeError:
-                        pass
+                    # Everything went out before an earlier timeout; the
+                    # EOF is still owed.
+                    _ignoring_broken_pipe(stdin.close)
             for stream in (self.stdout, self.stderr):
                 if stream and not stream.closed:
-                    sel.register(stream, selectors.EVENT_READ)
+                    selector.register(stream, selectors.EVENT_READ)
 
-            while sel.get_map():
-                remaining = self._remaining_time(endtime)
-                if remaining is not None and remaining < 0:
-                    self._check_timeout(endtime, orig_timeout, out_chunks,
-                                        err_chunks, skip_check_and_raise=True)
-                ready = sel.select(remaining)
-                self._check_timeout(endtime, orig_timeout, out_chunks,
-                                    err_chunks)
+            received = exchange.received
+            outgoing = exchange.outgoing
+            chunk = _PIPE_BUF
+            while selector.get_map():
+                left = None if deadline is None else deadline - _time()
+                if left is not None and left < 0:
+                    self._raise_timeout(timeout)
+                ready = selector.select(left)
+                if deadline is not None and _time() > deadline:
+                    self._raise_timeout(timeout)
                 for key, _ in ready:
                     stream = key.fileobj
-                    if stream is self.stdin:
-                        piece = pending[self._input_offset:
-                                        self._input_offset + _PIPE_BUF]
+                    if stream is stdin:
+                        start = exchange.written
                         try:
-                            self._input_offset += os.write(key.fd, piece)
+                            exchange.written = start + os.write(
+                                key.fd, outgoing[start:start + chunk])
                         except BrokenPipeError:
-                            done = True
-                        else:
-                            done = self._input_offset >= len(self._input)
-                        if done:
-                            sel.unregister(stream)
-                            stream.close()
+                            exchange.written = len(outgoing)    # nobody reads it
+                        finished = exchange.written >= len(outgoing)
                     else:
                         data = os.read(key.fd, 32768)
-                        if not data:
-                            sel.unregister(stream)
-                            stream.close()
-                        self._chunks[stream].append(data)
+                        received[stream].append(data)
+                        finished = not data
+                    if finished:
+                        selector.unregister(stream)
+                        stream.close()
 
-        try:
-            self.wait(timeout=self._remaining_time(endtime))
-        except TimeoutExpired as exc:
-            exc.timeout = orig_timeout
-            raise
+        return exchange.collected(self.stdout), exchange.collected(self.stderr)
 
-        out = b''.join(out_chunks) if out_chunks is not None else None
-        err = b''.join(err_chunks) if err_chunks is not None else None
-        if self.text_mode:
-            if out is not None:
-                out = self._translate_newlines(out, self.stdout.encoding,
-                                               self.stdout.errors)
-            if err is not None:
-                err = self._translate_newlines(err, self.stderr.encoding,
-                                               self.stderr.errors)
-        return out, err
+    def _raise_timeout(self, timeout):
+        exchange = self._exchange
+        raise TimeoutExpired(self.args, timeout,
+                             output=exchange.partial(self.stdout),
+                             stderr=exchange.partial(self.stderr))
 
-    # ------------------------------------------------------------ signals
+    # -- signals
 
     def send_signal(self, sig):
-        """Send *sig* to the child unless it is already known to be dead."""
-        # reap first so that a recycled pid is never signalled
+        """Send signal sig to the child, unless it is known to have exited."""
+        # Collect a finished child first: once reaped, its pid may already
+        # belong to an unrelated process.
         self.poll()
         if self.returncode is not None:
             return
         try:
             os.kill(self.pid, sig)
         except ProcessLookupError:
-            pass
+            pass        # exited between poll() and kill()
 
     def terminate(self):
-        """Terminate the child (SIGTERM)."""
+        """Ask the child to stop (SIGTERM)."""
         self.send_signal(signal.SIGTERM)
 
     def kill(self):
