@@ -28,6 +28,8 @@ const fn make_crc_tables() -> [[u32; 256]; 16] {
     t
 }
 
+// (mem1) in the cold read-only section (crates/launcher/docs.ld): no start-up reads it
+#[unsafe(link_section = ".rodata.rpycold")]
 static CRC_TABLES: [[u32; 256]; 16] = make_crc_tables();
 
 /// Update a CRC-32 with `data` (zlib's `crc32(crc, buf, len)` semantics).
@@ -305,6 +307,7 @@ const fn make_crc64_tables() -> [[u64; 256]; 8] {
     t
 }
 
+#[unsafe(link_section = ".rodata.rpycold")]
 static CRC64_TABLES: [[u64; 256]; 8] = make_crc64_tables();
 
 pub fn crc64(crc: u64, data: &[u8]) -> u64 {

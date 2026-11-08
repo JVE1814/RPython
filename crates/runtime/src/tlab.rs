@@ -28,9 +28,13 @@ const MAGIC: u32 = 0x5250_5947; // "RPYG"
 /// Block sizes. The 8-byte steps below 96 are used by GC objects only (instances with
 /// inline attributes, tuples, lists): other allocations are rounded to 16 bytes, which
 /// PyObject_Malloc callers may rely on for alignment.
-pub const CLASSES: [usize; 36] = [
-    16, 32, 40, 48, 56, 64, 72, 80, 88, 96, 112, 128, 144, 160, 176, 192, 224, 256, 288, 320, 352, 384, 448, 512, 576, 640, 704, 768, 832, 896,
-    960, 1024, 1280, 1536, 1792, 2048,
+/// (mem1) From 384 bytes on the steps are 32 bytes up to 1 KiB and 128 bytes up to 2 KiB
+/// (were 64 and 256): at most ~11% of a block is rounding (was up to 25%, e.g. a 100-item
+/// list's 800-byte item array took 832, a 1040-byte buffer 1280). A class that is used
+/// costs only the pages it carves, so the extra classes cost no memory when unused.
+pub const CLASSES: [usize; 50] = [
+    16, 32, 40, 48, 56, 64, 72, 80, 88, 96, 112, 128, 144, 160, 176, 192, 224, 256, 288, 320, 352, 384, 416, 448, 480, 512, 544, 576, 608, 640,
+    672, 704, 736, 768, 800, 832, 864, 896, 928, 960, 992, 1024, 1152, 1280, 1408, 1536, 1664, 1792, 1920, 2048,
 ];
 pub const MAX_SMALL: usize = 2048;
 const NCLASSES: usize = CLASSES.len();
@@ -41,6 +45,8 @@ pub const KIND_GC_MANAGED: usize = 2;
 const NKINDS: usize = 3;
 /// Free lists: one per (kind, class); index `kind * NCLASSES + class`.
 const NSLOTS: usize = NKINDS * NCLASSES;
+// slots are stored as u8 (SLOT_OF)
+const _: () = assert!(NSLOTS <= 256);
 /// Pre-header bytes in front of the object in a block of each kind.
 const KIND_PRE: [usize; NKINDS] = [0, 0, 16];
 
@@ -679,6 +685,35 @@ pub unsafe fn for_each_gc_block(mut f: impl FnMut(*mut crate::ffi::PyObject)) {
             page += PAGE;
         }
     }
+}
+
+/// (mem1) Per free-list slot: (kind, block size, pages, carved bytes, blocks cached free by
+/// the calling thread). For `sys._debugmallocstats()`; a racy snapshot.
+pub fn slot_stats() -> Vec<(usize, usize, usize, usize, usize)> {
+    let mut pages = [0usize; NSLOTS];
+    let mut carved = [0usize; NSLOTS];
+    let n = NSEGS.load(Acquire);
+    for s in 0..n {
+        let seg = SEGS[s].load(Acquire);
+        let mut page = seg;
+        while page < seg + SEGMENT {
+            let h = page as *const PageHeader;
+            unsafe {
+                if std::ptr::read_volatile(&(*h).magic) != MAGIC {
+                    break;
+                }
+                let slot = (*h).class as usize;
+                pages[slot] += 1;
+                carved[slot] += (*h).carved.load(Acquire) - (*h).first;
+            }
+            page += PAGE;
+        }
+    }
+    let tc = unsafe { &*(&raw const TC) };
+    (0..NSLOTS)
+        .filter(|&s| pages[s] != 0)
+        .map(|s| (s / NCLASSES, CLASSES[s % NCLASSES], pages[s], carved[s], tc.counts[s] as usize))
+        .collect()
 }
 
 /// Layout of the per-thread cache for JIT-generated inline allocation/free (jit
