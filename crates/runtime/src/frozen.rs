@@ -37,9 +37,12 @@ impl Entry {
     }
 }
 
+// (mem1) The sources live in the cold read-only section: a start runs the start-up image
+// and reads a source only when the image has no record for it (or for `_imp`'s
+// `get_frozen_object(..., data=True)`).
 macro_rules! lib {
     ($p:literal) => {
-        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Lib/", $p))
+        crate::cold_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Lib/", $p))
     };
 }
 

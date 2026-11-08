@@ -27,7 +27,8 @@ use crate::mdefs;
 use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-const PURE_SOURCE: &str = include_str!("../../../../Lib/_pydatetime.py");
+// (mem1) in the cold read-only section: only read when the C implementation is not used
+static PURE_SOURCE: &str = crate::cold_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Lib/_pydatetime.py"));
 
 // ===================================================================== layouts
 
