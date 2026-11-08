@@ -141,8 +141,13 @@ global lock taken around calls into such modules, or a GIL mode.
   ("memory allocation of 223053624 bytes failed"; memory growth over the 73-minute run).
 * test_repl test_toplevel_contextvars_async fails on core too (not from this branch).
 
-## Verification (after merging core, HEAD 85b6a2d)
-* `tools/jit_tests/run.sh` and `tools/stress/run.sh`: all pass.
+## Verification (after merging core again: HEAD f57a853, core 48d428e)
+* `tools/jit_tests/run.sh` and `tools/stress/run.sh`: all pass (on the f57a853 snapshot).
+* After the second merge: step-2 packages, tornado and a pandas subset (copy_view, io/xml,
+  frame/methods) unchanged; numpy and the full pandas run above are from 85b6a2d. In the
+  pandas subset run alone, test_to_records_with_Mapping_type needs `email.message` imported
+  by something earlier (it passes in the full run); CPython's importlib.metadata imports it
+  as a side effect, ours does not.
 * `<snapshot>/bin/python3 -m test test_capi test_threading test_sys test_free_threading`:
   all 60 test files OK. Also run clean: test_decimal, test_re, test_zlib, test_gzip,
   test_zipfile, test_tarfile, test_pyexpat, test_xml_etree(_c), test_sax, test_minidom,
