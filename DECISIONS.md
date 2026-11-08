@@ -394,3 +394,12 @@ lays out its shared archive along the same lines: hot and cold metadata in separ
 list decays whenever a merge renames start-up functions, so the coordinator refreshes it after each merge into core:
 `ORDER_REFRESH=1 tools/bench/perf/gen_order.sh <snapshot>/bin/python3`. The PGO build refreshes its own order with
 tools/pgo/reorder.sh. New big constant tables must be marked cold.
+
+## D38 — JIT code cache near the executable, shared call routines (perf8)
+The JIT reserves a 256 MB code cache within rel32 reach of the executable, as HotSpot reserves its code cache, so
+calls to runtime helpers are 5-byte `call rel32` and static addresses are RIP-relative. When the reservation is full,
+the JIT stops compiling rather than emitting far calls; `RPYTHON_JIT_FAR=1` forces far calls for testing. Call sites,
+and tier 1's LoadGlobal, go through shared process-wide routines instead of per-site inline sequences, much like
+HotSpot's shared call stubs. A Call site went from about 250 bytes to about 35. Tier 2 places cold blocks at the end of
+the unit and lets hot blocks fall through. The reason: the remaining single-thread gap is instruction-cache misses, not
+instruction count (D36).
