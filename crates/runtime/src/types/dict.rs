@@ -224,6 +224,24 @@ unsafe fn raw_free(p: *mut u8, bytes: usize) {
 /// Bytes before the index array in a data block: (size, cap) of the block.
 const BLOCK_HDR: usize = 16;
 
+/// (mem1) Data blocks of at least this size give their pages back while a resize copies
+/// them (`resize_inner`), every `RELEASE_STEP` entries.
+const RELEASE_MIN: usize = 512 * 1024;
+const RELEASE_STEP: usize = 8192;
+
+/// Return the whole pages inside `[lo, hi)` of the malloc block starting at `block` to the
+/// system (their contents are not needed any more; the block is freed afterwards). Pages
+/// holding the block's first or last bytes are kept: the allocator's own bookkeeping lives
+/// next to them.
+fn release_pages(block: *mut u8, lo: usize, hi: usize) {
+    const PG: usize = 4096;
+    let lo = ((lo.max(block as usize + 1)) + PG - 1) & !(PG - 1);
+    let hi = hi & !(PG - 1);
+    if hi > lo {
+        unsafe { libc::madvise(lo as *mut libc::c_void, hi - lo, libc::MADV_DONTNEED) };
+    }
+}
+
 impl DictTable {
     /// A table with room for `cap` entries (data block allocated, header by value).
     pub fn new(cap: usize) -> DictTable {
@@ -331,17 +349,36 @@ impl DictTable {
         {
             let mask = fresh.size - 1;
             let mut n = 0;
-            for e in self.entries().iter().filter(|e| !e.key.is_null()) {
-                unsafe { *fresh.entries_p.add(n) = *e };
-                let mut perturb = e.hash as usize;
-                let mut i = (e.hash as usize) & mask;
-                let idx = fresh.indices_mut();
-                while idx[i] != EMPTY {
-                    perturb >>= 5;
-                    i = (i.wrapping_mul(5).wrapping_add(perturb).wrapping_add(1)) & mask;
+            // (mem1) a big table that only its owner ever read gives its old pages back
+            // while it is copied: the old index array at once (the copy walks the
+            // entries), then the entries already copied, chunk by chunk. Both blocks
+            // fully resident at once were the peak of a growing dict.
+            let release = self.data_bytes >= RELEASE_MIN && !self.shared_read.load(Relaxed);
+            let block = unsafe { (self.indices_p as *mut u8).sub(BLOCK_HDR) };
+            if release {
+                release_pages(block, self.indices_p as usize, self.entries_p as usize);
+            }
+            let old = self.entries();
+            // chunks of RELEASE_STEP entries (the whole array when nothing is released),
+            // so that the copy loop itself stays as it was
+            let step = if release { RELEASE_STEP } else { old.len().max(1) };
+            for chunk in old.chunks(step) {
+                for e in chunk.iter().filter(|e| !e.key.is_null()) {
+                    unsafe { *fresh.entries_p.add(n) = *e };
+                    let mut perturb = e.hash as usize;
+                    let mut i = (e.hash as usize) & mask;
+                    let idx = fresh.indices_mut();
+                    while idx[i] != EMPTY {
+                        perturb >>= 5;
+                        i = (i.wrapping_mul(5).wrapping_add(perturb).wrapping_add(1)) & mask;
+                    }
+                    idx[i] = n as i32;
+                    n += 1;
                 }
-                idx[i] = n as i32;
-                n += 1;
+                if release {
+                    let end = chunk.as_ptr_range().end as usize;
+                    release_pages(block, chunk.as_ptr() as usize, end);
+                }
             }
             fresh.nentries = n;
             fresh.used = n;

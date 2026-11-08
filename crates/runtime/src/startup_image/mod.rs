@@ -21,7 +21,14 @@ use crate::types::{bytes, int, none, str as pystr, tuple};
 use fmt::In;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-static IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/startup_image.bin"));
+// (mem1) The image has a section of its own (`.rodata.rpyimg`, placed after `.rodata` by
+// crates/launcher/docs.ld): start-up reads its front (strings, the start-up modules' code
+// records) and pieces of the rest; amid the other constants its untouched parts and theirs
+// would share fault-around windows.
+#[unsafe(link_section = ".rodata.rpyimg")]
+static IMAGE_BYTES: [u8; include_bytes!(concat!(env!("OUT_DIR"), "/startup_image.bin")).len()] =
+    *include_bytes!(concat!(env!("OUT_DIR"), "/startup_image.bin"));
+static IMAGE: &[u8] = &IMAGE_BYTES;
 
 struct Index {
     /// (kind, offset of the data, length) per string

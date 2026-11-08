@@ -172,7 +172,8 @@ fn emit(out: &mut String, name: &str, doc: &str, m: &Map) {
         }
         out.push('\n');
     }
-    out.push_str("    ],\n    data: &[\n");
+    // (mem1) the code-point slots (the bulk of each table) go to the cold read-only section
+    out.push_str("    ],\n    data: crate::cold_slice!(u16, [\n");
     for chunk in data.chunks(16) {
         out.push_str("       ");
         for v in chunk {
@@ -180,7 +181,7 @@ fn emit(out: &mut String, name: &str, doc: &str, m: &Map) {
         }
         out.push('\n');
     }
-    out.push_str("    ],\n    wide: &[");
+    out.push_str("    ]),\n    wide: &[");
     if !wide.is_empty() {
         out.push('\n');
         for chunk in wide.chunks(6) {

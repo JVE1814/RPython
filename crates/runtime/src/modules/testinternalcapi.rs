@@ -98,7 +98,7 @@ fn get_tlbc_id(_m: &PyObject, f: &PyObject) -> PyResult {
 /// (tail3) The path-calculation program (modules/getpath.py), compiled: test_getpath
 /// executes it against a mocked namespace when no source checkout is around.
 fn get_getpath_codeobject(_m: &PyObject) -> PyResult {
-    let src = include_str!("getpath.py");
+    let src = crate::cold_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/modules/getpath.py"));
     Ok(crate::compile::compile_str(src, "getpath.py", crate::compile::Mode::Exec, 0, -1)?.code)
 }
 
