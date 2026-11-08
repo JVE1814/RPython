@@ -403,3 +403,15 @@ and tier 1's LoadGlobal, go through shared process-wide routines instead of per-
 HotSpot's shared call stubs. A Call site went from about 250 bytes to about 35. Tier 2 places cold blocks at the end of
 the unit and lets hot blocks fall through. The reason: the remaining single-thread gap is instruction-cache misses, not
 instruction count (D36).
+
+## D41 — Extensions that have not declared free-threading safety enable a real GIL, as in CPython ft (supersedes part of D-interp1)
+Py_mod_gil is part of the ABI contract: a module without `Py_mod_gil = Py_MOD_GIL_NOT_USED`, or a single-phase module
+that has not called PyUnstable_Module_SetGIL, assumes the GIL protects it. Until now we only *reported*
+`sys._is_gil_enabled()` in subinterpreters and never had a GIL. wheels3 found that this makes unmodified wheels like lxml
+racy under threads; on CPython ft, importing lxml turns the GIL back on with a RuntimeWarning. Decision: behave like
+CPython ft. Importing such a module in any interpreter enables a real global lock for that interpreter, unless
+`PYTHON_GIL=0` / `-X gil=0`. With `PYTHON_GIL=1` / `-X gil=1` the lock is on from the start. The lock is held while a
+thread runs in the VM; it is released where the thread detaches (blocking calls, Py_BEGIN_ALLOW_THREADS) and handed over
+at eval-breaker polls on a switch interval (sys.setswitchinterval), including polls inside JIT code. Pure-Python
+programs, and programs that only load free-threading-ready extensions, never take it, so the no-GIL requirement holds
+exactly as it does for CPython ft. HotSpot has no counterpart; the ABI forces this choice.
