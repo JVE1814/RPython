@@ -1944,6 +1944,48 @@ def parse_message_ids(value):
 # MIME headers (RFC 2045, 2231)
 #
 
+def _scan(value, keep_going):
+    # Split *value* after the longest prefix whose characters all satisfy
+    # keep_going(ch).
+    end = 0
+    while end < len(value) and keep_going(value[end]):
+        end += 1
+    return value[:end], value[end:]
+
+
+def _absorb_until_semicolon(value, container):
+    # Move everything up to the next ';' into *container*: phrases, and
+    # specials that cannot start one as 'misplaced-special' terminals.
+    while value and value[0] != ';':
+        if value[0] in PHRASE_ENDS:
+            container.append(ValueTerminal(value[0], 'misplaced-special'))
+            value = value[1:]
+        else:
+            token, value = get_phrase(value)
+            container.append(token)
+    return value
+
+
+def _mime_version_number(value, mv, which, stops):
+    # One of the two numbers of a MIME-Version; *which* is 'major' or
+    # 'minor'.  Whatever stands there is kept, flagged when not digits.
+    text, value = _scan(value, lambda ch: ch not in stops)
+    if text.isdigit():
+        setattr(mv, which, int(text))
+        mv.append(ValueTerminal(text, 'digits'))
+    else:
+        mv.defects.append(errors.InvalidHeaderDefect(
+            "Expected MIME {} version number but found {!r}".format(which, text)))
+        mv.append(ValueTerminal(text, 'xtext'))
+    return value
+
+
+def _incomplete_version(mv):
+    if mv.major is not None:
+        mv.defects.append(errors.InvalidHeaderDefect(
+            "Incomplete MIME version; found only major number"))
+
+
 def parse_mime_version(value):
     """mime-version = [CFWS] 1*digit [CFWS] "." [CFWS] 1*digit [CFWS]"""
     mv = MIMEVersion()
@@ -1957,43 +1999,19 @@ def parse_mime_version(value):
         if not value:
             mv.defects.append(errors.HeaderMissingRequiredValue(
                 "Expected MIME version number but found only CFWS"))
-    digits = ''
-    while value and value[0] != '.' and value[0] not in CFWS_LEADER:
-        digits += value[0]
-        value = value[1:]
-    if not digits.isdigit():
-        mv.defects.append(errors.InvalidHeaderDefect(
-            "Expected MIME major version number but found {!r}".format(digits)))
-        mv.append(ValueTerminal(digits, 'xtext'))
-    else:
-        mv.major = int(digits)
-        mv.append(ValueTerminal(digits, 'digits'))
+    value = _mime_version_number(value, mv, 'major', CFWS_LEADER | {'.'})
     value = _optional_cfws(value, mv)
-    if not value or value[0] != '.':
-        if mv.major is not None:
-            mv.defects.append(errors.InvalidHeaderDefect(
-                "Incomplete MIME version; found only major number"))
+    if value[:1] != '.':
+        _incomplete_version(mv)
         if value:
             mv.append(ValueTerminal(value, 'xtext'))
         return mv
     mv.append(ValueTerminal('.', 'version-separator'))
     value = _optional_cfws(value[1:], mv)
     if not value:
-        if mv.major is not None:
-            mv.defects.append(errors.InvalidHeaderDefect(
-                "Incomplete MIME version; found only major number"))
+        _incomplete_version(mv)
         return mv
-    digits = ''
-    while value and value[0] not in CFWS_LEADER:
-        digits += value[0]
-        value = value[1:]
-    if not digits.isdigit():
-        mv.defects.append(errors.InvalidHeaderDefect(
-            "Expected MIME minor version number but found {!r}".format(digits)))
-        mv.append(ValueTerminal(digits, 'xtext'))
-    else:
-        mv.minor = int(digits)
-        mv.append(ValueTerminal(digits, 'digits'))
+    value = _mime_version_number(value, mv, 'minor', CFWS_LEADER)
     value = _optional_cfws(value, mv)
     if value:
         mv.defects.append(errors.InvalidHeaderDefect(
@@ -2003,15 +2021,9 @@ def parse_mime_version(value):
 
 
 def get_invalid_parameter(value):
-    """Everything up to the next ';' as an invalid parameter."""
+    """Everything up to the next ';', as an invalid parameter."""
     invalid = InvalidParameter()
-    while value and value[0] != ';':
-        if value[0] in PHRASE_ENDS:
-            invalid.append(ValueTerminal(value[0], 'misplaced-special'))
-            value = value[1:]
-        else:
-            token, value = get_phrase(value)
-            invalid.append(token)
+    value = _absorb_until_semicolon(value, invalid)
     return invalid, value
 
 
@@ -2070,239 +2082,291 @@ def get_extended_attribute(value):
 
 
 def get_section(value):
-    """section = "*" digits  (no leading zeros except for 0 itself)"""
-    section = Section()
-    if not value or value[0] != '*':
+    """section = "*" digits   (RFC 2231 continuation number)"""
+    if value[:1] != '*':
         raise errors.HeaderParseError(
             "Expected section but found {}".format(value))
-    section.append(ValueTerminal('*', 'section-marker'))
     value = value[1:]
-    if not value or not value[0].isdigit():
+    digits, rest = _scan(value, str.isdigit)
+    if not digits:
         raise errors.HeaderParseError(
             "Expected section number but found {}".format(value))
-    end = 0
-    while end < len(value) and value[end].isdigit():
-        end += 1
-    digits = value[:end]
-    value = value[end:]
-    if digits[0] == '0' and digits != '0':
+    section = Section()
+    section.append(ValueTerminal('*', 'section-marker'))
+    if len(digits) > 1 and digits[0] == '0':
         section.defects.append(errors.InvalidHeaderDefect(
             "section number has an invalid leading 0"))
     section.number = int(digits)
     section.append(ValueTerminal(digits, 'digits'))
-    return section, value
+    return section, rest
 
 
 def get_value(value):
-    """value = token / quoted-string"""
-    v = Value()
+    """value = token / quoted-string   (with optional leading CFWS)"""
     if not value:
         raise errors.HeaderParseError("Expected value but found end of string")
     leader = None
     if value[0] in CFWS_LEADER:
         leader, value = get_cfws(value)
-    if not value:
-        raise errors.HeaderParseError(
-            "Expected value but found only {}".format(leader))
+        if not value:
+            raise errors.HeaderParseError(
+                "Expected value but found only {}".format(leader))
     if value[0] == '"':
         token, value = get_quoted_string(value)
     else:
         token, value = get_extended_attribute(value)
     if leader is not None:
         token[:0] = [leader]
-    v.append(token)
-    return v, value
+    wrapper = Value()
+    wrapper.append(token)
+    return wrapper, value
+
+
+def _parameter_markers(value, param):
+    # After the attribute: an optional "*N" section and an optional "*"
+    # marking an RFC 2231 extended (charset'lang'-prefixed) value.
+    if value[0] != '*':
+        return value
+    try:
+        section, value = get_section(value)
+    except errors.HeaderParseError:
+        pass
+    else:
+        param.sectioned = True
+        param.append(section)
+    if value[:1] == '*':
+        param.append(ValueTerminal('*', 'extended-parameter-marker'))
+        param.extended = True
+        value = value[1:]
+    if not value:
+        raise errors.HeaderParseError("Incomplete parameter")
+    return value
+
+
+def _looks_encoded(text, section_number):
+    # Could *text* (the inside of a quoted string) be an extended value?
+    # An initial section must start with "charset'"; a later one must be
+    # nothing but extended attrtext.
+    try:
+        if section_number == 0:
+            if text[:1] == "'":
+                return True
+            _, rest = get_attrtext(text)
+            return rest[:1] == "'"
+        _, rest = get_extended_attrtext(text)
+        return not rest
+    except errors.HeaderParseError:
+        return False
+
+
+def _open_quoted_extended(value, param):
+    # An extended value given as a quoted string is invalid but occurs in
+    # the wild.  When its contents look encoded, they are parsed as if
+    # unquoted, into the (emptied) bare-quoted-string of the parse tree.
+    # Returns (container, text to parse, text after the quoted string).
+    qstring, after = get_quoted_string(value)
+    inner = qstring.stripped_value
+    if not _looks_encoded(inner, param.section_number):
+        param.defects.append(errors.InvalidHeaderDefect(
+            "Parameter marked as extended but appears to have a "
+            "quoted string value that is non-encoded"))
+        return param, value, None
+    param.defects.append(errors.InvalidHeaderDefect(
+        "Quoted string value for extended parameter is invalid"))
+    param.append(qstring)
+    container = param
+    for part in qstring:
+        if part.token_type == 'bare-quoted-string':
+            part[:] = []
+            container = part
+            break
+    return container, inner, after
+
+
+def _rfc2231_prefix(value, first, container, param):
+    # charset "'" [language] "'" : *first* is what was parsed before the
+    # first quote (the charset), *value* starts at that quote.
+    if first is not None:
+        charset = first[0]
+        container.append(charset)
+        param.charset = charset.value
+    if value[0] != "'":
+        raise errors.HeaderParseError("Expected RFC2231 char/lang encoding "
+                                      "delimiter, but found {!r}".format(value))
+    container.append(ValueTerminal("'", 'RFC2231-delimiter'))
+    value = value[1:]
+    if value and value[0] != "'":
+        lang, value = get_attrtext(value)
+        container.append(lang)
+        param.lang = lang.value
+        if value[:1] != "'":
+            raise errors.HeaderParseError("Expected RFC2231 char/lang "
+                                          "encoding delimiter, but found {}".format(value))
+    # A missing closing quote at the very end is let through.
+    container.append(ValueTerminal("'", 'RFC2231-delimiter'))
+    return value[1:]
+
+
+def _raw_quoted_contents(value):
+    # The remaining inside of a quoted extended value, kept as qcontent,
+    # whitespace and stray quotes (it is percent-decoded later).
+    contents = Value()
+    while value:
+        if value[0] in WSP:
+            token, value = get_fws(value)
+        elif value[0] == '"':
+            token, value = ValueTerminal('"', 'DQUOTE'), value[1:]
+        else:
+            token, value = get_qcontent(value)
+        contents.append(token)
+    return contents
 
 
 def get_parameter(value):
     """attribute [section] ["*"] [CFWS] "=" value
 
-    Handles RFC 2231 sections and charset'language'value encoding, and
-    tolerates (with defects) extended values that are quoted.
+    The value of an extended parameter (RFC 2231) may carry a
+    charset'language' prefix.  Some invalid but common spellings (quoted
+    extended values, a prefix on a non-extended parameter) are accepted
+    with defects.
     """
     param = Parameter()
-    token, value = get_attribute(value)
-    param.append(token)
+    attribute, value = get_attribute(value)
+    param.append(attribute)
     if not value or value[0] == ';':
         param.defects.append(errors.InvalidHeaderDefect(
-            "Parameter contains name ({}) but no value".format(token)))
+            "Parameter contains name ({}) but no value".format(attribute)))
         return param, value
-    if value[0] == '*':
-        try:
-            token, value = get_section(value)
-            param.sectioned = True
-            param.append(token)
-        except errors.HeaderParseError:
-            pass
-        if not value:
-            raise errors.HeaderParseError("Incomplete parameter")
-        if value[0] == '*':
-            param.append(ValueTerminal('*', 'extended-parameter-marker'))
-            value = value[1:]
-            param.extended = True
+    value = _parameter_markers(value, param)
     if value[0] != '=':
         raise errors.HeaderParseError("Parameter not followed by '='")
     param.append(ValueTerminal('=', 'parameter-separator'))
     value = _optional_cfws(value[1:], param)
 
-    after_quotes = None      # what follows a quoted extended value
-    target = param
-    if param.extended and value and value[0] == '"':
-        # Quoted extended values are invalid, but common; accept them if
-        # their content looks like an extended value.
-        qstring, rest = get_quoted_string(value)
-        inner = qstring.stripped_value
-        plausible = False
-        if param.section_number == 0:
-            if inner and inner[0] == "'":
-                plausible = True
-            else:
-                try:
-                    token, tail = get_attrtext(inner)
-                except errors.HeaderParseError:
-                    pass
-                else:
-                    if tail and tail[0] == "'":
-                        plausible = True
-        else:
-            try:
-                token, tail = get_extended_attrtext(inner)
-            except errors.HeaderParseError:
-                pass
-            else:
-                if not tail:
-                    plausible = True
-        if plausible:
-            param.defects.append(errors.InvalidHeaderDefect(
-                "Quoted string value for extended parameter is invalid"))
-            param.append(qstring)
-            for t in qstring:
-                if t.token_type == 'bare-quoted-string':
-                    t[:] = []
-                    target = t
-                    break
-            value = inner
-            after_quotes = rest
-        else:
-            param.defects.append(errors.InvalidHeaderDefect(
-                "Parameter marked as extended but appears to have a "
-                "quoted string value that is non-encoded"))
-    if value and value[0] == "'":
-        token = None
-    else:
-        token, value = get_value(value)
-    if not param.extended or param.section_number > 0:
-        if not value or value[0] != "'":
-            target.append(token)
-            if after_quotes is not None:
-                assert not value, value
-                value = after_quotes
-            return param, value
+    container, after_quotes = param, None
+    if param.extended and value[:1] == '"':
+        container, value, after_quotes = _open_quoted_extended(value, param)
+
+    first = None
+    if value[:1] != "'":
+        first, value = get_value(value)
+    initial_extended = param.extended and param.section_number == 0
+    if not initial_extended:
+        if value[:1] != "'":
+            # A plain value (or a continuation section): done.
+            container.append(first)
+            return param, (value if after_quotes is None else after_quotes)
         param.defects.append(errors.InvalidHeaderDefect(
             "Apparent initial-extended-value but attribute "
             "was not marked as extended or was not initial section"))
-    if not value:
-        # charset'lang' prefix missing: the token is the value
+
+    if value:
+        value = _rfc2231_prefix(value, first, container, param)
+    else:
         param.defects.append(errors.InvalidHeaderDefect(
             "Missing required charset/lang delimiters"))
-        target.append(token)
+        container.append(first)
         if after_quotes is None:
             return param, value
+
+    if after_quotes is None:
+        encoded, value = get_value(value)
     else:
-        if token is not None:
-            for t in token:
-                if t.token_type == 'extended-attrtext':
-                    break
-            target.append(t)
-            param.charset = t.value
-        if value[0] != "'":
-            raise errors.HeaderParseError("Expected RFC2231 char/lang encoding "
-                                          "delimiter, but found {!r}".format(value))
-        target.append(ValueTerminal("'", 'RFC2231-delimiter'))
-        value = value[1:]
-        if value and value[0] != "'":
-            token, value = get_attrtext(value)
-            target.append(token)
-            param.lang = token.value
-            if not value or value[0] != "'":
-                raise errors.HeaderParseError("Expected RFC2231 char/lang "
-                                              "encoding delimiter, but found {}".format(value))
-        target.append(ValueTerminal("'", 'RFC2231-delimiter'))
-        value = value[1:]
-    if after_quotes is not None:
-        # the rest of the quoted string is the (percent encoded) value
-        v = Value()
-        while value:
-            if value[0] in WSP:
-                token, value = get_fws(value)
-            elif value[0] == '"':
-                token = ValueTerminal('"', 'DQUOTE')
-                value = value[1:]
-            else:
-                token, value = get_qcontent(value)
-            v.append(token)
-        token = v
-    else:
-        token, value = get_value(value)
-    target.append(token)
-    if after_quotes is not None:
-        assert not value, value
-        value = after_quotes
+        encoded, value = _raw_quoted_contents(value), after_quotes
+    container.append(encoded)
     return param, value
 
 
 def parse_mime_parameters(value):
-    """parameter *( ";" parameter )   -- never raises"""
+    """parameter *( ";" parameter )
+
+    Never raises: unparsable entries become invalid-parameter tokens with
+    a defect.
+    """
     params = MimeParameters()
     while value:
         try:
-            token, value = get_parameter(value)
-            params.append(token)
+            param, value = get_parameter(value)
         except errors.HeaderParseError:
-            leader = None
-            if value[0] in CFWS_LEADER:
-                leader, value = get_cfws(value)
-            if not value:
-                params.append(leader)
+            value = _recover_parameter(value, params)
+            if value is None:
                 return params
-            if value[0] == ';':
-                if leader is not None:
-                    params.append(leader)
+        else:
+            params.append(param)
+            if value and value[0] != ';':
+                # Junk after a good parameter spoils it.
+                param.token_type = 'invalid-parameter'
+                junk, value = get_invalid_parameter(value)
+                param.extend(junk)
                 params.defects.append(errors.InvalidHeaderDefect(
-                    "parameter entry with no content"))
-            else:
-                token, value = get_invalid_parameter(value)
-                if leader:
-                    token[:0] = [leader]
-                params.append(token)
-                params.defects.append(errors.InvalidHeaderDefect(
-                    "invalid parameter {!r}".format(token)))
-        if value and value[0] != ';':
-            param = params[-1]
-            param.token_type = 'invalid-parameter'
-            token, value = get_invalid_parameter(value)
-            param.extend(token)
-            params.defects.append(errors.InvalidHeaderDefect(
-                "parameter with invalid trailing text {!r}".format(token)))
+                    "parameter with invalid trailing text {!r}".format(junk)))
         if value:
             params.append(ValueTerminal(';', 'parameter-separator'))
             value = value[1:]
     return params
 
 
+def _recover_parameter(value, params):
+    # get_parameter() failed at *value*: keep its text as an invalid
+    # parameter (or note an empty entry).  Returns the rest, or None when
+    # only CFWS remained.
+    leader = None
+    if value[0] in CFWS_LEADER:
+        leader, value = get_cfws(value)
+        if not value:
+            params.append(leader)
+            return None
+    if value[0] == ';':
+        if leader is not None:
+            params.append(leader)
+        params.defects.append(errors.InvalidHeaderDefect(
+            "parameter entry with no content"))
+        return value
+    invalid, value = get_invalid_parameter(value)
+    if leader:
+        invalid[:0] = [leader]
+    params.append(invalid)
+    params.defects.append(errors.InvalidHeaderDefect(
+        "invalid parameter {!r}".format(invalid)))
+    return value
+
+
 def _find_mime_parameters(tokenlist, value):
-    # Skip junk up to the first ';' and parse what follows as parameters.
-    while value and value[0] != ';':
-        if value[0] in PHRASE_ENDS:
-            tokenlist.append(ValueTerminal(value[0], 'misplaced-special'))
-            value = value[1:]
-        else:
-            token, value = get_phrase(value)
-            tokenlist.append(token)
+    # Keep whatever precedes the first ';' as junk; parse what follows as
+    # parameters.
+    value = _absorb_until_semicolon(value, tokenlist)
+    if value:
+        tokenlist.append(ValueTerminal(';', 'parameter-separator'))
+        tokenlist.append(parse_mime_parameters(value[1:]))
+
+
+def _leading_token(header, value, missing_message):
+    # The first token of a MIME header, appended to *header*; None (after
+    # recording a defect and salvaging parameters) if there is none.
+    try:
+        token, value = get_token(value)
+    except errors.HeaderParseError:
+        header.defects.append(errors.InvalidHeaderDefect(
+            "{} but found {!r}".format(missing_message, value)))
+        _find_mime_parameters(header, value)
+        return None, value
+    header.append(token)
+    return token, value
+
+
+def _trailing_parameters(header, value, what):
+    # ';' parameters after the main value; False if something else follows.
     if not value:
-        return
-    tokenlist.append(ValueTerminal(';', 'parameter-separator'))
-    tokenlist.append(parse_mime_parameters(value[1:]))
+        return True
+    if value[0] != ';':
+        header.defects.append(errors.InvalidHeaderDefect(
+            "Only parameters are valid after {}, but "
+            "found {!r}".format(what, value)))
+        _find_mime_parameters(header, value)
+        return False
+    header.append(ValueTerminal(';', 'parameter-separator'))
+    header.append(parse_mime_parameters(value[1:]))
+    return True
 
 
 def parse_content_type_header(value):
@@ -2312,43 +2376,27 @@ def parse_content_type_header(value):
         ctype.defects.append(errors.HeaderMissingRequiredValue(
             "Missing content type specification"))
         return ctype
-    try:
-        token, value = get_token(value)
-    except errors.HeaderParseError:
-        ctype.defects.append(errors.InvalidHeaderDefect(
-            "Expected content maintype but found {!r}".format(value)))
-        _find_mime_parameters(ctype, value)
+    maintype, value = _leading_token(ctype, value,
+                                     "Expected content maintype")
+    if maintype is None:
         return ctype
-    ctype.append(token)
-    if not value or value[0] != '/':
-        ctype.defects.append(errors.InvalidHeaderDefect("Invalid content type"))
+    if value[:1] != '/':
+        ctype.defects.append(errors.InvalidHeaderDefect(
+            "Invalid content type"))
         if value:
             _find_mime_parameters(ctype, value)
         return ctype
-    ctype.maintype = token.value.strip().lower()
+    ctype.maintype = maintype.value.strip().lower()
     ctype.append(ValueTerminal('/', 'content-type-separator'))
-    value = value[1:]
-    try:
-        token, value = get_token(value)
-    except errors.HeaderParseError:
-        ctype.defects.append(errors.InvalidHeaderDefect(
-            "Expected content subtype but found {!r}".format(value)))
-        _find_mime_parameters(ctype, value)
+    subtype, value = _leading_token(ctype, value[1:],
+                                    "Expected content subtype")
+    if subtype is None:
         return ctype
-    ctype.append(token)
-    ctype.subtype = token.value.strip().lower()
-    if not value:
-        return ctype
-    if value[0] != ';':
-        ctype.defects.append(errors.InvalidHeaderDefect(
-            "Only parameters are valid after content type, but "
-            "found {!r}".format(value)))
-        # an invalid content type is treated as text/plain
+    ctype.subtype = subtype.value.strip().lower()
+    if not _trailing_parameters(ctype, value, 'content type'):
+        # A content type followed by junk is not trusted: fall back to the
+        # default (text/plain).
         del ctype.maintype, ctype.subtype
-        _find_mime_parameters(ctype, value)
-        return ctype
-    ctype.append(ValueTerminal(';', 'parameter-separator'))
-    ctype.append(parse_mime_parameters(value[1:]))
     return ctype
 
 
@@ -2359,30 +2407,17 @@ def parse_content_disposition_header(value):
         disp.defects.append(errors.HeaderMissingRequiredValue(
             "Missing content disposition"))
         return disp
-    try:
-        token, value = get_token(value)
-    except errors.HeaderParseError:
-        disp.defects.append(errors.InvalidHeaderDefect(
-            "Expected content disposition but found {!r}".format(value)))
-        _find_mime_parameters(disp, value)
+    kind, value = _leading_token(disp, value,
+                                 "Expected content disposition")
+    if kind is None:
         return disp
-    disp.append(token)
-    disp.content_disposition = token.value.strip().lower()
-    if not value:
-        return disp
-    if value[0] != ';':
-        disp.defects.append(errors.InvalidHeaderDefect(
-            "Only parameters are valid after content disposition, but "
-            "found {!r}".format(value)))
-        _find_mime_parameters(disp, value)
-        return disp
-    disp.append(ValueTerminal(';', 'parameter-separator'))
-    disp.append(parse_mime_parameters(value[1:]))
+    disp.content_disposition = kind.value.strip().lower()
+    _trailing_parameters(disp, value, 'content disposition')
     return disp
 
 
 def parse_content_transfer_encoding_header(value):
-    """mechanism"""
+    """mechanism   (a single token)"""
     cte = ContentTransferEncoding()
     if not value:
         cte.defects.append(errors.HeaderMissingRequiredValue(
@@ -2396,6 +2431,7 @@ def parse_content_transfer_encoding_header(value):
     else:
         cte.append(token)
         cte.cte = token.value.strip().lower()
+    # Anything else is kept, with one defect per piece.
     while value:
         cte.defects.append(errors.InvalidHeaderDefect(
             "Extra text after content transfer encoding"))
@@ -2611,106 +2647,148 @@ class _Refolder:
         return self.policy.linesep.join(lines) + self.policy.linesep
 
 
-def _fold_as_ew(to_encode, lines, maxlen, last_ew, ew_combine_allowed,
-                charset, leading_whitespace):
-    """Append *to_encode* to *lines* as encoded words, wrapping as needed.
+def _ew_charset(charset):
+    # Plain ASCII text never needs an encoded word; text that does is
+    # written as UTF-8.
+    return 'utf-8' if charset == 'us-ascii' else charset
 
-    If *last_ew* is the start of an encoded word at the end of the last
-    line and combining is allowed, the text is merged into it.  Returns the
-    position of the last encoded word for further combining (or None).
-    """
+
+def _start_ew_run(to_encode, lines, maxlen, last_ew, ew_combine_allowed):
+    # Prepare *to_encode* for encoding.  Text that may join the encoded
+    # word ending the last line is merged with it (that word is taken off
+    # the line and re-encoded); otherwise a leading blank stays plain.
+    # Returns (text, trailing blank, column where the run starts).
     if last_ew is not None and ew_combine_allowed:
         to_encode = str(get_unstructured(lines[-1][last_ew:] + to_encode))
         lines[-1] = lines[-1][:last_ew]
     elif to_encode[0] in WSP:
-        # keep a leading blank unencoded
-        blank = to_encode[0]
-        to_encode = to_encode[1:]
         if len(lines[-1]) == maxlen:
             lines.append(_steal_trailing_WSP_if_exists(lines))
-        lines[-1] += blank
+        lines[-1] += to_encode[0]
+        to_encode = to_encode[1:]
     trailing = ''
     if to_encode[-1] in WSP:
-        trailing = to_encode[-1]
-        to_encode = to_encode[:-1]
-    new_last_ew = len(lines[-1]) if last_ew is None else last_ew
-    encode_as = 'utf-8' if charset == 'us-ascii' else charset
-    chrome_len = len(encode_as) + 7
-    if chrome_len + 1 >= maxlen:
+        to_encode, trailing = to_encode[:-1], to_encode[-1]
+    start = len(lines[-1]) if last_ew is None else last_ew
+    return to_encode, trailing, start
+
+
+def _longest_ew(text, room, charset):
+    # The encoded word for the longest prefix of *text* that fits in
+    # *room* columns: (prefix length, encoded word).
+    take = len(text)
+    word = _ew.encode(text, charset=charset)
+    while len(word) > room:
+        take -= 1
+        word = _ew.encode(text[:take], charset=charset)
+    return take, word
+
+
+def _fold_as_ew(to_encode, lines, maxlen, last_ew, ew_combine_allowed,
+                charset, leading_whitespace):
+    """Write *to_encode* to *lines* as RFC 2047 encoded words, starting new
+    lines as needed.
+
+    *last_ew* is the column of an encoded word ending the last line, which
+    the new text joins when *ew_combine_allowed*.  *leading_whitespace* is
+    whitespace that belonged before the text; at the start of a
+    continuation line after an encoded word it is encoded too (a bare blank
+    there would be swallowed by the decoder).  Returns the column of the
+    last encoded word if later text may join it, else None.
+    """
+    to_encode, trailing, run_start = _start_ew_run(
+        to_encode, lines, maxlen, last_ew, ew_combine_allowed)
+    charset = _ew_charset(charset)
+    # "=?" charset "?q?" ... "?=" : everything but the payload.
+    overhead = len(charset) + 7
+    if overhead + 1 >= maxlen:
         raise errors.HeaderParseError(
             "max_line_length is too small to fit an encoded word")
     while to_encode:
         room = maxlen - len(lines[-1])
-        text_room = room - chrome_len - len(leading_whitespace)
-        if text_room <= 0:
+        if room - overhead - len(leading_whitespace) <= 0:
             lines.append(_steal_trailing_WSP_if_exists(lines) or ' ')
-            new_last_ew = len(lines[-1])
+            run_start = len(lines[-1])
             continue
-        if (len(lines) > 1 and len(lines[-1]) == 1 and leading_whitespace
+        if (leading_whitespace and len(lines) > 1 and len(lines[-1]) == 1
                 and lines[-2].rstrip(" \t").endswith("?=")):
-            lines[-1] += _ew.encode(leading_whitespace, charset=encode_as)
-            leading_whitespace = ''
-        chunk = to_encode[:text_room]
-        word = _ew.encode(chunk, charset=encode_as)
-        while len(word) > room:
-            chunk = chunk[:-1]
-            word = _ew.encode(chunk, charset=encode_as)
-        lines[-1] += word
-        to_encode = to_encode[len(chunk):]
+            lines[-1] += _ew.encode(leading_whitespace, charset=charset)
+        payload_room = room - overhead - len(leading_whitespace)
         leading_whitespace = ''
+        taken, word = _longest_ew(to_encode[:payload_room], room, charset)
+        lines[-1] += word
+        to_encode = to_encode[taken:]
         if to_encode:
             lines.append(' ')
-            new_last_ew = len(lines[-1])
+            run_start = len(lines[-1])
     lines[-1] += trailing
-    return new_last_ew if ew_combine_allowed else None
+    return run_start if ew_combine_allowed else None
+
+
+def _parameter_spelling(name, value, encoding):
+    # How a parameter is written when it fits on a line: name="value", or
+    # in RFC 2231 form when the value cannot be represented in *encoding*.
+    # Also returns the charset and error handler a split value is encoded
+    # with.
+    try:
+        value.encode(encoding)
+    except UnicodeEncodeError:
+        pass
+    else:
+        return '{}={}'.format(name, quote_string(value)), encoding, 'strict'
+    if utils._has_surrogates(value):
+        charset, handler = 'unknown-8bit', 'surrogateescape'
+    else:
+        charset, handler = 'utf-8', 'strict'
+    encoded = utils._percent_encode(value, "utf-8", handler)
+    return "{}*={}''{}".format(name, charset, encoded), charset, handler
+
+
+def _rfc2231_continuations(name, value, charset, handler, maxlen):
+    # Split a value too long for any line into numbered, percent-encoded
+    # sections ( name*0*=charset''..., name*1*=... ), one per line.
+    # Returns the lines and the width used, which grows to 78 if *maxlen*
+    # leaves no room for the value at all.
+    pieces = []
+    prefix = charset + "''"
+    number = 0
+    while value:
+        # " name*N*=" + prefix, and the ';' that ends all but the last line
+        overhead = len(name) + len(str(number)) + 3 + len(prefix)
+        if maxlen <= overhead + 3:
+            maxlen = 78
+        room = maxlen - overhead - 2
+        take = room
+        encoded = utils._percent_encode(value[:take], "utf-8", handler)
+        while len(encoded) > room and take > 0:
+            take -= 1
+            encoded = utils._percent_encode(value[:take], "utf-8", handler)
+        if take == 0 and not prefix:
+            # Not even one character fits and nothing will shrink: force
+            # progress with an over-long line rather than loop forever.
+            take = 1
+            encoded = utils._percent_encode(value[:take], "utf-8", handler)
+        # (An empty first section can happen: it only carries the prefix.)
+        pieces.append(" {}*{}*={}{}".format(name, number, prefix, encoded))
+        prefix = ''
+        number += 1
+        value = value[take:]
+    return [piece + ';' for piece in pieces[:-1]] + pieces[-1:], maxlen
 
 
 def _fold_mime_parameters(part, lines, maxlen, encoding):
-    """Fold MIME parameters, using RFC 2231 encoding (and continuations)
-    where the value needs it."""
+    """Append the parameters of *part* to *lines*: on the current line if
+    they fit, else on a line of their own, else split in RFC 2231
+    sections."""
     for name, value in part.params:
         if not lines[-1].rstrip().endswith(';'):
             lines[-1] += ';'
-        charset = encoding
-        errors_handler = 'strict'
-        try:
-            value.encode(encoding)
-            needs_encoding = False
-        except UnicodeEncodeError:
-            needs_encoding = True
-            if utils._has_surrogates(value):
-                charset = 'unknown-8bit'
-                errors_handler = 'surrogateescape'
-            else:
-                charset = 'utf-8'
-        if needs_encoding:
-            encoded = utils._percent_encode(value, "utf-8", errors_handler)
-            text = "{}*={}''{}".format(name, charset, encoded)
-        else:
-            text = '{}={}'.format(name, quote_string(value))
+        text, charset, handler = _parameter_spelling(name, value, encoding)
         if len(lines[-1]) + len(text) + 1 < maxlen:
-            lines[-1] = lines[-1] + ' ' + text
-            continue
-        if len(text) + 2 <= maxlen:
+            lines[-1] += ' ' + text
+        elif len(text) + 2 <= maxlen:
             lines.append(' ' + text)
-            continue
-        # Split into RFC 2231 sections, all of them encoded.
-        section = 0
-        prefix = charset + "''"
-        while value:
-            chrome_len = len(name) + len(str(section)) + 3 + len(prefix)
-            if maxlen <= chrome_len + 3:
-                maxlen = 78
-            limit = maxlen - chrome_len - 2
-            split = limit
-            while True:
-                encoded = utils._percent_encode(value[:split], "utf-8", errors_handler)
-                if len(encoded) <= limit:
-                    break
-                split -= 1
-            lines.append(" {}*{}*={}{}".format(name, section, prefix, encoded))
-            prefix = ''
-            section += 1
-            value = value[split:]
-            if value:
-                lines[-1] += ';'
+        else:
+            sections, maxlen = _rfc2231_continuations(name, value, charset,
+                                                       handler, maxlen)
+            lines.extend(sections)

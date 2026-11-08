@@ -1,5 +1,8 @@
 #
-# multiprocessing.dummy: the multiprocessing API on top of threads.
+# multiprocessing.dummy -- the multiprocessing API implemented with threads.
+#
+# "Processes" are threads, the synchronisation primitives and the queue
+# come straight from threading and queue, and the manager is this module.
 #
 
 __all__ = [
@@ -8,8 +11,8 @@ __all__ = [
     'Event', 'Barrier', 'Queue', 'Manager', 'Pipe', 'Pool', 'JoinableQueue'
     ]
 
-import threading
 import sys
+import threading
 import weakref
 
 from .connection import Pipe
@@ -19,43 +22,48 @@ from queue import Queue
 
 
 class DummyProcess(threading.Thread):
-    """A thread with the Process API."""
+    """A thread presented as a Process: it has an exitcode and is listed
+    by active_children() of the thread that started it."""
 
     def __init__(self, group=None, target=None, name=None, args=(), kwargs=None):
-        threading.Thread.__init__(self, group, target, name, args, kwargs)
+        super().__init__(group, target, name, args, kwargs)
         self._pid = None
         self._children = weakref.WeakKeyDictionary()
         self._start_called = False
         self._parent = current_process()
 
     def start(self):
-        if self._parent is not current_process():
+        starter = current_process()
+        if self._parent is not starter:
             raise RuntimeError(
                 "Parent is {0!r} but current_process is {1!r}".format(
-                    self._parent, current_process()))
+                    self._parent, starter))
         self._start_called = True
-        if hasattr(self._parent, '_children'):
-            self._parent._children[self] = None
-        threading.Thread.start(self)
+        children = getattr(self._parent, '_children', None)
+        if children is not None:
+            children[self] = None
+        super().start()
 
     @property
     def exitcode(self):
+        # 0 once a started thread has finished, None before.
         if self._start_called and not self.is_alive():
             return 0
-        else:
-            return None
+        return None
 
 
 Process = DummyProcess
 current_process = threading.current_thread
+# The main thread plays the main process and records its children too.
 current_process()._children = weakref.WeakKeyDictionary()
 
 
 def active_children():
+    """Started child threads of the calling thread that are still alive."""
     children = current_process()._children
-    for p in list(children):
-        if not p.is_alive():
-            children.pop(p, None)
+    for child in list(children):
+        if not child.is_alive():
+            children.pop(child, None)
     return list(children)
 
 
@@ -64,14 +72,15 @@ def freeze_support():
 
 
 class Namespace(object):
+    """Plain attribute container (what a manager's Namespace() gives)."""
+
     def __init__(self, /, **kwds):
         self.__dict__.update(kwds)
 
     def __repr__(self):
-        items = sorted('%s=%r' % (name, value)
-                       for name, value in self.__dict__.items()
-                       if not name.startswith('_'))
-        return '%s(%s)' % (self.__class__.__name__, ', '.join(items))
+        shown = sorted(f'{key}={value!r}' for key, value in self.__dict__.items()
+                       if not key.startswith('_'))
+        return f"{type(self).__name__}({', '.join(shown)})"
 
 
 dict = dict
@@ -84,6 +93,8 @@ def Array(typecode, sequence, lock=True):
 
 
 class Value(object):
+    """A mutable box with a .value attribute (no locking needed)."""
+
     def __init__(self, typecode, value, lock=True):
         self._typecode = typecode
         self._value = value
@@ -97,10 +108,11 @@ class Value(object):
         self._value = value
 
     def __repr__(self):
-        return '<%s(%r, %r)>' % (type(self).__name__, self._typecode, self._value)
+        return f'<{type(self).__name__}({self._typecode!r}, {self._value!r})>'
 
 
 def Manager():
+    # Threads share memory already: the "manager" is this module.
     return sys.modules[__name__]
 
 

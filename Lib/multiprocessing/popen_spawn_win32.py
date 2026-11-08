@@ -1,9 +1,10 @@
 #
-# multiprocessing.popen_spawn_win32: the spawn start method on Windows.
+# multiprocessing.popen_spawn_win32 -- the Windows "spawn" start method.
 #
-# This implementation targets POSIX systems only; on Windows the module
-# would start children with CreateProcess and pass handles with
-# DuplicateHandle.
+# This build targets POSIX systems only.  On Windows the module would start
+# the child with CreateProcess, hand it the pickled process through an
+# inherited pipe handle and wait on the process handle; none of that is
+# available here, so importing the module fails.
 #
 
 import sys

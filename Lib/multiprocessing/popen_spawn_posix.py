@@ -1,6 +1,6 @@
 #
-# multiprocessing.popen_spawn_posix: start children by executing a fresh
-# interpreter.
+# multiprocessing.popen_spawn_posix -- the "spawn" start method on POSIX:
+# the child is a new interpreter started with fork+exec.
 #
 
 import io
@@ -15,7 +15,8 @@ __all__ = ['Popen']
 
 
 class _DupFd(object):
-    """An fd passed to the child by keeping it open across exec."""
+    """A descriptor handed to the child by leaving it open across exec();
+    the number stays the same in the child."""
 
     def __init__(self, fd):
         self.fd = fd
@@ -24,12 +25,27 @@ class _DupFd(object):
         return self.fd
 
 
+def _pickle_for_child(popen, process_obj):
+    # The preparation data and the Process object, pickled while *popen* is
+    # registered as the Popen starting a child (reducers of inheritable
+    # objects check for that and may call popen.duplicate_for_child()).
+    data = spawn.get_preparation_data(process_obj._name)
+    out = io.BytesIO()
+    set_spawning_popen(popen)
+    try:
+        reduction.dump(data, out)
+        reduction.dump(process_obj, out)
+    finally:
+        set_spawning_popen(None)
+    return out
+
+
 class Popen(popen_fork.Popen):
     method = 'spawn'
     DupFd = _DupFd
 
     def __init__(self, process_obj):
-        self._fds = []
+        self._fds = []          # descriptors the new interpreter inherits
         super().__init__(process_obj)
 
     def duplicate_for_child(self, fd):
@@ -40,30 +56,28 @@ class Popen(popen_fork.Popen):
         from . import resource_tracker
         tracker_fd = resource_tracker.getfd()
         self._fds.append(tracker_fd)
-        prep_data = spawn.get_preparation_data(process_obj._name)
-        fp = io.BytesIO()
-        set_spawning_popen(self)
+        payload = _pickle_for_child(self, process_obj)
+        # Our ends of the two pipes are kept (and closed by the finalizer);
+        # the child's ends are closed here once it has been started.
+        ours, theirs = [], []
         try:
-            reduction.dump(prep_data, fp)
-            reduction.dump(process_obj, fp)
-        finally:
-            set_spawning_popen(None)
-
-        parent_r = child_w = child_r = parent_w = None
-        try:
-            parent_r, child_w = os.pipe()
+            # Nothing is ever written to the first pipe: its read end is our
+            # sentinel.  The child reads its two pickles from the second.
+            sentinel_r, sentinel_w = os.pipe()
+            ours.append(sentinel_r)
+            theirs.append(sentinel_w)
             child_r, parent_w = os.pipe()
-            cmd = spawn.get_command_line(tracker_fd=tracker_fd,
-                                         pipe_handle=child_r)
-            self._fds.extend([child_r, child_w])
-            self.pid = util.spawnv_passfds(spawn.get_executable(),
-                                           cmd, self._fds)
-            self.sentinel = parent_r
-            with open(parent_w, 'wb', closefd=False) as f:
-                f.write(fp.getbuffer())
+            theirs.append(child_r)
+            ours.append(parent_w)
+            argv = spawn.get_command_line(tracker_fd=tracker_fd,
+                                          pipe_handle=child_r)
+            self._fds += [child_r, sentinel_w]
+            self.pid = util.spawnv_passfds(spawn.get_executable(), argv,
+                                           self._fds)
+            self.sentinel = sentinel_r
+            with open(parent_w, 'wb', closefd=False) as stream:
+                stream.write(payload.getbuffer())
         finally:
-            to_close = [fd for fd in (parent_r, parent_w) if fd is not None]
-            self.finalizer = util.Finalize(self, util.close_fds, to_close)
-            for fd in (child_r, child_w):
-                if fd is not None:
-                    os.close(fd)
+            self.finalizer = util.Finalize(self, util.close_fds, ours)
+            for fd in theirs:
+                os.close(fd)
