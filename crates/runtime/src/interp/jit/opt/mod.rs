@@ -548,9 +548,7 @@ fn compile_locked(code: &PyObject, cd: &CodeData, globals: *mut PyObject, builti
         return None;
     }
     let asm = &out.asm;
-    let addr = super::mem::install(&asm.buf, |buf, base| {
-        let _ = asm.patch_abs(buf, base);
-    })?;
+    let addr = super::mem::install_asm(asm)?;
     if let Ok(dir) = std::env::var("RPYTHON_JIT_DUMP") {
         let _ = std::fs::write(format!("{}/{}.t2.{:x}.bin", dir, name(), addr), &asm.buf);
     }

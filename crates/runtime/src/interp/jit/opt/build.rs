@@ -449,8 +449,14 @@ impl<'a> B<'a> {
         }
     }
     fn new_block(&mut self, instr: u32) -> BlockId {
-        self.f.blocks.push(Block { insts: Vec::new(), term: Term::None, instr, tsuccs: Vec::new() });
+        self.f.blocks.push(Block { insts: Vec::new(), term: Term::None, instr, tsuccs: Vec::new(), cold: false });
         self.f.blocks.len() as BlockId - 1
+    }
+    /// (perf8) A synthetic block for a slow path (see `Block::cold`).
+    fn new_cold_block(&mut self) -> BlockId {
+        let b = self.new_block(u32::MAX);
+        self.f.blocks[b as usize].cold = true;
+        b
     }
     fn term(&mut self, t: Term) {
         self.f.blocks[self.cur as usize].term = t;
@@ -2133,6 +2139,66 @@ impl<'a> B<'a> {
         self.check(Cond::CmpMem(Base::V(keys), 8 * h as i32, name as i64, Cc::NE), f);
     }
 
+    /// (perf8) x = instance attribute `name` of `p` at index `h` of its inline values
+    /// or of its materialised dict (as tier 1's `dict_hinted`); leaves for `f`
+    /// otherwise. Objects whose dict was materialised (logging's records and handlers:
+    /// `record.__dict__` in Formatter) took the generic lookup on every access.
+    fn instance_attr_load(&mut self, p: V, h: u64, name: usize, f: Fail, x: V) {
+        let gb = self.v(Class::G);
+        self.emit(Inst::Load8(gb, Base::V(p), GC_BITS));
+        self.check(Cond::Test(gb, Opnd::I(crate::alloc::GC_BIT_MANAGED as i64), Cc::E), f);
+        let w = self.v(Class::G);
+        self.emit(Inst::Load(w, Base::V(p), MANAGED_DICT));
+        let lay = crate::interp::jit::tier1::layout();
+        let disp = h as i64 * lay.entry_size as i64;
+        if disp + 64 > i32::MAX as i64 {
+            self.check(Cond::Test(w, Opnd::I(1), Cc::E), f);
+            self.check_shape_key(w, h, name, f);
+            let vb = self.values_base(p, w);
+            self.emit(Inst::Load(x, Base::V(vb), 8 * h as i32));
+            return;
+        }
+        let vals = self.new_block(u32::MAX);
+        let dic = self.new_block(u32::MAX);
+        let join = self.new_block(u32::MAX);
+        self.term(Term::Branch(Cond::Test(w, Opnd::I(1), Cc::NE), vals, dic));
+        self.switch_to(vals);
+        self.check_shape_key(w, h, name, f);
+        let vb = self.values_base(p, w);
+        let x1 = self.v(Class::G);
+        self.emit(Inst::Load(x1, Base::V(vb), 8 * h as i32));
+        self.emit(Inst::Mov(x, x1));
+        self.term(Term::Jump(join));
+        self.switch_to(dic);
+        self.check(Cond::Test(w, Opnd::V(w), Cc::E), f);
+        self.check(Cond::CmpMem(Base::V(w), OB_TYPE, crate::types::dict::dict_type() as i64, Cc::NE), f);
+        let keys = self.v(Class::G);
+        self.emit(Inst::Load(keys, Base::V(w), std::mem::offset_of!(PyDictObject, ma_keys) as i32));
+        self.check(Cond::Test(keys, Opnd::V(keys), Cc::E), f);
+        // with threads, entries are read without the lock only from a table marked
+        // shared_read (its replaced blocks are then freed through QSBR; the runtime
+        // path marks it: dict::prepare_unlocked_read)
+        let mta = self.imm((&raw const crate::threads::MULTI_THREADED) as i64);
+        let mtchk = self.new_block(u32::MAX);
+        let st_ok = self.new_block(u32::MAX);
+        self.term(Term::Branch(Cond::CmpMem(Base::V(mta), 0, 0, Cc::NE), mtchk, st_ok));
+        self.switch_to(mtchk);
+        let sr = self.v(Class::G);
+        self.emit(Inst::Load8(sr, Base::V(keys), std::mem::offset_of!(crate::types::dict::DictTable, shared_read) as i32));
+        self.check(Cond::Test(sr, Opnd::V(sr), Cc::E), f);
+        self.term(Term::Jump(st_ok));
+        self.switch_to(st_ok);
+        self.check(Cond::CmpMem(Base::V(keys), lay.entries_len, h as i64, Cc::BE), f);
+        let ep = self.v(Class::G);
+        self.emit(Inst::Load(ep, Base::V(keys), lay.entries_ptr));
+        self.check(Cond::CmpMem(Base::V(ep), disp as i32 + lay.entry_key, name as i64, Cc::NE), f);
+        let x2 = self.v(Class::G);
+        self.emit(Inst::Load(x2, Base::V(ep), disp as i32 + lay.entry_value));
+        self.emit(Inst::Mov(x, x2));
+        self.term(Term::Jump(join));
+        self.switch_to(join);
+    }
+
     /// Address of value slot 0 of `p`, whose values word is `w`: `p + shape.voff`.
     fn values_base(&mut self, p: V, w: V) -> V {
         let (_id, _len, _keys, voff_off) = crate::shape::jit_layout();
@@ -2228,7 +2294,7 @@ impl<'a> B<'a> {
         let esnap = self.snap(i, SnapKind::Error);
         let res = self.v(Class::G);
         let cont = self.new_block(u32::MAX);
-        let slow = self.new_block(u32::MAX);
+        let slow = self.new_cold_block();
         let p;
         let bodies = if es.len() == 1 && !self.u.cautious_at(self.u.an.instrs[i]) {
             p = self.guard_tag(1, cases[0].a as u32, snap);
@@ -2245,12 +2311,9 @@ impl<'a> B<'a> {
             let f = Fail::Block(slow);
             let x = match s.kind {
                 kind::INSTANCE_DICT => {
-                    let w = self.values_word(p, f);
-                    self.check_shape_key(w, s.b, name, f);
-                    let vb = self.values_base(p, w);
                     let x = self.v(Class::G);
                     self.emit(Inst::NoteRead(p)); // scale2
-                    self.emit(Inst::Load(x, Base::V(vb), 8 * s.b as i32));
+                    self.instance_attr_load(p, s.b, name, f, x);
                     self.check(Cond::Test(x, Opnd::V(x), Cc::E), f);
                     x
                 }
@@ -2312,7 +2375,7 @@ impl<'a> B<'a> {
     /// released; for a store the value below it was consumed) and `result` pushed.
     fn epoch_check(&mut self, i: usize, e0: V, store: bool, result: Option<V>) {
         let e1 = self.epoch_load();
-        let chg = self.new_block(u32::MAX);
+        let chg = self.new_cold_block();
         let ok = self.new_block(u32::MAX);
         self.term(Term::Branch(Cond::Cmp(e1, Opnd::V(e0), Cc::NE), chg, ok));
         self.switch_to(chg);
@@ -2376,7 +2439,7 @@ impl<'a> B<'a> {
         // a real instance dict (objects that outgrew their inline values): look the
         // name up instead of deoptimising
         let _ = f;
-        let in_dict = self.new_block(u32::MAX);
+        let in_dict = self.new_cold_block();
         let values = self.new_block(u32::MAX);
         self.term(Term::Branch(Cond::Test(w, Opnd::I(1), Cc::E), in_dict, values));
         self.switch_to(in_dict);
@@ -2391,7 +2454,7 @@ impl<'a> B<'a> {
         let cv = self.imm(cell as i64);
         let memo = self.v(Class::G);
         self.emit(Inst::Load(memo, Base::V(cv), 0));
-        let slow = self.new_block(u32::MAX);
+        let slow = self.new_cold_block();
         self.term(Term::Branch(Cond::Cmp(sh, Opnd::V(memo), Cc::E), cont, slow));
         self.switch_to(slow);
         let r = self.v(Class::G);
@@ -2488,7 +2551,7 @@ impl<'a> B<'a> {
         };
         let esnap = self.snap(i, SnapKind::Error);
         let cont = self.new_block(u32::MAX);
-        let slow = self.new_block(u32::MAX);
+        let slow = self.new_cold_block();
         let bodies = if es.len() == 1 {
             vec![self.cur]
         } else {
@@ -2507,7 +2570,7 @@ impl<'a> B<'a> {
                     // the old value released after the unlock (qsbr::release_attr)
                     let mta = self.imm(mt_addr);
                     let stb = self.new_block(u32::MAX);
-                    let mtb = self.new_block(u32::MAX);
+                    let mtb = self.new_cold_block();
                     self.term(Term::Branch(Cond::CmpMem(Base::V(mta), 0, 0, Cc::NE), mtb, stb));
                     for mt in [false, true] {
                         let f = if mt {
@@ -2515,7 +2578,7 @@ impl<'a> B<'a> {
                             let lk = self.v(Class::G);
                             self.emit(Inst::TryLockFlag(lk, p));
                             self.check(Cond::Test(lk, Opnd::V(lk), Cc::E), Fail::Block(slow));
-                            let ul = self.new_block(u32::MAX);
+                            let ul = self.new_cold_block();
                             let here = self.cur;
                             self.switch_to(ul);
                             self.emit(Inst::Unlock(p));
@@ -2576,7 +2639,7 @@ impl<'a> B<'a> {
                     // and qsbr::release_attr for the old value
                     let mta = self.imm(mt_addr);
                     let stb = self.new_block(u32::MAX);
-                    let mtb = self.new_block(u32::MAX);
+                    let mtb = self.new_cold_block();
                     self.term(Term::Branch(Cond::CmpMem(Base::V(mta), 0, 0, Cc::NE), mtb, stb));
                     self.switch_to(stb);
                     let old = self.v(Class::G);
@@ -2780,7 +2843,7 @@ impl<'a> B<'a> {
                 let esnap = self.snap(i, SnapKind::Error);
                 let x = self.peek_ptr(2);
                 let res = self.v(Class::G);
-                let (hit, slow, cont) = (self.new_block(u32::MAX), self.new_block(u32::MAX), self.new_block(u32::MAX));
+                let (hit, slow, cont) = (self.new_block(u32::MAX), self.new_cold_block(), self.new_block(u32::MAX));
                 let ty = self.v(Class::G);
                 self.emit(Inst::Load(ty, Base::V(x), OB_TYPE));
                 self.term(Term::Branch(Cond::Cmp(ty, Opnd::I(cls as i64), Cc::E), hit, slow));
@@ -3395,7 +3458,7 @@ impl<'a> B<'a> {
         let bad = self.v(Class::G);
         self.emit(Inst::SetCond(bad, Cond::Cmp(ix, Opnd::V(size), Cc::AE)));
         let ok = self.new_block(u32::MAX);
-        let fail = self.new_block(u32::MAX);
+        let fail = self.new_cold_block();
         self.term(Term::Branch(Cond::Test(bad, Opnd::V(bad), Cc::NE), fail, ok));
         self.cur = fail;
         self.closed = false;
@@ -3844,7 +3907,7 @@ fn build_once(u: &Unit, reps: &[Rep], assume: &mut Vec<Option<State>>) -> Result
     let mut f = Func { blocks: Vec::new(), classes: Vec::new(), snaps: Vec::new(), order: Vec::new(), entries: Vec::new() };
     let mut ir_block = vec![u32::MAX; nb];
     for &b in &cfg.order {
-        f.blocks.push(Block { insts: Vec::new(), term: Term::None, instr: cfg.blocks[b].first as u32, tsuccs: Vec::new() });
+        f.blocks.push(Block { insts: Vec::new(), term: Term::None, instr: cfg.blocks[b].first as u32, tsuccs: Vec::new(), cold: false });
         ir_block[b] = f.blocks.len() as u32 - 1;
     }
     let mut homes = vec![u32::MAX; u.nlp];

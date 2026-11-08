@@ -1280,6 +1280,23 @@ unsafe fn listiter_step(o: *mut PyObject, step: isize) -> *mut PyObject {
             decref(finished);
             return std::ptr::null_mut();
         }
+        if !crate::threads::multi_threaded() {
+            // (perf8) one thread: nothing can change the list or the iterator meanwhile;
+            // an item in range is read directly (zip/map/enumerate over lists step
+            // their iterators through here)
+            let it = &mut *(o as *mut ListIter);
+            if !it.seq.is_null() && it.index >= 0 {
+                let l = lp(&*it.seq);
+                if it.index < (*l).ob_base.ob_size {
+                    let v = *(*l).ob_item.add(it.index as usize);
+                    if !v.is_null() {
+                        incref(v);
+                        it.index += step;
+                        return v;
+                    }
+                }
+            }
+        }
         let mut finished: *mut PyObject = std::ptr::null_mut();
         let r = {
             let _g = if crate::threads::multi_threaded() { Some(ob_lock(&*o)) } else { None };

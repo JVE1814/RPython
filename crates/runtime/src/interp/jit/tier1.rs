@@ -120,14 +120,14 @@ pub(crate) fn iter_layout_ok() -> bool {
 
 /// Layout facts about Rust-owned structures, probed at run time (Vec field order is
 /// not specified by Rust).
-struct Layout {
+pub(crate) struct Layout {
     /// DictTable: entries.ptr / entries.len / version
-    entries_ptr: i32,
-    entries_len: i32,
+    pub(crate) entries_ptr: i32,
+    pub(crate) entries_len: i32,
     version: i32,
-    entry_size: i32,
-    entry_key: i32,
-    entry_value: i32,
+    pub(crate) entry_size: i32,
+    pub(crate) entry_key: i32,
+    pub(crate) entry_value: i32,
 }
 
 /// (perf5) C getter and closure of an exact getset descriptor, if readable.
@@ -144,7 +144,7 @@ unsafe fn getset_getter(d: *mut PyObject) -> Option<(usize, usize)> {
     }
 }
 
-fn layout() -> &'static Layout {
+pub(crate) fn layout() -> &'static Layout {
     static L: std::sync::OnceLock<Layout> = std::sync::OnceLock::new();
     L.get_or_init(|| {
         Layout {
@@ -190,6 +190,13 @@ pub(crate) struct Gen<'a> {
     pub(crate) tagm: u64,
     /// (refs1) per instruction: a LoadFastBorrow emitted as an owned load (`owned_loads`)
     pub(crate) own_load: Vec<bool>,
+}
+
+/// (perf8) Call/CallKw sites call the shared dispatch routines (callpy.rs);
+/// RPYTHON_JIT_SHAREDCALL=0 emits the dispatch inline at every site instead.
+fn shared_calls() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| !matches!(std::env::var("RPYTHON_JIT_SHAREDCALL").as_deref(), Ok("0")))
 }
 
 fn fnaddr<T>(f: T) -> usize
@@ -251,16 +258,11 @@ impl<'a> Gen<'a> {
         self.a.jmp(self.exit);
     }
 
-    /// incref of the object in `r` (non-null). Clobbers r11.
+    /// incref of the object in `r` (non-null). Clobbers r11 (on the slow path).
     fn incref(&mut self, r: R) {
         let done = self.a.label();
         let slow = self.a.label();
-        self.a.load32(R11, M(r, OB_REF_LOCAL));
-        self.a.add32_ri(R11, 1);
-        self.a.jcc_short(Cc::E, done);
-        self.a.cmp_rm(R15, M(r, OB_TID));
-        self.a.jcc(Cc::NE, slow);
-        self.a.store32(M(r, OB_REF_LOCAL), R11);
+        emit_incref_fast(&mut self.a, r, done, slow);
         self.a.bind(done);
         self.stubs.push(Box::new(move |a: &mut Asm, _exit, _nlp| {
             a.bind(slow);
@@ -280,14 +282,7 @@ impl<'a> Gen<'a> {
         let done = self.a.label();
         let shared = self.a.label();
         let zero = self.a.label();
-        self.a.load32(R11, M(r, OB_REF_LOCAL));
-        self.a.cmp32_ri(R11, -1);
-        self.a.jcc_short(Cc::E, done);
-        self.a.cmp_rm(R15, M(r, OB_TID));
-        self.a.jcc(Cc::NE, shared);
-        self.a.sub32_ri(R11, 1);
-        self.a.store32(M(r, OB_REF_LOCAL), R11);
-        self.a.jcc(Cc::E, zero);
+        emit_decref_fast(&mut self.a, r, done, shared, zero);
         self.a.bind(done);
         let free_num = self.rt_free_num;
         self.stubs.push(Box::new(move |a: &mut Asm, _exit, _nlp| {
@@ -323,8 +318,7 @@ impl<'a> Gen<'a> {
         if obj != Rdi {
             self.a.mov_rr(Rdi, obj);
         }
-        self.a.mov_ri(R11, rt as i64);
-        self.a.call_r(R11);
+        self.a.call_abs_via(rt, R11);
         self.a.pop(Rdi);
         self.a.bind(done);
     }
@@ -453,10 +447,28 @@ impl<'a> Gen<'a> {
     /// Load compact-int value of the object in `obj` into `out` or jump to `slow`.
     /// Clobbers `tmp`.
     fn compact_int(&mut self, obj: R, out: R, tmp: R, slow: Label) {
+        self.compact_int_b(obj, out, tmp, slow, None)
+    }
+    /// `compact_int`; with `bool_prof` = Some((pc, operand shift)) also True/False
+    /// (int layout: tag 1 or 8), for operations whose result is an int either way
+    /// (+ - *: `c += flag`). A bool is profiled as OTHER, so tier 2 does not unbox it
+    /// as an int. Clobbers r11 then.
+    fn compact_int_b(&mut self, obj: R, out: R, tmp: R, slow: Label, bool_prof: Option<(u32, u32)>) {
         let int_t = crate::types::int::int_type() as i64;
         self.a.mov_ri(tmp, int_t);
         self.a.cmp_rm(tmp, M(obj, OB_TYPE));
-        self.a.jcc(Cc::NE, slow);
+        if let Some((pc, sh)) = bool_prof {
+            // (perf8)
+            let is_int = self.a.label();
+            self.a.jcc(Cc::E, is_int);
+            self.a.mov_ri(tmp, crate::types::bool_::bool_type() as i64);
+            self.a.cmp_rm(tmp, M(obj, OB_TYPE));
+            self.a.jcc(Cc::NE, slow);
+            self.prof(pc, (prof::OTHER as u16) << sh);
+            self.a.bind(is_int);
+        } else {
+            self.a.jcc(Cc::NE, slow);
+        }
         self.a.load(tmp, M(obj, LV_TAG));
         self.a.cmp_ri(tmp, 16);
         self.a.jcc(Cc::AE, slow);
@@ -1053,6 +1065,16 @@ impl<'a> Gen<'a> {
                 // call routines (callpy converts them, h_call_t passes untagged copies)
                 self.own_slot(base);
                 let tagged_args = (base + 1..d).any(|k| self.tagged(k));
+                // (perf8) one shared routine does the dispatch (callpy.rs `dispatch`)
+                let shared = super::callpy::dispatch(if tagged_args { super::callpy::Dispatch::CallTagged } else { super::callpy::Dispatch::Call });
+                if shared != 0 && shared_calls() {
+                    self.set_lasti(pc);
+                    self.lea_sp(Rdi, base);
+                    self.a.mov_ri(Rsi, arg as i64);
+                    self.call(shared);
+                    self.check(pc, base);
+                    return Ok(());
+                }
                 let generic = self.a.label();
                 let done = self.a.label();
                 let m = self.slot(base);
@@ -1141,6 +1163,20 @@ impl<'a> Gen<'a> {
             }
             Op::CallKw => {
                 let base = d - arg as i32 - 3;
+                let tagged = (base..d).any(|k| self.tagged(k));
+                if self.tagged(base) {
+                    // (the shared routine takes an owned callable)
+                    self.own_slot(base);
+                }
+                let shared = super::callpy::dispatch(if tagged { super::callpy::Dispatch::CallKwTagged } else { super::callpy::Dispatch::CallKw });
+                if shared != 0 && shared_calls() {
+                    self.set_lasti(pc);
+                    self.lea_sp(Rdi, base);
+                    self.a.mov_ri(Rsi, arg as i64);
+                    self.call(shared);
+                    self.check(pc, base);
+                    return Ok(());
+                }
                 let hc = if (base..d).any(|k| self.tagged(k)) { addr!(h::h_call_t) } else { addr!(h::h_call) };
                 self.generic_call(&ins, d, hc, 1, base);
                 self.poll(pc, base + 1);
@@ -2016,6 +2052,35 @@ impl<'a> Gen<'a> {
         use crate::interp::cache::kind;
         let e = self.tables.entry(ins.pc as usize) as *const _ as i64;
         let name = self.cd.names[ins.arg as usize].as_ptr() as i64;
+        // (perf8) the cached lookup is one shared routine (`load_global_routine`); the
+        // site keeps the call, the store and an out-of-line slow path
+        let rt = if shared_calls() { load_global_routine() } else { 0 };
+        if rt != 0 {
+            let slow = self.a.label();
+            let done = self.a.label();
+            self.a.mov_ri(Rcx, e);
+            self.call(rt);
+            self.a.test_rr(Rax, Rax);
+            self.a.jcc(Cc::E, slow);
+            let m = self.slot(d);
+            self.a.store(m, Rax);
+            self.a.bind(done);
+            let err = self.error_label(ins.pc, d);
+            let (pc, nlp) = (ins.pc, self.nlp);
+            self.stubs.push(Box::new(move |a: &mut Asm, _exit, _n| {
+                a.bind(slow);
+                a.store32_i(M(Rbx, LASTI), pc as i32);
+                a.mov_rr(Rdi, Rbx);
+                a.lea(Rsi, M(R12, 8 * (nlp + d)));
+                a.mov_ri(Rdx, name);
+                a.mov_ri(Rcx, e);
+                a.call_abs(addr!(h::h_load_global));
+                a.test_rr(Rax, Rax);
+                a.jcc(Cc::NE, err);
+                a.jmp(done);
+            }));
+            return;
+        }
         let slow = self.a.label();
         let done = self.a.label();
         let have = self.a.label();
@@ -2140,8 +2205,9 @@ impl<'a> Gen<'a> {
         self.load_obj(Rax, d - 2);
         self.load_obj(Rcx, d - 1);
         if int_ok {
-            self.compact_int(Rax, Rdi, Rdx, not_int);
-            self.compact_int(Rcx, Rsi, Rdx, not_int);
+            let ab = matches!(op, Add | InplaceAdd | Subtract | InplaceSubtract | Multiply | InplaceMultiply);
+            self.compact_int_b(Rax, Rdi, Rdx, not_int, ab.then_some((ins.pc, 0)));
+            self.compact_int_b(Rcx, Rsi, Rdx, not_int, ab.then_some((ins.pc, 8)));
             self.prof(ins.pc, (prof::INT as u16) | (prof::INT as u16) << 8);
             match op {
                 Add | InplaceAdd => self.a.add_rr(Rdi, Rsi),
@@ -2321,15 +2387,14 @@ pub(crate) fn emit_routines(a: &mut Asm, box_int: Label, box_float: Label, free_
         let l = [b.label(), b.label(), b.label()];
         emit_routines_body(&mut b, l[0], l[1], l[2]);
         b.resolve().ok()?;
-        let base = super::mem::install(&b.buf, |_, _| {})?;
+        let base = super::mem::install_asm(&b)?;
         Some([base + b.label_pos(l[0])?, base + b.label_pos(l[1])?, base + b.label_pos(l[2])?])
     });
     match shared {
         Some(s) => {
             for (l, &t) in [box_int, box_float, free_num].into_iter().zip(s.iter()) {
                 a.bind(l);
-                a.mov_ri(R11, t as i64);
-                a.jmp_r(R11);
+                a.jmp_abs_via(t, R11);
             }
         }
         None => emit_routines_body(a, box_int, box_float, free_num),
@@ -2718,6 +2783,10 @@ pub fn compile_mode(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crat
     let mut entries = vec![u32::MAX; cd.code.len() + 1];
     let mut prev_yield = false;
     let mut skip_next = false;
+    // (perf8) RPYTHON_JIT_OPSTATS=1: code bytes per instruction kind (inline, stubs)
+    let stats = opstats_enabled();
+    let (mut counts, mut inline_bytes, mut stub_bytes) = (vec![0u64; 256], vec![0u64; 256], vec![0u64; 256]);
+    let mut stub_owner: Vec<u8> = Vec::new();
     for i in 0..an.instrs.len() {
         let ins = an.instrs[i];
         let l = g.ilabel[i];
@@ -2741,7 +2810,15 @@ pub fn compile_mode(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crat
             }
         }
         g.tagm = masks[i];
+        let (p0, s0) = (g.a.pos(), g.stubs.len());
         g.emit(i)?;
+        if stats {
+            let (p1, s1) = (g.a.pos(), g.stubs.len());
+            inline_bytes[ins.op as usize] += (p1 - p0) as u64;
+            counts[ins.op as usize] += 1;
+            stub_owner.resize(s1, ins.op as u8);
+            let _ = s0;
+        }
         // fall off the end of a non-terminating instruction into the next one is implicit
     }
     // a trailing reachable fallthrough should not exist (code ends with a terminator);
@@ -2749,7 +2826,15 @@ pub fn compile_mode(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crat
     g.a.ud2();
     let nlp = g.nlp;
     while let Some(s) = g.stubs.pop() {
+        let p0 = g.a.pos();
         s(&mut g.a, exit, nlp);
+        if stats {
+            let k = g.stubs.len();
+            stub_bytes[stub_owner.get(k).copied().unwrap_or(0) as usize] += (g.a.pos() - p0) as u64;
+        }
+    }
+    if stats {
+        record_opstats(&counts, &inline_bytes, &stub_bytes);
     }
     emit_routines(&mut g.a, rt_box_int, rt_box_float, rt_free_num);
     g.a.resolve()?;
@@ -2760,6 +2845,138 @@ pub fn compile_mode(cd: &CodeData, nlocalsplus: usize, flags: u32, tables: &crat
         }
     }
     Ok(Output { asm: g.a, entries })
+}
+
+/// (perf8) Process-wide routine of the cached LoadGlobal lookup (the inline sequence
+/// of `Gen::load_global` was ~380 bytes at every site): rcx = the site's cache entry,
+/// rbx = frame, r15 = thread pointer. Returns rax = a new reference to the value, or 0
+/// when the cache does not apply (the site calls `h_load_global`). Clobbers the
+/// caller-saved registers.
+pub(crate) fn load_global_routine() -> usize {
+    static R: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *R.get_or_init(|| build_load_global_routine().unwrap_or(0))
+}
+
+fn build_load_global_routine() -> Option<usize> {
+    use crate::interp::cache::kind;
+    let mut a = Asm::new();
+    let slow = a.label();
+    let have = a.label();
+    let in_builtins = a.label();
+    let inc_done = a.label();
+    let inc_slow = a.label();
+    let dict_t = crate::types::dict::dict_type() as i64;
+    let kv = std::mem::offset_of!(crate::types::dict::DictTable, keys_version) as i32;
+    let lay = layout();
+    let (ep, esz, evalue) = (lay.entries_ptr, lay.entry_size, lay.entry_value);
+    a.load32(R8, M(Rcx, E_SEQ));
+    a.test_ri(R8, 1);
+    a.jcc(Cc::NE, slow);
+    a.cmp32_mi(M(Rcx, E_KIND), kind::GLOBAL as i32);
+    a.jcc(Cc::NE, slow);
+    // globals: exact dict with the recorded key layout
+    a.load(Rax, M(Rbx, FRAME_GLOBALS));
+    a.mov_ri(Rdi, dict_t);
+    a.cmp_rm(Rdi, M(Rax, OB_TYPE));
+    a.jcc(Cc::NE, slow);
+    a.mov_rr(Rdi, Rax);
+    a.load(Rax, M(Rax, MA_KEYS));
+    a.test_rr(Rax, Rax);
+    a.jcc(Cc::E, slow);
+    a.load(Rdx, M(Rax, kv));
+    a.cmp_rm(Rdx, M(Rcx, E_A));
+    a.jcc(Cc::NE, slow);
+    a.load(R9, M(Rcx, E_C));
+    a.test_ri(R9, 1);
+    a.jcc(Cc::NE, in_builtins);
+    a.bind(have);
+    // rax = table, rdi = its dict, rdx = its keys version (checked), r9 = ix << 1 | flag.
+    // (scale2) also with threads: the entry is read without the dict lock, validated by
+    // the table's sequence lock (see `Gen::load_global` before perf8)
+    {
+        let ok = a.label();
+        a.mov_rr(R10, Rdx);
+        a.load(R11, M(Rax, WSEQ));
+        a.test_ri(R11, 1);
+        a.jcc(Cc::NE, slow);
+        a.cmp_rm(R10, M(Rax, kv));
+        a.jcc(Cc::NE, slow);
+        a.mov_ri(Rdx, (&raw const crate::threads::MULTI_THREADED) as i64);
+        a.cmp_mi(M(Rdx, 0), 0);
+        a.jcc(Cc::E, ok);
+        a.cmp8_mi(M(Rax, SHARED_READ), 0);
+        a.jcc(Cc::NE, ok);
+        a.cmp_rm(R15, M(Rdi, OB_TID));
+        a.jcc(Cc::NE, slow);
+        a.bind(ok);
+    }
+    a.shr_ri(R9, 1);
+    a.cmp_rm(R9, M(Rax, NENTRIES));
+    a.jcc(Cc::AE, slow);
+    a.imul_rri(R9, R9, esz);
+    a.load(Rdx, M(Rax, ep));
+    a.add_rr(Rdx, R9);
+    a.load(Rsi, M(Rdx, evalue));
+    a.test_rr(Rsi, Rsi);
+    a.jcc(Cc::E, slow);
+    a.cmp_rm(R11, M(Rax, WSEQ));
+    a.jcc(Cc::NE, slow);
+    a.mov_ri(Rdx, crate::types::lazyimport::lazy_import_type() as i64);
+    a.cmp_rm(Rdx, M(Rsi, OB_TYPE));
+    a.jcc(Cc::E, slow);
+    a.cmp32_rm(R8, M(Rcx, E_SEQ));
+    a.jcc(Cc::NE, slow);
+    emit_incref_fast(&mut a, Rsi, inc_done, inc_slow);
+    a.bind(inc_done);
+    a.mov_rr(Rax, Rsi);
+    a.ret();
+    // builtins: exact dict with the recorded key layout (globals checked above)
+    a.bind(in_builtins);
+    a.load(Rax, M(Rbx, FRAME_BUILTINS));
+    a.mov_ri(Rdi, dict_t);
+    a.cmp_rm(Rdi, M(Rax, OB_TYPE));
+    a.jcc(Cc::NE, slow);
+    a.mov_rr(Rdi, Rax);
+    a.load(Rax, M(Rax, MA_KEYS));
+    a.test_rr(Rax, Rax);
+    a.jcc(Cc::E, slow);
+    a.load(Rdx, M(Rax, kv));
+    a.cmp_rm(Rdx, M(Rcx, E_B));
+    a.jcc(Cc::NE, slow);
+    a.jmp(have);
+    a.bind(slow);
+    a.xor_rr(Rax, Rax);
+    a.ret();
+    a.bind(inc_slow);
+    emit_nonowner_incref(&mut a, Rsi, inc_done);
+    a.resolve().ok()?;
+    crate::interp::jit::mem::install_asm(&a)
+}
+
+fn opstats_enabled() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| matches!(std::env::var("RPYTHON_JIT_OPSTATS").as_deref(), Ok("1")))
+}
+
+/// (perf8) Accumulate tier-1 code bytes per instruction kind over the process and
+/// print the running totals (the last table printed covers every compilation).
+fn record_opstats(counts: &[u64], inline: &[u64], stubs: &[u64]) {
+    static T: std::sync::Mutex<Vec<(u64, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+    let mut t = T.lock().unwrap_or_else(|e| e.into_inner());
+    t.resize(256, (0, 0, 0));
+    for k in 0..256 {
+        t[k].0 += counts[k];
+        t[k].1 += inline[k];
+        t[k].2 += stubs[k];
+    }
+    let mut rows: Vec<(usize, (u64, u64, u64))> = t.iter().copied().enumerate().filter(|r| r.1.0 > 0).collect();
+    rows.sort_by_key(|r| std::cmp::Reverse(r.1.1 + r.1.2));
+    let (ti, ts): (u64, u64) = rows.iter().fold((0, 0), |a, r| (a.0 + r.1.1, a.1 + r.1.2));
+    eprintln!("[jit] opstats: inline {} stubs {}", ti, ts);
+    for (op, (n, i, s)) in rows.into_iter().take(30) {
+        let name = format!("{:?}", Op::from_u8(op as u8));
+        eprintln!("[jit]   {:<22} n {:6} inline {:8} ({:5.1}/op) stubs {:8} ({:5.1}/op)", name, n, i, i as f64 / n as f64, s, s as f64 / n as f64);
+    }
 }
 
 // ---------------------------------------------------------------- sharded increfs (scale1)
@@ -2813,7 +3030,7 @@ fn preserving_routine(target: usize) -> Option<usize> {
         a.pop(Rbp);
         a.ret();
         a.resolve().ok()?;
-        crate::interp::jit::mem::install(&a.buf, |_, _| {})
+        crate::interp::jit::mem::install_asm(&a)
     }
 }
 
@@ -2831,6 +3048,30 @@ pub(crate) fn emit_note_attr_read(a: &mut Asm, r: R) {
     a.jcc(Cc::NE, done);
     a.lock_or16_mi(M(r, OB_FLAGS), crate::qsbr::XREAD);
     a.bind(done);
+}
+
+/// (perf8) Inline part of an incref of the object in `r`: immortal objects skip to
+/// `done`, objects of other threads go to `slow` (`emit_nonowner_incref`), the owner
+/// adds to its local count in memory. 19 bytes with disp8 forms (was 23 through r11).
+pub(crate) fn emit_incref_fast(a: &mut Asm, r: R, done: Label, slow: Label) {
+    a.cmp32_mi(M(r, OB_REF_LOCAL), -1);
+    a.jcc_short(Cc::E, done);
+    a.cmp_rm(R15, M(r, OB_TID));
+    a.jcc(Cc::NE, slow);
+    a.add32_mi(M(r, OB_REF_LOCAL), 1);
+}
+
+/// (perf8) Inline part of a decref of the object in `r`: immortal objects skip to
+/// `done`, objects of other threads go to `shared`, the owner subtracts in memory and
+/// goes to `zero` when the count reaches 0 (the stored count is then 0). 22 bytes
+/// (was 30 through r11); clobbers nothing.
+pub(crate) fn emit_decref_fast(a: &mut Asm, r: R, done: Label, shared: Label, zero: Label) {
+    a.cmp32_mi(M(r, OB_REF_LOCAL), -1);
+    a.jcc_short(Cc::E, done);
+    a.cmp_rm(R15, M(r, OB_TID));
+    a.jcc(Cc::NE, shared);
+    a.sub32_mi(M(r, OB_REF_LOCAL), 1);
+    a.jcc(Cc::E, zero);
 }
 
 /// Out-of-line part of an inline incref when the object in `r` (not r11) is owned by
@@ -2887,8 +3128,7 @@ pub(crate) fn emit_nonowner_incref(a: &mut Asm, r: R, done: Label) {
             if r != Rdi {
                 a.mov_rr(Rdi, r);
             }
-            a.mov_ri(R11, rt as i64);
-            a.call_r(R11);
+            a.call_abs_via(rt, R11);
             a.pop(Rdi);
             a.jmp(done);
         }
