@@ -447,10 +447,28 @@ impl<'a> Gen<'a> {
     /// Load compact-int value of the object in `obj` into `out` or jump to `slow`.
     /// Clobbers `tmp`.
     fn compact_int(&mut self, obj: R, out: R, tmp: R, slow: Label) {
+        self.compact_int_b(obj, out, tmp, slow, None)
+    }
+    /// `compact_int`; with `bool_prof` = Some((pc, operand shift)) also True/False
+    /// (int layout: tag 1 or 8), for operations whose result is an int either way
+    /// (+ - *: `c += flag`). A bool is profiled as OTHER, so tier 2 does not unbox it
+    /// as an int. Clobbers r11 then.
+    fn compact_int_b(&mut self, obj: R, out: R, tmp: R, slow: Label, bool_prof: Option<(u32, u32)>) {
         let int_t = crate::types::int::int_type() as i64;
         self.a.mov_ri(tmp, int_t);
         self.a.cmp_rm(tmp, M(obj, OB_TYPE));
-        self.a.jcc(Cc::NE, slow);
+        if let Some((pc, sh)) = bool_prof {
+            // (perf8)
+            let is_int = self.a.label();
+            self.a.jcc(Cc::E, is_int);
+            self.a.mov_ri(tmp, crate::types::bool_::bool_type() as i64);
+            self.a.cmp_rm(tmp, M(obj, OB_TYPE));
+            self.a.jcc(Cc::NE, slow);
+            self.prof(pc, (prof::OTHER as u16) << sh);
+            self.a.bind(is_int);
+        } else {
+            self.a.jcc(Cc::NE, slow);
+        }
         self.a.load(tmp, M(obj, LV_TAG));
         self.a.cmp_ri(tmp, 16);
         self.a.jcc(Cc::AE, slow);
@@ -2158,8 +2176,9 @@ impl<'a> Gen<'a> {
         self.load_obj(Rax, d - 2);
         self.load_obj(Rcx, d - 1);
         if int_ok {
-            self.compact_int(Rax, Rdi, Rdx, not_int);
-            self.compact_int(Rcx, Rsi, Rdx, not_int);
+            let ab = matches!(op, Add | InplaceAdd | Subtract | InplaceSubtract | Multiply | InplaceMultiply);
+            self.compact_int_b(Rax, Rdi, Rdx, not_int, ab.then_some((ins.pc, 0)));
+            self.compact_int_b(Rcx, Rsi, Rdx, not_int, ab.then_some((ins.pc, 8)));
             self.prof(ins.pc, (prof::INT as u16) | (prof::INT as u16) << 8);
             match op {
                 Add | InplaceAdd => self.a.add_rr(Rdi, Rsi),
