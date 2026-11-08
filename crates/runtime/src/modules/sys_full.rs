@@ -1038,6 +1038,17 @@ pub fn print_malloc_stats() {
     for name in ["PyDictObjects", "PyListObjects", "PyFloatObjects", "PyTupleObjects"] {
         s.push_str(&format!("{:>10} free {}\n", 0, name));
     }
+    // (mem1) the allocator's pages per size class (kind 0 = raw, 1 = GC, 2 = GC with the
+    // managed pre-header); "cached" = free blocks in this thread's cache
+    s.push_str("kind  block  pages  carved_bytes  cached_free\n");
+    let (mut tp, mut tc, mut tf) = (0, 0, 0);
+    for (kind, block, pages, carved, cached) in crate::tlab::slot_stats() {
+        s.push_str(&format!("{kind:>4} {block:>6} {pages:>6} {carved:>13} {cached:>12}\n"));
+        tp += pages;
+        tc += carved;
+        tf += cached * block;
+    }
+    s.push_str(&format!("total: {tp} pages, {tc} bytes carved, {tf} bytes cached free\n"));
     crate::modules::sys::write_fd(2, s.as_bytes());
 }
 fn sys_get_coroutine_origin_tracking_depth(_m: &PyObject) -> PyResult {

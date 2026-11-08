@@ -53,6 +53,94 @@ struct Cg<'a, 'b> {
     /// bytes pushed on the native stack since the spill area was set up (spill slot
     /// addresses are rsp-relative)
     sp_bias: i32,
+    /// (perf8) per register: entries to the decref slow-path routines
+    dec_entries: [Option<(Label, Label)>; 16],
+}
+
+/// (perf8) Emission order of the blocks, as HotSpot lays out compiled code with the
+/// uncommon paths out of line: chains putting each block's likely successor right
+/// after it (a Jump target, else the second target of a Branch: the continuation of
+/// a `check`, the hot side of a multi-threaded test), and the cold blocks
+/// (`Block::cold`, deoptimising blocks, synthetic blocks reached only from cold ones)
+/// after all hot ones. Synthetic blocks used to sit after every bytecode block, so the
+/// straight-line path of an attribute store jumped to the end of the unit and back.
+/// RPYTHON_JIT2_LAYOUT=0 keeps creation order.
+fn layout(f: &Func) -> Vec<BlockId> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| !matches!(std::env::var("RPYTHON_JIT2_LAYOUT").as_deref(), Ok("0"))) {
+        return f.order.clone();
+    }
+    let n = f.blocks.len();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (b, blk) in f.blocks.iter().enumerate() {
+        for s in blk.term.succs().into_iter().chain(blk.tsuccs.iter().copied()) {
+            preds[s as usize].push(b);
+        }
+    }
+    let mut cold: Vec<bool> = f.blocks.iter().map(|b| b.cold || matches!(b.term, Term::Deopt(_))).collect();
+    loop {
+        let mut changed = false;
+        for &b in &f.order {
+            let b = b as usize;
+            if cold[b] || f.blocks[b].instr != u32::MAX || preds[b].is_empty() {
+                continue;
+            }
+            if preds[b].iter().all(|&p| cold[p]) {
+                cold[b] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut placed = vec![false; n];
+    let mut out = Vec::with_capacity(f.order.len());
+    for pass_cold in [false, true] {
+        for &b0 in &f.order {
+            let mut b = b0 as usize;
+            if placed[b] || cold[b] != pass_cold {
+                continue;
+            }
+            loop {
+                placed[b] = true;
+                out.push(b as BlockId);
+                let next = match &f.blocks[b].term {
+                    Term::Jump(t) => [Some(*t), None],
+                    Term::Branch(_, t, e) => [Some(*e), Some(*t)],
+                    _ => [None, None],
+                };
+                match next.into_iter().flatten().map(|x| x as usize).find(|&x| !placed[x] && cold[x] == pass_cold) {
+                    Some(x) => b = x,
+                    None => break,
+                }
+            }
+        }
+    }
+    out
+}
+
+/// (perf8) Running totals of tier-2 code bytes per IR instruction kind; `body` is
+/// blocks + snapshot stubs, `tail` the template stubs and routines (before jump
+/// relaxation).
+fn record_t2_stats(st: std::collections::HashMap<String, (u64, u64)>, body: u64, tail: u64) {
+    static T: std::sync::Mutex<Option<(std::collections::HashMap<String, (u64, u64)>, u64, u64)>> = std::sync::Mutex::new(None);
+    let mut g = T.lock().unwrap_or_else(|e| e.into_inner());
+    let t = g.get_or_insert_with(|| (std::collections::HashMap::new(), 0, 0));
+    for (k, v) in st {
+        let e = t.0.entry(k).or_insert((0, 0));
+        e.0 += v.0;
+        e.1 += v.1;
+    }
+    t.1 += body;
+    t.2 += tail;
+    let mut rows: Vec<_> = t.0.iter().collect();
+    rows.sort_by_key(|r| std::cmp::Reverse(r.1.1));
+    let insts: u64 = rows.iter().map(|r| r.1.1).sum();
+    eprintln!("[jit] t2stats: body+snapshots {} (insts {}), template stubs+routines {}", t.1, insts, t.2);
+    for (k, (n, b)) in rows.into_iter().take(30) {
+        eprintln!("[jit]   {:<26} n {:6} bytes {:8} ({:5.1}/inst)", k, n, b, *b as f64 / *n as f64);
+    }
 }
 
 fn fa<T: Copy>(f: T) -> i64 {
@@ -166,12 +254,7 @@ impl<'a, 'b> Cg<'a, 'b> {
         let done = self.a().label();
         let slow = self.a().label();
         let a = self.a();
-        a.load32(R11, M(r, OB_REF_LOCAL));
-        a.add32_ri(R11, 1);
-        a.jcc_short(Cc::E, done);
-        a.cmp_rm(R15, M(r, OB_TID));
-        a.jcc(Cc::NE, slow);
-        a.store32(M(r, OB_REF_LOCAL), R11);
+        tier1::emit_incref_fast(a, r, done, slow);
         a.bind(done);
         self.g.add_stub(Box::new(move |a: &mut Asm, _e, _n| {
             a.bind(slow);
@@ -184,42 +267,33 @@ impl<'a, 'b> Cg<'a, 'b> {
         let shared = self.a().label();
         let zero = self.a().label();
         let a = self.a();
-        a.load32(R11, M(r, OB_REF_LOCAL));
-        a.cmp32_ri(R11, -1);
-        a.jcc_short(Cc::E, done);
-        a.cmp_rm(R15, M(r, OB_TID));
-        a.jcc(Cc::NE, shared);
-        a.sub32_ri(R11, 1);
-        a.store32(M(r, OB_REF_LOCAL), R11);
-        a.jcc(Cc::E, zero);
+        tier1::emit_decref_fast(a, r, done, shared, zero);
         a.bind(done);
         let (rs, rz) = (self.rt_decref_shared, self.rt_merge_zero);
+        // (perf8) the slow paths of every decref of r share one per-register entry
+        // (rax-based routines with rax saved around them) instead of a copy per site
+        let (es, ez) = self.decref_entries(r, rs, rz);
         self.g.add_stub(Box::new(move |a: &mut Asm, _e, _n| {
             a.bind(shared);
-            if r != Rax {
-                a.push(Rax);
-                a.push(Rax);
-                a.mov_rr(Rax, r);
-            }
-            a.call_label(rs);
-            if r != Rax {
-                a.pop(Rax);
-                a.pop(Rax);
-            }
+            a.call_label(es);
             a.jmp(done);
             a.bind(zero);
-            if r != Rax {
-                a.push(Rax);
-                a.push(Rax);
-                a.mov_rr(Rax, r);
-            }
-            a.call_label(rz);
-            if r != Rax {
-                a.pop(Rax);
-                a.pop(Rax);
-            }
+            a.call_label(ez);
             a.jmp(done);
         }));
+    }
+    /// (perf8) Labels of the per-register entries to the decref slow-path routines
+    /// (`emit_decref_entries` at the end of the unit).
+    fn decref_entries(&mut self, r: R, rs: Label, rz: Label) -> (Label, Label) {
+        if r == Rax {
+            return (rs, rz);
+        }
+        let k = r as usize;
+        if self.dec_entries[k].is_none() {
+            let (es, ez) = (self.g.a.label(), self.g.a.label());
+            self.dec_entries[k] = Some((es, ez));
+        }
+        self.dec_entries[k].unwrap()
     }
 
     // ------------------------------------------------------------ conditions
@@ -703,9 +777,21 @@ impl<'a, 'b> Cg<'a, 'b> {
                 a.cmp_rr(R11, Rax);
                 a.jcc(Cc::NE, l);
                 a.load(R11, M(p, LV_TAG));
-                a.cmp_ri(R11, 16);
+                // (perf8) one or two 30-bit digits (exact in i64, converted with the
+                // correctly rounded cvtsi2sd): a nanosecond difference passes 2^30
+                // after a second (logging's relativeCreated), which deoptimised
+                // every call until the unit was discarded
+                a.cmp_ri(R11, 24);
                 a.jcc(Cc::AE, l);
                 a.load32(Rax, M(p, LV_DIGIT));
+                let one = a.label();
+                a.cmp_ri(R11, 16);
+                a.jcc_short(Cc::B, one);
+                a.load32(R11, M(p, LV_DIGIT + 4));
+                a.shl_ri(R11, 30);
+                a.add_rr(Rax, R11);
+                a.load(R11, M(p, LV_TAG));
+                a.bind(one);
                 let pos = a.label();
                 a.and_ri(R11, 2);
                 a.jcc(Cc::E, pos);
@@ -807,8 +893,7 @@ impl<'a, 'b> Cg<'a, 'b> {
                 if rx != Rdi {
                     a.mov_rr(Rdi, rx);
                 }
-                a.mov_ri(R11, rt as i64);
-                a.call_r(R11);
+                a.call_abs_via(rt, R11);
                 a.pop(Rdi);
                 a.bind(skip);
             }
@@ -828,8 +913,7 @@ impl<'a, 'b> Cg<'a, 'b> {
                         if r != Rdi {
                             a.mov_rr(Rdi, r);
                         }
-                        a.mov_ri(R11, rt as i64);
-                        a.call_r(R11);
+                        a.call_abs_via(rt, R11);
                         a.pop(Rdi);
                         a.bind(done);
                     }
@@ -1333,15 +1417,14 @@ fn emit_routines(a: &mut Asm, box_int: Label, box_float: Label, dshared: Label, 
         let l = [b.label(), b.label(), b.label(), b.label()];
         emit_routines_body(&mut b, l[0], l[1], l[2], l[3]);
         b.resolve().ok()?;
-        let base = crate::interp::jit::mem::install(&b.buf, |_, _| {})?;
+        let base = crate::interp::jit::mem::install_asm(&b)?;
         Some([base + b.label_pos(l[0])?, base + b.label_pos(l[1])?, base + b.label_pos(l[2])?, base + b.label_pos(l[3])?])
     });
     match shared {
         Some(s) => {
             for (l, &t) in [box_int, box_float, dshared, mzero].into_iter().zip(s.iter()) {
                 a.bind(l);
-                a.mov_ri(R11, t as i64);
-                a.jmp_r(R11);
+                a.jmp_abs_via(t, R11);
             }
         }
         None => emit_routines_body(a, box_int, box_float, dshared, mzero),
@@ -1549,6 +1632,7 @@ pub fn codegen(u: &Unit, built: &Built, al: &Alloc, deopt_counter: usize) -> Res
         ret_syncs: Vec::new(),
         poll_back: Vec::new(),
         sp_bias: 0,
+        dec_entries: [None; 16],
     };
     let frame = al.frame;
     // ---- trampoline (tier-1 contract): fn(frame, slots, ts, target, out)
@@ -1621,15 +1705,34 @@ pub fn codegen(u: &Unit, built: &Built, al: &Alloc, deopt_counter: usize) -> Res
         let l = cg.blabel[b as usize];
         cg.a().jmp(l);
     }
-    // ---- blocks
-    for (k, &b) in f.order.iter().enumerate() {
+    // ---- blocks (perf8: in the emission order of `layout`; register allocation used
+    // f.order, but every value has one location, so the order of emission is free)
+    let emit_order = layout(f);
+    // (perf8) RPYTHON_JIT_OPSTATS=1: bytes per IR instruction kind (running totals)
+    let stats = matches!(std::env::var("RPYTHON_JIT_OPSTATS").as_deref(), Ok("1"));
+    let mut st: std::collections::HashMap<String, (u64, u64)> = std::collections::HashMap::new();
+    let body0 = cg.a().pos();
+    for (k, &b) in emit_order.iter().enumerate() {
         let blk = &f.blocks[b as usize];
         let l = cg.blabel[b as usize];
         cg.a().bind(l);
         for ins in &blk.insts {
+            let p0 = cg.a().pos();
             cg.inst(ins)?;
+            if stats {
+                let key = match ins {
+                    Inst::Template(i, ..) => format!("T:{:?}", u.an.instrs[*i as usize].op),
+                    _ => {
+                        let s = format!("{:?}", ins);
+                        s.split(|c: char| c == '(' || c == ' ' || c == '{').next().unwrap_or("").to_string()
+                    }
+                };
+                let e = st.entry(key).or_insert((0, 0));
+                e.0 += 1;
+                e.1 += (cg.a().pos() - p0) as u64;
+            }
         }
-        let next = f.order.get(k + 1).copied();
+        let next = emit_order.get(k + 1).copied();
         match &blk.term {
             Term::Jump(t) => {
                 if Some(*t) != next {
@@ -1641,11 +1744,16 @@ pub fn codegen(u: &Unit, built: &Built, al: &Alloc, deopt_counter: usize) -> Res
                 let lt = cg.blabel[*t as usize];
                 let le = cg.blabel[*e as usize];
                 if Some(*t) == next {
-                    // jump to e when !c
-                    let skip = cg.a().label();
-                    cg.jump_if(c, skip);
-                    cg.a().jmp(le);
-                    cg.a().bind(skip);
+                    // jump to e when !c (perf8: one jump with the inverted condition
+                    // for integer conditions)
+                    if let Some(cc) = cg.int_flags(c) {
+                        cg.a().jcc(cc.not(), le);
+                    } else {
+                        let skip = cg.a().label();
+                        cg.jump_if(c, skip);
+                        cg.a().jmp(le);
+                        cg.a().bind(skip);
+                    }
                 } else {
                     cg.jump_if(c, lt);
                     if Some(*e) != next {
@@ -1728,10 +1836,30 @@ pub fn codegen(u: &Unit, built: &Built, al: &Alloc, deopt_counter: usize) -> Res
         }
     }
     cg.emit_forced_and_ret_syncs();
+    // (perf8) per-register decref entries: the object into rax (saved; one push keeps
+    // the routines' entry alignment that the per-site sequence had), call the routine
+    for k in 0..16 {
+        if let Some((es, ez)) = cg.dec_entries[k] {
+            let r: R = unsafe { std::mem::transmute(k as u8) };
+            for (l, rt) in [(es, rt_decref_shared), (ez, rt_merge_zero)] {
+                let a = cg.a();
+                a.bind(l);
+                a.push(Rax);
+                a.mov_rr(Rax, r);
+                a.call_label(rt);
+                a.pop(Rax);
+                a.ret();
+            }
+        }
+    }
     emit_routines(cg.a(), rt_box_int, rt_box_float, rt_decref_shared, rt_merge_zero);
     let _ = tier1_exit;
     let sites = std::mem::take(&mut cg.sites);
+    let stubs0 = cg.a().pos();
     let asm = cg.g.finish()?;
+    if stats {
+        record_t2_stats(st, (stubs0 - body0) as u64, (asm.buf.len() - stubs0) as u64);
+    }
     // (perf7) jump relaxation in `resolve` moved the code
     let entries = entries.into_iter().map(|(pc, pos)| (pc, asm.map_pos(pos as usize) as u32)).collect();
     Ok(Out { asm, entries, sites })

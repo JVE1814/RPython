@@ -211,6 +211,55 @@ macro_rules! doc_str {
     }};
 }
 
+/// (mem1) The bytes of a file (`include_bytes!` path) as a `&'static [u8]` stored in the
+/// `.rodata.rpycold` section, which the launcher's link places after the other read-only
+/// data (crates/launcher/docs.ld): for big blobs that a normal start never reads (module
+/// sources kept for fallbacks, test helpers). Left among the other constants, a blob
+/// shares the kernel's fault-around windows (64-128 KB) with the constants start-up does
+/// read and becomes resident with them.
+#[macro_export]
+macro_rules! cold_bytes {
+    ($path:expr) => {{
+        const B: &[u8] = include_bytes!($path);
+        #[unsafe(link_section = ".rodata.rpycold")]
+        static D: [u8; B.len()] = *include_bytes!($path);
+        &D as &'static [u8]
+    }};
+}
+
+/// (mem1) A slice literal of a numeric type, `cold_slice!(u16, [1, 2, 3])`, as a
+/// `&'static [T]` stored in `.rodata.rpycold` (see `cold_bytes!`): for generated tables
+/// that only rarely used code reads (the CJK codec tables).
+#[macro_export]
+macro_rules! cold_slice {
+    ($t:ty, [$($e:tt)*]) => {{
+        const D: &[$t] = &[$($e)*];
+        #[unsafe(link_section = ".rodata.rpycold")]
+        static S: [$t; D.len()] = {
+            let mut a = [0 as $t; D.len()];
+            let mut i = 0;
+            while i < D.len() {
+                a[i] = D[i];
+                i += 1;
+            }
+            a
+        };
+        &S as &'static [$t]
+    }};
+}
+
+/// (mem1) `cold_bytes!` for a UTF-8 text file, as a `&'static str`.
+#[macro_export]
+macro_rules! cold_str {
+    ($path:expr) => {{
+        const S: &str = include_str!($path);
+        #[unsafe(link_section = ".rodata.rpycold")]
+        static D: [u8; S.len()] = *include_bytes!($path);
+        // SAFETY: the bytes of the same file, which include_str! checked to be UTF-8
+        unsafe { std::str::from_utf8_unchecked(&D) }
+    }};
+}
+
 pub fn method_name(ml: *const PyMethodDef) -> String {
     unsafe { CStr::from_ptr((*ml).ml_name).to_string_lossy().into_owned() }
 }

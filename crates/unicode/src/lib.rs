@@ -14,8 +14,11 @@
 //! Code points are passed as `u32`; values above 0x10FFFF are treated like
 //! U+10FFFF (an unassigned noncharacter).
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
+// (mem1) the generated tables put their cold arrays in a section of their own
+// (`#[unsafe(link_section)]`, the only "unsafe" in this crate)
+#[allow(unsafe_code)]
 mod tables {
     pub mod db;
     pub mod names;

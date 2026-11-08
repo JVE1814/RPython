@@ -117,6 +117,9 @@ struct Image {
     code: Out,
     /// translated forms, by area (see `translation`)
     tx: [Out; 2],
+    /// (mem1) writing the records of modules a start does not import: all their translated
+    /// forms go to the end of area 1, and their records after the translation areas
+    cold: bool,
 }
 
 /// Modules every start imports, in import order: their records come first, so a start
@@ -303,7 +306,7 @@ impl Image {
         let lines = out.pub_of_internal.iter().map(|&u| positions.get(u as usize).and_then(|p| p.lineno).map_or(-1, |l| l as i64));
         put_deltas(o, lines);
         // CO_OPTIMIZED marks functions (module and class bodies run at import time)
-        let area = (co.flags & 1 != 0) as usize;
+        let area = if self.cold { 1 } else { (co.flags & 1 != 0) as usize };
         let at = self.tx[area].buf.len() as u64;
         self.tx[area].raw(&tx.buf);
         self.code.u(at << 1 | area as u64);
@@ -347,9 +350,12 @@ fn main() {
     println!("cargo:rerun-if-changed=build/main.rs");
     let frozen_rs = std::fs::read_to_string(&frozen_rs_path).expect("src/frozen.rs");
     let mut img = Image::default();
-    let mut modules: Vec<(u64, u64)> = Vec::new();
+    // (module path id, offset of its record, record in the cold part)
+    let mut modules: Vec<(u64, u64, bool)> = Vec::new();
     let mut sources = frozen_sources(&frozen_rs);
     sources.sort_by_key(|p| STARTUP_FIRST.iter().position(|s| s == p).unwrap_or(STARTUP_FIRST.len()));
+    // (mem1) the records of the start-up modules; `img.code` then collects the others'
+    let mut hot_code: Option<Out> = None;
     for p in sources {
         let file = lib.join(&p);
         println!("cargo:rerun-if-changed={}", file.display());
@@ -358,10 +364,18 @@ fn main() {
             println!("cargo:warning=startup image: {} is left out (compiled at run time)", p);
             continue;
         };
+        if hot_code.is_none() && !STARTUP_FIRST.contains(&p.as_str()) {
+            hot_code = Some(std::mem::take(&mut img.code));
+            img.cold = true;
+        }
         let id = img.s(&p);
-        modules.push((id, img.code.buf.len() as u64));
+        modules.push((id, img.code.buf.len() as u64, img.cold));
         img.code_record(&co);
     }
+    let (hot_code, cold_code) = match hot_code {
+        Some(h) => (h, std::mem::take(&mut img.code)),
+        None => (std::mem::take(&mut img.code), Out::default()),
+    };
     // header: magic, string table, module table; code records follow
     let mut head = Out::default();
     head.raw(MAGIC);
@@ -392,17 +406,23 @@ fn main() {
     let tx_at = head.buf.len();
     head.raw(&[0; 16]);
     let base = head.buf.len() as u64;
-    for (k, (id, off)) in modules.iter().enumerate() {
+    // (mem1) layout: start-up modules' records, area 0 (their module and class bodies),
+    // area 1 (their functions, then everything of the other modules), the other modules'
+    // records: what a start does not touch is one piece at the end
+    let tx_base = base + hot_code.buf.len() as u64;
+    let cold_base = tx_base + (img.tx[0].buf.len() + img.tx[1].buf.len()) as u64;
+    for (k, (id, off, cold)) in modules.iter().enumerate() {
         let at = table_at + 12 * k;
         head.buf[at..at + 4].copy_from_slice(&(*id as u32).to_le_bytes());
-        head.buf[at + 4..at + 12].copy_from_slice(&(base + off).to_le_bytes());
+        let abs = if *cold { cold_base + off } else { base + off };
+        head.buf[at + 4..at + 12].copy_from_slice(&abs.to_le_bytes());
     }
-    let tx_base = base + img.code.buf.len() as u64;
     head.buf[tx_at..tx_at + 8].copy_from_slice(&tx_base.to_le_bytes());
     head.buf[tx_at + 8..tx_at + 16].copy_from_slice(&(img.tx[0].buf.len() as u64).to_le_bytes());
-    head.raw(&img.code.buf);
+    head.raw(&hot_code.buf);
     head.raw(&img.tx[0].buf);
     head.raw(&img.tx[1].buf);
+    head.raw(&cold_code.buf);
     let out = Path::new(&std::env::var("OUT_DIR").unwrap()).join("startup_image.bin");
     std::fs::write(out, &head.buf).expect("write startup image");
 }

@@ -271,6 +271,9 @@ pub struct Block {
     /// blocks a template instruction of this block jumps to by itself (control flow
     /// not described by `term`; needed for liveness)
     pub tsuccs: Vec<BlockId>,
+    /// (perf8) a slow path (generic helper call, multi-threaded variant, deoptimising
+    /// branch): emitted after the hot blocks (codegen `layout`)
+    pub cold: bool,
     /// first bytecode instruction index of the block (u32::MAX for synthetic blocks)
     pub instr: u32,
 }
