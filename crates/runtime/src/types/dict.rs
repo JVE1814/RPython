@@ -224,6 +224,24 @@ unsafe fn raw_free(p: *mut u8, bytes: usize) {
 /// Bytes before the index array in a data block: (size, cap) of the block.
 const BLOCK_HDR: usize = 16;
 
+/// (mem1) Data blocks of at least this size give their pages back while a resize copies
+/// them (`resize_inner`), every `RELEASE_STEP` entries.
+const RELEASE_MIN: usize = 512 * 1024;
+const RELEASE_STEP: usize = 8192;
+
+/// Return the whole pages inside `[lo, hi)` of the malloc block starting at `block` to the
+/// system (their contents are not needed any more; the block is freed afterwards). Pages
+/// holding the block's first or last bytes are kept: the allocator's own bookkeeping lives
+/// next to them.
+fn release_pages(block: *mut u8, lo: usize, hi: usize) {
+    const PG: usize = 4096;
+    let lo = ((lo.max(block as usize + 1)) + PG - 1) & !(PG - 1);
+    let hi = hi & !(PG - 1);
+    if hi > lo {
+        unsafe { libc::madvise(lo as *mut libc::c_void, hi - lo, libc::MADV_DONTNEED) };
+    }
+}
+
 impl DictTable {
     /// A table with room for `cap` entries (data block allocated, header by value).
     pub fn new(cap: usize) -> DictTable {
@@ -331,7 +349,30 @@ impl DictTable {
         {
             let mask = fresh.size - 1;
             let mut n = 0;
-            for e in self.entries().iter().filter(|e| !e.key.is_null()) {
+            // (mem1) a big table that only its owner ever read gives its old pages back
+            // while it is copied: the old index array at once (the copy walks the
+            // entries), then the entries already copied, chunk by chunk. Both blocks
+            // fully resident at once were the peak of a growing dict.
+            let mut release = if self.data_bytes >= RELEASE_MIN && !self.shared_read.load(Relaxed) {
+                let block = unsafe { (self.indices_p as *mut u8).sub(BLOCK_HDR) };
+                release_pages(block, self.indices_p as usize, self.entries_p as usize);
+                Some(self.entries_p as usize)
+            } else {
+                None
+            };
+            let old = self.entries();
+            for (k, e) in old.iter().enumerate() {
+                if e.key.is_null() {
+                    continue;
+                }
+                if let Some(from) = release.as_mut()
+                    && k % RELEASE_STEP == RELEASE_STEP - 1
+                {
+                    let upto = old.as_ptr() as usize + (k + 1) * std::mem::size_of::<Entry>();
+                    let block = unsafe { (self.indices_p as *mut u8).sub(BLOCK_HDR) };
+                    release_pages(block, *from, upto);
+                    *from = upto;
+                }
                 unsafe { *fresh.entries_p.add(n) = *e };
                 let mut perturb = e.hash as usize;
                 let mut i = (e.hash as usize) & mask;

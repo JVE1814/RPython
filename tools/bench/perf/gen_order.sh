@@ -2,8 +2,9 @@
 # Regenerate crates/launcher/startup.ld (perf2): the code that runs during startup is
 # grouped at the start of the text segment (see crates/launcher/build.rs).
 # usage: tools/bench/perf/gen_order.sh PY [OUT]   (PY = a release build of this tree)
-# Functions are listed in the order callgrind first names them; ThinLTO's ".llvm.N"
-# suffixes change between builds, so each name also matches its suffixed variants.
+# Start-up functions are listed in the order they first run (native_funcs.sh), the rest
+# in the order callgrind first names them; ThinLTO's ".llvm.N" suffixes change between
+# builds, so each name also matches its suffixed variants.
 PY="$1"
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 OUT="${2:-$ROOT/crates/launcher/startup.ld}"   # (perf7) optional output path
@@ -14,17 +15,46 @@ cd /tmp || exit 1
 export PYTHON_FROZEN_MODULES=on
 "$PY" -c pass >/dev/null 2>&1   # warm the bytecode caches
 cg() { valgrind --tool=callgrind --demangle=no --callgrind-out-file="$TMP/cg.$1" "${@:2}" >/dev/null 2>&1; }
-cg 1 "$PY" -c pass
-cg 2 "$PY" -S -c pass
-cg 3 "$PY" -c 'for l in open("/proc/self/status"):
-    if l.startswith(("VmHWM", "RssAnon")): print(l.split()[0], l.split()[1])'
-cg 4 "$PY" -c 'import os, re, collections, functools, threading, json'
+# (mem1) The start-up runs are recorded natively, in first-execution order, by
+# native_funcs.sh (gdb): callgrind took slightly different paths and named functions in its
+# own order, and every start-up function left out costs a 64-128 KB fault-around window of
+# code. Without gdb (or with ORDER_CALLGRIND=1): callgrind as before.
+NATIVE="$ROOT/tools/bench/perf/native_funcs.sh"
+start() {
+  if command -v gdb >/dev/null && [ -z "${ORDER_CALLGRIND:-}" ]; then
+    "$NATIVE" "$PY" "$TMP/nat.$1" "${@:2}" >/dev/null 2>&1
+  else
+    cg "$1" "$PY" "${@:2}"
+  fi
+}
+start 1 -c pass
+start 2 -S -c pass
+# reading a text file and the common str operations of small scripts
+start 3 -c 'for l in open("/proc/self/status"):
+    if l.startswith(("VmHWM", "RssAnon", "Name")): print("x_" + l.split(":")[0].lower().strip(), l.split()[1], f"{len(l)}", "%s" % l[:2].upper())'
+start 5 -c 'import os, re, collections, functools, threading, json'
+# (4) a small script's first steps (before the imports of 5, which fewer scripts need):
+# comprehensions of each kind, conversions, enough
+# allocation for the cycle collector and the eval breaker to run
+start 4 -c 'data = [str(i) * 2 for i in range(30000)]
+idx = {s: n for n, s in enumerate(data)}
+sq = {i: i * i for i in range(3000)}
+odd = [(k, v) for k, v in idx.items() if v % 3]
+total = sum(len(s) for s in data)
+seen = {s[:2] for s in data[:500]}
+text = " ".join(sorted(data[:50], key=len))
+nums = list(range(100)) + [int(s) for s in data[:100]]
+print(len(odd), total, len(seen), len(text), max(nums), len(sq))'
 # (perf7) ORDER_STARTUP_ONLY=1: start-up and common imports only (the profile-guided
 # build groups the steady-state hot code itself, in .text.hot)
-if [ -z "${ORDER_STARTUP_ONLY:-}" ]; then
-cg 5 "$PY" "$ROOT/tools/bench/perf/objs_small.py" 2000
+# (mem1) ORDER_REFRESH=1: record the start-up runs again and keep the rest of the current
+# list (OUT) after them: a few minutes instead of half an hour, for after a merge
+if [ -n "${ORDER_REFRESH:-}" ]; then
+  sed -n 's/^    \*(\.text\.\([^ ]*\) .*/\1/p' "$OUT" > "$TMP/nat.99"
+elif [ -z "${ORDER_STARTUP_ONLY:-}" ]; then
+cg 6 "$PY" "$ROOT/tools/bench/perf/objs_small.py" 2000
 # common operations (micro benchmarks with small sizes) after the startup set
-n=6
+n=7
 for m in "$ROOT"/tools/bench/micro/*.py; do
   cg $n "$PY" "$m" 5000
   n=$((n + 1))
@@ -32,8 +62,10 @@ done
 fi
 # (perf7) in run order (the temporary directory name contains a dot: sorting on a
 # dot-separated field put cg.10..cg.19 before cg.2)
-ls "$TMP" | sed -n "s/^cg\.//p" | sort -n | sed "s|^|$TMP/cg.|" | xargs cat | grep -oE '^c?fn=\([0-9]+\) [^ ]+' | sed -E 's/^c?fn=\([0-9]+\) //' |
-  grep -E '^[A-Za-z_][A-Za-z0-9_$.]*$' | sed -E 's/\.llvm\.[0-9]+$//' | awk '!seen[$0]++' > "$TMP/names0"
+for i in $(ls "$TMP" | sed -n -E "s/^(cg|nat)\.//p" | sort -n); do
+  if [ -f "$TMP/nat.$i" ]; then cat "$TMP/nat.$i"
+  else grep -oE '^c?fn=\([0-9]+\) [^ ]+' "$TMP/cg.$i" | sed -E 's/^c?fn=\([0-9]+\) //'; fi
+done | grep -E '^[A-Za-z_][A-Za-z0-9_$.*]*$' | sed -E 's/\.llvm\.[0-9]+$//' | awk '!seen[$0]++' > "$TMP/names0"
 # LLVM merges identical functions (one body, several symbol names): callgrind reports one
 # name, but the section may carry another, so add every name that shares the address.
 nm "$PY" | awk '$2 ~ /^[tTwW]$/ { n = $3; sub(/\.llvm\.[0-9]+$/, "", n); print $1, n }' > "$TMP/nm"
@@ -43,11 +75,17 @@ awk 'NR == FNR { at[$2] = $1; same[$1] = same[$1] " " $2; next }
 # (perf7) only functions of the executable itself (callgrind also names libc/libm code,
 # which no section of ours can match); crates/launcher/tests/startup_order.rs checks that
 # the list still matches the executable after later merges
-awk 'NR == FNR { have[$2] = 1; next } $0 in have' "$TMP/nm" "$TMP/names1" > "$TMP/names"
+# (mem1) compared with the crate hashes masked (`Cs*_`), as the list writes them (the
+# names kept by ORDER_REFRESH are in that form already)
+awk 'NR == FNR { n = $2; gsub(/Cs[A-Za-z0-9]+_/, "Cs*_", n); have[n] = 1; next }
+     { n = $0; gsub(/Cs[A-Za-z0-9]+_/, "Cs*_", n); if (n in have) print n }' "$TMP/nm" "$TMP/names1" > "$TMP/names"
 {
   echo "/* generated by tools/bench/perf/gen_order.sh: startup code first */"
   echo "SECTIONS {"
   echo "  .text.startup_hot : {"
+  # (mem1) the C run-time start files' code (_start, the init/fini helpers) runs at every
+  # start and exit; at the start of .text it cost a fault-around window of its own
+  echo "    *crt1.o(.text .text.*) *crti.o(.text .text.*) *crtbegin*.o(.text .text.*)"
   # (perf7) Rust symbol names carry a hash of their crate (`Cs<hash>_`), which changes with
   # the compiler flags and the build (a profile-guided build, a new Cargo.lock): match any
   sed -E "s/Cs[A-Za-z0-9]+_/Cs*_/g" "$TMP/names" | awk '!seen[$0]++' |
@@ -55,5 +93,5 @@ awk 'NR == FNR { have[$2] = 1; next } $0 in have' "$TMP/nm" "$TMP/names1" > "$TM
   echo "  }"
   echo "} INSERT BEFORE .text;"
 } > "$OUT"
-echo "$(wc -l < "$TMP/names") functions -> $OUT"
+echo "$(grep -c "^    \*(" "$OUT") functions -> $OUT"
 rm -rf "$TMP"

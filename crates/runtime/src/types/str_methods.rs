@@ -1796,16 +1796,22 @@ pub fn init_types() {
             ("format", FASTKW, m_format, "format($self, /, *args, **kwargs)\n--\n\nReturn a formatted version of the string, using substitutions from args and kwargs.\nThe substitutions are identified by braces ('{' and '}')."),
             ("format_map", O, m_format_map, "format_map($self, mapping, /)\n--\n\nReturn a formatted version of the string, using substitutions from mapping.\nThe substitutions are identified by braces ('{' and '}')."),
             ("__format__", O, m_dunder_format, "__format__($self, format_spec, /)\n--\n\nReturn a formatted version of the string as described by format_spec."),
-            ("maketrans", FAST, m_maketrans, "maketrans(x, y=<unrepresentable>, z=<unrepresentable>, /)\n--\n\nReturn a translation table usable for str.translate().\n\nIf there is only one argument, it must be a dictionary mapping Unicode\nordinals (integers) or characters to Unicode ordinals, strings or None.\nCharacter keys will be then converted to ordinals.\nIf there are two arguments, they must be strings of equal length, and\nin the resulting dictionary, each character in x will be mapped to the\ncharacter at the same position in y. If there is a third argument, it\nmust be a string, whose characters will be mapped to None in the result."; METH_STATIC),
+            ("maketrans", FAST, m_maketrans; METH_STATIC),
             ("__sizeof__", NOARGS, m_sizeof, "__sizeof__($self, /)\n--\n\nReturn the size of the string in memory, in bytes."),
             ("__getnewargs__", NOARGS, m_getnewargs),
         ];
+        // (mem1) maketrans's doc is read at start-up (type_ready wraps the static method in
+        // a staticmethod object, which copies __doc__): it stays with the other read-only
+        // data instead of among the method docs of `.rodata.rpydoc`, which a start does not
+        // read.
+        const MAKETRANS_DOC: &std::ffi::CStr = c"maketrans(x, y=<unrepresentable>, z=<unrepresentable>, /)\n--\n\nReturn a translation table usable for str.translate().\n\nIf there is only one argument, it must be a dictionary mapping Unicode\nordinals (integers) or characters to Unicode ordinals, strings or None.\nCharacter keys will be then converted to ordinals.\nIf there are two arguments, they must be strings of equal length, and\nin the resulting dictionary, each character in x will be mapped to the\ncharacter at the same position in y. If there is a third argument, it\nmust be a string, whose characters will be mapped to None in the result.";
         // maketrans is a static method: self is NULL, so it needs its own C shim.
         let mut p = t.tp_methods;
         while !(*p).ml_name.is_null() {
             if std::ffi::CStr::from_ptr((*p).ml_name).to_bytes() == b"maketrans" {
                 (*p).ml_meth = maketrans_c as *const std::ffi::c_void;
                 (*p).ml_flags = METH_FASTCALL | METH_STATIC;
+                (*p).ml_doc = MAKETRANS_DOC.as_ptr();
             }
             p = p.add(1);
         }

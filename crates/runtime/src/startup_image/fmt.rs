@@ -8,9 +8,12 @@
 //! nmod   then per module: string id of its path below Lib/ (u32 LE) and the offset of its
 //!        code record (u64 LE, relative to the start of the image)
 //! u64 LE start of the translation areas, u64 LE length of area 0
-//! code records (nested code objects are inline constants of their parent), modules that
-//!        every start imports first
-//! translation area 0 (module and class bodies), translation area 1 (functions)
+//! code records (nested code objects are inline constants of their parent) of the modules
+//!        every start imports
+//! translation area 0 (their module and class bodies), translation area 1 (their functions,
+//!        then all translated forms of the other modules)
+//! code records of the other modules (mem1: what a start does not read is one piece at the
+//!        end; module offsets are absolute)
 //! ```
 //! A code record: argcount, posonlyargcount, kwonlyargcount, stacksize, flags, firstlineno;
 //! co_code (blob); consts (count + tagged constants); names (count + string ids);
