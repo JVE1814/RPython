@@ -660,6 +660,8 @@ unsafe extern "C" fn writer_new(tp: *mut PyTypeObject, args: *mut PyObject, kw: 
             };
             let mode = opt_u8_mode(parsed[4])?;
             let capture = capture_flags(parsed[5])?;
+            // audit event as for open(), before the file is created
+            crate::modules::sys_full::audit("open", &[path_obj, &crate::types::str::new_str("wb"), &crate::types::int::new_int(0)])?;
             let file = std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -898,6 +900,7 @@ unsafe extern "C" fn reader_dealloc(op: *mut PyObject) {
 
 fn open_reader(path_obj: &PyObject) -> PyResult<ReaderState> {
     let path = path_of(path_obj, "BinaryReader")?;
+    crate::modules::sys_full::audit("open", &[path_obj, &crate::types::str::new_str("rb"), &crate::types::int::new_int(0)])?;
     let data = std::fs::read(&path).map_err(|e| io_error(&e, Some(path_obj)))?;
     let size = data.len();
     if size < HEADER_SIZE + FOOTER_SIZE {
